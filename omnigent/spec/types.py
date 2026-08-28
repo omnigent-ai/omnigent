@@ -555,8 +555,9 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
         auto-detection, telemetry, and tool-provider inference.
         ``None`` only when no model is declared anywhere in the spec.
     :param reasoning_effort: Default reasoning level for this agent,
-        e.g. ``"high"``. Read from the ``executor.reasoning_effort``
-        YAML key, alongside ``model``. Applies when nothing more
+        e.g. ``"high"``. Populated by the parser from either the
+        ``executor.reasoning_effort`` YAML key or (for backward
+        compatibility) ``llm.reasoning_effort``. Applies when nothing more
         specific asks for one: a per-dispatch
         ``sys_session_send``/``sys_session_create`` argument wins over
         it, and it in turn wins over whatever default the harness CLI
@@ -607,7 +608,8 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
     # the parser from executor.model or (backward compat) llm.model.
     model: str | None = None
     # Spec-level default reasoning effort, applied when no per-dispatch
-    # value asks for one. Populated from executor.reasoning_effort.
+    # value asks for one. Populated from executor.reasoning_effort or
+    # (backward compat) llm.reasoning_effort.
     reasoning_effort: str | None = None
     # Per-provider connection overrides (api_key, base_url, etc.).
     # Populated from executor.connection or (backward compat) llm.connection.

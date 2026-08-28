@@ -630,6 +630,32 @@ async def _permission_mode_launch_args(deps: FireDeps, task: ScheduledTask) -> l
     return ["--permission-mode", task.permission_mode]
 
 
+async def _spec_reasoning_effort(deps: FireDeps, task: ScheduledTask) -> str | None:
+    """Read ``executor.reasoning_effort`` from the task's agent spec.
+
+    Fail-safe like :func:`_permission_mode_launch_args`: a task with no explicit
+    effort inherits the spec default, and any load failure yields ``None`` (the
+    harness default) rather than breaking the fire. The spec value is validated
+    at spec load, so it needs no re-validation here.
+    """
+    if deps.agent_cache is None:
+        return None
+    try:
+        agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
+        if agent is None or getattr(agent, "bundle_location", None) is None:
+            return None
+        loaded = await asyncio.to_thread(deps.agent_cache.load, agent.id, agent.bundle_location)
+        executor = getattr(loaded.spec, "executor", None)
+        return getattr(executor, "reasoning_effort", None) if executor else None
+    except Exception:
+        _logger.exception(
+            "scheduled fire: could not resolve reasoning_effort for task %s; "
+            "using harness default",
+            task.id,
+        )
+        return None
+
+
 async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
     """Create a conversation bound to the task's agent, carrying the stored spec."""
     # Connected-host, existing-workspace runs create the conversation directly.
@@ -643,12 +669,15 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
         workspace=task.workspace,
         terminal_launch_args=await _permission_mode_launch_args(deps, task),
     )
-    if task.model_override is not None or task.reasoning_effort is not None:
+    reasoning_effort = task.reasoning_effort
+    if reasoning_effort is None:
+        reasoning_effort = await _spec_reasoning_effort(deps, task)
+    if task.model_override is not None or reasoning_effort is not None:
         updated: Conversation | None = await asyncio.to_thread(
             deps.conversation_store.update_conversation,
             conv.id,
             model_override=task.model_override,
-            reasoning_effort=task.reasoning_effort,
+            reasoning_effort=reasoning_effort,
         )
         if updated is not None:
             conv = updated
