@@ -27,7 +27,7 @@ export function PreviewCommentBanner({
         <button
           type="button"
           onClick={onSwitchToEdit}
-          className="font-medium text-foreground underline underline-offset-2 hover:text-primary"
+          className="cursor-pointer font-medium text-foreground underline underline-offset-2 hover:text-primary"
         >
           switch to edit mode
         </button>
