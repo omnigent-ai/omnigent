@@ -210,6 +210,21 @@ _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
 _SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
+
+
+def _session_id_from_request(request: Request) -> str | None:
+    """Best-effort session id parsed from a ``/v1/sessions/<id>/…`` request path.
+
+    Threaded into exception-handler logs (``extra={"session_id": …}``) so a 500
+    on a session route carries its conversation id in the debug-logs table. Read
+    from the request explicitly per-invocation — no ambient/request-scoped
+    session ContextVar exists on the server, deliberately, to avoid
+    cross-request mis-attribution.
+    """
+    match = _SESSION_PATH_RE.search(request.url.path)
+    return match.group(1) if match else None
+
+
 # polly's and debby's multi-file bundles are packaged under
 # omnigent.resources.examples (see pyproject package-data), so they resolve
 # in both a repo checkout and an installed wheel. The presence check in each
@@ -1561,15 +1576,24 @@ def create_app(
         """
         Convert application errors to structured JSON responses.
 
-        :param request: The incoming request (unused — FastAPI signature requirement).
+        :param request: The incoming request; its path supplies the session id
+            threaded into the error log.
         :param exc: The application error.
         :returns: A JSON response with the error code and message.
         """
         if exc.http_status >= 500:
-            _logger.error("Internal error: %s", exc.message, exc_info=exc)
+            _logger.error(
+                "Internal error: %s",
+                exc.message,
+                exc_info=exc,
+                extra={"session_id": _session_id_from_request(request)},
+            )
         elif exc.http_status == 400 and request.url.path.endswith("/policies/evaluate"):
             _logger.warning(
-                "Policy evaluate rejected 400 on %s: %s", request.url.path, exc.message
+                "Policy evaluate rejected 400 on %s: %s",
+                request.url.path,
+                exc.message,
+                extra={"session_id": _session_id_from_request(request)},
             )
         return JSONResponse(
             status_code=exc.http_status,
@@ -1578,7 +1602,7 @@ def create_app(
 
     @app.exception_handler(StatementError)
     async def _handle_statement_error(
-        request: Request,  # noqa: ARG001 — FastAPI exception-handler signature requires (request, exc); we only use exc
+        request: Request,
         exc: StatementError,
     ) -> JSONResponse:
         """
@@ -1591,7 +1615,8 @@ def create_app(
         not-found instead of an internal error. Any other statement error (real
         DB failure) falls through to the standard 500 shape.
 
-        :param request: The incoming request (unused — FastAPI signature requirement).
+        :param request: The incoming request; its path supplies the session id
+            threaded into the error log.
         :param exc: The SQLAlchemy statement error.
         :returns: 404 for a malformed id, otherwise a 500 JSON response.
         """
@@ -1604,7 +1629,12 @@ def create_app(
                 status_code=404,
                 content={"error": {"code": ErrorCode.NOT_FOUND, "message": "Not found."}},
             )
-        _logger.error("Database error: %s", exc, exc_info=exc)
+        _logger.error(
+            "Database error: %s",
+            exc,
+            exc_info=exc,
+            extra={"session_id": _session_id_from_request(request)},
+        )
         return JSONResponse(
             status_code=500,
             content={
@@ -1617,7 +1647,7 @@ def create_app(
 
     @app.exception_handler(Exception)
     async def _handle_unhandled_exception(
-        request: Request,  # noqa: ARG001 — FastAPI exception-handler signature requires (request, exc); we only use exc
+        request: Request,
         exc: Exception,
     ) -> JSONResponse:
         """
@@ -1625,11 +1655,17 @@ def create_app(
         OperationalError). Returns the standard JSON error schema
         so clients always get a consistent response format.
 
-        :param request: The incoming request (unused — FastAPI signature requirement).
+        :param request: The incoming request; its path supplies the session id
+            threaded into the error log.
         :param exc: The unhandled exception.
         :returns: A 500 JSON response with ``internal_error`` code.
         """
-        _logger.error("Unhandled exception: %s", exc, exc_info=exc)
+        _logger.error(
+            "Unhandled exception: %s",
+            exc,
+            exc_info=exc,
+            extra={"session_id": _session_id_from_request(request)},
+        )
         return JSONResponse(
             status_code=500,
             content={

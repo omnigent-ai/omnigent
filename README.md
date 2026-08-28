@@ -269,6 +269,9 @@ omnigent hermes                      # Hermes Agent (Nous Research)
 omnigent pi                          # Pi
 ```
 
+`omnigent agy` requires agy 1.1.13 or newer. When `GEMINI_API_KEY` is set,
+direct Gemini API authentication takes precedence over agy's saved OAuth login.
+
 Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
 its coding agents or drive a live OpenClaw Gateway session over ACP.
 
@@ -360,9 +363,13 @@ omnigent config set --global \
 
 The title generator receives the current date as `YYYY-MM-DD`, then applies
 these requirements to the first user message. The setting is server-owned and
-does not alter an agent's portable instructions. Generated titles longer than
-60 characters are rejected, leaving the first-message fallback title in place.
-The setting applies to new sessions after the local Omnigent server restarts.
+does not alter an agent's portable instructions. Default generated titles are
+limited to 100 characters; custom title requirements may use up to 200.
+Default titles over 100 characters are rejected, leaving the first-message
+fallback title in place. Custom titles over 200 characters are truncated with
+a trailing ellipsis. Manually assigned titles are also limited to 200
+characters. The setting applies to new sessions after the local Omnigent
+server restarts.
 For longer instructions, edit `~/.omnigent/config.yaml` directly and use a YAML
 block scalar:
 

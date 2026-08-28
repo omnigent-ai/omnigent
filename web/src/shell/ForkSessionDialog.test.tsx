@@ -15,7 +15,8 @@ import {
   type AvailableAgent,
 } from "@/hooks/useAvailableAgents";
 import { useSessionAgent } from "@/hooks/useAgents";
-import { useHosts, type Host } from "@/hooks/useHosts";
+import { useSession } from "@/hooks/useSession";
+import { useHosts, useHostModelOptions, type Host } from "@/hooks/useHosts";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { checkHostDirectory, useHostFilesystem } from "@/hooks/useHostFilesystem";
@@ -31,7 +32,8 @@ vi.mock("@/hooks/useAvailableAgents", () => ({
   prefetchAvailableAgentDetails: vi.fn(),
 }));
 vi.mock("@/hooks/useAgents", () => ({ useSessionAgent: vi.fn() }));
-vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
+vi.mock("@/hooks/useSession", () => ({ useSession: vi.fn() }));
+vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn(), useHostModelOptions: vi.fn() }));
 vi.mock("@/hooks/useDirectorySessions", () => ({ useDirectorySessions: vi.fn() }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({ useRunnerHealthRegistration: vi.fn() }));
 vi.mock("@/hooks/useHostFilesystem", () => ({
@@ -55,6 +57,8 @@ const launchRunnerMock = vi.mocked(launchRunner);
 const useAvailableAgentsMock = vi.mocked(useAvailableAgents);
 const useSessionAgentMock = vi.mocked(useSessionAgent);
 const useHostsMock = vi.mocked(useHosts);
+const useHostModelOptionsMock = vi.mocked(useHostModelOptions);
+const useSessionMock = vi.mocked(useSession);
 const useDirectorySessionsMock = vi.mocked(useDirectorySessions);
 const useRunnerHealthMock = vi.mocked(useRunnerHealthRegistration);
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
@@ -176,6 +180,20 @@ beforeEach(() => {
   checkHostDirectoryMock.mockResolvedValue(null);
   prefetchAvailableAgentDetailsMock.mockReset();
   setAgents(AVAILABLE_AGENTS, "claude-sdk");
+  // The run-config section reads the source snapshot (to seed a same-harness
+  // fork) and, for a native target, the host model catalog. Default both to
+  // empty so the section renders nothing for the SDK source these tests use
+  // and stays inert until a test opts into a native switch.
+  useSessionMock.mockReturnValue({
+    session: null,
+    isLoading: false,
+    error: null,
+  } as unknown as ReturnType<typeof useSession>);
+  useHostModelOptionsMock.mockReturnValue({
+    data: [],
+    isLoading: false,
+    error: null,
+  } as unknown as ReturnType<typeof useHostModelOptions>);
   // Defaults for the coding-fork wiring; the non-coding tests don't render
   // these fields but the hooks still run (with isCodingSource false).
   setHosts([host()]);
@@ -226,7 +244,9 @@ describe("ForkSessionDialog", () => {
     await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
     // No agent switch → agent_id omitted (undefined) so the server keeps
     // the source's agent.
-    expect(forkSessionMock).toHaveBeenCalledWith("conv_src", "My clone", undefined, undefined);
+    // A non-native (SDK) source with no agent switch renders no run-config
+    // section, so the config arg is an empty object (no run overrides sent).
+    expect(forkSessionMock).toHaveBeenCalledWith("conv_src", "My clone", undefined, undefined, {});
     // Session list refreshed so the fork shows in the sidebar, then navigated.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
     // A fork inherits the source's project, so the project-folder lists must
@@ -273,7 +293,7 @@ describe("ForkSessionDialog", () => {
     await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
     // The 4th arg is the truncation point — undefined here would mean the
     // dialog dropped it and the fork silently copied the full history.
-    expect(forkSessionMock).toHaveBeenCalledWith("conv_src", undefined, undefined, "resp_cut");
+    expect(forkSessionMock).toHaveBeenCalledWith("conv_src", undefined, undefined, "resp_cut", {});
   });
 
   it("omits the title (server derives it) when the field is cleared", async () => {
@@ -290,7 +310,7 @@ describe("ForkSessionDialog", () => {
 
     await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
     // Whitespace-only → undefined so the server applies "Fork of <title>".
-    expect(forkSessionMock).toHaveBeenCalledWith("conv_src", undefined, undefined, undefined);
+    expect(forkSessionMock).toHaveBeenCalledWith("conv_src", undefined, undefined, undefined, {});
   });
 
   it("pressing Enter in the title input submits the fork", async () => {
@@ -520,11 +540,76 @@ describe("ForkSessionDialog", () => {
     // Switching to a same-family native target forwards agent_id so the
     // server clones that agent and marks the fork for native rebuild. The
     // name was left blank (optional) → undefined so the server derives it.
+    // Switching reveals the run-config section, but no control was touched, so
+    // it emits `{}` — the server inherits/resets per its own family rule
+    // rather than the dialog racing the async model catalog and sending an
+    // explicit "default" that would clear the source's model.
     expect(forkSessionMock).toHaveBeenCalledWith(
       "conv_src",
       undefined,
       "ag_claude_native",
       undefined,
+      {},
+    );
+  });
+
+  it("emits only the run-config fields the user actually changed", async () => {
+    forkSessionMock.mockResolvedValue({
+      id: "conv_fork",
+    } as unknown as Awaited<ReturnType<typeof forkSession>>);
+    renderDialog();
+
+    // Switch to claude-native so the run-config section renders.
+    openAgentSelect();
+    fireEvent.click(screen.getByTestId("fork-session-agent-option-ag_claude_native"));
+
+    // Touch ONLY the permission control (pick "Plan"); leave model + effort
+    // untouched. The fork must carry the permission launch args and NOTHING
+    // for model/effort — so the server inherits those instead of the dialog
+    // sending a catalog-racing "default" that clears them.
+    fireEvent.click(screen.getByTestId("fork-session-config-permission"));
+    fireEvent.click(screen.getByRole("option", { name: "Plan" }));
+    fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+    await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+    expect(forkSessionMock).toHaveBeenCalledWith(
+      "conv_src",
+      undefined,
+      "ag_claude_native",
+      undefined,
+      { terminalLaunchArgs: ["--permission-mode", "plan"] },
+    );
+  });
+
+  it("arms Codex bypass only on an explicit pick, with a danger banner", async () => {
+    forkSessionMock.mockResolvedValue({
+      id: "conv_fork",
+    } as unknown as Awaited<ReturnType<typeof forkSession>>);
+    renderDialog();
+
+    // Switch to codex-native so the Approval row (with the 4th bypass option)
+    // renders. No banner until the dangerous option is actually chosen.
+    openAgentSelect();
+    fireEvent.click(screen.getByTestId("fork-session-agent-option-ag_codex_native"));
+    expect(screen.queryByTestId("fork-session-codex-bypass-banner")).not.toBeInTheDocument();
+
+    // Pick "Bypass approvals & sandbox" → danger banner appears and the fork
+    // carries the dedicated opt-in (as a label server-side), NOT launch args.
+    fireEvent.click(screen.getByTestId("fork-session-config-approval"));
+    fireEvent.click(screen.getByRole("option", { name: "Bypass approvals & sandbox" }));
+    expect(screen.getByTestId("fork-session-codex-bypass-banner")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+    await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+    expect(forkSessionMock).toHaveBeenCalledWith(
+      "conv_src",
+      undefined,
+      "ag_codex_native",
+      undefined,
+      {
+        terminalLaunchArgs: [],
+        codexBypassSandbox: true,
+      },
     );
   });
 
@@ -630,7 +715,8 @@ describe("ForkSessionDialog", () => {
 
       await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
       // Name left blank (optional) → undefined so the server derives it.
-      expect(forkSessionMock).toHaveBeenCalledWith("conv_src", undefined, undefined, undefined);
+      // Coding SDK source, no agent switch → no run-config section, empty config.
+      expect(forkSessionMock).toHaveBeenCalledWith("conv_src", undefined, undefined, undefined, {});
       // Navigation happens even though the launch promise is still pending.
       await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
       // The launch was kicked off (in the background) on the prefilled host/dir.

@@ -16,7 +16,11 @@ from typing import Annotated, Any, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, Strict, field_validator, model_validator
 
-from omnigent.entities import ConversationItem
+from omnigent.entities import (
+    DEFAULT_GENERATED_TITLE_MAX_CHARS,
+    USER_SESSION_TITLE_MAX_CHARS,
+    ConversationItem,
+)
 
 # ── Shared ──────────────────────────────────────────────────────
 
@@ -1433,7 +1437,7 @@ class SessionCreateRequest(BaseModel):
 
     agent_id: str
     initial_items: list[SessionEventInput] = Field(default_factory=list)
-    title: str | None = None
+    title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] = Field(default_factory=dict)
     parent_session_id: str | None = None
     sub_agent_name: str | None = None
@@ -1575,7 +1579,7 @@ class SessionCreateMetadata(BaseModel):
         valid with ``host_type: "managed"``.
     """
 
-    title: str | None = None
+    title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] = Field(default_factory=dict)
     reasoning_effort: str | None = None
     host_id: str | None = None
@@ -2184,7 +2188,7 @@ class UpdateSessionRequest(BaseModel):
     """
 
     runner_id: str | None = None
-    title: str | None = None
+    title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] | None = None
     reasoning_effort: str | None = None
     model_override: str | None = None
@@ -2204,7 +2208,7 @@ class UpdateSessionRequest(BaseModel):
 class AutomaticSessionRenameRequest(BaseModel):
     """Request body for the current-agent automatic rename endpoint."""
 
-    title: str = Field(min_length=2, max_length=60)
+    title: str = Field(min_length=2, max_length=DEFAULT_GENERATED_TITLE_MAX_CHARS)
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2353,11 +2357,44 @@ class SessionForkRequest(BaseModel):
         the last item of that response are copied — items after it are
         dropped from the fork. When ``None`` (default), the full history
         is copied.
+    :param model_override: Per-session LLM model override to apply to the
+        fork, e.g. ``"claude-opus-4-7"``. **Omitting** the field inherits
+        the source's model (same as today, within the same provider
+        family); an explicit value overrides it, and a clear alias
+        (``"default"``, ``"off"``, ``"reset"``) resets the fork to the
+        bound agent's default. Validated against a conservative model-id
+        charset. Set by the web fork dialog's model picker.
+    :param reasoning_effort: Per-session reasoning-effort override to apply
+        to the fork, e.g. ``"high"``. **Omitting** the field inherits the
+        source's effort; an explicit value overrides it, and a clear alias
+        (``"default"``, ``"off"``, ``"reset"``) resets it. Validated
+        against the shared effort vocabulary; provider support is enforced
+        at launch. Set by the web fork dialog's effort picker.
+    :param terminal_launch_args: Per-session native-terminal pass-through
+        args to apply to the fork, e.g. ``["--permission-mode", "auto"]``
+        (the fork dialog's permission-/approval-mode selector).
+        **Omitting** the field keeps today's behavior — the source's args
+        are carried on a same-agent fork and dropped on an agent switch. A
+        list (including ``[]``, which clears them) replaces them wholesale.
+        Bounds (count / length) are validated server-side.
+    :param codex_bypass_sandbox: Opt-in for the DANGEROUS codex-native
+        full-bypass (``--dangerously-bypass-approvals-and-sandbox``) on the
+        fork. The source's bypass label is ALWAYS dropped on a fork (a
+        bypass-armed source can never silently re-arm its clone), so this is
+        the only way a fork enables it — an explicit, banner-gated opt-in
+        from the dialog, mirroring the new-session approval selector. ``True``
+        stamps ``omnigent.codex_native.bypass_sandbox`` on the fork; ``False``
+        / omitted leaves the fork in Codex's normal approval/sandbox stance.
+        Only meaningful for a codex-native target; ignored otherwise.
     """
 
-    title: str | None = None
+    title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     agent_id: str | None = None
     up_to_response_id: str | None = None
+    model_override: str | None = None
+    reasoning_effort: str | None = None
+    terminal_launch_args: list[str] | None = None
+    codex_bypass_sandbox: bool = False
 
     model_config = ConfigDict(extra="forbid")
 

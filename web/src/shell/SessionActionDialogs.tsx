@@ -17,6 +17,7 @@ import {
   useStopAndDeleteConversation,
 } from "@/hooks/useConversations";
 import { Link, useNavigate } from "@/lib/routing";
+import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { conversationDisplayLabel } from "./sidebarNav";
 
 interface SessionDialogProps {
@@ -84,6 +85,7 @@ export function RenameSessionDialog({ conversation, open, onOpenChange }: Sessio
             autoFocus
             aria-label="Session name"
             data-testid="header-rename-conversation-input"
+            maxLength={USER_SESSION_TITLE_MAX_CHARS}
             value={title}
             onChange={(event) => setTitle(event.target.value)}
             onFocus={(event) => event.currentTarget.select()}

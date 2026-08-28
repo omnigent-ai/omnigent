@@ -679,6 +679,44 @@ def test_session_create_git_requires_host_id() -> None:
         )
 
 
+def test_session_title_request_limits() -> None:
+    """User titles allow 200 characters, while default generated titles allow 100."""
+    from omnigent.entities import (
+        DEFAULT_GENERATED_TITLE_MAX_CHARS,
+        USER_SESSION_TITLE_MAX_CHARS,
+    )
+    from omnigent.server.schemas import (
+        AutomaticSessionRenameRequest,
+        SessionCreateMetadata,
+        SessionCreateRequest,
+        SessionForkRequest,
+        UpdateSessionRequest,
+    )
+
+    user_title = "x" * USER_SESSION_TITLE_MAX_CHARS
+    user_requests = (
+        SessionCreateRequest(agent_id="ag_x", title=user_title),
+        SessionCreateMetadata(title=user_title),
+        SessionForkRequest(title=user_title),
+        UpdateSessionRequest(title=user_title),
+    )
+    assert all(request.title == user_title for request in user_requests)
+
+    for request_type, kwargs in (
+        (SessionCreateRequest, {"agent_id": "ag_x"}),
+        (SessionCreateMetadata, {}),
+        (SessionForkRequest, {}),
+        (UpdateSessionRequest, {}),
+    ):
+        with pytest.raises(ValidationError, match="at most 200 characters"):
+            request_type(title=user_title + "x", **kwargs)
+
+    generated_title = "x" * DEFAULT_GENERATED_TITLE_MAX_CHARS
+    assert AutomaticSessionRenameRequest(title=generated_title).title == generated_title
+    with pytest.raises(ValidationError, match="at most 100 characters"):
+        AutomaticSessionRenameRequest(title=generated_title + "x")
+
+
 def test_session_create_git_with_host_id_ok() -> None:
     """``git`` with ``host_id`` validates cleanly."""
     from omnigent.server.schemas import SessionCreateRequest, SessionGitOptions

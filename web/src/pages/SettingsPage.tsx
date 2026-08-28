@@ -188,6 +188,7 @@ import {
   writeCustomTheme,
 } from "@/lib/customTheme";
 import { useIsEmbedded } from "@/lib/embedded";
+import { getOmnigentThemeSettingsUrl } from "@/lib/host";
 import {
   type CliStatus,
   getCliStatus,
@@ -726,11 +727,12 @@ function HideUnconfiguredHarnessesControl() {
 }
 
 function AppearanceSection() {
-  // Embedded: the host owns light/dark, so the Mode and Color theme pickers
-  // would be no-ops — hide them and say so (matching ThemeModeMenu). Terminal
-  // theme and the font controls are per-device prefs that don't conflict with
-  // host theming, so they stay visible.
+  // Embedded: the host owns light/dark, so the Mode picker would be a no-op —
+  // replace it with a note (plus a link to the host's own theme settings when
+  // one is provided). The color palette, terminal theme, and font controls are
+  // per-device prefs that don't conflict with host light/dark, so they stay.
   const isEmbedded = useIsEmbedded();
+  const themeSettingsUrl = getOmnigentThemeSettingsUrl();
   const { setTheme } = useTheme();
   const [resetKey, setResetKey] = useState(0);
   const [isResetDialogOpen, setIsResetDialogOpen] = useState(false);
@@ -806,7 +808,19 @@ function AppearanceSection() {
           <div className="flex flex-col gap-3">
             <span className="text-ui font-medium">Theme</span>
             <p className="text-sm text-muted-foreground">
-              Theme is controlled by the host application.
+              Light and dark mode are controlled by the host application.
+              {themeSettingsUrl ? (
+                <>
+                  {" "}
+                  <a
+                    href={themeSettingsUrl}
+                    className="font-medium text-primary underline underline-offset-2 hover:text-primary/80"
+                  >
+                    Change it in your settings
+                  </a>
+                  .
+                </>
+              ) : null}
             </p>
           </div>
         ) : (
@@ -815,7 +829,7 @@ function AppearanceSection() {
 
         <TerminalThemeControl />
 
-        {!isEmbedded && <ColorThemeControl />}
+        <ColorThemeControl />
 
         <TranscriptViewDefaultControl />
 

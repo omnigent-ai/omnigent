@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import datetime
 import re
+import sys
+import types
 import uuid
 from dataclasses import replace
 from pathlib import Path
@@ -15,12 +17,22 @@ import click
 import pytest
 from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
+from pydantic import BaseModel
 
 from omnigent.db.utils import builtin_agent_id, generate_agent_id, now_epoch
 from omnigent.entities.agent import Agent
-from omnigent.onboarding.sandboxes.base import render_host_config_write_command
+from omnigent.onboarding.sandboxes.base import (
+    SandboxHostLauncher,
+    render_host_config_write_command,
+)
 from omnigent.onboarding.sandboxes.blaxel import managed_token_ttl_s as blaxel_managed_token_ttl_s
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
+from omnigent.onboarding.sandboxes.registry import (
+    COMMUNITY_MODULE_PREFIX,
+    SandboxProviderContribution,
+    SandboxProviderMetadata,
+    reset_plugin_state_for_tests,
+)
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.managed_hosts import (
@@ -3640,3 +3652,153 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
     assert engaged == [True, True]
     assert len(calls) == 1
     assert calls[0]["agent_id"] == builtin.id
+
+
+# ── contributed sandbox providers ───────────────────────────
+
+
+class _AcmeConfig(BaseModel):
+    """Config model for the contributed provider used below."""
+
+    namespace: str = "default"
+
+
+class _AcmeLauncher(SandboxHostLauncher):
+    """Minimal contributed launcher; records the config it was handed."""
+
+    provider: ClassVar[str] = "acme"
+
+    def __init__(self, *, config: _AcmeConfig) -> None:
+        self.config = config
+
+    def prepare(self) -> None:
+        """No preflight needed for a test double."""
+
+    def provision(self, name: str) -> str:
+        """Reserve a name, matching the entrypoint-as-host providers."""
+        return name
+
+    def start_host(self, sandbox_id: str, **kwargs: Any) -> str:
+        """Return a workspace path without starting anything."""
+        return "/workspace"
+
+    def terminate(self, sandbox_id: str) -> None:
+        """Nothing to tear down."""
+
+
+@pytest.fixture
+def contributed_acme_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Register an `acme` provider through the entry point group.
+
+    Installs a real module under the `omnigent.community.sandbox.*` namespace
+    the registry requires, so `instantiate` can import the launcher class
+    rather than only resolve its name.
+    """
+    module_name = f"{COMMUNITY_MODULE_PREFIX}acme"
+    module = types.ModuleType(module_name)
+    module.AcmeSandboxLauncher = _AcmeLauncher  # type: ignore[attr-defined]
+    module.AcmeConfig = _AcmeConfig  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, module_name, module)
+    # The registry requires the config model to live in that namespace too,
+    # not just the launcher, so both classes have to claim the fake module.
+    monkeypatch.setattr(_AcmeLauncher, "__module__", module_name)
+    monkeypatch.setattr(_AcmeConfig, "__module__", module_name)
+
+    def _contribution() -> SandboxProviderContribution:
+        return SandboxProviderContribution(
+            name="omnigent-acme",
+            providers={
+                "acme": SandboxProviderMetadata(
+                    name="acme",
+                    launcher_class=f"{module_name}:AcmeSandboxLauncher",
+                    config_model=_AcmeConfig,
+                    managed_token_ttl_s=1234,
+                )
+            },
+        )
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.sandboxes.registry._entry_points",
+        lambda: (SimpleNamespace(name="acme", load=lambda: _contribution),),
+    )
+    reset_plugin_state_for_tests()
+    yield
+    reset_plugin_state_for_tests()
+
+
+def test_parse_contributed_provider_builds_registry_backed_factory(
+    contributed_acme_provider: None,
+) -> None:
+    """
+    A provider contributed through the entry point group is configurable and
+    serves managed sessions, without being named in this module.
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "acme",
+            "server_url": "https://s.example.com",
+            "acme": {"namespace": "sandboxes"},
+        }
+    )
+    assert cfg is not None
+    cfg = cfg.default
+    assert cfg.provider == "acme"
+    # Contributed providers register in order to serve, so the web UI must be
+    # told the sandbox option works rather than offered one that 400s.
+    assert cfg.managed_launch_supported is True
+    assert cfg.token_ttl_s == 1234
+
+    launcher = cfg.launcher_factory()
+    assert isinstance(launcher, _AcmeLauncher)
+    # The `sandbox.acme` block reached the launcher through the config_model
+    # the registry documents, rather than being silently dropped.
+    assert launcher.config.namespace == "sandboxes"
+
+
+def test_contributed_provider_config_is_validated(
+    contributed_acme_provider: None,
+) -> None:
+    """A malformed provider block fails at parse time with the provider named."""
+    with pytest.raises(ValueError, match=r"acme"):
+        parse_sandbox_config(
+            {
+                "provider": "acme",
+                "server_url": "https://s.example.com",
+                "acme": {"namespace": ["not", "a", "string"]},
+            }
+        )
+
+
+def test_contributed_provider_non_mapping_block_is_rejected(
+    contributed_acme_provider: None,
+) -> None:
+    """A non-mapping ``sandbox.<provider>`` block is rejected at parse time."""
+    with pytest.raises(ValueError, match=r"sandbox\.acme"):
+        parse_sandbox_config(
+            {
+                "provider": "acme",
+                "server_url": "https://s.example.com",
+                "acme": "oops",
+            }
+        )
+
+
+def test_unknown_provider_is_still_rejected(contributed_acme_provider: None) -> None:
+    """Consulting the registry does not make every name acceptable."""
+    with pytest.raises(ValueError, match=r"sandbox\.provider"):
+        parse_sandbox_config({"provider": "nope", "server_url": "https://s.example.com"})
+
+
+def test_builtin_without_a_branch_is_unaffected_by_the_registry(
+    contributed_acme_provider: None,
+) -> None:
+    """
+    `lakebox` is registered in the registry AND listed as supported here, but
+    has no config branch, so it must keep falling through to the staged
+    rejection instead of gaining a launcher from the registry.
+    """
+    cfg = parse_sandbox_config({"provider": "lakebox", "server_url": "https://s.example.com"})
+    assert cfg is not None
+    assert cfg.default.managed_launch_supported is False
+    with pytest.raises(HTTPException):
+        cfg.default.launcher_factory()

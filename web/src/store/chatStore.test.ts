@@ -70,6 +70,7 @@ import {
   releaseConversation,
 } from "./chatStore";
 import { conversationRegistry } from "./conversationRegistry";
+import { markSessionCreated, resetInteractionTelemetryForTests } from "./interactionTelemetry";
 import {
   resetStreamSlotManager,
   setStreamSlotManagerForTest,
@@ -11567,6 +11568,9 @@ describe("chatStore — interaction_phase analytics", () => {
   let events: OmnigentAnalyticsEvent[];
 
   beforeEach(() => {
+    // The projector is a module singleton; clear its in-flight tracking so an
+    // un-terminated run from a prior case can't be swept (as "cancelled") here.
+    resetInteractionTelemetryForTests();
     events = [];
     setOmnigentHostConfig({ analytics: (e) => events.push(e) });
   });
@@ -11710,6 +11714,43 @@ describe("chatStore — interaction_phase analytics", () => {
       name: "shell",
     });
     expect(typeof tools[1]!.durationMs).toBe("number");
+    // No reliable success/failure signal on a tool result — the completion must
+    // carry no status rather than a fabricated one.
+    expect(tools[1]).not.toHaveProperty("status");
+
+    controller.abort();
+  });
+
+  it("completes create_session on the first live activity, not on response.created alone", async () => {
+    markSessionCreated("conv_ip_create", "computer");
+    useChatStore.setState({ conversationId: "conv_ip_create", blocks: [] });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    void pumpStreamEvents("conv_ip_create", sink.stream, controller, setState, getState, immediate);
+
+    sink.push(sse("response.created", { id: "resp_ip_c", status: "in_progress", output: [] }));
+    await tick();
+    // The turn started but produced no assistant output yet — span stays open.
+    expect(phases("create_session_computer").some((e) => e.phase === "complete")).toBe(false);
+
+    sink.push(
+      sse("response.output_item.done", {
+        item: {
+          id: "fc_ip_c",
+          type: "function_call",
+          response_id: "resp_ip_c",
+          call_id: "call_ip_c",
+          name: "shell",
+          arguments: "{}",
+          status: "in_progress",
+        },
+      }),
+    );
+    await tick();
+
+    const create = phases("create_session_computer");
+    expect(create[0]).toMatchObject({ phase: "start" });
+    expect(create.at(-1)).toMatchObject({ phase: "complete", status: "success" });
 
     controller.abort();
   });

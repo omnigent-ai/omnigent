@@ -616,6 +616,7 @@ async def _best_effort_stop(
             "Best-effort stop failed for %s; proceeding anyway",
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
         return
 
@@ -636,6 +637,7 @@ async def _best_effort_stop(
                 "Best-effort stop failed for %s; proceeding anyway",
                 target_id,
                 exc_info=True,
+                extra={"session_id": target_id},
             )
 
     if own_status == "running" or has_background_tasks:
@@ -687,6 +689,7 @@ async def _archive_stop(
             "Archive host-runner teardown lookup failed for %s",
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
         return
     if conv is None or not conv.host_id or not conv.runner_id:
@@ -706,6 +709,7 @@ async def _archive_stop(
             "Archive host-runner teardown failed for %s",
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
         delivered = False
     if not delivered:
@@ -2914,6 +2918,7 @@ async def _bind_and_launch_managed_runner(
             "terminating fresh sandbox on host %s",
             session_id,
             managed.host_id,
+            extra={"session_id": session_id},
         )
         host = await asyncio.to_thread(host_store.get_host, managed.host_id)
         if host is not None:
@@ -3155,6 +3160,7 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
         sandbox_running,
         host_tunnel_stale,
         runner_tunnel_stale,
+        extra={"session_id": session_id},
     )
     return await _maybe_relaunch_managed_sandbox(
         session_id=session_id,
@@ -3408,11 +3414,13 @@ def _kick_managed_relaunch(
                 session_id,
                 MANAGED_REPO_LABEL_KEY,
                 raw_repo,
+                extra={"session_id": session_id},
             )
     _logger.info(
         "Managed sandbox for session %s (host %s) is gone; relaunching a new generation",
         session_id,
         conv.host_id,
+        extra={"session_id": session_id},
     )
     tracker.begin(session_id)
     # Seed the relaunch's progress indicator immediately — the user is
@@ -3423,6 +3431,7 @@ def _kick_managed_relaunch(
         _logger.warning(
             "session %s: relaunch has no agent store; runner stays unclassified",
             session_id,
+            extra={"session_id": session_id},
         )
     relaunch_task = asyncio.create_task(
         _run_managed_launch(
@@ -3505,6 +3514,7 @@ def _kick_managed_wake_impl(
         "Managed host %s (session %s) is dormant but resumable; waking in background",
         conv.host_id,
         session_id,
+        extra={"session_id": session_id},
     )
     tracker.begin(session_id)
     # Seed the progress indicator immediately — the user is watching the
@@ -3785,6 +3795,7 @@ async def _ensure_runner_session_initialized(
             "forwarding the message anyway",
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
         if require_success:
             raise OmnigentError(
@@ -5922,6 +5933,7 @@ async def _relay_runner_stream(
                     "Relay: transport lost during server shutdown for session=%s; "
                     "not failing the turn",
                     session_id,
+                    extra={"session_id": session_id},
                 )
             elif not await _runner_drop_interrupted_turn(session_id, conversation_store):
                 # The runner went away while this session sat idle (host
@@ -9424,6 +9436,7 @@ async def _get_session_snapshot(
                 _logger.debug(
                     "Runner status query failed for %s",
                     session_id,
+                    extra={"session_id": session_id},
                 )
     # last_total_tokens and last_task_error come from the context-tokens
     # label written by the forwarder (tasks table has been removed).
@@ -9477,6 +9490,7 @@ async def _get_session_snapshot(
                                 "renamed/removed sub-agent or stale session metadata.",
                                 conv.sub_agent_name,
                                 session_id,
+                                extra={"session_id": session_id},
                             )
                         else:
                             resolved_spec = _sub_spec

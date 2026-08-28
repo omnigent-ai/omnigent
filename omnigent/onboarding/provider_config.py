@@ -96,10 +96,11 @@ _PI_FALLBACK_FAMILIES = (ANTHROPIC_FAMILY, OPENAI_FAMILY)
 # too (a Databricks AI Gateway is pi-consumable — Pi speaks its Anthropic
 # surface), with the actual gateway capability validated at resolution time.
 # A ``subscription`` (CLI login, unusable outside its own CLI) and ``bedrock``
-# (native-``omnigent claude`` only) can never drive pi. Resolution: an
-# explicit pi default wins; otherwise pi falls back to the anthropic then
-# openai family default, skipping the non-pi kinds (see
-# :func:`default_provider_for_harness`).
+# (native-``omnigent claude`` only) can never drive pi — EXCEPT for a pi
+# subscription (``kind="subscription", cli="pi"``), which explicitly opts into
+# Pi's own native auth and may default the pi surface. Resolution: an explicit
+# pi default wins; otherwise pi falls back to the anthropic then openai family
+# default, skipping the non-pi kinds (see :func:`default_provider_for_harness`).
 PI_SURFACE = "pi"
 
 # Accepted ``wire_api`` values. ``responses`` is the OpenAI Responses API;
@@ -323,6 +324,13 @@ class FamilyConfig:
         allowing self-hosted providers serving catalog-known model IDs to use
         their own rates. ``None`` (the default) means no custom pricing — falls
         back to catalog. See :class:`ModelPricingConfig`.
+    :param context_window: Optional context window size in tokens for the
+        default model (e.g. ``1048576`` for a 1M-context gateway model).
+        When set, pi-native sessions advertise this limit in ``models.json``
+        so Pi does not fall back to its own 128k default.
+    :param max_output_tokens: Optional maximum output token count for the
+        default model (e.g. ``65536``). When set, pi-native sessions
+        advertise this limit in ``models.json`` instead of Pi's 16k default.
     """
 
     base_url: str
@@ -332,6 +340,8 @@ class FamilyConfig:
     wire_api: str | None = None
     models: dict[str, str] = field(default_factory=dict)
     pricing: ModelPricingConfig | None = None
+    context_window: int | None = None
+    max_output_tokens: int | None = None
 
     @property
     def default_model(self) -> str | None:
@@ -757,6 +767,27 @@ def _parse_family(provider_name: str, family_name: str, raw: dict[str, object]) 
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
+    context_window_raw = raw.get("context_window")
+    context_window: int | None = None
+    if context_window_raw is not None:
+        if not isinstance(context_window_raw, int) or context_window_raw <= 0:
+            raise OmnigentError(
+                f"{prefix}.context_window must be a positive integer, got {context_window_raw!r}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        context_window = context_window_raw
+
+    max_output_tokens_raw = raw.get("max_output_tokens")
+    max_output_tokens: int | None = None
+    if max_output_tokens_raw is not None:
+        if not isinstance(max_output_tokens_raw, int) or max_output_tokens_raw <= 0:
+            raise OmnigentError(
+                f"{prefix}.max_output_tokens must be a positive integer, "
+                f"got {max_output_tokens_raw!r}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        max_output_tokens = max_output_tokens_raw
+
     return FamilyConfig(
         base_url=base_url_raw,
         api_key=api_key,
@@ -765,6 +796,8 @@ def _parse_family(provider_name: str, family_name: str, raw: dict[str, object]) 
         wire_api=wire_api,
         models=models,
         pricing=pricing,
+        context_window=context_window,
+        max_output_tokens=max_output_tokens,
     )
 
 
@@ -824,7 +857,7 @@ def _parse_default_families(
     # ``provider_families`` and rejects a hand-edited ``default: ["gemini",
     # "pi"]`` at parse time (parity with how a subscription's pi scope is
     # rejected), rather than failing loudly only at pi launch.
-    pi_ok = pi_capable and bool(served & frozenset(_PI_FALLBACK_FAMILIES))
+    pi_ok = pi_capable and (bool(served & frozenset(_PI_FALLBACK_FAMILIES)) or not served)
     allowed = served | {PI_SURFACE} if pi_ok else served
     invalid = requested - allowed
     if invalid:
@@ -905,19 +938,24 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
                 code=ErrorCode.INVALID_INPUT,
             )
         # A subscription serves the family its CLI implies (claude→anthropic,
-        # codex→openai); an unknown CLI serves nothing.
+        # codex→openai); a pi subscription serves no model family directly —
+        # it is pi-capable so it can claim the pi scope explicitly, signalling
+        # "use Pi's own native auth"; an unknown CLI serves nothing.
         served = (
             {ANTHROPIC_FAMILY}
             if cli_raw == "claude"
             else ({OPENAI_FAMILY} if cli_raw == "codex" else set())
         )
+        # claude/codex subscriptions are locked to their own CLIs and cannot
+        # drive pi. A pi subscription explicitly opts into Pi's own native auth
+        # and may default the pi surface (pi_capable=True, served={}).
         return ProviderEntry(
             name=name,
             kind=kind,
             cli=cli_raw,
-            # A subscription is locked to its own CLI, so it can never drive
-            # pi — naming "pi" in its default scope is a config error.
-            default_families=_parse_default_families(name, default_raw, served, pi_capable=False),
+            default_families=_parse_default_families(
+                name, default_raw, served, pi_capable=(cli_raw == "pi")
+            ),
         )
 
     if kind == CLI_CONFIG_KIND:
@@ -1181,8 +1219,8 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
       plus the :data:`PI_SURFACE` scope (pi consumes either family).
     - ``subscription`` / ``cli-config``: derived from the CLI — ``claude``
       serves the ``anthropic`` surface, ``codex`` serves the ``openai``
-      surface. Never pi: a CLI login (or a provider pinned in the CLI's
-      own config file) is unusable outside its own CLI.
+      surface, ``pi`` serves only the :data:`PI_SURFACE` scope (signals
+      "use Pi's own native auth"). Other CLIs serve nothing.
     - ``databricks``: both families plus pi — ucode routes the Claude,
       Codex, and pi surfaces.
 
@@ -1222,6 +1260,10 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
     if entry.kind in (SUBSCRIPTION_KIND, CLI_CONFIG_KIND):
         if entry.cli == "claude":
             return frozenset({ANTHROPIC_FAMILY})
+        if entry.cli == "pi":
+            # A pi subscription signals "use Pi's own native auth" — it serves
+            # only the pi scope (no model family directly).
+            return frozenset({PI_SURFACE})
         if entry.cli == "codex":
             # A codex *cli-config* provider may ALSO serve pi: a Databricks AI
             # Gateway exposes an Anthropic Messages surface Pi speaks natively

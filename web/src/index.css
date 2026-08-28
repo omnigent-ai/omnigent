@@ -617,8 +617,15 @@ aside[aria-label="Workspace"][data-maximized] {
  * the traffic lights float (0–5rem) and the title-bar cluster sits (5rem–10rem,
  * z above the rail). Pad the strip past both so its leftmost tab icon clears
  * them. Only the maximized rail reaches this corner; the docked rail sits right
- * of the sidebar and is untouched. */
-[data-electron-mac] aside[aria-label="Workspace"][data-maximized] .workspace-tab-strip {
+ * of the sidebar and is untouched.
+ *
+ * Skip the clearance when the sidebar is reopened over a maximized rail: the
+ * sidebar (z above the rail) then covers the window corner, so the lights and
+ * cluster sit over IT, not the strip — the strip starts right of the sidebar
+ * with nothing to clear, and the padding would shove the tabs into the middle. */
+[data-electron-mac]:not([data-sidebar-open])
+  aside[aria-label="Workspace"][data-maximized]
+  .workspace-tab-strip {
   padding-left: 10.5rem;
 }
 /* Drag regions are geometric, not z-ordered: anything that overlaps the

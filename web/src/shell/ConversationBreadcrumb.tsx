@@ -24,6 +24,8 @@ import { cn } from "@/lib/utils";
 export function ConversationBreadcrumb({
   conversationTitle,
   projectName,
+  projectTag,
+  titleSlot,
   titleLinkTo,
   isChildSession,
   boundAgent,
@@ -35,6 +37,19 @@ export function ConversationBreadcrumb({
   conversationTitle: string;
   /** Project the conversation is filed under, or `null` when unfiled. */
   projectName: string | null;
+  /**
+   * Leading folder segment. When set (the desktop title shortcut), it replaces
+   * the static folder icon with an interactive "Move to…" trigger and self-gates
+   * its own visibility. When omitted, a static folder renders iff `projectName`
+   * is set — the fallback for surfaces without the shortcut (e.g. sub-agents).
+   */
+  projectTag?: ReactNode;
+  /**
+   * Interactive title node (the desktop click-to-rename control). Replaces the
+   * plain-text title. Ignored when `titleLinkTo` is set — a sub-agent keeps its
+   * back-to-parent link rather than becoming editable.
+   */
+  titleSlot?: ReactNode;
   /** Parent-session route the title links to, or `undefined` for plain text. */
   titleLinkTo?: string;
   /** Whether the active session is a sub-agent (appends its identity). */
@@ -65,32 +80,33 @@ export function ConversationBreadcrumb({
       aria-label="Conversation"
       className={cn("conversation-breadcrumb flex min-w-0 items-center gap-1.5 text-ui", className)}
     >
-      {projectName && (
-        <div className="hidden md:flex min-w-0 items-center gap-1.5 text-ui shrink-0">
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <span
-                className="breadcrumb-folder flex shrink-0 items-center text-muted-foreground opacity-40 hover:opacity-100"
-                aria-label={`Project: ${projectName}`}
-              >
-                <FolderIcon className="size-4" />
-              </span>
-            </TooltipTrigger>
-            <TooltipContent side="bottom" align="start">
-              <div>
-                <span className="font-semibold text-ui">{conversationTitle}</span>
-                <div className="flex gap-1 text-muted-foreground">
+      {projectTag ??
+        (projectName && (
+          <div className="hidden md:flex min-w-0 items-center gap-1.5 text-ui shrink-0">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span
+                  className="breadcrumb-folder flex shrink-0 items-center text-muted-foreground opacity-40 hover:opacity-100"
+                  aria-label={`Project: ${projectName}`}
+                >
                   <FolderIcon className="size-4" />
-                  {projectName}
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" align="start">
+                <div>
+                  <span className="font-semibold text-ui">{conversationTitle}</span>
+                  <div className="flex gap-1 text-muted-foreground">
+                    <FolderIcon className="size-4" />
+                    {projectName}
+                  </div>
                 </div>
-              </div>
-            </TooltipContent>
-          </Tooltip>
-          <span aria-hidden className="shrink-0 text-muted-foreground opacity-40">
-            /
-          </span>
-        </div>
-      )}
+              </TooltipContent>
+            </Tooltip>
+            <span aria-hidden className="shrink-0 text-muted-foreground opacity-40">
+              /
+            </span>
+          </div>
+        ))}
       {titleLinkTo ? (
         <Link
           to={titleLinkTo}
@@ -112,7 +128,7 @@ export function ConversationBreadcrumb({
           )}
         </Link>
       ) : (
-        <span className="min-w-0 truncate text-foreground">{conversationTitle}</span>
+        (titleSlot ?? <span className="min-w-0 truncate text-foreground">{conversationTitle}</span>)
       )}
       {actions}
       {isChildSession && (

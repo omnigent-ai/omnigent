@@ -10,7 +10,11 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from omnigent.entities.conversation import synthesize_conversation_title
+from omnigent.entities.conversation import (
+    DEFAULT_GENERATED_TITLE_MAX_CHARS,
+    USER_SESSION_TITLE_MAX_CHARS,
+    synthesize_conversation_title,
+)
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_plugins import background_title_generators
 from omnigent.stores.conversation_store import ConversationStore
@@ -48,16 +52,27 @@ BackgroundTitleGenerator = Callable[[BackgroundTitleRequest], Awaitable[str | No
 
 _TITLE_WRAPPERS = "'\"`“”‘’"
 _TRAILING_PUNCTUATION = re.compile(r"[.!?;:,]+$")
+BACKGROUND_TITLE_MAX_CHARS = DEFAULT_GENERATED_TITLE_MAX_CHARS
+CUSTOM_BACKGROUND_TITLE_MAX_CHARS = USER_SESSION_TITLE_MAX_CHARS
 
 
-def normalize_background_title(value: str | None) -> str | None:
+def normalize_background_title(
+    value: str | None,
+    *,
+    max_chars: int = BACKGROUND_TITLE_MAX_CHARS,
+    truncate_overflow: bool = False,
+) -> str | None:
     """Return a compact title or ``None`` when model output is unusable."""
     if not value:
         return None
     first_line = next((line.strip() for line in value.splitlines() if line.strip()), "")
     title = " ".join(first_line.strip(_TITLE_WRAPPERS).split())
     title = _TRAILING_PUNCTUATION.sub("", title).strip()
-    if len(title) < 2 or len(title) > 60:
+    if len(title) > max_chars:
+        if not truncate_overflow:
+            return None
+        title = title[: max_chars - 1].rstrip() + "…"
+    if len(title) < 2:
         return None
     return title
 
@@ -225,19 +240,33 @@ class BackgroundSessionTitleCoordinator:
                         "reason=seed_unavailable elapsed_ms=%.1f",
                         request.session_id,
                         (time.perf_counter() - started) * 1000,
+                        extra={"session_id": request.session_id},
                     )
                     return
                 generated = await asyncio.wait_for(
                     self._generator(request),
                     timeout=self._timeout_seconds,
                 )
-            title = normalize_background_title(generated)
+            has_custom_instructions = bool(
+                request.additional_instructions and request.additional_instructions.strip()
+            )
+            max_chars = (
+                CUSTOM_BACKGROUND_TITLE_MAX_CHARS
+                if has_custom_instructions
+                else BACKGROUND_TITLE_MAX_CHARS
+            )
+            title = normalize_background_title(
+                generated,
+                max_chars=max_chars,
+                truncate_overflow=has_custom_instructions,
+            )
             if title is None:
                 _logger.info(
                     "background session title skipped session=%s "
                     "reason=invalid_title elapsed_ms=%.1f",
                     request.session_id,
                     (time.perf_counter() - started) * 1000,
+                    extra={"session_id": request.session_id},
                 )
                 return
             updated = await asyncio.to_thread(
@@ -251,12 +280,14 @@ class BackgroundSessionTitleCoordinator:
                 request.session_id,
                 updated is not None,
                 (time.perf_counter() - started) * 1000,
+                extra={"session_id": request.session_id},
             )
         except TimeoutError:
             _logger.info(
                 "background session title timed out session=%s elapsed_ms=%.1f",
                 request.session_id,
                 (time.perf_counter() - started) * 1000,
+                extra={"session_id": request.session_id},
             )
         except asyncio.CancelledError:
             raise
@@ -266,6 +297,7 @@ class BackgroundSessionTitleCoordinator:
                 request.session_id,
                 (time.perf_counter() - started) * 1000,
                 exc_info=True,
+                extra={"session_id": request.session_id},
             )
 
     async def _run_task_summary(

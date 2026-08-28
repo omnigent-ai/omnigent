@@ -11,7 +11,15 @@
 // stack into the `font-sans` utility instead of a `var()` reference, so setting
 // `--font-sans` at runtime is a no-op. The `html` rule reads
 // `var(--ui-font-family, var(--font-sans))`, so an unset family falls back to
-// the system stack and any value we set on documentElement wins.
+// the system stack and any value we set on the style root wins.
+//
+// The DOM mutations target `getStyleRoot()`, not `document.documentElement`
+// directly: embedded, the scoped `.omnigent-app` redefines the font tokens
+// locally, so a value set on the real document root is shadowed for the subtree
+// and must be set on the scope root instead. Standalone `getStyleRoot()` IS the
+// document root, so behavior is unchanged.
+
+import { getStyleRoot } from "./host";
 
 const STORAGE_KEY = "omnigent:ui-font-size";
 
@@ -70,11 +78,9 @@ export function writeUiFontSizePx(px: number): void {
  * independent. This is the single source of the DOM side-effect.
  */
 export function applyDesktopUiFontSize(px: number): void {
-  if (typeof document === "undefined") return;
-  document.documentElement.style.setProperty(
-    "--desktop-ui-font-size",
-    `${clampUiFontSizePx(px)}px`,
-  );
+  const root = getStyleRoot();
+  if (!root) return;
+  root.style.setProperty("--desktop-ui-font-size", `${clampUiFontSizePx(px)}px`);
 }
 
 // ---- Font family ---------------------------------------------------------
@@ -156,11 +162,12 @@ export function writeUiFontFamily(name: string): void {
  * DOM side-effect.
  */
 export function applyUiFontFamily(name: string): void {
-  if (typeof document === "undefined") return;
+  const root = getStyleRoot();
+  if (!root) return;
   const normalized = normalizeUiFontFamily(name);
   if (!normalized) {
-    document.documentElement.style.removeProperty("--ui-font-family");
+    root.style.removeProperty("--ui-font-family");
     return;
   }
-  document.documentElement.style.setProperty("--ui-font-family", `${normalized}, var(--font-sans)`);
+  root.style.setProperty("--ui-font-family", `${normalized}, var(--font-sans)`);
 }

@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
+from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
 from omnigent.llms.context_window import ModelPricing
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.background_session_titles import BackgroundTitleRequest
@@ -2186,12 +2187,33 @@ async def test_external_session_title_collapses_whitespace(
     assert snapshot.json()["title"] == "auth refactor"
 
 
-@pytest.mark.parametrize("title", ["", "   ", "one\ntwo"])
+async def test_external_session_title_accepts_user_limit(
+    client: httpx.AsyncClient,
+) -> None:
+    """Terminal-originated manual titles accept the full user title limit."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    title = "x" * USER_SESSION_TITLE_MAX_CHARS
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_title", "data": {"title": title}},
+    )
+
+    assert response.status_code in (200, 202), response.text
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["title"] == title
+
+
+@pytest.mark.parametrize(
+    "title",
+    ["", "   ", "one\ntwo", "x" * (USER_SESSION_TITLE_MAX_CHARS + 1)],
+)
 async def test_external_session_title_rejects_malformed_titles(
     client: httpx.AsyncClient,
     title: str,
 ) -> None:
-    """Blank and multi-line titles are rejected rather than persisted."""
+    """Blank, multi-line, and oversized titles are rejected rather than persisted."""
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"], title="Original title")
 
