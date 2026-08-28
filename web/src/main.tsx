@@ -15,12 +15,7 @@ import { createBootServerInfo, withBootTimeout } from "./lib/bootCapabilities";
 import { isLoginRedirectPending, resolveIdentity } from "./lib/identity";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
-import {
-  applyDesktopUiFontSize,
-  applyUiFontFamily,
-  readUiFontFamily,
-  readUiFontSizePx,
-} from "./lib/uiFontPreferences";
+import { restoreFontPreferences } from "./lib/restoreFontPreferences";
 import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
 import { initChatStore } from "./store/chatStore";
@@ -68,9 +63,10 @@ const bootIdentity = resolveIdentity();
 // No-op off the iOS shell (the inset vars stay at their env()-only defaults).
 initNativeInsets();
 
-// Apply the saved desktop UI font size and family before first paint so there's no flash.
-applyDesktopUiFontSize(readUiFontSizePx());
-applyUiFontFamily(readUiFontFamily());
+// Apply the saved UI + code font preferences before first paint so there's no
+// flash, and kick off the catalog webfont loads so a chosen font is fetched on
+// boot rather than only on the next Settings change.
+restoreFontPreferences();
 
 // The standalone sidebar font size control was removed. Clear its legacy value
 // so sidebar items follow the shared desktop interface size.

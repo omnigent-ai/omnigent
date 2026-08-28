@@ -5,6 +5,7 @@ import {
   readUiFontFamily,
   readUiFontSizePx,
   UI_FONT_FAMILY_DEFAULT,
+  UI_FONT_FAMILY_FALLBACK,
   UI_FONT_SIZE_DEFAULT,
   UI_FONT_SIZE_MAX,
   UI_FONT_SIZE_MIN,
@@ -133,14 +134,14 @@ describe("uiFontPreferences — family", () => {
     // the app's default sans, not the browser's default serif.
     applyUiFontFamily("Inter");
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe(
-      "Inter, var(--font-sans)",
+      `Inter, ${UI_FONT_FAMILY_FALLBACK}`,
     );
   });
 
   it("removes the custom property when applied empty (System default)", () => {
     applyUiFontFamily("Inter");
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe(
-      "Inter, var(--font-sans)",
+      `Inter, ${UI_FONT_FAMILY_FALLBACK}`,
     );
     applyUiFontFamily("");
     // Removing the property lets the html rule fall back to var(--font-sans).
