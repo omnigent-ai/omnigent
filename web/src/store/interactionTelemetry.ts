@@ -80,11 +80,23 @@ function runStatus(state: string): "success" | "failure" | "cancelled" {
   return "cancelled"; // cancelled / incomplete (interrupted)
 }
 
-// "First AI activity" = the first assistant output the user perceives: streamed
-// text, streamed reasoning, or a tool call. NOT the `user_message` echo or an
-// `error` block (those aren't assistant activity and must not complete the span).
+// "First AI activity" = the first assistant output the user perceives, in either
+// its streaming or its committed/hydrated form: the native-harness path (the
+// common new-chat case) commits assistant text as `text_done` — never
+// `text_chunk` — and reasoning as `reasoning_block`, so matching only the
+// streaming chunk types would record a successful text-first session as a
+// failure. NOT the `user_message` echo or an `error` block — those aren't
+// assistant activity and must not complete the span.
+const ACTIVITY_BLOCKS = new Set([
+  "text_chunk",
+  "text_done",
+  "reasoning_chunk",
+  "reasoning_block",
+  "tool_group",
+  "native_tool",
+]);
 function isActivityBlock(type: string): boolean {
-  return type === "text_chunk" || type === "reasoning_chunk" || type === "tool_group";
+  return ACTIVITY_BLOCKS.has(type);
 }
 
 function process(id: string): void {
@@ -124,15 +136,28 @@ function process(id: string): void {
   }
 
   // tool_call — from the committed transcript. Re-scan only when it changed; the
-  // seen/done sets make it emit once per callId across scans.
+  // seen/done sets make it emit once per callId across scans. A call whose result
+  // is ALREADY present the first time we see it was hydrated from history or
+  // reconnect-reconciled (its `tool_group` and `tool_result` arrive together in
+  // one snapshot), never observed executing live — so record it settled WITHOUT
+  // emitting. Otherwise reopening a past conversation would replay a phantom
+  // ~0ms start+complete for every historical tool call.
   if (state.blocks !== t.lastBlocks) {
     t.lastBlocks = state.blocks;
+    const haveResult = new Set<string>();
+    for (const block of state.blocks) {
+      if (block.type === "tool_result") haveResult.add(block.callId);
+    }
     for (const block of state.blocks) {
       if (block.type === "tool_group") {
         for (const ex of block.executions) {
           if (ex.callId && !t.toolSeen.has(ex.callId)) {
             t.toolSeen.add(ex.callId);
-            t.tools.set(ex.callId, startTimedInteraction("tool_call", ex.callId, ex.name));
+            if (haveResult.has(ex.callId)) {
+              t.toolDone.add(ex.callId); // already complete on first sight → hydrated
+            } else {
+              t.tools.set(ex.callId, startTimedInteraction("tool_call", ex.callId, ex.name));
+            }
           }
         }
       } else if (block.type === "tool_result") {

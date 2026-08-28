@@ -29,6 +29,9 @@ function ctx() {
   return { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "resp", itemId: null };
 }
 const textChunk = { type: "text_chunk", ctx: ctx(), text: "hi" };
+// The native-harness path (common new-chat case) commits assistant text as
+// `text_done`, never `text_chunk` — the block the real first-activity check sees.
+const textDone = { type: "text_done", ctx: ctx(), fullText: "hi", hasCodeBlocks: false };
 const errorBlock = { type: "error", ctx: ctx(), message: "boom", source: "llm", code: "x" };
 const userEcho = { type: "user_message", ctx: ctx(), content: [] };
 function toolGroup(callId: string, name = "shell") {
@@ -70,9 +73,9 @@ function phasesFor(interactionId: string) {
 
 describe("interaction telemetry projector", () => {
   describe("create_session", () => {
-    it("completes on the first assistant text (first AI message)", () => {
+    it("completes on the first assistant text — committed as text_done on the native path", () => {
       markSessionCreated("s1", "sandbox");
-      set("s1", { blocks: blocks(userEcho, textChunk) });
+      set("s1", { blocks: blocks(userEcho, textDone) });
 
       const p = phasesFor("s1");
       expect(p[0]).toMatchObject({ interactionKind: "create_session_sandbox", phase: "start" });
@@ -159,6 +162,14 @@ describe("interaction telemetry projector", () => {
         name: "web_search",
       });
       expect(p.at(-1)).toMatchObject({ phase: "complete" });
+    });
+
+    it("does NOT re-emit for a tool call hydrated from history", () => {
+      // Reopening a past conversation lands the group + result together in one
+      // snapshot scan; a call already complete on first sight was never live.
+      set("t2", { blocks: blocks(toolGroup("hist_1", "shell"), toolResult("hist_1", "shell")) });
+
+      expect(phasesFor("hist_1")).toHaveLength(0);
     });
   });
 });
