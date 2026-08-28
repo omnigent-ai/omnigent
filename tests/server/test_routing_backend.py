@@ -422,6 +422,20 @@ async def test_route_with_fallback_never_offers_normalized_sol_to_automatic_clie
     assert client.available == {"codex": ["databricks-gpt-5-5"]}
 
 
+async def test_route_with_fallback_offers_sol_when_the_session_opts_in() -> None:
+    client = _Recording(RoutingResult(model="gpt-5.6-sol", rationale="difficult task"))
+    call = await route_with_fallback(
+        RoutingBackends(local=client),
+        "design a difficult system-wide architecture",
+        {"codex": ["gpt-5.6-sol", "gpt-5.6-terra"]},
+        gateway_backed=False,
+        allow_gpt_5_6_sol=True,
+    )
+    assert call is not None
+    assert client.available == {"codex": ["gpt-5.6-sol", "gpt-5.6-terra"]}
+    assert call.result == client.result
+
+
 async def test_route_with_fallback_falls_back_when_external_returns_sol() -> None:
     external = _Recording(RoutingResult(model="gpt-5.6-sol", rationale="bad"))
     local = _Recording(RoutingResult(model="databricks-gpt-5-5", rationale="safe"))

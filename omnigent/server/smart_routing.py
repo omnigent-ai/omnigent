@@ -15,15 +15,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
 
-from omnigent.errors import OmnigentError
 from omnigent.model_fallbacks import (
     CODEX_DEFAULT_MODEL,
+    DATABRICKS_ROUTING_DEFAULT_MODELS,
     SMART_ROUTING_CLAUDE_LADDER,
     SMART_ROUTING_CURRENT_GENERATION_GPT,
     SMART_ROUTING_FAMILY_FALLBACKS,
@@ -377,6 +378,22 @@ class CodexSubscriptionRoutingClient:
                 return model, tier
         return None
 
+    @classmethod
+    def _databricks_model_for_profile(cls, candidates: list[str], profile: str) -> str | None:
+        """Pick a configured Databricks endpoint using task-appropriate name cues."""
+        preferred_tokens = {
+            "trivial work": ("kimi", "nano", "mini", "haiku", "flash", "luna"),
+            "quick work": ("kimi", "nano", "mini", "haiku", "flash", "luna"),
+            "routine edit": ("kimi", "mini", "haiku", "flash", "luna", "terra"),
+            "routine work": ("mini", "haiku", "flash", "luna", "terra", "kimi"),
+            "debugging": ("terra", "sonnet", "glm", "gpt", "kimi"),
+            "investigation": ("sol", "opus", "large", "terra", "sonnet", "glm"),
+        }
+        for token in preferred_tokens.get(profile, ()):
+            if model := next((item for item in candidates if token in item.lower()), None):
+                return model
+        return candidates[0] if candidates else None
+
     async def route(
         self,
         message: str,
@@ -385,11 +402,32 @@ class CodexSubscriptionRoutingClient:
         self.last_error = None
         all_candidates = _flatten_models(available_models)
         candidates = [model for model in all_candidates if _model_family(model) == "gpt"]
+        profile, preferred_tier, requested_effort = self._task_profile(message)
+        databricks_candidates = [
+            model for model in all_candidates if _is_databricks_routing_model(model)
+        ]
+        if databricks_candidates and len(databricks_candidates) == len(all_candidates):
+            model = self._databricks_model_for_profile(databricks_candidates, profile)
+            if model is None:
+                self.last_error = "no configured Databricks routing candidates were available"
+                return None
+            harness = next(
+                (name for name, models in available_models.items() if model in models), None
+            )
+            return RoutingResult(
+                model=model,
+                rationale=f"Selected configured Databricks endpoint for {profile}.",
+                harness=harness,
+                reasoning_effort=(
+                    self._effort_for_model(requested_effort, model)
+                    if _model_family(model) == "gpt"
+                    else None
+                ),
+            )
         if not candidates:
             self.last_error = "no Codex subscription candidates were available"
             return None
 
-        profile, preferred_tier, requested_effort = self._task_profile(message)
         kimi = next((model for model in all_candidates if _is_databricks_kimi_model(model)), None)
         if kimi is not None and profile in self._KIMI_TASK_PROFILES:
             harness = next(
@@ -426,32 +464,80 @@ def _is_databricks_kimi_model(model: str) -> bool:
     return "kimi" in normalized and normalized.startswith(("databricks-", "system.ai." + "kimi"))
 
 
-def configured_databricks_kimi_models(models: Sequence[str]) -> tuple[list[str], str | None]:
-    """Return explicitly configured Databricks Kimi candidates, never probing auth.
+def _is_databricks_routing_model(model: str) -> bool:
+    """Whether *model* is a Databricks gateway or model-service endpoint."""
+    return model.lower().startswith(("databricks-", "system.ai."))
 
-    Provider config is read only.  In particular this must not call the
-    Databricks CLI, select a profile, resolve a token, or synthesize an
-    endpoint.  A listed Kimi endpoint plus a declared Databricks provider is
-    the minimum explicit configuration contract.
+
+_DATABRICKS_ROUTING_PROFILE_ENV = "OMNIGENT_DATABRICKS_ROUTING_PROFILE"
+_DATABRICKS_ROUTING_MODELS_ENV = "OMNIGENT_DATABRICKS_ROUTING_MODELS"
+_DEFAULT_DATABRICKS_ROUTING_PROFILE = "produ2m"
+_DEFAULT_DATABRICKS_ROUTING_MODELS = DATABRICKS_ROUTING_DEFAULT_MODELS
+
+
+def _configured_databricks_routing_model_ids() -> tuple[str, tuple[str, ...]]:
+    """Read profile and allowlist, with safe local defaults for each setting."""
+    profile = (
+        os.environ.get(
+            _DATABRICKS_ROUTING_PROFILE_ENV, _DEFAULT_DATABRICKS_ROUTING_PROFILE
+        ).strip()
+        or _DEFAULT_DATABRICKS_ROUTING_PROFILE
+    )
+    raw_models = os.environ.get(
+        _DATABRICKS_ROUTING_MODELS_ENV, ",".join(_DEFAULT_DATABRICKS_ROUTING_MODELS)
+    )
+    models = tuple(dict.fromkeys(item.strip() for item in raw_models.split(",") if item.strip()))
+    if not models:
+        models = _DEFAULT_DATABRICKS_ROUTING_MODELS
+    return profile, models
+
+
+def databricks_routing_profile() -> str:
+    """Return the explicit profile used for Smart Routing Databricks arms."""
+    return _configured_databricks_routing_model_ids()[0]
+
+
+def is_configured_databricks_routing_model(model: str) -> bool:
+    """Whether *model* is in the local Smart Routing Databricks allowlist."""
+    return model in _configured_databricks_routing_model_ids()[1]
+
+
+async def configured_databricks_routing_models(
+    models: Sequence[str] | None = None,
+) -> tuple[list[str], str | None]:
+    """Return allowlisted, live Databricks endpoints available to this task.
+
+    The profile and allowlist are explicit environment settings. The live
+    workspace listing verifies that the profile can authenticate and that each
+    selected endpoint still exists. When *models* is supplied it is intersected
+    as an additional caller restriction. Omitting it deliberately exposes the
+    configured Databricks source independently of a Codex subscription's
+    local model catalog; the runner dispatches a selected endpoint through the
+    configured Databricks profile.
     """
-    listed = [model for model in models if _is_databricks_kimi_model(model)]
-    if not listed:
-        return [], "Databricks Kimi is unavailable: no configured Kimi endpoint was listed."
+    profile, configured = _configured_databricks_routing_model_ids()
     try:
-        from omnigent.onboarding.provider_config import (
-            DATABRICKS_KIND,
-            load_config,
-            load_providers,
-        )
+        from omnigent.model_catalog import list_databricks_profile_models
 
-        providers = load_providers(load_config())
-    except (OmnigentError, OSError, ValueError):
-        return [], "Databricks Kimi is unavailable: configured provider could not be read."
-    if not any(provider.kind == DATABRICKS_KIND for provider in providers.values()):
+        listing = await asyncio.to_thread(list_databricks_profile_models, profile)
+    except (OSError, ValueError, ImportError):
+        return [], f"Databricks routing is unavailable: profile {profile!r} could not be resolved."
+    except Exception:  # noqa: BLE001 — endpoint discovery must not block a task
+        _logger.warning("smart_routing: Databricks endpoint discovery failed", exc_info=True)
         return [], (
-            "Databricks Kimi is unavailable: no Databricks provider is explicitly configured."
+            f"Databricks routing is unavailable: profile {profile!r} endpoint discovery failed."
         )
-    return listed, None
+    live = {entry.id for entry in listing.models}
+    catalog = set(models) if models is not None else None
+    allowed = [
+        model for model in configured if model in live and (catalog is None or model in catalog)
+    ]
+    if not allowed:
+        return [], (
+            "Databricks routing is unavailable: none of the allowlisted endpoints "
+            "are available to this task."
+        )
+    return allowed, None
 
 
 def codex_subscription_display_label(
@@ -1349,14 +1435,16 @@ def automatic_routing_model_allowed(
     model: str,
     *,
     prefixes: Sequence[str] | None = None,
+    allow_gpt_5_6_sol: bool = False,
 ) -> bool:
     """Whether automatic routing may offer or apply *model*.
 
-    Sol remains a valid explicit model choice.  Smart Routing is the one
-    policy-controlled path that excludes it, across catalog spellings,
-    router vocabulary, and long-context aliases.
+    Sol remains a valid explicit model choice. Smart Routing excludes it by
+    default, but a session may explicitly opt in to offer it to the router.
     """
-    return _bare_id(model, prefixes) != _bare_id(SMART_ROUTING_TASK_V1_CODEX_ARMS[1])
+    return allow_gpt_5_6_sol or _bare_id(model, prefixes) != _bare_id(
+        SMART_ROUTING_TASK_V1_CODEX_ARMS[1]
+    )
 
 
 def _model_family(model: str) -> str:
@@ -2234,6 +2322,8 @@ async def route_session_harness(
     catalog: Mapping[str, Sequence[str]] | None = None,
     gateway_backed: bool = True,
     allow_static_fallback: bool = True,
+    allow_databricks_kimi: bool = False,
+    allow_gpt_5_6_sol: bool = False,
 ) -> tuple[str | None, str | None, dict[str, Any] | None, str | None]:
     """Pick the best harness + model for a new session via the routing client.
 
@@ -2364,9 +2454,43 @@ async def route_session_harness(
     if not harness_models:
         return None, None, None, "No routable harnesses are available on this runner."
 
+    # Databricks is an explicit, profile-backed routing source alongside the
+    # Codex subscription. Its allowlist does not have to appear in Codex's
+    # local catalog: a selected endpoint is launched through its profile.
+    if isinstance(backends.local, CodexSubscriptionRoutingClient):
+        configured_databricks, _databricks_status = (
+            await configured_databricks_routing_models() if allow_databricks_kimi else ([], None)
+        )
+        allowed_databricks = set(configured_databricks)
+        harness_models = {
+            name: [
+                model
+                for model in models
+                if not _is_databricks_routing_model(model)
+                or (allow_databricks_kimi and model in allowed_databricks)
+            ]
+            for name, models in harness_models.items()
+        }
+        if configured_databricks:
+            # Codex's local catalog advertises subscription models only. Add
+            # the independently validated Databricks arm to the Codex SDK
+            # harness; the runner switches its transport to the profile when
+            # this arm wins the routing decision.
+            target = next((name for name in candidate_harnesses if name == "codex"), None)
+            if target is not None:
+                existing = harness_models.setdefault(target, [])
+                existing.extend(model for model in configured_databricks if model not in existing)
+        harness_models = {name: models for name, models in harness_models.items() if models}
+        if not harness_models:
+            return None, None, None, "No routable harnesses are available on this runner."
+
     try:
         call = await route_with_fallback(
-            backends, user_message, harness_models, gateway_backed=gateway_backed
+            backends,
+            user_message,
+            harness_models,
+            gateway_backed=gateway_backed,
+            allow_gpt_5_6_sol=allow_gpt_5_6_sol,
         )
     except Exception as exc:  # routing failures must not block session creation
         _logger.exception("smart_routing: route_session_harness failed")
@@ -2484,6 +2608,7 @@ async def route_turn(
     gateway_backed: bool = True,
     allow_static_fallback: bool = True,
     allow_databricks_kimi: bool = False,
+    allow_gpt_5_6_sol: bool = False,
 ) -> tuple[str | None, dict[str, Any] | None]:
     """Pick the best model for a turn via the deployment's routing backends.
 
@@ -2574,19 +2699,24 @@ async def route_turn(
         available = {harness or "": models}
 
     prefixes = routing_settings().model_prefixes
-    kimi_status: str | None = None
+    databricks_status: str | None = None
     if isinstance(backends.local, CodexSubscriptionRoutingClient):
-        flattened = _flatten_models(available)
-        configured_kimi, kimi_status = configured_databricks_kimi_models(flattened)
-        allowed_kimi = set(configured_kimi) if allow_databricks_kimi else set()
+        configured_databricks, databricks_status = (
+            await configured_databricks_routing_models() if allow_databricks_kimi else ([], None)
+        )
+        allowed_databricks = set(configured_databricks)
         available = {
             name: [
                 model
                 for model in models
-                if not _is_databricks_kimi_model(model) or model in allowed_kimi
+                if not _is_databricks_routing_model(model)
+                or (allow_databricks_kimi and model in allowed_databricks)
             ]
             for name, models in available.items()
         }
+        if configured_databricks and harness == "codex":
+            existing = available.setdefault(harness, [])
+            existing.extend(model for model in configured_databricks if model not in existing)
     # A turn cannot change the harness, so a model its gateway bars is not a
     # candidate at all. The seam still injects whatever arms the router's menu
     # requires, so dropping these rows never makes that menu partial.
@@ -2612,7 +2742,11 @@ async def route_turn(
     _prep_s = time.monotonic() - _prep_started
     _route_started = time.monotonic()
     call = await route_with_fallback(
-        backends, user_message, available, gateway_backed=gateway_backed
+        backends,
+        user_message,
+        available,
+        gateway_backed=gateway_backed,
+        allow_gpt_5_6_sol=allow_gpt_5_6_sol,
     )
     _logger.info(
         "smart_routing: session=%s prep=%.3fs router=%.3fs catalog_fetch=%s candidates=%d",
@@ -2660,8 +2794,8 @@ async def route_turn(
     }
     if result.reasoning_effort is not None:
         verdict["reasoning_effort"] = result.reasoning_effort
-    if allow_databricks_kimi and kimi_status is not None:
-        verdict["rationale"] = f"{result.rationale} {kimi_status} Fell back to Codex."
+    if allow_databricks_kimi and databricks_status is not None:
+        verdict["rationale"] = f"{result.rationale} {databricks_status} Fell back to Codex."
     if raw_model and _bare_id(raw_model, prefixes) != _bare_id(model, prefixes):
         verdict["raw_model"] = raw_model
     return model, verdict

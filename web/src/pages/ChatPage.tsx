@@ -5986,7 +5986,7 @@ function formatEffortLabel(effort: string): string {
 /** Gear-modal row governing the routing of sub-agents the session spawns. */
 const SUBAGENT_ROUTING_LABEL = "Subagent routing";
 const SUBAGENT_ROUTING_DESCRIPTION = "Model routing for subagents this session spawns";
-const DATABRICKS_KIMI_ROUTING_LABEL = "Use configured Databricks Kimi";
+const DATABRICKS_KIMI_ROUTING_LABEL = "Use configured Databricks models";
 
 /**
  * In-session run-config modal opened from the composer's gear icon. The
@@ -6373,7 +6373,7 @@ function SessionConfigModal({
           {costRoutingEligible && (
             <ConfigRow
               label={DATABRICKS_KIMI_ROUTING_LABEL}
-              description="Allow automatic routing to an already configured Kimi endpoint"
+              description="Route only within the configured Databricks endpoint allowlist"
             >
               <Select
                 value={draftDatabricksKimiRoutingEnabled ? "on" : "off"}

@@ -320,6 +320,44 @@ def clear_model_catalog_cache() -> None:
         _listing_cache.clear()
 
 
+def list_databricks_profile_models(profile: str) -> ModelListing:
+    """List live LLM endpoints and model services for one Databricks profile.
+
+    The profile supplies the workspace host and renewable authentication. This
+    is intentionally profile-explicit: callers must not fall back to the
+    ambient/default Databricks CLI profile when routing a task.
+    """
+    normalized = profile.strip()
+    if not normalized:
+        raise ValueError("a Databricks profile is required")
+    provider = ResolvedModelProvider(
+        kind=DATABRICKS_KIND,
+        profile=normalized,
+        detail="Databricks routing environment",
+    )
+    endpoints = _listing_for_provider(provider, transport=None)
+    uc_key = ("uc", *_listing_cache_key(provider))
+    with _listing_cache_lock:
+        model_services = cast(ModelListing | None, _listing_cache.get(uc_key))
+    if model_services is None:
+        try:
+            model_services = _fetch_databricks_uc_listing(provider, transport=None)
+            with _listing_cache_lock:
+                _listing_cache[uc_key] = model_services
+        except (httpx.HTTPError, OSError):
+            # Serving endpoints remain useful when the model-services API is
+            # unavailable to this profile.
+            _logger.debug("Databricks model-service listing failed", exc_info=True)
+    if model_services is None:
+        return endpoints
+    models = tuple(dict.fromkeys((*endpoints.models, *model_services.models)))
+    return replace(
+        endpoints,
+        models=models,
+        note=f"{endpoints.note}; {model_services.note}",
+    )
+
+
 def model_family_token(model_id: str) -> str:
     """Tag a model id with the harness family that can serve it.
 

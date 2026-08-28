@@ -1101,6 +1101,7 @@ def _build_session_response(
         model_override=conv.model_override,
         cost_control_mode_override=conv.cost_control_mode_override,
         subagent_routing_override=conv.subagent_routing_override,
+        gpt_5_6_sol_routing_enabled=labels.get("omnigent.routing.gpt_5_6_sol") == "on",
         databricks_kimi_routing_enabled=labels.get("omnigent.routing.databricks_kimi") == "on",
         context_window=context_window,
         last_total_tokens=last_total_tokens,
@@ -4976,6 +4977,10 @@ async def _forward_event_to_runner(
                 runner_client=runner_client,
                 gateway_backed=_auto_backed,
                 allow_static_fallback=_auto_backed,
+                allow_databricks_kimi=(
+                    conv.labels.get("omnigent.routing.databricks_kimi") == "on"
+                ),
+                allow_gpt_5_6_sol=(conv.labels.get("omnigent.routing.gpt_5_6_sol") == "on"),
             )
             try:
                 # Always clear the "auto" sentinel even when routing
@@ -5135,6 +5140,10 @@ async def _forward_event_to_runner(
                     harness_candidates=_child_candidates,
                     gateway_backed=_child_backed,
                     allow_static_fallback=_child_backed,
+                    allow_databricks_kimi=(
+                        conv.labels.get("omnigent.routing.databricks_kimi") == "on"
+                    ),
+                    allow_gpt_5_6_sol=(conv.labels.get("omnigent.routing.gpt_5_6_sol") == "on"),
                 )
                 if _routed_model is not None:
                     effective_runner_override = _routed_model
@@ -5202,6 +5211,7 @@ async def _forward_event_to_runner(
                     allow_databricks_kimi=(
                         conv.labels.get("omnigent.routing.databricks_kimi") == "on"
                     ),
+                    allow_gpt_5_6_sol=(conv.labels.get("omnigent.routing.gpt_5_6_sol") == "on"),
                 )
                 if _turn_route_err is not None:
                     # Not routed, and visibly so — the turn runs on the
@@ -5719,6 +5729,7 @@ async def _dispatch_session_event_to_runner_impl(
                     allow_databricks_kimi=(
                         conv.labels.get("omnigent.routing.databricks_kimi") == "on"
                     ),
+                    allow_gpt_5_6_sol=(conv.labels.get("omnigent.routing.gpt_5_6_sol") == "on"),
                 )
                 if _native_route_err is not None:
                     _native_routed_model, _native_verdict = _unavailable_routing_card(
@@ -7813,6 +7824,8 @@ async def _resolve_fixed_native_model_routing(
         catalog=await _pre_session_model_catalog(request, host, (harness,)),
         gateway_backed=backed,
         allow_static_fallback=backed,
+        allow_databricks_kimi=body.databricks_kimi_routing_enabled,
+        allow_gpt_5_6_sol=body.gpt_5_6_sol_routing_enabled,
     )
     if model is None or verdict is None:
         return None, None, error or "Routing unavailable; using the harness default model."
@@ -7900,6 +7913,8 @@ async def _resolve_native_smart_routing(
         catalog=await _pre_session_model_catalog(request, host, candidates),
         gateway_backed=backed,
         allow_static_fallback=backed,
+        allow_databricks_kimi=body.databricks_kimi_routing_enabled,
+        allow_gpt_5_6_sol=body.gpt_5_6_sol_routing_enabled,
     )
     if judge_only:
         kept = native_coding_agent_for_harness(candidates[0])
@@ -8488,6 +8503,17 @@ async def _create_session_from_existing_agent(
         conv.labels.update(_merged)
     elif body.labels:
         await asyncio.to_thread(conversation_store.set_labels, conv.id, body.labels)
+    # Candidate opt-ins are session-owned preferences, not user-provided
+    # labels. Persist them after the wrapper labels so the first routed turn
+    # sees the same policy the create-time router used.
+    _routing_preferences = {
+        "omnigent.routing.gpt_5_6_sol": "on" if body.gpt_5_6_sol_routing_enabled else "off",
+        "omnigent.routing.databricks_kimi": "on"
+        if body.databricks_kimi_routing_enabled
+        else "off",
+    }
+    await asyncio.to_thread(conversation_store.set_labels, conv.id, _routing_preferences)
+    conv.labels.update(_routing_preferences)
 
     if harness_override == "auto" or _native_smart_routing:
         # Routing replaces the "auto" sentinel (at the first message for a

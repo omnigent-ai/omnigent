@@ -363,7 +363,7 @@ export interface Session {
    * `"on"` at create, so `null` means Default rather than "inherit".
    */
   subagentRoutingOverride?: "on" | "off" | null;
-  /** Opt-in: permit an explicitly configured Databricks Kimi endpoint in Smart Routing. */
+  /** Opt-in: restrict Smart Routing to the configured Databricks endpoint allowlist. */
   databricksKimiRoutingEnabled?: boolean;
   /** Model context window size in tokens as looked up server-side. */
   contextWindow?: number | null;

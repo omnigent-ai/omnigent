@@ -140,6 +140,7 @@ async def route_with_fallback(
     available_models: dict[str, list[str]],
     *,
     gateway_backed: bool,
+    allow_gpt_5_6_sol: bool = False,
 ) -> RoutedCall | None:
     """Call the deployment's router, falling back to the judge when it fails.
 
@@ -166,7 +167,11 @@ async def route_with_fallback(
     from omnigent.server.smart_routing import automatic_routing_model_allowed
 
     candidates = {
-        harness: [model for model in models if automatic_routing_model_allowed(model)]
+        harness: [
+            model
+            for model in models
+            if automatic_routing_model_allowed(model, allow_gpt_5_6_sol=allow_gpt_5_6_sol)
+        ]
         for harness, models in available_models.items()
     }
     candidates = {harness: models for harness, models in candidates.items() if models}
@@ -176,7 +181,9 @@ async def route_with_fallback(
 
     def allowed(result: RoutingResult | None) -> RoutingResult | None:
         model = getattr(result, "model", None)
-        if isinstance(model, str) and not automatic_routing_model_allowed(model):
+        if isinstance(model, str) and not automatic_routing_model_allowed(
+            model, allow_gpt_5_6_sol=allow_gpt_5_6_sol
+        ):
             _logger.warning("routing: declining excluded automatic-routing model %r", model)
             return None
         return result
