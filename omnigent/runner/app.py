@@ -6224,11 +6224,21 @@ def create_runner_app(
             # re-wake no longer describes outstanding work; forget it or a
             # later episode's matching notice is wrongly deduped.
             _last_rewake_notice.pop(parent_session_id, None)
-        if parent_session_id not in _subagent_wake_pending:
+            # The wake-pending flag may still be set (cleared at turn start),
+            # so discard it to keep state consistent with a drained inbox.
+            _subagent_wake_pending.discard(parent_session_id)
             return
+        # Inbox is non-empty.  Whether or not _subagent_wake_pending is set,
+        # we need to ensure a wake fires.  Clear the pending flag first so
+        # _schedule_subagent_wake (which guards on the flag to prevent
+        # double-wakes) will actually schedule one.
+        #
+        # This covers the gap where _run_turn_bg discards the flag at turn
+        # start, the wake turn ends with an empty response.completed, and
+        # the flag is gone by the time we arrive here — the inbox is still
+        # full but the old guard (`if parent not in _subagent_wake_pending:
+        # return`) prevented any recovery wake from firing.
         _subagent_wake_pending.discard(parent_session_id)
-        if drained:
-            return
         entries = list_subagent_work(parent_session_id)
         if not entries:
             return
