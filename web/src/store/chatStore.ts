@@ -113,14 +113,11 @@ import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import { codexPlanModeFromSession } from "@/lib/codexPlanMode";
 import { getCurrentAuthorId } from "@/lib/identity";
-import { getOmnigentHostConfig, type OmnigentInteractionStatus } from "@/lib/host";
+import { getOmnigentHostConfig } from "@/lib/host";
 // Routing-free emit primitive (not "@/lib/analytics", which pulls in useLocation
 // and would form a routing↔store import cycle).
-import {
-  emitInteractionPhase,
-  startTimedInteraction,
-  type TimedInteraction,
-} from "@/lib/analyticsEmit";
+import { emitInteractionPhase, startTimedInteraction } from "@/lib/analyticsEmit";
+import { markSessionCreated } from "./interactionTelemetry";
 import { getSessionHost } from "@/lib/sessionHost";
 import { isSystemUserContent } from "@/lib/systemMessage";
 import { isNativeWrapper } from "@/lib/nativeCodingAgents";
@@ -2772,11 +2769,11 @@ async function ensureBoundSession(
     // missed). Bind the stream FIRST, then post the first message.
     const session = await createSession(agentId, []);
     sessionId = session.id;
-    // Open the create_session CUJ span (see `beginCreateSessionTiming`); the pump
-    // completes it on the session's first AI message. This path sends no host
-    // params, so the server always makes an external ("computer") session —
-    // managed sandboxes are created by the New Chat dialog, which times itself.
-    beginCreateSessionTiming(sessionId, "computer");
+    // Register the create_session span (see interactionTelemetry). This path
+    // sends no host params, so the server always makes an external ("computer")
+    // session — managed sandboxes are created by the New Chat dialog, which
+    // registers itself.
+    markSessionCreated(sessionId, "computer");
     // Claim the send chain for this id NOW, while it is still private to this
     // call. Everything below publishes it (the store write, the navigate
     // callback, the sidebar invalidation) and awaits network work, so a send
@@ -4194,16 +4191,6 @@ export async function startStreamPump(
     if (get().abortController === controller) {
       set({ abortController: null });
     }
-    // The session's streaming is over (aborted / switched away / gave up).
-    // Reconnects stay inside the loop above, so reaching here is a true terminal.
-    // If a create_session span is still open, its first AI message never arrived —
-    // settle it as a failure so it neither leaks nor is completed later as a stale,
-    // inflated success.
-    const pendingCreate = createSessionPending.get(id);
-    if (pendingCreate) {
-      createSessionPending.delete(id);
-      pendingCreate.fail();
-    }
   }
   /* eslint-enable no-await-in-loop */
 }
@@ -4561,58 +4548,11 @@ function revivePendingElicitationBlock(set: Setter, elicitationId: string): void
   });
 }
 
-// Product-analytics interaction tracking (agent runs, tool calls). START stamps
-// a timestamp keyed by the run/tool id; COMPLETE reads-and-deletes it, so each
-// interaction emits start/complete exactly once (guarding SSE re-delivery on
-// reconnect) and carries a duration. Only the LIVE pump below writes these —
-// history hydration goes through `reduceSync`, which never runs this loop, so
-// reopening an old conversation never re-emits.
-const runStartTimes = new Map<string, number>();
-const toolStartTimes = new Map<string, number>();
-// create_session CUJ: an open interaction per brand-new session, keyed by session
-// id. Opened at create time (see `beginCreateSessionTiming`), completed on that
-// session's FIRST painted assistant content in the pump below ("first AI message"),
-// and settled as a failure on pump exit if that content never arrives. The span is
-// "session created → first AI message", the part that varies by host (bind / sandbox
-// launch / time-to-first-token); the create POST itself is excluded (small and
-// measurable from backend traces).
-const createSessionPending = new Map<string, TimedInteraction>();
-
-/**
- * Open the create_session span for a brand-new session, keyed by `sessionId`.
- * Called from both create paths: the send/landing-composer path (always a
- * `"computer"` external session) and the New Chat dialog (`"sandbox"` when the
- * user picked a managed sandbox, else `"computer"`). Host kind is baked into the
- * interaction kind so the host can segment sandbox vs computer without a queryable
- * sub-dimension. The pump settles it (complete on first content, fail on exit).
- */
-export function beginCreateSessionTiming(
-  sessionId: string,
-  hostKind: "sandbox" | "computer",
-): void {
-  createSessionPending.set(
-    sessionId,
-    startTimedInteraction(
-      hostKind === "sandbox" ? "create_session_sandbox" : "create_session_computer",
-      sessionId,
-    ),
-  );
-}
-
-function mapRunStatus(state: string): OmnigentInteractionStatus {
-  switch (state) {
-    case "completed":
-      return "success";
-    case "failed":
-      return "failure";
-    // "incomplete"/"cancelled" are both a stopped turn from the user's view.
-    case "incomplete":
-    case "cancelled":
-      return "cancelled";
-    default:
-      return "failure";
-  }
-}
+// agent_run / tool_call / create_session telemetry is DERIVED from committed
+// conversation state by the projector in `interactionTelemetry.ts` (subscribed to
+// `conversationRegistry`), not emitted from this pump. Create sites call
+// `markSessionCreated`; the projector owns the rest. `approval` above stays a
+// direct emit — it has no stream lifecycle to derive.
 
 export async function pumpStreamEvents(
   id: string,
@@ -4694,37 +4634,16 @@ export async function pumpStreamEvents(
       if (controller.signal.aborted) return "aborted";
       if (isConversationDisposed(id)) return "switched";
 
-      // First genuine assistant output for a brand-new session ends the
-      // create_session CUJ ("first AI message"). Gate on assistant text/reasoning
-      // specifically — NOT "first painted block", which also covers the pre-
-      // `response_end` `error` block (would log a failed create as success) and a
-      // slash/skill `user_message` echo (would complete on the user's own command).
-      // `id` is this pump's session id; the delete makes it fire once, so later
-      // responses and duplicate chunks on reconnect find nothing.
-      if (block.type === "text_chunk" || block.type === "reasoning_chunk") {
-        const pendingCreate = createSessionPending.get(id);
-        if (pendingCreate) {
-          createSessionPending.delete(id);
-          pendingCreate.complete();
-        }
-      }
-
       if (block.type === "response_start") {
         // New response: force-flush whatever is buffered, then land the
         // marker + lifecycle in one commit. Reset the first-paint latch.
+        // (agent_run / create_session telemetry is derived from this
+        // activeResponse transition by interactionTelemetry.ts, not emitted here.)
         paintedFirstContent = false;
         flush(block, {
           activeResponse: { responseId: block.responseId, state: "streaming", error: null },
           status: "streaming",
         });
-        if (block.responseId && !runStartTimes.has(block.responseId)) {
-          runStartTimes.set(block.responseId, Date.now());
-          emitInteractionPhase({
-            interactionId: block.responseId,
-            interactionKind: "agent_run",
-            phase: "start",
-          });
-        }
         continue;
       }
 
@@ -4866,27 +4785,8 @@ export async function pumpStreamEvents(
           const errorMsg = block.response?.error?.message ?? null;
           finalizeActive(set, block.status as ActiveResponse["state"], errorMsg);
         }
-        const runStart = runStartTimes.get(endedId);
-        if (endedId && runStart !== undefined) {
-          runStartTimes.delete(endedId);
-          emitInteractionPhase({
-            interactionId: endedId,
-            interactionKind: "agent_run",
-            phase: "complete",
-            status:
-              active?.state === "cancelled" ? "cancelled" : mapRunStatus(String(block.status)),
-            durationMs: Date.now() - runStart,
-          });
-        }
-        // A create_session span still open at a response terminal means this
-        // response ended without ever painting content — no "first AI message" —
-        // so settle it as a failure (and clear it so a later turn can't complete a
-        // stale span). The success path already deleted it at first content.
-        const pendingCreate = createSessionPending.get(id);
-        if (pendingCreate) {
-          createSessionPending.delete(id);
-          pendingCreate.fail();
-        }
+        // agent_run complete + create_session settle are derived from the
+        // finalized activeResponse by interactionTelemetry.ts, not emitted here.
         // Turn over: drop any provisional preview never finalized by a
         // committed item (e.g. an interrupt where the partial item lands
         // after this event, or a stream drop). Normal messages already
@@ -4911,35 +4811,8 @@ export async function pumpStreamEvents(
         continue;
       }
 
-      // Tool-call analytics (live only). No reliable success/failure signal on
-      // the result block — tool errors surface as separate error events — so we
-      // report invocation + duration + tool name, not an outcome status.
-      if (block.type === "tool_group") {
-        for (const ex of block.executions) {
-          if (ex.callId && !toolStartTimes.has(ex.callId)) {
-            toolStartTimes.set(ex.callId, Date.now());
-            emitInteractionPhase({
-              interactionId: ex.callId,
-              interactionKind: "tool_call",
-              phase: "start",
-              name: ex.name,
-            });
-          }
-        }
-      } else if (block.type === "tool_result") {
-        const toolStart = toolStartTimes.get(block.callId);
-        if (block.callId && toolStart !== undefined) {
-          toolStartTimes.delete(block.callId);
-          emitInteractionPhase({
-            interactionId: block.callId,
-            interactionKind: "tool_call",
-            phase: "complete",
-            name: block.name,
-            durationMs: Date.now() - toolStart,
-          });
-        }
-      }
-
+      // tool_call telemetry is derived from tool_group / tool_result blocks in
+      // the committed transcript by interactionTelemetry.ts, not emitted here.
       buffer.push(block);
       if (!paintedFirstContent) {
         // First content of the response — paint it immediately so the

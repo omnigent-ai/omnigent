@@ -70,6 +70,7 @@ import {
   releaseConversation,
 } from "./chatStore";
 import { conversationRegistry } from "./conversationRegistry";
+import { resetInteractionTelemetryForTests } from "./interactionTelemetry";
 import {
   resetStreamSlotManager,
   setStreamSlotManagerForTest,
@@ -11567,6 +11568,9 @@ describe("chatStore — interaction_phase analytics", () => {
   let events: OmnigentAnalyticsEvent[];
 
   beforeEach(() => {
+    // The projector is a module singleton; clear its in-flight tracking so an
+    // un-terminated run from a prior case can't be swept (as "cancelled") here.
+    resetInteractionTelemetryForTests();
     events = [];
     setOmnigentHostConfig({ analytics: (e) => events.push(e) });
   });

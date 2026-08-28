@@ -92,14 +92,19 @@ export interface TimedInteraction {
  *
  *   const interaction = startTimedInteraction("get_session", sessionId);
  *   try { await load(); interaction.complete(); } catch (e) { interaction.fail(); throw e; }
+ *
+ * `name` is an optional bounded, non-PII label (e.g. a tool name) carried on both
+ * phases; never user content.
  */
 export function startTimedInteraction(
   interactionKind: OmnigentInteractionKind,
   interactionId: string = newInteractionId(),
+  name?: string,
 ): TimedInteraction {
   const startedAt = Date.now();
   let settled = false;
-  emitInteractionPhase({ interactionId, interactionKind, phase: "start" });
+  const label = name ? { name } : {};
+  emitInteractionPhase({ interactionId, interactionKind, phase: "start", ...label });
   const complete = (status: OmnigentInteractionStatus = "success"): void => {
     if (settled) return;
     settled = true;
@@ -108,6 +113,7 @@ export function startTimedInteraction(
       interactionKind,
       phase: "complete",
       status,
+      ...label,
       durationMs: Date.now() - startedAt,
     });
   };
