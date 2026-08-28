@@ -18,7 +18,11 @@
 // plus a single `apply*` function that owns the DOM side-effect, called at boot
 // (main.tsx) before first paint and on every change (Appearance settings).
 
-import { getThemeRoots } from "./host";
+// `.ts` extension (not extensionless like the app's other imports): this module
+// is also loaded directly by the `generate-theme-palettes.mjs` node script,
+// whose ESM resolver can't do extensionless resolution. tsconfig has
+// `allowImportingTsExtensions`, and Vite resolves it the same either way.
+import { getThemeRoots } from "./host.ts";
 
 const STORAGE_KEY = "omnigent:ui-theme-palette";
 
