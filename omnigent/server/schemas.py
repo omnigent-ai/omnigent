@@ -2221,6 +2221,7 @@ class BackgroundSessionTitleRequest(BaseModel):
     """Private runner request for isolated background title inference."""
 
     prompt: str = Field(min_length=1, max_length=20_000)
+    additional_instructions: str | None = Field(default=None, max_length=4_000)
     agent_id: str | None = None
     model_override: str | None = None
     harness_override: str | None = None

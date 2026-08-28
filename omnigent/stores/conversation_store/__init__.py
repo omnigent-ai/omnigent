@@ -1,6 +1,7 @@
 """Conversation store — manages conversations and their items."""
 
 import hashlib
+import math
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -285,6 +286,26 @@ class NameAlreadyExistsError(Exception):
     """
 
 
+def _is_addable_usage_increment(value: Any) -> bool:
+    """
+    Return whether *value* is a safe additive ``session_usage`` increment.
+
+    Every production caller (the relay ``_accumulate_session_usage`` path)
+    only ever adds a finite, non-negative count or cost. A negative or
+    non-finite increment is therefore corruption — applied additively it
+    would drive a cumulative counter backwards or poison it with ``NaN`` /
+    ``inf``, and the relay cost-budget gate reads these very totals — so
+    :func:`apply_session_usage_delta` drops it rather than merging it.
+
+    :param value: A flat or ``by_model`` sub-key increment from a delta.
+    :returns: ``True`` when *value* is a finite, non-negative, non-bool
+        number; ``False`` otherwise.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value) and value >= 0
+
+
 def apply_session_usage_delta(current: dict[str, Any], delta: dict[str, Any]) -> None:
     """
     Apply a usage *delta* to *current* in place (add semantics, nested-aware).
@@ -293,6 +314,11 @@ def apply_session_usage_delta(current: dict[str, Any], delta: dict[str, Any]) ->
     model id, summing each model's sub-keys independently. Used by
     :meth:`ConversationStore.increment_session_usage` implementations to
     keep the merge logic in one place.
+
+    Negative and non-finite increments are dropped (see
+    :func:`_is_addable_usage_increment`): they can only come from a forged
+    runner usage frame and would corrupt the cumulative totals the relay
+    cost-budget gate enforces on.
 
     :param current: Existing ``session_usage`` dict (mutated in place).
     :param delta: Increments to apply (same layout as ``session_usage``).
@@ -303,8 +329,10 @@ def apply_session_usage_delta(current: dict[str, Any], delta: dict[str, Any]) ->
             for model_id, model_delta in value.items():
                 bucket = by_model.setdefault(model_id, {})
                 for sub_key, sub_value in model_delta.items():
+                    if not _is_addable_usage_increment(sub_value):
+                        continue
                     bucket[sub_key] = bucket.get(sub_key, 0) + sub_value
-        else:
+        elif _is_addable_usage_increment(value):
             current[key] = current.get(key, 0) + value
 
 

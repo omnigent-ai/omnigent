@@ -149,7 +149,7 @@ import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import {
   isAcpHarnessAgent,
   partitionAgentsByKind,
-  sortAgentsForDisplay,
+  selectableSessionAgents,
 } from "@/lib/agentGrouping";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
@@ -226,11 +226,6 @@ import { AgentRowTooltip } from "@/components/AgentHoverCard";
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import { createBundledSession, importLocalSessions, launchRunner } from "@/lib/sessionsApi";
-
-// Hidden from the new-session picker only. `nessie` is superseded by polly.
-// `kimi` / `kimi-code` are the headless SDK harness (kept for sub-agent / `run
-// --harness kimi` use) — the picker offers only the native TUI (`kimi-native-ui`).
-const NEW_SESSION_HIDDEN_AGENTS = new Set(["nessie", "kimi", "kimi-code"]);
 
 // Short picker-row blurbs — the spec descriptions are long paragraphs that
 // truncate badly in the dropdown; other dialogs keep the server values.
@@ -2071,6 +2066,11 @@ function HarnessConfigModal({
 // when the user navigates into an existing session and back. Module-scoped,
 // not persisted to storage (a page refresh starts clean); cleared on create.
 interface LandingDraft {
+  // `?project=` context the draft was composed under ("" = plain visit).
+  // A draft restored under a DIFFERENT project only brings back its text and
+  // attachments — the agent/host/workspace slots are discarded so the new
+  // project's stored defaults win (the prefill writes are fill-empty-only).
+  project: string;
   message: string;
   files: File[];
   pickedAgentId: string | null;
@@ -2135,7 +2135,58 @@ export function NewChatLandingScreen() {
   const heading = useHeading();
   const poweredBy = usePoweredBy();
   const serverUrl = getCliServerUrl();
-  const { data: agents } = useAvailableAgents();
+
+  // Project driving this visit, when the sidebar's per-project "new session"
+  // pencil landed here with a `?project=` query param. Empty otherwise.
+  const projectParam = searchParams.get("project") ?? "";
+  // Project prefill source: a project-driven visit seeds the composer from the
+  // project's stored defaults (host / working directory / agent / worktree).
+  // `?project=` carries the project NAME, so resolve it to the first-class id
+  // the config endpoint needs; a label-only folder (id null) or plain visit
+  // has no config to read. Resolved before the agent catalog below so the
+  // configured agent can be pinned into discovery.
+  const { data: projectList, isLoading: projectListLoading } = useProjects();
+  const configProjectId = useMemo(
+    () =>
+      projectParam !== ""
+        ? ((projectList ?? []).find((p) => p.name === projectParam)?.id ?? null)
+        : null,
+    [projectList, projectParam],
+  );
+  const { data: storedProjectConfig, isLoading: projectConfigLoading } =
+    useProjectConfig(configProjectId);
+  // Normalize into the machine's shape. `undefined` = still loading (the machine
+  // waits so a generic default can't win the race); `{}` = nothing to wait for
+  // (plain visit / label-only folder / genuinely empty config), so it settles
+  // immediately and the generic defaults take over.
+  const prefillConfig = useMemo<ProjectPrefillConfig | undefined>(() => {
+    // A project-scoped visit must resolve name → id via the projects list
+    // before we know whether there's a config to read — until it loads, the id
+    // is falsely null, so wait rather than settle prematurely.
+    if (projectParam !== "" && projectListLoading) return undefined;
+    if (configProjectId !== null && projectConfigLoading) return undefined;
+    const c = storedProjectConfig;
+    if (!c) return {};
+    return {
+      hostId: c.host_id,
+      workspace: c.workspace,
+      agentId: c.agent_id,
+      useWorktree: c.use_worktree,
+    };
+  }, [
+    projectParam,
+    projectListLoading,
+    configProjectId,
+    projectConfigLoading,
+    storedProjectConfig,
+  ]);
+
+  // Pin the configured project agent into discovery so the recency-bounded
+  // session scan (or its same-name dedup) can't drop or id-swap it out of
+  // the picker — the config must seed the agent the project actually pinned.
+  const { data: agents } = useAvailableAgents({
+    pinnedAgentIds: prefillConfig?.agentId != null ? [prefillConfig.agentId] : [],
+  });
   // refetchOnFocus: returning from a terminal `omni setup` must clear the
   // readiness badge even if the live push was missed while the tab was hidden.
   const { data: hosts, isLoading: hostsLoading } = useHosts({ refetchOnFocus: true });
@@ -2163,11 +2214,7 @@ export function NewChatLandingScreen() {
     return () => clearInterval(id);
   }, [quickImporting, queryClient]);
 
-  const agentList = useMemo(
-    () =>
-      sortAgentsForDisplay((agents ?? []).filter((a) => !NEW_SESSION_HIDDEN_AGENTS.has(a.name))),
-    [agents],
-  );
+  const agentList = useMemo(() => selectableSessionAgents(agents ?? []), [agents]);
 
   // Split the picker into "Harnesses" (harness-backed picks — the native
   // terminal CLIs plus generic-ACP harness agents like Grok / Devin / Kilocode)
@@ -2200,7 +2247,36 @@ export function NewChatLandingScreen() {
   const [landingSurface, setLandingSurface] = useState<HTMLElement | null>(null);
   useNativeServerSwitcherForMainSurface(landingSurface, true);
 
-  const [message, setMessage] = useState<string>(() => landingDraft?.message ?? "");
+  // Draft restore is project-scoped: the user's text and attachments always
+  // come back, but agent/host/workspace slots parked under another project's
+  // visit (or a plain one) must not beat THIS visit's project defaults —
+  // strip them so the prefill machine (fill-empty-only) can seed. Read once
+  // per mount; only the lazy state initializers below consume it.
+  const restoredDraft: LandingDraft | null =
+    landingDraft === null || landingDraft.project === projectParam
+      ? landingDraft
+      : {
+          ...landingDraft,
+          pickedAgentId: null,
+          pickedHarness: null,
+          selectedHostId: null,
+          sandboxSelected: false,
+          sandboxProvider: null,
+          // The repo inputs compose the managed create's workspace string, so
+          // they are location state too — keeping them would clone another
+          // project's repository into this project's sandbox.
+          sandboxRepoUrl: "",
+          sandboxRepoBranch: "",
+          workspace: "",
+          branchName: "",
+          // The branch may be the worktree-default's auto-seed, generated for
+          // the other visit's workspace — drop the marker with it so the
+          // seed/retract machinery starts clean for this visit.
+          autoSeededBranch: "",
+          prefilledBranch: "",
+        };
+
+  const [message, setMessage] = useState<string>(() => restoredDraft?.message ?? "");
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -2215,7 +2291,7 @@ export function NewChatLandingScreen() {
   // Attachments for the first message — same affordances as the in-session
   // composer (paperclip + paste); carried to ChatPage via the pending
   // initial prompt and sent with the auto-dispatched first turn.
-  const [files, setFiles] = useState<File[]>(() => landingDraft?.files ?? []);
+  const [files, setFiles] = useState<File[]>(() => restoredDraft?.files ?? []);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Reject unsupported types (only images, PDF, and text/code) and oversized
@@ -2316,19 +2392,16 @@ export function NewChatLandingScreen() {
   const databricksGitCredentialsTooltipContent = docsLinks?.databricksGitCredentials;
   const showDisabledSandboxWithDocs = !managedSandboxesEnabled && !!newSandboxTooltipContent;
 
-  // Project driving this visit, when the sidebar's per-project "new session"
-  // pencil landed here with a `?project=` query param. Empty otherwise.
-  const projectParam = searchParams.get("project") ?? "";
   // Seeded from the persisted last pick so a returning user starts on the
   // agent they used last; validated against the live list in
   // effectiveAgentId below (a stale id falls back to the default). A
   // project-driven visit defers to the project-prefill effect instead
   // (which falls back to the same last pick).
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(
-    () => landingDraft?.pickedAgentId ?? (projectParam !== "" ? null : readLastAgentId()),
+    () => restoredDraft?.pickedAgentId ?? (projectParam !== "" ? null : readLastAgentId()),
   );
   const [selectedHostId, setSelectedHostId] = useState<string | null>(
-    () => landingDraft?.selectedHostId ?? null,
+    () => restoredDraft?.selectedHostId ?? null,
   );
   // Sessions on the selected host — fetched only when a host is selected,
   // to avoid registering hundreds of sessions into the health poll at idle.
@@ -2337,13 +2410,13 @@ export function NewChatLandingScreen() {
   // host — the server provisions a sandbox host at create time
   // (host_type: "managed"), so no host_id or workspace is sent.
   const [sandboxSelected, setSandboxSelected] = useState(
-    () => landingDraft?.sandboxSelected ?? false,
+    () => restoredDraft?.sandboxSelected ?? false,
   );
   // Provider the sandbox pick launches on. Seeded to the sticky last pick (or
   // the first offered row) once the picker rows load; null both before that
   // seed and for a single-provider server that names no provider.
   const [sandboxProvider, setSandboxProvider] = useState<string | null>(
-    () => landingDraft?.sandboxProvider ?? null,
+    () => restoredDraft?.sandboxProvider ?? null,
   );
   const {
     data: hostClaudeModelOptions,
@@ -2407,18 +2480,18 @@ export function NewChatLandingScreen() {
   // `workspace` string (`<url>[#<branch>]`); both blank = empty
   // server-created workspace.
   const [sandboxRepoUrl, setSandboxRepoUrl] = useState<string>(
-    () => landingDraft?.sandboxRepoUrl ?? "",
+    () => restoredDraft?.sandboxRepoUrl ?? "",
   );
   const [sandboxRepoBranch, setSandboxRepoBranch] = useState<string>(
-    () => landingDraft?.sandboxRepoBranch ?? "",
+    () => restoredDraft?.sandboxRepoBranch ?? "",
   );
-  const [workspace, setWorkspace] = useState<string>(() => landingDraft?.workspace ?? "");
-  const [branchName, setBranchName] = useState<string>(() => landingDraft?.branchName ?? "");
+  const [workspace, setWorkspace] = useState<string>(() => restoredDraft?.workspace ?? "");
+  const [branchName, setBranchName] = useState<string>(() => restoredDraft?.branchName ?? "");
   // Branch the worktree-default effect auto-seeded (empty = none), so it can
   // retract its own seed when the default turns off. In the preserved draft so
   // it survives the composer unmounting (e.g. a trip to Settings) and remounting.
   const [autoSeededBranch, setAutoSeededBranch] = useState<string>(
-    () => landingDraft?.autoSeededBranch ?? "",
+    () => restoredDraft?.autoSeededBranch ?? "",
   );
   // The base branch auto-fills from the configured default (Settings › Git)
   // when the user names a worktree branch, and is left alone once the user
@@ -2436,7 +2509,7 @@ export function NewChatLandingScreen() {
   // that worktree (no git opts). Editing the field away from it means the user
   // wants a *new* worktree off that name.
   const [prefilledBranch, setPrefilledBranch] = useState<string>(
-    () => landingDraft?.prefilledBranch ?? "",
+    () => restoredDraft?.prefilledBranch ?? "",
   );
   // Project to file the new session under. Empty = unfiled. Stamped as the
   // `omni_project` label at create (so the row is filed from its first sidebar
@@ -2454,13 +2527,13 @@ export function NewChatLandingScreen() {
   // meaningful for the claude-native wrapper; ignored otherwise. Lives in
   // the footer tray's Advanced settings menu.
   const [permissionMode, setPermissionMode] = useState<string>(
-    () => landingDraft?.permissionMode ?? CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
+    () => restoredDraft?.permissionMode ?? CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
   );
   // Approval mode for Codex (codex --approval-mode). Only meaningful for
   // the codex-native wrapper; ignored otherwise. Lives in the footer
   // tray's Advanced settings menu.
   const [approvalMode, setApprovalMode] = useState<string>(
-    () => landingDraft?.approvalMode ?? CODEX_NATIVE_DEFAULT_APPROVAL_MODE,
+    () => restoredDraft?.approvalMode ?? CODEX_NATIVE_DEFAULT_APPROVAL_MODE,
   );
   // DANGEROUS codex full-bypass opt-in (Codex only). OFF by default and only
   // flippable on after the user types the confirmation phrase, so it can
@@ -2468,38 +2541,38 @@ export function NewChatLandingScreen() {
   // label so it survives reload. When on, a persistent red banner warns and
   // the runner ignores the approval-mode preset's flags.
   const [bypassSandbox, setBypassSandbox] = useState<boolean>(
-    () => landingDraft?.bypassSandbox ?? false,
+    () => restoredDraft?.bypassSandbox ?? false,
   );
   // Execution mode for Cursor (cursor-agent --mode / --yolo). Only meaningful
   // for the cursor-native wrapper; ignored otherwise.
   const [cursorExecMode, setCursorExecMode] = useState<string>(
-    () => landingDraft?.cursorExecMode ?? CURSOR_NATIVE_DEFAULT_EXEC_MODE,
+    () => restoredDraft?.cursorExecMode ?? CURSOR_NATIVE_DEFAULT_EXEC_MODE,
   );
   // agy's all-or-nothing `--dangerously-skip-permissions` toggle. Only
   // meaningful for the antigravity-native wrapper; ignored otherwise.
   const [agySkipMode, setAgySkipMode] = useState<string>(
-    () => landingDraft?.agySkipMode ?? AGY_NATIVE_DEFAULT_SKIP_MODE,
+    () => restoredDraft?.agySkipMode ?? AGY_NATIVE_DEFAULT_SKIP_MODE,
   );
   // Per-session brain-harness override for bundle agents (polly / debby).
   // null = the agent spec's declared harness (no override sent). On agent
   // switch, seeded from the user's last stored pick for that agent.
   const [pickedHarness, setPickedHarness] = useState<string | null>(
     () =>
-      landingDraft?.pickedHarness ??
-      readLastHarness(landingDraft?.pickedAgentId ?? readLastAgentId()),
+      restoredDraft?.pickedHarness ??
+      readLastHarness(restoredDraft?.pickedAgentId ?? readLastAgentId()),
   );
   // Per-session model + reasoning effort for the claude-native model picker.
   // "" = unselected: nothing is checked and `model_override` / `reasoning_effort`
   // are omitted from the create, so Claude Code uses its own configured model.
   // An explicit pick rides along and is remembered (seeded back on a later visit
   // via the harness-seed effect below).
-  const [pickedModel, _setPickedModel] = useState<string>(() => landingDraft?.pickedModel ?? "");
-  const [pickedEffort, setPickedEffort] = useState<string>(() => landingDraft?.pickedEffort ?? "");
+  const [pickedModel, _setPickedModel] = useState<string>(() => restoredDraft?.pickedModel ?? "");
+  const [pickedEffort, setPickedEffort] = useState<string>(() => restoredDraft?.pickedEffort ?? "");
   // Per-session cost-control switch ("Cost Optimized" pill). Unset
   // (null) defers to the agent spec's default and is omitted from
   // the create body.
   const [costControlMode, _setCostControlMode] = useState<CostControlMode>(
-    () => landingDraft?.costControlMode ?? null,
+    () => restoredDraft?.costControlMode ?? null,
   );
   // Model selection and smart routing are mutually exclusive: enabling
   // routing clears the explicit model pick, and picking a model turns
@@ -2541,6 +2614,7 @@ export function NewChatLandingScreen() {
   const onScreenRef = useRef(true);
   const draftRef = useRef<LandingDraft>(null as unknown as LandingDraft);
   draftRef.current = {
+    project: projectParam,
     message,
     files,
     pickedAgentId,
@@ -2613,46 +2687,6 @@ export function NewChatLandingScreen() {
     };
   }, []);
 
-  // Project prefill: a project-driven visit seeds the composer from the
-  // project's stored defaults (host / working directory / agent / worktree).
-  // `?project=` carries the project NAME, so resolve it to the first-class id
-  // the config endpoint needs; a label-only folder (id null) or plain visit
-  // has no config to read.
-  const { data: projectList, isLoading: projectListLoading } = useProjects();
-  const configProjectId = useMemo(
-    () =>
-      projectParam !== ""
-        ? ((projectList ?? []).find((p) => p.name === projectParam)?.id ?? null)
-        : null,
-    [projectList, projectParam],
-  );
-  const { data: storedProjectConfig, isLoading: projectConfigLoading } =
-    useProjectConfig(configProjectId);
-  // Normalize into the machine's shape. `undefined` = still loading (the machine
-  // waits so a generic default can't win the race); `{}` = nothing to wait for
-  // (plain visit / label-only folder / genuinely empty config), so it settles
-  // immediately and the generic defaults take over.
-  const prefillConfig = useMemo<ProjectPrefillConfig | undefined>(() => {
-    // A project-scoped visit must resolve name → id via the projects list
-    // before we know whether there's a config to read — until it loads, the id
-    // is falsely null, so wait rather than settle prematurely.
-    if (projectParam !== "" && projectListLoading) return undefined;
-    if (configProjectId !== null && projectConfigLoading) return undefined;
-    const c = storedProjectConfig;
-    if (!c) return {};
-    return {
-      hostId: c.host_id,
-      workspace: c.workspace,
-      agentId: c.agent_id,
-      useWorktree: c.use_worktree,
-    };
-  }, [
-    projectParam,
-    projectListLoading,
-    configProjectId,
-    projectConfigLoading,
-    storedProjectConfig,
-  ]);
   // State machine driving the project prefill: a location seed (host +
   // workspace from config) plus an independent agent seed. The generic
   // host/workspace defaults below hold off until it settles so they can't win
@@ -2701,6 +2735,11 @@ export function NewChatLandingScreen() {
     setWorkspace("");
     setBranchName("");
     setAutoSeededBranch("");
+    // Drafted sandbox repo fields are location state too — left in place they
+    // would clone the previous project's repo into this project's sandbox.
+    setSandboxRepoUrl("");
+    setSandboxRepoBranch("");
+    setPrefilledBranch("");
     seededHostRef.current = null;
     worktreeSeededForRef.current = null;
     seededConfigSigRef.current = prefillConfigSig;
@@ -2921,11 +2960,24 @@ export function NewChatLandingScreen() {
   // bundled agent. So a pending pick made before switching to a sandbox is
   // dropped there, falling back to a real agent; off the sandbox it's kept.
   const pendingAgentAllowedOnTarget = !sandboxSelected;
+  // The project's configured agent could not be resolved: the catalog, the
+  // session scan, AND the pinned direct lookup all came up empty (deleted
+  // agent, or one the caller can't read). Never substitute another agent for
+  // it — the composer surfaces this state ("Agent unavailable" chip, blocked
+  // submit) until the user explicitly picks an agent instead.
+  const configuredAgentUnavailable =
+    projectParam !== "" &&
+    prefillConfig?.agentId != null &&
+    agents !== undefined &&
+    !agentList.some((a) => a.id === prefillConfig.agentId);
   const effectiveAgentId =
     pickedAgentId === PENDING_AGENT_ID && pendingAgentAllowedOnTarget
       ? PENDING_AGENT_ID
-      : ((agentList.some((a) => a.id === pickedAgentId) ? pickedAgentId : agentList[0]?.id) ??
-        null);
+      : agentList.some((a) => a.id === pickedAgentId)
+        ? pickedAgentId
+        : configuredAgentUnavailable
+          ? null
+          : (agentList[0]?.id ?? null);
   const selectedAgent = useMemo(
     () =>
       effectiveAgentId === PENDING_AGENT_ID && pendingAgent
@@ -3749,9 +3801,11 @@ export function NewChatLandingScreen() {
       ? "Please enter a valid repository URL"
       : !sandboxSelected && (!selectedHostId || !workspaceValid)
         ? "Please choose a host and working directory"
-        : message.trim().length === 0
-          ? "Enter a message to get started"
-          : null;
+        : configuredAgentUnavailable && selectedAgent == null
+          ? "This project's configured agent is unavailable — pick an agent to continue"
+          : message.trim().length === 0
+            ? "Enter a message to get started"
+            : null;
 
   // Chip display labels.
   const workspaceLabel = workspaceTrimmed
@@ -3790,7 +3844,9 @@ export function NewChatLandingScreen() {
     ? SMART_ROUTING_LABEL
     : selectedAgent
       ? selectedAgent.display_name
-      : "Select agent";
+      : configuredAgentUnavailable
+        ? "Agent unavailable"
+        : "Select agent";
 
   // Wrap the harness setter so every explicit pick is persisted to
   // localStorage. The caller can pass an explicit `agentId` for the

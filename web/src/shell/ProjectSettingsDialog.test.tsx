@@ -13,22 +13,26 @@ vi.mock("@/lib/projectsApi", () => ({
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: () => ({ data: [{ host_id: "h1", name: "Laptop", owner: "me", status: "online" }] }),
 }));
+// Hoisted so the vi.mock factory below can reference it; per-test overrides
+// let cases control the agent catalog (the default is set in beforeEach).
+const { availableAgentsMock } = vi.hoisted(() => ({ availableAgentsMock: vi.fn() }));
 vi.mock("@/hooks/useAvailableAgents", () => ({
-  useAvailableAgents: () => ({
-    data: [
-      {
-        id: "ag_1",
-        name: "hello",
-        display_name: "Hello",
-        description: null,
-        harness: null,
-        skills: [],
-      },
-    ],
-  }),
+  useAvailableAgents: availableAgentsMock,
   // The reused agent picker prefetches details on open; no-op in the dialog test.
   prefetchAvailableAgentDetails: vi.fn(),
 }));
+
+function pickerAgent(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "ag_1",
+    name: "hello",
+    display_name: "Hello",
+    description: null,
+    harness: null,
+    skills: [],
+    ...overrides,
+  };
+}
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({ managed_sandboxes_enabled: false, sandbox_provider: null }),
 }));
@@ -63,6 +67,8 @@ beforeEach(() => {
   getProjectMock.mockReset();
   updateMock.mockReset();
   createMock.mockReset();
+  availableAgentsMock.mockReset();
+  availableAgentsMock.mockReturnValue({ data: [pickerAgent()] });
   updateMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
 });
 
@@ -254,5 +260,38 @@ describe("ProjectSettingsDialog", () => {
     // Even if a submit is forced, onSubmit bails — no clearing PATCH is sent.
     fireEvent.submit(screen.getByTestId("project-settings-save").closest("form")!);
     expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it("offers the same agent set as the composer picker (hidden agents excluded)", async () => {
+    // Filter parity with the new-session composer (selectableSessionAgents):
+    // if this picker offered an agent the composer hides, a project could pin
+    // a default the composer then can't show — the silent-substitution setup.
+    availableAgentsMock.mockReturnValue({
+      data: [
+        pickerAgent(),
+        pickerAgent({ id: "ag_nessie", name: "nessie", display_name: "Nessie" }),
+      ],
+    });
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    renderDialog();
+    await waitFor(() =>
+      expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+
+    // Open the agent picker dropdown (Radix opens on pointerdown), then the
+    // "Custom agents" submenu where composed agents are listed.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    expect(screen.getByTestId("new-chat-landing-agent-ag_1")).toBeInTheDocument();
+    expect(screen.queryByTestId("new-chat-landing-agent-ag_nessie")).not.toBeInTheDocument();
+    // And the stored default agent is pinned into discovery, so a
+    // session-scoped default that the bounded scan misses still resolves here.
+    expect(
+      availableAgentsMock.mock.calls.some(
+        ([opts]) => (opts as { pinnedAgentIds?: string[] } | undefined)?.pinnedAgentIds != null,
+      ),
+    ).toBe(true);
   });
 });

@@ -41,6 +41,7 @@ class BackgroundTitleRequest:
     harness_override: str | None = None
     model_override: str | None = None
     sub_agent_name: str | None = None
+    additional_instructions: str | None = None
 
 
 BackgroundTitleGenerator = Callable[[BackgroundTitleRequest], Awaitable[str | None]]
@@ -72,15 +73,18 @@ class RunnerBackgroundTitleGenerator:
         routed = self._runner_router.client_for_existing_conversation(request.session_id)
         if routed is None:
             return None
+        body = {
+            "prompt": request.prompt,
+            "agent_id": request.agent_id,
+            "harness_override": request.harness_override,
+            "model_override": request.model_override,
+            "sub_agent_name": request.sub_agent_name,
+        }
+        if request.additional_instructions is not None:
+            body["additional_instructions"] = request.additional_instructions
         response = await routed.client.post(
             f"/v1/sessions/{request.session_id}/background-title",
-            json={
-                "prompt": request.prompt,
-                "agent_id": request.agent_id,
-                "harness_override": request.harness_override,
-                "model_override": request.model_override,
-                "sub_agent_name": request.sub_agent_name,
-            },
+            json=body,
             timeout=self._timeout_seconds,
         )
         response.raise_for_status()
@@ -102,6 +106,7 @@ class BackgroundSessionTitleCoordinator:
         timeout_seconds: float = 70.0,
         seed_wait_seconds: float = 15.0,
         max_concurrency: int = 4,
+        additional_instructions: str | None = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be at least 1")
@@ -109,6 +114,7 @@ class BackgroundSessionTitleCoordinator:
         self._generator = generator
         self._timeout_seconds = timeout_seconds
         self._seed_wait_seconds = seed_wait_seconds
+        self._additional_instructions = additional_instructions
         self._generation_slots = asyncio.Semaphore(max_concurrency)
         self._pending: set[asyncio.Task[None]] = set()
         self._scheduled_session_ids: set[str] = set()
@@ -138,6 +144,7 @@ class BackgroundSessionTitleCoordinator:
                     harness_override=harness_override,
                     model_override=model_override,
                     sub_agent_name=sub_agent_name,
+                    additional_instructions=self._additional_instructions,
                 ),
                 expected_seed_title=expected_seed_title,
             ),

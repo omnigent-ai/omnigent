@@ -1039,6 +1039,9 @@ def create_app(
         falsy — ``0``/``false``/``no``/``off``), failing open to enabled
         when unset. Reported by ``GET /v1/info`` as
         ``public_sharing_enabled``.
+    :param server_config: Resolved non-secret server settings. The optional
+        ``session_title_instructions`` string augments the isolated automatic
+        title prompt. ``None`` loads the standard server config.
     :returns: A fully configured :class:`FastAPI` application.
     :raises ValueError: If ``permission_store`` is provided
         without an ``auth_provider``.
@@ -1046,9 +1049,15 @@ def create_app(
     if permission_store is not None and auth_provider is None:
         raise ValueError("auth_provider is required when permission_store is provided")
 
-    from omnigent.server.server_config import load_branding_snapshot
+    from omnigent.server.server_config import (
+        load_branding_snapshot,
+        load_server_config,
+        session_title_instructions,
+    )
 
-    branding_snapshot = load_branding_snapshot(server_config)
+    resolved_server_config = load_server_config() if server_config is None else server_config
+    branding_snapshot = load_branding_snapshot(resolved_server_config)
+    title_instructions = session_title_instructions(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
 
     # First-boot admin bootstrap for the accounts auth provider.
@@ -1107,6 +1116,7 @@ def create_app(
     background_title_coordinator = BackgroundSessionTitleCoordinator(
         conversation_store,
         RunnerBackgroundTitleGenerator(runner_router),
+        additional_instructions=title_instructions,
     )
     # Shared between the host tunnel (which records ``host.runner_exited``
     # reports from daemons) and the runner status endpoint (which surfaces

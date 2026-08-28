@@ -4749,6 +4749,232 @@ def test_post_connect_auth_rejection_escalates_without_going_fatal(
     assert host._auth_retry_streak == _AUTH_REJECT_ESCALATE_ATTEMPTS
 
 
+async def test_handle_launch_supersedes_previous_runner_for_same_session(
+    tmp_path: Path,
+) -> None:
+    """A relaunch for a session tears down that session's previous runner.
+
+    The server rotates the binding token on every relaunch, so without
+    this the host accumulates one live runner per attempt — each with a
+    transcript forwarder tailing the same session (the #5182 leak).
+    """
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        return original_popen(
+            ["sleep", "30"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        first = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_a",
+                binding_token="tok_a",
+                workspace=str(workspace),
+                session_id="conv_super",
+            )
+        )
+        first_handle = host._runners[first.runner_id]
+        second = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_b",
+                binding_token="tok_b",
+                workspace=str(workspace),
+                session_id="conv_super",
+            )
+        )
+
+    assert first.status == "launched" and second.status == "launched"
+    # The superseded runner is untracked at once; its termination runs
+    # detached, so poll-wait briefly for the process to go down.
+    assert first.runner_id not in host._runners
+    for _ in range(70):
+        if first_handle.proc.poll() is not None:
+            break
+        await asyncio.sleep(0.1)
+    assert first_handle.proc.poll() is not None, (
+        "the previous runner for the session must be terminated on relaunch"
+    )
+    assert second.runner_id in host._runners
+    _cleanup_host(host)
+
+
+async def test_handle_launch_leaves_other_sessions_runners_alone(
+    tmp_path: Path,
+) -> None:
+    """Supersession is scoped to the frame's session: no cross-session kills."""
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        return original_popen(
+            ["sleep", "30"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        first = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_a",
+                binding_token="tok_a2",
+                workspace=str(workspace),
+                session_id="conv_one",
+            )
+        )
+        second = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_b",
+                binding_token="tok_b2",
+                workspace=str(workspace),
+                session_id="conv_two",
+            )
+        )
+
+    assert first.runner_id in host._runners
+    assert second.runner_id in host._runners
+    assert host._runners[first.runner_id].proc.poll() is None
+    _cleanup_host(host)
+
+
+async def test_handle_launch_spawn_failure_preserves_previous_runner(
+    tmp_path: Path,
+) -> None:
+    """A failed relaunch spawn must not have killed the session's runner.
+
+    Supersession runs only after the replacement is alive: trading a
+    working runner for a spawn failure would leave the session with
+    nothing (worse than the leak this fixes).
+    """
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+    calls = {"n": 0}
+
+    def _popen_second_fails(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise OSError("fork failed")
+        return original_popen(
+            ["sleep", "30"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_popen_second_fails):
+        first = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_a",
+                binding_token="tok_keep",
+                workspace=str(workspace),
+                session_id="conv_keep",
+            )
+        )
+        second = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_b",
+                binding_token="tok_fail",
+                workspace=str(workspace),
+                session_id="conv_keep",
+            )
+        )
+
+    assert second.status == "failed"
+    assert first.runner_id in host._runners, (
+        "a failed replacement spawn must leave the previous runner tracked"
+    )
+    assert host._runners[first.runner_id].proc.poll() is None, (
+        "a failed replacement spawn must leave the previous runner alive"
+    )
+    _cleanup_host(host)
+
+
+async def test_supersede_stop_does_not_block_the_launch(
+    tmp_path: Path,
+) -> None:
+    """A SIGTERM-ignoring old runner can't head-of-line block the relaunch.
+
+    The termination round (5s grace, then SIGKILL) runs detached; the
+    launch handler must return while the stubborn process is still up.
+    """
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+    calls = {"n": 0}
+
+    def _popen_first_stubborn(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Ignores SIGTERM: only the detached round's SIGKILL ends it.
+            return original_popen(
+                ["bash", "-c", 'trap "" TERM; sleep 30'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        return original_popen(
+            ["sleep", "30"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_popen_first_stubborn):
+        first = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_a",
+                binding_token="tok_stub",
+                workspace=str(workspace),
+                session_id="conv_stub",
+            )
+        )
+        first_handle = host._runners[first.runner_id]
+        started = time.monotonic()
+        second = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_b",
+                binding_token="tok_new",
+                workspace=str(workspace),
+                session_id="conv_stub",
+            )
+        )
+        elapsed = time.monotonic() - started
+
+    assert second.status == "launched"
+    assert elapsed < 3.0, (
+        f"the launch must not wait out the old runner's termination grace (took {elapsed:.1f}s)"
+    )
+    # The stubborn process survives SIGTERM but the detached round's
+    # SIGKILL takes it down within its 5s grace + margin.
+    for _ in range(80):
+        if first_handle.proc.poll() is not None:
+            break
+        await asyncio.sleep(0.1)
+    assert first_handle.proc.poll() is not None, (
+        "the detached stop must eventually SIGKILL a SIGTERM-ignoring runner"
+    )
+    _cleanup_host(host)
+
+
 async def test_handle_import_local_all_streams_a_frame_per_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

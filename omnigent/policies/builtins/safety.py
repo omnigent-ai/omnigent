@@ -78,6 +78,14 @@ _GOOSE_NATIVE_OS_TOOLS = frozenset(
 # the file-search categories (``grep`` / ``glob``) pi lacks.
 _OPENCODE_NATIVE_OS_TOOLS = frozenset({"bash", "edit", "read", "grep", "glob"})
 
+# Codex in-process harness tool names surfaced as observational
+# ``ToolCallRequest`` events. The codex app-server executor translates
+# ``commandExecution`` items to a ``ToolCallRequest(name="shell")`` and
+# ``fileChange`` items to ``ToolCallRequest(name="apply_patch")``. Only
+# the shell tool needs to be in the OS gate here; apply_patch carries no
+# ``command`` argument, so the shell-preview branch below is not reached.
+_CODEX_IN_PROCESS_OS_TOOLS = frozenset({"shell"})
+
 
 # ── Rate limiting ────────────────────────────────────────────────────────────
 
@@ -261,11 +269,20 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
         | _HERMES_OS_TOOLS
         | _GOOSE_NATIVE_OS_TOOLS
         | _OPENCODE_NATIVE_OS_TOOLS
+        | _CODEX_IN_PROCESS_OS_TOOLS
     )
     if tool in _all_os_tools:
         args = data.get("arguments", {})
         # Build a short preview of what the tool is doing.
-        if tool in ("sys_os_shell", "Bash", "bash", "Shell", "terminal", "developer__shell"):
+        if tool in (
+            "sys_os_shell",
+            "Bash",
+            "bash",
+            "Shell",
+            "terminal",
+            "developer__shell",
+            "shell",
+        ):
             preview = args.get("command", "") if isinstance(args, dict) else ""
         elif tool in ("Grep", "Glob", "search_files", "grep", "glob"):
             preview = args.get("pattern", "") if isinstance(args, dict) else ""

@@ -10,10 +10,10 @@ import uuid
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.runner.background_titles.service import (
     BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS,
-    BACKGROUND_TITLE_INSTRUCTIONS,
     BACKGROUND_TITLE_MAX_OUTPUT_TOKENS,
     BackgroundTitleContext,
     BackgroundTitleHarnessError,
+    build_background_title_instructions,
 )
 
 _logger = logging.getLogger("omnigent.runner.background_titles.sdk")
@@ -45,7 +45,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         "content": f"<user_message>\n{context.prompt}\n</user_message>",
         "model": "session-title",
         "tools": [],
-        "instructions": BACKGROUND_TITLE_INSTRUCTIONS,
+        "instructions": build_background_title_instructions(context.additional_instructions),
         "reasoning": {"effort": "low"},
         "max_output_tokens": BACKGROUND_TITLE_MAX_OUTPUT_TOKENS,
     }

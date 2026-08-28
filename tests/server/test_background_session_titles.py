@@ -212,10 +212,15 @@ async def test_schedule_returns_before_delayed_generator_finishes(db_uri: str) -
         assert request.prompt == "please investigate the authentication timeout"
         assert request.harness_override == "claude-sdk"
         assert request.model_override == "claude-sonnet-4-6"
+        assert request.additional_instructions == "Prefix titles with the current date."
         await release.wait()
         return "Debug authentication timeout"
 
-    coordinator = BackgroundSessionTitleCoordinator(store, generator)
+    coordinator = BackgroundSessionTitleCoordinator(
+        store,
+        generator,
+        additional_instructions="Prefix titles with the current date.",
+    )
     started = time.perf_counter()
     coordinator.schedule(
         session_id=session_id,
@@ -427,6 +432,7 @@ async def test_runner_generator_posts_session_configuration() -> None:
             agent_id="agent_test",
             harness_override="claude-sdk",
             model_override="claude-sonnet-4-6",
+            additional_instructions="Use the requested slug format.",
         )
     )
 
@@ -441,6 +447,7 @@ async def test_runner_generator_posts_session_configuration() -> None:
                 "harness_override": "claude-sdk",
                 "model_override": "claude-sonnet-4-6",
                 "sub_agent_name": None,
+                "additional_instructions": "Use the requested slug format.",
             },
         )
     ]

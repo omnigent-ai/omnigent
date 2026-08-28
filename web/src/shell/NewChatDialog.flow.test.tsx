@@ -321,6 +321,41 @@ describe("NewChatLandingScreen create flow", () => {
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
   });
 
+  it("records the launched workspace under its host without corrupting other recents", async () => {
+    // Write-back hygiene for omnigent:recent-workspaces: the launched path
+    // moves to the front of ITS host's list (deduplicated, not appended
+    // twice), and other hosts' lists survive untouched. A corrupted or
+    // cross-host write here is what later feeds recent[0] into the composer's
+    // generic workspace seeding.
+    localStorage.setItem(
+      RECENT_KEY,
+      JSON.stringify({
+        host_1: ["/Users/corey/projects/other", SEEDED_WORKSPACE],
+        host_2: ["/srv/elsewhere"],
+      }),
+    );
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    // The auto-seed takes the most-recent path for host_1.
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("other"),
+    );
+    typeMessage("inspect the repo");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+
+    const stored = JSON.parse(localStorage.getItem(RECENT_KEY) ?? "{}") as Record<string, string[]>;
+    // Launched path stays a single front entry — re-launching the same
+    // workspace must not insert a duplicate or reorder the rest.
+    expect(stored.host_1).toEqual(["/Users/corey/projects/other", SEEDED_WORKSPACE]);
+    // Another host's recents are untouched by the write-back.
+    expect(stored.host_2).toEqual(["/srv/elsewhere"]);
+  });
+
   it("opens the session on the stream's announcement instead of waiting for the create", async () => {
     // POST /v1/sessions doesn't answer until the host has spawned a runner — a
     // process boot, seconds of it — but the session row exists, and is

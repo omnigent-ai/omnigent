@@ -835,10 +835,16 @@ class _RunnerHandle:
         ``Path("~/.omnigent/logs/runner/runner-ab12.log")``.
         Read back for diagnostics when the runner dies before
         connecting its tunnel.
+    :param session_id: The session this runner was launched for, e.g.
+        ``"conv_abc123"``. Lets a relaunch tear down the session's
+        previous runner (the server rotates the binding token per
+        attempt, so the runner id alone can't identify a predecessor).
+        ``None`` for frames from servers that predate ``session_id``.
     """
 
     proc: subprocess.Popen[bytes] | ZygoteRunnerProc
     log_path: Path
+    session_id: str | None = None
 
 
 class HostRetryableConnectionError(Exception):
@@ -935,6 +941,9 @@ class HostProcess:
         # Strong refs to per-runner watcher tasks; asyncio only keeps
         # weak refs, so an unreferenced task can be GC'd mid-flight.
         self._watcher_tasks: set[asyncio.Task[None]] = set()
+        # Strong refs to detached superseded-runner stops (see
+        # _spawn_superseded_stop), for the same GC reason.
+        self._supersede_stop_tasks: set[asyncio.Task[None]] = set()
         # Strong ref to the orphan-reaper task (see :meth:`_orphan_reaper_loop`).
         self._reaper_task: asyncio.Task[None] | None = None
         # Number of host-owned ``subprocess`` operations (e.g. the git worktree
@@ -1545,7 +1554,29 @@ class HostProcess:
                 error=_runner_exit_error(proc.returncode, log_path),
             )
 
-        self._runners[runner_id] = _RunnerHandle(proc=proc, log_path=log_path)
+        # One live runner per session: the session's previous runner —
+        # whose binding the server has already rotated away — is
+        # superseded, but only now that its replacement is alive (a failed
+        # spawn must not trade a working runner for nothing). Left alive
+        # it would idle forever: tunnel still authenticating, transcript
+        # forwarder still posting — one leaked generation per relaunch.
+        # The pops run under the _runner_lifecycle_lock the frame
+        # dispatcher holds (mirroring _handle_stop, so the watcher reads
+        # the exit as intentional); the SIGTERM/SIGKILL round itself is
+        # detached so a stop that waits out its 5s grace cannot
+        # head-of-line block other sessions' launches on this host.
+        if frame.session_id:
+            superseded = [
+                (rid, handle)
+                for rid, handle in self._runners.items()
+                if handle.session_id == frame.session_id
+            ]
+            for rid, handle in superseded:
+                self._runners.pop(rid, None)
+                self._spawn_superseded_stop(rid, handle, frame.session_id)
+        self._runners[runner_id] = _RunnerHandle(
+            proc=proc, log_path=log_path, session_id=frame.session_id or None
+        )
         watcher = asyncio.create_task(self._watch_runner(runner_id))
         self._watcher_tasks.add(watcher)
         watcher.add_done_callback(self._watcher_tasks.discard)
@@ -1756,6 +1787,45 @@ class HostProcess:
             request_id=frame.request_id,
             status="stopped",
         )
+
+    def _spawn_superseded_stop(
+        self, runner_id: str, handle: _RunnerHandle, session_id: str
+    ) -> None:
+        """
+        Terminate a superseded runner as a retained background task.
+
+        The handle is already popped from ``self._runners`` (so its watcher
+        reads the exit as intentional); only the SIGTERM/SIGKILL round runs
+        detached, keeping the frame dispatcher's lifecycle lock free while
+        a stubborn runner waits out its termination grace. A failure here
+        is logged loudly — the process would otherwise linger untracked
+        until the orphan reaper collects it post-exit.
+
+        :param runner_id: The superseded runner's id (for logging).
+        :param handle: Its popped :class:`_RunnerHandle`.
+        :param session_id: The session being relaunched (for logging).
+        """
+
+        async def _stop_and_log() -> None:
+            try:
+                await asyncio.to_thread(self._stop_runner_proc, handle.proc)
+                _logger.info(
+                    "Stopped superseded runner %s for session %s",
+                    runner_id,
+                    session_id,
+                )
+            except Exception:  # noqa: BLE001 — must never die unobserved
+                _logger.warning(
+                    "Failed to stop superseded runner %s for session %s; "
+                    "the process may linger until it exits on its own",
+                    runner_id,
+                    session_id,
+                    exc_info=True,
+                )
+
+        task = asyncio.create_task(_stop_and_log())
+        self._supersede_stop_tasks.add(task)
+        task.add_done_callback(self._supersede_stop_tasks.discard)
 
     @staticmethod
     def _stop_runner_proc(proc: subprocess.Popen[bytes] | ZygoteRunnerProc) -> None:

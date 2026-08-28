@@ -121,6 +121,7 @@ from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner,
     _get_runner_client,
     _invalidate_runner_backed_snapshot_state,
+    _merge_claude_permission_launch_args,
     _multipart_missing_detail,
     _notify_runner_of_bundled_child,
     _parse_session_create_metadata,
@@ -1975,13 +1976,28 @@ def register_core_routes(
             )
             # Raises unless the runner confirms the switch, so the label can
             # never claim a mode Claude isn't in. Stores the mode it reached.
-            labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY] = (
-                _require_permission_mode_forward(
-                    session_id,
-                    requested_claude_permission_mode,
-                    _mode_result,
-                )
+            _confirmed_permission_mode = _require_permission_mode_forward(
+                session_id,
+                requested_claude_permission_mode,
+                _mode_result,
             )
+            labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY] = _confirmed_permission_mode
+            # The launcher restores the mode from terminal_launch_args, not the
+            # label above, so reflect the confirmed mode there too — otherwise a
+            # relaunch reverts to the launch --permission-mode. Merge against
+            # ``updated`` (the post-write row), not the pre-update snapshot, so a
+            # combined PATCH that also set terminal_launch_args keeps those. Only
+            # rewrites an existing --permission-mode; mirrors the shift+tab path.
+            _merged_permission_args = _merge_claude_permission_launch_args(
+                updated.terminal_launch_args,
+                _confirmed_permission_mode,
+            )
+            if updated.terminal_launch_args != _merged_permission_args:
+                await asyncio.to_thread(
+                    conversation_store.update_conversation,
+                    session_id,
+                    terminal_launch_args=_merged_permission_args,
+                )
         # Some labels are cleared by DELETE, not by upserting an empty value:
         # the project membership (empty = "remove from project") and the pinned
         # flag (empty = "unpin"). Split any empty-valued clear keys out before

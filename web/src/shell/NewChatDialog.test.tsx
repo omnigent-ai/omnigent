@@ -2547,6 +2547,46 @@ describe("NewChatLandingScreen", () => {
     expect("git" in body).toBe(false);
   });
 
+  it("clears a drafted sandbox repository when remounting under another project", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    // Project Alpha's composer: stage a sandbox repo + branch, then navigate
+    // away (unmount parks them in the module-scoped landing draft).
+    renderLanding({ managed_sandboxes_enabled: true }, "/?project=Alpha");
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
+      target: { value: "https://github.com/org/alpha-repo" },
+    });
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-branch-input"), {
+      target: { value: "alpha-main" },
+    });
+    // Unmount WITHOUT resetting the draft — the leak under test rides in it.
+    cleanup();
+
+    // Project Beta's composer: the repo inputs compose the managed create's
+    // workspace string, so Alpha's repo/branch must not survive — otherwise
+    // Beta's sandbox silently clones another project's repository.
+    renderLanding({ managed_sandboxes_enabled: true }, "/?project=Beta");
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-repo-chip")).toHaveTextContent("Repository"),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "start fresh" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.host_type).toBe("managed");
+    // Blank repo inputs compose to an omitted workspace (empty server-created
+    // one) — not Alpha's repo#branch.
+    expect(body.workspace).toBeUndefined();
+  });
+
   it("carries the picked provider in the managed create when several are offered", async () => {
     // A multi-provider server renders one row per provider. Picking the
     // second (non-default) row must ride into the POST as sandbox_provider,

@@ -201,6 +201,27 @@ def test_ask_on_os_tools_asks_for_opencode_native_tools(
     assert expected_preview in result["reason"]
 
 
+# ── ask_on_os_tools: codex in-process harness observed shell tool ─────────────
+
+
+def test_ask_on_os_tools_asks_for_codex_in_process_shell_tool() -> None:
+    """Codex in-process harness's observed ``shell`` tool triggers ASK.
+
+    The codex app-server executor surfaces ``commandExecution`` items as
+    ``ToolCallRequest(name="shell")``. Without ``"shell"`` in the OS-tool set,
+    ``ask_on_os_tools`` would silently pass every codex-harness shell command
+    without prompting — the policy would appear active (it fires on ``Bash``)
+    but be inert for the separate in-process codex lane.
+
+    A correct result means the preview also carries the command string so the
+    user can see what codex is about to run.
+    """
+    result = ask_on_os_tools(tc("shell", {"command": "rm -rf /"}))
+    assert result["result"] == "ASK"
+    assert "shell" in result["reason"]
+    assert "rm -rf /" in result["reason"]
+
+
 def test_ask_on_os_tools_allows_non_os_tool() -> None:
     """A tool that is not a file/shell operation passes through.
 

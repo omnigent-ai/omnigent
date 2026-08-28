@@ -401,7 +401,7 @@ export function AppShell() {
   const agentTerminal = useMemo(() => findAgentTerminal(terminals), [terminals]);
 
   const debugMode = useDebugMode();
-  const { data: conversationsData } = useConversations("", true);
+  const { data: conversationsData, isLoading: conversationsLoading } = useConversations("", true);
   // Surface sessions needing attention as OS notifications + a dock badge.
   // Mounted here (inside the Router) so it can navigate on click and knows
   // the active conversation id, which suppresses the notification/badge for
@@ -441,11 +441,11 @@ export function AppShell() {
   // Set when this client launches a runner outside the send path (a host
   // switch); extends the liveness startup grace so the move spins.
   const runnerLaunchedAt = useChatStore((s) => s.runnerLaunchedAt);
-  const liveness = useSessionLiveness(
-    conversationId ?? undefined,
-    activeConv ?? livenessRowFromSession(activeSession),
-    { turnActive: chatStatus === "streaming", launchedAt: runnerLaunchedAt },
-  );
+  const livenessRow = activeConv ?? livenessRowFromSession(activeSession);
+  const liveness = useSessionLiveness(conversationId ?? undefined, livenessRow, {
+    turnActive: chatStatus === "streaming",
+    launchedAt: runnerLaunchedAt,
+  });
   // Full agent object (mcp_servers + policies) for the header info icon.
   // react-query-cached, so this shares the fetch ChatPage's picker makes.
   const { data: boundAgent } = useSessionAgent(conversationId ?? null);
@@ -1616,10 +1616,41 @@ export function AppShell() {
   // the failed-suppression exactly like an in-flight send does.
   const launchPending =
     runnerLaunchedAt !== null && Date.now() - runnerLaunchedAt < STARTING_GRACE_S * 1000;
+  // Until the liveness row or session snapshot hydrates, a brand-new
+  // session is indistinguishable from a stopped one — treat the unobserved
+  // window as starting so the stopped UI can't flash during startup.
+  const livenessRowPending =
+    activeConv === null && activeSession === null && (conversationsLoading || sessionLoading);
+  // The runner can register online before its auto-created PTY reaches the
+  // inventory; hold startup through that gap inside the cold-boot grace. A
+  // PTY seen for THIS conversation and then removed is a stop, not a gap.
+  const createdAtS = livenessRow?.created_at;
+  const hadPtyForConvRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (agentTerminal) hadPtyForConvRef.current = conversationId ?? null;
+  }, [conversationId, agentTerminal]);
+  const freshOnlineGrace =
+    terminalFirst &&
+    liveness.kind === "online" &&
+    hadPtyForConvRef.current !== conversationId &&
+    typeof createdAtS === "number" &&
+    createdAtS > 0 &&
+    Date.now() / 1000 - createdAtS < STARTING_GRACE_S;
   const terminalStartingUp =
     !terminalsAvailable &&
     (sessionStatus !== "failed" || chatStatus === "streaming" || launchPending) &&
-    (liveness.kind === "starting" || terminalPending);
+    (livenessRowPending ||
+      launchPending ||
+      // terminal_pending is the runner's own "creating the PTY" signal,
+      // accurate in the snapshot after a reload; gate on an alive-ish
+      // liveness so a stale flag from a dead runner can't pin the spinner.
+      ((terminalPending || activeSession?.terminalPending === true) &&
+        (liveness.kind === "online" ||
+          liveness.kind === "starting" ||
+          liveness.kind === "unknown")) ||
+      // A send in flight is this client (re)launching the runner now.
+      (chatStatus === "streaming" && liveness.kind !== "online") ||
+      freshOnlineGrace);
   // A rail-opened shell (any open terminal key other than the agent's
   // own terminal) takes over the main view chrome-free:
   // ConnectionIndicator hides the Chat/Terminal pill while this is

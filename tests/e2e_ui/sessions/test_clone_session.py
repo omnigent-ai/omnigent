@@ -75,7 +75,7 @@ def test_clone_session_copies_transcript_and_navigates(
 
     # Seed the transcript with a uniquely-marked user turn and wait for
     # the assistant reply so the fork has BOTH roles to copy.
-    composer = page.get_by_placeholder("Ask the agent anything…")
+    composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible()
     composer.fill(f"Reply with one short word. Marker: {_MARKER}")
     page.get_by_role("button", name="Send", exact=True).click()
@@ -178,7 +178,7 @@ def test_clone_dialog_offers_cross_family_native_target_and_forks(
 
     # One marked turn so the fork has content and an assistant bubble to
     # anchor the "Fork from here" action.
-    composer = page.get_by_placeholder("Ask the agent anything…")
+    composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible()
     composer.fill(f"Reply with one short word. Marker: {_XFAM_MARKER}")
     page.get_by_role("button", name="Send", exact=True).click()
@@ -360,7 +360,7 @@ def test_clone_worktree_source_prefills_repo_and_validates_directory(
 
     # One marked turn so the fork has content and an assistant bubble to
     # anchor the "Fork from here" action.
-    composer = page.get_by_placeholder("Ask the agent anything…")
+    composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible()
     composer.fill(f"Reply with one short word. Marker: {_WT_MARKER}")
     page.get_by_role("button", name="Send", exact=True).click()

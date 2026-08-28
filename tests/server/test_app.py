@@ -463,7 +463,13 @@ def _branding_png(color: tuple[int, int, int, int]) -> bytes:
     return output.getvalue()
 
 
-def _build_branding_app(db_uri: str, tmp_path: Path, label: str) -> FastAPI:
+def _build_branding_app(
+    db_uri: str,
+    tmp_path: Path,
+    label: str,
+    *,
+    server_config: dict[str, object] | None = None,
+) -> FastAPI:
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 
     artifact_store = LocalArtifactStore(str(tmp_path / f"artifacts-{label}"))
@@ -476,6 +482,25 @@ def _build_branding_app(db_uri: str, tmp_path: Path, label: str) -> FastAPI:
             artifact_store=artifact_store,
             cache_dir=tmp_path / f"cache-{label}",
         ),
+        server_config=server_config,
+    )
+
+
+def test_session_title_instructions_are_wired_into_coordinator(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "custom-titles",
+        server_config={"session_title_instructions": "Prefix titles with the current date."},
+    )
+
+    assert (
+        app.state.background_title_coordinator._additional_instructions
+        == "Prefix titles with the current date."
     )
 
 

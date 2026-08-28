@@ -773,6 +773,41 @@ def test_discover_host_skills_skips_unreadable_skill_file(
     assert "could not be read" in msg
 
 
+def _write_skill(skill_dir: Path, name: str) -> None:
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(f"---\nname: {name}\ndescription: d\n---\nBody.")
+
+
+def test_discover_skills_in_namespace_directories(agent_dir: Path) -> None:
+    """
+    A folder under ``skills/`` without its own ``SKILL.md`` groups
+    skills one level deeper: ``skills/<ns>/<skill>/SKILL.md`` must be
+    discovered alongside flat ``skills/<skill>/SKILL.md`` entries.
+    """
+    skills = agent_dir / "skills"
+    _write_skill(skills / "flat", "flat")
+    _write_skill(skills / "ops" / "deploy", "deploy")
+    _write_skill(skills / "ops" / "rollback", "rollback")
+
+    assert [s.name for s in parse(agent_dir).skills] == ["flat", "deploy", "rollback"]
+
+
+def test_discover_skills_namespace_depth_is_bounded(agent_dir: Path) -> None:
+    """
+    Namespace descent stops after one level and never enters dot-dirs,
+    so a cloned skill pack's ``.git`` tree or a deeply nested layout
+    cannot be walked (host skill dirs are user-managed).
+    """
+    skills = agent_dir / "skills"
+    _write_skill(skills / "ops" / "deploy", "deploy")
+    _write_skill(skills / "ops" / "too" / "deep", "deep")
+    _write_skill(skills / ".git" / "hidden", "hidden")
+    _write_skill(skills / ".direct-hidden", "direct-hidden")
+    _write_skill(skills / "ops" / ".nested-hidden", "nested-hidden")
+
+    assert [s.name for s in parse(agent_dir).skills] == ["deploy"]
+
+
 # ── top-level ``skills:`` field (host-skill filter) ──────────────
 
 

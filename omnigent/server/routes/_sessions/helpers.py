@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import re
 import secrets
 import time
@@ -2122,23 +2123,26 @@ def _coerce_cumulative_field(
 
     :param data: The ``external_session_usage`` event ``data`` dict.
     :param key: Field name, e.g. ``"cumulative_input_tokens"``.
-    :param numeric: When ``True`` accept any non-negative number (cost);
-        when ``False`` require a non-negative int (token counts).
+    :param numeric: When ``True`` accept any finite non-negative number
+        (cost); when ``False`` require a finite non-negative int (token
+        counts).
     :returns: The validated value, or ``None`` when the key is absent.
-    :raises OmnigentError: When present but the wrong type / negative.
+    :raises OmnigentError: When present but the wrong type / negative /
+        non-finite (``NaN`` / ``inf`` — which the monotonic ``max(old,
+        new)`` clamp downstream would otherwise latch permanently).
     """
     value = data.get(key)
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise OmnigentError(
-            f"external_session_usage data.{key} must be a non-negative "
+            f"external_session_usage data.{key} must be a finite non-negative "
             f"{'number' if numeric else 'int'}",
             code=ErrorCode.INVALID_INPUT,
         )
-    if (not numeric and not isinstance(value, int)) or value < 0:
+    if (not numeric and not isinstance(value, int)) or not math.isfinite(value) or value < 0:
         raise OmnigentError(
-            f"external_session_usage data.{key} must be a non-negative "
+            f"external_session_usage data.{key} must be a finite non-negative "
             f"{'number' if numeric else 'int'}",
             code=ErrorCode.INVALID_INPUT,
         )
@@ -2490,6 +2494,18 @@ async def _persist_external_permission_mode_change(
             f"{sorted(_CLAUDE_NATIVE_PERMISSION_MODES)}; got {mode!r}",
             code=ErrorCode.INVALID_INPUT,
         )
+    # Reflect the switch into terminal_launch_args so a relaunch reopens in this
+    # mode — the launcher reads the mode from launch args, while the label below
+    # is only the web UI's read-back. Rewrites an existing --permission-mode only
+    # (a no-op for a session launched without one); kept ahead of the label
+    # short-circuit so a stale launch arg is fixed even when the label matches.
+    merged_args = _merge_claude_permission_launch_args(conv.terminal_launch_args, mode)
+    if conv.terminal_launch_args != merged_args:
+        await asyncio.to_thread(
+            conversation_store.update_conversation,
+            session_id,
+            terminal_launch_args=merged_args,
+        )
     if conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY) == mode:
         return
     await asyncio.to_thread(
@@ -2574,6 +2590,45 @@ def _merge_codex_permission_launch_args(
         merged.append(arg)
         index += 1
     return [*merged, *permission_args]
+
+
+def _merge_claude_permission_launch_args(
+    existing_args: list[str] | None,
+    mode: str,
+) -> list[str] | None:
+    """Rewrite an existing ``--permission-mode`` in Claude launch args to ``mode``.
+
+    A runtime mode switch (shift+tab or PATCH) must survive relaunch, and the
+    launcher restores the mode from ``terminal_launch_args`` — not the label.
+    Rewrite the existing ``--permission-mode`` entry (space- or ``=``-joined) to
+    the current mode, preserving other args in order, so a cold resume reopens
+    in the mode the user last chose.
+
+    Returns ``existing_args`` unchanged when they carry no ``--permission-mode``:
+    a session launched without the flag (manual, or a ``settings.json``
+    ``defaultMode``) must NOT be pinned to an explicit mode by a footer report —
+    the forwarder posts the launch mode on its first poll (see
+    ``claude_native_forwarder``), and pinning it would override the session's
+    settings default on relaunch. Those sessions surface the live mode through
+    the permission-mode label instead.
+    """
+    args = list(existing_args or ())
+    if not any(a == "--permission-mode" or a.startswith("--permission-mode=") for a in args):
+        return existing_args
+    merged: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--permission-mode":
+            index += 2  # drop the flag and its separate value token
+            continue
+        if arg.startswith("--permission-mode="):
+            index += 1
+            continue
+        merged.append(arg)
+        index += 1
+    merged.extend(("--permission-mode", mode))
+    return merged
 
 
 def _handle_external_session_todos(
@@ -4853,6 +4908,69 @@ async def _launch_runner_on_host(*args: Any, **kwargs: Any) -> _HostLaunchAttemp
     return await _facade._launch_runner_on_host(*args, **kwargs)
 
 
+# Per-conversation relaunch locks (single-flight; weak values so a lock is
+# collected once no flight holds or awaits it), the most recent attempt per
+# conversation (so a rider that short-circuits onto another flight's binding
+# surfaces THAT flight's structured refusal instead of a generic connect
+# timeout), and strong refs to the detached superseded-runner stops.
+_relaunch_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+_relaunch_last_attempt: dict[str, _HostLaunchAttempt] = {}
+# Riders read the memo within a flight's own window (milliseconds), so it only
+# has to outlive the racing callers, not the conversation. Cap it: a
+# weak-valued map would drop entries the racers still need, and an uncapped one
+# would keep a row for every conversation this process ever relaunched.
+_RELAUNCH_MEMO_MAX = 512
+_detached_supersede_stops: set[asyncio.Task[None]] = set()
+
+
+def _spawn_superseded_runner_stop(
+    session_id: str,
+    host_id: str,
+    runner_id: str,
+    host_registry: HostRegistry,
+) -> None:
+    """
+    Stop a relaunch's superseded runner as a retained background task.
+
+    The relaunch has already rotated the session's binding, so the old
+    runner serves nothing — but left alive it idles forever (tunnel still
+    authenticating, transcript forwarder still tailing the session): one
+    leaked generation per relaunch, each holding a native pane. Detached so
+    the relaunch's latency never waits out the stop's ack timeout; the host
+    connection is live by construction here (the launch frame just went
+    over it), so delivery is the overwhelmingly common case, and the
+    host-side supersession check covers a lost frame. Any failure is
+    logged rather than left as an unretrieved task exception.
+
+    :param session_id: Session/conversation identifier.
+    :param host_id: The session's owning host.
+    :param runner_id: The superseded runner's id.
+    :param host_registry: Registry holding the live host tunnel.
+    """
+
+    async def _stop_and_log() -> None:
+        try:
+            await _stop_session_host_runner(
+                session_id,
+                host_id,
+                runner_id,
+                host_registry,
+                expect_already_stopped=True,
+            )
+        except Exception:  # noqa: BLE001 — must never die unobserved
+            _logger.warning(
+                "Superseded-runner stop failed for session %s runner %s; "
+                "the host-side supersession check reaps it on the next relaunch",
+                session_id,
+                runner_id,
+                exc_info=True,
+            )
+
+    task = asyncio.create_task(_stop_and_log())
+    _detached_supersede_stops.add(task)
+    task.add_done_callback(_detached_supersede_stops.discard)
+
+
 async def _launch_runner_on_host_impl(
     conv: Conversation,
     conversation_store: ConversationStore,
@@ -4871,6 +4989,14 @@ async def _launch_runner_on_host_impl(
     structured refusal (harness not configured) can be surfaced instead
     of silently timing out as ``RUNNER_UNAVAILABLE``.
 
+    Single-flight per conversation: concurrent callers (a turn POST racing a
+    terminal ensure, both seeing the runner offline) serialize on a
+    per-conversation lock, and a caller that waited re-reads the row — a
+    binding another flight just rotated is ridden instead of spawning a
+    second runner. The superseded runner is stopped best-effort in the
+    background (see :func:`_spawn_superseded_runner_stop`); before this,
+    every relaunch leaked the previous runner process on the host.
+
     :param conv: The conversation that needs a runner.
     :param conversation_store: Store for updating ``runner_id``.
     :param host_registry: In-memory ``HostRegistry``.
@@ -4878,9 +5004,51 @@ async def _launch_runner_on_host_impl(
     :returns: The :class:`_HostLaunchAttempt` — the new runner id plus any
         structured refusal from the host.
     """
+    lock = _relaunch_locks.setdefault(conv.id, asyncio.Lock())
+    async with lock:
+        # Re-read under the lock: a binding that moved past the caller's
+        # snapshot means another flight just relaunched (concurrently, or
+        # a moment ago) — ride its runner rather than rotating it away
+        # and double-spawning. Return that flight's own attempt when it is
+        # on record, so a structured refusal (harness not configured,
+        # workspace missing) still reaches this caller's error surface.
+        fresh = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+        if fresh is None:
+            # Deleted mid-relaunch: don't rotate a vanished row or spawn a
+            # runner for a session nothing can route to.
+            return _HostLaunchAttempt(
+                runner_id=conv.runner_id or "",
+                error_code="session_not_found",
+                error="session was deleted while its relaunch was in flight",
+            )
+        if fresh.runner_id and fresh.runner_id != conv.runner_id:
+            last = _relaunch_last_attempt.get(conv.id)
+            if last is not None and last.runner_id == fresh.runner_id:
+                return last
+            return _HostLaunchAttempt(runner_id=fresh.runner_id)
+        attempt = await _launch_runner_on_host_locked(
+            fresh, conversation_store, host_registry, host_conn
+        )
+        # Re-insert so the plain dict's insertion order is newest-last, then
+        # evict from the front once past the cap.
+        _relaunch_last_attempt.pop(conv.id, None)
+        _relaunch_last_attempt[conv.id] = attempt
+        while len(_relaunch_last_attempt) > _RELAUNCH_MEMO_MAX:
+            del _relaunch_last_attempt[next(iter(_relaunch_last_attempt))]
+        return attempt
+
+
+async def _launch_runner_on_host_locked(
+    conv: Conversation,
+    conversation_store: ConversationStore,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+) -> _HostLaunchAttempt:
+    """The launch round-trip proper; runs under the conversation's lock."""
     from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
     from omnigent.runner.identity import token_bound_runner_id
 
+    superseded_runner_id = conv.runner_id
     binding_token = secrets.token_urlsafe(32)
     new_runner_id = token_bound_runner_id(binding_token)
 
@@ -4889,6 +5057,11 @@ async def _launch_runner_on_host_impl(
         conv.id,
         new_runner_id,
     )
+    if superseded_runner_id and conv.host_id is not None:
+        # The old runner is unbound as of the replace above; reap it so it
+        # doesn't idle on the host forever (tunnel still authenticating,
+        # forwarder still tailing this session).
+        _spawn_superseded_runner_stop(conv.id, conv.host_id, superseded_runner_id, host_registry)
 
     # Pull workspace from the session row — populated and validated
     # at session create per designs/SESSION_WORKSPACE_SELECTION.md.
@@ -5849,6 +6022,8 @@ async def _stop_session_host_runner(
     host_id: str,
     runner_id: str,
     host_registry: Any,
+    *,
+    expect_already_stopped: bool = False,
 ) -> bool:
     """
     Terminate the host-launched runner backing a host-spawned session.
@@ -5886,6 +6061,10 @@ async def _stop_session_host_runner(
     :param host_registry: The :class:`HostRegistry` tracking live host
         tunnels on this replica, or ``None`` when host support is not wired
         (in-process / test setups without a host tunnel).
+    :param expect_already_stopped: Log a host-reported ``failed`` at debug
+        instead of warning, for callers that race another reaper for the same
+        runner (the relaunch belt: see
+        :func:`_spawn_superseded_runner_stop`). Delivery failures still warn.
     :returns: ``True`` when the stop was delivered and acknowledged (the
         runner is exiting, so a tunnel drop is expected); ``False`` on any
         best-effort early-out (no host registry, host offline/replaced,
@@ -5939,7 +6118,10 @@ async def _stop_session_host_runner(
         )
         return False
     if result.get("status") == "failed":
-        _logger.warning(
+        # An unknown runner means someone already reaped it. Expected for the
+        # relaunch belt, which the host's own supersession normally beats, so
+        # a warning there would report a successful reap as a failure.
+        (_logger.debug if expect_already_stopped else _logger.warning)(
             "Host %s failed to stop runner %s for session %s: %s",
             host_id,
             runner_id,
@@ -9954,6 +10136,7 @@ __all__ = [
     "_mcp_input_required_response",
     "_mcp_ok_response",
     "_mcp_tool_result",
+    "_merge_claude_permission_launch_args",
     "_merge_pending_file_blocks",
     "_message_text",
     "_model_options_from_wire",

@@ -35,7 +35,7 @@ import { Switch } from "@/components/ui/switch";
 import { useProjectConfig, useUpdateProjectConfig } from "@/hooks/useConversations";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
-import { sortAgentsForDisplay } from "@/lib/agentGrouping";
+import { selectableSessionAgents } from "@/lib/agentGrouping";
 import { sandboxOptionLabel } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
@@ -103,7 +103,12 @@ export function ProjectSettingsDialog({
   const loadFailed = projectId !== null && isError;
   const updateConfig = useUpdateProjectConfig();
   const hosts = useHosts();
-  const { data: agents } = useAvailableAgents();
+  // Pin the stored default agent into discovery so an already-configured
+  // session-scoped agent (archived / paginated out of the scan) still
+  // resolves here — matching what the composer's prefill will see.
+  const { data: agents } = useAvailableAgents({
+    pinnedAgentIds: stored?.agent_id != null ? [stored.agent_id] : [],
+  });
   const info = useServerInfo();
   // Sandbox is only a real default when the server can provision managed
   // sandbox hosts — mirror the composer's gate so we don't offer a target that
@@ -224,7 +229,10 @@ export function ProjectSettingsDialog({
 
   // Agent picker groups, mirroring the composer's split (native harness CLIs vs
   // SDK / bundle agents). The picker takes both lists and a selection.
-  const agentList = useMemo(() => sortAgentsForDisplay(agents ?? []), [agents]);
+  // Same resolver as the composer's picker (selectableSessionAgents): the two
+  // surfaces must offer the SAME set, or a project could pin a default the
+  // composer refuses to show — and then silently substitutes another for.
+  const agentList = useMemo(() => selectableSessionAgents(agents ?? []), [agents]);
   const harnessEntries = useMemo(() => agentList.filter(isNativeCodingAgent), [agentList]);
   const agentEntries = useMemo(() => agentList.filter((a) => !isNativeCodingAgent(a)), [agentList]);
   const selectedAgent = agentList.find((a) => a.id === agentId) ?? null;
