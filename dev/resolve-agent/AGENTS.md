@@ -514,10 +514,12 @@ server and runner you already run on; no new infrastructure.
    PR bots later catch a new recurring class, add a line to that checklist so the
    next run catches it up front.
 3. **Read the review back** (`sys_session_get_history` on the child) and **act on
-   it**: fix any blocking/security finding it surfaces, re-run the deliverable
+   every finding it surfaces — not only the blocking/security ones**: address each
+   (fix it at the root, or record why it's not actionable), re-run the deliverable
    (back through 2B.5) so it stays green, and — because the diff changed — refresh
-   the review or note why a finding was left. Do not open the PR with an
-   unaddressed blocking finding.
+   the review or note why a finding was left. Treat a non-blocking note the same way
+   you will treat Polly's in 4.3: judge it by whether it's correct, not by its
+   label. Do not open the PR with an unaddressed finding of any severity.
 4. **If no different-vendor bundle is reachable** (e.g. codex isn't configured in
    this environment), do **not** silently fall back to reviewing your own work as
    if it were independent. Skip the spawn and record `cross_review: "skipped: no
@@ -927,25 +929,37 @@ bot/association gate:
 gh workflow run polly-review.yml -R omnigent-ai/omnigent -f pr=<pr>
 ```
 
-Wait for the review to land (a few minutes), then triage the newest comment:
+Wait for the review to land (a few minutes), then **triage every finding — under
+*all* headings, not just Blocking/Security**. Polly's bucketing is a hint, not a
+verdict: a real defect regularly lands under **Non-blocking notes** (a missed edge
+case, a subtly wrong condition, a dropped error path), and "non-blocking" is not a
+licence to ignore it. Go through the newest comment finding by finding — Blocking
+issues, Security vulnerabilities, **and** Non-blocking notes — and for each one do
+exactly one of:
 
-- **Critical findings present** — anything under **Blocking issues** or **Security
-  vulnerabilities** that is a real defect in the PR's diff. Fix each one at the root
-  (same fail→pass discipline as Step 2B — add/adjust a targeted test where it
-  makes sense), re-run the affected tests, then land the fix per the
-  **push-or-take-over rule**: `git commit` + `git push` when you can push to the
-  branch; on a **fork PR** you can't push to, take over into your own PR (Step 4
-  preamble) and continue on it.
-  - After **pushing** a fix (to your PR or an in-repo branch), **re-trigger the
-    review** the same way — another `gh workflow run polly-review.yml -f pr=<pr>`
-    (again: not a `/review` comment from you). Then poll for a **new**
-    `<!-- polly-review-bot -->` comment and triage again.
-- **No critical findings** — only non-blocking notes or a clean summary → the
-  review is clean; you're done with this loop. You may address cheap non-blocking
-  notes if they're clearly right, but they don't gate.
+- **Fix it** — the default for anything that is, or might be, a real defect or a
+  cheap correctness/robustness win. Fix at the root (same fail→pass discipline as
+  Step 2B — add/adjust a targeted test where it makes sense), re-run the affected
+  tests, then land the fix per the **push-or-take-over rule**: `git commit` +
+  `git push` when you can push to the branch; on a **fork PR** you can't push to,
+  take over into your own PR (Step 4 preamble) and continue on it. **Re-assess a
+  non-blocking note as if it were blocking** — decide by whether it's *correct*,
+  not by which heading Polly filed it under.
+- **Justify skipping it** — only when it is genuinely not actionable in this PR: a
+  false positive, purely stylistic/subjective, or out of scope (a pre-existing
+  issue your diff didn't introduce). State *which* finding and *why* — in a PR
+  reply to Polly's comment and in the handoff (`polly_review`). Never skip a
+  finding silently, and never skip one merely because it's labelled non-blocking.
 
-Repeat push → re-trigger → re-read within the round cap until no critical Polly
-findings remain. Record the final state in the handoff (`polly_review`). If a
+After **pushing** any fix (to your PR or an in-repo branch), **re-trigger the
+review** — another `gh workflow run polly-review.yml -f pr=<pr>` (again: not a
+`/review` comment from you) — then poll for a **new** `<!-- polly-review-bot -->`
+comment and triage it again the same way.
+
+Repeat push → re-trigger → re-read within the round cap until **every** finding on
+the newest review is either fixed or has a recorded justification — no unaddressed
+notes of any severity remain. Record the final state in the handoff
+(`polly_review`), including which non-blocking notes you fixed vs. justified. If a
 recurring class of bug shows up here, add a one-line check to
 `dev/resolve-agent/review-checklist.md` so the pre-PR reviewer catches it next
 time.
@@ -1216,10 +1230,11 @@ Field meanings:
   and whether each was diff-caused vs pre-existing/flaky/infra. If a fork PR needed
   a fix and you took over into your own PR, this reflects **your** PR's checks.
   Empty when `skip_push` was set or you stopped before there was a PR to land.
-- `polly_review` — the result of the Step 4.3 automated-review loop: `clean` (no
-  blocking/security findings) with how many review rounds it took and what you
-  fixed, or the unresolved critical findings if you hit the round cap. Empty when
-  no PR was opened.
+- `polly_review` — the result of the Step 4.3 automated-review loop: `clean` (every
+  finding on the newest review addressed — blocking, security, **and** non-blocking)
+  with how many review rounds it took, what you fixed, and which non-blocking notes
+  you fixed vs. justified skipping; or the unresolved findings if you hit the round
+  cap. Empty when no PR was opened.
 - `ui_preview` — the result of Step 4.1 (run on every PR, not just frontend fixes):
   the **preview URL** (verbatim, so the ticket write-back can surface it and a
   reviewer can `omnigent claude -p '<prompt>' --server <url>`), or why it failed to
