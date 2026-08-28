@@ -135,6 +135,7 @@ from omnigent.native_terminal import (
 from omnigent.native_terminal import (
     terminal_attach_url as _attach_url,
 )
+from omnigent.process_logging import log_info_once
 from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -2731,7 +2732,8 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
             entry.name,
         )
         return None
-    _logger.info(
+    log_info_once(
+        _logger,
         "native-claude routing: provider %r (base_url=%s, model=%s)",
         entry.name,
         family.base_url,
@@ -2860,7 +2862,8 @@ def _bedrock_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcode
             "Bedrock account. Set models.default to a Bedrock inference-profile id.",
             entry.name,
         )
-    _logger.info(
+    log_info_once(
+        _logger,
         "native-claude routing: bedrock provider %r (base_url=%s, model=%s)",
         entry.name,
         family.base_url,
@@ -2917,9 +2920,11 @@ def _native_claude_config_from_entry(
     if entry.kind == BEDROCK_KIND:
         return _bedrock_config_for_native_claude(entry)
     if entry.kind == DATABRICKS_KIND:
-        _logger.info("native-claude routing: Databricks ucode profile %r", entry.profile)
+        log_info_once(_logger, "native-claude routing: Databricks ucode profile %r", entry.profile)
         return _ucode_config_for_profile(entry.profile, refresh_models=refresh_models)
-    _logger.info("native-claude routing: Claude CLI login (subscription provider %r)", entry.name)
+    log_info_once(
+        _logger, "native-claude routing: Claude CLI login (subscription provider %r)", entry.name
+    )
     return None
 
 
@@ -2991,10 +2996,11 @@ def resolve_native_claude_config(
     entry = default_provider_for_harness(effective_config_with_detected(explicit), "claude-sdk")
     if entry is not None:
         return _native_claude_config_from_entry(entry, refresh_models=refresh_models)
-    _logger.info(
+    log_info_once(
+        _logger,
         "native-claude routing: Claude CLI login (no provider configured for the Claude "
         "harness, no Databricks profile). Run `omnigent setup --no-internal-beta` to route "
-        "through a provider."
+        "through a provider.",
     )
     return None
 

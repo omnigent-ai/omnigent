@@ -301,12 +301,15 @@ def debug_event(
             "tool_call_dispatched", session_id=session_id,
             tool_call_id=tc.id, model=model))
 
-    ``session_id``/``turn_id`` are populated only from what the callsite passes;
-    ``user_id`` additionally has an ambient fallback the sink applies when the
-    record carries none (a request-scoped ContextVar on the server, the
-    ``OMNIGENT_USER_ID`` env on the runner/host). Freeform ``_logger.debug("…")``
-    calls need no ``extra``; they ship with null correlation columns and an empty
-    attributes map.
+    ``turn_id`` is populated only from what the callsite passes. ``session_id``
+    is likewise callsite-driven, but the sink additionally falls back to the
+    runner's primary (parent) conversation id when a record carries none (see
+    :func:`record_to_row`); that fallback is runner-only, so on the server an
+    unthreaded ``session_id`` stays null. ``user_id`` has its own ambient
+    fallback (a request-scoped ContextVar on the server, the ``OMNIGENT_USER_ID``
+    env on the runner/host). Freeform ``_logger.debug("…")`` calls need no
+    ``extra``; they ship with null correlation columns and an empty attributes
+    map.
     """
     extra: dict[str, object] = {"event_name": event_name, "attributes": dict(attributes)}
     if session_id is not None:
@@ -339,6 +342,15 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
     the two shapes the ZeroBus JSON path requires for the ``TIMESTAMP`` and
     ``MAP<STRING,STRING>`` columns respectively.
 
+    ``session_id`` is taken from what the callsite threaded via ``extra`` and,
+    failing that, falls back to the runner's primary (parent) conversation id
+    (:func:`runner_primary_session_id`). That fallback reads a runner-only env
+    that is absent on the multi-tenant server, so a server record with no
+    explicit id stays null rather than risk cross-request mis-attribution --
+    this is deliberate; do NOT add an ambient request-scoped fallback here. On a
+    runner, a co-located subagent turn whose log is not threaded can be
+    attributed to the parent conversation, an accepted trade-off.
+
     ``workspace_id``/``app_name`` describe the record's origin deployment: the
     managed service stamps ``record.workspace_id`` per request (so it wins),
     while single-tenant deployments fall back to the process-constant
@@ -347,7 +359,7 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
     """
     workspace_id, app_name = _process_identity()
     return {
-        "session_id": getattr(record, "session_id", None),
+        "session_id": getattr(record, "session_id", None) or runner_primary_session_id(),
         "turn_id": getattr(record, "turn_id", None),
         "source": source,
         "event_name": getattr(record, "event_name", None),

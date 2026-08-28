@@ -225,6 +225,7 @@ class BackgroundSessionTitleCoordinator:
                         "reason=seed_unavailable elapsed_ms=%.1f",
                         request.session_id,
                         (time.perf_counter() - started) * 1000,
+                        extra={"session_id": request.session_id},
                     )
                     return
                 generated = await asyncio.wait_for(
@@ -238,6 +239,7 @@ class BackgroundSessionTitleCoordinator:
                     "reason=invalid_title elapsed_ms=%.1f",
                     request.session_id,
                     (time.perf_counter() - started) * 1000,
+                    extra={"session_id": request.session_id},
                 )
                 return
             updated = await asyncio.to_thread(
@@ -251,12 +253,14 @@ class BackgroundSessionTitleCoordinator:
                 request.session_id,
                 updated is not None,
                 (time.perf_counter() - started) * 1000,
+                extra={"session_id": request.session_id},
             )
         except TimeoutError:
             _logger.info(
                 "background session title timed out session=%s elapsed_ms=%.1f",
                 request.session_id,
                 (time.perf_counter() - started) * 1000,
+                extra={"session_id": request.session_id},
             )
         except asyncio.CancelledError:
             raise
@@ -266,6 +270,7 @@ class BackgroundSessionTitleCoordinator:
                 request.session_id,
                 (time.perf_counter() - started) * 1000,
                 exc_info=True,
+                extra={"session_id": request.session_id},
             )
 
     async def _run_task_summary(

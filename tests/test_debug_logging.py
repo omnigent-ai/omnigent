@@ -114,9 +114,11 @@ def test_record_to_row_shape_and_coercions() -> None:
     }
 
 
-def test_record_to_row_reads_session_id_from_extra() -> None:
+def test_record_to_row_reads_session_id_from_extra(monkeypatch: pytest.MonkeyPatch) -> None:
     # session_id is passed explicitly at the callsite via extra= and read off
-    # the record; there is no ambient contextvar fallback.
+    # the record. There is deliberately no ambient request-scoped fallback; an
+    # explicit id also wins over the runner-primary env fallback.
+    monkeypatch.setenv(dl.PRIMARY_SESSION_ID_ENV_VAR, "conv_primary")
     record = logging.LogRecord(
         "omnigent.runner", logging.INFO, __file__, 1, "hi", (), None, func="f"
     )
@@ -125,7 +127,22 @@ def test_record_to_row_reads_session_id_from_extra() -> None:
     assert row["session_id"] == "conv_row"
 
 
+def test_record_to_row_session_id_falls_back_to_primary_on_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # On a runner the primary-session env is set, so an unthreaded log is
+    # attributed to the primary (parent) conversation. A co-located subagent's
+    # unthreaded log can be mis-attributed to the parent — an accepted trade-off.
+    monkeypatch.setenv(dl.PRIMARY_SESSION_ID_ENV_VAR, "conv_primary")
+    record = logging.LogRecord("omnigent.runner", logging.INFO, __file__, 1, "hi", (), None)
+    assert dl.record_to_row(record, source="runner")["session_id"] == "conv_primary"
+
+
 def test_record_to_row_null_correlation_without_extra() -> None:
+    # The server never sets the primary-session env (the _clear_env fixture
+    # mirrors that), so an unthreaded server log stays null rather than
+    # borrowing another concurrent request's id — the deliberate no-ambient-
+    # fallback property.
     record = logging.LogRecord("omnigent", logging.INFO, __file__, 1, "hi", (), None)
     row = dl.record_to_row(record, source="server")
     assert row["session_id"] is None

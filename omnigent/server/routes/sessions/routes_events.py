@@ -1637,6 +1637,7 @@ def register_events_routes(
                     _sf._HOST_BOUND_RUNNER_CONNECT_GRACE_S,
                     conv.runner_id,
                     session_id,
+                    extra={"session_id": session_id},
                 )
                 if _grace_host_reg is not None and _grace_host_conn is not None:
                     runner_client = await _wait_for_host_bound_runner_client(
