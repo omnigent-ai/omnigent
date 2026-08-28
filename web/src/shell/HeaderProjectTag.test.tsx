@@ -37,11 +37,7 @@ afterEach(cleanup);
 describe("HeaderProjectTag", () => {
   it("labels the trigger by project when filed and by intent when unfiled", () => {
     const { rerender } = renderTag(
-      <HeaderProjectTag
-        conversationId="conv-1"
-
-        projectName="Payments"
-      />,
+      <HeaderProjectTag conversationId="conv-1" projectName="Payments" />,
     );
     expect(screen.getByTestId("header-project-tag")).toHaveAttribute(
       "aria-label",
@@ -57,6 +53,25 @@ describe("HeaderProjectTag", () => {
       "aria-label",
       "Add to project",
     );
+  });
+
+  it("shows the current project in the tooltip when filed, else invites the move", () => {
+    const { rerender } = renderTag(
+      <HeaderProjectTag conversationId="conv-1" projectName="Payments" />,
+    );
+    // Radix opens the tooltip immediately on focus (no hover delay) and renders
+    // the content into a portal; getAllByText covers the visually-hidden a11y
+    // copy Radix mirrors alongside the visible one.
+    fireEvent.focus(screen.getByTestId("header-project-tag"));
+    expect(screen.getAllByText("Currently in: Payments").length).toBeGreaterThan(0);
+
+    rerender(
+      <TooltipProvider>
+        <HeaderProjectTag conversationId="conv-1" projectName={null} />
+      </TooltipProvider>,
+    );
+    fireEvent.focus(screen.getByTestId("header-project-tag"));
+    expect(screen.getAllByText("Move session").length).toBeGreaterThan(0);
   });
 
   it("opens the picker and moves the session to the chosen project", () => {
