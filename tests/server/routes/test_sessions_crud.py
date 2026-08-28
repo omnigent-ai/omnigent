@@ -15,6 +15,7 @@ import pytest
 import pytest_asyncio
 
 from omnigent.db.utils import generate_agent_id
+from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -312,6 +313,20 @@ async def test_patch_session_title(
         headers={"Content-Type": "application/json"},
     )
     assert resp.status_code == 200
+
+
+async def test_patch_session_title_enforces_user_limit(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """Manual titles accept 200 characters and reject 201."""
+    accepted = "x" * USER_SESSION_TITLE_MAX_CHARS
+    resp = await client.patch(f"/v1/sessions/{session_id}", json={"title": accepted})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["title"] == accepted
+
+    resp = await client.patch(f"/v1/sessions/{session_id}", json={"title": accepted + "x"})
+    assert resp.status_code == 422, resp.text
 
 
 async def test_patch_session_not_found(client: httpx.AsyncClient) -> None:

@@ -24,6 +24,8 @@ import {
 import { AgentInfoButton } from "@/components/AgentInfo";
 import { ConversationBreadcrumb } from "./ConversationBreadcrumb";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
+import { HeaderProjectTag } from "./HeaderProjectTag";
+import { HeaderTitle } from "./HeaderTitle";
 import { UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { PresenceAvatars } from "@/components/PresenceAvatars";
 import type { Agent } from "@/hooks/useAgents";
@@ -171,7 +173,8 @@ interface ChatHeaderProps {
  * mask, index.css; chat reserves clearance via ``pt-20``,
  * terminal-first via ``pt-14``). Left slot: open-sidebar + a conversation
  * breadcrumb (``[folder] / <title> [/ <sub-agent>]``, with the session-actions
- * kebab on desktop). Right slot: desktop action buttons (Agent info ·
+ * kebab on desktop and a "Move to…" project picker on the folder tag). Right
+ * slot: desktop action buttons (Agent info ·
  * Share · right-panel toggle) and, on mobile, a **single** kebab holding both
  * the session actions (pin/share/rename/project/archive/delete) and the
  * workspace-rail entries that open Files · Agents · Shells as full-screen
@@ -342,6 +345,27 @@ export function ChatHeader({
       workspaceItems={isMobile ? workspaceItems : null}
     />
   ) : null;
+  // Slack-style "Move to…" shortcut on the breadcrumb's folder tag: click it to
+  // file/move/unfile the session without opening the kebab. Desktop-only (the
+  // tag is hidden on mobile; the mobile menu keeps its own move item) and only
+  // for the owner-managed top-level row — a sub-agent's folder stays static so
+  // the title keeps its back-to-parent role. `null` falls back to the static
+  // folder icon in the breadcrumb.
+  const projectTag =
+    !isMobile && actionConversation && !isChildSession ? (
+      <HeaderProjectTag conversationId={actionConversation.id} projectName={projectName} />
+    ) : null;
+  // Click-to-rename on the breadcrumb title, same gating as the folder tag:
+  // desktop, owner-managed top-level row. A sub-agent's title stays a
+  // back-to-parent link (titleLinkTo wins over titleSlot in the breadcrumb),
+  // and mobile keeps the Rename item in the kebab.
+  const titleSlot =
+    !isMobile && actionConversation && !isChildSession ? (
+      <HeaderTitle
+        conversationId={actionConversation.id}
+        title={conversationTitle ?? UNTITLED_CONVERSATION_LABEL}
+      />
+    ) : null;
   return (
     <header
       className={cn(
@@ -418,6 +442,8 @@ export function ChatHeader({
           <ConversationBreadcrumb
             conversationTitle={conversationTitle ?? UNTITLED_CONVERSATION_LABEL}
             projectName={projectName}
+            projectTag={projectTag ?? undefined}
+            titleSlot={titleSlot ?? undefined}
             titleLinkTo={titleLinkTo}
             isChildSession={isChildSession}
             boundAgent={boundAgent}

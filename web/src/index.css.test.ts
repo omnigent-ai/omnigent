@@ -636,6 +636,70 @@ describe("index.css electron-mac sidebar header", () => {
   });
 });
 
+/* Regression test for the "maximized rail tabs float in the middle when the
+ * sidebar is reopened" bug on the macOS desktop shell.
+ *
+ * A maximized workspace rail breaks out to the window's top-left corner, so its
+ * tab strip is padded 10.5rem to clear the traffic lights and the title-bar
+ * cluster. Maximizing normally collapses the sidebar, but the user can reopen
+ * it (⌘⌥[ / the title-bar toggle) over the still-maximized rail. The sidebar
+ * (z above the rail) then covers that corner — the lights sit over IT, and the
+ * strip starts to the sidebar's right with nothing to clear — so the clearance
+ * must drop, or the padding shoves the tabs into the middle. The rule keys off
+ * `data-sidebar-open` on the app shell (set by AppShell) to do this; asserted at
+ * the CSS level because the lights are painted by macOS OUTSIDE the page, so no
+ * DOM test or screenshot can see them. This selector IS the alignment.
+ */
+describe("index.css maximized workspace rail traffic-light clearance", () => {
+  const rule = (cssSource.match(/[^{}]+\{[^{}]*\}/g) ?? []).find(
+    (block) => block.includes(".workspace-tab-strip") && /padding-left/.test(block),
+  );
+  const selector = (rule ?? "")
+    .slice(0, rule ? rule.indexOf("{") : 0)
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .trim();
+
+  function makeStrip(shellAttrs: Record<string, string>): HTMLElement {
+    const shell = document.createElement("div");
+    shell.className = "app-shell";
+    for (const [k, v] of Object.entries(shellAttrs)) shell.setAttribute(k, v);
+    const rail = document.createElement("aside");
+    rail.setAttribute("aria-label", "Workspace");
+    rail.setAttribute("data-maximized", "true");
+    const strip = document.createElement("div");
+    strip.className = "workspace-tab-strip";
+    rail.appendChild(strip);
+    shell.appendChild(rail);
+    document.body.appendChild(shell);
+    return strip;
+  }
+
+  it("has the clearance rule this test exists to protect", () => {
+    expect(rule, "the maximized rail tab-strip padding rule is gone from index.css").toBeDefined();
+    expect(rule).toMatch(/padding-left:\s*10\.5rem/);
+  });
+
+  it("clears the lights on the mac shell while the sidebar is collapsed", () => {
+    const strip = makeStrip({ "data-electron-mac": "true" });
+    expect(strip.matches(selector)).toBe(true);
+    strip.closest(".app-shell")?.remove();
+  });
+
+  it("drops the clearance once the sidebar is reopened over the maximized rail", () => {
+    // The exact bug: sidebar open covers the window corner, so the 10.5rem
+    // padding has nothing to clear and would push the tabs into the middle.
+    const strip = makeStrip({ "data-electron-mac": "true", "data-sidebar-open": "true" });
+    expect(strip.matches(selector)).toBe(false);
+    strip.closest(".app-shell")?.remove();
+  });
+
+  it("never clears in a plain browser (no lights to avoid)", () => {
+    const strip = makeStrip({});
+    expect(strip.matches(selector)).toBe(false);
+    strip.closest(".app-shell")?.remove();
+  });
+});
+
 describe("index.css native conversation breadcrumb", () => {
   it("does not hide the parent-session link on iOS/Android native shells", () => {
     // Native chrome is a server switcher, not session back. A blanket

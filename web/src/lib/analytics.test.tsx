@@ -117,12 +117,12 @@ describe("startTimedInteraction", () => {
     const analytics = vi.fn();
     setOmnigentHostConfig({ analytics });
 
-    startTimedInteraction("create_session", "sess_2").fail();
+    startTimedInteraction("create_session_sandbox", "sess_2").fail();
 
     expect(analytics).toHaveBeenLastCalledWith({
       type: "interaction_phase",
       interactionId: "sess_2",
-      interactionKind: "create_session",
+      interactionKind: "create_session_sandbox",
       phase: "complete",
       status: "failure",
       durationMs: expect.any(Number),

@@ -8,7 +8,6 @@ import {
 } from "react";
 import {
   ArchiveIcon,
-  CheckIcon,
   ChevronLeftIcon,
   EllipsisIcon,
   FolderInputIcon,
@@ -18,7 +17,6 @@ import {
   PencilIcon,
   PinIcon,
   PinOffIcon,
-  SearchIcon,
   ShareIcon,
   Trash2Icon,
 } from "lucide-react";
@@ -37,9 +35,6 @@ import {
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
-  DropdownMenuSub,
-  DropdownMenuSubContent,
-  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
@@ -47,15 +42,16 @@ import {
   type Conversation,
   useArchiveConversation,
   useMoveToProject,
-  useProjects,
   useRenameConversation,
   useStopAndDeleteConversation,
   useTogglePinnedConversation,
 } from "@/hooks/useConversations";
+import { ProjectPicker } from "./ProjectPicker";
 import { markConversationUnread } from "@/hooks/useUnseenConversations";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { Link, useNavigate } from "@/lib/routing";
+import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showToast } from "@/components/ui/toast";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
@@ -87,63 +83,6 @@ function ArchivedToast() {
 
 function showArchivedToast() {
   showToast(<ArchivedToast />);
-}
-
-function ProjectPicker({
-  currentProject,
-  onSelect,
-}: {
-  currentProject: string | null;
-  onSelect: (project: string) => void;
-}) {
-  const { data: projects = [] } = useProjects();
-  const [search, setSearch] = useState("");
-  const filtered = search
-    ? projects.filter((project) => project.name.toLowerCase().includes(search.toLowerCase()))
-    : projects;
-
-  return (
-    <>
-      <div className="flex items-center gap-2 border-b px-2 py-1.5">
-        <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
-        <input
-          aria-label="Search projects"
-          className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
-          placeholder="Search projects"
-          value={search}
-          onChange={(event) => setSearch(event.target.value)}
-          onKeyDown={(event) => event.stopPropagation()}
-        />
-      </div>
-      <div className="max-h-48 overflow-y-auto">
-        {filtered.map((project) => (
-          <DropdownMenuItem
-            key={project.name}
-            className="px-2 py-1"
-            onSelect={() => onSelect(project.name)}
-          >
-            <span className="flex-1 truncate text-left">{project.name}</span>
-            {currentProject === project.name && (
-              <CheckIcon className="size-3.5 shrink-0 text-primary" />
-            )}
-          </DropdownMenuItem>
-        ))}
-        {filtered.length === 0 && (
-          <p className="px-2 py-1.5 text-sm text-muted-foreground">No projects yet.</p>
-        )}
-      </div>
-      {currentProject && (
-        <div className="border-t pt-1">
-          <DropdownMenuItem className="px-2 py-1" onSelect={() => onSelect("")}>
-            Remove from{" "}
-            <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
-              {currentProject}
-            </span>
-          </DropdownMenuItem>
-        </div>
-      )}
-    </>
-  );
 }
 
 export function HeaderConversationMenu({
@@ -284,14 +223,19 @@ export function HeaderConversationMenu({
           Agent info
         </DropdownMenuItem>
       )}
-      <DropdownMenuItem
-        data-testid="header-rename-conversation"
-        className={itemClass}
-        onSelect={() => setRenameOpen(true)}
-      >
-        <PencilIcon className="size-3.5" />
-        Rename
-      </DropdownMenuItem>
+      {/* Rename lives here only on mobile — the native shells hide the
+          breadcrumb, so this menu is the sole entry point. On desktop the
+          shortcut is clicking the breadcrumb title (HeaderTitle). */}
+      {isMobile && (
+        <DropdownMenuItem
+          data-testid="header-rename-conversation"
+          className={itemClass}
+          onSelect={() => setRenameOpen(true)}
+        >
+          <PencilIcon className="size-3.5" />
+          Rename
+        </DropdownMenuItem>
+      )}
       <DropdownMenuItem
         data-testid="header-mark-unread-conversation"
         className={itemClass}
@@ -300,7 +244,10 @@ export function HeaderConversationMenu({
         <MailIcon className="size-3.5" />
         Mark as unread
       </DropdownMenuItem>
-      {isMobile ? (
+      {/* Move to project lives here only on mobile — the native mobile shells
+          hide the breadcrumb, so this menu is the sole entry point. On desktop
+          the shortcut is the breadcrumb's folder tag (HeaderProjectTag). */}
+      {isMobile && (
         <DropdownMenuItem
           data-testid="header-move-to-project"
           className={cn("whitespace-nowrap", itemClass)}
@@ -312,19 +259,6 @@ export function HeaderConversationMenu({
           <FolderInputIcon className="size-3.5" />
           {currentProject ? "Move session" : "Add to project"}
         </DropdownMenuItem>
-      ) : (
-        <DropdownMenuSub>
-          <DropdownMenuSubTrigger
-            data-testid="header-move-to-project"
-            className="whitespace-nowrap"
-          >
-            <FolderInputIcon className="size-3.5" />
-            {currentProject ? "Move session" : "Add to project"}
-          </DropdownMenuSubTrigger>
-          <DropdownMenuSubContent className="min-w-56">
-            <ProjectPicker currentProject={currentProject} onSelect={handleProjectSelect} />
-          </DropdownMenuSubContent>
-        </DropdownMenuSub>
       )}
       {workspaceItems && (
         <>
@@ -423,6 +357,7 @@ export function HeaderConversationMenu({
               autoFocus
               aria-label="Session name"
               data-testid="header-rename-conversation-input"
+              maxLength={USER_SESSION_TITLE_MAX_CHARS}
               value={renameTitle}
               onChange={(event) => setRenameTitle(event.target.value)}
               onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => {

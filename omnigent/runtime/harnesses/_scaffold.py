@@ -127,7 +127,7 @@ _TURN_IDLE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_TIMEOUT_S", "600"))
 # keeps emitting, so a runaway-but-active loop (e.g. an infinite tool
 # loop emitting steadily) needs this. Generous so it never clips a real
 # long turn. ``<= 0`` disables. Whichever of (idle, absolute) trips first.
-_TURN_ABSOLUTE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_ABSOLUTE_TIMEOUT_S", "3600"))
+_TURN_ABSOLUTE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_ABSOLUTE_TIMEOUT_S", "10800"))
 
 
 @dataclass(frozen=True)

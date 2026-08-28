@@ -5,6 +5,7 @@ import type { Conversation } from "@/hooks/useConversations";
 import type * as ConversationsModule from "@/hooks/useConversations";
 import type * as UnseenConversationsModule from "@/hooks/useUnseenConversations";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 
@@ -108,15 +109,18 @@ describe("HeaderConversationMenu", () => {
     expect(trigger.querySelector("svg")).toHaveClass("lucide-ellipsis");
 
     openMenu();
+    // Desktop drops "Rename" and "Move to project" from the kebab — the
+    // breadcrumb title (HeaderTitle) and folder tag (HeaderProjectTag) own
+    // those shortcuts now.
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
       "Pin",
       "Share",
-      "Rename",
       "Mark as unread",
-      "Add to project",
       "Archive",
       "Delete",
     ]);
+    expect(screen.queryByTestId("header-move-to-project")).toBeNull();
+    expect(screen.queryByTestId("header-rename-conversation")).toBeNull();
   });
 
   it("opens from the keyboard and focuses the first action", () => {
@@ -128,7 +132,7 @@ describe("HeaderConversationMenu", () => {
     expect(screen.getByRole("menuitem", { name: "Pin" })).toHaveFocus();
   });
 
-  it("runs pin, mark-unread, and rename actions for the active session", () => {
+  it("runs pin and mark-unread actions for the active session", () => {
     renderMenu();
 
     openMenu();
@@ -138,10 +142,18 @@ describe("HeaderConversationMenu", () => {
     openMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Mark as unread" }));
     expect(mocks.markUnread).toHaveBeenCalledWith("conv-1", 1_700_000_100);
+  });
+
+  it("renames from the mobile Rename dialog", () => {
+    // Rename is mobile-only in this menu now — desktop renames by clicking the
+    // breadcrumb title (HeaderTitle).
+    mocks.isMobile = true;
+    renderMenu();
 
     openMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Rename" }));
     const input = screen.getByRole("textbox", { name: "Session name" });
+    expect(input).toHaveAttribute("maxLength", String(USER_SESSION_TITLE_MAX_CHARS));
     fireEvent.change(input, { target: { value: "Roadmap planning" } });
     fireEvent.click(screen.getByRole("button", { name: "Rename" }));
     expect(mocks.rename).toHaveBeenCalledWith({ id: "conv-1", title: "Roadmap planning" });
@@ -170,6 +182,9 @@ describe("HeaderConversationMenu", () => {
   });
 
   it("labels project actions for filed and unfiled sessions", () => {
+    // Move to project is mobile-only in this menu now (desktop moved it to the
+    // breadcrumb folder tag).
+    mocks.isMobile = true;
     const view = renderMenu();
     openMenu();
     expect(screen.getByTestId("header-move-to-project")).toHaveTextContent("Add to project");
@@ -191,12 +206,14 @@ describe("HeaderConversationMenu", () => {
 
     expect(screen.getByTestId("header-project-picker-back")).toBeInTheDocument();
     expect(screen.queryByTestId("header-rename-conversation")).toBeNull();
-    expect(screen.getByRole("textbox", { name: "Search projects" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Search or create project" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("menuitem", { name: "Sprint 42" }));
     expect(mocks.moveToProject).toHaveBeenCalledWith({ id: "conv-1", project: "Sprint 42" });
   });
 
   it("closes and resets Rename when the conversation id changes", async () => {
+    // Rename item is mobile-only now.
+    mocks.isMobile = true;
     const view = renderMenu();
     openMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Rename" }));

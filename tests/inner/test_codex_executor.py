@@ -2652,6 +2652,41 @@ def test_populate_codex_home_config_symlinks_remote_mcp_oauth(tmp_path: Path) ->
     assert (target / "mcp-oauth-locks" / "file-store.lock").is_file()
 
 
+def test_populate_codex_home_config_symlinks_memories(tmp_path: Path) -> None:
+    """``memories_1.sqlite``, ``memories/``, and ``rules/`` are symlinked.
+
+    Codex stores memories in ``memories_1.sqlite`` and ``memories/``, and
+    user-defined rules in ``rules/``. Without symlinking them a private home
+    starts with no memories and ignores the user's rules.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "auth.json").write_text('{"auth_mode": "chatgpt"}')
+    (source / "config.toml").write_text("[default]\n")
+    (source / "memories_1.sqlite").write_bytes(b"SQLite format 3\x00fake")
+    (source / "memories").mkdir()
+    (source / "memories" / "mem.md").write_text("# memory")
+    (source / "rules").mkdir()
+    (source / "rules" / "default.rules").write_text(
+        'prefix_rule(pattern=["git"], decision="allow")'
+    )
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    assert (target / "memories_1.sqlite").is_symlink()
+    assert (target / "memories_1.sqlite").read_bytes() == b"SQLite format 3\x00fake"
+    assert (target / "memories").is_symlink()
+    assert (target / "memories" / "mem.md").read_text() == "# memory"
+    assert (target / "rules").is_symlink()
+    assert (
+        target / "rules" / "default.rules"
+    ).read_text() == 'prefix_rule(pattern=["git"], decision="allow")'
+
+
 def test_populate_codex_home_config_symlinks_plugins_cache(tmp_path: Path) -> None:
     """``plugins/cache`` is symlinked to the shared home to dedupe it.
 
@@ -3093,6 +3128,69 @@ def test_populate_codex_home_config_does_not_overwrite_existing(tmp_path: Path) 
 
     assert (target / "auth.json").read_text() == '{"old": true}'
     assert not (target / "auth.json").is_symlink()
+
+
+@pytest.mark.parametrize(
+    "provider_config",
+    [
+        '[model_providers.gateway]\nname = "Gateway"\nbase_url = "https://example.test"\n',
+        'model_providers = { gateway = { name = "Gateway", '
+        'base_url = "https://example.test" } }\n',
+    ],
+    ids=["table", "inline-table"],
+)
+def test_materialize_codex_provider_config_applies_default_retry_policy(
+    tmp_path: Path, provider_config: str
+) -> None:
+    """Private Codex providers receive Omnigent's retry budget.
+
+    Codex does not honor the speculative ``OPENAI_MAX_RETRIES`` environment
+    variable. Its native provider settings must be written into the private
+    config so a sustained retryable response does not exhaust Codex's smaller
+    built-in default first.
+    """
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+    from omnigent.spec.types import RetryPolicy
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(provider_config)
+
+    materialize_codex_provider_config(codex_home, [])
+
+    config = tomllib.loads((codex_home / "config.toml").read_text())
+    provider = config["model_providers"]["gateway"]
+    assert provider["request_max_retries"] == RetryPolicy().max_retries
+    assert provider["stream_max_retries"] == RetryPolicy().max_retries
+    assert provider["stream_idle_timeout_ms"] == 120_000
+
+
+def test_materialize_codex_provider_config_applies_custom_retry_policy(tmp_path: Path) -> None:
+    """Agent-specific retry values override Codex provider defaults."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+    from omnigent.spec.types import RetryPolicy
+
+    codex_home = tmp_path / "codex-home"
+    retry_policy = RetryPolicy(max_retries=13, timeout_per_request_s=300)
+
+    materialize_codex_provider_config(
+        codex_home,
+        [
+            'model_providers.generated={name="Generated",'
+            'base_url="https://example.test",wire_api="responses"}'
+        ],
+        retry_policy=retry_policy,
+    )
+
+    config = tomllib.loads((codex_home / "config.toml").read_text())
+    provider = config["model_providers"]["generated"]
+    assert provider["request_max_retries"] == 13
+    assert provider["stream_max_retries"] == 13
+    assert provider["stream_idle_timeout_ms"] == 300_000
 
 
 # ---------------------------------------------------------------------------

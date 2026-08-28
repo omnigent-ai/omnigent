@@ -127,6 +127,7 @@ _KIRO_MIN_VERSION = "2.10.0"
 _CLAUDE_MIN_VERSION = "2.1.161"
 _CURSOR_MIN_VERSION = "2026.06.02"
 _KIMI_MIN_VERSION = "0.7.0"
+_ANTIGRAVITY_MIN_VERSION = "1.1.13"
 
 # OpenCode native harness CLI (``opencode serve`` / ``opencode attach``),
 # installed via the ``opencode-ai`` npm package. No login/logout/status argv
@@ -293,6 +294,8 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         status_args=("models",),
         install_hint="curl -fsSL https://antigravity.google/cli/install.sh | bash",
         auth_hint="run `agy` and complete the browser sign-in",
+        # Direct GEMINI_API_KEY authentication first shipped in agy 1.1.13.
+        min_version=_ANTIGRAVITY_MIN_VERSION,
     ),
     GOOSE_KEY: HarnessInstallSpec(
         "Goose",

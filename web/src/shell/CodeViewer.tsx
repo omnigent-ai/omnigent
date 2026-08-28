@@ -42,6 +42,7 @@ import remarkEmoji from "remark-emoji";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { rehypeGithubAlerts } from "rehype-github-alerts";
+import rehypeSlug from "rehype-slug";
 import { mermaid } from "@streamdown/mermaid";
 import { MarkdownErrorBoundary } from "@/components/ai-elements/MarkdownErrorBoundary";
 import { Streamdown } from "streamdown";
@@ -72,9 +73,11 @@ import { useScrollRestore } from "./useScrollRestore";
 import { PreviewSearchBar } from "./PreviewSearchBar";
 import { renderLineTokens } from "./codeViewerRendering";
 import { HtmlCommentViewer } from "./HtmlCommentViewer";
+import { PreviewCommentBanner } from "./PreviewCommentBanner";
 import { TruncatedBanner } from "./TruncatedBanner";
 import { useLightbox } from "@/components/ImageLightbox";
 import { getEmbedRoot } from "@/lib/host";
+import { MarkdownTableOfContents } from "./MarkdownTableOfContents";
 
 // Monaco is heavy (~MBs + worker); load it only when a non-markdown file is
 // actually viewed, so the initial bundle and markdown/preview paths don't pay
@@ -117,13 +120,19 @@ const ALERT_TITLE_CLASS = /^markdown-alert-title$/;
 // on the alert wrapper div (markdown-alert*) and its title p (markdown-alert-
 // title) only for those exact tokens. Everything else — <script>, event
 // handlers, javascript: URLs, arbitrary classes — is still stripped, so raw
-// HTML in a .md file stays safe to render inline.
+// HTML in a .md file stays safe to render inline. Keep hast-util-sanitize's
+// default `clobberPrefix: "user-content-"`: heading IDs derive from untrusted
+// markdown (rehype-slug), and the prefix keeps them from clobbering named DOM
+// access or app-owned ids. The TOC reads `el.id` off the rendered DOM, so it
+// works regardless of the prefix.
+// Allow common img attributes (alt, width, height, align, valign) that GitHub supports.
 const MARKDOWN_SANITIZE_SCHEMA = {
   ...defaultSchema,
   attributes: {
     ...defaultSchema.attributes,
     div: [...(defaultSchema.attributes?.div ?? []), ["className", ALERT_CLASS]],
     p: [...(defaultSchema.attributes?.p ?? []), ["className", ALERT_TITLE_CLASS]],
+    img: [...(defaultSchema.attributes?.img ?? []), "alt", "width", "height", "align", "valign"],
   },
 };
 
@@ -132,10 +141,11 @@ const MARKDOWN_SANITIZE_SCHEMA = {
 // drops by default, showing the escaped tags as literal text. rehype-raw parses
 // that HTML; rehype-sanitize then strips anything unsafe (<script>, event
 // handlers, javascript: URLs) so this stays safe to render inline without an
-// iframe. Order matters: alerts transform before sanitize, and sanitize runs
-// last, after raw parsing and GFM.
+// iframe. Order matters: alerts transform before sanitize, slug adds IDs to
+// headings, and sanitize runs last, after raw parsing and GFM.
 const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
   rehypeRaw,
+  rehypeSlug,
   rehypeGithubAlerts,
   [rehypeSanitize, MARKDOWN_SANITIZE_SCHEMA],
 ];
@@ -187,25 +197,41 @@ function MarkdownPreview({
   content,
   rootRef,
   onScroll,
+  tocOpen,
+  onTocOpenChange,
 }: {
   content: string;
   rootRef?: RefObject<HTMLDivElement | null>;
   onScroll?: (event: UIEvent<HTMLElement>) => void;
+  tocOpen: boolean;
+  onTocOpenChange: (open: boolean) => void;
 }) {
   return (
-    <div
-      ref={rootRef}
-      data-preview-scroll
-      onScroll={onScroll}
-      className="markdown-preview px-6 py-4 overflow-auto h-full prose dark:prose-invert prose-sm max-w-none"
-    >
-      <ReactMarkdown
-        remarkPlugins={MARKDOWN_REMARK_PLUGINS}
-        rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
-        components={MARKDOWN_COMPONENTS}
+    <div className="flex h-full">
+      <div
+        ref={rootRef}
+        data-preview-scroll
+        onScroll={onScroll}
+        className="markdown-preview flex-1 px-6 py-4 overflow-auto prose dark:prose-invert prose-sm max-w-none"
       >
-        {content}
-      </ReactMarkdown>
+        <ReactMarkdown
+          remarkPlugins={MARKDOWN_REMARK_PLUGINS}
+          rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
+          components={MARKDOWN_COMPONENTS}
+        >
+          {content}
+        </ReactMarkdown>
+      </div>
+      {tocOpen && (
+        <aside className="w-64 shrink-0">
+          <MarkdownTableOfContents
+            content={content}
+            containerRef={rootRef}
+            open={tocOpen}
+            onClose={() => onTocOpenChange(false)}
+          />
+        </aside>
+      )}
     </div>
   );
 }
@@ -223,6 +249,9 @@ function PreviewWithSearch({
   searchInputRef,
   scrollKey,
   scrollReady,
+  tocOpen,
+  onTocOpenChange,
+  commentHint,
 }: {
   content: string;
   isNotebook: boolean;
@@ -234,6 +263,14 @@ function PreviewWithSearch({
   scrollKey: string | null;
   /** True once the file content backing the preview is present. */
   scrollReady: boolean;
+  tocOpen: boolean;
+  onTocOpenChange: (open: boolean) => void;
+  /**
+   * When present, shows a banner pointing users at the editor for commenting
+   * (the rendered preview can't anchor text-selection comments). Omitted for
+   * notebooks, which have no comment surface.
+   */
+  commentHint?: { conversationId: string; onSwitchToEdit: () => void };
 }) {
   const previewRef = useRef<HTMLDivElement>(null);
   // The preview div (not the FileViewer content area) is the real scroller
@@ -251,7 +288,13 @@ function PreviewWithSearch({
   const preview = isNotebook ? (
     <NotebookPreview content={content} rootRef={previewRef} onScroll={handleScroll} />
   ) : (
-    <MarkdownPreview content={content} rootRef={previewRef} onScroll={handleScroll} />
+    <MarkdownPreview
+      content={content}
+      rootRef={previewRef}
+      onScroll={handleScroll}
+      tocOpen={tocOpen}
+      onTocOpenChange={onTocOpenChange}
+    />
   );
   // The find bar sits above the preview; a truncated preview also shows the
   // banner. The bar renders nothing when closed, so layout is unchanged then.
@@ -259,6 +302,14 @@ function PreviewWithSearch({
     <div className="flex h-full flex-col">
       {bar}
       {truncated && <TruncatedBanner />}
+      {/* A truncated file can't be edited (or commented on) in the editor
+          either, so the hint would send the user to a dead end — suppress it. */}
+      {commentHint && !truncated && (
+        <PreviewCommentBanner
+          conversationId={commentHint.conversationId}
+          onSwitchToEdit={commentHint.onSwitchToEdit}
+        />
+      )}
       <div className="min-h-0 flex-1">{preview}</div>
     </div>
   );
@@ -370,6 +421,16 @@ export interface CodeViewerProps {
   onSaveStatusChange?: (status: SaveStatus) => void;
   /** Forwarded to MarkdownRichTextViewer → MarkdownCommentPlugin. */
   pendingBodyRef?: RefObject<string>;
+  /** Whether the TOC panel is open (for markdown preview). */
+  tocOpen?: boolean;
+  /** Callback to toggle TOC panel. */
+  onTocToggle?: () => void;
+  /**
+   * Switches a markdown file to the rich-text editor. When set, the rendered
+   * preview shows a banner pointing users there for commenting (the preview
+   * itself can't anchor text-selection comments).
+   */
+  onRequestEditMode?: () => void;
 }
 
 export function CodeViewer({
@@ -388,6 +449,9 @@ export function CodeViewer({
   onDirtyChange,
   onSaveStatusChange,
   pendingBodyRef,
+  tocOpen = false,
+  onTocToggle,
+  onRequestEditMode,
 }: CodeViewerProps) {
   const canEdit = useCanEdit(conversationId);
   const activeCommentId = activeSelection?.comment_id;
@@ -763,16 +827,24 @@ export function CodeViewer({
   }
 
   if (viewMode === "preview" && (lang === "markdown" || isNotebookPath(path))) {
+    const isNotebook = isNotebookPath(path);
     return (
       <PreviewWithSearch
         content={content}
-        isNotebook={isNotebookPath(path)}
+        isNotebook={isNotebook}
         truncated={truncated}
         searchOpen={searchOpen}
         onSearchHandled={handleSearchHandled}
         searchInputRef={searchInputRef}
         scrollKey={conversationId && path ? `viewer-preview:${conversationId}:${path}` : null}
         scrollReady={fileQuery.data !== undefined}
+        tocOpen={tocOpen}
+        onTocOpenChange={(open) => !open && onTocToggle?.()}
+        commentHint={
+          !isNotebook && onRequestEditMode
+            ? { conversationId, onSwitchToEdit: onRequestEditMode }
+            : undefined
+        }
       />
     );
   }

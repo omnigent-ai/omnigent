@@ -123,6 +123,7 @@ from omnigent.server.routes._sessions.helpers import (
     _invalidate_runner_backed_snapshot_state,
     _merge_claude_permission_launch_args,
     _multipart_missing_detail,
+    _native_coding_agent_for_agent,
     _notify_runner_of_bundled_child,
     _parse_session_create_metadata,
     _permission_level_from_grants,
@@ -185,6 +186,9 @@ from omnigent.session_lifecycle import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY as _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+)
 from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
@@ -2145,6 +2149,17 @@ def register_core_routes(
         from the truncated items instead of resuming the source's full
         native transcript.
 
+        The dialog's run-config picks (``body.model_override``,
+        ``body.reasoning_effort``, ``body.terminal_launch_args`` — the
+        permission-/approval-mode selector) override what the fork would
+        otherwise inherit. Each is opt-in: a field omitted from the request
+        keeps the inherited value (model/effort within the same provider
+        family; launch args on a same-agent fork), while a field present
+        wins — a clear alias (``"default"``) resets to the bound agent's
+        default, and an explicit launch-args list also drops the source's
+        copied permission-mode / codex-bypass labels so they can't shadow
+        the freshly chosen mode.
+
         A sub-agent source is allowed, which is how a sub-agent is
         promoted to a session of its own: the fork is always a fresh
         top-level conversation (no parent, its own spawn-tree root, its
@@ -2226,6 +2241,99 @@ def register_core_routes(
                 _same_provider_family, source_agent, base_agent
             )
 
+        # Explicit run-config overrides from the fork dialog. Each field is
+        # opt-in: a field the client OMITS (not in model_fields_set) inherits
+        # the source per the copy rules above; a field the client SENDS wins,
+        # overriding the inheritance (a clear alias like "default" resets to
+        # the bound agent's default). Validated before any row exists — the
+        # persisted values reach a native CLI as --model / --effort argv at
+        # terminal launch, so a bad value must never create an orphan fork.
+        fields_set = body.model_fields_set
+        model_override_set = "model_override" in fields_set
+        effort_set = "reasoning_effort" in fields_set
+        launch_args_set = "terminal_launch_args" in fields_set
+
+        override_model: str | None = None
+        clear_override_model = False
+        if model_override_set:
+            raw_model = body.model_override
+            if isinstance(raw_model, str) and raw_model.strip().lower() in EFFORT_CLEAR_VALUES:
+                clear_override_model = True
+            elif raw_model is not None:
+                try:
+                    override_model = validate_model_override(raw_model)
+                except ValueError as exc:
+                    raise OmnigentError(
+                        f"invalid model_override: {exc}",
+                        code=ErrorCode.INVALID_INPUT,
+                    ) from exc
+            else:
+                # Explicit JSON null clears the override (matches the clear
+                # aliases), so the fork falls back to the bound agent default.
+                clear_override_model = True
+
+        override_effort: str | None = None
+        clear_override_effort = False
+        if effort_set:
+            raw_effort = body.reasoning_effort
+            if raw_effort is None or raw_effort in EFFORT_CLEAR_VALUES:
+                clear_override_effort = True
+            else:
+                try:
+                    override_effort = validate_effort(raw_effort, "fork", EFFORT_VALUES)
+                except ValueError as exc:
+                    raise OmnigentError(
+                        f"invalid reasoning_effort: {exc}",
+                        code=ErrorCode.INVALID_INPUT,
+                    ) from exc
+
+        override_launch_args: list[str] | None = None
+        if launch_args_set:
+            try:
+                override_launch_args = _validate_terminal_launch_args(body.terminal_launch_args)
+            except ValueError as exc:
+                raise OmnigentError(
+                    f"invalid terminal_launch_args: {exc}",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
+
+        # Permission mode lives BOTH in launch args (``--permission-mode``) and
+        # as a copied label — and the label wins when both are present. So when
+        # the dialog picks explicit launch args, drop the source's mode-derived
+        # labels from the fork; otherwise the copied label would shadow the
+        # freshly chosen mode. Only on an explicit pick: an untouched picker
+        # sends no launch args and the label carries over as before.
+        dropped_label_keys_set: set[str] = set()
+        if launch_args_set:
+            dropped_label_keys_set |= {
+                _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
+                _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+            }
+        # The claude-native permission-mode label is Claude-specific; on an
+        # agent switch (which already drops the source's launch args) it would
+        # otherwise ride along as stale metadata that could hydrate a wrong mode
+        # in generic native-wrapper UI state. Drop it whenever the agent changes.
+        if switching_agent:
+            dropped_label_keys_set.add(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+        dropped_label_keys: frozenset[str] = frozenset(dropped_label_keys_set)
+
+        # DANGEROUS codex full-bypass. The source's bypass label is always
+        # dropped above (instance-scoped), so a bypass-armed source never
+        # silently re-arms its clone. The ONLY way a fork enables bypass is an
+        # explicit, banner-gated opt-in from the dialog — and only when the
+        # bound target is actually codex-native (the label is inert elsewhere,
+        # so refuse to stamp it on a non-Codex fork). Stamped via extra_labels,
+        # which the store applies AFTER the drop so the opt-in wins.
+        extra_labels: dict[str, str] = {}
+        if body.codex_bypass_sandbox:
+            target_native = await asyncio.to_thread(_native_coding_agent_for_agent, base_agent)
+            if target_native is None or target_native.harness != "codex-native":
+                raise OmnigentError(
+                    "codex_bypass_sandbox is only valid for a codex-native fork target",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            extra_labels[_CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY] = "1"
+
         # When the fork binds a NATIVE target, the native CLI won't replay
         # the copied Omnigent transcript on its own — mark the fork so the
         # runner carries history into the native harness. Same-family: clone
@@ -2292,11 +2400,24 @@ def register_core_routes(
                 cloned_agent_bundle_location=base_agent.bundle_location,
                 cloned_agent_description=base_agent.description,
                 copy_model_settings=copy_model_settings,
+                # Explicit run-config picks from the fork dialog. Each rides a
+                # (value, set-flag) pair so the store can tell "override to
+                # None / clear" from "not chosen — inherit". When unset, the
+                # store falls back to copy_model_settings / copy_terminal_launch_args.
+                override_model_override=None if clear_override_model else override_model,
+                override_model_override_set=model_override_set,
+                override_reasoning_effort=None if clear_override_effort else override_effort,
+                override_reasoning_effort_set=effort_set,
+                override_terminal_launch_args=override_launch_args,
+                override_terminal_launch_args_set=launch_args_set,
+                dropped_label_keys=dropped_label_keys,
+                extra_labels=extra_labels,
                 # Launch flags are CLI-specific. On an agent switch the fork may
                 # bind a different CLI (e.g. claude-code → pi), whose flag set
                 # differs — Claude Code's ``--permission-mode`` makes pi exit at
                 # launch (unknown option → ``required_terminal_exited``). Only
-                # carry the source's launch args on a same-agent fork.
+                # carry the source's launch args on a same-agent fork. An
+                # explicit override above supersedes this.
                 copy_terminal_launch_args=not switching_agent,
                 carry_history_into_native=carry_history_into_native,
                 resume_source_native_session=resume_source_native_session,

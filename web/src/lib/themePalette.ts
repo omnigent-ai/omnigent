@@ -18,6 +18,12 @@
 // plus a single `apply*` function that owns the DOM side-effect, called at boot
 // (main.tsx) before first paint and on every change (Appearance settings).
 
+// `.ts` extension (not extensionless like the app's other imports): this module
+// is also loaded directly by the `generate-theme-palettes.mjs` node script,
+// whose ESM resolver can't do extensionless resolution. tsconfig has
+// `allowImportingTsExtensions`, and Vite resolves it the same either way.
+import { getThemeRoots } from "./host.ts";
+
 const STORAGE_KEY = "omnigent:ui-theme-palette";
 
 /** Selectable color palettes. The first entry is the default (brand) look. */
@@ -606,17 +612,25 @@ export function writeThemePalette(palette: ThemeSelection): void {
 }
 
 /**
- * Apply the palette to the DOM by setting `data-theme` on the document root.
+ * Apply the palette to the DOM by setting `data-theme` on the theme roots.
  * The generated `[data-theme]` blocks re-point the color tokens; the default
- * "omni" palette removes the attribute. This composes with next-themes' `.dark`
+ * "omni" palette removes the attribute. This composes with the `.dark` mode
  * class untouched.
+ *
+ * Embedded, `getThemeRoots()` returns both the scope root (matched by the light
+ * `:root[data-theme]` selectors) and the inner `.dark` root (matched by the
+ * dark `.dark[data-theme]` selectors); standalone it's just the document root,
+ * so behavior is unchanged.
  */
 export function applyThemePalette(palette: ThemeSelection): void {
-  if (typeof document === "undefined") return;
+  const roots = getThemeRoots();
+  if (roots.length === 0) return;
   const next = isThemeSelection(palette) ? palette : DEFAULT_PALETTE;
-  if (next === DEFAULT_PALETTE) {
-    document.documentElement.removeAttribute("data-theme");
-    return;
+  for (const root of roots) {
+    if (next === DEFAULT_PALETTE) {
+      root.removeAttribute("data-theme");
+    } else {
+      root.setAttribute("data-theme", next);
+    }
   }
-  document.documentElement.setAttribute("data-theme", next);
 }

@@ -23,6 +23,12 @@ against**. Your working directory is an `omnigent-ai/omnigent` checkout — the
 product repo where the bug lives, the code you may change, and where the tests
 belong.
 
+**Environment note:** when you run under `--server` you're inside a
+Databricks-network session where the public npm/PyPI registries are blocked —
+point package installs at the internal proxies. See
+[`dev/agent-environment.md`](../agent-environment.md) before running any
+`npm`/`pnpm`/`pip`/`uv` install.
+
 ## Input contract
 
 You are invoked with a **pointer to a completed repro run** — not the bug report
@@ -266,8 +272,11 @@ reproduction test is your objective instrument.
    through **and** produce the after; when it carries none, still produce the
    after and note the missing before. Only omit the after clip when it is
    genuinely unobtainable (recorder tooling missing, or the fixture can't come
-   online after the SPA build) — say so explicitly in your review comment and in
-   `evidence`, naming the blocker. A missing upstream before-clip is never that
+   online after the SPA build **and** the leaked runner env is stripped) — say so
+   explicitly in your review comment and in `evidence`, naming the blocker. An
+   `online: false` seen while `OMNIGENT_RUNNER_ID` is still set is your own
+   un-stripped env, not a blocker: re-run with the `env -u` prefix from
+   `dev/recording-lanes.md` first. A missing upstream before-clip is never that
    blocker. Never drop it silently.
 4. **Review the diff** for quality, not just green: does it address the **root
    cause** or only mask the symptom? Does it miss facets or obvious adjacent edge
@@ -296,6 +305,14 @@ reproduction test is your objective instrument.
      --body '…'`. A genuine independent verification — the "someone checked it, take
      your pass" signal a maintainer wants. Note in the body that it's an automated
      reviewer's approval and a maintainer's approval is still required to merge.
+     **"Polly clean" here means a real Polly review actually ran and came back
+     clean** — a fresh `<!-- polly-review-bot -->` comment for the current head,
+     every finding fixed or justified (4.3), **not** a green check. If you could not
+     get a real Polly review to run (the dispatch failed, no comment ever landed,
+     or you only ever saw the phantom green check on a fork PR), you have **not**
+     verified this precondition: do **not** approve. Leave a `--comment` review
+     that states the fail→pass evidence *and* that a Polly review could not be
+     obtained, and let a maintainer take over the review from there.
    - **`not_fixed` / `partially_fixed`** → `gh pr review <pr> --request-changes
      --body '…'` naming what still fails.
    - **You pushed fixes to this PR** (in-repo branch) **or took it over** (fork) →
@@ -311,7 +328,10 @@ reproduction test is your objective instrument.
    **fork PR** you can't push to *and it needs a fix*, take over by opening your
    own PR that carries their commits + your fix (crediting them). If the fork PR
    needs no fix, keep it as-is. Either way you **do** iterate CI and Polly, rather
-   than triggering one review and stopping. Record `mode: "reviewed_existing_pr"`
+   than triggering one review and stopping — and on a fork PR you must actually
+   dispatch Polly and wait for its comment, because the automatic check reports a
+   green `pass` there without ever running (see 4.3). Record
+   `mode: "reviewed_existing_pr"`
    and its `pr_url` when you keep it; if a fork takeover made you open your own,
    record `mode: "authored_fix"` with the fork PR in `reviewed_pr_url`.
 
@@ -482,7 +502,12 @@ produces*:
   and the handoff (`recordings`). Omit it **only** for the genuine environmental
   blockers named in `dev/recording-lanes.md` (tooling missing, server won't come
   online, `api`-surface facet with nothing to film) — and then say which, with the
-  evidence; never report an after-clip you didn't actually produce.
+  evidence; never report an after-clip you didn't actually produce. When you run
+  inside a server-spawned runner (`OMNIGENT_RUNNER_ID` is set), a recorder
+  `online: false` is **not** an environmental blocker until you have stripped the
+  leaked runner/host env vars per `dev/recording-lanes.md`; an un-stripped
+  `online: false` is your own env and must be re-run with the `env -u` prefix, not
+  filed as "runner won't come online."
 
 ### 2B.6 — Get an independent cross-vendor review before you open the PR
 
@@ -514,10 +539,12 @@ server and runner you already run on; no new infrastructure.
    PR bots later catch a new recurring class, add a line to that checklist so the
    next run catches it up front.
 3. **Read the review back** (`sys_session_get_history` on the child) and **act on
-   it**: fix any blocking/security finding it surfaces, re-run the deliverable
+   every finding it surfaces — not only the blocking/security ones**: address each
+   (fix it at the root, or record why it's not actionable), re-run the deliverable
    (back through 2B.5) so it stays green, and — because the diff changed — refresh
-   the review or note why a finding was left. Do not open the PR with an
-   unaddressed blocking finding.
+   the review or note why a finding was left. Treat a non-blocking note the same way
+   you will treat Polly's in 4.3: judge it by whether it's correct, not by its
+   label. Do not open the PR with an unaddressed finding of any severity.
 4. **If no different-vendor bundle is reachable** (e.g. codex isn't configured in
    this environment), do **not** silently fall back to reviewing your own work as
    if it were independent. Skip the spawn and record `cross_review: "skipped: no
@@ -915,37 +942,66 @@ gh pr view <pr> --json comments \
   --jq '[.comments[] | select(.body | startswith("<!-- polly-review-bot -->"))] | last | .body'
 ```
 
+**A green "Polly AI Review" check is not proof Polly reviewed anything.** On a
+**fork PR** the automatic `pull_request` run has no LLM credentials (GitHub
+withholds secrets from fork events), so the workflow's credentials gate skips every
+real step and the check still reports `pass` in a few seconds — a green check with
+no review behind it. Never read the check status as "Polly is clean." The **only**
+evidence of a real review is a fresh `<!-- polly-review-bot -->` **comment** for
+the current head; if the query above returns empty, Polly has **not** reviewed this
+head, no matter what `gh pr checks` says.
+
 Polly runs automatically when the PR first becomes ready, but on a **reviewed PR**
-that already opened before you arrived it may not have run for the current head —
-so kick off the first review yourself. **Trigger it via the workflow's
+that already opened before you arrived — and on **every fork PR**, where the
+automatic run always skips — it will not have posted a real review for the current
+head, so you must kick one off yourself. **Trigger it via the workflow's
 `workflow_dispatch` entry point, not a `/review` comment**: Polly's comment handler
 **ignores `/review` from `[bot]` accounts, and you are one** (`omni-resolve-agent[bot]`),
 so a `/review` comment you post is silently dropped. `workflow_dispatch` has no
-bot/association gate:
+bot/association gate, and it reviews a prefetched diff so it works even for a fork
+PR whose automatic run skipped:
 
 ```
 gh workflow run polly-review.yml -R omnigent-ai/omnigent -f pr=<pr>
 ```
 
-Wait for the review to land (a few minutes), then triage the newest comment:
+Your App token carries `actions: write`, so this dispatch is expected to succeed;
+a `403` means the App lost that permission — record `polly_review` as "could not
+dispatch — App lacks actions:write" and flag it, rather than falling back to the
+green check as if the review were clean.
 
-- **Critical findings present** — anything under **Blocking issues** or **Security
-  vulnerabilities** that is a real defect in the PR's diff. Fix each one at the root
-  (same fail→pass discipline as Step 2B — add/adjust a targeted test where it
-  makes sense), re-run the affected tests, then land the fix per the
-  **push-or-take-over rule**: `git commit` + `git push` when you can push to the
-  branch; on a **fork PR** you can't push to, take over into your own PR (Step 4
-  preamble) and continue on it.
-  - After **pushing** a fix (to your PR or an in-repo branch), **re-trigger the
-    review** the same way — another `gh workflow run polly-review.yml -f pr=<pr>`
-    (again: not a `/review` comment from you). Then poll for a **new**
-    `<!-- polly-review-bot -->` comment and triage again.
-- **No critical findings** — only non-blocking notes or a clean summary → the
-  review is clean; you're done with this loop. You may address cheap non-blocking
-  notes if they're clearly right, but they don't gate.
+Wait for a **new** `<!-- polly-review-bot -->` comment to land (a few minutes) —
+never treat the review as done on the green check alone — then **triage every
+finding under *all* headings, not just Blocking/Security**. Polly's bucketing is a hint, not a
+verdict: a real defect regularly lands under **Non-blocking notes** (a missed edge
+case, a subtly wrong condition, a dropped error path), and "non-blocking" is not a
+licence to ignore it. Go through the newest comment finding by finding — Blocking
+issues, Security vulnerabilities, **and** Non-blocking notes — and for each one do
+exactly one of:
 
-Repeat push → re-trigger → re-read within the round cap until no critical Polly
-findings remain. Record the final state in the handoff (`polly_review`). If a
+- **Fix it** — the default for anything that is, or might be, a real defect or a
+  cheap correctness/robustness win. Fix at the root (same fail→pass discipline as
+  Step 2B — add/adjust a targeted test where it makes sense), re-run the affected
+  tests, then land the fix per the **push-or-take-over rule**: `git commit` +
+  `git push` when you can push to the branch; on a **fork PR** you can't push to,
+  take over into your own PR (Step 4 preamble) and continue on it. **Re-assess a
+  non-blocking note as if it were blocking** — decide by whether it's *correct*,
+  not by which heading Polly filed it under.
+- **Justify skipping it** — only when it is genuinely not actionable in this PR: a
+  false positive, purely stylistic/subjective, or out of scope (a pre-existing
+  issue your diff didn't introduce). State *which* finding and *why* — in a PR
+  reply to Polly's comment and in the handoff (`polly_review`). Never skip a
+  finding silently, and never skip one merely because it's labelled non-blocking.
+
+After **pushing** any fix (to your PR or an in-repo branch), **re-trigger the
+review** — another `gh workflow run polly-review.yml -f pr=<pr>` (again: not a
+`/review` comment from you) — then poll for a **new** `<!-- polly-review-bot -->`
+comment and triage it again the same way.
+
+Repeat push → re-trigger → re-read within the round cap until **every** finding on
+the newest review is either fixed or has a recorded justification — no unaddressed
+notes of any severity remain. Record the final state in the handoff
+(`polly_review`), including which non-blocking notes you fixed vs. justified. If a
 recurring class of bug shows up here, add a one-line check to
 `dev/resolve-agent/review-checklist.md` so the pre-PR reviewer catches it next
 time.
@@ -1216,10 +1272,14 @@ Field meanings:
   and whether each was diff-caused vs pre-existing/flaky/infra. If a fork PR needed
   a fix and you took over into your own PR, this reflects **your** PR's checks.
   Empty when `skip_push` was set or you stopped before there was a PR to land.
-- `polly_review` — the result of the Step 4.3 automated-review loop: `clean` (no
-  blocking/security findings) with how many review rounds it took and what you
-  fixed, or the unresolved critical findings if you hit the round cap. Empty when
-  no PR was opened.
+- `polly_review` — the result of the Step 4.3 automated-review loop: `clean` (every
+  finding on the newest **real review comment** addressed — blocking, security, **and**
+  non-blocking) with how many review rounds it took, what you fixed, and which
+  non-blocking notes you fixed vs. justified skipping; or the unresolved findings if
+  you hit the round cap. If a real review never ran — the dispatch failed or no
+  `<!-- polly-review-bot -->` comment ever landed (a phantom green check does not
+  count) — say so here explicitly; that state also blocks an approving review (see
+  the review-verdict step). Empty when no PR was opened.
 - `ui_preview` — the result of Step 4.1 (run on every PR, not just frontend fixes):
   the **preview URL** (verbatim, so the ticket write-back can surface it and a
   reviewer can `omnigent claude -p '<prompt>' --server <url>`), or why it failed to

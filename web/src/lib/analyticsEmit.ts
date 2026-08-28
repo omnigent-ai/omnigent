@@ -73,10 +73,12 @@ function newInteractionId(): string {
 export interface TimedInteraction {
   /**
    * Report the terminal outcome and elapsed `durationMs` (defaults to
-   * "success"). Idempotent: only the first settle emits, so a double-settle
-   * (e.g. a catch after a partial success) can never double-count.
+   * "success"; pass `null` to omit status entirely — for interactions with no
+   * reliable outcome signal, such as tool calls). Idempotent: only the first
+   * settle emits, so a double-settle (e.g. a catch after a partial success)
+   * can never double-count.
    */
-  complete: (status?: OmnigentInteractionStatus) => void;
+  complete: (status?: OmnigentInteractionStatus | null) => void;
   /** Shorthand for `complete("failure")`. */
   fail: () => void;
 }
@@ -92,22 +94,30 @@ export interface TimedInteraction {
  *
  *   const interaction = startTimedInteraction("get_session", sessionId);
  *   try { await load(); interaction.complete(); } catch (e) { interaction.fail(); throw e; }
+ *
+ * `name` is an optional bounded, non-PII label (e.g. a tool name) carried on both
+ * phases; never user content.
  */
 export function startTimedInteraction(
   interactionKind: OmnigentInteractionKind,
   interactionId: string = newInteractionId(),
+  name?: string,
 ): TimedInteraction {
   const startedAt = Date.now();
   let settled = false;
-  emitInteractionPhase({ interactionId, interactionKind, phase: "start" });
-  const complete = (status: OmnigentInteractionStatus = "success"): void => {
+  const label = name ? { name } : {};
+  emitInteractionPhase({ interactionId, interactionKind, phase: "start", ...label });
+  const complete = (status: OmnigentInteractionStatus | null = "success"): void => {
     if (settled) return;
     settled = true;
     emitInteractionPhase({
       interactionId,
       interactionKind,
       phase: "complete",
-      status,
+      // `null` omits status: an interaction with no reliable outcome signal
+      // (a tool call) must not report a fabricated success/failure.
+      ...(status !== null ? { status } : {}),
+      ...label,
       durationMs: Date.now() - startedAt,
     });
   };

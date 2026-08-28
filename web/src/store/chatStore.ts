@@ -113,13 +113,19 @@ import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import { codexPlanModeFromSession } from "@/lib/codexPlanMode";
 import { getCurrentAuthorId } from "@/lib/identity";
-import { getOmnigentHostConfig, type OmnigentInteractionStatus } from "@/lib/host";
+import { getOmnigentHostConfig } from "@/lib/host";
 // Routing-free emit primitive (not "@/lib/analytics", which pulls in useLocation
 // and would form a routing↔store import cycle).
 import { emitInteractionPhase, startTimedInteraction } from "@/lib/analyticsEmit";
+import {
+  markSessionCreated,
+  onLiveBlock,
+  onResponseEnd,
+  onResponseStart,
+} from "./interactionTelemetry";
 import { getSessionHost } from "@/lib/sessionHost";
 import { isSystemUserContent } from "@/lib/systemMessage";
-import { isNativeWrapper } from "@/lib/nativeCodingAgents";
+import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
 
 export interface SendOptions {
   /**
@@ -2766,16 +2772,13 @@ async function ensureBoundSession(
     // initial_items dispatch synchronously inside create_session,
     // before we can subscribe to /stream, so early events can be
     // missed). Bind the stream FIRST, then post the first message.
-    const createInteraction = startTimedInteraction("create_session");
-    let session: Session;
-    try {
-      session = await createSession(agentId, []);
-      createInteraction.complete();
-    } catch (error) {
-      createInteraction.fail();
-      throw error;
-    }
+    const session = await createSession(agentId, []);
     sessionId = session.id;
+    // Register the create_session span (see interactionTelemetry). This path
+    // sends no host params, so the server always makes an external ("computer")
+    // session — managed sandboxes are created by the New Chat dialog, which
+    // registers itself.
+    markSessionCreated(sessionId, "computer");
     // Claim the send chain for this id NOW, while it is still private to this
     // call. Everything below publishes it (the store write, the navigate
     // callback, the sidebar invalidation) and awaits network work, so a send
@@ -2958,14 +2961,13 @@ function sessionBindingPatch(
   | "sandboxStatus"
   | "mcpStartup"
 > {
-  const wrapper = session.labels?.["omnigent.wrapper"];
   return {
-    isNativeTerminalSession: isNativeWrapper(wrapper),
+    isNativeTerminalSession: isNativeTerminalSessionFn(session),
     // Native wrapper whose model lives in the vendor TUI (no Omnigent picker):
     // qwen/goose/cursor/pi/opencode. nativeModelFamilyForSession is non-null
     // only for claude-/codex-native, which keep the composer model label.
     nativeVendorOwnsModel:
-      isNativeWrapper(wrapper) && nativeModelFamilyForSession(session) === null,
+      isNativeTerminalSessionFn(session) && nativeModelFamilyForSession(session) === null,
     boundAgentId: session.agentId,
     boundAgentName: session.agentName,
     llmModel: session.llmModel ?? null,
@@ -2976,7 +2978,7 @@ function sessionBindingPatch(
     costControlModeOverride: session.costControlModeOverride ?? null,
     subagentRoutingOverride: session.subagentRoutingOverride ?? null,
     codexPlanMode: codexPlanModeFromSession(session),
-    claudePermissionMode: isNativeWrapper(wrapper)
+    claudePermissionMode: isNativeTerminalSessionFn(session)
       ? (claudePermissionModeFromSession(session) ?? "")
       : "",
     contextWindow: session.contextWindow ?? null,
@@ -4550,29 +4552,11 @@ function revivePendingElicitationBlock(set: Setter, elicitationId: string): void
   });
 }
 
-// Product-analytics interaction tracking (agent runs, tool calls). START stamps
-// a timestamp keyed by the run/tool id; COMPLETE reads-and-deletes it, so each
-// interaction emits start/complete exactly once (guarding SSE re-delivery on
-// reconnect) and carries a duration. Only the LIVE pump below writes these —
-// history hydration goes through `reduceSync`, which never runs this loop, so
-// reopening an old conversation never re-emits.
-const runStartTimes = new Map<string, number>();
-const toolStartTimes = new Map<string, number>();
-
-function mapRunStatus(state: string): OmnigentInteractionStatus {
-  switch (state) {
-    case "completed":
-      return "success";
-    case "failed":
-      return "failure";
-    // "incomplete"/"cancelled" are both a stopped turn from the user's view.
-    case "incomplete":
-    case "cancelled":
-      return "cancelled";
-    default:
-      return "failure";
-  }
-}
+// agent_run / tool_call / create_session telemetry is emitted from this pump's
+// live reduce-loop (see `onResponseStart` / `onResponseEnd` / `onLiveBlock` in
+// `interactionTelemetry.ts`) — the one place each stream frame is seen once,
+// live, in order. Create sites call `markSessionCreated`. `approval` above stays
+// a direct emit — it has no stream lifecycle.
 
 export async function pumpStreamEvents(
   id: string,
@@ -4658,18 +4642,13 @@ export async function pumpStreamEvents(
         // New response: force-flush whatever is buffered, then land the
         // marker + lifecycle in one commit. Reset the first-paint latch.
         paintedFirstContent = false;
+        // agent_run start. This is the live turn edge — a revive reopens the
+        // turn via `set()` and emits no `response_start`, so it never double-opens.
+        onResponseStart(id, block.responseId);
         flush(block, {
           activeResponse: { responseId: block.responseId, state: "streaming", error: null },
           status: "streaming",
         });
-        if (block.responseId && !runStartTimes.has(block.responseId)) {
-          runStartTimes.set(block.responseId, Date.now());
-          emitInteractionPhase({
-            interactionId: block.responseId,
-            interactionKind: "agent_run",
-            phase: "start",
-          });
-        }
         continue;
       }
 
@@ -4811,18 +4790,9 @@ export async function pumpStreamEvents(
           const errorMsg = block.response?.error?.message ?? null;
           finalizeActive(set, block.status as ActiveResponse["state"], errorMsg);
         }
-        const runStart = runStartTimes.get(endedId);
-        if (endedId && runStart !== undefined) {
-          runStartTimes.delete(endedId);
-          emitInteractionPhase({
-            interactionId: endedId,
-            interactionKind: "agent_run",
-            phase: "complete",
-            status:
-              active?.state === "cancelled" ? "cancelled" : mapRunStatus(String(block.status)),
-            durationMs: Date.now() - runStart,
-          });
-        }
+        // agent_run complete + create_session settle. Read the finalized state so
+        // a `session.interrupted` cancelled (kept above) wins over block.status.
+        onResponseEnd(id, endedId, get().activeResponse?.state ?? block.status);
         // Turn over: drop any provisional preview never finalized by a
         // committed item (e.g. an interrupt where the partial item lands
         // after this event, or a stream drop). Normal messages already
@@ -4847,35 +4817,10 @@ export async function pumpStreamEvents(
         continue;
       }
 
-      // Tool-call analytics (live only). No reliable success/failure signal on
-      // the result block — tool errors surface as separate error events — so we
-      // report invocation + duration + tool name, not an outcome status.
-      if (block.type === "tool_group") {
-        for (const ex of block.executions) {
-          if (ex.callId && !toolStartTimes.has(ex.callId)) {
-            toolStartTimes.set(ex.callId, Date.now());
-            emitInteractionPhase({
-              interactionId: ex.callId,
-              interactionKind: "tool_call",
-              phase: "start",
-              name: ex.name,
-            });
-          }
-        }
-      } else if (block.type === "tool_result") {
-        const toolStart = toolStartTimes.get(block.callId);
-        if (block.callId && toolStart !== undefined) {
-          toolStartTimes.delete(block.callId);
-          emitInteractionPhase({
-            interactionId: block.callId,
-            interactionKind: "tool_call",
-            phase: "complete",
-            name: block.name,
-            durationMs: Date.now() - toolStart,
-          });
-        }
-      }
-
+      // tool_call boundaries + create_session first-activity, from live blocks.
+      // Only fresh (non-deduped) blocks reach here, so each is observed once;
+      // history hydration takes the `reduceSync` path and never runs this loop.
+      onLiveBlock(id, block);
       buffer.push(block);
       if (!paintedFirstContent) {
         // First content of the response — paint it immediately so the
