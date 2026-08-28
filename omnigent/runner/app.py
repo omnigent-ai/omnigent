@@ -2344,6 +2344,10 @@ def create_runner_app(
 
     _version_cache: dict[str, int] = {}  # conversation_id → last seen agent_version
     _spec_cache: dict[str, _SpecEntry] = {}  # agent_id → cached AgentSpec for terminal tools
+    # Agent-keyed analogue of _session_cache_generations. This cache is shared
+    # by every conversation, so a resolution parked across an invalidation must
+    # discard its write instead of reinstating the retired bundle for everyone.
+    _spec_cache_generations: dict[str, int] = {}
     _resp_to_conv: dict[str, str] = {}  # harness response_id → conversation_id
     _live_response_id: dict[str, str] = {}
     app.state.live_response_id = _live_response_id
@@ -2433,6 +2437,18 @@ def create_runner_app(
     def _session_cache_generation_is_current(session_id: str, generation: int) -> bool:
         """True only when the captured generation still matches — fill may write."""
         return _session_cache_generations.get(session_id, 0) == generation
+
+    def _spec_cache_generation(agent_id: str) -> int:
+        """Return (and materialize) the generation an agent-spec fill starts under."""
+        return _spec_cache_generations.setdefault(agent_id, 0)
+
+    def _spec_cache_generation_is_current(agent_id: str, generation: int) -> bool:
+        """True only when the captured generation still matches — fill may write."""
+        return _spec_cache_generations.get(agent_id, 0) == generation
+
+    # The spec caches are closure state, but their invalidation ordering is
+    # worth asserting directly rather than inferring from a turn's output.
+    app.state.spec_caches = {"agent": _spec_cache, "session": _session_spec_cache}
 
     _codex_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _pi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
@@ -6516,6 +6532,9 @@ def create_runner_app(
         if _dispatched_agent_id:
             _session_agent_ids[conv] = _dispatched_agent_id
 
+        # Captured before the resolver awaits below: every memoizing write in
+        # this block is fenced on it, so a reset landing mid-resolve is not undone.
+        _turn_session_generation = _session_cache_generation(conv)
         cached_spec_entry = _session_spec_cache.get(conv)
         cached_spec = _unwrap_resolved_spec(cached_spec_entry)
         cached_spec_workdir = _resolved_spec_workdir(cached_spec_entry)
@@ -6524,13 +6543,19 @@ def create_runner_app(
             if _aid:
                 try:
                     resolved = await spec_resolver(_aid, conv)
+                    # This turn keeps what it resolved; only caching is fenced.
+                    _generation_current = _session_cache_generation_is_current(
+                        conv, _turn_session_generation
+                    )
                     if isinstance(resolved, ResolvedSpec):
                         cached_spec = _unwrap_resolved_spec(resolved)
                         cached_spec_workdir = _resolved_spec_workdir(resolved)
-                        _session_spec_cache[conv] = resolved
+                        if _generation_current:
+                            _session_spec_cache[conv] = resolved
                     elif resolved is not None:
                         cached_spec = resolved
-                        _session_spec_cache[conv] = resolved
+                        if _generation_current:
+                            _session_spec_cache[conv] = resolved
                 except (httpx.HTTPError, RuntimeError):
                     _logger.warning(
                         "Spec resolution failed for %s",
@@ -6567,12 +6592,14 @@ def create_runner_app(
                 cached_spec_entry = sub_entry
                 cached_spec = _unwrap_resolved_spec(sub_entry)
                 cached_spec_workdir = _resolved_spec_workdir(sub_entry)
-                _session_spec_cache[conv] = sub_entry
+                if _session_cache_generation_is_current(conv, _turn_session_generation):
+                    _session_spec_cache[conv] = sub_entry
 
         cached_spec = _spec_with_workdir_paths(cached_spec, cached_spec_workdir)
         if cached_spec is not None:
             cached_spec_entry = _rewrap_like(cached_spec_entry, cached_spec, cached_spec_workdir)
-            _session_spec_cache[conv] = cached_spec_entry
+            if _session_cache_generation_is_current(conv, _turn_session_generation):
+                _session_spec_cache[conv] = cached_spec_entry
 
         harness_name: str | None = None
         spawn_env: dict[str, str] | None = None
@@ -7052,6 +7079,7 @@ def create_runner_app(
                 _turn_spec_entry = _session_entry
                 _turn_spec = _unwrap_resolved_spec(_session_entry)
             if _turn_spec is None and spec_resolver is not None:
+                _eager_generation = _spec_cache_generation(_turn_agent_id)
                 try:
                     _resolved_turn_spec = await spec_resolver(_turn_agent_id, conv_id)
                     _turn_spec = _unwrap_resolved_spec(_resolved_turn_spec)
@@ -7069,7 +7097,10 @@ def create_runner_app(
                     )
                 else:
                     if _resolved_turn_spec is not None and _turn_spec is not None:
-                        _spec_cache[_turn_agent_id] = _resolved_turn_spec
+                        # This turn keeps what it resolved; only the shared cache
+                        # is fenced.
+                        if _spec_cache_generation_is_current(_turn_agent_id, _eager_generation):
+                            _spec_cache[_turn_agent_id] = _resolved_turn_spec
                         _turn_spec_entry = _resolved_turn_spec
             _turn_spec_resolved = True
             _turn_mcp = ProxyMcpManager(conv_id, server_client)
@@ -7107,6 +7138,7 @@ def create_runner_app(
                 _turn_spec_entry = cached
                 _turn_spec = _unwrap_resolved_spec(cached)
                 return cached, None
+            _lazy_generation = _spec_cache_generation(_turn_agent_id)
             try:
                 resolved = await spec_resolver(_turn_agent_id, conv_id)
             except (httpx.HTTPError, RuntimeError) as exc:
@@ -7122,7 +7154,8 @@ def create_runner_app(
                     "Failed to resolve the agent spec for this turn.",
                 )
             if resolved is not None:
-                _spec_cache[_turn_agent_id] = resolved
+                if _spec_cache_generation_is_current(_turn_agent_id, _lazy_generation):
+                    _spec_cache[_turn_agent_id] = resolved
                 _turn_spec_entry = resolved
                 _turn_spec = _unwrap_resolved_spec(resolved)
                 return resolved, None
@@ -9940,6 +9973,7 @@ def create_runner_app(
         _session_sub_agent_resolved.pop(session_id, None)
         if agent_id:
             _spec_cache.pop(agent_id, None)
+            _spec_cache_generations[agent_id] = _spec_cache_generations.get(agent_id, 0) + 1
 
     async def _invalidate_session_agent_state(session_id: str, new_agent_id: str | None) -> None:
         """Clear all agent-derived caches and release the harness subprocess.
