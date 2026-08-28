@@ -1501,6 +1501,7 @@ function HarnessConfigModal({
   costControlMode,
   gpt56SolRoutingEnabled,
   databricksKimiRoutingEnabled,
+  codexSubscriptionRoutingEnabled,
   setPermissionMode,
   setApprovalMode,
   setCursorExecMode,
@@ -1512,6 +1513,7 @@ function HarnessConfigModal({
   setCostControlMode,
   setGpt56SolRoutingEnabled,
   setDatabricksKimiRoutingEnabled,
+  setCodexSubscriptionRoutingEnabled,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -1537,6 +1539,7 @@ function HarnessConfigModal({
   costControlMode: CostControlMode;
   gpt56SolRoutingEnabled: boolean;
   databricksKimiRoutingEnabled: boolean;
+  codexSubscriptionRoutingEnabled: boolean;
   setPermissionMode: (mode: string) => void;
   setApprovalMode: (mode: string) => void;
   setCursorExecMode: (mode: string) => void;
@@ -1548,6 +1551,7 @@ function HarnessConfigModal({
   setCostControlMode: (mode: CostControlMode) => void;
   setGpt56SolRoutingEnabled: (enabled: boolean) => void;
   setDatabricksKimiRoutingEnabled: (enabled: boolean) => void;
+  setCodexSubscriptionRoutingEnabled: (enabled: boolean) => void;
 }) {
   const info = useServerInfo();
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
@@ -1578,6 +1582,9 @@ function HarnessConfigModal({
   const [draftDatabricksKimiRoutingEnabled, setDraftDatabricksKimiRoutingEnabled] = useState(
     databricksKimiRoutingEnabled,
   );
+  const [draftCodexSubscriptionRoutingEnabled, setDraftCodexSubscriptionRoutingEnabled] = useState(
+    () => codexSubscriptionRoutingEnabled,
+  );
 
   useEffect(() => {
     if (!open) return;
@@ -1592,6 +1599,7 @@ function HarnessConfigModal({
     setDraftRouting(costControlMode);
     setDraftGpt56SolRoutingEnabled(gpt56SolRoutingEnabled);
     setDraftDatabricksKimiRoutingEnabled(databricksKimiRoutingEnabled);
+    setDraftCodexSubscriptionRoutingEnabled(codexSubscriptionRoutingEnabled);
     // Seed once per open from the current live values.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
@@ -1649,6 +1657,7 @@ function HarnessConfigModal({
     if (autoNative) {
       setGpt56SolRoutingEnabled(draftGpt56SolRoutingEnabled);
       setDatabricksKimiRoutingEnabled(draftDatabricksKimiRoutingEnabled);
+      setCodexSubscriptionRoutingEnabled(draftCodexSubscriptionRoutingEnabled);
       onOpenChange(false);
       return;
     }
@@ -1711,6 +1720,7 @@ function HarnessConfigModal({
     if (autoRouting) {
       setGpt56SolRoutingEnabled(draftGpt56SolRoutingEnabled);
       setDatabricksKimiRoutingEnabled(draftDatabricksKimiRoutingEnabled);
+      setCodexSubscriptionRoutingEnabled(draftCodexSubscriptionRoutingEnabled);
     }
     onOpenChange(false);
   };
@@ -2003,6 +2013,17 @@ function HarnessConfigModal({
                   data-testid="new-chat-landing-config-databricks-kimi-routing"
                 />
               </ConfigRow>
+              <ConfigRow
+                label="Use Codex subscription models"
+                description="Allow Luna, Terra, and optionally Sol alongside the Databricks allowlist"
+              >
+                <Switch
+                  checked={draftCodexSubscriptionRoutingEnabled}
+                  onCheckedChange={setDraftCodexSubscriptionRoutingEnabled}
+                  aria-label="Use Codex subscription models"
+                  data-testid="new-chat-landing-config-codex-subscription-routing"
+                />
+              </ConfigRow>
             </>
           )}
         </div>
@@ -2053,6 +2074,7 @@ interface LandingDraft {
   costControlMode: CostControlMode;
   gpt56SolRoutingEnabled: boolean;
   databricksKimiRoutingEnabled: boolean;
+  codexSubscriptionRoutingEnabled: boolean;
 }
 
 let landingDraft: LandingDraft | null = null;
@@ -2411,6 +2433,9 @@ export function NewChatLandingScreen() {
   const [databricksKimiRoutingEnabled, setDatabricksKimiRoutingEnabled] = useState(
     () => landingDraft?.databricksKimiRoutingEnabled ?? false,
   );
+  const [codexSubscriptionRoutingEnabled, setCodexSubscriptionRoutingEnabled] = useState(
+    () => landingDraft?.codexSubscriptionRoutingEnabled ?? true,
+  );
   // Model selection and smart routing are mutually exclusive: enabling
   // routing clears the explicit model pick, and picking a model turns
   // routing off.
@@ -2473,6 +2498,7 @@ export function NewChatLandingScreen() {
     costControlMode,
     gpt56SolRoutingEnabled,
     databricksKimiRoutingEnabled,
+    codexSubscriptionRoutingEnabled,
   };
   useEffect(() => {
     // Re-set on setup so StrictMode's setup→cleanup→setup double-invoke
@@ -4006,6 +4032,7 @@ export function NewChatLandingScreen() {
             cost_control_mode_override: costControlOverride,
             gpt_5_6_sol_routing_enabled: routingOwnsModel && gpt56SolRoutingEnabled,
             databricks_kimi_routing_enabled: routingOwnsModel && databricksKimiRoutingEnabled,
+            codex_subscription_routing_enabled: routingOwnsModel && codexSubscriptionRoutingEnabled,
             // Top-level Smart Routing sends the same "auto" sentinel the bundle
             // path does; the server tells them apart by the bound agent being a
             // native wrapper, and routes at create time (the terminal launches
@@ -4575,6 +4602,7 @@ export function NewChatLandingScreen() {
                     costControlMode={costControlMode}
                     gpt56SolRoutingEnabled={gpt56SolRoutingEnabled}
                     databricksKimiRoutingEnabled={databricksKimiRoutingEnabled}
+                    codexSubscriptionRoutingEnabled={codexSubscriptionRoutingEnabled}
                     setPermissionMode={setPermissionMode}
                     setApprovalMode={setApprovalMode}
                     setCursorExecMode={setCursorExecMode}
@@ -4586,6 +4614,7 @@ export function NewChatLandingScreen() {
                     setCostControlMode={setCostControlMode}
                     setGpt56SolRoutingEnabled={setGpt56SolRoutingEnabled}
                     setDatabricksKimiRoutingEnabled={setDatabricksKimiRoutingEnabled}
+                    setCodexSubscriptionRoutingEnabled={setCodexSubscriptionRoutingEnabled}
                   />
                 )}
                 {/* Routing is not a standalone composer toggle — it folds into

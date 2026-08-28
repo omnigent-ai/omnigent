@@ -333,6 +333,7 @@ export interface Session {
   subagentRoutingOverride?: "on" | "off" | null;
   /** Opt-in: restrict Smart Routing to the configured Databricks endpoint allowlist. */
   databricksKimiRoutingEnabled?: boolean;
+  codexSubscriptionRoutingEnabled?: boolean;
   /** Model context window size in tokens as looked up server-side. */
   contextWindow?: number | null;
   /**

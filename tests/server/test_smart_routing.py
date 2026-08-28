@@ -2389,6 +2389,18 @@ def test_route_option_source_offers_only_the_catalog_for_another_router() -> Non
     assert [o.model for o in options] == ["gpt-5-4"]
 
 
+def test_strict_route_options_never_inject_task_v1_menu_arms() -> None:
+    """The Databricks judge receives precisely the task's permitted models."""
+    from omnigent.server.smart_routing import TaskV1RouteOptionSource
+
+    options = TaskV1RouteOptionSource().build_route_options(
+        ["codex"],
+        {"codex": ["gpt-5.6-luna", "databricks-kimi-k2-6"]},
+        strict_candidates=True,
+    )
+    assert [option.model for option in options] == ["gpt-5.6-luna", "kimi-k2-6"]
+
+
 def test_route_option_source_rejects_never_offered_pick() -> None:
     from omnigent.server.smart_routing import RoutePick, TaskV1RouteOptionSource
 

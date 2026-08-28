@@ -951,6 +951,73 @@ class LLMRoutingClient:
         return RoutingResult(model=model, rationale=str(rationale), harness=chosen_harness)
 
 
+_ROUTING_JUDGE_ENV = "OMNIGENT_SMART_ROUTING_JUDGE"
+_OLLAMA_ROUTING_MODEL_ENV = "OMNIGENT_OLLAMA_ROUTING_MODEL"
+_OLLAMA_ROUTING_BASE_URL_ENV = "OMNIGENT_OLLAMA_ROUTING_BASE_URL"
+
+
+def configured_routing_judge() -> str:
+    """Return the explicitly requested judge, defaulting to existing behavior."""
+    judge = os.environ.get(_ROUTING_JUDGE_ENV, "auto").strip().lower()
+    return judge if judge in {"auto", "databricks", "ollama"} else "auto"
+
+
+class OllamaRoutingClient:
+    """Small local OpenAI-compatible judge for strict Smart Routing menus."""
+
+    router_source = "ollama"
+
+    def __init__(self, *, base_url: str, model: str) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._model = model
+        self.last_error: str | None = None
+
+    async def route(
+        self, message: str, available_models: dict[str, list[str]]
+    ) -> RoutingResult | None:
+        import httpx
+
+        flat = _flatten_models(available_models)
+        try:
+            async with httpx.AsyncClient(timeout=ROUTING_REQUEST_TIMEOUT_S) as client:
+                response = await client.post(
+                    f"{self._base_url}/chat/completions",
+                    json={
+                        "model": self._model,
+                        "temperature": 0,
+                        "messages": [
+                            {"role": "system", "content": _build_rubric(available_models)},
+                            {"role": "user", "content": message[:4000]},
+                        ],
+                        "response_format": {"type": "json_object"},
+                    },
+                )
+                response.raise_for_status()
+                verdict = json.loads(response.json()["choices"][0]["message"]["content"])
+        except Exception as exc:  # noqa: BLE001 - local judges fail open
+            self.last_error = f"Ollama routing judge failed: {failure_detail(exc)}"
+            return None
+        model = verdict.get("model")
+        if not isinstance(model, str) or model not in flat:
+            self.last_error = "Ollama routing judge chose a model outside the allowed list"
+            return None
+        harness = next(
+            (name for name, models in available_models.items() if model in models), None
+        )
+        return RoutingResult(
+            model=model, rationale=str(verdict.get("rationale", "")), harness=harness
+        )
+
+
+def ollama_routing_client_from_environment() -> OllamaRoutingClient | None:
+    """Build the local judge only when an operator names its model explicitly."""
+    model = os.environ.get(_OLLAMA_ROUTING_MODEL_ENV, "").strip()
+    if not model:
+        return None
+    base_url = os.environ.get(_OLLAMA_ROUTING_BASE_URL_ENV, "http://127.0.0.1:11434/v1")
+    return OllamaRoutingClient(base_url=base_url, model=model)
+
+
 def _bearer_auth(token: str) -> httpx.Auth:
     """Build a static ``Authorization: Bearer <token>`` httpx auth.
 
@@ -1693,6 +1760,8 @@ class TaskV1RouteOptionSource:
         self,
         harnesses: Sequence[str],
         catalog: dict[str, list[str]],
+        *,
+        strict_candidates: bool = False,
     ) -> list[RouteOptionSpec]:
         """Offer the catalog plus whatever arms the router's menu requires.
 
@@ -1712,6 +1781,8 @@ class TaskV1RouteOptionSource:
                     _bare_id(router_id, self._model_prefixes),
                     RouteOptionSpec(model=router_id, harness=harness),
                 )
+        if strict_candidates:
+            return list(offered.values())
         for arm in self.menu(harnesses or list(catalog)):
             key = _bare_id(arm, self._model_prefixes)
             existing = offered.get(key)
@@ -2113,6 +2184,8 @@ class ExternalRoutingClient:
         self,
         message: str,
         available_models: dict[str, list[str]],
+        *,
+        strict_candidates: bool = False,
     ) -> RoutingResult | None:
         import httpx
         from google.protobuf import json_format
@@ -2127,7 +2200,9 @@ class ExternalRoutingClient:
         # The seam turns the catalog into router vocabulary and injects
         # whatever arms the router's scenario menu demands.
         harnesses = list(available_models)
-        specs = self._source.build_route_options(harnesses, available_models)
+        specs = self._source.build_route_options(
+            harnesses, available_models, strict_candidates=strict_candidates
+        )
         if not specs:
             return None
         options = [pb.RouteOption(model=s.model, harness=s.harness) for s in specs]
@@ -2324,6 +2399,7 @@ async def route_session_harness(
     allow_static_fallback: bool = True,
     allow_databricks_kimi: bool = False,
     allow_gpt_5_6_sol: bool = False,
+    allow_codex_subscription_models: bool = True,
 ) -> tuple[str | None, str | None, dict[str, Any] | None, str | None]:
     """Pick the best harness + model for a new session via the routing client.
 
@@ -2466,7 +2542,7 @@ async def route_session_harness(
             name: [
                 model
                 for model in models
-                if not _is_databricks_routing_model(model)
+                if (allow_codex_subscription_models and not _is_databricks_routing_model(model))
                 or (allow_databricks_kimi and model in allowed_databricks)
             ]
             for name, models in harness_models.items()
@@ -2491,6 +2567,8 @@ async def route_session_harness(
             harness_models,
             gateway_backed=gateway_backed,
             allow_gpt_5_6_sol=allow_gpt_5_6_sol,
+            strict_candidate_allowlist=allow_databricks_kimi
+            or not allow_codex_subscription_models,
         )
     except Exception as exc:  # routing failures must not block session creation
         _logger.exception("smart_routing: route_session_harness failed")
@@ -2609,6 +2687,7 @@ async def route_turn(
     allow_static_fallback: bool = True,
     allow_databricks_kimi: bool = False,
     allow_gpt_5_6_sol: bool = False,
+    allow_codex_subscription_models: bool = True,
 ) -> tuple[str | None, dict[str, Any] | None]:
     """Pick the best model for a turn via the deployment's routing backends.
 
@@ -2709,7 +2788,7 @@ async def route_turn(
             name: [
                 model
                 for model in models
-                if not _is_databricks_routing_model(model)
+                if (allow_codex_subscription_models and not _is_databricks_routing_model(model))
                 or (allow_databricks_kimi and model in allowed_databricks)
             ]
             for name, models in available.items()
@@ -2747,6 +2826,7 @@ async def route_turn(
         available,
         gateway_backed=gateway_backed,
         allow_gpt_5_6_sol=allow_gpt_5_6_sol,
+        strict_candidate_allowlist=allow_databricks_kimi or not allow_codex_subscription_models,
     )
     _logger.info(
         "smart_routing: session=%s prep=%.3fs router=%.3fs catalog_fetch=%s candidates=%d",
