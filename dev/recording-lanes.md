@@ -36,6 +36,40 @@ a concrete reason, never a silent skip. Never let recording block or distort the
 work itself, and never fabricate a hollow journey that doesn't reach the failure
 just to produce a video.
 
+## Package installs must go through the Databricks registry proxies
+
+You run inside a Databricks-network session, where **direct access to the public
+npm and PyPI registries is blocked** (a supply-chain security control). So a bare
+`pnpm install`, `pip install`, `uv pip install`, or `npx <pkg>` — anything that
+fetches from `registry.npmjs.org` or `pypi.org` — fails with an auth/connection
+error, *not* because your command is wrong but because the registry is unreachable.
+This bites the install steps below (the SPA build's `pnpm install`, Playwright,
+`vhs`, any `uv`/`pip` install). Point the tools at the internal proxies first:
+
+```bash
+# npm / pnpm / npx / yarn — writes ~/.npmrc, so all of them pick it up
+npm config set registry https://npm-proxy.cloud.databricks.com/
+# pip
+pip3 config set global.index-url https://pypi-proxy.cloud.databricks.com/simple
+# uv — pass the index explicitly (don't bake the proxy into uv.lock)
+uv pip install --default-index https://pypi-proxy.cloud.databricks.com/simple/ <pkg>
+uv sync --index-url https://pypi-proxy.cloud.databricks.com/simple/
+```
+
+Do this **once, up front**, before any install command in this doc. Notes:
+
+- **Never commit the proxy URL into a lockfile.** `uv sync` records the index it
+  resolved against into `uv.lock`; passing `--index-url` on the CLI keeps it out
+  of the committed lockfile (the proxy isn't reachable from GitHub-hosted CI, and
+  it must not leak into a public repo). If a build step writes a lockfile, revert
+  that lockfile change unless it's genuinely part of the fix.
+- The proxies embargo package versions **newer than 7 days**; if an install fails
+  only for a just-published version, that's the age filter, not a misconfig — note
+  it rather than trying to bypass the block.
+- If an install still fails **after** pointing at the proxy, treat that lane's
+  tooling as unavailable per the best-effort rule (keep `recordings: []` and name
+  the blocker) — do not attempt to reach the public registry directly.
+
 ## The recorder needs its own local server
 
 A `web`/`terminal` recording runs the `tests/e2e_ui/` suite, which drives a live
@@ -64,6 +98,8 @@ and block on control FDs it doesn't have, so it hangs with an empty `runner.log`
 and stays `online: false`. Strip them with `env -u`:
 
 ```bash
+# Point npm/pnpm at the proxy first (see "Package installs must go through the
+# Databricks registry proxies" above) or this install fails with an auth error.
 pnpm --filter web install && pnpm --filter web run build   # once, up front
 env -u OMNIGENT_RUNNER_ID -u OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN \
     -u OMNIGENT_RUNNER_TUNNEL_TOKEN -u OMNIGENT_RUNNER_PARENT_PID \
