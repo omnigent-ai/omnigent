@@ -471,14 +471,30 @@ def _harness_availability(canonical: str) -> HarnessAvailability:
         # warning copy uniform across every CLI-backed native harness.
         return _cli_family_availability(canonical, install_key)
     if canonical in _PI_HARNESSES:
-        # pi has no CLI login — its only credential is an omnigent-managed
-        # provider (an API key / gateway, incl. one set from the UI). So the
-        # two-step signal is binary + provider: installed-but-no-provider is
-        # the yellow "needs-auth" state the setup dialog acts on.
+        # pi has no CLI login — its only credential is either an omnigent-managed
+        # provider (an API key / gateway) or a pi-subscription ("Pi original auth",
+        # which signals "use Pi's own ~/.pi/agent as-is"). So the two-step signal
+        # is binary + provider: installed-but-no-provider is the yellow "needs-auth"
+        # state the setup dialog acts on.
         binary_state = _binary_availability_reason(PI_KEY)
         if binary_state is not True:
             return binary_state
-        return True if _family_provider_configured(PI_SURFACE) else "needs-auth"
+        if _family_provider_configured(PI_SURFACE):
+            return True
+        # A pi subscription (original auth) is also a valid configured state —
+        # it means Pi will use its own ~/.pi/agent credentials, no omnigent
+        # provider needed.
+        try:
+            provider = default_provider_for_harness(load_config(), PI_SURFACE)
+            if (
+                provider is not None
+                and provider.kind == SUBSCRIPTION_KIND
+                and provider.cli == "pi"
+            ):
+                return True
+        except Exception:
+            pass
+        return "needs-auth"
     return _harness_availability_core(canonical)
 
 
