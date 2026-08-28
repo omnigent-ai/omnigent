@@ -294,6 +294,31 @@ async def test_done_approval_future_does_not_pin_runner() -> None:
 
 
 @pytest.mark.asyncio
+async def test_running_native_harness_blocks_idle_shutdown() -> None:
+    """Terminal-owned work remains active after the HTTP turn slot clears."""
+    app = _scaffold_app()
+    app.state.native_pane_status["conv_native"] = "running"
+    assert app.state.has_active_work() is True
+
+    async def _release() -> None:
+        app.state.native_pane_status["conv_native"] = "idle"
+
+    await _assert_monitor_blocked_then_shuts_down(
+        has_active_work=app.state.has_active_work,
+        release=_release,
+    )
+    assert app.state.has_active_work() is False
+
+
+@pytest.mark.parametrize("status", ["waiting", "idle", "error"])
+def test_inactive_native_harness_status_does_not_pin_runner(status: str) -> None:
+    """Only the cross-harness running state counts as active work."""
+    app = _scaffold_app()
+    app.state.native_pane_status["conv_native"] = status
+    assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
 async def test_drain_session_streams_enqueues_done_sentinel() -> None:
     """Graceful shutdown signals end-of-stream to every open session stream.
 
