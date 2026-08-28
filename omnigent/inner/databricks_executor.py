@@ -15,12 +15,16 @@ Environment:
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import json
 import logging
 import os
 import shlex
+import shutil
+import subprocess
+import time
 from collections.abc import AsyncIterator, Generator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
 
 import httpx
@@ -55,6 +59,8 @@ OpenAIKwargs: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 _API_CALL_TIMEOUT_SECONDS = 30.0
 _STREAM_IDLE_TIMEOUT_SECONDS = 60.0
+_CLI_TOKEN_REFRESH_MARGIN_SECONDS = 90.0
+_CLI_TOKEN_DEFAULT_TTL_SECONDS = 50 * 60.0
 
 _SESSION_ONLY_EXECUTOR_EXTRA_KEYS = {
     "new_user_messages_flushed",
@@ -397,6 +403,90 @@ class _DatabricksAuthConfig(Protocol):
         raise NotImplementedError
 
 
+@dataclass(frozen=True)
+class _DatabricksCliToken:
+    access_token: str
+    expires_at: float
+
+
+@dataclass
+class _DatabricksCliProfileAuthConfig:
+    """Profile-pinned Databricks CLI OAuth token source."""
+
+    profile: str
+    host: str
+    _cached_token: _DatabricksCliToken | None = field(default=None, init=False, repr=False)
+
+    def authenticate(self) -> dict[str, str]:
+        now = time.time()
+        cached = self._cached_token
+        if cached is None or cached.expires_at - now <= _CLI_TOKEN_REFRESH_MARGIN_SECONDS:
+            cached = _databricks_cli_profile_token(self.profile, now=now)
+            self._cached_token = cached
+        return {"Authorization": f"Bearer {cached.access_token}"}
+
+
+def _databricks_cli_profile_token(
+    profile: str, *, now: float | None = None
+) -> _DatabricksCliToken:
+    """Mint a bearer token by profile, avoiding ambiguous host lookup."""
+    databricks_bin = shutil.which("databricks")
+    if databricks_bin is None:
+        raise ValueError("databricks CLI is not installed")
+    try:
+        result = subprocess.run(
+            [databricks_bin, "auth", "token", "--profile", profile, "--output", "json"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30.0,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(f"databricks auth token --profile {profile} timed out") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip()
+        raise ValueError(detail or f"databricks auth token --profile {profile} failed")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"databricks auth token --profile {profile} returned invalid JSON"
+        ) from exc
+    token = payload.get("access_token") if isinstance(payload, dict) else None
+    if not isinstance(token, str) or not token.strip():
+        raise ValueError(f"databricks auth token --profile {profile} returned no access_token")
+    return _DatabricksCliToken(
+        access_token=token.strip(),
+        expires_at=_databricks_cli_token_expires_at(payload, now=now),
+    )
+
+
+def _databricks_cli_token_expires_at(
+    payload: dict[str, Any], *, now: float | None = None
+) -> float:
+    """Return the CLI token expiry timestamp, falling back conservatively."""
+    base = time.time() if now is None else now
+    expires_in = payload.get("expires_in")
+    if isinstance(expires_in, (int, float)):
+        return base + max(float(expires_in), 0.0)
+    if isinstance(expires_in, str):
+        try:
+            return base + max(float(expires_in), 0.0)
+        except ValueError:
+            pass
+    expiry = payload.get("expiry")
+    if isinstance(expiry, str) and expiry:
+        try:
+            normalized = expiry.replace("Z", "+00:00")
+            parsed = dt.datetime.fromisoformat(normalized)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=dt.UTC)
+            return parsed.timestamp()
+        except ValueError:
+            pass
+    return base + _CLI_TOKEN_DEFAULT_TTL_SECONDS
+
+
 class _DatabricksBearerAuth(httpx.Auth):
     """httpx Auth that calls ``Config.authenticate()`` on every HTTP request.
 
@@ -432,6 +522,10 @@ class _DatabricksBearerAuth(httpx.Auth):
         self._config = config
         self._profile_name = profile_name
         self._failure_message = failure_message
+
+    @property
+    def profile_name(self) -> str | None:
+        return self._profile_name
 
     def _authenticate_headers(self) -> dict[str, str]:
         """
@@ -645,8 +739,21 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
             cfg = _sdk_config(profile=profile_name)
             cfg.authenticate()
         except Exception:  # noqa: BLE001 — try the next matching profile
-            logger.debug("profile %r matched host %s but did not authenticate", profile_name, host)
-            continue
+            logger.debug(
+                "profile %r matched host %s but did not authenticate via SDK",
+                profile_name,
+                host,
+            )
+            try:
+                cfg = _DatabricksCliProfileAuthConfig(profile=profile_name, host=host)
+                cfg.authenticate()
+            except Exception:  # noqa: BLE001 — try the next matching profile
+                logger.debug(
+                    "profile %r matched host %s but did not authenticate via CLI",
+                    profile_name,
+                    host,
+                )
+                continue
         return _DatabricksBearerAuth(cfg, profile_name=profile_name), cfg.host or host
     try:
         host_cfg = _sdk_config(host=host, auth_type="databricks-cli")
@@ -728,6 +835,31 @@ def databrickscfg_workspace_id_for_host(host: str) -> str | None:
         if workspace_id:
             return workspace_id
     return None
+
+
+def databrickscfg_workspace_id_for_profile(profile: str) -> str | None:
+    """Return the ``workspace_id`` recorded for an exact Databricks profile."""
+    import configparser
+    from pathlib import Path
+
+    cfg_path = Path(os.environ.get("DATABRICKS_CONFIG_FILE") or (Path.home() / ".databrickscfg"))
+    if not cfg_path.exists():
+        return None
+    config = configparser.ConfigParser()
+    try:
+        config.read(cfg_path)
+    except configparser.Error:
+        return None
+    if profile == "DEFAULT":
+        values = config.defaults()
+    elif profile in config:
+        values = config[profile]
+    else:
+        values = None
+    if values is None:
+        return None
+    workspace_id = values.get("workspace_id")
+    return workspace_id if workspace_id else None
 
 
 def _get_openai_client(profile: str | None = None) -> OpenAI:
