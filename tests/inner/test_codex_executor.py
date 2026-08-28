@@ -3095,7 +3095,18 @@ def test_populate_codex_home_config_does_not_overwrite_existing(tmp_path: Path) 
     assert not (target / "auth.json").is_symlink()
 
 
-def test_materialize_codex_provider_config_applies_default_retry_policy(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "provider_config",
+    [
+        '[model_providers.gateway]\nname = "Gateway"\nbase_url = "https://example.test"\n',
+        'model_providers = { gateway = { name = "Gateway", '
+        'base_url = "https://example.test" } }\n',
+    ],
+    ids=["table", "inline-table"],
+)
+def test_materialize_codex_provider_config_applies_default_retry_policy(
+    tmp_path: Path, provider_config: str
+) -> None:
     """Private Codex providers receive Omnigent's retry budget.
 
     Codex does not honor the speculative ``OPENAI_MAX_RETRIES`` environment
@@ -3110,9 +3121,7 @@ def test_materialize_codex_provider_config_applies_default_retry_policy(tmp_path
 
     codex_home = tmp_path / "codex-home"
     codex_home.mkdir()
-    (codex_home / "config.toml").write_text(
-        '[model_providers.gateway]\nname = "Gateway"\nbase_url = "https://example.test"\n'
-    )
+    (codex_home / "config.toml").write_text(provider_config)
 
     materialize_codex_provider_config(codex_home, [])
 

@@ -977,12 +977,12 @@ def materialize_codex_provider_config(
     for provider_name, provider_config in list(providers.items()):
         if not isinstance(provider_config, MutableMapping):
             continue
-        if not isinstance(provider_config, tomlkit.items.Table):
-            provider_table = tomlkit.table()
+        if isinstance(provider_config, tomlkit.items.InlineTable):
+            inline_provider = tomlkit.inline_table()
             for key, value in provider_config.items():
-                provider_table[key] = value
-            providers[provider_name] = provider_table
-            provider_config = provider_table
+                inline_provider[key] = value
+            providers[provider_name] = inline_provider
+            provider_config = inline_provider
         provider_config["request_max_retries"] = policy.max_retries
         provider_config["stream_max_retries"] = policy.max_retries
         if policy.timeout_per_request_s is not None:
