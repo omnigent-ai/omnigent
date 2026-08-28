@@ -49,27 +49,33 @@ def test_header_session_menu_renames_owner_and_hides_for_subagent(
         expect(trigger).to_be_visible(timeout=30_000)
         trigger.click()
 
-        # Desktop drops "Add to project" from the kebab — the breadcrumb's
-        # folder tag owns that shortcut now (see HeaderProjectTag). It stays in
-        # this menu only on mobile, where the native shells hide the breadcrumb.
+        # Desktop drops "Rename" and "Add to project" from the kebab — the
+        # breadcrumb title (HeaderTitle) and folder tag (HeaderProjectTag) own
+        # those shortcuts now. Both stay in this menu only on mobile, where the
+        # native shells hide the breadcrumb.
         menu_items = page.get_by_role("menuitem")
-        expect(menu_items).to_have_count(5)
+        expect(menu_items).to_have_count(4)
         assert menu_items.all_inner_texts() == [
             "Pin",
-            "Rename",
             "Mark as unread",
             "Archive",
             "Delete",
         ]
+        # Dismiss the menu and wait for it to fully detach — Radix briefly puts
+        # `pointer-events: none` on the body while closing, which would swallow
+        # the title click that follows.
+        page.keyboard.press("Escape")
+        expect(page.get_by_role("menu")).to_have_count(0)
 
-        page.get_by_role("menuitem", name="Rename").click()
+        # Rename by clicking the breadcrumb title → inline input, Enter commits.
+        breadcrumb = page.get_by_role("navigation", name="Conversation")
+        page.get_by_test_id("header-title").click()
         rename_input = page.get_by_role("textbox", name="Session name")
         expect(rename_input).to_be_visible()
-        renamed_title = "Header menu renamed session"
+        renamed_title = "Header title renamed session"
         rename_input.fill(renamed_title)
-        page.get_by_role("button", name="Rename").click()
+        rename_input.press("Enter")
 
-        breadcrumb = page.get_by_role("navigation", name="Conversation")
         expect(breadcrumb.get_by_text(renamed_title, exact=True)).to_be_visible(timeout=15_000)
 
         agent_resp = httpx.get(

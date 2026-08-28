@@ -25,6 +25,7 @@ import { AgentInfoButton } from "@/components/AgentInfo";
 import { ConversationBreadcrumb } from "./ConversationBreadcrumb";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 import { HeaderProjectTag } from "./HeaderProjectTag";
+import { HeaderTitle } from "./HeaderTitle";
 import { UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { PresenceAvatars } from "@/components/PresenceAvatars";
 import type { Agent } from "@/hooks/useAgents";
@@ -354,6 +355,17 @@ export function ChatHeader({
     !isMobile && actionConversation && !isChildSession ? (
       <HeaderProjectTag conversationId={actionConversation.id} projectName={projectName} />
     ) : null;
+  // Click-to-rename on the breadcrumb title, same gating as the folder tag:
+  // desktop, owner-managed top-level row. A sub-agent's title stays a
+  // back-to-parent link (titleLinkTo wins over titleSlot in the breadcrumb),
+  // and mobile keeps the Rename item in the kebab.
+  const titleSlot =
+    !isMobile && actionConversation && !isChildSession ? (
+      <HeaderTitle
+        conversationId={actionConversation.id}
+        title={conversationTitle ?? UNTITLED_CONVERSATION_LABEL}
+      />
+    ) : null;
   return (
     <header
       className={cn(
@@ -431,6 +443,7 @@ export function ChatHeader({
             conversationTitle={conversationTitle ?? UNTITLED_CONVERSATION_LABEL}
             projectName={projectName}
             projectTag={projectTag ?? undefined}
+            titleSlot={titleSlot ?? undefined}
             titleLinkTo={titleLinkTo}
             isChildSession={isChildSession}
             boundAgent={boundAgent}

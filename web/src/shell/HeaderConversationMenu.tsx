@@ -222,14 +222,19 @@ export function HeaderConversationMenu({
           Agent info
         </DropdownMenuItem>
       )}
-      <DropdownMenuItem
-        data-testid="header-rename-conversation"
-        className={itemClass}
-        onSelect={() => setRenameOpen(true)}
-      >
-        <PencilIcon className="size-3.5" />
-        Rename
-      </DropdownMenuItem>
+      {/* Rename lives here only on mobile — the native shells hide the
+          breadcrumb, so this menu is the sole entry point. On desktop the
+          shortcut is clicking the breadcrumb title (HeaderTitle). */}
+      {isMobile && (
+        <DropdownMenuItem
+          data-testid="header-rename-conversation"
+          className={itemClass}
+          onSelect={() => setRenameOpen(true)}
+        >
+          <PencilIcon className="size-3.5" />
+          Rename
+        </DropdownMenuItem>
+      )}
       <DropdownMenuItem
         data-testid="header-mark-unread-conversation"
         className={itemClass}

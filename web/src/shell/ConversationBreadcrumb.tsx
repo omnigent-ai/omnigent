@@ -25,6 +25,7 @@ export function ConversationBreadcrumb({
   conversationTitle,
   projectName,
   projectTag,
+  titleSlot,
   titleLinkTo,
   isChildSession,
   boundAgent,
@@ -43,6 +44,12 @@ export function ConversationBreadcrumb({
    * is set — the fallback for surfaces without the shortcut (e.g. sub-agents).
    */
   projectTag?: ReactNode;
+  /**
+   * Interactive title node (the desktop click-to-rename control). Replaces the
+   * plain-text title. Ignored when `titleLinkTo` is set — a sub-agent keeps its
+   * back-to-parent link rather than becoming editable.
+   */
+  titleSlot?: ReactNode;
   /** Parent-session route the title links to, or `undefined` for plain text. */
   titleLinkTo?: string;
   /** Whether the active session is a sub-agent (appends its identity). */
@@ -121,7 +128,7 @@ export function ConversationBreadcrumb({
           )}
         </Link>
       ) : (
-        <span className="min-w-0 truncate text-foreground">{conversationTitle}</span>
+        (titleSlot ?? <span className="min-w-0 truncate text-foreground">{conversationTitle}</span>)
       )}
       {actions}
       {isChildSession && (
