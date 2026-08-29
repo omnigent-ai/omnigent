@@ -89,7 +89,7 @@ _REPLAY_POST_TIMEOUT_SECONDS = 5.0
 _REPLAY_DEADLINE_SECONDS = 30.0
 _DELTA_FLUSH_INTERVAL_SECONDS = 0.05
 _DELTA_FLUSH_CHAR_THRESHOLD = 64
-_CHILD_MODEL_RECOVERY_CLOSE_TIMEOUT_SECONDS = 5.0
+_CHILD_MODEL_RECOVERY_CLOSE_TIMEOUT_SECONDS = 3.0
 # A worker cancelled at loop teardown can no longer resolve its queued markers, so an
 # unbounded wait parks the caller for good. Under the runner's 10s auto-forwarder cancel
 # budget so this resolves first.
