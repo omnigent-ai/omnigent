@@ -7368,6 +7368,28 @@ def _external_router_usable(caps: Any = None) -> bool:  # type: ignore[explicit-
     return usable_external(backends_from_caps(caps)) is not None
 
 
+def _native_routing_has_restricted_candidates(body: SessionCreateRequest) -> bool:
+    """Whether a native Smart Routing create may not use a CLI default.
+
+    Enabling a Databricks allowlist or disabling Codex subscription candidates
+    makes the configured menu authoritative.  A router outage must therefore
+    reject the create instead of starting an unrelated installed CLI on its
+    own default model.
+    """
+    return bool(getattr(body, "databricks_kimi_routing_enabled", False)) or not bool(
+        getattr(body, "codex_subscription_routing_enabled", True)
+    )
+
+
+def _restricted_native_routing_error(error: str | None) -> str:
+    """Explain why a restricted Smart Routing create was not started."""
+    detail = error or "The router returned no allowed model."
+    return (
+        f"{detail} Smart Routing did not start a default model because this session has "
+        "a restricted candidate allowlist."
+    )
+
+
 def _judge_only_harness_note(harness: str, verdict: dict[str, Any]) -> str:
     """Explain on the chip why only the model was routed.
 
@@ -7829,6 +7851,9 @@ async def _resolve_fixed_native_model_routing(
     from omnigent.server.smart_routing import models_in_family, route_session_harness
 
     host = await _routing_host_for_create(body, request, user_id)
+    allow_databricks = bool(getattr(body, "databricks_kimi_routing_enabled", False))
+    allow_sol = bool(getattr(body, "gpt_5_6_sol_routing_enabled", False))
+    allow_codex_subscription = bool(getattr(body, "codex_subscription_routing_enabled", True))
     # Off the gateway the built-in judge answers, and the static table's
     # ``databricks-*`` ids are unreachable — the host's pre-launch catalog is the
     # only provider-accurate candidate source.
@@ -7839,9 +7864,9 @@ async def _resolve_fixed_native_model_routing(
         catalog=await _pre_session_model_catalog(request, host, (harness,)),
         gateway_backed=backed,
         allow_static_fallback=backed,
-        allow_databricks_kimi=body.databricks_kimi_routing_enabled,
-        allow_gpt_5_6_sol=body.gpt_5_6_sol_routing_enabled,
-        allow_codex_subscription_models=body.codex_subscription_routing_enabled,
+        allow_databricks_kimi=allow_databricks,
+        allow_gpt_5_6_sol=allow_sol,
+        allow_codex_subscription_models=allow_codex_subscription,
     )
     if model is None or verdict is None:
         return None, None, error or "Routing unavailable; using the harness default model."
@@ -7874,10 +7899,13 @@ async def _resolve_native_smart_routing(
     create, terminal launch and all, so nothing is launched twice.
 
     Falls back to the first installed candidate when routing is unavailable, so
-    the session still lands on a terminal (with the CLI's own default model).
-    Same candidate when only the built-in judge is configured: choosing between
-    two panes is the workspace router's job, so a judge-only deployment routes
-    the default pane's MODEL and says so on the chip.
+    an unrestricted session still lands on a terminal (with the CLI's own
+    default model). A session with a Databricks allowlist or with subscription
+    models disabled instead fails closed: its default CLI model is not an
+    allowed routing candidate. Same candidate when only the built-in judge is
+    configured: choosing between two panes is the workspace router's job, so a
+    judge-only deployment routes the default pane's MODEL and says so on the
+    chip.
 
     :param body: The create request; ``smart_routing_message`` carries the
         routing text and ``host_id`` selects whose CLIs are on offer.
@@ -7903,6 +7931,9 @@ async def _resolve_native_smart_routing(
     )
 
     host = await _routing_host_for_create(body, request, user_id)
+    allow_databricks = bool(getattr(body, "databricks_kimi_routing_enabled", False))
+    allow_sol = bool(getattr(body, "gpt_5_6_sol_routing_enabled", False))
+    allow_codex_subscription = bool(getattr(body, "codex_subscription_routing_enabled", True))
     # Both arms must be gateway-backed before the WORKSPACE router may choose
     # between them: an arm off the gateway cannot run its picks, and the pick is
     # made after the create commits, so there is no safe half-menu. That only
@@ -7922,6 +7953,7 @@ async def _resolve_native_smart_routing(
     # default pane and routes only its model with the built-in judge — a normal
     # Smart Routing session, minus the harness half — instead of declining.
     judge_only = not _external_router_usable()
+    restricted_candidates = _native_routing_has_restricted_candidates(body)
     candidates = (installed[0],) if judge_only else installed
     harness, model, verdict, error = await route_session_harness(
         body.smart_routing_message or "",
@@ -7929,14 +7961,16 @@ async def _resolve_native_smart_routing(
         catalog=await _pre_session_model_catalog(request, host, candidates),
         gateway_backed=backed,
         allow_static_fallback=backed,
-        allow_databricks_kimi=body.databricks_kimi_routing_enabled,
-        allow_gpt_5_6_sol=body.gpt_5_6_sol_routing_enabled,
-        allow_codex_subscription_models=body.codex_subscription_routing_enabled,
+        allow_databricks_kimi=allow_databricks,
+        allow_gpt_5_6_sol=allow_sol,
+        allow_codex_subscription_models=allow_codex_subscription,
     )
     if judge_only:
         kept = native_coding_agent_for_harness(candidates[0])
         kept_name = kept.agent_name if kept is not None else None
         if model is None or verdict is None:
+            if restricted_candidates:
+                return None, None, None, _restricted_native_routing_error(error)
             return (
                 kept_name,
                 None,
@@ -7947,6 +7981,15 @@ async def _resolve_native_smart_routing(
             # One pane on offer, so the seam resolves any pick onto it — and an
             # out-of-family model would reach the launch as a ``--model`` this
             # CLI cannot run. Keep the pane, pin nothing, say why.
+            if restricted_candidates:
+                return (
+                    None,
+                    None,
+                    None,
+                    _restricted_native_routing_error(
+                        f"Not applied: this {candidates[0]} session cannot run {model}."
+                    ),
+                )
             return (
                 kept_name,
                 None,
@@ -7961,6 +8004,8 @@ async def _resolve_native_smart_routing(
         )
     native_agent = native_coding_agent_for_harness(harness) if harness is not None else None
     if native_agent is None:
+        if restricted_candidates:
+            return None, None, None, _restricted_native_routing_error(error)
         # Routing unavailable (or it named something that is not a native
         # terminal) — land on the first installed CLI so the session still
         # opens a terminal; the CLI keeps its own default model.
@@ -8081,8 +8126,9 @@ async def _create_session_from_existing_agent(
     # Fixed native harness + Smart Routing on: the harness is the caller's own
     # choice, so only the MODEL is routed — and it has to happen here, since the
     # terminal launches with the row and its turns originate in the TUI (the
-    # server never sees the first message pre-inference). Fails open: no pin, a
-    # decision card with the reason, and the CLI's default model.
+    # server never sees the first message pre-inference). Unrestricted sessions
+    # fail open with no pin and the CLI's default model; restricted candidate
+    # menus fail closed so that default cannot escape their allowlist.
     # A spec that hands its brain harness to the router (``smart_routing_harness:
     # auto``) takes the sentinel path below instead of any create-time pick: the
     # harness is not decided until the first message, so there is no single
@@ -8106,6 +8152,11 @@ async def _create_session_from_existing_agent(
         ) = await _resolve_fixed_native_model_routing(
             body, request, user_id, _fixed_native_harness
         )
+        if _fixed_routed_model is None and _native_routing_has_restricted_candidates(body):
+            raise OmnigentError(
+                _restricted_native_routing_error(_fixed_routing_error),
+                code=ErrorCode.INVALID_INPUT,
+            )
 
     # Authorize parent_session_id before inheriting anything.
     # The caller must own or have READ access to the parent session;

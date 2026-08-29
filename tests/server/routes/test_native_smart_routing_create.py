@@ -1326,6 +1326,53 @@ async def test_top_level_smart_routing_create_is_rejected_when_no_router_can_ser
     assert routing_client.offered == []
 
 
+async def test_top_level_restricted_smart_routing_never_falls_back_to_a_default_cli(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A failed judge cannot bypass a session's configured candidate menu."""
+    wrappers = await _native_wrappers(client, db_uri)
+    routing_client = FakeRoutingClient(
+        None,
+        last_error=("router returned HTTP 403: system.ai.gpt-5-4-mini has a rate limit set to 0."),
+    )
+    body = {
+        "agent_id": wrappers["claude-native"],
+        "harness_override": "auto",
+        "cost_control_mode_override": "on",
+        "smart_routing_message": ROUTING_MESSAGE,
+        # This is a Databricks-only session. Starting Claude's default model
+        # would silently escape the configured execution list.
+        "codex_subscription_routing_enabled": False,
+    }
+    with patch("omnigent.runtime._globals._caps", new=_caps_with(routing_client, oss=False)):
+        created = await client.post("/v1/sessions", json=body)
+
+    assert created.status_code == 400, created.text
+    message = created.json()["error"]["message"]
+    assert "HTTP 403" in message
+    assert "restricted candidate allowlist" in message
+
+
+async def test_fixed_harness_restricted_smart_routing_never_uses_the_cli_default(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A fixed native pane has the same candidate-menu guarantee."""
+    wrappers = await _native_wrappers(client, db_uri)
+    routing_client = FakeRoutingClient(None, last_error="router returned HTTP 403")
+
+    created = await _create_fixed_harness_session(
+        client,
+        wrappers["claude-native"],
+        routing_client,
+        codex_subscription_routing_enabled=False,
+    )
+
+    assert created.status_code == 400, created.text
+    assert "restricted candidate allowlist" in created.json()["error"]["message"]
+
+
 async def test_top_level_smart_routing_create_succeeds_off_the_gateway_with_the_judge(
     client: httpx.AsyncClient,
     db_uri: str,
