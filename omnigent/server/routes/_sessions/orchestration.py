@@ -4229,7 +4229,7 @@ async def _forward_native_terminal_message(
     :raises HTTPException: 502 when the runner or harness rejects
         the injection request.
     """
-    display_name, _, _ = _native_terminal_runtime(conv)
+    display_name, _, harness = _native_terminal_runtime(conv)
     event = _build_native_terminal_message_event(
         conv,
         body,
