@@ -153,8 +153,6 @@ def test_export_and_import_preserve_theme_mode(
     expect(page.get_by_test_id("theme-dark")).to_have_attribute("aria-checked", "true")
 
 
-
-
 def test_import_rejects_invalid_json(page: Page, seeded_session: tuple[str, str]) -> None:
     """Import shows error when uploaded file contains invalid JSON or structure."""
     base_url, _session_id = seeded_session
