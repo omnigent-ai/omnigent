@@ -3860,6 +3860,26 @@ def test_run_host_process_exits_nonzero_on_fatal(
     assert "HTTP 403" in err
 
 
+async def test_run_host_process_invalid_host_id_exits_actionably(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A malformed configured identity is a user error, not a CLI crash."""
+    monkeypatch.setenv("OMNIGENT_HOST_ID", "not-a-uuid")
+    monkeypatch.setenv("OMNIGENT_HOST_NAME", "managed-test")
+
+    with pytest.raises(SystemExit) as excinfo:
+        run_host_process(
+            server_url="https://app.example.databricks.com",
+            config_path=tmp_path / "config.yaml",
+        )
+
+    assert excinfo.value.code == HOST_FATAL_EXIT_CODE
+    err = capsys.readouterr().err
+    assert "Could not start host" in err
+    assert "OMNIGENT_HOST_ID" in err
+    assert "not-a-uuid" in err
+
+
 def test_run_host_process_announces_session_log_dir_on_start(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -4806,7 +4826,7 @@ def test_post_connect_auth_rejection_escalates_without_going_fatal(
     assert host._auth_retry_streak == _AUTH_REJECT_ESCALATE_ATTEMPTS
 
 
-def test_fatal_upgrade_error_surfaces_server_refusal_body() -> None:
+async def test_fatal_upgrade_error_surfaces_server_refusal_body() -> None:
     """A refusal that carries a body (what ``_refuse_upgrade`` sends, e.g. the
     server's malformed-host-id 400) is surfaced verbatim — the client passes the
     server's own reason through instead of guessing from the status code.
@@ -4822,7 +4842,7 @@ def test_fatal_upgrade_error_surfaces_server_refusal_body() -> None:
     assert "HTTP 400" in str(err)
 
 
-def test_fatal_upgrade_error_bodyless_4xx_falls_back_to_generic() -> None:
+async def test_fatal_upgrade_error_bodyless_4xx_falls_back_to_generic() -> None:
     """A permanent 4xx with no body (a bare pre-accept close carries none) still
     yields an actionable, generic message rather than an empty one.
     """

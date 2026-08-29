@@ -230,6 +230,25 @@ def test_env_legacy_prefixed_host_id_accepted(
     assert identity.host_id == "329c39d03aad39ccf2f8597d596676bd"
 
 
+@pytest.mark.parametrize(
+    "configured_host_id",
+    [
+        "329c39d0-3aad-39cc-f2f8-597d596676bd",
+        "host_329c39d03aad39ccf2f8597d596676bd",
+    ],
+)
+def test_config_uuid_host_id_normalized(tmp_path: Path, configured_host_id: str) -> None:
+    """Dashed and legacy-prefixed config ids resolve to the same bare UUID."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"host": {"host_id": configured_host_id, "name": "my-laptop"}})
+    )
+
+    identity = load_or_create_host_identity(config_path)
+
+    assert identity.host_id == "329c39d03aad39ccf2f8597d596676bd"
+
+
 def test_config_non_uuid_host_id_raises_actionable(tmp_path: Path) -> None:
     """
     A non-UUID host_id persisted in config.yaml is rejected with a message

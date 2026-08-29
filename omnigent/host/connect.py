@@ -3877,7 +3877,15 @@ def run_host_process(
     from omnigent.host.identity import CONFIG_PATH
 
     path = config_path or CONFIG_PATH
-    identity = load_or_create_host_identity(path)
+    try:
+        identity = load_or_create_host_identity(path)
+    except ValueError as exc:
+        print(
+            f"\n✗ Could not start host.\n{exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(HOST_FATAL_EXIT_CODE) from None
     if not path.exists():
         print(f"Auto-generated {path} ({identity.host_id}, name: {identity.name})")
     # User-facing: the display form (workspace /omnigent URL with ?o= when
