@@ -209,6 +209,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _read_last_seen,
     _runner_skills_cache,
     _runner_skills_inflight,
+    _runner_skills_stale,
     _session_active_response_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
@@ -4507,13 +4508,16 @@ def _invalidate_runner_backed_snapshot_state(
     """
     Drop runner-derived session snapshot overlays for one session.
 
-    Skills are discovered from the bound runner, so they are dropped and
-    re-fetched at the next snapshot. The native model catalog is instead
-    marked stale by default: it must outlive runner death so the model
-    picker stays populated (and offline model/effort changes stay possible)
-    while the session is asleep — a stale catalog keeps serving until a
-    live-runner re-fetch replaces it. Runner teardown additionally cancels
-    any in-flight fetch so a dead runner cannot land a late stale value.
+    Skills are discovered from the bound runner, so they are marked stale
+    and re-fetched at the next snapshot — but they keep serving until that
+    lands, because the request asking for the refresh is the same one whose
+    response fills the composer's slash-command menu. The native model
+    catalog is marked stale for the same reason, and additionally must
+    outlive runner death so the model picker stays populated (and offline
+    model/effort changes stay possible) while the session is asleep. Runner
+    teardown cancels any in-flight fetch so a dead runner cannot land a late
+    stale value, and drops the skills outright — they belong to the runner
+    that went away.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
@@ -4528,12 +4532,18 @@ def _invalidate_runner_backed_snapshot_state(
     """
     from omnigent.server.smart_routing import invalidate_runner_catalog
 
-    _runner_skills_cache.pop(session_id, None)
+    # Only worth marking when there is something to keep serving: a session
+    # with no cached skills already re-fetches on the next read, and marking
+    # it would leave an id behind for every cold session ever opened.
+    if session_id in _runner_skills_cache:
+        _runner_skills_stale.add(session_id)
     # Routing's candidate catalog is runner-derived too: a rebind or a relaunch
     # can change which models the session can be switched onto, so it must not
     # keep routing off the previous runner's list.
     invalidate_runner_catalog(session_id)
     if cancel_inflight:
+        _runner_skills_cache.pop(session_id, None)
+        _runner_skills_stale.discard(session_id)
         inflight = _runner_skills_inflight.pop(session_id, None)
         if inflight is not None:
             inflight.cancel()
@@ -9819,6 +9829,7 @@ async def _load_runner_skills(
         )
         return
     _runner_skills_cache[session_id] = skills
+    _runner_skills_stale.discard(session_id)
     # Nudge any subscribed client to re-read the (now-warm) snapshot so
     # its slash-command menu fills without waiting for the next bind.
     _publish_runner_skills(session_id)

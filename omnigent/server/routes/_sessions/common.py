@@ -544,6 +544,12 @@ _session_mcp_startup_cache: dict[str, dict[str, McpServerStartup]] = {}
 _runner_skills_cache: dict[str, list[SkillSummary]] = {}
 
 
+# Sessions whose cached skills need a re-fetch but should keep serving until it
+# lands. A browser reload asks for one, and dropping the entry outright would
+# empty the composer's slash-command menu for the reload that requested it.
+_runner_skills_stale: set[str] = set()
+
+
 _runner_skills_inflight: dict[str, asyncio.Task[None]] = {}
 
 
@@ -979,6 +985,7 @@ __all__ = [
     "_runner_relay_tasks",
     "_runner_skills_cache",
     "_runner_skills_inflight",
+    "_runner_skills_stale",
     "_server_host_registry",
     "_server_runner_router",
     "_session_active_response_cache",

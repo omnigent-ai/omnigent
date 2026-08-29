@@ -101,6 +101,15 @@ _FORK_COMMAND_NAMES = frozenset({"/branch", "/fork"})
 _HTTP_POST_MAX_PERMANENT_FAILURES = 3
 _HTTP_POST_RETRY_BASE_DELAY_S = 1.0
 _HTTP_POST_RETRY_MAX_DELAY_S = 30.0
+# Ceiling for the backoff exponent. Transient failures retry with no give-up
+# budget (by design — see _PostRetryTracker), so ``attempts`` is unbounded, and
+# ``min()`` evaluates both operands: without this clamp ``2 ** attempts`` is
+# computed in full before the delay cap can apply, and overflows float once
+# attempts passes ~1025 (OverflowError out of record_failure). Any exponent past
+# the cap is dead weight anyway — with the defaults the cap is already reached at
+# attempt 6 — so 32 leaves the schedule identical while staying far inside float
+# range for any realistic max_delay_s / base_delay_s ratio.
+_HTTP_POST_RETRY_MAX_BACKOFF_EXPONENT = 32
 _HTTP_TRANSIENT_STATUS_CODES = {408, 409, 425, 429}
 # A 503 ``subagent_delivery_not_confirmed`` means the runner could not deliver a
 # terminal sub-agent result to the parent inbox. It is retried (the work entry can
@@ -722,8 +731,9 @@ class _PostRetryTracker:
                 exhausted=True,
                 permanent=permanent,
             )
+        exponent = min(max(0, entry.attempts - 1), _HTTP_POST_RETRY_MAX_BACKOFF_EXPONENT)
         delay_s = min(
-            self._base_delay_s * (2 ** max(0, entry.attempts - 1)),
+            self._base_delay_s * (2**exponent),
             self._max_delay_s,
         )
         entry.next_attempt_at = time.monotonic() + delay_s

@@ -180,6 +180,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _runner_relay_tasks,
     _runner_skills_cache,
     _runner_skills_inflight,
+    _runner_skills_stale,
     _session_active_response_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
@@ -9190,12 +9191,12 @@ async def _fetch_runner_skills(
     if runner_client is None:
         return []
     cached = _runner_skills_cache.get(session_id)
-    if cached is not None:
+    if cached is not None and session_id not in _runner_skills_stale:
         return cached
     # Don't await the runner here: this snapshot is polled continuously
     # (incl. mid-turn), and a per-poll runner round-trip pins the runner's
     # event loop and wedges the turn. Kick one background fetch (single-
-    # flight) and return ``[]``; a later poll serves the cached result.
+    # flight); a later poll serves the fresh result.
     if session_id not in _runner_skills_inflight:
         task = asyncio.create_task(_load_runner_skills(runner_client, session_id))
         _runner_skills_inflight[session_id] = task
@@ -9204,7 +9205,17 @@ async def _fetch_runner_skills(
             _runner_skills_inflight.pop(session_id, None)
 
         task.add_done_callback(_clear_skills_inflight)
-    return []
+    # Stale skills serve while that runs, so a browser reload — which asks for
+    # the refresh — still gets a populated slash-command menu on the response
+    # to its own request. Success publishes ``session.skills`` and open clients
+    # re-read the snapshot.
+    #
+    # A runner that keeps failing the fetch leaves the entry stale, so each poll
+    # starts one more single-flight. That is the same ceiling a cold cache has
+    # always had — one in-flight fetch per session, bounded by the poll rate —
+    # and the alternative, clearing the mark on failure, would serve the old
+    # list until something else invalidated it.
+    return cached or []
 
 
 async def _fetch_model_options(
