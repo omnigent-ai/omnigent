@@ -122,7 +122,11 @@ def test_import_restores_localstorage_settings(
 def test_export_and_import_preserve_theme_mode(
     page: Page, seeded_session: tuple[str, str]
 ) -> None:
-    """The web-theme key (next-themes) is included in export/import."""
+    """The web-theme key (next-themes) is included in export/import.
+
+    Note: next-themes stores the value as a plain string (e.g. 'dark'), not
+    JSON-stringified like other settings.
+    """
     base_url, _session_id = seeded_session
     _open_appearance(page, base_url)
 
@@ -130,16 +134,16 @@ def test_export_and_import_preserve_theme_mode(
     page.get_by_test_id("theme-dark").click()
     expect(page.get_by_test_id("theme-dark")).to_have_attribute("aria-checked", "true")
 
-    # Verify theme was written to localStorage.
+    # Verify theme was written to localStorage (plain string, not JSON).
     theme = page.evaluate("() => window.localStorage.getItem('web-theme')")
-    assert theme == '"dark"'
+    assert theme == "dark"
 
     # Change to light.
     page.get_by_test_id("theme-light").click()
     expect(page.get_by_test_id("theme-light")).to_have_attribute("aria-checked", "true")
 
     # Restore dark theme (simulating import).
-    page.evaluate("() => window.localStorage.setItem('web-theme', '\"dark\"')")
+    page.evaluate("() => window.localStorage.setItem('web-theme', 'dark')")
     page.reload()
     expect(page.get_by_role("group", name="Interface font size", exact=True)).to_be_visible(
         timeout=30_000
@@ -169,12 +173,13 @@ def test_import_flow_with_file_upload(page: Page, seeded_session: tuple[str, str
     expect(page.get_by_test_id("terminal-theme-dark")).to_have_attribute("aria-checked", "true")
 
     # Step 2: Create an exported settings file content.
+    # Note: web-theme is stored as plain string, terminal-theme as JSON.
     exported_settings = {
         "version": 1,
         "settings": {
             "omnigent:ui-font-size": "18",
             "omnigent:terminal-theme": '"dark"',
-            "web-theme": '"dark"',
+            "web-theme": "dark",
         },
     }
 

@@ -821,8 +821,9 @@ function AppearanceSection() {
       applyImportedSettings(imported);
 
       // Apply DOM side-effects so imported settings take effect immediately.
+      // Note: web-theme is stored as plain string by next-themes, not JSON.
       const themeMode = imported.settings["web-theme"];
-      if (themeMode) setTheme(JSON.parse(themeMode));
+      if (themeMode) setTheme(themeMode);
       applyDesktopUiFontSize(readUiFontSizePx());
       applyUiFontFamily(readUiFontFamily());
       applyThemePalette(readThemePalette());
