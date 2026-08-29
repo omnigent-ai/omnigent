@@ -66,7 +66,7 @@ def test_settings_persist_to_localstorage(page: Page, seeded_session: tuple[str,
     font_size = page.evaluate("() => window.localStorage.getItem('omnigent:ui-font-size')")
     terminal_theme = page.evaluate("() => window.localStorage.getItem('omnigent:terminal-theme')")
     assert font_size == "16"
-    assert terminal_theme == '"dark"'  # Stored as JSON
+    assert terminal_theme == "dark"  # Stored as plain string
 
 
 def test_import_restores_localstorage_settings(
