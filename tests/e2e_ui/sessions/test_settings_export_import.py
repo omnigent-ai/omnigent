@@ -143,3 +143,107 @@ def test_export_and_import_preserve_theme_mode(page: Page, seeded_session: tuple
 
     # Dark theme is restored.
     expect(page.get_by_test_id("theme-dark")).to_have_attribute("aria-checked", "true")
+
+
+def test_import_flow_with_file_upload(page: Page, seeded_session: tuple[str, str]) -> None:
+    """Import button triggers file input which processes uploaded JSON settings.
+
+    This test exercises the full import flow: button click → dialog → file input
+    → JSON parsing → localStorage writes → UI update. We use Playwright's
+    set_input_files to simulate uploading a valid settings file.
+    """
+    base_url, _session_id = seeded_session
+    _open_appearance(page, base_url)
+
+    # Step 1: Set initial preferences.
+    font_size_inc = page.get_by_test_id("ui-font-size-inc")
+    for _ in range(5):
+        font_size_inc.click()
+    expect(page.get_by_test_id("ui-font-size-input")).to_have_value("18")
+
+    page.get_by_test_id("terminal-theme-dark").click()
+    expect(page.get_by_test_id("terminal-theme-dark")).to_have_attribute("aria-checked", "true")
+
+    # Step 2: Create an exported settings file content.
+    exported_settings = {
+        "version": 1,
+        "settings": {
+            "omnigent:ui-font-size": "18",
+            "omnigent:terminal-theme": '"dark"',
+            "theme": '"dark"',
+        },
+    }
+
+    # Step 3: Change settings to different values.
+    font_size_dec = page.get_by_test_id("ui-font-size-dec")
+    for _ in range(6):
+        font_size_dec.click()
+    expect(page.get_by_test_id("ui-font-size-input")).to_have_value("12")
+
+    page.get_by_test_id("terminal-theme-light").click()
+    page.get_by_test_id("theme-light").click()
+
+    # Step 4: Import the saved settings via file upload.
+    # Open import dialog.
+    page.get_by_test_id("import-settings-button").click()
+    expect(page.get_by_role("dialog", name="Import settings")).to_be_visible(timeout=30_000)
+
+    # The dialog has a hidden file input that's triggered by "Choose file" button.
+    # We'll set the file directly on the input element.
+    import json
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(exported_settings, f)
+        temp_path = f.name
+
+    try:
+        # Set the file on the hidden input.
+        file_input = page.get_by_test_id("import-settings-file-input")
+        file_input.set_input_files(temp_path)
+
+        # The file is processed immediately via onChange handler.
+        # Wait for dialog to close (import succeeded).
+        expect(page.get_by_role("dialog", name="Import settings")).to_have_count(0, timeout=5000)
+
+        # Settings are restored immediately without reload.
+        expect(page.get_by_test_id("ui-font-size-input")).to_have_value("18")
+        expect(page.get_by_test_id("terminal-theme-dark")).to_have_attribute(
+            "aria-checked", "true"
+        )
+        expect(page.get_by_test_id("theme-dark")).to_have_attribute("aria-checked", "true")
+    finally:
+        Path(temp_path).unlink()
+
+
+def test_import_rejects_invalid_json(page: Page, seeded_session: tuple[str, str]) -> None:
+    """Import shows error when uploaded file contains invalid JSON or structure."""
+    base_url, _session_id = seeded_session
+    _open_appearance(page, base_url)
+
+    # Open import dialog.
+    page.get_by_test_id("import-settings-button").click()
+    expect(page.get_by_role("dialog", name="Import settings")).to_be_visible(timeout=30_000)
+
+    # Upload a file with invalid structure (missing version).
+    import json
+    import tempfile
+    from pathlib import Path
+
+    invalid_settings = {"settings": {"omnigent:ui-font-size": "14"}}  # Missing version field
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(invalid_settings, f)
+        temp_path = f.name
+
+    try:
+        file_input = page.get_by_test_id("import-settings-file-input")
+        file_input.set_input_files(temp_path)
+
+        # Dialog stays open and shows error.
+        expect(page.get_by_role("dialog", name="Import settings")).to_be_visible()
+        expect(page.get_by_role("alert")).to_be_visible()
+        expect(page.get_by_role("alert")).to_contain_text("valid Omnigent settings")
+    finally:
+        Path(temp_path).unlink()
