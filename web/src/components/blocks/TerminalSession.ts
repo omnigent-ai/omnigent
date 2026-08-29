@@ -5,28 +5,38 @@
 // down on the matching detach.
 //
 // Wire protocol (mirrors `omnigent/server/routes/terminal_attach.py`):
-//   - Server → client: binary frames, raw PTY bytes → `term.write`; text
-//     frames for JSON control messages (currently tmux clipboard writes).
+//   - Server → client: binary pane output → `term.write`; text frames for
+//     JSON control messages (currently tmux clipboard writes).
 //   - Client → server: binary frames for keystrokes (`term.onData`);
 //     text frames for JSON control messages (currently only resize).
 
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
-import { type ITheme, Terminal } from "@xterm/xterm";
+import { type FontWeight, type ITheme, Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import { codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
+import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
 
 // Card background colors derived from the app's CSS palette.
 // Light: --card: oklch(1.000 0 0) = pure white.
 // Dark:  --card: oklch(0.195 0.004 240) ≈ rgb(19, 21, 23) via OKLab → sRGB.
 const CARD_LIGHT = "#ffffff";
 const CARD_DARK = "#131517";
+const TERMINAL_BOLD_WEIGHT_OFFSET = 300;
+
+function terminalFontOptions({ sizePx, family, weight }: CodeFont) {
+  return {
+    fontFamily: codeFontFamilyForEditor(family),
+    fontSize: sizePx,
+    fontWeight: weight as FontWeight,
+    fontWeightBold: (weight + TERMINAL_BOLD_WEIGHT_OFFSET) as FontWeight,
+  };
+}
 
 // WebSocket close codes (RFC 6455 reserves 4xxx).
 // 4400 signals wrong-replica routing: the keyed request reached the wrong
 // replica (the ``?omnigent_slice_key=`` doesn't match where the tunnel lives).
-// Mirrors ``ws_bridge.py`` ``WS_CLOSE_WRONG_REPLICA``.
+// Mirrors ``ws_common.py`` ``WS_CLOSE_WRONG_REPLICA``.
 export const WS_CLOSE_WRONG_REPLICA = 4400;
 
 /**
@@ -127,7 +137,7 @@ export type ConnectionState =
  * Deliberate closes — normal closure (1000), auth/policy rejections
  * (1008), and the app's own 4xxx codes (4404 terminal-not-found,
  * 4405 terminal-detached, 4500 internal error; see
- * ``omnigent/terminals/ws_bridge.py``) — mean the server decided the
+ * ``omnigent/terminals/ws_common.py``) — mean the server decided the
  * attach should end, so re-dialing would either loop on the same
  * answer or resurrect a terminal the user intentionally left.
  *
@@ -209,43 +219,11 @@ export function terminalKeyEventPayload(event: KeyboardEvent): string | null {
 const INPUT_ENCODER = new TextEncoder();
 
 /**
- * How recently the user must have typed for an inbound chunk to count as
- * an echo, and the largest chunk still eligible for the synchronous paint.
- */
-export const SYNC_ECHO_WINDOW_MS = 750;
-export const SYNC_ECHO_MAX_BYTES = 2048;
-
-/**
- * Decide whether an inbound PTY chunk should be painted synchronously
- * rather than queued through xterm's async ``write``.
- *
- * The public ``term.write`` defers parsing+paint to a later
- * microtask/frame, adding a frame (or more, under load) of keystroke→echo
- * latency. When the user typed within the last {@link SYNC_ECHO_WINDOW_MS}
- * and the chunk is small (≤ {@link SYNC_ECHO_MAX_BYTES} — an echo or
- * prompt redraw, not a flood), painting it in the same task makes typing
- * feel immediate. Large chunks stay on the async path so an output flood
- * can't monopolize the main thread. Mirrors openui's terminal input fast
- * path.
- *
- * Pure helper — exported for direct unit testing.
- *
- * :param byteLength: Size of the inbound chunk in bytes.
- * :param msSinceLastInput: Milliseconds since the last user keystroke.
- * :returns: ``true`` to take the synchronous echo path.
- */
-export function shouldEchoSynchronously(byteLength: number, msSinceLastInput: number): boolean {
-  return msSinceLastInput < SYNC_ECHO_WINDOW_MS && byteLength <= SYNC_ECHO_MAX_BYTES;
-}
-
-/**
- * Structural view of xterm's internal core, used only to reach the
- * synchronous ``writeSync`` method that the public types don't expose
- * (see {@link TerminalSession.writeOutput}).
+ * Structural view of xterm's internal mouse service. The public modes API
+ * exposes tracking but not the active encoding.
  */
 interface TerminalCore {
   _core?: {
-    writeSync?: (data: Uint8Array, maxSubsequentCalls?: number) => void;
     coreMouseService?: { activeEncoding?: string };
   };
 }
@@ -287,13 +265,10 @@ export function loadWebglRenderer(term: Terminal): WebglAddon | null {
  * Populate the clipboard from a terminal text selection on a browser
  * ``copy`` event.
  *
- * The attached tmux session runs with ``mouse on``, so a plain click-drag
- * is captured by tmux for its own copy-mode and never becomes a browser
- * selection; the user makes a selection with Shift-drag (non-Mac) or
- * ⌥-drag (Mac, via ``macOptionClickForcesSelection``). xterm renders that
- * selection in its own layer rather than a DOM range, so the browser's
- * default copy of it is unreliable — we feed ``term.getSelection()`` into
- * the event's ``clipboardData`` ourselves. ``getSelection()`` already
+ * xterm renders terminal selections in its own layer rather than a DOM range,
+ * so the browser's default copy is unreliable — we feed
+ * ``term.getSelection()`` into the event's ``clipboardData`` ourselves.
+ * ``getSelection()`` already
  * rejoins soft-wrapped rows, so a paragraph the terminal wrapped across
  * several rows copies back as one logical line.
  *
@@ -348,17 +323,6 @@ export function decodeTerminalClipboardBase64(encoded: string): string | null {
   return new TextDecoder().decode(bytes);
 }
 
-/** Parse a tmux-compatible OSC 52 clipboard-set payload. */
-export function parseOsc52Clipboard(data: string): string | null {
-  const separator = data.indexOf(";");
-  if (separator < 0) return null;
-  const selector = data.slice(0, separator);
-  const encoded = data.slice(separator + 1);
-  // tmux uses the empty selector; `c` is the standard system clipboard.
-  if ((selector !== "" && selector !== "c") || encoded === "?") return null;
-  return decodeTerminalClipboardBase64(encoded);
-}
-
 /** Parse the strict server→browser clipboard control-message schema. */
 export function parseTerminalClipboardMessage(message: string): string | null {
   let value: unknown;
@@ -377,25 +341,6 @@ export function parseTerminalClipboardMessage(message: string): string | null {
     return null;
   }
   return decodeTerminalClipboardBase64((value as { data: string }).data);
-}
-
-/** Parse the server's explicit PTY OSC 52 trust capability. */
-export function parseTerminalOsc52Capability(message: string): boolean | null {
-  let value: unknown;
-  try {
-    value = JSON.parse(message);
-  } catch {
-    return null;
-  }
-  if (
-    typeof value !== "object" ||
-    value === null ||
-    (value as { type?: unknown }).type !== "osc52-clipboard-capability" ||
-    typeof (value as { enabled?: unknown }).enabled !== "boolean"
-  ) {
-    return null;
-  }
-  return (value as { enabled: boolean }).enabled;
 }
 
 /** Whether a clipboard event is attributable to recent input on this attach. */
@@ -456,8 +401,8 @@ export function sgrWheelReports(lines: number, col: number, row: number): string
  * xterm's built-in wheel→report conversion is unusable with macOS
  * trackpads: it damps sub-50px pixel deltas by ×0.3 and emits at most one
  * report per DOM event regardless of magnitude, so two-finger scrolling
- * over a mouse-tracking TUI (Claude Code, tmux with ``mouse on``) barely
- * moves. This helper replaces that path: deltas convert to lines at face
+ * over a mouse-tracking TUI (such as Claude Code) barely moves. This helper
+ * replaces that path: deltas convert to lines at face
  * value, the fractional remainder accumulates in *partial* so a run of
  * small trackpad deltas still adds up, and one report is emitted per whole
  * line (capped at {@link WHEEL_REPORTS_MAX_PER_EVENT}; the excess is
@@ -465,10 +410,9 @@ export function sgrWheelReports(lines: number, col: number, row: number): string
  * after the gesture).
  *
  * The event is only consumed when the pane program is tracking the mouse
- * with SGR encoding — both tmux ``mouse on`` (PTY transport) and Claude
- * Code's own tracking (control transport) request SGR. Otherwise the
- * caller must let xterm handle the wheel natively so, e.g., a plain shell
- * on the control transport scrolls xterm's own scrollback. Shift-wheel is
+ * with SGR encoding, such as Claude Code on the control transport. Otherwise
+ * the caller must let xterm handle the wheel natively so, e.g., a plain shell
+ * scrolls xterm's own scrollback. Shift-wheel is
  * also left to xterm, mirroring its built-in escape hatch.
  *
  * Pure helper — exported for direct unit testing; production code calls it
@@ -550,9 +494,7 @@ export class TerminalSession {
   private readonly onClipboardRequest?: TerminalClipboardListener;
   /** Whether this visible, interactive attach may write the local clipboard. */
   private clipboardEnabled: boolean;
-  /** Explicit server capability; defaults off so old/unknown servers fail safe. */
-  private osc52ClipboardEnabled = false;
-  /** ``performance.now()`` of the last keystroke; gates the echo fast path. */
+  /** ``performance.now()`` of the last keystroke; gates clipboard writes. */
   private lastUserInputAt = 0;
   /** Guards {@link dispose} so calling it twice is a safe no-op. */
   private disposed = false;
@@ -576,16 +518,10 @@ export class TerminalSession {
    * :param onState: Called with each state transition so React can
    *     render the connecting / closed / error overlay. Invoked
    *     synchronously from WS event handlers.
-   * :param onActivity: Called whenever PTY output arrives from the
+   * :param onActivity: Called whenever terminal output arrives from the
    *     server. This is a best-effort UI activity signal, not a shell
    *     job-state oracle.
    * :param onInput: Called when user input is sent to the terminal.
-   * :param nativeSelection: When ``true`` (control-mode transport), xterm
-   *     owns the character buffer and mouse, so plain click-drag selects and
-   *     the browser's own copy works — the ``macOptionClickForcesSelection``
-   *     workaround and the custom ``copy`` listener are skipped. When
-   *     ``false`` (PTY transport, the default), tmux runs with ``mouse on``
-   *     and captures drags, so both workarounds stay wired.
    * :param clipboardEnabled: Whether tmux copies may write the local clipboard.
    * :param onClipboardRequest: Receives validated tmux copy-mode text.
    */
@@ -596,7 +532,6 @@ export class TerminalSession {
     isDark = false,
     onActivity?: TerminalActivityListener,
     onInput?: TerminalInputListener,
-    nativeSelection = false,
     clipboardEnabled = true,
     onClipboardRequest?: TerminalClipboardListener,
   ) {
@@ -606,10 +541,8 @@ export class TerminalSession {
     // construction; a mid-session change is applied live via setFont(). The
     // xterm.js defaults (15px, no theme) feel out of place inside the app
     // chrome, so an unset family falls back to the shared mono stack.
-    const { sizePx, family } = readCodeFont();
     this.term = new Terminal({
-      fontFamily: codeFontFamilyForEditor(family),
-      fontSize: sizePx,
+      ...terminalFontOptions(readCodeFont()),
       scrollback: 20000,
       cursorBlink: true,
       theme: terminalTheme(isDark),
@@ -619,29 +552,12 @@ export class TerminalSession {
       // cell's foreground luminance only when it lacks contrast against
       // its actual background.
       minimumContrastRatio: 4.5,
-      // PTY transport only: the attached tmux session runs with `mouse on`
-      // (terminal.py) so the wheel pages through scrollback, but tmux then
-      // captures every mouse drag for its own copy-mode, so a plain
-      // click-drag never produces a browser text selection. xterm's escape
-      // hatch `macOptionClickForcesSelection` lets Mac users ⌥-drag to select,
-      // then ⌘-C copies. In control mode xterm owns the mouse and plain drag
-      // selects natively, so the forced-selection workaround is unnecessary.
-      macOptionClickForcesSelection: !nativeSelection,
       // Opt into xterm's proposed APIs, matching openui's terminal setup.
       allowProposedApi: true,
     });
-    // PTY tmux clients emit OSC 52 after copy-mode commits. Consume only
-    // bounded write requests; clipboard reads/queries are deliberately absent.
-    this.osc52Dispose = this.term.parser.registerOscHandler(52, (data) => {
-      // Control mode forwards raw pane output, so accepting pane OSC 52 there
-      // would bypass tmux's `set-clipboard external` trust boundary. Its copy
-      // path is the typed websocket message emitted from tmux notifications.
-      if (!nativeSelection && this.osc52ClipboardEnabled) {
-        const text = parseOsc52Clipboard(data);
-        if (text !== null) this.requestClipboardWrite(text);
-      }
-      return true;
-    });
+    // Control mode forwards raw pane output. Consume pane OSC 52 so clipboard
+    // writes can only arrive through validated tmux `clipboard-write` frames.
+    this.osc52Dispose = this.term.parser.registerOscHandler(52, () => true);
     this.fit = new FitAddon();
     this.term.loadAddon(this.fit);
     // Turn bare URLs in terminal output into clickable links. Without
@@ -672,7 +588,7 @@ export class TerminalSession {
 
     // Make the browser copy gesture (right-click → Copy and Edit → Copy on
     // every platform, ⌘C on macOS) yield the terminal selection as text.
-    // Without this, a Shift/⌥-drag selection has no working copy path on
+    // Without this, an xterm selection has no working copy path on
     // Linux/Windows — Ctrl+C is SIGINT, and xterm's selection layer isn't a
     // DOM range the browser copies on its own. Capture phase + the shared
     // abort signal so `dispose()` removes it for free. Ctrl+C is never
@@ -706,21 +622,16 @@ export class TerminalSession {
       (ev) => {
         if (ev.data instanceof ArrayBuffer) {
           const bytes = new Uint8Array(ev.data);
-          this.writeOutput(bytes);
+          this.term.write(bytes);
           const now = performance.now();
           if (now - lastActivityTs > 300) {
             lastActivityTs = now;
             onActivity?.();
           }
         } else if (typeof ev.data === "string") {
-          const capability = parseTerminalOsc52Capability(ev.data);
-          if (capability !== null) {
-            this.osc52ClipboardEnabled = capability;
-          } else {
-            const text = parseTerminalClipboardMessage(ev.data);
-            if (text !== null) this.requestClipboardWrite(text);
-            // Unknown text frames stay ignored for protocol forward compatibility.
-          }
+          const text = parseTerminalClipboardMessage(ev.data);
+          if (text !== null) this.requestClipboardWrite(text);
+          // Unknown text frames stay ignored for protocol forward compatibility.
         }
       },
       { signal },
@@ -744,9 +655,8 @@ export class TerminalSession {
 
     this.dataDispose = this.term.onData((d) => {
       onInput?.();
-      // Stamp the keystroke so the next inbound chunk can take the
-      // synchronous echo path; stamp before the readyState guard so a
-      // momentary WS hiccup doesn't disarm the fast path.
+      // Stamp before the readyState guard so clipboard trust still reflects
+      // local input during a momentary WebSocket hiccup.
       this.lastUserInputAt = performance.now();
       if (this.ws.readyState !== WebSocket.OPEN) return;
       this.ws.send(INPUT_ENCODER.encode(d));
@@ -823,7 +733,7 @@ export class TerminalSession {
   }
 
   /**
-   * Update the terminal's code font (size + family) without reconnecting —
+   * Update the terminal's code font without reconnecting —
    * mirrors {@link setTheme}, mutating options in place. A new glyph size
    * changes the character-cell dimensions, so this re-fits the grid to the
    * container and pushes the resulting cols×rows to tmux via {@link sendResize}
@@ -831,9 +741,8 @@ export class TerminalSession {
    * open). An empty family falls back to the shared mono stack. Safe to call at
    * any point after construction.
    */
-  setFont(sizePx: number, family: string): void {
-    this.term.options.fontFamily = codeFontFamilyForEditor(family);
-    this.term.options.fontSize = sizePx;
+  setFont(font: CodeFont): void {
+    Object.assign(this.term.options, terminalFontOptions(font));
     this.sendResize();
   }
 
@@ -864,17 +773,6 @@ export class TerminalSession {
     this.term.dispose();
   }
 
-  /**
-   * Write inbound PTY bytes to the terminal, taking the synchronous echo
-   * fast path for small chunks that arrive right after a keystroke (see
-   * {@link shouldEchoSynchronously}).
-   *
-   * ``writeSync`` is an internal xterm method not in the public typings,
-   * so it's feature-detected and wrapped in try/catch: any failure — or a
-   * future xterm that drops it — falls back to the async public ``write``.
-   * Correctness never depends on the private API; it only shaves a frame
-   * off the echo when present.
-   */
   private requestClipboardWrite(text: string): void {
     if (
       !this.clipboardEnabled ||
@@ -885,32 +783,13 @@ export class TerminalSession {
     this.onClipboardRequest?.(text);
   }
 
-  private writeOutput(bytes: Uint8Array): void {
-    if (shouldEchoSynchronously(bytes.length, performance.now() - this.lastUserInputAt)) {
-      // eslint-disable-next-line no-underscore-dangle
-      const core = (this.term as unknown as TerminalCore)._core;
-      if (typeof core?.writeSync === "function") {
-        try {
-          core.writeSync(bytes, 1);
-          return;
-        } catch {
-          /* fall through to the async public write */
-        }
-      }
-    }
-    this.term.write(bytes);
-  }
-
   /**
    * Whether the pane program requested SGR mouse encoding (``?1006h``).
    *
    * The public ``IModes`` exposes the tracking mode but not the encoding,
-   * so this feature-detects xterm's core mouse service — same pattern as
-   * the ``writeSync`` fast path. Both tmux with ``mouse on`` (PTY
-   * transport) and Claude Code (control transport) request SGR; when the
-   * private shape is missing or the encoding is anything else, the wheel
-   * handler defers to xterm rather than synthesizing reports the program
-   * could not parse.
+   * so this feature-detects xterm's core mouse service. When a pane program
+   * requests SGR tracking (for example Claude Code on the control transport),
+   * reports are synthesized; otherwise the wheel handler defers to xterm.
    */
   private sgrMouseEncodingActive(): boolean {
     // eslint-disable-next-line no-underscore-dangle

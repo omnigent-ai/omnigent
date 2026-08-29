@@ -17,6 +17,7 @@ from omnigent.harness_capabilities import (
     Elicitation,
     ForkHistory,
     HarnessCapabilities,
+    InstructionDelivery,
     IntegrationMode,
     ModelFamily,
     Resume,
@@ -29,6 +30,7 @@ from omnigent.harness_plugins import (
     native_agents,
     valid_harnesses,
 )
+from omnigent.inner.devin import DEVIN_ACP_EXTENSION
 from omnigent.model_override import (
     _ANTIGRAVITY_FAMILY_HARNESSES,
     _CLAUDE_FAMILY_HARNESSES,
@@ -71,10 +73,24 @@ def test_model_family_matches_model_override_sets() -> None:
             assert family is ModelFamily.MULTI, harness
 
 
-def test_subagents_matches_native_wrapper_label() -> None:
-    # subagents is derivable: only native agents with a subagent_wrapper_label
-    # can spawn Omnigent native sub-agents.
+def test_subagents_matches_its_implementing_mechanism() -> None:
+    """``subagents`` is derivable — from the two mechanisms that implement it.
+
+    1. A **native** agent with a ``subagent_wrapper_label``: Omnigent intercepts
+       the vendor's own spawn and mints the child session.
+    2. An **ACP vendor extension** carrying a sub-agent dialect
+       (:mod:`omnigent.inner.devin`): the agent reports its sub-agent lifecycle in
+       its own ``_meta``, and the runner mints the child from that. No native
+       wrapper label is involved — deliberately, since the child inherits its
+       parent's harness identity rather than claiming a vendor's.
+
+    Keeping the derivation here means a harness cannot publish a ``subagents``
+    capability on ``/v1/harnesses`` that nothing implements, or implement one it
+    does not publish.
+    """
     subagent_capable = {agent.harness for agent in native_agents() if agent.subagent_wrapper_label}
+    if DEVIN_ACP_EXTENSION.surfaces_subagents:
+        subagent_capable.add("devin")
     for harness, capability in harness_capabilities().items():
         expected = harness in subagent_capable
         assert capability.subagents == expected, harness
@@ -95,6 +111,17 @@ def test_p0_bench_harnesses_declare_interrupt_and_streaming() -> None:
     for harness in ("claude-sdk", "codex", "pi", "openai-agents"):
         assert caps[harness].interrupt is True, harness
         assert caps[harness].streaming is True, harness
+
+
+def test_pi_harnesses_declare_the_pi_effort_family() -> None:
+    """Both pi harnesses advertise pi's 7-level ladder, not "no effort knob"."""
+    from omnigent.reasoning_effort import EFFORT_VALUES, PI_EFFORTS
+
+    caps = harness_capabilities()
+    for harness in ("pi", "pi-native"):
+        assert caps[harness].effort is EffortFamily.PI, harness
+        assert caps[harness].as_dict()["effort"] == "pi", harness
+    assert PI_EFFORTS == EFFORT_VALUES
 
 
 def test_optional_bench_capabilities_default_to_unknown() -> None:
@@ -118,6 +145,7 @@ def test_optional_bench_capabilities_default_to_unknown() -> None:
     assert capability.fork_history is ForkHistory.NONE
     assert capability.shell_tool_name is None
     assert capability.shell_tool_prompt is None
+    assert capability.instruction_delivery is InstructionDelivery.UNKNOWN
     assert capability.as_dict() == {
         "integration_mode": "sdk-in-process",
         "elicitation": "none",
@@ -135,6 +163,7 @@ def test_optional_bench_capabilities_default_to_unknown() -> None:
         "fork_history": "none",
         "shell_tool_name": None,
         "shell_tool_prompt": None,
+        "instruction_delivery": "unknown",
     }
 
 
@@ -328,3 +357,20 @@ def test_native_tui_harnesses_declare_shell_tool_provocation() -> None:
         assert capability.shell_tool_name, harness
         assert capability.shell_tool_prompt, harness
         assert "omnigent-bench-ok" in capability.shell_tool_prompt, harness
+
+
+def test_every_canonical_harness_declares_instruction_delivery() -> None:
+    caps = harness_capabilities()
+    for harness in valid_harnesses():
+        assert caps[harness].instruction_delivery is not InstructionDelivery.UNKNOWN, harness
+
+
+def test_hermes_and_hermes_native_deliver_differently() -> None:
+    caps = harness_capabilities()
+    assert caps["hermes"].instruction_delivery is InstructionDelivery.FIRST_USER_PREFIX
+    assert caps["hermes-native"].instruction_delivery is InstructionDelivery.NOT_DELIVERED
+
+
+def test_kiro_native_is_not_delivered() -> None:
+    caps = harness_capabilities()
+    assert caps["kiro-native"].instruction_delivery is InstructionDelivery.NOT_DELIVERED

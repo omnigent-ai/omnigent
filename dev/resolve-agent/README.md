@@ -10,8 +10,10 @@ test), then does one of two things:
   PR, runs the repro test against it, and reviews the diff — instead of writing a
   competing fix.
 - **If no fix exists yet**, it **authors the fix** in a fresh worktree, adds
-  targeted tests at the layer it changed, proves the set goes fail→pass, and opens
-  a ready-for-review PR.
+  targeted tests at the layer it changed, proves the set goes fail→pass, opens a
+  ready-for-review PR, and then **drives that PR to a landable state** — a live
+  preview deploy (on every PR, so the fix can be validated directly), green CI, a
+  clean automated review, and the issue's maintainer tagged to review.
 
 ## Prerequisites
 
@@ -94,13 +96,22 @@ the review gate after the fact.
 3. *(author path)* **Audits the e2e test against the unfixed tree first** — it must
    fail on the real buggy behavior, not because it references something the fix
    would add. Existence-checks are rewritten into behavioral assertions and
-   flagged.
+   flagged. A test that *passes* on the unfixed tree means `main` has since
+   fixed the bug: outcome `nothing_to_fix` with the fixing commit named and a
+   ticket-closure recommendation — stale reproductions are retired, not
+   "fixed" again.
 4. *(author path)* Root-causes, implements the fix, and adds targeted
    unit/integration tests at the layer it changed, each fail→pass on the bug.
 5. *(author path)* Re-runs the whole set to prove every live facet goes fail→pass
    (not just a loosened test), and — when the fix touches env-derived defaults —
    **re-runs new tests with ambient vars set** to prove the fixtures are hermetic,
-   not flaky-green on a clean machine.
+   not flaky-green on a clean machine. When the repro handoff carries
+   before-fix recordings, **re-records the same drivers on the fixed tree**
+   (building the SPA up front, then pytest-playwright `--video` for web/terminal
+   facets, the VHS tape for CLI facets), captions each after clip with the actions
+   it performs, and carries the before clips' captions through — so the captioned
+   before/after pair lands in the PR's Demo section and, for Linear bugs with a
+   key available, on the ticket.
 6. *(author path)* **Gets an independent cross-vendor review before opening the
    PR** — spawns a different-model reviewer child (a `codex-native` bundle) on its
    own diff, the same review polly runs after the fact but here *before* publish,
@@ -109,10 +120,30 @@ the review gate after the fact.
    blocking finding, then commits, pushes, and opens a **ready-for-review PR** (so
    the repo's automated review runs too). Reuses the same server + runner; if no
    second vendor is configured it skips and says so.
-7. Emits a single fenced ```json handoff block: `mode`
+7. *(author path)* **Drives the open PR to a landable state** — a bounded loop:
+   - Labels **every** PR **`ui-preview`** (not just frontend fixes) to request a
+     live app deploy — but only **after** CI is green and the Polly review is
+     clean for the current commit, never up front, since the label triggers a
+     `pull_request_target` deploy of the PR's code. Then waits for the
+     preview URL and posts a comment with how to connect a runner to it
+     (`omnigent run --server <url>`) to validate the fix directly. (The workflow
+     deploys for any labelled non-draft PR, forks included — the label is the
+     trust boundary, and only a maintainer-privileged identity can apply it; the
+     agent degrades gracefully when no preview appears.)
+   - Watches CI (`gh pr checks --watch`); when a check fails it reads the log,
+     fixes its own regressions, and pushes — while leaving pre-existing/flaky/infra
+     failures alone (and saying so).
+   - Reads the latest **Polly AI Review** comment; fixes any blocking/security
+     finding at the root, pushes, and re-triggers the review with a `/review`
+     comment, looping until no critical findings remain.
+   - Writes a **paste-to-an-agent live-validation prompt** into the PR body so a
+     human can reproduce and confirm the fix, then **tags the issue's assignee**
+     (the maintainer) to review once CI is green and the review is clean.
+8. Emits a single fenced ```json handoff block: `mode`
    (`reviewed_existing_pr` / `authored_fix`), `outcome` (`fixed` /
    `partially_fixed` / `not_fixed` / `nothing_to_fix` / `needs_more_info`), the
-   per-facet fail→pass proof, the `cross_review` result, and the PR URL (opened or
-   reviewed).
+   per-facet fail→pass proof, the `cross_review` result, the PR URL (opened or
+   reviewed), and the Step 4 landing state (`ci_status`, `polly_review`,
+   `ui_preview`, `validation_prompt`, `maintainer_review`).
 
 It does **not** merge. See `AGENTS.md` for the full operating procedure.

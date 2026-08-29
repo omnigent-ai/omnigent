@@ -2965,6 +2965,10 @@ async def _forward_available_status_events(
                 background_task_count=(
                     None if status == "failed" else record.background_task_count
                 ),
+                # Detail rides alongside the count on the same ``Stop`` edge so
+                # the UI can name the shells. Dropped on ``failed`` for the same
+                # reason as the count (the server clears the tally there).
+                background_tasks=(None if status == "failed" else record.background_tasks),
             )
         except httpx.HTTPError as exc:
             decision = retry_tracker.record_failure(retry_key, exc)

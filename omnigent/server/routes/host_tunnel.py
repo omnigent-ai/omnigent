@@ -26,6 +26,7 @@ from collections.abc import Awaitable, Callable
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
+from omnigent.debug_logging import set_current_user_id
 from omnigent.host.frames import (
     HostConnectionErrorFrame,
     HostCreateDirResultFrame,
@@ -34,6 +35,8 @@ from omnigent.host.frames import (
     HostFsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostImportLocalDoneFrame,
+    HostImportLocalSessionFrame,
     HostInstallHarnessResultFrame,
     HostLaunchRunnerResultFrame,
     HostListDirResultFrame,
@@ -191,6 +194,12 @@ def create_host_tunnel_router(
             # deployment; RESERVED_USER_LOCAL is the accepted local owner
             # (consistent with get_user_id returning None on the HTTP side).
             tunnel_owner = RESERVED_USER_LOCAL
+
+        # Attribute debug-log records emitted while servicing this host's tunnel
+        # to its owner. This WebSocket handler runs in its own task, so the set
+        # is scoped to this connection (child loop tasks inherit it) and cannot
+        # bleed across concurrent host connections.
+        set_current_user_id(tunnel_owner)
 
         # Reject a cross-owner takeover before accept(). ``host_id`` is
         # UNIQUE, so a peer authenticated as one user dialing in on a
@@ -728,6 +737,34 @@ async def _receive_loop(
                         "routable_models": frame.routable_models,
                         "error": frame.error,
                     }
+                )
+            continue
+        if isinstance(frame, HostImportLocalSessionFrame):
+            queue = conn.pending_import_local.get(frame.request_id)
+            if queue is not None:
+                s = frame.session
+                queue.put_nowait(
+                    (
+                        "session",
+                        {
+                            "total": frame.total,
+                            "external_session_id": s.external_session_id,
+                            "workspace": s.workspace,
+                            "items": s.items,
+                            "title": s.title,
+                            "source": s.source,
+                        },
+                    )
+                )
+            continue
+        if isinstance(frame, HostImportLocalDoneFrame):
+            queue = conn.pending_import_local.get(frame.request_id)
+            if queue is not None:
+                queue.put_nowait(
+                    (
+                        "done",
+                        {"status": frame.status, "error": frame.error, "failed": frame.failed},
+                    )
                 )
             continue
 

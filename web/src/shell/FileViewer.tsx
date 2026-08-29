@@ -35,6 +35,7 @@ import {
   EyeOffIcon,
   FileDiffIcon,
   Link2Icon,
+  ListIcon,
   Loader2Icon,
   MessageSquareTextIcon,
   MoreHorizontalIcon,
@@ -416,11 +417,14 @@ function FileViewerBody({
   const [linkCopied, setLinkCopied] = useState(false);
   const linkCopiedTimerRef = useRef<number>(0);
   const [pendingAction, setPendingAction] = useState<(() => void) | null>(null);
+  // TOC panel state (for markdown preview)
+  const [tocOpen, setTocOpen] = useState(false);
   // Reset selection state whenever the file changes.
   useEffect(() => {
     setActiveSelection(null);
     setIsEditorDirty(false);
     setSaveStatus("idle");
+    setTocOpen(false);
   }, [path]);
   // Reset comments initialization when the viewer transitions from closed to open,
   // so the panel state is derived from the freshly-opened file's comments.
@@ -477,14 +481,6 @@ function FileViewerBody({
     },
     [isEditorDirty],
   );
-
-  const handleSetActiveSelection = (sel: ActiveSelection | null) => {
-    setActiveSelection(sel);
-    if (sel !== null) {
-      commentsInitializedRef.current = true;
-      setCommentsOpen(true);
-    }
-  };
 
   useEffect(
     () => () => {
@@ -545,9 +541,24 @@ function FileViewerBody({
     [allComments, fileContent],
   );
 
+  const handleSetActiveSelection = (selection: ActiveSelection | null) => {
+    let nextSelection = selection;
+    if (selection && selection.comment_id == null) {
+      const comment = openComments.find(
+        (c) => c.start_index === selection.start_index && c.end_index === selection.end_index,
+      );
+      if (comment) nextSelection = { ...selection, comment_id: comment.id };
+    }
+    setActiveSelection(nextSelection);
+    if (selection !== null) {
+      commentsInitializedRef.current = true;
+      setCommentsOpen(true);
+    }
+  };
+
   // Apply the linked comment (from ?comment= URL param) once per lifecycle.
   // Waits for fileQuery.data so classifyAndRemapComments has run with real content,
-  // ensuring activeSelection uses remapped indices that match openComments.
+  // ensuring activeSelection uses remapped indices that match open comments.
   useEffect(() => {
     if (linkedCommentAppliedRef.current) return;
     const commentId = initialCommentIdRef.current;
@@ -561,6 +572,7 @@ function FileViewerBody({
       start_index: comment.start_index,
       end_index: comment.end_index,
       anchor_content: comment.anchor_content ?? "",
+      comment_id: comment.id,
     });
   }, [openComments]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -686,6 +698,15 @@ function FileViewerBody({
   const [deepLinkBiasPath, setDeepLinkBiasPath] = useState<string | null>(() =>
     initialCommentIdRef.current ? path : null,
   );
+
+  // Switch a markdown file to the rich-text editor — the surface where text-
+  // selection commenting works. Used by the preview's "switch to edit mode"
+  // hint. Coming from preview/source there are no edits to guard, so it applies
+  // directly (mirrors the toolbar's switchTo for the non-editor case).
+  const handleRequestEditMode = useCallback(() => {
+    setDeepLinkBiasPath(null);
+    setPreviewableViewMode("editor");
+  }, []);
 
   // Persist the global view preferences so they survive a refresh. commentsOpen
   // is intentionally excluded — it's contextual (per-open), not a sticky
@@ -911,6 +932,16 @@ function FileViewerBody({
       label: "Open in new tab",
       icon: <SquareArrowOutUpRightIcon className="size-4" />,
       onSelect: openHtmlInNewTab,
+    });
+  }
+  // Table of contents for markdown preview
+  if (lang === "markdown" && viewMode === "preview") {
+    toolbarActions.push({
+      key: "toc",
+      label: tocOpen ? "Hide table of contents" : "Show table of contents",
+      icon: <ListIcon className="size-4" />,
+      active: tocOpen,
+      onSelect: () => setTocOpen((prev) => !prev),
     });
   }
   // PDFs render through PdfViewer with text-layer comment anchors.
@@ -1435,6 +1466,7 @@ function FileViewerBody({
               onDirtyChange={setIsEditorDirty}
               onSaveStatusChange={setSaveStatus}
               comments={openComments}
+              addressedComments={addressedComments}
               activeSelection={activeSelection}
               onSetActiveSelection={handleSetActiveSelection}
               pendingBodyRef={pendingBodyRef}
@@ -1443,6 +1475,9 @@ function FileViewerBody({
               setSearchOpen={setSearchOpen}
               searchInputRef={searchInputRef}
               viewMode={viewMode}
+              tocOpen={tocOpen}
+              onTocToggle={() => setTocOpen((prev) => !prev)}
+              onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
             />
           )}
         </div>
@@ -1471,20 +1506,21 @@ function FileViewerBody({
               if (!sender) return;
               const ids = openComments.map((c) => c.id);
               sender.mutate({ comment_ids: ids });
-              setActiveSelection(null);
             }}
             onClickComment={(comment) => {
               setActiveSelection({
                 start_index: comment.start_index,
                 end_index: comment.end_index,
                 anchor_content: comment.anchor_content ?? "",
+                comment_id: comment.id,
               });
               // Sync the selected comment into the URL so the address bar is
               // always shareable. AppShell clears this param when the viewer closes.
               setSearchParams(
                 (prev) => {
                   const next = new URLSearchParams(prev);
-                  next.set("comment", comment.id);
+                  if (comment.status === "draft") next.set("comment", comment.id);
+                  else next.delete("comment");
                   return next;
                 },
                 { replace: true },
@@ -1496,8 +1532,10 @@ function FileViewerBody({
               const deleted = [...openComments, ...addressedComments].find((c) => c.id === id);
               if (
                 deleted &&
-                activeSelection?.start_index === deleted.start_index &&
-                activeSelection?.end_index === deleted.end_index
+                (activeSelection?.comment_id === deleted.id ||
+                  (activeSelection?.comment_id == null &&
+                    activeSelection?.start_index === deleted.start_index &&
+                    activeSelection?.end_index === deleted.end_index))
               )
                 setActiveSelection(null);
             }}

@@ -172,7 +172,9 @@ _INIT_CONTAINER_NAME: str = "workspace-prep"
 # Pod-start wait budget, consumed inside start_host BEFORE the
 # shared _wait_for_host_online poll, so a Pod that can't schedule / pull its
 # image / clone its repo fails fast with a clear reason instead of as a generic
-# online timeout. Kept tight; a cold image pull is the usual slow case.
+# online timeout. Kept tight; a cold image pull is the usual slow case —
+# deployments whose host image regularly takes longer to pull can raise the
+# budget via ``sandbox.kubernetes.pod_ready_timeout_s``.
 _POD_READY_TIMEOUT_S: int = 90
 _POD_READY_POLL_S: float = 2.0
 
@@ -1021,6 +1023,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         resources: dict[str, object] | None = None,
         pvc_mounts: Sequence[Mapping[str, object]] | None = None,
         secret_mounts: Sequence[Mapping[str, object]] | None = None,
+        pod_ready_timeout_s: int | None = None,
     ) -> None:
         """
         Store provider config for lazy use by :meth:`start_host` / :meth:`terminate`.
@@ -1042,6 +1045,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         self._resources = resources
         self._pvc_mounts = list(pvc_mounts) if pvc_mounts else None
         self._secret_mounts = list(secret_mounts) if secret_mounts else None
+        self._pod_ready_timeout_s = pod_ready_timeout_s
         self._core: k8s_client.CoreV1Api | None = None
         self._batch: k8s_client.BatchV1Api | None = None
         self._api_client: k8s_client.ApiClient | None = None
@@ -1373,7 +1377,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         Filters out Pods with a ``deletionTimestamp`` (being torn down) and
         prefers a running Pod over a pending one when a replacement exists.
         Re-raises 401/403 so RBAC misconfigurations surface immediately
-        instead of masquerading as a 90s timeout.
+        instead of masquerading as a readiness timeout.
 
         :param namespace: Namespace the Job lives in.
         :param job_name: The Job whose child Pod to find.
@@ -1430,7 +1434,12 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         from urllib3.exceptions import HTTPError
 
         core = self._load_core()
-        deadline = time.monotonic() + _POD_READY_TIMEOUT_S
+        timeout_s = (
+            self._pod_ready_timeout_s
+            if self._pod_ready_timeout_s is not None
+            else _POD_READY_TIMEOUT_S
+        )
+        deadline = time.monotonic() + timeout_s
         last_reason: str | None = None
         pod_name: str | None = None
         while True:
@@ -1441,7 +1450,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     if time.monotonic() >= deadline:
                         raise click.ClickException(
                             f"Kubernetes sandbox job '{job_name}' did not create a "
-                            f"child pod within {_POD_READY_TIMEOUT_S}s."
+                            f"child pod within {timeout_s}s."
                         )
                     time.sleep(_POD_READY_POLL_S)
                     continue
@@ -1458,7 +1467,17 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                 if getattr(exc, "status", None) == 404:
                     # Under OnFailure the Job may replace the Pod (eviction,
                     # preemption, node drain) — re-discover instead of failing.
+                    replaced_pod_name = pod_name
                     pod_name = None
+                    if time.monotonic() >= deadline:
+                        raise click.ClickException(
+                            self._pod_failure_message(
+                                namespace,
+                                replaced_pod_name,
+                                "disappeared and could not be rediscovered before the "
+                                f"{timeout_s}s deadline",
+                            )
+                        ) from exc
                     time.sleep(_POD_READY_POLL_S)
                     continue
                 last_reason = _api_reason(exc)
@@ -1467,8 +1486,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                         self._pod_failure_message(
                             namespace,
                             pod_name,
-                            "could not be read before the "
-                            f"{_POD_READY_TIMEOUT_S}s deadline ({last_reason})",
+                            f"could not be read before the {timeout_s}s deadline ({last_reason})",
                         )
                     ) from exc
                 time.sleep(_POD_READY_POLL_S)
@@ -1480,8 +1498,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                         self._pod_failure_message(
                             namespace,
                             pod_name,
-                            "could not be read before the "
-                            f"{_POD_READY_TIMEOUT_S}s deadline ({last_reason})",
+                            f"could not be read before the {timeout_s}s deadline ({last_reason})",
                         )
                     ) from exc
                 time.sleep(_POD_READY_POLL_S)
@@ -1515,7 +1532,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     self._pod_failure_message(
                         namespace,
                         pod_name,
-                        f"did not start within {_POD_READY_TIMEOUT_S}s "
+                        f"did not start within {timeout_s}s "
                         f"(last phase '{phase or 'unknown'}'{detail})",
                     )
                 )

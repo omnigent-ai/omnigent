@@ -263,13 +263,51 @@ Or launch a specific agent runtime:
 omnigent claude                      # Claude Code, in a session your team can join
 omnigent codex                       # Codex
 omnigent cursor                      # Cursor
+omnigent agy                         # Antigravity
 omnigent opencode                    # OpenCode
 omnigent hermes                      # Hermes Agent (Nous Research)
 omnigent pi                          # Pi
 ```
 
+`omnigent agy` requires agy 1.1.13 or newer. When `GEMINI_API_KEY` is set,
+direct Gemini API authentication takes precedence over agy's saved OAuth login.
+
 Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
 its coding agents or drive a live OpenClaw Gateway session over ACP.
+
+<details>
+<summary>Grok Build and Devin</summary>
+
+Two more coding agents are built in but have no `omnigent <name>` launcher of
+their own, because each ships a CLI that holds its own login. Install the vendor
+CLI, log in with it, then name the harness:
+
+```bash
+# Grok Build (xAI)
+curl -fsSL https://x.ai/cli/install.sh | bash
+grok login --device-auth              # xAI OAuth
+omnigent run --harness grok           # 'grok-build' also works
+
+# Devin (Cognition)
+curl -fsSL https://cli.devin.ai/install.sh | bash
+devin auth login
+omnigent run --harness devin
+```
+
+Both speak the [Agent Client Protocol](https://agentclientprotocol.com) over
+stdio, and Omnigent stores no credential for either — each CLI reads back the
+login it wrote to disk. That also means `--model` is refused rather than
+silently dropped: both run their account-default model. To pin one, configure an
+`acp:` agent whose command passes the vendor's own model flag.
+
+Use the vendor login rather than an API key. A builtin ACP row has no
+`env_passthrough` of its own, and `XAI_API_KEY` is not in the host-to-runner
+credential allowlist, so exporting it in your shell does not reach the agent.
+If you need the key route, pass it explicitly with
+`OMNIGENT_RUNNER_ENV_PASSTHROUGH=XAI_API_KEY`, or configure an `acp:` agent that
+declares the passthrough.
+
+</details>
 
 #### 🐙 Polly and 🟠🔵 Debby
 
@@ -312,6 +350,41 @@ omnigent start   # starts the local server and registers this machine as a host
 Open the server URL it prints, hit **New Chat**, pick your machine, and go.
 Check status with `omnigent server status`; stop everything with
 `omnigent stop`.
+
+<details>
+<summary>Customize automatic session titles</summary>
+
+Set additional natural-language requirements for the isolated title generator:
+
+```bash
+omnigent config set --global \
+  'session_title_instructions=Prefix titles with the current date as lowercase mon-dd. Use PR-number-short-name for pull requests, issue-number-short-description for issues, and a short snake_case activity otherwise.'
+```
+
+The title generator receives the current date as `YYYY-MM-DD`, then applies
+these requirements to the first user message. The setting is server-owned and
+does not alter an agent's portable instructions. Default generated titles are
+limited to 100 characters; custom title requirements may use up to 200.
+Default titles over 100 characters are rejected, leaving the first-message
+fallback title in place. Custom titles over 200 characters are truncated with
+a trailing ellipsis. Manually assigned titles are also limited to 200
+characters. The setting applies to new sessions after the local Omnigent
+server restarts.
+For longer instructions, edit `~/.omnigent/config.yaml` directly and use a YAML
+block scalar:
+
+```yaml
+session_title_instructions: |
+  Prefix every title with the current date as lowercase mon-dd.
+  For pull requests use mon-dd-PR-number-short-name.
+  For issues use mon-dd-issue-number-short-description.
+  For other work use mon-dd-short_snake_case_activity.
+```
+
+Server operators can set the same key in the YAML passed to
+`omnigent server --config`.
+
+</details>
 
 ### 3. Choose & switch models
 

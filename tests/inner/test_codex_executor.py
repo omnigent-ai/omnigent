@@ -20,6 +20,7 @@ from omnigent.inner.codex_executor import (
     _TURN_EVENT_WARN_SECONDS,
     CodexExecutor,
     _build_initial_prompt,
+    _codex_builtin_tool_completion,
     _codex_cli_version,
     _CodexAppServerSession,
     _databricks_codex_config_overrides,
@@ -1914,6 +1915,154 @@ async def test_run_turn_method_error_emits_retryable_executor_error() -> None:
     assert "shell command crashed" in error_events[0].message
 
 
+async def test_run_turn_emits_correlated_codex_builtin_tool_events() -> None:
+    """Expose built-in shell and file items without re-executing either tool."""
+
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd="/tmp/workspace",
+        env={},
+        tool_executor=None,
+    )
+    session.start = AsyncMock()
+    session._proc = _FakeProcess()
+    session.thread_id = "thread-1"
+    turn_started = asyncio.Event()
+
+    async def _start_turn(*_args: object, **_kwargs: object) -> dict[str, object]:
+        """Return the turn id and release the live event producer."""
+
+        turn_started.set()
+        return {"result": {"turn": {"id": "turn-1"}}}
+
+    session._request = AsyncMock(side_effect=_start_turn)
+
+    command_item = {
+        "id": "command-1",
+        "type": "commandExecution",
+        "command": "pwd",
+        "cwd": "/tmp/workspace",
+    }
+
+    async def _produce_live_events() -> None:
+        """Publish lifecycle notifications after ``turn/start`` returns."""
+
+        await turn_started.wait()
+        events = [
+            {
+                "method": "item/started",
+                "params": {"turnId": "turn-1", "item": command_item},
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "turnId": "turn-1",
+                    "item": {
+                        **command_item,
+                        "aggregatedOutput": "/tmp/workspace\n",
+                        "exitCode": 0,
+                        "durationMs": 12,
+                    },
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "file-1",
+                        "type": "fileChange",
+                        "status": "completed",
+                        "changes": [
+                            {"path": "/tmp/workspace/result.txt", "kind": {"type": "add"}}
+                        ],
+                    },
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "message-1",
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": "done",
+                    },
+                },
+            },
+        ]
+        for event in events:
+            await session._events.put(event)
+
+    producer = asyncio.create_task(_produce_live_events())
+
+    events = [
+        event
+        async for event in session.run_turn(
+            messages=[{"role": "user", "content": "inspect and edit"}],
+            tools=[],
+            system_prompt="",
+            model="gpt-5.4-mini",
+            cwd=".",
+            sandbox="workspace-write",
+        )
+    ]
+    await producer
+
+    tool_events = [
+        event for event in events if isinstance(event, (ToolCallRequest, ToolCallComplete))
+    ]
+    assert [event.name for event in tool_events] == [
+        "shell",
+        "shell",
+        "shell",
+        "apply_patch",
+        "apply_patch",
+    ]
+    assert [event.metadata["call_id"] for event in tool_events] == [
+        "command-1",
+        "command-1",
+        "command-1",
+        "file-1",
+        "file-1",
+    ]
+    assert isinstance(tool_events[0], ToolCallRequest)
+    assert tool_events[0].args == {"command": "pwd", "cwd": "/tmp/workspace"}
+    assert tool_events[0].metadata["observed_call_completed"] is False
+    assert isinstance(tool_events[1], ToolCallRequest)
+    assert tool_events[1].metadata["observed_call_completed"] is True
+    assert isinstance(tool_events[2], ToolCallComplete)
+    assert tool_events[2].result == "/tmp/workspace\n"
+    assert tool_events[2].status is ToolCallStatus.SUCCESS
+    assert isinstance(tool_events[3], ToolCallRequest)
+    assert tool_events[3].args == {
+        "changes": [{"path": "/tmp/workspace/result.txt", "kind": {"type": "add"}}]
+    }
+    assert tool_events[3].metadata["observed_call_completed"] is True
+    assert isinstance(events[-1], TurnComplete)
+    assert events[-1].response == "done"
+
+
+def test_codex_builtin_command_completion_surfaces_nonzero_exit() -> None:
+    """Keep failed command output visibly distinguishable from success."""
+
+    completion = _codex_builtin_tool_completion(
+        {
+            "id": "command-failed",
+            "type": "commandExecution",
+            "command": "false",
+            "aggregatedOutput": "boom",
+            "exitCode": 3,
+        }
+    )
+
+    assert completion is not None
+    assert completion.status is ToolCallStatus.ERROR
+    assert completion.result == "boom\n[exit code: 3]"
+    assert completion.error == "Command exited with status 3."
+
+
 async def test_run_turn_refuses_to_adopt_stale_final_answer_event() -> None:
     """Adopt fallback must drop a stale final-answer item rather
     than adopt it as the new turn's response.
@@ -2475,6 +2624,69 @@ def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> 
     assert (target / "config.toml").read_text() == '[default]\nmodel = "gpt-5.4"'
 
 
+def test_populate_codex_home_config_symlinks_remote_mcp_oauth(tmp_path: Path) -> None:
+    """``.credentials.json`` and its lock dir are symlinked, not left behind.
+
+    Codex keeps OAuth tokens for remote (``url =``) MCP servers in
+    ``.credentials.json``, guarded across processes by
+    ``mcp-oauth-locks/``. A private home missing them starts those servers
+    unauthenticated while ``command =`` (stdio) servers still work.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "config.toml").write_text('[mcp_servers.linear]\nurl = "https://x/mcp"')
+    (source / ".credentials.json").write_text('{"linear|abc": {"access_token": "t"}}')
+    (source / "mcp-oauth-locks").mkdir()
+    (source / "mcp-oauth-locks" / "file-store.lock").write_text("")
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    # Symlinked (not copied) so a refresh in either direction is shared.
+    assert (target / ".credentials.json").is_symlink()
+    assert (target / ".credentials.json").read_text() == '{"linear|abc": {"access_token": "t"}}'
+    assert (target / "mcp-oauth-locks").is_symlink()
+    assert (target / "mcp-oauth-locks" / "file-store.lock").is_file()
+
+
+def test_populate_codex_home_config_symlinks_memories(tmp_path: Path) -> None:
+    """``memories_1.sqlite``, ``memories/``, and ``rules/`` are symlinked.
+
+    Codex stores memories in ``memories_1.sqlite`` and ``memories/``, and
+    user-defined rules in ``rules/``. Without symlinking them a private home
+    starts with no memories and ignores the user's rules.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "auth.json").write_text('{"auth_mode": "chatgpt"}')
+    (source / "config.toml").write_text("[default]\n")
+    (source / "memories_1.sqlite").write_bytes(b"SQLite format 3\x00fake")
+    (source / "memories").mkdir()
+    (source / "memories" / "mem.md").write_text("# memory")
+    (source / "rules").mkdir()
+    (source / "rules" / "default.rules").write_text(
+        'prefix_rule(pattern=["git"], decision="allow")'
+    )
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    assert (target / "memories_1.sqlite").is_symlink()
+    assert (target / "memories_1.sqlite").read_bytes() == b"SQLite format 3\x00fake"
+    assert (target / "memories").is_symlink()
+    assert (target / "memories" / "mem.md").read_text() == "# memory"
+    assert (target / "rules").is_symlink()
+    assert (
+        target / "rules" / "default.rules"
+    ).read_text() == 'prefix_rule(pattern=["git"], decision="allow")'
+
+
 def test_populate_codex_home_config_symlinks_plugins_cache(tmp_path: Path) -> None:
     """``plugins/cache`` is symlinked to the shared home to dedupe it.
 
@@ -2916,6 +3128,69 @@ def test_populate_codex_home_config_does_not_overwrite_existing(tmp_path: Path) 
 
     assert (target / "auth.json").read_text() == '{"old": true}'
     assert not (target / "auth.json").is_symlink()
+
+
+@pytest.mark.parametrize(
+    "provider_config",
+    [
+        '[model_providers.gateway]\nname = "Gateway"\nbase_url = "https://example.test"\n',
+        'model_providers = { gateway = { name = "Gateway", '
+        'base_url = "https://example.test" } }\n',
+    ],
+    ids=["table", "inline-table"],
+)
+def test_materialize_codex_provider_config_applies_default_retry_policy(
+    tmp_path: Path, provider_config: str
+) -> None:
+    """Private Codex providers receive Omnigent's retry budget.
+
+    Codex does not honor the speculative ``OPENAI_MAX_RETRIES`` environment
+    variable. Its native provider settings must be written into the private
+    config so a sustained retryable response does not exhaust Codex's smaller
+    built-in default first.
+    """
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+    from omnigent.spec.types import RetryPolicy
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(provider_config)
+
+    materialize_codex_provider_config(codex_home, [])
+
+    config = tomllib.loads((codex_home / "config.toml").read_text())
+    provider = config["model_providers"]["gateway"]
+    assert provider["request_max_retries"] == RetryPolicy().max_retries
+    assert provider["stream_max_retries"] == RetryPolicy().max_retries
+    assert provider["stream_idle_timeout_ms"] == 120_000
+
+
+def test_materialize_codex_provider_config_applies_custom_retry_policy(tmp_path: Path) -> None:
+    """Agent-specific retry values override Codex provider defaults."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+    from omnigent.spec.types import RetryPolicy
+
+    codex_home = tmp_path / "codex-home"
+    retry_policy = RetryPolicy(max_retries=13, timeout_per_request_s=300)
+
+    materialize_codex_provider_config(
+        codex_home,
+        [
+            'model_providers.generated={name="Generated",'
+            'base_url="https://example.test",wire_api="responses"}'
+        ],
+        retry_policy=retry_policy,
+    )
+
+    config = tomllib.loads((codex_home / "config.toml").read_text())
+    provider = config["model_providers"]["generated"]
+    assert provider["request_max_retries"] == 13
+    assert provider["stream_max_retries"] == 13
+    assert provider["stream_idle_timeout_ms"] == 300_000
 
 
 # ---------------------------------------------------------------------------

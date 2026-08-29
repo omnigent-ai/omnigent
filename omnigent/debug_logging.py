@@ -28,6 +28,8 @@ import time
 import traceback
 import urllib.parse
 import uuid
+from collections.abc import Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 import httpx
@@ -48,16 +50,29 @@ ENDPOINT_ENV_VAR = "OMNIGENT_DEBUG_LOG_ENDPOINT"
 # runner-level log callsites that have no per-request session id in scope.
 PRIMARY_SESSION_ID_ENV_VAR = "OMNIGENT_RUNNER_PRIMARY_SESSION_ID"
 
+# Authenticated user id (email) attribution. The multi-tenant server sets a
+# request-scoped ContextVar per request; the single-user runner/host set the
+# env var once at startup (a process constant — an env var, not a ContextVar,
+# because a ContextVar set at startup is invisible to run_in_executor threads).
+USER_ID_ENV_VAR = "OMNIGENT_USER_ID"
+_user_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_user_id", default=None)
+
+# Origin deployment identity for the workspace_id/app_name columns. The
+# multi-tenant managed service stamps a per-request ``record.workspace_id`` (via
+# its logging ContextFilter), so the sink prefers that; the values below are the
+# process-constant fallback for single-tenant deployments -- the DATABRICKS_* env
+# a Databricks App injects, else parsed from the server URL a runner/host
+# connected to an App carries. All absent on OSS/local (columns stay null).
+ORIGIN_WORKSPACE_ID_ENV_VAR = "DATABRICKS_WORKSPACE_ID"
+APP_NAME_ENV_VAR = "DATABRICKS_APP_NAME"
+SERVER_URL_ENV_VAR = "RUNNER_SERVER_URL"
+
 # Batching / delivery defaults.
 _BATCH_MAX_RECORDS = 100
 _FLUSH_INTERVAL_S = 2.0
 _QUEUE_MAX_RECORDS = 10_000
 _TOKEN_REFRESH_SKEW_S = 300.0
 _HTTP_TIMEOUT_S = 10.0
-# Delay before the one-shot startup self-probe fires. Long enough to land after
-# the process's startup-time logging reconfiguration (uvicorn's dictConfig,
-# which closes all handlers, runs a second or two into serving).
-_PROBE_DELAY_S = 10.0
 # Logger-name prefixes the sink drops as noise: httpx/httpcore emit an
 # "HTTP Request: …" line per call — high-volume plumbing the debug view doesn't
 # want (and the sink's own uploads go through httpx).
@@ -191,11 +206,89 @@ def runner_primary_session_id() -> str | None:
     return os.environ.get(PRIMARY_SESSION_ID_ENV_VAR) or None
 
 
+def set_current_user_id(user_id: str | None) -> None:
+    """Bind the current request's authenticated user (server middleware / WS boundary)."""
+    _user_id_var.set(user_id or None)
+
+
+@contextlib.contextmanager
+def current_user_id_scope(user_id: str | None) -> Iterator[None]:
+    """Bind ``user_id`` for the duration of the block, restoring the prior value on exit."""
+    token = _user_id_var.set(user_id or None)
+    try:
+        yield
+    finally:
+        _user_id_var.reset(token)
+
+
+def current_user_id() -> str | None:
+    """Best-available user attribution the sink stamps when a record has no explicit user_id.
+
+    Request-scoped ContextVar first (multi-tenant server, per request), then the
+    process-constant ``OMNIGENT_USER_ID`` env (single-user runner/host). Both
+    empty -> ``None``. On the runner/host this is the process **owner** (session/
+    host owner), which in a shared session can differ from the per-turn initiator
+    the server records -- inherent to a per-process attribution column.
+    """
+    return _user_id_var.get() or os.environ.get(USER_ID_ENV_VAR) or None
+
+
+def _clean(value: object) -> str | None:
+    """Coerce a missing/blank record attribute to ``None`` so a fallback engages.
+
+    The managed service's logging filter sets ``record.workspace_id`` to ``""``
+    (present-but-empty) for records emitted outside a workspace-bound request, so
+    an empty value must fall through to the process-constant fallback, not win.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _parse_databricks_app_host(url: str | None) -> tuple[str | None, str | None]:
+    """Parse ``(app_name, workspace_id)`` from a Databricks Apps server URL.
+
+    Apps URLs are ``https://<app_name>-<workspace_id>.<region>.databricksapps.com``;
+    the app name may itself contain hyphens, so split on the last one and require a
+    numeric workspace-id suffix. ``(None, None)`` for any non-Apps URL -- the
+    managed service (``dbc-<hash>...``), localhost, or a custom domain.
+    """
+    if not url:
+        return None, None
+    host = urllib.parse.urlparse(url).hostname or ""
+    if not host.endswith(".databricksapps.com"):
+        return None, None
+    label = host.split(".", 1)[0]
+    app_name, sep, workspace_id = label.rpartition("-")
+    if not sep or not app_name or not workspace_id.isdigit():
+        return None, None
+    return app_name, workspace_id
+
+
+def _process_identity() -> tuple[str | None, str | None]:
+    """Best-available ``(workspace_id, app_name)`` for single-tenant deployments.
+
+    The fallback the sink applies when a record carries no per-request identity:
+    the ``DATABRICKS_*`` env (a Databricks App injects it; a host connected to a
+    managed service resolves its workspace id and publishes it there, and injects
+    it into each runner it spawns), else the values parsed from the server URL a
+    runner/host connected to an App carries. ``(None, None)`` on the managed
+    service (which supplies identity per-record) and on OSS/local. Read fresh per
+    call, not cached: the host resolves and sets the env after import.
+    """
+    url_app, url_ws = _parse_databricks_app_host(os.environ.get(SERVER_URL_ENV_VAR))
+    workspace_id = _clean(os.environ.get(ORIGIN_WORKSPACE_ID_ENV_VAR)) or url_ws
+    app_name = _clean(os.environ.get(APP_NAME_ENV_VAR)) or url_app
+    return workspace_id, app_name
+
+
 def debug_event(
     event_name: str,
     *,
     session_id: str | None = None,
     turn_id: str | None = None,
+    user_id: str | None = None,
     **attributes: object,
 ) -> dict[str, object]:
     """Build a logging ``extra=`` payload naming a semantic event.
@@ -208,16 +301,23 @@ def debug_event(
             "tool_call_dispatched", session_id=session_id,
             tool_call_id=tc.id, model=model))
 
-    The correlation columns are populated only from what the callsite passes --
-    the sink reads them off the record, with no ambient fallback. Freeform
-    ``_logger.debug("…")`` calls need no ``extra``; they ship with null
-    correlation columns and an empty attributes map.
+    ``turn_id`` is populated only from what the callsite passes. ``session_id``
+    is likewise callsite-driven, but the sink additionally falls back to the
+    runner's primary (parent) conversation id when a record carries none (see
+    :func:`record_to_row`); that fallback is runner-only, so on the server an
+    unthreaded ``session_id`` stays null. ``user_id`` has its own ambient
+    fallback (a request-scoped ContextVar on the server, the ``OMNIGENT_USER_ID``
+    env on the runner/host). Freeform ``_logger.debug("…")`` calls need no
+    ``extra``; they ship with null correlation columns and an empty attributes
+    map.
     """
     extra: dict[str, object] = {"event_name": event_name, "attributes": dict(attributes)}
     if session_id is not None:
         extra["session_id"] = session_id
     if turn_id is not None:
         extra["turn_id"] = turn_id
+    if user_id is not None:
+        extra["user_id"] = user_id
     return extra
 
 
@@ -241,9 +341,25 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
     ``client_time`` is epoch microseconds and ``attributes`` a plain object --
     the two shapes the ZeroBus JSON path requires for the ``TIMESTAMP`` and
     ``MAP<STRING,STRING>`` columns respectively.
+
+    ``session_id`` is taken from what the callsite threaded via ``extra`` and,
+    failing that, falls back to the runner's primary (parent) conversation id
+    (:func:`runner_primary_session_id`). That fallback reads a runner-only env
+    that is absent on the multi-tenant server, so a server record with no
+    explicit id stays null rather than risk cross-request mis-attribution --
+    this is deliberate; do NOT add an ambient request-scoped fallback here. On a
+    runner, a co-located subagent turn whose log is not threaded can be
+    attributed to the parent conversation, an accepted trade-off.
+
+    ``workspace_id``/``app_name`` describe the record's origin deployment: the
+    managed service stamps ``record.workspace_id`` per request (so it wins),
+    while single-tenant deployments fall back to the process-constant
+    :func:`_process_identity`. ``app_name`` has no per-request source, so it is
+    null on the managed service.
     """
+    workspace_id, app_name = _process_identity()
     return {
-        "session_id": getattr(record, "session_id", None),
+        "session_id": getattr(record, "session_id", None) or runner_primary_session_id(),
         "turn_id": getattr(record, "turn_id", None),
         "source": source,
         "event_name": getattr(record, "event_name", None),
@@ -257,7 +373,9 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
         "stack_trace": _stack_trace(record),
         "attributes": _attributes(record),
         "log_id": uuid.uuid4().hex,
-        "user_id": getattr(record, "user_id", None),
+        "user_id": getattr(record, "user_id", None) or current_user_id(),
+        "workspace_id": _clean(getattr(record, "workspace_id", None)) or workspace_id,
+        "app_name": _clean(getattr(record, "app_name", None)) or app_name,
     }
 
 
@@ -374,33 +492,6 @@ class ZerobusLogHandler(logging.Handler):
         self._delivered_any = False
         self._start_worker()
         atexit.register(self.close)
-        # One-shot startup self-probe. Deliberately NOT cancelled on close() —
-        # uvicorn's dictConfig close()s this handler a beat into startup, and the
-        # probe firing *after* that is exactly what re-arms the worker and proves
-        # end-to-end delivery on an otherwise-idle process.
-        self._probe_timer = threading.Timer(_PROBE_DELAY_S, self._probe)
-        self._probe_timer.daemon = True
-        self._probe_timer.start()
-
-    def _probe(self) -> None:
-        """Emit one startup self-probe, after logging reconfiguration.
-
-        Fires ~10s after arm — past uvicorn's startup ``dictConfig()`` — so every
-        boot leaves a health line in the local log (``alive``/``delivered``/queue
-        depth) and, via the normal emit path, a delivered ``sink_online`` row.
-        The emit revives the worker if ``dictConfig`` (or a fork) stopped it, so
-        the sink is guaranteed live even when no session traffic has flowed yet.
-        Best-effort; never raises.
-        """
-        with contextlib.suppress(Exception):  # a probe must never break anything
-            _logger.info(
-                "debug-log sink: self-probe source=%s alive=%s delivered=%s qsize=%d",
-                self._source,
-                self._thread.is_alive(),
-                self._delivered_any,
-                self._queue.qsize(),
-                extra=debug_event("sink_online"),
-            )
 
     def _start_worker(self) -> None:
         """Create the queue/client and launch the uploader thread.
@@ -462,14 +553,32 @@ class ZerobusLogHandler(logging.Handler):
                 pass
 
     def _run(self) -> None:
-        while not self._stop.is_set():
-            batch = self._collect_batch(self._FLUSH_WAIT)
-            if batch:
-                self._post(batch)
-        # Drain whatever is left on shutdown.
-        remaining = self._collect_batch(0.0)
-        if remaining:
-            self._post(remaining)
+        # This worker owns the client captured at start and closes it on exit,
+        # so close() never shuts the client down from another thread while a
+        # post/token-mint is in flight (which raises inside httpx and would
+        # otherwise kill this thread with an uncaught exception).
+        client = self._client
+        try:
+            while not self._stop.is_set():
+                try:
+                    batch = self._collect_batch(self._FLUSH_WAIT)
+                    if batch:
+                        self._post(batch)
+                except Exception:  # noqa: BLE001 — the uploader thread must never die
+                    # A transient error (or a closed client during a shutdown
+                    # race) must not kill the worker: emit()'s self-heal only
+                    # revives a *stopped* thread, so a crash would silently end
+                    # delivery for the process. Drop and keep going.
+                    time.sleep(0.1)
+            # Best-effort drain of whatever is left on shutdown.
+            remaining = self._collect_batch(0.0)
+            if remaining:
+                self._post(remaining)
+        except Exception:  # noqa: BLE001 — shutdown drain is best-effort
+            pass
+        finally:
+            with contextlib.suppress(Exception):
+                client.close()
 
     _FLUSH_WAIT = _FLUSH_INTERVAL_S
 
@@ -541,24 +650,52 @@ class ZerobusLogHandler(logging.Handler):
     def close(self) -> None:
         if self._closed:
             return
-        # Capture the worker we are tearing down first. A concurrent emit()
-        # (which runs under the handler lock) can revive the sink during the
-        # join below — reassigning self._stop/_thread/_client to fresh ones — so
-        # stop and close the captured locals, never the revived worker.
-        stop, thread, client = self._stop, self._thread, self._client
+        # Signal the worker and let it finish and close its own client. Capture
+        # the worker we are tearing down first: a concurrent emit() (under the
+        # handler lock) can revive the sink during the join below, reassigning
+        # self._stop/_thread to fresh ones. Do NOT close the client here — the
+        # worker's shutdown drain may still be minting a token / posting, and
+        # closing it underneath raises inside httpx and kills the thread.
+        stop, thread = self._stop, self._thread
         self._closed = True
         stop.set()
         thread.join(timeout=5.0)
-        try:
-            client.close()
-        finally:
-            super().close()
+        super().close()
 
 
 # Process-wide sink; recreated only if a prior instance was closed (e.g. a
 # logging reconfigure closed the root handlers out from under us).
 _active_sink: ZerobusLogHandler | None = None
 _sink_lock = threading.Lock()
+
+# Dedicated logger for the server's outgoing SSE-event stream. It gets the sink
+# as its sole handler with ``propagate=False`` (wired in attach_debug_log_sink),
+# so its high-volume, table-only records — one per emitted event, names + safe
+# ids, never content — never reach the on-disk/stderr logs.
+SSE_LOGGER_NAME = "omnigent.sse_events"
+
+
+def debug_sink_enabled() -> bool:
+    """Whether the debug-log sink is active in this process.
+
+    A cheap gate for opt-in, table-only logging (e.g. the SSE-event stream):
+    callers skip building records entirely when the sink is off, so the feature
+    adds no cost for OSS / non-internal users who never enabled it.
+    """
+    # Intentionally lock-free: a single global-object read is atomic under the
+    # GIL, and this is a best-effort gate — a stale read only mis-times one
+    # record around enable/close, never corrupts state.
+    return _active_sink is not None and not _active_sink.closed
+
+
+def sse_event_logger() -> logging.Logger:
+    """Return the table-only logger for SSE events (see :data:`SSE_LOGGER_NAME`).
+
+    Records go only to the debug sink (attached with ``propagate=False`` in
+    :func:`attach_debug_log_sink`); when the sink is disabled the logger has no
+    handlers and records are dropped -- so gate on :func:`debug_sink_enabled`.
+    """
+    return logging.getLogger(SSE_LOGGER_NAME)
 
 
 def attach_debug_log_sink(loggers: list[logging.Logger], *, source: str, level: int) -> None:
@@ -591,3 +728,10 @@ def attach_debug_log_sink(loggers: list[logging.Logger], *, source: str, level: 
         _active_sink.setLevel(level)
         for target in loggers:
             target.addHandler(_active_sink)
+        # Table-only SSE-event logger: the sink is its sole handler and it does
+        # not propagate to root, so per-token delta events populate the table
+        # without flooding the on-disk/stderr logs.
+        sse_logger = logging.getLogger(SSE_LOGGER_NAME)
+        sse_logger.setLevel(level)
+        sse_logger.propagate = False
+        sse_logger.addHandler(_active_sink)

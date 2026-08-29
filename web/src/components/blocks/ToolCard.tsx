@@ -449,6 +449,7 @@ function OutputSection({ output }: { output: string }) {
             size="xs"
             type="button"
             variant="outline"
+            componentId="diagnostics.tool.toggle_expanded"
           >
             {isExpanded ? (
               <Minimize2Icon className="size-3" />
@@ -544,6 +545,7 @@ function CopyTextButton({ text, label }: CopyTextButtonProps) {
           size="icon-xs"
           type="button"
           variant="ghost"
+          componentId="diagnostics.tool.copy"
         >
           <Icon className="size-3.5" />
         </Button>

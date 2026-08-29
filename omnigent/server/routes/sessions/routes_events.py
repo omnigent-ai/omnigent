@@ -78,6 +78,7 @@ from omnigent.server.routes._sessions.common import (
     _ALLOWED_EVENT_TYPES,
     _APPROVAL_TYPE,
     _COMPACT_TYPE,
+    _EXTERNAL_ACP_SUBAGENT_START_TYPE,
     _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
     _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
     _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
@@ -136,6 +137,8 @@ from omnigent.server.routes._sessions.helpers import (
     _handle_external_session_todos,
     _is_codex_native_subagent,
     _launch_runner_on_host,
+    _parse_background_tasks,
+    _persist_external_acp_subagent_start,
     _persist_external_assistant_message,
     _persist_external_codex_approval_mode_change,
     _persist_external_codex_collaboration_mode_change,
@@ -174,7 +177,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
     _child_session_summaries_from_conversations,
     _dispatch_session_event_to_runner,
-    _enrich_idle_status_with_subagent_output,
+    _enrich_terminal_status_with_subagent_output,
     _ensure_native_terminal_ready,
     _ensure_runner_relay_ready,
     _ensure_runner_session_initialized,
@@ -195,6 +198,7 @@ from omnigent.server.routes._sessions.orchestration import (
     ensure_runner_connected,
 )
 from omnigent.server.schemas import (
+    BackgroundTaskInfo,
     ConversationDeleted,
     ElicitationRequestEvent,
     ElicitationRequestParams,
@@ -213,6 +217,7 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedEvent
 from omnigent.telemetry.events import SessionStoppedEvent as _TelSessionStoppedEvent
+from omnigent.telemetry.events import TurnEndEvent as _TelTurnEndEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.tools.client_specified import parse_client_side_tool_specs
 
@@ -545,6 +550,7 @@ def register_events_routes(
             _EXTERNAL_SESSION_TITLE_TYPE,
             _EXTERNAL_SESSION_TODOS_TYPE,
             _EXTERNAL_SUBAGENT_START_TYPE,
+            _EXTERNAL_ACP_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
             _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
@@ -1171,26 +1177,6 @@ def register_events_routes(
                     "external_session_status data.response_id must be a string",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            # Surface the failure reason a native forwarder carries so a
-            # top-level session sees it on its own status edge and persisted
-            # last_task_error, not only the sub-agent parent-inbox path.
-            output = body.data.get("output")
-            status_error: ErrorDetail | None = None
-            if status == "failed" and isinstance(output, str) and output.strip():
-                status_error = ErrorDetail(
-                    code=(
-                        "codex_reauth_required"
-                        if body.data.get("reauth_required") is True
-                        else "codex_turn_error"
-                    ),
-                    message=output.strip(),
-                )
-            if status_error is not None:
-                await _persist_session_status_error_labels(
-                    session_id, status_error, conversation_store
-                )
-            elif status == "running":
-                await _persist_session_status_error_labels(session_id, None, conversation_store)
             # ``None`` (field absent) = no information; leave the sticky
             # tally untouched (the PTY-activity ``idle`` carries none). An
             # explicit ``0`` from a ``Stop`` hook is authoritative and clears
@@ -1203,6 +1189,11 @@ def register_events_routes(
                 and raw_bg_count >= 0
                 else None
             )
+            # Per-shell detail behind that count, so the UI can name each
+            # running shell. Best-effort: an older runner sends the count with no
+            # detail, and the server keeps it in lockstep with the tally (see
+            # ``_publish_status``).
+            bg_tasks = _parse_background_tasks(body.data.get("background_tasks"))
             # Why a still-running session is parked, e.g. a permission prompt
             # the web UI does not mirror. Absent or blank = not parked, so the
             # indicator falls back to its ordinary working label.
@@ -1220,18 +1211,66 @@ def register_events_routes(
             if effective_status != status:
                 status = effective_status
                 body.data["status"] = status
+            # Terminal edges carry the harness's own persisted text: the
+            # child's result on ``idle``, and on ``failed`` — when the
+            # forwarder attached no detail — its error report (claude-native's
+            # StopFailure edge posts none). Enriched before the reason is
+            # derived so the pill, ``last_task_error``, and the parent inbox
+            # all see the same detail.
+            data = await _enrich_terminal_status_with_subagent_output(
+                body.data, status, session_id, conversation_store
+            )
+            # Surface the failure reason a native forwarder carries so a
+            # top-level session sees it on its own status edge and persisted
+            # last_task_error, not only the sub-agent parent-inbox path.
+            output = data.get("output")
+            status_error: ErrorDetail | None = None
+            if status == "failed" and isinstance(output, str) and output.strip():
+                status_error = ErrorDetail(
+                    code=(
+                        "codex_reauth_required"
+                        if data.get("reauth_required") is True
+                        # The store-enriched detail keeps a harness-neutral
+                        # code; a forwarder-sent detail keeps codex's.
+                        else (
+                            "codex_turn_error" if body.data.get("output") else "native_turn_error"
+                        )
+                    ),
+                    message=output.strip(),
+                )
+            if status_error is not None:
+                await _persist_session_status_error_labels(
+                    session_id, status_error, conversation_store
+                )
+            elif status == "running":
+                await _persist_session_status_error_labels(session_id, None, conversation_store)
             _publish_status(
                 session_id,
                 status,
                 status_error,
                 response_id=response_id,
                 background_task_count=bg_count,
+                background_tasks=bg_tasks,
                 blocked_on=blocked_on,
             )
+            # Emit a turn-end telemetry event for native harnesses. "idle"
+            # means the turn completed normally; "failed" means it errored.
+            # No latency or token deltas are available on this path.
+            if status in {"idle", "failed"}:
+                _tel_emit(
+                    _TelTurnEndEvent(
+                        installation_id=_get_installation_id(),
+                        session_id=session_id,
+                        status="completed" if status == "idle" else "failed",
+                        latency_ms=None,
+                        model=None,
+                        input_tokens=None,
+                        output_tokens=None,
+                        cost_usd=None,
+                    )
+                )
             forward_body = body.model_dump()
-            forward_body["data"] = await _enrich_idle_status_with_subagent_output(
-                forward_body["data"], status, session_id, conversation_store
-            )
+            forward_body["data"] = data
             runner_result = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
@@ -1424,6 +1463,16 @@ def register_events_routes(
                 conversation_store,
             )
             return {"queued": False, "child_session_id": child_id}
+        if body.type == _EXTERNAL_ACP_SUBAGENT_START_TYPE:
+            child_id = await _persist_external_acp_subagent_start(
+                session_id,
+                conv,
+                body,
+                conversation_store,
+            )
+            # Returned to the runner so it can address the sub-agent's transcript
+            # items and its completion status to the child id.
+            return {"queued": False, "child_session_id": child_id}
         if body.type == "function_call_output":
             # A client-side tool's result tunneling back to a parked turn.
             # The harness scaffold resolves the parked tool Future on a
@@ -1588,6 +1637,7 @@ def register_events_routes(
                     _sf._HOST_BOUND_RUNNER_CONNECT_GRACE_S,
                     conv.runner_id,
                     session_id,
+                    extra={"session_id": session_id},
                 )
                 if _grace_host_reg is not None and _grace_host_conn is not None:
                     runner_client = await _wait_for_host_bound_runner_client(
@@ -2173,7 +2223,7 @@ def register_events_routes(
         if runner_client is not None:
             try:
                 await runner_client.delete(
-                    f"/v1/sessions/{session_id}/resources",
+                    f"/v1/sessions/{session_id}",
                     timeout=10.0,
                 )
             except (httpx.HTTPError, ConnectionError):
@@ -2211,6 +2261,8 @@ def register_events_routes(
                 delete_branch=True,
                 request=request,
                 reason="session-delete",
+                conversation_store=conversation_store,
+                exclude_conversation_id=conv.id,
             )
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.discard(session_id)

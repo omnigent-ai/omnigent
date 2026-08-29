@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     # import annotations`` is in effect).
     from omnigent.inner.datamodel import OSEnvSpec
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.entities import (
     NON_CONTENT_ITEM_TYPES,
     CompactionData,
@@ -1045,7 +1046,7 @@ def _resolve_provider_for_build(
             raise OmnigentError(
                 f"executor.auth references provider {auth.name!r}, but no such provider is "
                 "configured under 'providers:' in ~/.omnigent/config.yaml. "
-                "Run `omnigent setup --no-internal-beta` to configure one.",
+                f"Run `{cli_invocation()} setup --no-internal-beta` to configure one.",
                 code=ErrorCode.INVALID_INPUT,
             )
         return entry
@@ -1620,6 +1621,9 @@ def _build_acp_spawn_env(
         omnigent_mcp = embedded.get("omnigent_mcp", True)
         if not isinstance(omnigent_mcp, bool):
             raise ValueError("executor acp_agent omnigent_mcp must be a boolean")
+        inject_system_prompt = embedded.get("inject_system_prompt", True)
+        if not isinstance(inject_system_prompt, bool):
+            raise ValueError("executor acp_agent inject_system_prompt must be a boolean")
         session_id_mode = embedded.get("session_id_mode", "server")
         if session_id_mode not in ("server", "client"):
             raise ValueError(
@@ -1640,6 +1644,7 @@ def _build_acp_spawn_env(
             session_id_mode=session_id_mode,
             send_model=send_model,
             omnigent_mcp=omnigent_mcp,
+            inject_system_prompt=inject_system_prompt,
             env_passthrough=parse_env_passthrough(embedded.get("env_passthrough")),
         )
     else:
@@ -1655,6 +1660,8 @@ def _build_acp_spawn_env(
         if agent.send_model:
             env["HARNESS_ACP_SEND_MODEL"] = "1"
         env["HARNESS_ACP_OMNIGENT_MCP"] = "1" if agent.omnigent_mcp else "0"
+        if not agent.inject_system_prompt:
+            env["HARNESS_ACP_INJECT_SYSTEM_PROMPT"] = "0"
         if agent.env_passthrough:
             # Names only; the harness reads each value from its own environment.
             env["HARNESS_ACP_ENV_PASSTHROUGH"] = ",".join(agent.env_passthrough)
@@ -2906,33 +2913,9 @@ def _find_spec_by_name(
     child ``__web_researcher`` session boots by re-parsing the bundle
     fresh (``runner/_entry.py`` spec resolver), so the researcher is
     absent from the re-parsed tree and a plain search returns ``None``.
-    Every caller swaps to the resolved sub-spec only ``if ... is not
-    None`` and otherwise keeps the parent spec, which boots the child as
-    a full clone of the parent (runaway recursion via ``sys_session_send``
-    when the parent is a coordinator). To keep that fallback safe, the
-    researcher is reconstructed deterministically from the parent (the
-    same pure builder ``WebFetchTool`` uses) instead of returning ``None``,
-    but only when some node in the tree actually declares the ``web_fetch``
-    builtin. That builtin is the sole reason the researcher ever exists, so a
-    tree without it anywhere has no such child and the name falls through to
-    normal resolution (``None``). Reconstructing unconditionally would let a
-    caller-controlled ``sub_agent_name`` coerce any parent into a
-    shell-capable researcher (``build_researcher_spec`` synthesizes an
-    ``OSEnvSpec``), widening the parent's tool boundary.
+    The root is never matched against itself, even when ``spec.name == name``.
 
-    The owning node need not be the root: a nested sub-agent may own
-    ``web_fetch`` while the handed-in root does not. The gate locates the
-    ``web_fetch`` owner via a root-first pre-order walk
-    (:func:`_find_web_fetch_owner`) and reconstructs from THAT owner, not the
-    root, so the researcher inherits the owner's LLM and sandbox/egress
-    boundary (``build_researcher_spec`` derives both from its argument). When
-    several nodes own ``web_fetch`` the first pre-order owner wins; this is a
-    deliberate limitation tied to the ``__web_researcher`` name not being
-    unique per owner (plumbing an "effective parent" through every call site
-    is out of scope). The root-owner case is unchanged: the owner is the
-    root, so the output is identical to before.
-
-    :param spec: The root agent spec to search.
+    :param spec: The root agent spec to search under.
     :param name: The sub-agent name to find,
         e.g. ``"researcher"``.
     :returns: The matching sub-agent spec, the reconstructed
@@ -2950,35 +2933,13 @@ def _find_spec_by_name(
     # so reconstruct from the owner (root-first pre-order) — never the root —
     # to inherit the owner's LLM and sandbox/egress boundary. Imported lazily
     # to keep the tools layer off this module's import path.
-    from omnigent.tools.builtins.web_fetch import RESEARCHER_NAME
+    from omnigent.tools.builtins.web_fetch import (
+        RESEARCHER_NAME,
+        reconstruct_researcher_spec,
+    )
 
     if name == RESEARCHER_NAME:
-        owner = _find_web_fetch_owner(spec)
-        if owner is not None:
-            from omnigent.tools.builtins.web_fetch import build_researcher_spec
-
-            return build_researcher_spec(owner)
-    return None
-
-
-def _find_web_fetch_owner(spec: AgentSpec) -> AgentSpec | None:
-    """
-    Find the first node owning the ``web_fetch`` builtin, root-first.
-
-    Pre-order DFS (root, then children left-to-right), mirroring
-    :func:`_search_sub_agent_tree`. The ``web_fetch`` owner is the node whose
-    ``tools.builtins`` carries an entry named ``web_fetch``; that node's spec
-    is the correct parent for ``build_researcher_spec`` (its LLM + sandbox).
-
-    :param spec: The agent spec whose sub-tree to search.
-    :returns: The first node (root-first) owning ``web_fetch``, or ``None``.
-    """
-    if any(entry.name == "web_fetch" for entry in spec.tools.builtins):
-        return spec
-    for sa in spec.sub_agents:
-        owner = _find_web_fetch_owner(sa)
-        if owner is not None:
-            return owner
+        return reconstruct_researcher_spec(spec)
     return None
 
 

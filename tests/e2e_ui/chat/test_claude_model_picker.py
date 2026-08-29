@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 from playwright.sync_api import Page, Route, expect
 
 from omnigent.claude_native import ClaudeNativeUcodeConfig, claude_native_model_options
-from tests.e2e_ui.conftest import seed_committed_turn
+from tests.e2e_ui.conftest import fetch_with_retry, seed_committed_turn
 
 _EXPECTED_ROWS = [
     ("opus", "Opus 4.10"),
@@ -86,7 +86,7 @@ def _patch_session_as_claude_native(
 
         headers = {"content-type": "application/json"}
         if request.method == "GET":
-            response = route.fetch()
+            response = fetch_with_retry(route)
             payload = response.json()
             headers = {**response.headers, **headers}
         elif request.method == "PATCH":
@@ -309,7 +309,7 @@ def _force_asleep_liveness(page: Page, session_id: str) -> None:
         if request.method != "GET" or urlparse(request.url).path != "/health":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         offline = {"runner_online": False, "host_online": False}
         if isinstance(payload.get("sessions"), dict):
@@ -327,7 +327,7 @@ def _force_asleep_liveness(page: Page, session_id: str) -> None:
         if request.method != "GET" or urlparse(request.url).path != "/v1/sessions":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         rows = payload.get("data") if isinstance(payload, dict) else None
         if isinstance(rows, list):
@@ -365,15 +365,15 @@ def test_claude_native_picker_saves_model_while_host_asleep(
     _force_asleep_liveness(page, session_id)
     patch_bodies = _patch_session_as_claude_native(page, session_id, host_asleep=True)
 
-    page.goto(f"{base_url}/c/{session_id}")
-
-    # Wait for liveness to resolve to host_asleep (the composer's resume
-    # placeholder) so the gear assertions exercise the asleep state, not the
-    # initial not-yet-polled window.
-    composer = page.get_by_label("Message the agent")
-    expect(composer).to_have_attribute(
-        "placeholder", re.compile("resume the sandbox host"), timeout=15_000
-    )
+    # Wait for the /health poll that resolves liveness to host_asleep to land
+    # before the gear assertions, so they exercise the settled asleep state and
+    # not the initial not-yet-polled window. (The composer placeholder is no
+    # longer state-specific, so it can't be the signal.)
+    with page.expect_response(
+        lambda r: urlparse(r.url).path == "/health" and r.status == 200,
+        timeout=15_000,
+    ):
+        page.goto(f"{base_url}/c/{session_id}")
 
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_have_attribute("aria-disabled", "false")
@@ -538,7 +538,7 @@ def _patch_native_session_pair(page: Page, codex_session_id: str, claude_session
             route.continue_()
             return
 
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         if path == f"/v1/sessions/{codex_session_id}":
             wrapper, harness = "codex-native-ui", "codex"

@@ -463,7 +463,13 @@ def _branding_png(color: tuple[int, int, int, int]) -> bytes:
     return output.getvalue()
 
 
-def _build_branding_app(db_uri: str, tmp_path: Path, label: str) -> FastAPI:
+def _build_branding_app(
+    db_uri: str,
+    tmp_path: Path,
+    label: str,
+    *,
+    server_config: dict[str, object] | None = None,
+) -> FastAPI:
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 
     artifact_store = LocalArtifactStore(str(tmp_path / f"artifacts-{label}"))
@@ -476,6 +482,25 @@ def _build_branding_app(db_uri: str, tmp_path: Path, label: str) -> FastAPI:
             artifact_store=artifact_store,
             cache_dir=tmp_path / f"cache-{label}",
         ),
+        server_config=server_config,
+    )
+
+
+def test_session_title_instructions_are_wired_into_coordinator(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "custom-titles",
+        server_config={"session_title_instructions": "Prefix titles with the current date."},
+    )
+
+    assert (
+        app.state.background_title_coordinator._additional_instructions
+        == "Prefix titles with the current date."
     )
 
 
@@ -1494,6 +1519,117 @@ def test_ensure_default_polly_agent_repairs_stale_cache(
     assert repaired != "STALE CACHED SPEC"
 
 
+def test_ensure_default_polly_agent_repairs_lost_bundle_blob(
+    seed_stores: _SeedStores,
+) -> None:
+    """
+    A matching-hash re-seed restores a bundle blob lost from the store.
+
+    The matching-hash fast path trusts the artifact store without
+    checking the blob is present. If the row survives but the bundle is
+    gone (artifacts pruned, or the DB restored without the matching
+    store), every restart re-computes the same hash, matches the stored
+    ``bundle_location``, and returns without re-``put``-ing — so boot can
+    never self-heal and each session launch raises ``failed to load
+    agent spec``. The seeder must re-``put`` on the matching path when
+    the store is missing the blob. Without the fix this test fails: the
+    blob stays absent and the reload raises ``KeyError``.
+    """
+    server_app._ensure_default_polly_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+    agent = seed_stores.agent_store.get_by_name(server_app._POLLY_AGENT_NAME)
+    assert agent is not None
+    assert seed_stores.artifact_store.exists(agent.bundle_location)
+
+    # Lose the blob while the row survives, and drop the local cache so
+    # nothing masks the missing bundle at load time.
+    seed_stores.artifact_store.delete(agent.bundle_location)
+    seed_stores.agent_cache.evict(agent.id)
+    assert not seed_stores.artifact_store.exists(agent.bundle_location)
+
+    # Re-seed: source unchanged → hash matches the row (the fast path).
+    server_app._ensure_default_polly_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+
+    # The fast path re-put the lost bundle: the store has it again and a
+    # fresh load succeeds instead of raising.
+    assert seed_stores.artifact_store.exists(agent.bundle_location)
+    reloaded = seed_stores.agent_cache.load(agent.id, agent.bundle_location)
+    assert reloaded.spec is not None
+    # Row untouched on the matching path: same location, no version bump.
+    still = seed_stores.agent_store.get_by_name(server_app._POLLY_AGENT_NAME)
+    assert still is not None
+    assert still.bundle_location == agent.bundle_location
+    assert still.version == agent.version
+
+
+def test_ensure_default_polly_agent_repairs_legacy_prefixed_bundle_location(
+    seed_stores: _SeedStores,
+) -> None:
+    """
+    The lost-blob repair targets the row's own ``bundle_location``, so it
+    also heals a legacy ``ag_``-prefixed one.
+
+    Rows seeded before the binary-uuid migration keep an ``ag_``-prefixed
+    left segment in ``bundle_location`` while ``id`` is bare hex (the
+    migration excluded ``bundle_location`` as a physical artifact key), and
+    they reach the matching-hash path through the sha-segment compare.
+
+    What breaks if this fails: keying the repair off ``f"{id}/{hash}"``
+    probes and writes a key nothing reads, so an upgraded deployment whose
+    built-in blob was pruned keeps raising ``failed to load agent spec`` on
+    every session launch while boot leaves an orphan bundle behind.
+    """
+    server_app._ensure_default_polly_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+    agent = seed_stores.agent_store.get_by_name(server_app._POLLY_AGENT_NAME)
+    assert agent is not None
+    bundle_hash = agent.bundle_location.rsplit("/", 1)[-1]
+    bundle_bytes = seed_stores.artifact_store.get(agent.bundle_location)
+
+    # Rewrite the row into the pre-migration shape: bare-hex id, blob and
+    # location under the ``ag_``-prefixed physical key.
+    legacy_loc = f"ag_{agent.id}/{bundle_hash}"
+    seed_stores.artifact_store.put(legacy_loc, bundle_bytes)
+    seed_stores.artifact_store.delete(agent.bundle_location)
+    legacy = seed_stores.agent_store.update(agent.id, legacy_loc)
+    assert legacy is not None
+
+    # Lose the blob while the row survives, and drop the local cache so
+    # nothing masks the missing bundle at load time.
+    seed_stores.artifact_store.delete(legacy_loc)
+    seed_stores.agent_cache.evict(agent.id)
+    assert not seed_stores.artifact_store.exists(legacy_loc)
+
+    # Re-seed: source unchanged -> hash matches the row (the fast path).
+    server_app._ensure_default_polly_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+
+    # Repaired at the key the loader reads, and nothing written to the
+    # bare-hex key the row does not point at.
+    assert seed_stores.artifact_store.exists(legacy_loc)
+    assert not seed_stores.artifact_store.exists(f"{agent.id}/{bundle_hash}")
+    reloaded = seed_stores.agent_cache.load(agent.id, legacy_loc)
+    assert reloaded.spec is not None
+    # Row untouched on the matching path: same location, no version bump.
+    still = seed_stores.agent_store.get_by_name(server_app._POLLY_AGENT_NAME)
+    assert still is not None
+    assert still.bundle_location == legacy_loc
+    assert still.version == legacy.version
+
+
 def test_tar_gz_dir_is_order_independent(tmp_path: Path) -> None:
     """
     Same content, different file-creation order → identical bundle bytes.
@@ -1755,3 +1891,21 @@ def test_load_debug_routers_collects_entries() -> None:
     _router, prefix, tags = entries[0]
     assert prefix == "/debug"
     assert tags == ["debug"]
+
+
+def test_session_id_from_request_parses_session_path() -> None:
+    """The exception handlers read the session id off the request path.
+
+    A ``/v1/sessions/<id>/…`` path yields the id (threaded into the 500 log so
+    the debug-logs row is correlated); anything else yields ``None``.
+    """
+    from types import SimpleNamespace
+
+    def _req(path: str) -> object:
+        return SimpleNamespace(url=SimpleNamespace(path=path))
+
+    parse = server_app._session_id_from_request
+    assert parse(_req("/v1/sessions/conv_abc/events")) == "conv_abc"  # type: ignore[arg-type]
+    assert parse(_req("/v1/sessions/conv_abc")) == "conv_abc"  # type: ignore[arg-type]
+    assert parse(_req("/health")) is None  # type: ignore[arg-type]
+    assert parse(_req("/v1/sessions")) is None  # type: ignore[arg-type]

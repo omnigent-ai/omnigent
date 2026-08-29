@@ -183,6 +183,20 @@ def test_subscription_default_returns_none() -> None:
     assert creds.resolve_pi_native_provider(config_loader=lambda: config) is None
 
 
+def test_pi_native_subscription_returns_none() -> None:
+    """A pi subscription as the pi-surface default returns None.
+
+    ``kind="subscription", cli="pi"`` signals "use Pi's own native auth".
+    When it is configured as the pi-surface default,
+    ``resolve_pi_native_provider`` returns ``None`` so Pi reads from its
+    own ``~/.pi/agent`` without an Omnigent-managed ``models.json``.
+    """
+    config = {
+        "providers": {"pi-subscription": {"kind": "subscription", "cli": "pi", "default": "pi"}}
+    }
+    assert creds.resolve_pi_native_provider(config_loader=lambda: config) is None
+
+
 def test_no_providers_returns_none() -> None:
     """No configured providers → None (Pi uses its own login)."""
     assert creds.resolve_pi_native_provider(config_loader=dict) is None
@@ -238,7 +252,7 @@ def test_to_models_config_shape() -> None:
     assert entry["api"] == "anthropic-messages"
     assert entry["apiKey"] == "!get-token"
     assert entry["authHeader"] is True
-    assert entry["models"] == [{"id": "databricks-claude-sonnet-4-6"}]
+    assert entry["models"] == [{"id": "databricks-claude-sonnet-4-6", "reasoning": True}]
 
 
 def test_write_models_config_is_owner_only(tmp_path: Path) -> None:
@@ -272,11 +286,73 @@ def test_provider_launch_returns_env_and_args(tmp_path: Path) -> None:
         auth_header=False,
     )
     agent_dir = tmp_path / "pi-agent"
-    env, args = creds.pi_native_provider_launch(agent_dir, provider)
+    env, args, _warning = creds.pi_native_provider_launch(agent_dir, provider)
 
     assert env == {creds.PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
     assert args == ["--provider", "omnigent", "--model", "claude-sonnet-4-6"]
     assert (agent_dir / "models.json").exists()
+
+
+def test_provider_launch_passes_reasoning_effort_as_thinking(tmp_path: Path) -> None:
+    """A session effort becomes ``--thinking <level>`` on the primary provider."""
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://api.anthropic.com",
+        api="anthropic-messages",
+        model="claude-sonnet-4-6",
+        api_key="sk-secret",
+        auth_header=False,
+    )
+
+    _env, args, warning = creds.pi_native_provider_launch(tmp_path / "pi-agent", provider, "high")
+
+    assert args[-2:] == ["--thinking", "high"]
+    assert warning is None
+
+
+@pytest.mark.parametrize(
+    ("effort", "expected"),
+    [("none", ["--thinking", "off"]), ("default", []), (None, [])],
+)
+def test_provider_launch_effort_edge_values(
+    tmp_path: Path, effort: str | None, expected: list[str]
+) -> None:
+    """``none`` becomes pi's ``off``; a clear value omits the flag entirely."""
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://api.anthropic.com",
+        api="anthropic-messages",
+        model="claude-sonnet-4-6",
+        api_key="sk-secret",
+        auth_header=False,
+    )
+
+    _env, args, warning = creds.pi_native_provider_launch(tmp_path / "pi-agent", provider, effort)
+
+    assert args[4:] == expected
+    assert warning is None
+
+
+def test_provider_launch_gateway_routed_model_keeps_thinking_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The gateway-routed pin wins over the user's effort, with a warning.
+
+    Those models' ``reasoning_tokens`` break pi's completions handler so text
+    never surfaces; honouring the effort would reintroduce that.
+    """
+    provider = _databricks_provider_without_catalog(monkeypatch, "databricks-glm-5-2")
+    monkeypatch.setattr(
+        "omnigent.inner.pi_settings.prepare_managed_pi_agent_dir",
+        lambda *_args, **_kwargs: None,
+    )
+
+    _env, args, warning = creds.pi_native_provider_launch(tmp_path / "pi-agent", provider, "high")
+
+    assert args.count("--thinking") == 1
+    assert args[-2:] == ["--thinking", "off"]
+    assert warning is not None
+    assert "databricks-glm-5-2" in warning
 
 
 def test_pi_native_provider_launch_namespaced_model_uses_qualified_arg(
@@ -301,7 +377,7 @@ def test_pi_native_provider_launch_namespaced_model_uses_qualified_arg(
         auth_header=False,
     )
     agent_dir = tmp_path / "pi-agent"
-    _env, args = creds.pi_native_provider_launch(agent_dir, provider)
+    _env, args, _warning = creds.pi_native_provider_launch(agent_dir, provider)
 
     assert args == ["--provider", "omnigent", "--model", "omnigent/moonshotai/kimi-k2.5"]
 
@@ -325,7 +401,7 @@ def test_provider_launch_accepts_provider_qualified_selection(tmp_path: Path) ->
         },
     )
 
-    _, args = creds.pi_native_provider_launch(
+    _, args, _ = creds.pi_native_provider_launch(
         tmp_path / "pi-agent",
         provider,
         selection="omnigent-openai/gpt-5.6-sol",
@@ -969,7 +1045,10 @@ def test_model_override_beats_inline_family_default() -> None:
     assert provider is not None
     assert provider.model == "claude-opus-4-7"
     cfg = provider.to_models_config()
-    assert cfg["providers"]["omnigent"]["models"] == [{"id": "claude-opus-4-7"}]
+    entry = cfg["providers"]["omnigent"]["models"][0]
+    assert entry["id"] == "claude-opus-4-7"
+    # The entry now carries full metadata (input, reasoning) rather than a bare id.
+    assert entry.get("reasoning") is True
 
 
 def test_databricks_prefixed_override_normalized_for_inline_anthropic() -> None:
@@ -1002,7 +1081,9 @@ def test_databricks_prefixed_override_normalized_for_inline_anthropic() -> None:
     # The gateway prefix is stripped for the vendor-direct Anthropic endpoint.
     assert provider.model == "claude-opus-4-7"
     cfg = provider.to_models_config()
-    assert cfg["providers"]["omnigent"]["models"] == [{"id": "claude-opus-4-7"}]
+    entry = cfg["providers"]["omnigent"]["models"][0]
+    assert entry["id"] == "claude-opus-4-7"
+    assert entry.get("reasoning") is True
 
 
 def test_databricks_prefixed_override_normalized_for_inline_openai() -> None:
@@ -1033,7 +1114,9 @@ def test_databricks_prefixed_override_normalized_for_inline_openai() -> None:
     # The gateway prefix is stripped for the vendor-direct OpenAI endpoint.
     assert provider.model == "gpt-5-4"
     cfg = provider.to_models_config()
-    assert cfg["providers"]["omnigent"]["models"] == [{"id": "gpt-5-4"}]
+    entry = cfg["providers"]["omnigent"]["models"][0]
+    assert entry["id"] == "gpt-5-4"
+    # The entry now carries input metadata rather than a bare id-only dict.
 
 
 def test_inline_family_passes_non_mechanical_override_through() -> None:
@@ -1064,7 +1147,38 @@ def test_inline_family_passes_non_mechanical_override_through() -> None:
     assert provider is not None
     assert provider.model == "zai-org/GLM-4.7"
     cfg = provider.to_models_config()
-    assert cfg["providers"]["omnigent"]["models"] == [{"id": "zai-org/GLM-4.7"}]
+    entry = cfg["providers"]["omnigent"]["models"][0]
+    assert entry["id"] == "zai-org/GLM-4.7"
+    # The entry now carries input metadata rather than a bare id-only dict.
+
+
+def test_inline_family_configured_gateway_default_survives_verbatim() -> None:
+    """A configured ``databricks-`` family default is not rewritten.
+
+    A protocol-translating proxy (a LiteLLM / AI-Gateway-shaped ``/anthropic``
+    passthrough) is addressed by serving-endpoint name, so stripping the prefix
+    the user configured yields an id the endpoint answers ``ENDPOINT_NOT_FOUND``
+    for. Only a session override is normalized for a vendor-direct endpoint.
+    """
+    config = {
+        "providers": {
+            "translating-proxy": {
+                "kind": "gateway",
+                "default": ["pi"],
+                "anthropic": {
+                    "base_url": "http://127.0.0.1:8399/ai-gateway/anthropic",
+                    "api_key": "local",
+                    "models": {"default": "databricks-claude-opus-4-8"},
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+    assert provider.api == "anthropic-messages"
+    assert provider.model == "databricks-claude-opus-4-8"
+    cfg = provider.to_models_config()
+    assert cfg["providers"]["omnigent"]["models"][0]["id"] == "databricks-claude-opus-4-8"
 
 
 def test_databricks_profile_registers_gpt_provider(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1585,7 +1699,7 @@ def test_uncataloged_model_launch_arg_matches_rendered_provider(
         lambda *_args, **_kwargs: None,
     )
 
-    _env, args = creds.pi_native_provider_launch(tmp_path / "pi-agent", provider)
+    _env, args, _warning = creds.pi_native_provider_launch(tmp_path / "pi-agent", provider)
 
     assert args == [
         "--provider",
@@ -1760,3 +1874,93 @@ def test_default_claude_model_from_picks_by_tier_then_newest() -> None:
     assert _default_claude_model_from(entries) == "system.ai.claude-opus-5"
     # An empty live listing lets the caller fall through to the bundled catalog.
     assert _default_claude_model_from([]) is None
+
+
+# ---------------------------------------------------------------------------
+# Tests for gateway provider metadata propagation (context/maxTokens/reasoning)
+# ---------------------------------------------------------------------------
+
+
+def test_gateway_provider_config_context_window_flows_to_models_json() -> None:
+    """context_window in FamilyConfig propagates to models.json contextWindow.
+
+    When a user configures ``context_window: 1048576`` on their gateway provider
+    family, the pi-native provider entry carries that value so Pi uses the real
+    limit instead of defaulting to 128k.
+    """
+    config = {
+        "providers": {
+            "litellm": {
+                "kind": "gateway",
+                "openai": {
+                    "api_key": "test-key",
+                    "base_url": "https://api.example.com",
+                    "models": {"default": "glm-5.2"},
+                    "wire_api": "chat",
+                    "context_window": 1_048_576,
+                    "max_output_tokens": 131_072,
+                },
+                "default": True,
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+    cfg = provider.to_models_config()
+    entry = cfg["providers"]["omnigent"]["models"][0]
+    assert entry["id"] == "glm-5.2"
+    assert entry["contextWindow"] == 1_048_576
+    assert entry["maxTokens"] == 131_072
+
+
+def test_gateway_provider_without_limits_still_carries_input_and_reasoning() -> None:
+    """A gateway config with no limits still produces a richer entry than bare id.
+
+    Even when ``context_window``/``max_output_tokens`` are absent, the entry
+    includes ``input`` and (for reasoning models) ``reasoning: true``.
+    """
+    config = {
+        "providers": {
+            "local": {
+                "kind": "gateway",
+                "openai": {
+                    "api_key": "test-key",
+                    "base_url": "http://localhost:8080/v1",
+                    "models": {"default": "deepseek-r1"},
+                    "wire_api": "chat",
+                },
+                "default": True,
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+    cfg = provider.to_models_config()
+    entry = cfg["providers"]["omnigent"]["models"][0]
+    assert entry["id"] == "deepseek-r1"
+    # Even without limits, reasoning and input are populated.
+    assert entry.get("reasoning") is True
+    assert "input" in entry
+
+
+def test_gateway_provider_max_output_tokens_validation_rejects_negative() -> None:
+    """Negative max_output_tokens is rejected by the provider config parser."""
+    from omnigent.errors import OmnigentError
+    from omnigent.onboarding.provider_config import load_providers
+
+    config = {
+        "providers": {
+            "bad-provider": {
+                "kind": "gateway",
+                "openai": {
+                    "api_key": "test-key",
+                    "base_url": "https://api.example.com",
+                    "models": {"default": "model"},
+                    "max_output_tokens": -1,
+                },
+                "default": True,
+            }
+        }
+    }
+    with pytest.raises(OmnigentError, match="max_output_tokens"):
+        load_providers(config)

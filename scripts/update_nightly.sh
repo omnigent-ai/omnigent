@@ -18,6 +18,10 @@
 set -euo pipefail
 
 REPO="${OMNIGENT_REPO:-https://github.com/omnigent-ai/omnigent}"
+# Match install.sh: pinning the interpreter keeps uv reusing the existing
+# tool environment instead of recreating it (which removes the working
+# install before the new wheel is built, so a build failure leaves none).
+PYTHON_VERSION="${OMNIGENT_PYTHON_VERSION:-3.12}"
 
 # Newest nightly tag: strictly vX.Y.Z.devYYYYMMDD (the 8-digit date also
 # screens out legacy .dev0-style tags). Version sorts before date, so the
@@ -39,5 +43,6 @@ if command -v omnigent >/dev/null 2>&1 \
 fi
 
 echo "update_nightly: installing ${tag}"
-uv tool install --force "omnigent @ git+${REPO}@${tag}"
+uv tool install --reinstall --python "$PYTHON_VERSION" \
+  "omnigent @ git+${REPO}@${tag}"
 omnigent --version

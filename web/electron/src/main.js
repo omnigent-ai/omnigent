@@ -47,10 +47,13 @@ const {
 const { parseOmnigentDeepLink, chooseDeepLinkStrategy } = require("./deepLink");
 const { registerWorkspaceChromeHide } = require("./workspace-chrome");
 const { registerWorkspaceRootBounce } = require("./workspace-root-bounce");
+const { registerServerAwayWatch, AWAY_BANNER_DELAY_MS } = require("./away_banner");
+const { createReturnBanner } = require("./return_banner");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
 const { isDeveloperModeEnabled } = require("./developer_mode");
+const { excludingManagedServers, getManagedServerUrls } = require("./managed_preferences");
 const { registerSessionExpiryReload } = require("./session-expiry");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
 const omnigentCli = require("./omnigent_cli");
@@ -108,6 +111,17 @@ function developerModeEnabled() {
   });
 }
 
+/** Read the current macOS MDM-provided server list without persisting it. */
+function managedServerUrls() {
+  return getManagedServerUrls({
+    platform: process.platform,
+    getUserDefault:
+      typeof systemPreferences.getUserDefault === "function"
+        ? systemPreferences.getUserDefault.bind(systemPreferences)
+        : undefined,
+  });
+}
+
 /**
  * Quit-safety timeouts (see the before-quit handler near the end of this
  * file). `let` (not const) so tests can shrink them via testApi.setQuitTimeouts
@@ -116,6 +130,9 @@ function developerModeEnabled() {
  */
 let quitCleanupTimeoutMs = 10000;
 let quitInstallFallbackMs = 3000;
+// Away-banner delay, `let` for the same reason: wiring tests shrink it via
+// testApi.setAwayBannerDelayMs instead of waiting out the real delay.
+let awayBannerDelayMs = AWAY_BANNER_DELAY_MS;
 
 /**
  * Permissions the SPA legitimately needs and we auto-grant. The dictation
@@ -728,6 +745,7 @@ const updater = createDesktopUpdater({
   pinnedOrigin,
   iconPath: ICON_PNG,
   getCurrentVersion: () => currentDesktopVersion,
+  onInstallReadyChange: () => buildMenu(),
   // Dev builds use dev-app-update.yml, which mirrors the production HTTPS
   // endpoint; packaged builds always use their baked app-update.yml. Tying
   // this to !app.isPackaged — not an env var — ensures a packaged app can
@@ -745,6 +763,22 @@ const updateOverlay = createUpdateOverlay({
   overlayPage: UPDATE_OVERLAY_PAGE,
   preloadPath: path.join(__dirname, "update_overlay_preload.js"),
 });
+
+// Shell-owned "return to your server?" banner: offered when a window has sat
+// on a foreign page (e.g. an SSO login) instead of its pinned server — see
+// away_banner.js. Like the update overlay it ships with the desktop app so it
+// works against any server bundle (and against foreign pages, which get an
+// inert bridge).
+const returnBanner = createReturnBanner({
+  BrowserWindow,
+  ipcMain,
+  bannerPage: path.join(__dirname, "..", "return-banner", "index.html"),
+  preloadPath: path.join(__dirname, "return_banner_preload.js"),
+  onGoBack: (win) => awayWatches.get(win)?.reset(),
+});
+
+/** Per-window away-watch handles (win → {reset, dispose}); see away_banner.js. */
+const awayWatches = new Map();
 
 // ---------------------------------------------------------------------------
 // Persisted settings (the saved server URL and the recently-connected server
@@ -1055,6 +1089,61 @@ function loadServerUrl(win, serverUrl, routePath) {
 }
 
 /**
+ * Wire server-load failure fallbacks for a shell window.
+ *
+ * @param {BrowserWindow} win
+ */
+function registerNavigationFallbacks(win) {
+  // Server unreachable / DNS failure / TLS error → fall back to the setup
+  // page with the failure shown, instead of stranding the user on Chromium's
+  // raw error surface with no way back. The saved server_url is left intact:
+  // the server may simply be down, and Connect retries it.
+  win.webContents.on(
+    "did-fail-load",
+    (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+      if (!isMainFrame) return;
+      if (errorCode === ERR_ABORTED) return;
+      // A failure report for a URL the window is no longer pinned to (the
+      // window was re-pointed while the failing load was in flight) must
+      // not yank the window off its new destination.
+      const failedOrigin = originOf(validatedURL ?? "");
+      if (failedOrigin !== windows.get(win)?.origin) return;
+      const params = new URLSearchParams({
+        error: `${errorDescription || "load failed"} (${errorCode})`,
+        // The failure often happens on a deep SPA route (e.g. /chat/…);
+        // prefill the setup form with just the server origin — that's what
+        // the user connects to — not the full path that happened to fail.
+        url: failedOrigin ? failedOrigin + "/" : (validatedURL ?? ""),
+      });
+      if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
+      pinWindow(win, null); // back on the setup page → no trusted origin
+      void win.loadFile(SETUP_PAGE, { search: params.toString() });
+    },
+  );
+
+  // HTTP 4xx/5xx commits as a successful navigation in Chromium (empty body
+  // → black window), so did-fail-load never fires. did-navigate is
+  // main-frame-only and carries httpResponseCode; reuse the setup-page
+  // fallback so the user sees the status and can change server / retry.
+  win.webContents.on("did-navigate", (_event, url, httpResponseCode, httpStatusText) => {
+    if (httpResponseCode < 400) return;
+    const state = windows.get(win);
+    const failedOrigin = originOf(url ?? "");
+    if (failedOrigin !== state?.origin) return;
+    const status = httpStatusText
+      ? `${httpResponseCode} ${httpStatusText}`
+      : `HTTP ${httpResponseCode}`;
+    const params = new URLSearchParams({
+      error: status,
+      url: state.serverUrl ?? url ?? "",
+    });
+    if (state.ephemeral) params.set("ephemeral", "1");
+    pinWindow(win, null);
+    void win.loadFile(SETUP_PAGE, { search: params.toString() });
+  });
+}
+
+/**
  * Create a shell window and load a destination, in priority order:
  *   1. `opts.path` joined onto `opts.serverUrl` (a deep link opening a
  *      specific conversation on a specific server).
@@ -1167,6 +1256,19 @@ function createWindow(targetUrl, opts = {}) {
     browserRegistry: createBrowserRegistryForWindow(win),
   });
   registerWorkspaceRootBounce(win.webContents, () => pinnedOrigin(win));
+  // Show the return banner when the window navigates away from its server
+  // (e.g. SSO) and stays away. The watch's on-away URL is the last committed
+  // page on the server — subpage, mount path, and query args included.
+  awayWatches.set(
+    win,
+    registerServerAwayWatch(win.webContents, {
+      getPinnedOrigin: () => pinnedOrigin(win),
+      delayMs: awayBannerDelayMs,
+      debugLog: (message) => console.warn(`[omnigent] ${message}`),
+      onAway: (returnUrl) => returnBanner.show(win, returnUrl ?? windows.get(win)?.serverUrl),
+      onReturn: () => returnBanner.hide(win),
+    }),
+  );
   if (destination) {
     // Learn the server's version alongside the load. Every window that opens
     // straight onto a server (normal app launch with a saved URL, a deep link,
@@ -1248,32 +1350,7 @@ function createWindow(targetUrl, opts = {}) {
   // Fires only for window.open the handler above allowed (OAuth popups).
   win.webContents.on("did-create-window", (child) => hardenOauthPopup(child));
 
-  // Server unreachable / DNS failure / TLS error → fall back to the setup
-  // page with the failure shown, instead of stranding the user on Chromium's
-  // raw error surface with no way back. The saved server_url is left intact:
-  // the server may simply be down, and Connect retries it.
-  win.webContents.on(
-    "did-fail-load",
-    (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
-      if (!isMainFrame) return;
-      if (errorCode === ERR_ABORTED) return;
-      // A failure report for a URL the window is no longer pinned to (the
-      // window was re-pointed while the failing load was in flight) must
-      // not yank the window off its new destination.
-      const failedOrigin = originOf(validatedURL ?? "");
-      if (failedOrigin !== windows.get(win)?.origin) return;
-      const params = new URLSearchParams({
-        error: `${errorDescription || "load failed"} (${errorCode})`,
-        // The failure often happens on a deep SPA route (e.g. /chat/…);
-        // prefill the setup form with just the server origin — that's what
-        // the user connects to — not the full path that happened to fail.
-        url: failedOrigin ? failedOrigin + "/" : (validatedURL ?? ""),
-      });
-      if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
-      pinWindow(win, null); // back on the setup page → no trusted origin
-      void win.loadFile(SETUP_PAGE, { search: params.toString() });
-    },
-  );
+  registerNavigationFallbacks(win);
 
   // Databricks workspace-hosted Omnigent renders inside the workspace's
   // top-nav chrome (the SPA is a workspace page). On a dedicated desktop
@@ -1291,6 +1368,8 @@ function createWindow(targetUrl, opts = {}) {
     } catch {
       /* registry already torn down */
     }
+    awayWatches.get(win)?.dispose();
+    awayWatches.delete(win);
     windows.delete(win);
     updateBadge(); // drop this window's contribution from the app-wide badge
   });
@@ -1916,13 +1995,8 @@ function buildMenu() {
     {
       id: "restart_to_update",
       label: "Restart to Update",
+      visible: updater.getStatus().state === "downloaded",
       click: async () => {
-        // Production install path: the UpdateBanner toast is dismissible (and
-        // a user may have closed it), so the menubar must still offer a way to
-        // install a downloaded update. installUpdateNow() quits the app to
-        // hand off to the installer; it returns false when nothing is ready
-        // (e.g. the toast was for an update since skipped or not downloaded),
-        // which we surface with a native dialog instead of silently no-op'ing.
         if (!updater.installUpdateNow()) {
           await dialog.showMessageBox(activeWindow(), {
             type: "info",
@@ -2168,9 +2242,11 @@ function registerIpc() {
       // A server page must never be able to re-point which server is saved.
       throw new Error("set-server-url is only available to the setup page");
     }
-    const normalized = normalizeUrl(url); // throws → rejects → setup page shows error
-    // Bare Databricks workspace URLs serve a 404 at the root; expand them to
-    // the Omnigent UI mount so the user can paste just the workspace host.
+    // A managed choice is already validated and may name a workspace mount;
+    // preserve it exactly. The shared expansion is a no-op for paths, while a
+    // managed workspace root still gets the normal mount discovery.
+    const managedTarget = managedServerUrls().find((candidate) => candidate === url);
+    const normalized = managedTarget ?? normalizeUrl(url); // throws → setup page shows error
     const target = await expandDatabricksWorkspaceUrl(normalized);
     const win = BrowserWindow.fromWebContents(event.sender) ?? activeWindow();
     // Multi-server windows connect without touching the saved server —
@@ -2231,7 +2307,18 @@ function registerIpc() {
     if (!isSetupPageSender(event)) {
       throw new Error("get-recent-servers is only available to the setup page");
     }
-    return normalizeRecentServers(loadSettings().recent_servers);
+    const managed = managedServerUrls();
+    return excludingManagedServers(normalizeRecentServers(loadSettings().recent_servers), managed);
+  });
+
+  // Setup page → organization-provided server choices from macOS Managed
+  // Preferences. Re-read on every request so policy removal is never copied
+  // into or masked by settings.json.
+  ipcMain.handle("omnigent:get-managed-servers", (event) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("get-managed-servers is only available to the setup page");
+    }
+    return managedServerUrls();
   });
 
   ipcMain.handle("omnigent:copy-setup-text", (event, text) => {
@@ -2253,11 +2340,13 @@ function registerIpc() {
       return null;
     }
     const win = BrowserWindow.fromWebContents(event.sender);
-    const recents = loadSettings().recent_servers;
+    const managedServers = managedServerUrls();
+    const recents = excludingManagedServers(loadSettings().recent_servers, managedServers);
     return {
       // isPinnedOriginSender guarantees the sender window is tracked.
       currentOrigin: windows.get(win).origin,
-      recentServers: Array.isArray(recents) ? recents.filter((u) => typeof u === "string") : [],
+      managedServers,
+      recentServers: recents,
       // The connected server's manifest, forwarded so the SPA branches on the
       // same document the shell did rather than re-fetching it (and so an
       // older shell, which simply omits this field, is detectable as absent —
@@ -2267,19 +2356,18 @@ function registerIpc() {
   });
 
   // SPA title-bar server picker → re-point the SENDING window to another
-  // server. Only URLs already in the persisted recent-servers list are
-  // accepted: pinning is a privilege grant (notifications, badge, protocol
-  // grants), so a server page must never be able to pin a window to an
-  // arbitrary origin of its choosing — only to servers the user previously
-  // connected to by hand.
+  // server. Only URLs in the persisted recent list or the current managed list
+  // are accepted: pinning is a privilege grant (notifications, badge, protocol
+  // grants), so a server page must never choose an arbitrary origin.
   ipcMain.handle("omnigent:switch-server", (event, url) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("switch-server is only available to a connected server page");
     }
     const recents = loadSettings().recent_servers;
-    const known = Array.isArray(recents) && recents.includes(url);
-    if (!known) {
-      throw new Error("switch-server target must be a previously-connected server");
+    const knownRecent = Array.isArray(recents) && recents.includes(url);
+    const knownManaged = managedServerUrls().includes(url);
+    if (!knownRecent && !knownManaged) {
+      throw new Error("switch-server target must be a recent or managed server");
     }
     const win = BrowserWindow.fromWebContents(event.sender);
     const ephemeral = Boolean(win && windows.get(win)?.ephemeral);
@@ -2550,6 +2638,7 @@ function registerIpc() {
   // The module owns the handlers and their trusted-sender + consent gates.
   updater.registerIpc();
   updateOverlay.registerIpc();
+  returnBanner.registerIpc();
 
   // Mirror the web app's in-app theme onto the native side so the update
   // overlay, native dialogs, and menus track the theme switcher (not just the
@@ -3057,6 +3146,13 @@ if (!gotLock) {
   // pidfile that the next launch reuses or `omnigent server stop` reclaims.
   let quitCleanupDone = false;
   let quitCleanupStarted = false;
+  let quitForceExitTimer = null;
+  const clearQuitForceExitTimer = () => {
+    if (quitForceExitTimer === null) return;
+    clearTimeout(quitForceExitTimer);
+    quitForceExitTimer = null;
+  };
+  app.on("quit", clearQuitForceExitTimer);
   app.on("before-quit", (event) => {
     if (quitCleanupDone) return;
     // A second quit (e.g. Cmd-Q again during the SIGKILL grace window) must not
@@ -3069,12 +3165,12 @@ if (!gotLock) {
     // unref'd so the cap itself can't hold the event loop open; app.exit()
     // bypasses before-quit/will-quit, so it's the guaranteed way out when
     // app.quit() proves unreliable.
-    const cap = setTimeout(() => {
-      if (quitCleanupDone) return;
+    quitForceExitTimer = setTimeout(() => {
+      quitForceExitTimer = null;
       quitCleanupDone = true;
       app.exit(0);
     }, quitCleanupTimeoutMs);
-    if (typeof cap.unref === "function") cap.unref();
+    if (typeof quitForceExitTimer.unref === "function") quitForceExitTimer.unref();
 
     // resolvedCliPath() is evaluated inside the async IIFE so a throw (a future
     // change to settings/CLI resolution) becomes a rejection caught below,
@@ -3088,22 +3184,17 @@ if (!gotLock) {
       .finally(() => {
         if (quitCleanupDone) return; // the hard cap already forced the exit
         quitCleanupDone = true;
-        clearTimeout(cap);
-        // Hand off to a user-approved install if one is pending; otherwise
-        // complete the deferred quit. quitAndInstall() re-issues app.quit()
-        // (via setImmediate) only when it can actually install — so if the
-        // staged update is gone and install() returns false, fall back to a
-        // plain quit and then a forced exit after a short grace, rather than
-        // leave the app up waiting for an update that won't install. The
-        // installer is spawned synchronously inside quitAndInstall(), so by
-        // the time the fallback fires the update is already underway (or was
-        // never going to install) — force-exiting only ensures we quit.
-        if (updater.quitAndInstallIfPending()) {
-          const fallback = setTimeout(() => app.exit(0), quitInstallFallbackMs);
-          if (typeof fallback.unref === "function") fallback.unref();
-        } else {
-          app.quit();
-        }
+        // Re-entering app.quit() while Electron is unwinding the prevented quit
+        // can stop after before-quit, so resume on the next event-loop turn.
+        setImmediate(() => {
+          if (updater.quitAndInstallIfPending()) {
+            clearQuitForceExitTimer();
+            const fallback = setTimeout(() => app.exit(0), quitInstallFallbackMs);
+            if (typeof fallback.unref === "function") fallback.unref();
+          } else {
+            app.quit();
+          }
+        });
       });
   });
 }

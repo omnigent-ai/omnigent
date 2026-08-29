@@ -16,7 +16,6 @@ import {
   ArrowUpIcon,
   BotIcon,
   CheckIcon,
-  AlertTriangleIcon,
   CornerUpLeftIcon,
   CopyIcon,
   FileTextIcon,
@@ -29,7 +28,6 @@ import {
   SettingsIcon,
   SquareIcon,
   SquareTerminalIcon,
-  WifiOffIcon,
   XIcon,
 } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -74,13 +72,7 @@ import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
 import { useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
-import {
-  isIOSShell,
-  onNativeSidebarDrag,
-  onNativeViewModeChanged,
-  setNativeServerSwitcherHidden,
-  setNativeViewMode,
-} from "@/lib/nativeBridge";
+import { isIOSShell, onNativeSidebarDrag, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
 import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
 import { agentDisplayLabel } from "@/components/AgentInfo";
 import {
@@ -90,11 +82,10 @@ import {
 } from "@/lib/agentLabels";
 import { useConversations } from "@/hooks/useConversations";
 import { usePermissions } from "@/hooks/usePermissions";
-import type { NativeModelOption, SandboxStatus, Session, SessionStatus } from "@/lib/types";
+import type { NativeModelOption, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
-import { useIOSNativeKeyboardVisible } from "@/hooks/useIOSNativeKeyboardInset";
 import type { MessageContentBlock } from "@/lib/blocks";
 import { ELICITATION_RESPONSE_PREFIX } from "@/lib/blocks";
 import {
@@ -140,6 +131,7 @@ import {
   rankMentionEntries,
 } from "@/lib/composerMentions";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
+import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 // Re-exported so existing tests importing these from "./ChatPage" keep working
 // after the pure helpers moved to the shared lib.
 export { detectMentionAt, mentionMarkerFor };
@@ -223,11 +215,18 @@ import {
 } from "@/lib/claudePermissionMode";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
+import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
 import { SessionImage } from "@/components/SessionImage";
 import { GoalControl, GoalStatusPill, useGoalState, type Goal } from "@/components/goal";
 import { copyText } from "@/lib/clipboard";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import {
+  ConnectionIndicator,
+  McpStartupIndicator,
+  RunnerStartingIndicator,
+} from "./ChatIndicators";
+import { CHAT_COLUMN_WIDTH } from "./chatLayout";
 
 // Matches both wordings the native executors emit: "[Attached: <path>]"
 // (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
@@ -384,9 +383,6 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
     .join("\n\n")
     .trim();
 }
-
-// All chat-column elements must share this width to stay aligned.
-const CHAT_COLUMN_WIDTH = "max-w-3xl min-[1921px]:max-w-4xl min-[2561px]:max-w-5xl";
 
 const TABLE_SEPARATOR_RE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/;
 const DISPLAY_MATH_RE = /(^|\n)\s*(\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\])/;
@@ -675,47 +671,6 @@ function truncateTitle(raw: string, max = 60): string {
   const cut = lastSpace > max - 10 ? lastSpace : slice.length;
   return slice.slice(0, cut).join("").trimEnd() + "…";
 }
-
-// Per-session draft storage — module-level so it survives the Composer
-// unmount/remount that happens during the loading gate between session
-// switches (ChatPage returns <HydratingPlaceholder /> while
-// loadingConversation is true, which unmounts the entire chat surface).
-// Text drafts are also persisted to sessionStorage so they survive page
-// refreshes; File objects can't be serialized, so only text round-trips.
-const SESSION_DRAFTS_KEY = "omnigent.sessionDrafts";
-
-function loadDraftsFromStorage(): Map<string, { text: string; files: File[] }> {
-  try {
-    const raw = window.sessionStorage.getItem(SESSION_DRAFTS_KEY);
-    if (!raw) return new Map();
-    const entries = JSON.parse(raw) as Record<string, string>;
-    const map = new Map<string, { text: string; files: File[] }>();
-    for (const [id, text] of Object.entries(entries)) {
-      if (text) map.set(id, { text, files: [] });
-    }
-    return map;
-  } catch {
-    return new Map();
-  }
-}
-
-function saveDraftsToStorage(drafts: Map<string, { text: string; files: File[] }>): void {
-  try {
-    const obj: Record<string, string> = {};
-    for (const [id, draft] of drafts) {
-      if (draft.text) obj[id] = draft.text;
-    }
-    if (Object.keys(obj).length === 0) {
-      window.sessionStorage.removeItem(SESSION_DRAFTS_KEY);
-    } else {
-      window.sessionStorage.setItem(SESSION_DRAFTS_KEY, JSON.stringify(obj));
-    }
-  } catch {
-    // Storage full or unavailable — drafts still work in-memory.
-  }
-}
-
-const sessionDrafts = loadDraftsFromStorage();
 
 /**
  * Single component that drives the chat surface. Streaming + history
@@ -1607,9 +1562,8 @@ interface MainAgentSurfaceProps {
    *  Never includes child-session activity and never gates Stop/Interrupt. */
   showsWorking: boolean;
   /**
-   * Strict runner-tunnel liveness, used only to gate the inline terminal
-   * view (the PTY dies the moment the runner tunnel drops). The reconnect
-   * affordances key off `liveness` instead.
+   * Strict runner-tunnel liveness. The terminal view remains selectable when
+   * this is false and uses it to show the stopped-harness resume state.
    */
   runnerOnline: boolean | undefined;
   /** Derived open-session liveness — drives the reconnect hint/banner. */
@@ -1731,7 +1685,7 @@ export interface WarmTerminalEntry {
 /**
  * How many sessions' terminal surfaces stay warm at once (the active one
  * included). Each warm surface holds a WebSocket + a runner-side
- * ``tmux attach``, a WebGL context (browsers cap those per page; losing
+ * tmux control client, a WebGL context (browsers cap those per page; losing
  * one falls back to xterm's DOM renderer), and keeps parsing any output
  * its TUI streams while hidden — so the cache is bounded rather than
  * unbounded, but sized to cover a working set of sessions, not just a
@@ -2064,6 +2018,17 @@ function MainAgentSurface({
     mountTerminal && conversationId
       ? updateWarmTerminalSurfaces(warmTerminals, conversationId, terminalReadOnly)
       : warmTerminals;
+  const handleTerminalResume = useCallback(async () => {
+    if (!conversationId) throw new Error("Session is not available");
+    if (liveness.kind === "host_offline" || liveness.kind === "local_stranded") {
+      onShowReconnectHelp();
+      return;
+    }
+    const result = await retrySession(conversationId);
+    if (!result.recovered) {
+      throw new Error("The session is already connected; no recovery was performed");
+    }
+  }, [conversationId, liveness.kind, onShowReconnectHelp]);
   const terminalSurfaces = renderedTerminals.map((entry) => {
     const isActive = mountTerminal && entry.conversationId === conversationId;
     const isShown = isActive && showTerminal;
@@ -2077,6 +2042,8 @@ function MainAgentSurface({
           conversationId={entry.conversationId}
           initialTerminalKey={isActive ? terminalFirst?.terminalViewKey : null}
           visible={isShown}
+          runnerOnline={isActive ? runnerOnline : undefined}
+          onResume={isActive ? handleTerminalResume : undefined}
           onSurfaceElement={isActive ? setTerminalSurfaceEl : undefined}
           readOnly={entry.readOnly}
         />
@@ -2323,8 +2290,6 @@ function MainAgentSurface({
             showPollyCodexGoalControl={showPollyCodexGoalControl}
             isTerminalFirst={isTerminalFirst}
             isNativeWrapper={isNativeWrapper}
-            reconnectHint={liveness.kind === "runner_asleep" || liveness.kind === "host_asleep"}
-            sandboxAsleepHint={liveness.kind === "host_asleep"}
             unreachable={
               !sandboxLaunching &&
               (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
@@ -2990,6 +2955,7 @@ export function JumpToTopButton({
         disabled={jumping}
         onClick={() => void jumpToTop()}
         aria-label="Jump to the first message"
+        componentId="chat.nav.jump_to_top"
         // When hidden (opacity-0 / pointer-events-none) keep the button out of
         // the tab order and the accessibility tree so it can't take focus or be
         // announced while invisible.
@@ -3143,395 +3109,6 @@ function WorkingIndicator() {
 export function shouldShowWorkingIndicator(showsWorking: boolean, bubbles: Bubble[]): boolean {
   if (!showsWorking) return false;
   return bubbles[bubbles.length - 1]?.kind !== "compaction_loading";
-}
-
-/**
- * Band copy for each in-flight managed-sandbox launch stage, in
- * pipeline order: provisioning → cloning (repo workspaces only) →
- * starting → connecting. `starting` is the in-sandbox host booting
- * and dialing back to the server (so it reads "Connecting host");
- * `connecting` is the agent runner being launched on that host
- * (so it reads "Starting agent"). Terminal stages are absent on
- * purpose — `ready` clears the band and `failed` renders its own
- * error band.
- */
-const SANDBOX_STAGE_LABELS: Record<string, string | undefined> = {
-  provisioning: "Provisioning sandbox",
-  cloning: "Cloning repository",
-  starting: "Connecting host",
-  connecting: "Starting agent",
-};
-
-/**
- * Failure band for a managed-sandbox session whose background launch
- * died. Renders the recorded reason so a dead launch explains itself
- * instead of presenting a silent dead chat. In-flight launch progress
- * does NOT render here — it shares the in-thread
- * :func:`RunnerStartingIndicator` spot so all launch states live on
- * one consistent line.
- */
-export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
-  return (
-    <div
-      data-testid="sandbox-failed-indicator"
-      role="status"
-      className={cn("mx-auto w-full", CHAT_COLUMN_WIDTH)}
-    >
-      <ErrorBanner message={status.error ?? ""} source="" code="" title="Sandbox launch failed" />
-    </div>
-  );
-}
-
-export function ConnectionIndicator({
-  liveness,
-  onShowReconnectHelp,
-  surfaceFrontmost = true,
-}: {
-  liveness: SessionLiveness;
-  onShowReconnectHelp: () => void;
-  // Whether the chat/terminal surface is frontmost (not under a drawer). Gates
-  // the native iOS bar so it doesn't float over an opened sidebar/panel.
-  surfaceFrontmost?: boolean;
-}) {
-  const terminalFirst = useTerminalFirst();
-  const keyboardVisible = useIOSNativeKeyboardVisible(
-    terminalFirst?.isTerminalFirst === true,
-    terminalFirst?.view === "chat",
-  );
-  const sandboxStatus = useChatStore((s) => s.sandboxStatus);
-  // Genuinely-unreachable states get the reconnect banner, for
-  // both terminal-first and regular sessions. `runner_asleep` (host up,
-  // runner relaunches on the next message), `host_asleep` (resumable managed
-  // host the server wakes on the next message), and `unknown` (pre-poll) are
-  // NOT unreachable — they're handled below.
-  const unreachable = liveness.kind === "host_offline" || liveness.kind === "local_stranded";
-
-  // In the iOS shell the Chat/Terminal toggle is the native Liquid Glass bar,
-  // not the in-page pill. Drive it from here (always mounted) with the SAME
-  // visibility the pill would have, expressed as a stable boolean so switching
-  // views never flickers the bar. Hook is called unconditionally (before any
-  // early return) to satisfy the rules of hooks.
-  const nativeBarVisible =
-    isIOSShell() &&
-    terminalFirst?.isTerminalFirst === true &&
-    !terminalFirst.isShellView &&
-    sandboxStatus?.stage !== "failed" &&
-    !unreachable &&
-    !keyboardVisible &&
-    surfaceFrontmost;
-  useNativeChatTerminalBar(terminalFirst, nativeBarVisible);
-
-  if (sandboxStatus !== null) {
-    // A failed launch owns this band with its reason. An IN-FLIGHT
-    // launch renders in the chat thread (RunnerStartingIndicator)
-    // instead — but still suppresses the liveness bands below, which
-    // would misread the not-yet-bound session as stranded.
-    if (sandboxStatus.stage === "failed") {
-      return <SandboxFailedIndicator status={sandboxStatus} />;
-    }
-    return null;
-  }
-  if (unreachable) {
-    // A host-bound session carries the reconnect affordance in the composer's
-    // host badge (ComposerStatusLine), which names the host that dropped — so
-    // render nothing here whenever that composer is on screen (sub-agent
-    // sessions included; their badge carries it just like a normal session's).
-    // The composer is hidden only in the terminal-first *terminal* view (the
-    // PTY owns the surface); there the banner still carries the affordance.
-    // `local_stranded` keeps the banner everywhere (no host, hence no badge).
-    const composerOnScreen = !(terminalFirst?.isTerminalFirst && terminalFirst.view === "terminal");
-    if (liveness.kind === "host_offline" && composerOnScreen) {
-      return null;
-    }
-    return (
-      <div className={cn("mx-auto mb-4 flex w-full justify-center px-6", CHAT_COLUMN_WIDTH)}>
-        {/* Reconnect affordance styled as the destructive error pill (never
-            raw red text). Keeps its own click → reconnect dialog rather than
-            the ErrorBanner's async Retry, since some states need the picker. */}
-        <button
-          type="button"
-          data-testid="disconnected-indicator"
-          onClick={onShowReconnectHelp}
-          className="flex items-center gap-2 rounded-[12px] px-4 py-2 text-sm text-destructive transition-[filter] hover:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-          style={{
-            background:
-              "color-mix(in srgb, var(--destructive) 4%, var(--app-shell-bg, var(--background)))",
-            border: "1px solid color-mix(in srgb, var(--destructive) 32%, transparent)",
-          }}
-        >
-          <WifiOffIcon className="size-3.5 shrink-0" />
-          <span>
-            {liveness.kind === "host_offline"
-              ? "Host is offline — click to reconnect"
-              : "Agent disconnected — click to reconnect"}
-          </span>
-        </button>
-      </div>
-    );
-  }
-
-  // Terminal-first sessions: the Chat/Terminal toggle lives in the header
-  // (ViewModeToggle) for every reachable state — only the unreachable
-  // states above replace this band with the reconnect banner. In the iOS
-  // shell the toggle is the native Liquid Glass bar, so this band still
-  // reserves a spacer for its footprint.
-  if (terminalFirst?.isTerminalFirst) {
-    // In the iOS shell the toggle is the native bar (driven above). Render only
-    // a spacer reserving its fixed footprint so the composer clears it — and
-    // nothing when the bar is hidden.
-    if (isIOSShell()) {
-      // Chat reserves a touch less than terminal: the composer's own bottom
-      // content (the status line) already cushions the gap to the bar.
-      return nativeBarVisible ? (
-        <div
-          aria-hidden
-          className={cn(
-            "omnigent-native-bottom-spacer",
-            terminalFirst.view === "chat" && "omnigent-native-bottom-spacer--chat",
-          )}
-        />
-      ) : null;
-    }
-    // Outside the iOS shell the Chat/Terminal switcher lives in the header
-    // (ViewModeToggle) — this band renders nothing for terminal-first
-    // sessions now that the in-page pill is gone.
-    return null;
-  }
-
-  // A regular (non-terminal-first) session whose runner is still spinning
-  // up shows a passive "Connecting…" row — no action, no banner, just a
-  // heartbeat so the empty chat doesn't read as broken.
-  if (liveness.kind === "starting") {
-    return (
-      <div
-        data-testid="connecting-indicator"
-        className={cn(
-          "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-muted-foreground text-sm",
-          CHAT_COLUMN_WIDTH,
-        )}
-      >
-        <Loader2Icon className="size-3.5 shrink-0 animate-spin" aria-hidden />
-        <span>Connecting…</span>
-      </div>
-    );
-  }
-
-  // `online`/`unknown` for a non-terminal-first session and
-  // `runner_asleep`/`host_asleep` for any session: status lives in the
-  // sidebar / the composer stays open, so render nothing here.
-  return null;
-}
-
-/**
- * Main-pane launch indicator — the single in-thread line for every
- * "session is coming up" state. Two launch shapes feed it, in
- * priority order:
- *
- * 1. A managed-sandbox launch (`sandboxStatus` in flight): shows the
- *    current pipeline stage ("Provisioning sandbox…", "Cloning
- *    repository…", …) for ANY session type.
- * 2. A terminal-first runner spin-up (`terminalStartingUp`): shows the
- *    generic "Starting up…" terminal copy. The sandbox stages win
- *    while both are active — they're strictly more specific.
- *
- * Self-gates to null when neither applies. `hero` is the centered
- * empty-state placeholder (no bubbles yet); `row` is the in-thread
- * spinner beneath the user's first message (the create-then-send path
- * renders that bubble immediately, so the empty state never shows
- * there).
- */
-export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }) {
-  const terminalFirst = useTerminalFirst();
-  const sandboxStatus = useChatStore((s) => s.sandboxStatus);
-  // `ready` never reaches the store (cleared) and `failed` renders the
-  // destructive band in ConnectionIndicator — only in-flight stages
-  // with known copy show here.
-  const sandboxLabel =
-    sandboxStatus !== null && sandboxStatus.stage !== "failed"
-      ? SANDBOX_STAGE_LABELS[sandboxStatus.stage]
-      : undefined;
-  // `terminalStartingUp` is computed for ALL sessions in AppShell (it does not
-  // check isTerminalFirst), so gate on isTerminalFirst too: regular agents
-  // (e.g. polly) get the generic ConnectionIndicator "Connecting…" band and
-  // must not also render this.
-  const terminalSpinUp = Boolean(
-    terminalFirst?.isTerminalFirst && terminalFirst.terminalStartingUp,
-  );
-  if (sandboxLabel === undefined && !terminalSpinUp) {
-    return null;
-  }
-  const line = sandboxLabel !== undefined ? `${sandboxLabel}…` : "Starting up…";
-  // role=status + aria-live so assistive tech announces the transient wait;
-  // the spinner glyph itself is decorative (aria-hidden).
-  if (variant === "hero") {
-    return (
-      <ConversationEmptyState
-        data-testid="runner-starting-indicator"
-        role="status"
-        aria-live="polite"
-        icon={<Loader2Icon className="size-7 animate-spin" aria-hidden />}
-        title={sandboxLabel !== undefined ? `${sandboxLabel}…` : "Starting up…"}
-        description={
-          sandboxLabel !== undefined
-            ? "Setting up your sandbox — this can take a minute."
-            : "This can take a few seconds."
-        }
-      />
-    );
-  }
-  return (
-    <Message
-      from="assistant"
-      data-testid="runner-starting-indicator"
-      role="status"
-      aria-live="polite"
-    >
-      <MessageContent>
-        <span className="flex items-center gap-2 text-muted-foreground text-ui">
-          <Loader2Icon className="size-4 shrink-0 animate-spin" aria-hidden />
-          {line}
-        </span>
-      </MessageContent>
-    </Message>
-  );
-}
-
-// How many still-starting server names the startup band spells out
-// before collapsing the rest into "…" — mirrors the Codex TUI's own
-// startup header, and keeps a 20-server config to one line.
-const MCP_STARTING_NAMES_SHOWN = 3;
-// Cap for the settled warning's failed/cancelled name lists. Longer
-// than the starting cap because these name servers the user may need
-// to fix; beyond this the count carries the signal.
-const MCP_SETTLED_NAMES_SHOWN = 8;
-
-/**
- * The startup band's in-flight line, mirroring the Codex TUI's header.
- *
- * @param starting Still-starting server names, sorted.
- * @param total Total servers in the round.
- * @returns e.g. `"Starting MCP servers (1/20): glean, jira, safe, …"`.
- */
-export function mcpStartingLine(starting: string[], total: number): string {
-  if (total === 1 && starting.length === 1) {
-    return `Starting MCP server: ${starting[0]}…`;
-  }
-  const shown = starting.slice(0, MCP_STARTING_NAMES_SHOWN);
-  if (starting.length > MCP_STARTING_NAMES_SHOWN) shown.push("…");
-  return `Starting MCP servers (${total - starting.length}/${total}): ${shown.join(", ")}`;
-}
-
-/**
- * A settled warning's name list, capped so the band stays scannable.
- *
- * @param names Failed or cancelled server names, sorted.
- * @returns e.g. `"a, b, c, d, e, f, g, h, +12 more"`.
- */
-export function mcpSettledNames(names: string[]): string {
-  if (names.length <= MCP_SETTLED_NAMES_SHOWN) return names.join(", ");
-  const shown = names.slice(0, MCP_SETTLED_NAMES_SHOWN);
-  return `${shown.join(", ")}, +${names.length - MCP_SETTLED_NAMES_SHOWN} more`;
-}
-
-/**
- * Per-MCP-server startup band for native harness sessions (codex-native).
- * Codex defers a mid-startup turn's execution until its MCP servers
- * settle, and the session previously showed nothing during that window.
- * Renders a spinner naming the still-starting servers; once startup
- * settles with failures/cancellations, a one-line notice says which
- * servers never came up. Self-gates to null when the store carries no
- * startup state (an all-ready map is cleared by the store handler).
- */
-export function McpStartupIndicator() {
-  const mcpStartup = useChatStore((s) => s.mcpStartup);
-  if (mcpStartup === null) return null;
-  const names = Object.keys(mcpStartup).sort();
-  const starting = names.filter((name) => mcpStartup[name].status === "starting");
-  if (starting.length > 0) {
-    return (
-      <Message
-        from="assistant"
-        data-testid="mcp-startup-indicator"
-        role="status"
-        aria-live="polite"
-      >
-        <MessageContent>
-          <span className="flex items-center gap-2 text-muted-foreground text-ui">
-            <Loader2Icon className="size-4 shrink-0 animate-spin" aria-hidden />
-            {mcpStartingLine(starting, names.length)}
-          </span>
-        </MessageContent>
-      </Message>
-    );
-  }
-  const failed = names.filter((name) => mcpStartup[name].status === "failed");
-  const cancelled = names.filter((name) => mcpStartup[name].status === "cancelled");
-  if (failed.length === 0 && cancelled.length === 0) return null;
-  const parts: string[] = [];
-  if (failed.length > 0) parts.push(`failed: ${mcpSettledNames(failed)}`);
-  if (cancelled.length > 0) parts.push(`cancelled: ${mcpSettledNames(cancelled)}`);
-  return (
-    <Message from="assistant" data-testid="mcp-startup-indicator" role="status">
-      <MessageContent>
-        <span className="flex items-center gap-2 text-muted-foreground text-ui">
-          <AlertTriangleIcon className="size-4 shrink-0" aria-hidden />
-          {`MCP startup incomplete (${parts.join("; ")})`}
-        </span>
-      </MessageContent>
-    </Message>
-  );
-}
-
-/**
- * Mirrors the Chat/Terminal state onto the iOS shell's native Liquid Glass
- * switcher and routes its taps back into `setView`. Driven by a stable
- * `visible` boolean (not this hook's mount/unmount), so toggling Chat/Terminal
- * updates the bar in place instead of flickering it hidden→shown. A no-op
- * outside the iOS shell; the caller renders its own in-page pill there.
- */
-function useNativeChatTerminalBar(
-  ctx: ReturnType<typeof useTerminalFirst> | null,
-  visible: boolean,
-): void {
-  const native = isIOSShell();
-  const view = ctx?.view ?? "chat";
-  const terminalsAvailable = ctx?.terminalsAvailable ?? false;
-  const terminalStartingUp = ctx?.terminalStartingUp ?? false;
-
-  // Keep `setView` reachable from the subscribe-once effect without
-  // resubscribing whenever the callback identity changes.
-  const setViewRef = useRef(ctx?.setView);
-  setViewRef.current = ctx?.setView;
-
-  // Push current state + visibility down whenever any of it changes.
-  useEffect(() => {
-    if (!native) return;
-    setNativeViewMode({
-      mode: view,
-      terminalEnabled: terminalsAvailable,
-      terminalStartingUp,
-      visible,
-    });
-  }, [native, view, terminalsAvailable, terminalStartingUp, visible]);
-
-  // Belt-and-suspenders: hide the bar if the host component ever unmounts.
-  useEffect(() => {
-    if (!native) return;
-    return () => {
-      setNativeViewMode({
-        mode: "chat",
-        terminalEnabled: false,
-        terminalStartingUp: false,
-        visible: false,
-      });
-    };
-  }, [native]);
-
-  // Route native taps back into the web layer.
-  useEffect(() => {
-    if (!native) return;
-    return onNativeViewModeChanged((mode) => setViewRef.current?.(mode));
-  }, [native]);
 }
 
 /**
@@ -3866,7 +3443,12 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
             {text && (
               <MessageActions>
-                <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
+                <MessageAction
+                  tooltip="Copy"
+                  size="icon-xxs"
+                  onClick={handleCopy}
+                  componentId="chat.message.copy_user"
+                >
                   {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
                 </MessageAction>
               </MessageActions>
@@ -3943,6 +3525,7 @@ function AssistantBubble({
   // element — the hover footer's timestamp/actions belong to assistant text,
   // not to the error.
   const errorOnly = hasError && !markdownText;
+  const spansFullColumn = isWide || hasError;
 
   return (
     <>
@@ -3950,14 +3533,16 @@ function AssistantBubble({
         from="assistant"
         data-testid="message-bubble"
         data-role="assistant"
-        className={isWide ? "max-w-full" : "max-w-3xl"}
+        className={
+          spansFullColumn ? "max-w-full" : "max-w-3xl min-[2561px]:max-w-[clamp(56rem,30vw,64rem)]"
+        }
       >
         {/* A fold-only bubble takes w-full at the ordinary max-w-3xl cap
             rather than shrink-wrapping to the summary row's ~110px, which
             collapsed the row's trailing hairline (a flex-1 span) to zero
             and stopped its click target short of the column. Keeping the
             cap lands the hairline where an answered turn's does. */}
-        <MessageContent className={isWide || foldOnly || hasError ? "w-full" : undefined}>
+        <MessageContent className={spansFullColumn || foldOnly ? "w-full" : undefined}>
           <BlockRenderer
             items={bubble.items}
             sessionStatus={sessionStatus}
@@ -3992,7 +3577,12 @@ function AssistantBubble({
           <div className="flex items-center gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
             {markdownText && (
               <MessageActions>
-                <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
+                <MessageAction
+                  tooltip="Copy"
+                  size="icon-xxs"
+                  onClick={handleCopy}
+                  componentId="chat.message.copy_assistant"
+                >
                   {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
                 </MessageAction>
                 {/* Fork from this response: clone the session with history
@@ -4005,6 +3595,7 @@ function AssistantBubble({
                     size="icon-xxs"
                     data-testid="fork-from-response"
                     onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
+                    componentId="chat.message.fork"
                   >
                     <GitForkIcon size={14} />
                   </MessageAction>
@@ -4107,21 +3698,6 @@ interface ComposerProps {
    * terminal) keep it.
    */
   isNativeWrapper?: boolean;
-  /**
-   * The session's runner is asleep but its host is online (`runner_asleep`):
-   * the composer stays enabled and the placeholder nudges the user to send a
-   * message, which relaunches the runner on the live host. Ignored while a
-   * turn is streaming (the follow-up placeholder wins).
-   */
-  reconnectHint?: boolean;
-  /**
-   * The session is host-bound to a dormant resumable managed host that is
-   * offline (`host_asleep`): the composer stays enabled, and the placeholder
-   * tells the user their next message will resume the sandbox host (which can
-   * take a few minutes) so the wake latency is expected, not surprising.
-   * Ignored once a turn is streaming.
-   */
-  sandboxAsleepHint?: boolean;
   /**
    * The session is unreachable (`host_offline` / `local_stranded`): a message
    * can't wake it. The composer is blocked (disabled) and the reconnect
@@ -4537,27 +4113,133 @@ function SubagentComposerTray({ label }: { label: string }) {
 }
 
 /**
- * Pill above the composer tallying background tasks that are running (a dev
- * server, a background shell, a sub-agent). Independent of the "Working…"
- * shimmer: while the turn is active both show — the shimmer for the turn, the
- * pill for the tally — and once the turn ends the pill carries on alone.
- * Label-only: the count spans shells, sub-agents, and tools, so there's no
- * single terminal to open.
+ * Pill above the composer tallying running background tasks (a dev server, a
+ * background shell, a sub-agent), shown independently of the "Working…" shimmer.
+ *
+ * The tally expands into a card listing each running shell by name: on hover
+ * for a mouse, on tap for touch (which focuses it, so a tap outside closes it
+ * via blur), and on focus for the keyboard. It morphs in place — the same
+ * element tweens width and height to the measured content size at a constant
+ * corner radius (CSS can't animate to an `auto` size), growing upward out of an
+ * absolute layer over a hidden spacer so the composer below never shifts. A
+ * count-only edge (older runner, no per-shell detail) stays a plain tally.
  */
 function BackgroundTaskPill() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
+  const bgTasks = useChatStore((s) => s.backgroundTasks);
+  const [open, setOpen] = useState(false);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [box, setBox] = useState<{ width: number; height: number } | null>(null);
+  const canExpand = bgTasks.length > 0;
+
+  useEffect(() => {
+    if (bgCount <= 0 || !canExpand) setOpen(false);
+  }, [bgCount, canExpand]);
+
+  // Measure the current content so the container tweens to a concrete size in
+  // both dimensions. Re-measured whenever the state or the task list changes.
+  useLayoutEffect(() => {
+    const el = contentRef.current;
+    if (el) setBox({ width: el.offsetWidth, height: el.offsetHeight });
+  }, [open, canExpand, bgCount, bgTasks]);
+
   if (bgCount <= 0) return null;
+
+  const showCard = open && canExpand;
+
   return (
     <div className={cn("mx-auto flex w-full px-1 pb-1.5", CHAT_COLUMN_WIDTH)}>
-      <div
-        role="status"
-        data-testid="background-task-pill"
-        className="flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-sm text-muted-foreground shadow-sm"
-      >
-        <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
-        <span>
-          {bgCount} background task{bgCount === 1 ? "" : "s"}
-        </span>
+      <div className="relative">
+        {/* Reserves the collapsed footprint so the absolute, upward-growing
+            card never shoves the composer. */}
+        <div aria-hidden className="invisible px-3 py-1.5 text-sm">
+          <div className="flex items-center gap-1.5 whitespace-nowrap">
+            <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
+            <span>
+              {bgCount} background task{bgCount === 1 ? "" : "s"}
+            </span>
+          </div>
+        </div>
+        <div
+          role="status"
+          data-testid="background-task-pill"
+          aria-label={`${bgCount} background task${bgCount === 1 ? "" : "s"} still running`}
+          tabIndex={canExpand ? 0 : undefined}
+          // Hover opens ONLY for a real mouse. On touch, opening on emulated
+          // hover triggers iOS's "first tap reveals hover, second tap clicks"
+          // heuristic — which swallows the first tap inconsistently. Touch opens
+          // via onClick instead, so the first tap always lands.
+          onPointerEnter={(e) => {
+            if (e.pointerType === "mouse" && canExpand) setOpen(true);
+          }}
+          onPointerLeave={(e) => {
+            if (e.pointerType === "mouse") setOpen(false);
+          }}
+          // Tap/click: open and focus the pill so onBlur can close it on
+          // tap-out (a gesture-driven focus() works even on iOS, where tapping a
+          // non-button element otherwise won't focus it).
+          onClick={(e) => {
+            if (!canExpand) return;
+            setOpen(true);
+            e.currentTarget.focus({ preventScroll: true });
+          }}
+          onFocus={() => canExpand && setOpen(true)}
+          onBlur={(e) => {
+            // Close when focus leaves the pill entirely (tap/click outside,
+            // Tab away); staying open if it moves to a child.
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setOpen(false);
+          }}
+          style={box ? { width: box.width, height: box.height } : undefined}
+          className={cn(
+            "absolute bottom-0 left-0 overflow-hidden rounded-2xl bg-card text-sm shadow-sm ring-1 ring-border transition-[width,height,box-shadow] duration-200 ease-out",
+            showCard && "z-10 shadow-menu",
+          )}
+        >
+          <div
+            ref={contentRef}
+            // Cap at Tailwind's `md` container (28rem/448px), but never wider
+            // than the viewport minus a margin so it can't overflow on a narrow
+            // screen. The margin exceeds the composer's own px-4/px-6 inset (this
+            // pill sits at px-1) so the card's right edge, ring included, stays
+            // inside the composer rather than overhanging it.
+            style={
+              showCard ? { maxWidth: "min(var(--container-md, 28rem), 100vw - 3rem)" } : undefined
+            }
+            className={cn("w-max text-left", showCard ? "px-3 py-2" : "px-3 py-1.5")}
+          >
+            {showCard ? (
+              <ul className="flex animate-in flex-col gap-1.5 fade-in-0 duration-200">
+                {bgTasks.map((task, i) => {
+                  const label = task.description || task.command || "Background shell";
+                  const cmd = task.command && task.command !== label ? task.command : null;
+                  return (
+                    <li key={task.id ?? i} className="flex items-start gap-2">
+                      <SquareTerminalIcon
+                        className="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
+                        aria-hidden="true"
+                      />
+                      <div className="min-w-0">
+                        <div className="truncate text-foreground">{label}</div>
+                        {cmd ? (
+                          <div className="truncate font-mono text-xs text-muted-foreground">
+                            {cmd}
+                          </div>
+                        ) : null}
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            ) : (
+              <div className="flex items-center gap-1.5 whitespace-nowrap text-muted-foreground">
+                <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
+                <span>
+                  {bgCount} background task{bgCount === 1 ? "" : "s"}
+                </span>
+              </div>
+            )}
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -4594,8 +4276,6 @@ export function Composer({
   showPollyCodexGoalControl = false,
   isTerminalFirst = false,
   isNativeWrapper = false,
-  reconnectHint = false,
-  sandboxAsleepHint = false,
   unreachable = false,
   onShowReconnectHelp,
   costRoutingEligible = false,
@@ -4636,6 +4316,10 @@ export function Composer({
   // Nonce bumped when bare "/model" is submitted; opens the AgentPicker
   // dropdown instead of sending (see submit()).
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
+  // Single send-telemetry point (see submit()). Emitting here rather than via
+  // the Button's componentId covers Enter-key sends too — a textarea Enter never
+  // submits the form, so it would otherwise bypass the Button entirely.
+  const { trackClick } = useOmnigentAnalytics();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // Declared after textareaRef so dictation can place the caret after the
@@ -4691,9 +4375,8 @@ export function Composer({
   );
 
   // Preserve unsent text + file attachments per session so switching
-  // tabs and coming back restores the draft. The drafts map lives at
-  // module scope (not useRef) because Composer unmounts during the
-  // loading gate between session switches.
+  // tabs and coming back restores the draft. The shared draft store also lets
+  // the sidebar surface which sessions have unfinished composer content.
   const conversationId = useChatStore((s) => s.conversationId);
   const queuedMessages = useChatStore((s) => s.queuedMessages);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
@@ -4766,7 +4449,7 @@ export function Composer({
   }, []);
 
   useEffect(() => {
-    const restored = conversationId ? sessionDrafts.get(conversationId) : undefined;
+    const restored = conversationId ? getSessionDraft(conversationId) : undefined;
     setValue(restored?.text ?? "");
     setFiles(restored?.files ?? []);
     dirtyRef.current = false;
@@ -4779,16 +4462,19 @@ export function Composer({
 
     return () => {
       if (!conversationId || !dirtyRef.current) return;
-      const text = valueRef.current;
-      const draftFiles = filesRef.current;
-      if (text || draftFiles.length > 0) {
-        sessionDrafts.set(conversationId, { text, files: draftFiles });
-      } else {
-        sessionDrafts.delete(conversationId);
-      }
-      saveDraftsToStorage(sessionDrafts);
+      setSessionDraft(conversationId, {
+        text: valueRef.current,
+        files: filesRef.current,
+      });
     };
   }, [conversationId]);
+
+  // Publish edits as they happen so the open sidebar updates immediately,
+  // rather than only learning about a draft when this composer unmounts.
+  useEffect(() => {
+    if (!conversationId || settledConversationId !== conversationId || !dirtyRef.current) return;
+    setSessionDraft(conversationId, { text: value, files });
+  }, [conversationId, settledConversationId, value, files]);
 
   // Adding a reply quote (via the floating "Reply" button) should drop the
   // caret straight into the composer so the user can type immediately. Only
@@ -5207,6 +4893,11 @@ export function Composer({
     )
       return;
 
+    // A send is actually happening: report it for both pointer clicks (which
+    // reach here via the form submit) and Enter-key sends. Placed after the
+    // guard so guarded no-ops don't emit, matching the disabled Send button.
+    trackClick("chat.composer.send", "button");
+
     // Slash command path: the first token must read as "/name" (the shared
     // isSlashCommandText guard — file paths like "/Users/foo/bar.txt" don't
     // match, while args after the name may carry paths or URLs, e.g.
@@ -5549,7 +5240,7 @@ export function Composer({
             (text-transparent, caret kept visible) and render an aligned mirror
             behind it. Same box/typography so wrapping matches the textarea
             exactly. Only mounted while the draft is a command. */}
-        <div className="relative">
+        <div className="relative overflow-hidden">
           {composerIsCommand && (
             <div
               ref={backdropRef}
@@ -5636,17 +5327,13 @@ export function Composer({
                         ? "Waiting for agents…"
                         : isStreaming
                           ? "Send a follow-up (queued) — Esc to stop"
-                          : sandboxAsleepHint
-                            ? "Current session's host is offline. Next message will resume the sandbox host which can take minutes"
-                            : reconnectHint
-                              ? "Send a message to reconnect this session"
-                              : "Ask the agent anything…"
+                          : "Send a message…"
             }
             rows={1}
             disabled={disabled || isReadOnly || unreachable || hasPendingElicitation}
             data-slash-command={composerIsCommand ? "true" : undefined}
             className={cn(
-              "relative w-full resize-none bg-transparent px-4 pt-3 pb-2 text-ui outline-none placeholder:text-muted-foreground disabled:opacity-60",
+              "relative w-full resize-none overflow-y-auto bg-transparent px-4 pt-3 pb-2 text-ui outline-none [scrollbar-width:none] placeholder:text-muted-foreground disabled:opacity-60 [&::-webkit-scrollbar]:hidden",
               // Hand glyph painting to the overlay while a command is drafted;
               // the caret stays visible via caret-foreground.
               composerIsCommand && "text-transparent caret-foreground",
@@ -5737,6 +5424,7 @@ export function Composer({
               disabled={disabled || isReadOnly || hasPendingElicitation}
               onClick={() => fileInputRef.current?.click()}
               title="Attach files"
+              componentId="chat.composer.attach_files"
             >
               <PaperclipIcon className="size-4" data-icon-size="16" />
               <span className="sr-only">Attach files</span>
@@ -5787,6 +5475,7 @@ export function Composer({
                     data-testid="codex-plan-mode-toggle"
                     data-active={codexPlanMode ? "true" : undefined}
                     onClick={() => void toggleCodexPlanMode()}
+                    componentId="chat.composer.toggle_plan_mode"
                   >
                     {planModeBusy ? (
                       <Loader2Icon className="size-3.5 animate-spin" />
@@ -5859,7 +5548,6 @@ export function Composer({
             <Button
               type="submit"
               size="icon"
-              componentId="chat.composer.send"
               variant={showInterruptButton ? "destructive" : "default"}
               // Send button fades more decisively when there's no draft —
               // overrides the base 50% disabled-opacity so the affordance
@@ -6115,6 +5803,17 @@ const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 /** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
 const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
+/** Pi thinking ladder (matches PI_EFFORTS in reasoning_effort.py; ``ultra`` aliases to ``max`` on Pi so omitted). */
+const PI_NATIVE_EFFORT_LEVELS = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const;
+
 type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
@@ -6157,6 +5856,8 @@ export function effortLevelsForConv(
       return CLAUDE_NATIVE_EFFORT_LEVELS;
     case "codex-native-ui":
       return codexEffortLevelsForModel(codexModelOptions, currentModel);
+    case "pi-native-ui":
+      return PI_NATIVE_EFFORT_LEVELS;
     default:
       return EFFORT_LEVELS;
   }
@@ -6548,6 +6249,7 @@ function SessionConfigModal({
                     : undefined
                 }
                 activeModelId={draftModelId}
+                componentId="chat.composer.model"
               />
             </ConfigRow>
           )}
@@ -6560,6 +6262,8 @@ function SessionConfigModal({
                 value={draftRoutingOn ? "" : (draftEffort ?? EFFORT_SELECT_NONE)}
                 onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? null : v)}
                 disabled={draftRoutingOn}
+                componentId="chat.composer.effort"
+                valueHasNoPii
               >
                 <SelectTrigger
                   className="w-full"
@@ -6594,7 +6298,12 @@ function SessionConfigModal({
               footer in some pane states, and a guess would misreport it. */}
           {showClaudePermissionMode && claudePermissionMode !== "" && (
             <ConfigRow label="Permissions" description="How much Claude asks before acting">
-              <Select value={draftPermissionMode} onValueChange={setDraftPermissionMode}>
+              <Select
+                value={draftPermissionMode}
+                onValueChange={setDraftPermissionMode}
+                componentId="chat.composer.permission_mode"
+                valueHasNoPii
+              >
                 <SelectTrigger
                   className="w-full"
                   data-testid="composer-config-permission-mode"
@@ -6632,6 +6341,8 @@ function SessionConfigModal({
               <Select
                 value={subagentRoutingValue}
                 onValueChange={(v) => setPickedSubagentRouting(v === "on" ? "on" : "off")}
+                componentId="chat.composer.subagent_routing"
+                valueHasNoPii
               >
                 <SelectTrigger
                   className="w-full"

@@ -16,6 +16,8 @@ const mocks = vi.hoisted(() => ({
   theme: "system" as string,
   archiveMutate: vi.fn(),
   deleteMutate: vi.fn(),
+  bulkArchiveMutate: vi.fn(),
+  bulkDeleteMutate: vi.fn(),
   accountsEnabled: true,
   // login_url: non-null for any sign-in mode (accounts OR OIDC), null in
   // header mode. Gates the Account section.
@@ -55,6 +57,7 @@ vi.mock("@/lib/accountsApi", () => ({
 vi.mock("@/lib/identity", () => ({
   resolveIdentity: () => Promise.resolve(mocks.me?.id ?? null),
   getCurrentIsAdmin: () => mocks.me?.is_admin ?? false,
+  getCurrentUserId: () => mocks.me?.id ?? null,
 }));
 vi.mock("@/hooks/useConversations", async () => {
   // A stateful mock that emulates useInfiniteQuery pagination: it tracks how
@@ -104,6 +107,16 @@ vi.mock("@/hooks/useConversations", async () => {
       isPending: false,
     }),
     useStopAndDeleteConversation: () => ({ mutate: mocks.deleteMutate, isPending: false }),
+    useBulkArchiveConversations: () => ({
+      mutate: mocks.bulkArchiveMutate,
+      isPending: false,
+      isError: false,
+    }),
+    useBulkDeleteConversations: () => ({
+      mutate: mocks.bulkDeleteMutate,
+      isPending: false,
+      isError: false,
+    }),
   };
 });
 // Radix Select uses a portal + pointer events jsdom can't drive; stub it to a
@@ -193,6 +206,8 @@ beforeEach(() => {
   mocks.setTheme.mockReset();
   mocks.archiveMutate.mockReset();
   mocks.deleteMutate.mockReset();
+  mocks.bulkArchiveMutate.mockReset();
+  mocks.bulkDeleteMutate.mockReset();
   mocks.fetchNextPage.mockReset();
   mocks.theme = "system";
   mocks.accountsEnabled = true;
@@ -306,6 +321,24 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "false");
   });
 
+  it("defaults transcripts to Chat and persists a Terminal default", () => {
+    renderPage("/settings/appearance");
+
+    expect(screen.getByRole("radiogroup", { name: "Default transcript view" })).toBeInTheDocument();
+    expect(screen.getByTestId("transcript-view-default-chat")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(localStorage.getItem("omnigent:default-transcript-view")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("transcript-view-default-terminal"));
+    expect(screen.getByTestId("transcript-view-default-terminal")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(localStorage.getItem("omnigent:default-transcript-view")).toBe("terminal");
+  });
+
   it("renders the color theme dropdown, defaults to Omnigent, and applies a palette on change", () => {
     localStorage.clear();
     renderPage("/settings/appearance");
@@ -330,7 +363,7 @@ describe("SettingsPage", () => {
 
     fireEvent.click(screen.getByTestId("custom-theme-accent-trigger"));
     const accent = screen.getByTestId("custom-theme-accent-input") as HTMLInputElement;
-    expect(accent.value).toBe("#0969DA");
+    expect(accent.value).toBe("#1F883D");
     fireEvent.change(accent, { target: { value: "#2563eb" } });
 
     expect(select.value).toBe("custom");
@@ -339,10 +372,51 @@ describe("SettingsPage", () => {
     expect(JSON.parse(localStorage.getItem("omnigent:custom-theme") ?? "null")).toMatchObject({
       basePalette: "github",
       accent: "#2563eb",
+      darkAccent: "#2563eb",
     });
     expect(document.documentElement.style.getPropertyValue("--custom-light-primary")).toBe(
       "#2563eb",
     );
+  });
+
+  it("keeps the preset primary color when contrast creates a custom theme", () => {
+    renderPage("/settings/appearance");
+    fireEvent.change(screen.getByTestId("color-theme-select"), {
+      target: { value: "github" },
+    });
+
+    fireEvent.change(screen.getByTestId("custom-theme-contrast"), {
+      target: { value: "68" },
+    });
+
+    expect(document.documentElement.getAttribute("data-theme")).toBe("custom");
+    expect(document.documentElement.style.getPropertyValue("--custom-light-primary")).toBe(
+      "#1f883d",
+    );
+    expect(document.documentElement.style.getPropertyValue("--custom-dark-primary")).toBe(
+      "#238636",
+    );
+    expect(document.documentElement.style.getPropertyValue("--custom-dark-background")).toBe(
+      "#0d1117",
+    );
+  });
+
+  it("restores Dracula surfaces when contrast returns to 50", () => {
+    renderPage("/settings/appearance");
+    fireEvent.change(screen.getByTestId("color-theme-select"), {
+      target: { value: "dracula" },
+    });
+
+    const contrast = screen.getByTestId("custom-theme-contrast");
+    fireEvent.change(contrast, { target: { value: "53" } });
+    fireEvent.change(contrast, { target: { value: "50" } });
+
+    const style = document.documentElement.style;
+    expect(style.getPropertyValue("--custom-light-background")).toBe("#f7f5fd");
+    expect(style.getPropertyValue("--custom-light-card")).toBe("#ffffff");
+    expect(style.getPropertyValue("--custom-light-sidebar")).toBe("#f3f0fa");
+    expect(style.getPropertyValue("--custom-light-border")).toBe("#e6e0f2");
+    expect(style.getPropertyValue("--custom-light-brand-accent")).toBe("#d6409f");
   });
 
   it("persists the shared contrast and translucent-sidebar controls", () => {
@@ -353,6 +427,9 @@ describe("SettingsPage", () => {
     });
     fireEvent.click(screen.getByTestId("custom-theme-translucent-sidebar"));
 
+    expect(screen.getByTestId("custom-theme-contrast")).toHaveStyle({
+      "--range-progress": "68%",
+    });
     expect(screen.getByTestId("color-theme-select")).toHaveValue("custom");
     expect(screen.getByTestId("custom-theme-contrast-value")).toHaveTextContent("68");
     expect(JSON.parse(localStorage.getItem("omnigent:custom-theme") ?? "null")).toMatchObject({
@@ -458,6 +535,7 @@ describe("SettingsPage", () => {
     fireEvent.change(screen.getByTestId("color-theme-select") as HTMLSelectElement, {
       target: { value: "github" },
     });
+    fireEvent.click(screen.getByTestId("transcript-view-default-terminal"));
     fireEvent.click(screen.getByTestId("workspace-panel-default-collapsed"));
     fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
@@ -470,12 +548,15 @@ describe("SettingsPage", () => {
     fireEvent.change(screen.getByTestId("code-font-family-input") as HTMLInputElement, {
       target: { value: "Fira Code" },
     });
+    fireEvent.click(screen.getByTestId("heavier-code-text-toggle"));
 
     // Sanity: the non-default choices were persisted.
     expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
+    expect(localStorage.getItem("omnigent:default-transcript-view")).toBe("terminal");
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
     expect(localStorage.getItem("omnigent:ui-font-size")).toBe("15");
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("15");
+    expect(localStorage.getItem("omnigent:code-font-weight")).toBe("500");
 
     // Open the confirmation dialog and confirm the reset.
     fireEvent.click(screen.getByTestId("reset-appearance-button"));
@@ -493,13 +574,18 @@ describe("SettingsPage", () => {
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
     expect(localStorage.getItem("omnigent:ui-font-size")).toBeNull();
     expect(localStorage.getItem("omnigent:code-font-size")).toBeNull();
+    expect(localStorage.getItem("omnigent:code-font-weight")).toBeNull();
 
     // Color theme is back to Omnigent.
     expect((screen.getByTestId("color-theme-select") as HTMLSelectElement).value).toBe("omni");
     expect(document.documentElement.getAttribute("data-theme")).toBeNull();
 
-    // Terminal theme, workspace panel, and harness visibility are restored.
+    // Terminal theme, transcript view, workspace panel, and harness visibility are restored.
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("transcript-view-default-chat")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
     expect(screen.getByTestId("workspace-panel-default-open")).toHaveAttribute(
       "aria-checked",
       "true",
@@ -637,6 +723,28 @@ describe("SettingsPage", () => {
     // Reset clears the field and the stored key.
     expect(input.value).toBe("");
     expect(localStorage.getItem("omnigent:code-font-family")).toBeNull();
+  });
+
+  it("shows and persists the code font weight", () => {
+    localStorage.clear();
+    renderPage("/settings/appearance");
+    const toggle = screen.getByTestId("heavier-code-text-toggle");
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(localStorage.getItem("omnigent:code-font-weight")).toBe("500");
+  });
+
+  it("maps legacy font weights to the supported presets", () => {
+    localStorage.setItem("omnigent:code-font-weight", "900");
+    renderPage("/settings/appearance");
+    expect(screen.getByTestId("heavier-code-text-toggle")).toHaveAttribute("aria-checked", "true");
+
+    cleanup();
+    localStorage.setItem("omnigent:code-font-weight", "100");
+    renderPage("/settings/appearance");
+    expect(screen.getByTestId("heavier-code-text-toggle")).toHaveAttribute("aria-checked", "false");
   });
 
   it("defaults bare /settings to Account when a login session exists, else Appearance", async () => {
@@ -988,5 +1096,98 @@ describe("SettingsPage", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("enters selection mode and selects rows via click", () => {
+    mocks.conversations = [
+      conv("a1", { archived: true, title: "Chat A" }),
+      conv("a2", { archived: true, title: "Chat B" }),
+    ];
+    renderPage("/settings/archived");
+
+    fireEvent.click(screen.getByTestId("archived-toggle-selection"));
+    const rows = screen.getAllByTestId("archived-row");
+    expect(rows).toHaveLength(2);
+
+    // Clicking a row in selection mode toggles its checkbox.
+    fireEvent.click(rows[0]);
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+
+    fireEvent.click(rows[1]);
+    expect(screen.getByText("2 selected")).toBeInTheDocument();
+
+    // Clicking again deselects.
+    fireEvent.click(rows[0]);
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+  });
+
+  it("bulk-deletes selected archived sessions after confirming", () => {
+    mocks.conversations = [
+      conv("a1", { archived: true, title: "Chat A" }),
+      conv("a2", { archived: true, title: "Chat B" }),
+    ];
+    renderPage("/settings/archived");
+
+    fireEvent.click(screen.getByTestId("archived-toggle-selection"));
+    const rows = screen.getAllByTestId("archived-row");
+    fireEvent.click(rows[0]);
+    fireEvent.click(rows[1]);
+
+    fireEvent.click(screen.getByTestId("archived-bulk-delete"));
+    fireEvent.click(screen.getByRole("button", { name: /Delete 2 session/ }));
+    expect(mocks.bulkDeleteMutate).toHaveBeenCalledWith({ ids: ["a1", "a2"] }, expect.anything());
+  });
+
+  it("bulk-unarchives selected archived sessions", () => {
+    mocks.conversations = [
+      conv("a1", { archived: true, title: "Chat A" }),
+      conv("a2", { archived: true, title: "Chat B" }),
+    ];
+    renderPage("/settings/archived");
+
+    fireEvent.click(screen.getByTestId("archived-toggle-selection"));
+    fireEvent.click(screen.getAllByTestId("archived-row")[0]);
+
+    fireEvent.click(screen.getByTestId("archived-bulk-unarchive"));
+    expect(mocks.bulkArchiveMutate).toHaveBeenCalledWith(
+      { ids: ["a1"], archived: false },
+      expect.anything(),
+    );
+  });
+
+  it("exits selection mode and clears selection", () => {
+    mocks.conversations = [conv("a1", { archived: true, title: "Chat A" })];
+    renderPage("/settings/archived");
+
+    fireEvent.click(screen.getByTestId("archived-toggle-selection"));
+    fireEvent.click(screen.getAllByTestId("archived-row")[0]);
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("archived-exit-selection"));
+    expect(screen.queryByText("1 selected")).toBeNull();
+    expect(screen.queryByTestId("archived-bulk-delete")).toBeNull();
+  });
+
+  it("select-all picks every visible archived row", () => {
+    mocks.conversations = [
+      conv("a1", { archived: true, title: "Chat A" }),
+      conv("a2", { archived: true, title: "Chat B" }),
+      conv("a3", { archived: true, title: "Chat C" }),
+    ];
+    renderPage("/settings/archived");
+
+    fireEvent.click(screen.getByTestId("archived-toggle-selection"));
+    fireEvent.click(screen.getByRole("button", { name: "Select all" }));
+    expect(screen.getByText("3 selected")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Deselect all" }));
+    expect(screen.getByText("None selected")).toBeInTheDocument();
+  });
+
+  it("hides the Select button when there are no archived sessions", () => {
+    mocks.conversations = [conv("conv_active")];
+    renderPage("/settings/archived");
+
+    expect(screen.queryByTestId("archived-toggle-selection")).toBeNull();
   });
 });

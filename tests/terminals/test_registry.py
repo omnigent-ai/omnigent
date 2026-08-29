@@ -159,6 +159,89 @@ async def test_shutdown_on_empty_registry_is_noop() -> None:
     assert reg.active_conversation_ids() == []
 
 
+async def test_close_expected_leaves_a_successor_on_the_same_key_running(
+    tmp_path: Path,
+) -> None:
+    """
+    ``close(expected=...)`` retracts only the instance it was given.
+
+    A creator whose work was superseded may try to retract the terminal it
+    published after the key has already been reassigned to a successor built
+    for the current agent. Closing by key alone would terminate that
+    successor — a live terminal belonging to the session's current agent.
+    Passing the original instance as *expected* makes the removal a
+    compare-and-close, so the successor survives.
+    """
+
+    class _RecordingTerminal(TerminalInstance):
+        closed: bool = False
+
+        async def close(self) -> None:
+            self.closed = True
+            self.running = False
+
+    reg = TerminalRegistry()
+    superseded = _RecordingTerminal(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "old.sock",
+        private_dir=tmp_path / "old",
+        running=True,
+    )
+    successor = _RecordingTerminal(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "new.sock",
+        private_dir=tmp_path / "new",
+        running=True,
+    )
+    # The successor now occupies the key the superseded creator published to.
+    reg._by_conversation["conv_close_expected_successor"] = {("claude", "main"): successor}
+    reg._instance_locks[("conv_close_expected_successor", "claude", "main")] = threading.Lock()
+
+    closed = await reg.close(
+        "conv_close_expected_successor", "claude", "main", expected=superseded
+    )
+
+    assert closed is False, "compare-and-close must report that nothing was closed"
+    assert successor.closed is False, (
+        "the successor terminal belonging to the session's current agent must "
+        "still be running — closing by key alone would have terminated it"
+    )
+    assert reg.get("conv_close_expected_successor", "claude", "main") is successor, (
+        "the successor must remain registered under its key"
+    )
+
+
+async def test_close_expected_closes_its_own_instance(tmp_path: Path) -> None:
+    """``close(expected=...)`` still closes when the key holds that instance."""
+
+    class _RecordingTerminal(TerminalInstance):
+        closed: bool = False
+
+        async def close(self) -> None:
+            self.closed = True
+            self.running = False
+
+    reg = TerminalRegistry()
+    mine = _RecordingTerminal(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "mine.sock",
+        private_dir=tmp_path / "mine",
+        running=True,
+    )
+    reg._by_conversation["conv_close_expected_own"] = {("claude", "main"): mine}
+    reg._instance_locks[("conv_close_expected_own", "claude", "main")] = threading.Lock()
+
+    closed = await reg.close("conv_close_expected_own", "claude", "main", expected=mine)
+
+    assert closed is True
+    assert mine.closed is True
+    assert reg.get("conv_close_expected_own", "claude", "main") is None
+
+
+@pytest.mark.asyncio
 async def test_launch_replaces_stale_running_entry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

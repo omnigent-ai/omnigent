@@ -24,6 +24,8 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import Page, Route, expect
 
+from tests.e2e_ui.conftest import fetch_with_retry
+
 # Must match the OmnigentError raised in the compact branch of
 # omnigent/server/routes/sessions/routes_events.py.
 _RECONNECT_ERROR = (
@@ -54,7 +56,7 @@ def _force_native_wrapper_and_stub_compact(page: Page, session_id: str) -> None:
         if request.method != "GET" or urlparse(request.url).path != f"/v1/sessions/{session_id}":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         labels = dict(payload.get("labels") or {})
         labels[_WRAPPER_LABEL_KEY] = _CLAUDE_NATIVE_WRAPPER

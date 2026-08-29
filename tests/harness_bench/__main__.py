@@ -10,6 +10,7 @@ from dataclasses import replace
 from tests.harness_bench.bench import run_bench
 from tests.harness_bench.events import LineSink
 from tests.harness_bench.manifest import OFFICIAL_PROFILES
+from tests.harness_bench.native_tui_driver import NativeTuiDriver, requires_gateway
 from tests.harness_bench.probes import ALL_PROBES, PROBES_BY_NAME, CapabilityProbe
 from tests.harness_bench.profile import BenchProfile, resolve_profile
 from tests.harness_bench.report import render_json, render_markdown, render_table
@@ -53,8 +54,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         dest="live",
         action="store_true",
         default=None,
-        help="Force the live layer (needs resolvable creds: --profile, a "
-        "configured ~/.omnigent profile, or ambient OPENAI_*).",
+        help="Force the live layer. Needs resolvable gateway creds (--profile, "
+        "a configured ~/.omnigent profile, or ambient OPENAI_*) unless every "
+        "selected harness authenticates its own model.",
     )
     parser.add_argument(
         "--no-live",
@@ -162,6 +164,33 @@ def _resolve_probes(values: list[str] | None) -> list[CapabilityProbe]:
     return [probe for probe in ALL_PROBES if probe.name in selected]
 
 
+def _all_own_auth_native(
+    profiles: list[BenchProfile], *, transport: str | None, fast: bool
+) -> bool:
+    """Whether every selected harness authenticates its own model.
+
+    Defers to :func:`~tests.harness_bench.native_tui_driver.requires_gateway`,
+    the predicate the driver itself uses, so this gate cannot drift from the one
+    ``NativeTuiDriver.unavailable`` applies a moment later.
+
+    :param profiles: The selected harness profiles.
+    :param transport: The ``--transport`` override, or ``None``.
+    :param fast: The ``--fast`` flag.
+    :returns: ``True`` when every profile lands on the native-tui driver with a
+        vendor that authenticates itself, so the run needs no gateway
+        credentials.
+    """
+    if not profiles:
+        return False
+    for profile in profiles:
+        resolved = resolve_transport_name(profile, override=transport, fast=fast)
+        if driver_registry().get(resolved) is not NativeTuiDriver:
+            return False
+        if requires_gateway(profile):
+            return False
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
 
@@ -197,7 +226,19 @@ def main(argv: list[str] | None = None) -> int:
     from tests.harness_bench.runtime_env import bench_creds_skip_reason
 
     creds_skip = bench_creds_skip_reason(args.profile)
+    # Auto-live stays keyed on the gateway: with no explicit --live, a
+    # credential-less box gets the declared-only render rather than a surprise
+    # run that launches vendor CLIs.
     live = args.live if args.live is not None else creds_skip is None
+    if (
+        live
+        and creds_skip is not None
+        and _all_own_auth_native(profiles, transport=args.transport, fast=args.fast)
+    ):
+        # Every selected harness logs its own model in, so the run never reaches
+        # the gateway. NativeTuiDriver.unavailable() already waives the check for
+        # these; refusing here would skip them on any box without a gateway.
+        creds_skip = None
     if live and creds_skip is not None:
         print(f"--live needs resolvable gateway creds: {creds_skip}", file=sys.stderr)
         return 2

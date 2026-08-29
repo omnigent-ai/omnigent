@@ -340,7 +340,8 @@ class HermesExecutor(Executor):
 
         :param messages: Conversation history from Omnigent.
         :param tools: Tool schemas (Hermes uses its own tools internally).
-        :param system_prompt: System prompt (used by Hermes internally).
+        :param system_prompt: Composed instructions; prepended to the first
+            user turn of a fresh session.
         :param config: Per-turn config (model override, etc.).
         :yields: ``TextChunk`` and ``TurnComplete`` events.
         :yields: ``ExecutorError`` on subprocess failure or timeout.
@@ -365,6 +366,10 @@ class HermesExecutor(Executor):
         # Determine session key for this conversation
         session_key = self._session_key(messages)
         hermes_sid = self._hermes_session_id(session_key)
+
+        # Prefix instructions on the first turn only; --resume prevents re-prefixing.
+        if hermes_sid is None and system_prompt:
+            user_text = f"{system_prompt}\n\n{user_text}"
 
         # Build the command-line arguments
         args = _build_hermes_args(

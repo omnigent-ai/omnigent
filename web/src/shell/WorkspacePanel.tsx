@@ -524,7 +524,6 @@ function RailTerminalView({
         sessionId={conversationId}
         terminalId={terminal.id}
         readOnly={readOnly}
-        transport={terminal.transport}
         directAttachUrl={terminal.directAttachUrl}
         onStateChange={(state) => setTerminalConnectionState(terminal.id, state)}
         onActivity={() => markTerminalActive(terminal.id)}
@@ -763,6 +762,7 @@ export function WorkspacePanel({
               : rightRailTab
           }
           onValueChange={(v) => onRightRailTabChange(v as RightRailTab)}
+          componentId="chat.right_rail.tabs"
         >
           <TabsList variant="pill" className="gap-1">
             {showFilesPanel && (

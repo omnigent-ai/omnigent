@@ -393,6 +393,7 @@ export function ErrorBanner({
                     copiedTarget === "message" ? "Error message copied" : "Copy error message"
                   }
                   onClick={() => void copy("message", messageText)}
+                  componentId="diagnostics.status.copy"
                 >
                   {copiedTarget === "message" ? (
                     <CheckIcon className="size-3.5" aria-hidden="true" />
@@ -432,7 +433,11 @@ export function ErrorBanner({
                   </button>
                 </CollapsibleTrigger>
                 <CollapsibleContent id={diagnosticsId} className="min-w-0 px-[12px] pb-[12px]">
-                  <Tabs value={activeDiagnostics} onValueChange={setActiveDiagnostics}>
+                  <Tabs
+                    value={activeDiagnostics}
+                    onValueChange={setActiveDiagnostics}
+                    componentId="diagnostics.status.tabs"
+                  >
                     {diagnostics.length > 1 ? (
                       <TabsList
                         variant="line"
@@ -470,6 +475,7 @@ export function ErrorBanner({
                                 : `Copy ${item.label.toLowerCase()}`
                             }
                             onClick={() => void copy(item.id, item.content)}
+                            componentId="diagnostics.status.diagnostic_copy"
                           >
                             {copiedTarget === item.id ? (
                               <CheckIcon aria-hidden="true" />

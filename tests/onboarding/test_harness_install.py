@@ -128,6 +128,21 @@ def test_kimi_required_cli_returns_install_spec() -> None:
     assert spec.binary == "kimi"
 
 
+@pytest.mark.parametrize(
+    "harness",
+    ["antigravity-native", "native-antigravity", "agy-native", "native-agy"],
+)
+def test_antigravity_native_aliases_require_agy_cli(
+    monkeypatch: pytest.MonkeyPatch, harness: str
+) -> None:
+    """Every native agy spelling fails early when its CLI is unavailable."""
+    monkeypatch.setattr(hi.shutil, "which", lambda _name: None)
+    spec = hi.required_cli_for_harness(harness)
+    assert spec is not None
+    assert spec.binary == "agy"
+    assert hi.missing_harness_cli(harness) == spec
+
+
 def test_kimi_only_upstream_binary_satisfies_readiness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -369,13 +384,17 @@ def test_antigravity_install_spec_launches_auth_service_no_npm() -> None:
     assert spec.auth_hint is not None
 
 
-def test_harness_setup_hint_antigravity_surfaces_sign_in() -> None:
+@pytest.mark.parametrize(
+    "harness",
+    ["antigravity-native", "native-antigravity", "agy-native", "native-agy"],
+)
+def test_harness_setup_hint_antigravity_surfaces_sign_in(harness: str) -> None:
     """A not-yet-signed-in agy is fixed by launching ``agy`` itself, so the
     launch hint names the installer AND the "run agy to sign in" step —
     otherwise a user who already has agy installed gets a misleading
     install-only hint.
     """
-    hint = hi.harness_setup_hint("antigravity-native")
+    hint = hi.harness_setup_hint(harness)
     assert "antigravity.google/cli/install.sh" in hint
     assert "agy" in hint
     assert "sign" in hint.lower()
@@ -1281,11 +1300,12 @@ def test_ui_setup_steps_generic_for_non_installable() -> None:
         (hi.KIMI_KEY, "0.7.0", None),
         (ANTHROPIC_FAMILY, "2.1.161", None),
         (OPENAI_FAMILY, "0.137.0", None),
-        (hi.PI_KEY, "0.79.0", None),
+        (hi.PI_KEY, "0.84.2", None),
         (hi.QWEN_KEY, "0.18.1", None),
         (hi.GOOSE_KEY, "1.38.0", None),
         (hi.HERMES_KEY, "0.17.0", None),
         (hi.KIRO_KEY, "2.10.0", None),
+        (GEMINI_FAMILY, "1.1.13", None),
     ],
 )
 def test_versioned_specs_declare_bounds(
@@ -1445,19 +1465,6 @@ def test_harness_cli_installed_true_when_version_in_range(
 
     monkeypatch.setattr(hi.subprocess, "run", _run)
     assert hi.harness_cli_installed(hi.OPENCODE_KEY) is True
-
-
-def test_harness_cli_installed_ignores_upper_bound_for_unversioned_specs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Harnesses without a version declaration are not probed with ``--version``."""
-    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
-
-    def _explode(*a: object, **k: object) -> None:
-        raise AssertionError("version probe spawned for an unversioned harness")
-
-    monkeypatch.setattr(hi.subprocess, "run", _explode)
-    assert hi.harness_cli_installed(GEMINI_FAMILY) is True
 
 
 @pytest.mark.parametrize(

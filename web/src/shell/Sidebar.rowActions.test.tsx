@@ -15,6 +15,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import type * as IdentityModule from "@/lib/identity";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 
 // Controllable rename mutation so the double-click test can assert the
 // committed title was forwarded to the PATCH. `isMobile` toggles the mocked
@@ -346,6 +347,33 @@ describe("quick pin/unpin hover button", () => {
     }
   });
 
+  it("keeps the Projects group-header actions visible without hover, hover-revealed on desktop", () => {
+    // The "New project" (+) button is the only way to create a project, so its
+    // group-header wrapper must stay visible wherever hover is unavailable —
+    // phones AND touch tablets at `md`+ widths — rather than fade out like the
+    // desktop-only session-header controls. jsdom doesn't evaluate media
+    // queries, so assert the responsive classes: base `flex` (shown at every
+    // breakpoint) with the fade + hover/focus reveals gated on hover
+    // capability, not just the `md` width.
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    const wrapper = screen.getByTestId("new-project").closest(".transition-opacity");
+    expect(wrapper).not.toBeNull();
+    // Visible without hover: base display is `flex`, never `hidden`, and the
+    // fade is not applied by viewport width alone.
+    expect(wrapper).toHaveClass("flex");
+    expect(wrapper).not.toHaveClass("hidden");
+    expect(wrapper).not.toHaveClass("md:opacity-0");
+    // Hover-capable desktop: fades out until the header is hovered / focused /
+    // a menu opens.
+    expect(wrapper).toHaveClass(
+      "[@media(hover:hover)]:md:opacity-0",
+      "[@media(hover:hover)]:md:group-hover/header:opacity-100",
+      "[@media(hover:hover)]:md:has-[:focus-visible]:opacity-100",
+    );
+  });
+
   it("hides the Projects list-actions kebab when there are no projects", () => {
     // With no projects, the kebab has nothing to offer (no expand/collapse, no
     // sessions to select) and would open empty — so it's hidden entirely,
@@ -452,6 +480,19 @@ describe("quick pin/unpin hover button", () => {
     // classes actually take effect), rather than a block (which would not).
     expect(quickButton).toHaveClass("md:inline-flex");
     expect(quickButton).not.toHaveClass("md:block");
+  });
+
+  it("drops the row kebab on mobile, revealing it only from md up", () => {
+    // The per-row "..." menu is desktop-only: on mobile the chat page's own
+    // header menu covers these per-session actions, so the row kebab is hidden
+    // (`hidden`) and only surfaces from `md` up (`md:inline-flex`). It reveals
+    // like the quick-pin button — flex, not block — so its glyph stays
+    // centered.
+    renderSidebar();
+
+    const kebab = screen.getByTestId("conversation-actions");
+    expect(kebab).toHaveClass("hidden", "md:inline-flex");
+    expect(kebab).not.toHaveClass("md:block");
   });
 });
 
@@ -804,7 +845,7 @@ describe("mobile in-place project picker", () => {
     // actions are gone, and the picker (search + project list) plus a Back
     // control are shown.
     fireEvent.click(moveItem);
-    expect(screen.getByPlaceholderText("Search projects")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Search or create project")).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /Sprint 42/ })).toBeInTheDocument();
     expect(screen.getByTestId("project-picker-back")).toBeInTheDocument();
     // The main actions are no longer rendered — the body was replaced, not
@@ -817,7 +858,7 @@ describe("mobile in-place project picker", () => {
     fireEvent.click(screen.getByTestId("project-picker-back"));
     expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
     expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
-    expect(screen.queryByPlaceholderText("Search projects")).toBeNull();
+    expect(screen.queryByPlaceholderText("Search or create project")).toBeNull();
   });
 
   it("moves the session into a picked project just like desktop", () => {
@@ -834,6 +875,41 @@ describe("mobile in-place project picker", () => {
       id: "conv_1",
       project: "Sprint 42",
     });
+  });
+
+  it("creates a project from a typed name that matches nothing", () => {
+    mocks.isMobile = true;
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("move-to-project"));
+
+    fireEvent.change(screen.getByPlaceholderText("Search or create project"), {
+      target: { value: "Roadmap" },
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: /Create Roadmap/ }));
+
+    // The move resolves-or-creates the project id server-side, so filing into a
+    // brand-new name uses the same mutation contract as picking an existing one.
+    expect(mocks.moveToProject.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      project: "Roadmap",
+    });
+  });
+
+  it("offers no create row when the typed name already exists", () => {
+    mocks.isMobile = true;
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("move-to-project"));
+
+    fireEvent.change(screen.getByPlaceholderText("Search or create project"), {
+      target: { value: "sprint 42" },
+    });
+    expect(screen.queryByRole("menuitem", { name: /Create/ })).toBeNull();
   });
 
   it("keeps the desktop side-flyout submenu (no in-place swap)", () => {
@@ -969,6 +1045,7 @@ describe("right-click context menu", () => {
     fireEvent.contextMenu(links[0]);
     fireEvent.click(screen.getByTestId("rename-conversation"));
     const input = screen.getByTestId("rename-conversation-input") as HTMLInputElement;
+    expect(input).toHaveAttribute("maxLength", String(USER_SESSION_TITLE_MAX_CHARS));
     fireEvent.change(input, { target: { value: "Renamed A" } });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(mocks.rename.mutate).toHaveBeenCalledWith({ id: "conv_a", title: "Renamed A" });

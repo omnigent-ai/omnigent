@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 
 import click
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.inner import ui
 from omnigent.onboarding.ucode_setup import (
     build_ucode_configure_command,
@@ -765,54 +766,54 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         )
 
     elif kind == "subscription":
-        cli_name = chosen.cli  # preset by the flat option (claude / codex)
+        cli_name = chosen.cli  # preset by the flat option (claude / codex / pi)
         if cli_name is None:
             raise click.ClickException("internal: subscription option missing a cli login")
-        from omnigent.onboarding.harness_install import harness_install_spec, harness_login
+        from omnigent.onboarding.configure_models import cli_display_name
 
-        login_family = {agent: fam for fam, agent in _FAMILY_UCODE_AGENT.items()}.get(cli_name)
-        if login_family is None:
-            raise click.ClickException(f"internal: no login family for cli {cli_name!r}")
-        spec = harness_install_spec(login_family)
-        disp = spec.display if spec is not None else cli_name
-        # A harness has at most ONE subscription — the CLI's own login. If one
-        # is already configured for this CLI (under any name, including an
-        # ambient login adopted as e.g. ``claude``), adding another just
-        # duplicates it — the ``claude`` + ``claude-subscription`` bug. Offer to
-        # replace the existing one; declining aborts before we touch the login.
+        # A harness has at most ONE subscription. If one is already configured
+        # for this CLI (under any name), offer to replace it — declining aborts
+        # before we touch any login.
         existing_subs = [
             n
             for n, e in load_providers(_load_global_config()).items()
             if e.kind == SUBSCRIPTION_KIND and e.cli == cli_name
         ]
         if existing_subs:
-            brand = _CLI_LOGIN_BRAND.get(cli_name, cli_name)
             replace = select(
-                f"A {brand} subscription is already configured. Replace it?",
+                f"A {cli_display_name(cli_name)} subscription is already configured. Replace it?",
                 ["Replace it", "Keep the current one"],
                 default=0,
                 clear_on_exit=True,
             )
             if replace != 0:  # "Keep the current one" or Esc — abort the add
                 return None
-        # Configure is the single place to sign in: drive the harness's own
-        # login (a no-op if already logged in). Only record the subscription
-        # once the CLI is actually authenticated — otherwise we'd persist a
-        # phantom subscription that strands the user at the harness's own login
-        # screen at run time (the exact bug this whole flow fixes).
-        console.print(f"  [dim]Signing in to {disp} (its login will open)…[/dim]")
-        if not harness_login(login_family):
-            return f"✗ {disp} login not completed — subscription not added"
-        # Login succeeded — drop the existing subscription(s) for this CLI so the
-        # canonical entry is the only one left (clearing the old default lets the
-        # new entry re-claim the family default below). Done AFTER login so a
-        # failed login leaves the existing subscription intact.
+        # CLIs listed in _CLI_LOGIN_BRAND (claude / codex) require a login step.
+        # CLIs not listed (pi) manage their own auth — no login step needed.
+        if cli_name in _CLI_LOGIN_BRAND:
+            from omnigent.onboarding.harness_install import harness_install_spec, harness_login
+
+            login_family = {agent: fam for fam, agent in _FAMILY_UCODE_AGENT.items()}.get(cli_name)
+            if login_family is None:
+                raise click.ClickException(f"internal: no login family for cli {cli_name!r}")
+            spec = harness_install_spec(login_family)
+            disp = spec.display if spec is not None else cli_name
+            # Configure is the single place to sign in: drive the harness's own
+            # login (a no-op if already logged in). Only record the subscription
+            # once the CLI is actually authenticated — otherwise we'd persist a
+            # phantom subscription that strands the user at the harness's own login
+            # screen at run time (the exact bug this whole flow fixes).
+            console.print(f"  [dim]Signing in to {disp} (its login will open)…[/dim]")
+            if not harness_login(login_family):
+                return f"✗ {disp} login not completed — subscription not added"
+        # Drop the existing subscription(s) now that we know we're proceeding.
+        # Done after any login so a failed login leaves the existing entry intact.
         if existing_subs:
             block = _load_global_config().get("providers")
             if isinstance(block, dict):
                 remaining = {k: v for k, v in block.items() if k not in existing_subs}
-                _save_global_config({"providers": remaining})  # wholesale replace
-        # Subscription name is derived from the CLI login — no prompt.
+                _save_global_config({"providers": remaining})
+        # Subscription name is derived from the CLI — no prompt.
         name = f"{cli_name}-subscription"
         entry = build_subscription_provider_entry(cli_name)
 
@@ -1148,6 +1149,22 @@ def _promote_global_auth_to_provider() -> str | None:
     return name
 
 
+def _claude_managed_gateway_label() -> str | None:
+    """Display label for a Claude credential backed by Claude Code's managed gateway.
+
+    When Claude Code's own settings deliver a gateway credential (enterprise
+    ``ANTHROPIC_BASE_URL`` + ``apiKeyHelper``), the Claude "subscription" the
+    machine really carries is that gateway, so setup names it as such (e.g.
+    ``"Databricks AI Gateway"``) instead of the generic ``"Subscription"``.
+    Purely a display derivation from live managed settings — nothing persisted.
+
+    :returns: The gateway label, or ``None`` when no managed credential is present.
+    """
+    from omnigent.onboarding.ambient import claude_managed_gateway_display_name
+
+    return claude_managed_gateway_display_name()
+
+
 def _compact_credential_label(det: DetectedProvider) -> str:
     """A short, brand-qualified label for an auto-configured credential.
 
@@ -1168,6 +1185,12 @@ def _compact_credential_label(det: DetectedProvider) -> str:
     from omnigent.onboarding.configure_models import credential_label
 
     if det.kind == SUBSCRIPTION_KIND:
+        # A Claude login whose real backing is Claude Code's managed-settings
+        # gateway names that gateway, so the callout matches Codex-Databricks.
+        if det.name == "claude":
+            gateway = _claude_managed_gateway_label()
+            if gateway is not None:
+                return gateway
         # Fallback to the raw CLI name is unreachable for today's detections
         # (see _CLI_LOGIN_BRAND) but keeps an added CLI readable, not crashing.
         brand = _CLI_LOGIN_BRAND.get(det.name, det.name)
@@ -1284,7 +1307,19 @@ def _credential_label(name: str, entry: ProviderEntry) -> str:
     :returns: A human label, e.g. ``"Anthropic API Key"`` or ``"Databricks (oss)"``.
     """
     from omnigent.onboarding.configure_models import credential_label
+    from omnigent.onboarding.provider_config import SUBSCRIPTION_KIND
 
+    # A Claude subscription whose real backing is Claude Code's managed-settings
+    # gateway reads as that gateway (e.g. "Databricks AI Gateway") rather than
+    # the generic "Subscription", so the credential the user recognizes is named
+    # — the Claude analogue of the "Codex-Databricks" row. Display only; the
+    # persisted entry stays a plain subscription (no new shape on disk).
+    if entry.kind == SUBSCRIPTION_KIND and entry.cli == "claude":
+        gateway = _claude_managed_gateway_label()
+        if gateway is not None:
+            return gateway
+    if entry.kind == SUBSCRIPTION_KIND and entry.cli == "pi":
+        return "Pi original auth"
     return credential_label(
         entry.kind, name, profile=entry.profile, display_name=entry.display_name
     )
@@ -2558,43 +2593,74 @@ def _print_kimi_auth_help() -> None:
     """Print Kimi Code's authentication options.
 
     Kimi authenticates against Moonshot AI's backend rather than an Omnigent
-    credential: ``kimi login`` (OAuth or a Moonshot API key) for the default
-    provider, and ``kimi provider add`` to register any other provider (an
-    OpenAI-compatible endpoint, a Databricks gateway, …) in
-    ``~/.kimi/config.toml``. Omnigent has no per-spawn provider override for
-    upstream kimi, so all of this lives in the kimi CLI's own config —
-    Omnigent-side injection remains a deferred follow-up.
+    credential. Membership accounts use ``kimi login`` (OAuth). Pay-per-use
+    accounts are rejected by OAuth ("unable to verify your membership
+    benefits"), so they configure an API-key provider instead — and which one
+    depends on where the credit lives:
+
+    - **Moonshot open platform** (keys from platform.moonshot.ai): import the
+      catalog provider with ``kimi provider catalog add moonshotai --api-key
+      …`` — the catalog supplies the type, base URL, and model.
+    - **Kimi Code coding endpoint** (keys from the Kimi API platform,
+      ``api.kimi.com``): add a ``type = "kimi"`` provider block pointed at
+      ``https://api.kimi.com/coding/v1`` to ``~/.kimi-code/config.toml``.
+
+    Both are covered below so a user on either platform can complete auth.
+    Omnigent stores no kimi credential and cannot thread one per spawn, so all
+    of this lives in the kimi CLI's own config.
     """
     from omnigent.onboarding.interactive import console
 
     console.print(
         "\n  [bold]Authenticate Kimi Code[/bold] (kimi manages its own config in "
-        "~/.kimi/config.toml):\n"
-        "    • Default provider: run [bold]kimi login[/bold] "
-        "(Moonshot OAuth, or paste a Moonshot API key)\n"
-        "    • Other providers: run [bold]kimi provider add[/bold] "
-        "(OpenAI-compatible endpoint, gateway, …), then pin that model id in "
-        "the agent spec\n"
+        "[bold]$KIMI_CODE_HOME/config.toml[/bold], default "
+        "~/.kimi-code/config.toml):\n"
+        "    • [bold]Membership[/bold]: run [bold]kimi login[/bold] "
+        "(OAuth device flow — grants membership benefits)\n"
+        "    • [bold]Pay-per-use[/bold] (API credit, no membership): [bold]kimi "
+        "login[/bold] is rejected — add an API-key provider for whichever "
+        "platform your credit is on:\n"
+        "        [bold]a) Moonshot open platform[/bold] (keys from "
+        "platform.moonshot.ai) — run [bold]kimi provider catalog list[/bold] to "
+        "find the Moonshot provider id (e.g. [dim]moonshotai[/dim]) and a model "
+        "id, then:\n"
+        "            [dim]kimi provider catalog add moonshotai --api-key <key> "
+        "--default-model <model>[/dim]\n"
+        "        [bold]b) Kimi Code coding endpoint[/bold] (keys from the Kimi "
+        "API platform, api.kimi.com) — add this block to your kimi config "
+        "([bold]$KIMI_CODE_HOME/config.toml[/bold], default "
+        "~/.kimi-code/config.toml):\n"
+        # Escape the leading ``[`` so Rich renders the TOML table header verbatim
+        # instead of parsing ``[providers...]`` as a markup tag.
+        '            [dim]\\[providers."kimi-code"]\n'
+        '            type = "kimi"\n'
+        '            base_url = "https://api.kimi.com/coding/v1"\n'
+        '            api_key = "sk-…"[/dim]\n'
         "    • Omnigent stores no kimi credential and cannot thread one per "
         "spawn — configure it once in the kimi CLI\n"
     )
 
 
 def _manage_kimi_harness() -> None:
-    """Run the level-2 loop for Kimi Code: install the CLI and drive ``kimi login``.
+    """Run the level-2 loop for Kimi Code: install the CLI and drive sign-in.
 
-    Kimi ships a real ``kimi login`` (Moonshot OAuth or API key), so this
-    drill-in offers sign-in directly. It has **no** ``kimi logout`` subcommand
-    (verified against kimi CLI v0.29.1), so there is no sign-out row — the user
-    clears credentials by removing kimi's own credential file. Kimi has no
-    first-class "am I logged in?" exit-code probe (its install spec sets
-    ``status_args=None``), so
+    Kimi authenticates two ways: ``kimi login`` (OAuth, membership benefits) and
+    a pay-per-use API key in ``~/.kimi-code/config.toml`` (OAuth is rejected for
+    accounts without an active membership). This drill-in offers the membership
+    ``kimi login`` directly and points pay-per-use users at the API-key path,
+    which lives entirely in the kimi CLI's own config.
+
+    It has **no** ``kimi logout`` subcommand (verified against kimi CLI v0.29.1),
+    so there is no sign-out row — the user clears credentials by removing kimi's
+    own credential file. Kimi has no first-class "am I logged in?" exit-code
+    probe (its install spec sets ``status_args=None``), so
     :func:`~omnigent.onboarding.harness_install.harness_cli_logged_in` always
     reports ``False`` for it — meaning ``harness_login`` runs ``kimi login``
     every time it is asked (the interactive flow lets the user cancel if
     already authenticated) and its boolean return is not a reliable success
-    signal. We therefore treat login as a best-effort side effect and report
-    that the flow finished rather than asserting an auth state.
+    signal. We therefore treat login as a best-effort side effect and reflect
+    the detected auth state via ``kimi_auth_configured`` rather than asserting
+    the login call succeeded.
 
     Like the other CLI-backed harnesses, a missing CLI gates the drill-in —
     there is nothing to configure for a harness you can't run.
@@ -2609,6 +2675,7 @@ def _manage_kimi_harness() -> None:
         harness_login,
     )
     from omnigent.onboarding.interactive import console, select
+    from omnigent.onboarding.kimi_auth import kimi_auth_configured
 
     # Gate on the CLI. Kimi ships a single binary via a curl installer (not
     # npm), so there's no in-process auto-install — name the command and let
@@ -2624,12 +2691,14 @@ def _manage_kimi_harness() -> None:
         )
         return
 
-    # Carry the prior action's confirmation as a transient status line.
-    status: str | None = None
+    # Seed the status line with the detected auth state so a pay-per-use user who
+    # already set an API key isn't nudged to run a login that will be rejected.
+    configured_status = "✓ Kimi is configured (login credential or API key detected)"
+    status: str | None = configured_status if kimi_auth_configured() else None
     while True:
         rows: list[_HarnessMenuRow] = [
-            _HarnessMenuRow("Sign in (kimi login)", action="login"),
-            _HarnessMenuRow("Show auth options", action="help"),
+            _HarnessMenuRow("Sign in with membership (kimi login)", action="login"),
+            _HarnessMenuRow("Set up pay-per-use (API key)", action="help"),
             _HarnessMenuRow("← Back", action="back"),
         ]
         idx = select(
@@ -2644,12 +2713,19 @@ def _manage_kimi_harness() -> None:
         if action == "back":
             return
         if action == "login":
-            # ``kimi login`` runs in the foreground (OAuth / API-key prompt);
-            # its boolean return is unreliable for kimi (no status probe), so
-            # don't assert success — just confirm the flow finished.
+            # ``kimi login`` runs in the foreground (OAuth device flow); its
+            # boolean return is unreliable for kimi (no status probe), so
+            # re-derive the auth state from disk instead of asserting success.
             console.print("  [dim]Signing in to Kimi (its login will open)…[/dim]")
             harness_login(KIMI_KEY)
-            status = "kimi login flow finished — kimi stores its own credentials"
+            status = (
+                configured_status
+                if kimi_auth_configured()
+                else (
+                    "kimi login flow finished — if it reported a membership error,"
+                    " use the pay-per-use API-key option instead"
+                )
+            )
         elif action == "help":
             _print_kimi_auth_help()
             status = None
@@ -3283,7 +3359,8 @@ def _print_opencode_auth_help() -> None:
         "    • Databricks gateway: set an agent ``profile`` (configured under Claude / Codex);\n"
         "      Omnigent synthesizes opencode's per-session provider config from it.\n"
         "  Omnigent stores no OpenCode credential of its own.\n"
-        "  [dim]Tip:[/dim] 'Set default model' picks which model `omni opencode` launches on\n"
+        f"  [dim]Tip:[/dim] 'Set default model' picks which model "
+        f"`{cli_invocation(name='omni')} opencode` launches on\n"
         "  (otherwise OpenCode uses its built-in default, opencode/big-pickle)."
     )
 
@@ -3875,19 +3952,29 @@ def _run_configure_harnesses_interactive() -> None:
                 (_KIRO, "Kiro", _cli_absence_label(KIRO_KEY), "missing", _install_hint(kiro_hint))
             )
 
-        # Kimi Code — native CLI, own auth via `kimi login`. There is no CLI
-        # login-status probe, but `kimi login` writes a credential file, so a
-        # subprocess-free file check (`kimi_login_detected`) distinguishes
-        # "signed in" (green) from "installed but not configured" (yellow).
-        # Curl-installed (no npm package), so use its install_hint when absent.
+        # Kimi Code — native CLI, own auth via `kimi login` (membership OAuth) or
+        # a Kimi API key in `~/.kimi-code/config.toml` (pay-per-use). There is no
+        # CLI login-status probe, so a subprocess-free check
+        # (`kimi_auth_configured`) distinguishes "signed in / API key set"
+        # (green) from "installed but not configured" (yellow). Curl-installed
+        # (no npm package), so use its install_hint when absent.
         if harness_cli_installed(KIMI_KEY):
-            from omnigent.onboarding.kimi_auth import kimi_login_detected
+            from omnigent.onboarding.kimi_auth import kimi_auth_configured
 
-            if kimi_login_detected():
+            if kimi_auth_configured():
                 rows.append((_KIMI, "Kimi Code", "Signed in", "ready", ""))
             else:
                 rows.append(
-                    (_KIMI, "Kimi Code", "Not configured", "warn", "Sign in with `kimi login`.")
+                    (
+                        _KIMI,
+                        "Kimi Code",
+                        "Not configured",
+                        "warn",
+                        (
+                            "Sign in with `kimi login`, or (pay-per-use) set a Kimi"
+                            " API key in `~/.kimi-code/config.toml`."
+                        ),
+                    )
                 )
         else:
             kimi_spec = harness_install_spec(KIMI_KEY)

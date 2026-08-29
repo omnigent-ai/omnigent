@@ -99,7 +99,7 @@ def test_right_panel_terminals_and_file_viewer(
         # open so the shell tab and Files panel below are reachable.
         open_right_rail(page)
 
-        composer = page.get_by_placeholder("Ask the agent anything…")
+        composer = page.get_by_placeholder("Send a message…")
         expect(composer).to_be_visible()
         composer.fill("spin up zsh")
         page.get_by_role("button", name="Send", exact=True).click()

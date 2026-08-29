@@ -32,7 +32,7 @@ struct ConnectView: View {
           .frame(height: 80)
           .padding(.bottom, 12)
 
-        Text("Enter the URL of the Omnigents server.")
+        Text("Enter the URL of the Omnigent server.")
           .font(.system(size: 14))
           .lineSpacing(2)
           .multilineTextAlignment(.center)

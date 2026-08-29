@@ -1106,10 +1106,10 @@ def test_help_hides_update_alias_but_keeps_it_runnable() -> None:
 def test_help_hides_extras_gated_harness_when_sdk_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """cursor/antigravity drop out of the harness list; a notice replaces them."""
+    """cursor/agy drop out of the harness list; a notice replaces them."""
     monkeypatch.setattr(
         "omnigent.cli._harness_extra_checks",
-        lambda: {"cursor": lambda: False, "antigravity": lambda: False},
+        lambda: {"cursor": lambda: False, "agy": lambda: False},
     )
 
     result = CliRunner().invoke(cli, ["--help"])
@@ -1127,17 +1127,17 @@ def test_help_hides_extras_gated_harness_when_sdk_missing(
 def test_help_shows_extras_gated_harness_when_sdk_installed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """cursor/antigravity appear in --help once their extra is importable."""
+    """cursor/agy appear in --help once their extra is importable."""
     monkeypatch.setattr(
         "omnigent.cli._harness_extra_checks",
-        lambda: {"cursor": lambda: True, "antigravity": lambda: True},
+        lambda: {"cursor": lambda: True, "agy": lambda: True},
     )
 
     result = CliRunner().invoke(cli, ["--help"])
 
     assert result.exit_code == 0, result.output
     assert "cursor" in result.output
-    assert "antigravity" in result.output
+    assert "agy" in result.output
     assert "Some harnesses need an optional extra" not in result.output
 
 
@@ -1945,6 +1945,15 @@ def test_server_command_reads_tunnel_token_and_does_not_spawn_runner(
     monkeypatch.setattr(_local_server_mod, "register_local_server", lambda port: None)
     monkeypatch.setattr(_local_server_mod, "clear_local_server_record", lambda: None)
 
+    config_home = tmp_path / "config"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        "session_title_instructions: Prefix titles with the current date.\n"
+        "branding:\n"
+        "  app_name: Must not leak into bare server config\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+
     db_path = tmp_path / "chat.db"
     artifact_dir = tmp_path / "artifacts"
 
@@ -1977,6 +1986,9 @@ def test_server_command_reads_tunnel_token_and_does_not_spawn_runner(
     assert captured["create_app_kwargs"]["runner_tunnel_tokens"] == frozenset(
         {"test-tunnel-token-abc"}
     )
+    assert captured["create_app_kwargs"]["server_config"] == {
+        "session_title_instructions": "Prefix titles with the current date."
+    }
 
 
 def test_server_explicit_config_overrides_omnigent_config_env(
@@ -4701,6 +4713,68 @@ def test_config_set_global_writes_auto_open_conversation_bool(
     assert _resolve_auto_open_conversation_from_config(cfg) is True
 
 
+def test_config_set_global_writes_session_title_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "config",
+            "set",
+            "--global",
+            "session_title_instructions=Prefix titles with the current date.",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert cfg["session_title_instructions"] == "Prefix titles with the current date."
+
+
+def test_config_set_rejects_project_local_session_title_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "config",
+            "set",
+            "session_title_instructions=Prefix titles with the current date.",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "session_title_instructions" in result.output
+    assert "only be set with --global" in result.output
+    assert not (tmp_path / ".omnigent" / "config.yaml").exists()
+
+
+def test_config_list_warns_about_project_local_session_title_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    local_path = tmp_path / ".omnigent" / "config.yaml"
+    local_path.parent.mkdir()
+    local_path.write_text("session_title_instructions: Prefix titles with the current date.\n")
+    monkeypatch.setattr("omnigent.cli._load_global_config", dict)
+    monkeypatch.setattr("omnigent.cli._print_credentials_by_harness", lambda: None)
+
+    result = CliRunner().invoke(cli, ["config", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "ignored user-level-only setting(s): session_title_instructions" in result.output
+    assert "set with --global" in result.output
+    assert "  session_title_instructions=" not in result.output
+
+
 def test_config_set_global_reports_effective_config_home(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -5796,6 +5870,19 @@ def test_click_subcommands_allowlist_covers_registered_commands() -> None:
     )
 
 
+def test_agy_cli_alias_registered_and_in_subcommands() -> None:
+    """``omni agy`` is registered on the cli group, prioritized in harnesses list."""
+    from omnigent.cli import _ALIAS_COMMANDS, _CLICK_SUBCOMMANDS, _HARNESS_COMMANDS, cli
+
+    assert "agy" in cli.commands
+    assert "antigravity" in cli.commands
+    assert cli.commands["agy"].callback is cli.commands["antigravity"].callback
+    assert "agy" in _CLICK_SUBCOMMANDS
+    assert "agy" in _HARNESS_COMMANDS
+    assert "antigravity" in _ALIAS_COMMANDS
+    assert "agy" not in _ALIAS_COMMANDS
+
+
 # ── first-run smart defaults (omnigent run) ──────────
 
 
@@ -6756,10 +6843,13 @@ def test_manage_kimi_harness_back_does_not_login(
 
     monkeypatch.setattr(hi, "harness_cli_installed", lambda key: True)
     monkeypatch.setattr(it, "console", Mock())
+    # The drill-in seeds its status line from the auth probe; pin it so the test
+    # stays hermetic instead of reading the dev machine's real ~/.kimi-code.
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_auth_configured", lambda: False)
     login = Mock()
     monkeypatch.setattr(hi, "harness_login", login)
-    # rows = [Sign in, Show auth options, ← Back]; pick Back (2). There is no
-    # "Sign out" row — kimi has no ``kimi logout`` subcommand.
+    # rows = [Sign in with membership, Set up pay-per-use (API key), ← Back];
+    # pick Back (2). There is no "Sign out" row — kimi has no ``kimi logout``.
     monkeypatch.setattr(it, "select", lambda *a, **k: 2)
 
     _manage_kimi_harness()
@@ -6780,6 +6870,8 @@ def test_manage_kimi_harness_has_no_sign_out_row(
 
     monkeypatch.setattr(hi, "harness_cli_installed", lambda key: True)
     monkeypatch.setattr(it, "console", Mock())
+    # Pin the auth probe so the status-line seed doesn't read real local state.
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_auth_configured", lambda: False)
     monkeypatch.setattr(hi, "harness_login", Mock())
     captured: list[str] = []
 
@@ -6806,6 +6898,8 @@ def test_manage_kimi_harness_login_runs_kimi_login(
 
     monkeypatch.setattr(hi, "harness_cli_installed", lambda key: True)
     monkeypatch.setattr(it, "console", Mock())
+    # Pin the auth probe (seed + post-login) so the test stays hermetic.
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_auth_configured", lambda: False)
     login = Mock(return_value=False)  # kimi has no status probe; return is ignored
     monkeypatch.setattr(hi, "harness_login", login)
     # First iteration: Sign in (0); second: ← Back (2) to exit the loop.

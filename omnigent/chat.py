@@ -46,7 +46,11 @@ from omnigent._wrapper_labels import (
 from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
 )
-from omnigent.conversation_browser import open_conversation_link_if_enabled
+from omnigent.cli_invocation import cli_invocation
+from omnigent.conversation_browser import (
+    announce_conversation_url,
+    open_conversation_link_if_enabled,
+)
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.inner import _proc
@@ -60,6 +64,7 @@ from omnigent.process_logging import (
     child_logging_popen_kwargs,
     logs_root,
     open_process_log_file,
+    process_log_dir_reference,
 )
 from omnigent.spec import load as load_spec
 from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
@@ -257,6 +262,36 @@ class _SessionToolAdapter:
             iteration=0,
         )
         return self.tool_handler.execute(legacy_info)
+
+
+def _on_session_known(
+    *,
+    base_url: str,
+    session_id: str,
+    auto_open_conversation: bool,
+) -> None:
+    """Announce (and optionally open) the conversation URL at session start.
+
+    Called the moment the session id is known — before the turn runs — so a
+    headless wrapper can surface the session link immediately. Always prints
+    the stable ``Omnigent session: <url>`` line; additionally opens the
+    browser when the user opted in.
+
+    :param base_url: Omnigent server base URL.
+    :param session_id: The freshly created/resumed conversation id.
+    :param auto_open_conversation: Whether to also open the browser link.
+    """
+    announce_conversation_url(
+        base_url=base_url,
+        conversation_id=session_id,
+        echo=lambda message: click.echo(message, err=True),
+    )
+    open_conversation_link_if_enabled(
+        base_url=base_url,
+        conversation_id=session_id,
+        enabled=auto_open_conversation,
+        warn=lambda message: click.echo(message, err=True),
+    )
 
 
 def run_chat(
@@ -558,10 +593,13 @@ def run_attach(
     # snapshot gives the agent name + harness for an honest banner.
     info = _attach_session_info(base_url=base_url, conversation_id=conversation_id)
     if not info.runner_online:
+        from omnigent.server_url import display_server_url
+
         raise click.ClickException(
-            f"Session {conversation_id} has no online runner on {base_url} — its "
+            f"Session {conversation_id} has no online runner on "
+            f"{display_server_url(base_url)} — its "
             "host is offline. `attach` never starts a runner; bring the host back "
-            "(`omnigent run` locally, or reconnect it with `omnigent host`), "
+            f"(`{cli_invocation()} run` locally, or reconnect it with `{cli_invocation()} host`), "
             "then attach again."
         )
 
@@ -1531,11 +1569,13 @@ def _unreachable_server_message(base_url: str) -> str:
     if is_loopback_url(base_url):
         return (
             f"Could not connect to the local Omnigent server at {base_url}. "
-            "It may have stopped — run `omnigent stop`, then try again. "
-            "Server logs are under ~/.omnigent/logs/server/."
+            f"It may have stopped — run `{cli_invocation()} stop`, then try again. "
+            f"Server logs are under {process_log_dir_reference('server')}."
         )
+    from omnigent.server_url import display_server_url
+
     return (
-        f"Could not connect to the Omnigent server at {base_url}. "
+        f"Could not connect to the Omnigent server at {display_server_url(base_url)}. "
         "Check the URL, your network connection, and any HTTP proxy settings."
     )
 
@@ -1940,7 +1980,8 @@ def _poll_remote_runner(
             if resp.status_code in {401, 403}:
                 raise click.ClickException(
                     f"Remote runner status check was rejected ({resp.status_code}); "
-                    "run `omnigent login <server-url>` or check remote auth credentials."
+                    f"run `{cli_invocation()} login <server-url>` "
+                    "or check remote auth credentials."
                     f"{format_runner_log_tail(log_path)}"
                 )
         except httpx.HTTPError as exc:
@@ -2281,13 +2322,13 @@ async def _query_sessions_once(
         if runner_id is None:
             raise RuntimeError(
                 "This server has no online runner to run the turn. Start one against "
-                "it with `omnigent host --server <url>` (or run the agent locally "
-                "with `omnigent run <agent.yaml>`), then retry."
+                f"it with `{cli_invocation()} host --server <url>` (or run the agent locally "
+                f"with `{cli_invocation()} run <agent.yaml>`), then retry."
             )
     if runner_id is None:
         raise RuntimeError(
             "Sessions API headless prompt requires a registered runner id. "
-            "Start through `omnigent run <agent>` or pass --server so the CLI "
+            f"Start through `{cli_invocation()} run <agent>` or pass --server so the CLI "
             "can launch and bind a runner."
         )
     tool_callables = _sessions_tool_callables(tool_handler, agent_name)
@@ -4018,11 +4059,10 @@ def _run_repl(
                 used_families=used_families,
                 attach_only=attach_only,
                 on_session_start=(
-                    lambda session_id: open_conversation_link_if_enabled(
+                    lambda session_id: _on_session_known(
                         base_url=base_url,
-                        conversation_id=session_id,
-                        enabled=auto_open_conversation,
-                        warn=lambda message: click.echo(message, err=True),
+                        session_id=session_id,
+                        auto_open_conversation=auto_open_conversation,
                     )
                 ),
             )
@@ -4085,11 +4125,10 @@ def _run_one_shot(
                 runner_id=runner_id,
                 resume_conversation_id=resume_conversation_id,
                 on_session_ready=(
-                    lambda session_id: open_conversation_link_if_enabled(
+                    lambda session_id: _on_session_known(
                         base_url=base_url,
-                        conversation_id=session_id,
-                        enabled=auto_open_conversation,
-                        warn=lambda message: click.echo(message, err=True),
+                        session_id=session_id,
+                        auto_open_conversation=auto_open_conversation,
                     )
                 ),
             )
