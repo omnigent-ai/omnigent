@@ -373,7 +373,12 @@ def _build_alembic_config(db_uri: str) -> Config:
 
     alembic_ini = Path(__file__).parent / "alembic.ini"
     config = Config(str(alembic_ini))
-    config.set_main_option("sqlalchemy.url", db_uri)
+    # Alembic's Config is backed by ConfigParser, which treats % as
+    # interpolation syntax: a correctly percent-encoded DATABASE_URL
+    # (e.g. p%40ssword) raised ValueError before startup. Escape the % the
+    # configparser way; alembic/env.py reads the option through
+    # config.get_main_option, which reverses the escaping.
+    config.set_main_option("sqlalchemy.url", db_uri.replace("%", "%%"))
     config.set_main_option("script_location", str(Path(__file__).parent / "migrations"))
     return config
 
