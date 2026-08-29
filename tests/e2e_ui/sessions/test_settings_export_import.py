@@ -216,12 +216,17 @@ def test_import_flow_with_file_upload(page: Page, seeded_session: tuple[str, str
         # Wait for dialog to close (import succeeded).
         expect(page.get_by_role("dialog", name="Import settings")).to_have_count(0, timeout=5000)
 
-        # Settings are restored immediately without reload.
+        # Settings are restored and UI updates after React remounts controls.
+        # Font size updates immediately via DOM side-effects.
         expect(page.get_by_test_id("ui-font-size-input")).to_have_value("18")
+
+        # Wait for terminal theme and app theme to update (they remount after resetKey changes).
         expect(page.get_by_test_id("terminal-theme-dark")).to_have_attribute(
-            "aria-checked", "true"
+            "aria-checked", "true", timeout=10_000
         )
-        expect(page.get_by_test_id("theme-dark")).to_have_attribute("aria-checked", "true")
+        expect(page.get_by_test_id("theme-dark")).to_have_attribute(
+            "aria-checked", "true", timeout=10_000
+        )
     finally:
         Path(temp_path).unlink()
 
