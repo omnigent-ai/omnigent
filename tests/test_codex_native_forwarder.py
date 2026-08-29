@@ -568,22 +568,12 @@ async def test_post_user_message_truly_empty_is_skipped() -> None:
     assert client.posts == []
 
 
-# ── sub-agent usage pricing: seed the child coalescer's model ──────────
+# ── sub-agent usage pricing: child-local model attribution ──────────
 
 
 @pytest.mark.asyncio
 async def test_usage_coalescer_seeded_model_rides_along_so_child_usage_prices() -> None:
-    """A coalescer seeded with a model attaches it to its token post.
-
-    Codex sub-agent (child-thread) usage is recorded on a coalescer created on
-    the child-event path, where ``forwarder_state`` (the usual model source) is
-    intentionally ``None`` — so ``record()`` receives no model. Without the
-    constructor seed the token post carries no ``model``, the server leaves the
-    child's ``total_cost_usd`` unpriced (``None``), and the sub-agent's spend
-    drops out of the parent's subtree cost — letting it run past the budget.
-    The seeded model must ride along on every token post so the server can
-    price the cumulative tokens.
-    """
+    """A coalescer seeded with a model attaches it to its token post."""
     client = _RecordingClient()
     coalescer = fwd._SessionUsageCoalescer(client, "conv_child", model="gpt-5.5")
     # Mirror the child path exactly: a usage frame with NO model in record().
@@ -595,12 +585,528 @@ async def test_usage_coalescer_seeded_model_rides_along_so_child_usage_prices() 
     assert url == "/v1/sessions/conv_child/events"
     assert body["type"] == "external_session_usage"
     data = body["data"]
-    # The seeded model rides along — this is what lets the server price the
-    # tokens into the child's total_cost_usd (the whole point of the fix).
+    # The server uses this model to price the child's cumulative tokens.
     assert data["model"] == "gpt-5.5"
     # The cumulative token counts the server prices from are present.
     assert data["cumulative_input_tokens"] == 46003
     assert data["cumulative_output_tokens"] == 4141
+
+
+@pytest.mark.asyncio
+async def test_child_usage_uses_its_resume_model_not_the_parent_model() -> None:
+    """A child usage frame is attributed to the model reported by child resume.
+
+    Codex usage notifications carry a thread id and cumulative token counts but
+    no model. The child thread's own ``thread/resume`` response is authoritative;
+    its model may differ from the parent forwarder's model.
+    """
+    client = _RecordingClient()
+    codex_client = MagicMock()
+    codex_client.request = AsyncMock()
+    state = _state(model="parent-model", posted_model="parent-model")
+    state.parent_session_id = "conv_parent"
+    state.codex_client = codex_client
+    state.note_child_thread("thread_child", "conv_child")
+    tracker = fwd._CodexElicitationTaskTracker()
+
+    await fwd._apply_child_resume(
+        client,
+        parent_session_id="conv_parent",
+        child_session_id="conv_child",
+        child_thread_id="thread_child",
+        response={
+            "result": {
+                "model": "child-model",
+                "thread": {"id": "thread_child", "turns": []},
+            }
+        },
+        forwarder_state=state,
+    )
+    client.posts.clear()
+
+    await fwd._handle_event(
+        client,
+        session_id="conv_parent",
+        bridge_dir=Path(),
+        event={
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread_child",
+                "turnId": "turn_child",
+                "tokenUsage": {
+                    "total": {
+                        "inputTokens": 20_280,
+                        "cachedInputTokens": 9_984,
+                        "outputTokens": 23,
+                    }
+                },
+            },
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_parent"),
+        elicitation_tracker=tracker,
+        expected_thread_id="thread_parent",
+        forwarder_state=state,
+    )
+
+    usage_posts = [
+        body
+        for url, body in client.posts
+        if url == "/v1/sessions/conv_child/events" and body.get("type") == "external_session_usage"
+    ]
+    assert len(usage_posts) == 1
+    data = usage_posts[0]["data"]
+    assert data["cumulative_input_tokens"] == 20_280
+    assert data["cumulative_output_tokens"] == 23
+    assert data["cumulative_cache_read_input_tokens"] == 9_984
+    assert data["model"] == "child-model"
+    codex_client.request.assert_not_awaited()
+    await tracker.close()
+
+
+@pytest.mark.asyncio
+async def test_child_usage_models_are_isolated_by_thread() -> None:
+    """Sibling child coalescers retain their own models and destinations."""
+    client = _RecordingClient()
+    state = _state(model="parent-model", posted_model="parent-model")
+    for thread_id, session_id, model in (
+        ("thread_a", "conv_a", "model-a"),
+        ("thread_b", "conv_b", "model-b"),
+    ):
+        state.note_child_thread(thread_id, session_id)
+        state.note_child_resume_response(
+            thread_id,
+            {
+                "result": {
+                    "model": model,
+                    "thread": {"id": thread_id, "turns": []},
+                }
+            },
+        )
+        coalescer = state.usage_coalescer_for_child_thread(
+            client,
+            thread_id=thread_id,
+            session_id=session_id,
+        )
+        coalescer.record({"tokenUsage": {"total": {"inputTokens": 100, "outputTokens": 5}}})
+        await coalescer.flush()
+
+    usage_by_session = {
+        url: body["data"]["model"]
+        for url, body in client.posts
+        if body["type"] == "external_session_usage"
+    }
+    assert usage_by_session == {
+        "/v1/sessions/conv_a/events": "model-a",
+        "/v1/sessions/conv_b/events": "model-b",
+    }
+
+
+@pytest.mark.asyncio
+async def test_child_usage_retries_model_discovery_after_initial_resume_race() -> None:
+    """A live usage frame retries a child resume that initially raced its rollout."""
+    client = _RecordingClient()
+    codex_client = MagicMock()
+    codex_client.request = AsyncMock(
+        side_effect=[
+            RuntimeError("no rollout found for thread id thread_child"),
+            {
+                "result": {
+                    "model": "child-model",
+                    "thread": {"id": "thread_child", "turns": []},
+                }
+            },
+        ]
+    )
+    state = _state(model="parent-model", posted_model="parent-model")
+    state.parent_session_id = "conv_parent"
+    state.codex_client = codex_client
+    state.note_child_thread("thread_child", "conv_child")
+    tracker = fwd._CodexElicitationTaskTracker()
+
+    await fwd._backfill_child_thread(
+        client,
+        codex_client,
+        parent_session_id="conv_parent",
+        child_session_id="conv_child",
+        child_thread_id="thread_child",
+        forwarder_state=state,
+    )
+    assert state.model_for_child_thread("thread_child") is None
+
+    await fwd._handle_event(
+        client,
+        session_id="conv_parent",
+        bridge_dir=Path(),
+        event={
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread_child",
+                "turnId": "turn_child",
+                "tokenUsage": {
+                    "total": {
+                        "inputTokens": 100,
+                        "cachedInputTokens": 80,
+                        "outputTokens": 5,
+                    }
+                },
+            },
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_parent"),
+        elicitation_tracker=tracker,
+        expected_thread_id="thread_parent",
+        forwarder_state=state,
+    )
+
+    assert codex_client.request.await_count == 2
+    usage_posts = [body for _url, body in client.posts if body["type"] == "external_session_usage"]
+    assert len(usage_posts) == 1
+    assert usage_posts[0]["data"] == {
+        "context_tokens": 100,
+        "cumulative_input_tokens": 100,
+        "cumulative_output_tokens": 5,
+        "cumulative_cache_read_input_tokens": 80,
+        "model": "child-model",
+    }
+    await tracker.close()
+
+
+@pytest.mark.asyncio
+async def test_child_usage_close_makes_final_model_discovery_attempt() -> None:
+    """Shutdown resolves and posts usage retained through repeated not-ready races."""
+    client = _RecordingClient()
+    codex_client = MagicMock()
+    codex_client.request = AsyncMock(
+        side_effect=[
+            RuntimeError("no rollout found for thread id thread_child"),
+            {
+                "result": {
+                    "model": "child-model",
+                    "thread": {"id": "thread_child", "turns": []},
+                }
+            },
+        ]
+    )
+    state = _state(model="parent-model", posted_model="parent-model")
+    state.parent_session_id = "conv_parent"
+    state.codex_client = codex_client
+    state.note_child_thread("thread_child", "conv_child")
+    tracker = fwd._CodexElicitationTaskTracker()
+
+    await fwd._handle_event(
+        client,
+        session_id="conv_parent",
+        bridge_dir=Path(),
+        event={
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread_child",
+                "turnId": "turn_child",
+                "tokenUsage": {
+                    "total": {
+                        "inputTokens": 100,
+                        "cachedInputTokens": 80,
+                        "outputTokens": 5,
+                    }
+                },
+            },
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_parent"),
+        elicitation_tracker=tracker,
+        expected_thread_id="thread_parent",
+        forwarder_state=state,
+    )
+    assert not [body for _url, body in client.posts if body["type"] == "external_session_usage"]
+
+    await state.close_child_usage_coalescers(client)
+
+    assert codex_client.request.await_count == 2
+    codex_client.request.assert_awaited_with("thread/resume", {"threadId": "thread_child"})
+    usage_posts = [body for _url, body in client.posts if body["type"] == "external_session_usage"]
+    assert len(usage_posts) == 1
+    assert usage_posts[0]["data"]["model"] == "child-model"
+    await tracker.close()
+
+
+@pytest.mark.asyncio
+async def test_child_usage_close_continues_after_recovery_exception() -> None:
+    """One broken child recovery cannot prevent later child usage from flushing."""
+    client = _RecordingClient()
+    codex_client = MagicMock()
+    codex_client.request = AsyncMock(
+        side_effect=[
+            ValueError("connection closed"),
+            {
+                "result": {
+                    "model": "model-b",
+                    "thread": {"id": "thread_b", "turns": []},
+                }
+            },
+        ]
+    )
+    state = _state(model="parent-model", posted_model="parent-model")
+    state.parent_session_id = "conv_parent"
+    state.codex_client = codex_client
+    for thread_id, session_id in (("thread_a", "conv_a"), ("thread_b", "conv_b")):
+        state.note_child_thread(thread_id, session_id)
+        coalescer = state.usage_coalescer_for_child_thread(
+            client,
+            thread_id=thread_id,
+            session_id=session_id,
+        )
+        coalescer.record({"tokenUsage": {"total": {"inputTokens": 100, "outputTokens": 5}}})
+
+    await state.close_child_usage_coalescers(client)
+
+    assert codex_client.request.await_count == 2
+    usage_posts = [
+        (url, body) for url, body in client.posts if body["type"] == "external_session_usage"
+    ]
+    assert usage_posts == [
+        (
+            "/v1/sessions/conv_b/events",
+            {
+                "type": "external_session_usage",
+                "data": {
+                    "context_tokens": 100,
+                    "cumulative_input_tokens": 100,
+                    "cumulative_output_tokens": 5,
+                    "model": "model-b",
+                },
+            },
+        )
+    ]
+    assert state.child_usage_coalescers_by_thread == {}
+
+
+@pytest.mark.asyncio
+async def test_child_usage_close_bounds_hung_model_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hung app-server request cannot block child usage cleanup indefinitely."""
+
+    async def wait_forever(*_args: object, **_kwargs: object) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        fwd,
+        "_CHILD_MODEL_RECOVERY_CLOSE_TIMEOUT_SECONDS",
+        0.01,
+    )
+    client = _RecordingClient()
+    codex_client = MagicMock()
+    codex_client.request = AsyncMock(side_effect=wait_forever)
+    state = _state(model="parent-model", posted_model="parent-model")
+    state.parent_session_id = "conv_parent"
+    state.codex_client = codex_client
+    for thread_id, session_id in (("thread_a", "conv_a"), ("thread_b", "conv_b")):
+        state.note_child_thread(thread_id, session_id)
+        coalescer = state.usage_coalescer_for_child_thread(
+            client,
+            thread_id=thread_id,
+            session_id=session_id,
+        )
+        coalescer.record({"tokenUsage": {"total": {"inputTokens": 100, "outputTokens": 5}}})
+
+    await asyncio.wait_for(state.close_child_usage_coalescers(client), timeout=0.25)
+
+    codex_client.request.assert_awaited_once_with("thread/resume", {"threadId": "thread_a"})
+    assert state.child_usage_coalescers_by_thread == {}
+    assert client.posts == []
+
+
+@pytest.mark.asyncio
+async def test_child_usage_close_tolerates_child_discovery_during_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resume replay may discover a nested child while shutdown iterates children."""
+    client = _RecordingClient()
+    state = _state(model="parent-model", posted_model="parent-model")
+    state.parent_session_id = "conv_parent"
+    state.note_child_thread("thread_child", "conv_child")
+    coalescer = state.usage_coalescer_for_child_thread(
+        client,
+        thread_id="thread_child",
+        session_id="conv_child",
+    )
+    coalescer.record({"tokenUsage": {"total": {"inputTokens": 100, "outputTokens": 5}}})
+
+    async def discover_nested_child(
+        _client: httpx.AsyncClient,
+        *,
+        child_session_id: str,
+        child_thread_id: str,
+        forwarder_state: fwd._CodexForwarderState,
+    ) -> None:
+        assert child_session_id == "conv_child"
+        assert child_thread_id == "thread_child"
+        forwarder_state.note_child_thread("thread_nested", "conv_nested")
+        forwarder_state.usage_coalescer_for_child_thread(
+            client,
+            thread_id="thread_nested",
+            session_id="conv_nested",
+        )
+
+    monkeypatch.setattr(fwd, "_recover_child_usage_model", discover_nested_child)
+
+    await state.close_child_usage_coalescers(client)
+
+    assert state.child_usage_coalescers_by_thread == {}
+
+
+@pytest.mark.asyncio
+async def test_child_usage_model_less_resume_is_not_retried() -> None:
+    """A successful model-less resume stops retries until settings report a model."""
+    client = _RecordingClient()
+    codex_client = MagicMock()
+    codex_client.request = AsyncMock(
+        return_value={"result": {"thread": {"id": "thread_child", "turns": []}}}
+    )
+    state = _state(model="parent-model", posted_model="parent-model")
+    state.parent_session_id = "conv_parent"
+    state.codex_client = codex_client
+    state.note_child_thread("thread_child", "conv_child")
+    coalescer = state.usage_coalescer_for_child_thread(
+        client,
+        thread_id="thread_child",
+        session_id="conv_child",
+    )
+    coalescer.record({"tokenUsage": {"total": {"inputTokens": 100, "outputTokens": 5}}})
+
+    for _ in range(2):
+        await fwd._recover_child_usage_model(
+            client,
+            child_session_id="conv_child",
+            child_thread_id="thread_child",
+            forwarder_state=state,
+        )
+
+    codex_client.request.assert_awaited_once_with("thread/resume", {"threadId": "thread_child"})
+    assert state.model_for_child_thread("thread_child") is None
+    assert client.posts == []
+
+    state.note_child_thread_settings_updated(
+        {
+            "threadId": "thread_child",
+            "threadSettings": {"model": "settings-model"},
+        }
+    )
+    coalescer = state.usage_coalescer_for_child_thread(
+        client,
+        thread_id="thread_child",
+        session_id="conv_child",
+    )
+    coalescer.record({"tokenUsage": {"total": {"inputTokens": 200, "outputTokens": 8}}})
+    await coalescer.flush()
+
+    usage_posts = [body for _url, body in client.posts if body["type"] == "external_session_usage"]
+    assert len(usage_posts) == 1
+    assert usage_posts[0]["data"]["cumulative_input_tokens"] == 200
+    assert usage_posts[0]["data"]["cumulative_output_tokens"] == 8
+    assert usage_posts[0]["data"]["model"] == "settings-model"
+
+
+@pytest.mark.asyncio
+async def test_child_usage_recovery_error_does_not_mark_session_failed() -> None:
+    """Usage-only model recovery stays retryable without failing the child."""
+    client = _RecordingClient()
+    codex_client = MagicMock()
+    codex_client.request = AsyncMock(
+        side_effect=[
+            RuntimeError("temporary resume failure"),
+            {
+                "result": {
+                    "model": "child-model",
+                    "thread": {"id": "thread_child", "turns": []},
+                }
+            },
+        ]
+    )
+    state = _state(model="parent-model", posted_model="parent-model")
+    state.parent_session_id = "conv_parent"
+    state.codex_client = codex_client
+    state.note_child_thread("thread_child", "conv_child")
+
+    for _ in range(2):
+        await fwd._recover_child_usage_model(
+            client,
+            child_session_id="conv_child",
+            child_thread_id="thread_child",
+            forwarder_state=state,
+        )
+
+    assert codex_client.request.await_count == 2
+    assert state.model_for_child_thread("thread_child") == "child-model"
+    failed_posts = [
+        body
+        for _url, body in client.posts
+        if body["type"] == "external_session_status" and body["data"]["status"] == "failed"
+    ]
+    assert failed_posts == []
+
+
+@pytest.mark.asyncio
+async def test_child_settings_change_updates_only_the_child_usage_model() -> None:
+    """A child settings update changes later child attribution without mutating the parent."""
+    client = _RecordingClient()
+    state = _state(model="parent-model", posted_model="parent-model")
+    state.parent_session_id = "conv_parent"
+    state.note_child_thread("thread_child", "conv_child")
+    state.note_child_resume_response(
+        "thread_child",
+        {
+            "result": {
+                "model": "child-model",
+                "thread": {"id": "thread_child", "turns": []},
+            }
+        },
+    )
+    tracker = fwd._CodexElicitationTaskTracker()
+
+    await fwd._handle_event(
+        client,
+        session_id="conv_parent",
+        bridge_dir=Path(),
+        event={
+            "method": "thread/settings/updated",
+            "params": {
+                "threadId": "thread_child",
+                "threadSettings": {"model": "updated-child-model"},
+            },
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_parent"),
+        elicitation_tracker=tracker,
+        expected_thread_id="thread_parent",
+        forwarder_state=state,
+    )
+    await fwd._handle_event(
+        client,
+        session_id="conv_parent",
+        bridge_dir=Path(),
+        event={
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread_child",
+                "turnId": "turn_child",
+                "tokenUsage": {
+                    "total": {
+                        "inputTokens": 100,
+                        "cachedInputTokens": 80,
+                        "outputTokens": 5,
+                    }
+                },
+            },
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_parent"),
+        elicitation_tracker=tracker,
+        expected_thread_id="thread_parent",
+        forwarder_state=state,
+    )
+
+    assert state.model == "parent-model"
+    usage_posts = [body for _url, body in client.posts if body["type"] == "external_session_usage"]
+    assert len(usage_posts) == 1
+    assert usage_posts[0]["data"]["model"] == "updated-child-model"
+    await tracker.close()
 
 
 @pytest.mark.asyncio

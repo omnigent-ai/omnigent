@@ -89,6 +89,7 @@ _REPLAY_POST_TIMEOUT_SECONDS = 5.0
 _REPLAY_DEADLINE_SECONDS = 30.0
 _DELTA_FLUSH_INTERVAL_SECONDS = 0.05
 _DELTA_FLUSH_CHAR_THRESHOLD = 64
+_CHILD_MODEL_RECOVERY_CLOSE_TIMEOUT_SECONDS = 5.0
 # A worker cancelled at loop teardown can no longer resolve its queued markers, so an
 # unbounded wait parks the caller for good. Under the runner's 10s auto-forwarder cancel
 # budget so this resolves first.
@@ -352,6 +353,10 @@ class _CodexForwarderState:
         ``thread/resume`` requests.
     :param subagents_by_thread: Maps Codex child thread ids to Omnigent child
         session ids, e.g. ``{"thread_child": "conv_child"}``.
+    :param child_models_by_thread: Latest Codex model reported for each child
+        thread, e.g. ``{"thread_child": "child-model"}``.
+    :param child_usage_coalescers_by_thread: Persistent usage coalescers keyed
+        by child thread so usage received before model discovery can be retained.
     :param pending_child_threads: Codex child thread ids announced by
         ``thread/started`` but not yet mapped to AP child sessions,
         mapped to their spawning parent thread id when known, e.g.
@@ -411,6 +416,10 @@ class _CodexForwarderState:
     parent_session_id: str | None = None
     codex_client: CodexAppServerClient | None = None
     subagents_by_thread: dict[str, str] = field(default_factory=dict)
+    child_models_by_thread: dict[str, str] = field(default_factory=dict)
+    child_usage_coalescers_by_thread: dict[str, _SessionUsageCoalescer] = field(
+        default_factory=dict
+    )
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
     subscribed_child_threads: set[str] = field(default_factory=set)
     synced_item_keys: set[str] = field(default_factory=set)
@@ -549,6 +558,105 @@ class _CodexForwarderState:
             when the thread is unknown.
         """
         return self.subagents_by_thread.get(thread_id)
+
+    def model_for_child_thread(self, thread_id: str | None) -> str | None:
+        """
+        Return the latest model reported for a Codex child thread.
+
+        :param thread_id: Codex child thread id, e.g. ``"thread_child"``.
+        :returns: Model id, e.g. ``"child-model"``, or ``None`` when unknown.
+        """
+        if thread_id is None:
+            return None
+        return self.child_models_by_thread.get(thread_id)
+
+    def note_child_resume_response(self, thread_id: str, response: CodexMessage) -> None:
+        """
+        Record the model from a child thread's ``thread/resume`` response.
+
+        :param thread_id: Expected Codex child thread id.
+        :param response: Codex ``thread/resume`` response envelope.
+        :returns: None.
+        """
+        result = response.get("result")
+        if not isinstance(result, dict):
+            return
+        thread = result.get("thread")
+        if not isinstance(thread, dict) or thread.get("id") != thread_id:
+            return
+        model = result.get("model")
+        if isinstance(model, str) and model:
+            self.child_models_by_thread[thread_id] = model
+
+    def note_child_thread_settings_updated(self, params: _JsonObject) -> None:
+        """Record a model change reported for a child thread."""
+        thread_id = _thread_id_from_params(params)
+        settings = params.get("threadSettings")
+        if thread_id is None or not isinstance(settings, dict):
+            return
+        model = settings.get("model")
+        if isinstance(model, str) and model:
+            self.child_models_by_thread[thread_id] = model
+
+    def usage_coalescer_for_child_thread(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        thread_id: str,
+        session_id: str,
+    ) -> _SessionUsageCoalescer:
+        """Return a child coalescer, reconciling its model from child state."""
+        coalescer = self.child_usage_coalescers_by_thread.get(thread_id)
+        if coalescer is None:
+            coalescer = _SessionUsageCoalescer(
+                client,
+                session_id,
+                model=self.model_for_child_thread(thread_id),
+                defer_until_model=True,
+            )
+            self.child_usage_coalescers_by_thread[thread_id] = coalescer
+        else:
+            coalescer.set_model(self.model_for_child_thread(thread_id))
+        return coalescer
+
+    async def close_child_usage_coalescers(self, client: httpx.AsyncClient) -> None:
+        """Recover child models, then flush usage owned by this connection."""
+        model_recovery_available = True
+        for thread_id, coalescer in list(self.child_usage_coalescers_by_thread.items()):
+            child_session_id = self.session_for_child_thread(thread_id)
+            if (
+                model_recovery_available
+                and coalescer.has_pending_usage
+                and child_session_id is not None
+            ):
+                try:
+                    async with asyncio.timeout(_CHILD_MODEL_RECOVERY_CLOSE_TIMEOUT_SECONDS):
+                        await _recover_child_usage_model(
+                            client,
+                            child_session_id=child_session_id,
+                            child_thread_id=thread_id,
+                            forwarder_state=self,
+                        )
+                except TimeoutError:
+                    model_recovery_available = False
+                    _logger.warning(
+                        "Codex child model recovery timed out at shutdown: thread_id=%s",
+                        thread_id,
+                    )
+                except Exception:  # noqa: BLE001 - shutdown recovery is best-effort.
+                    _logger.warning(
+                        "Codex child model recovery failed at shutdown: thread_id=%s",
+                        thread_id,
+                        exc_info=True,
+                    )
+            await coalescer.close()
+            if coalescer.has_pending_usage:
+                _logger.warning(
+                    "Codex child usage remained unposted at shutdown: thread_id=%s model_known=%s",
+                    thread_id,
+                    self.model_for_child_thread(thread_id) is not None,
+                )
+        self.child_usage_coalescers_by_thread.clear()
 
     def note_child_thread(self, thread_id: str, session_id: str) -> None:
         """
@@ -1425,6 +1533,8 @@ class _SessionUsageCoalescer:
         client: httpx.AsyncClient,
         session_id: str,
         model: str | None = None,
+        *,
+        defer_until_model: bool = False,
     ) -> None:
         """
         Initialize the usage coalescer.
@@ -1432,10 +1542,10 @@ class _SessionUsageCoalescer:
         :param client: HTTP client for Omnigent event posts.
         :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
         :param model: Model name to attach to token posts, e.g. ``"gpt-5.5"``.
-            Needed for child coalescers, created where ``forwarder_state`` is
-            ``None`` and ``record()`` receives no model — without it the server
-            cannot price the child's cumulative tokens. ``None`` for the parent
-            coalescer, which learns its model via :meth:`record`.
+            ``None`` for the parent coalescer, which learns its model via
+            :meth:`record`.
+        :param defer_until_model: Retain token updates instead of posting them
+            model-less. Used for children whose resume may race their first usage.
         :returns: None.
         """
         self._client = client
@@ -1443,6 +1553,12 @@ class _SessionUsageCoalescer:
         self._pending: dict[str, int] = {}
         self._last_posted: dict[str, int] = {}
         self._model: str | None = model
+        self._defer_until_model = defer_until_model
+
+    def set_model(self, model: str | None) -> None:
+        """Update the model attached to later token posts when it is known."""
+        if model:
+            self._model = model
 
     def record(self, params: _JsonObject, model: str | None = None) -> None:
         """
@@ -1457,8 +1573,7 @@ class _SessionUsageCoalescer:
             so a usage frame on its own carries no model).
         :returns: None.
         """
-        if model:
-            self._model = model
+        self.set_model(model)
         data = _session_usage_data_from_params(params)
         if data is None:
             return
@@ -1472,6 +1587,8 @@ class _SessionUsageCoalescer:
             attempted.
         """
         if not self._pending:
+            return
+        if self._defer_until_model and not self._model:
             return
         data = {
             key: value
@@ -1506,6 +1623,11 @@ class _SessionUsageCoalescer:
         :returns: None after the final usage flush has been attempted.
         """
         await self.flush()
+
+    @property
+    def has_pending_usage(self) -> bool:
+        """Return whether an unposted usage update remains buffered."""
+        return bool(self._pending)
 
 
 @dataclass(frozen=True)
@@ -1972,6 +2094,7 @@ async def supervise_forwarder(
                     await mcp_settle_timer
             await target.delta_coalescer.close()
             await target.usage_coalescer.close()
+            await forwarder_state.close_child_usage_coalescers(ap_client)
             await target.elicitation_tracker.close()
             subscribe_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -2659,17 +2782,30 @@ async def _handle_event(
         forwarder_state=forwarder_state,
     ):
         return
-    # Child token-usage events must post to the child session, not the
-    # parent's coalescer. A fresh coalescer is created per-event for
-    # children and flushed immediately so accumulated data is not lost.
-    # Seed it with the session model so the server can price the child's tokens.
-    child_coalescer = (
-        _SessionUsageCoalescer(
+    event_thread_id = _thread_id_from_params(params)
+    if is_child and method == "thread/settings/updated" and forwarder_state is not None:
+        forwarder_state.note_child_thread_settings_updated(params)
+    if (
+        is_child
+        and method == "thread/tokenUsage/updated"
+        and forwarder_state is not None
+        and event_thread_id is not None
+    ):
+        await _recover_child_usage_model(
             client,
-            route_session_id,
-            model=forwarder_state.model if forwarder_state is not None else None,
+            child_session_id=route_session_id,
+            child_thread_id=event_thread_id,
+            forwarder_state=forwarder_state,
         )
-        if is_child
+    # Keep one coalescer per child so early usage can wait for that thread's
+    # authoritative model instead of inheriting the parent's attribution.
+    child_coalescer = (
+        forwarder_state.usage_coalescer_for_child_thread(
+            client,
+            thread_id=event_thread_id,
+            session_id=route_session_id,
+        )
+        if is_child and forwarder_state is not None and event_thread_id is not None
         else None
     )
     if await _maybe_handle_turn_event(
@@ -4925,6 +5061,33 @@ def _extract_child_session_id(
     return child_session_id
 
 
+async def _recover_child_usage_model(
+    client: httpx.AsyncClient,
+    *,
+    child_session_id: str,
+    child_thread_id: str,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """Resume an active child whose authoritative usage model is still unknown."""
+    if forwarder_state.model_for_child_thread(child_thread_id) is not None:
+        return
+    if not forwarder_state.needs_child_thread_backfill(child_thread_id):
+        return
+    codex_client = forwarder_state.codex_client
+    parent_session_id = _parent_session_id_from_forwarder_state(forwarder_state)
+    if codex_client is None or parent_session_id is None:
+        return
+    await _backfill_child_thread(
+        client,
+        codex_client,
+        parent_session_id=parent_session_id,
+        child_session_id=child_session_id,
+        child_thread_id=child_thread_id,
+        forwarder_state=forwarder_state,
+        mark_failed_on_error=False,
+    )
+
+
 async def _backfill_child_thread(
     client: httpx.AsyncClient,
     codex_client: CodexAppServerClient,
@@ -4933,6 +5096,7 @@ async def _backfill_child_thread(
     child_session_id: str,
     child_thread_id: str,
     forwarder_state: _CodexForwarderState,
+    mark_failed_on_error: bool = True,
 ) -> None:
     """
     Replay a child thread's backlog and upsert its name metadata.
@@ -4953,10 +5117,16 @@ async def _backfill_child_thread(
     :param child_thread_id: Codex child thread id, e.g.
         ``"thread_child"``.
     :param forwarder_state: Mutable state for sub-agent mappings.
+    :param mark_failed_on_error: Whether a resume error should fail the child
+        session. Usage-only model recovery leaves a healthy child running.
     :returns: None.
     """
     response = await _resume_child_thread_or_log(
-        client, codex_client, child_session_id=child_session_id, child_thread_id=child_thread_id
+        client,
+        codex_client,
+        child_session_id=child_session_id,
+        child_thread_id=child_thread_id,
+        mark_failed_on_error=mark_failed_on_error,
     )
     if response is None:
         return
@@ -4976,6 +5146,7 @@ async def _resume_child_thread_or_log(
     *,
     child_session_id: str,
     child_thread_id: str,
+    mark_failed_on_error: bool = True,
 ) -> CodexMessage | None:
     """
     Request ``thread/resume`` for a child thread, logging errors.
@@ -4985,6 +5156,8 @@ async def _resume_child_thread_or_log(
     :param child_session_id: Omnigent child session id, e.g. ``"conv_child"``.
     :param child_thread_id: Codex child thread id, e.g.
         ``"thread_child"``.
+    :param mark_failed_on_error: Whether a non-transient error should post a
+        failed child-session status.
     :returns: JSON-RPC response on success, or ``None`` on error.
     """
     try:
@@ -4998,7 +5171,8 @@ async def _resume_child_thread_or_log(
                 child_thread_id,
                 exc_info=True,
             )
-            await _post_status(client, child_session_id, "failed")
+            if mark_failed_on_error:
+                await _post_status(client, child_session_id, "failed")
         return None
 
 
@@ -5028,9 +5202,12 @@ async def _apply_child_resume(
         child_thread_id=child_thread_id,
         response=response,
     )
-    # Seed the session model (sub-agents inherit it) so replayed child token
-    # usage is priced into the child's total_cost_usd — see _SessionUsageCoalescer.
-    usage_coalescer = _SessionUsageCoalescer(client, child_session_id, model=forwarder_state.model)
+    forwarder_state.note_child_resume_response(child_thread_id, response)
+    usage_coalescer = forwarder_state.usage_coalescer_for_child_thread(
+        client,
+        thread_id=child_thread_id,
+        session_id=child_session_id,
+    )
     # A fresh tracker is used for child replay rather than the parent's,
     # because child items do not trigger elicitation requests on the parent.
     child_elicitation_tracker = _CodexElicitationTaskTracker()
@@ -5046,6 +5223,7 @@ async def _apply_child_resume(
         )
     finally:
         await child_elicitation_tracker.close()
+    await usage_coalescer.flush()
     forwarder_state.note_child_thread_subscribed(child_thread_id)
 
 
