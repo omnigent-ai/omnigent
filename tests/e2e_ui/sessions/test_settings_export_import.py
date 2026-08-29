@@ -69,7 +69,9 @@ def test_settings_persist_to_localstorage(page: Page, seeded_session: tuple[str,
     assert terminal_theme == '"dark"'  # Stored as JSON
 
 
-def test_import_restores_localstorage_settings(page: Page, seeded_session: tuple[str, str]) -> None:
+def test_import_restores_localstorage_settings(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
     """Writing settings to localStorage (simulating import) restores UI state."""
     base_url, _session_id = seeded_session
     _open_appearance(page, base_url)
@@ -117,7 +119,9 @@ def test_import_restores_localstorage_settings(page: Page, seeded_session: tuple
     expect(page.get_by_test_id("terminal-theme-dark")).to_have_attribute("aria-checked", "true")
 
 
-def test_export_and_import_preserve_theme_mode(page: Page, seeded_session: tuple[str, str]) -> None:
+def test_export_and_import_preserve_theme_mode(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
     """The theme key (next-themes) is included in export/import."""
     base_url, _session_id = seeded_session
     _open_appearance(page, base_url)
