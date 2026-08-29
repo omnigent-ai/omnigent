@@ -38,15 +38,20 @@ function loadNavigationHarness({
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   const listeners = new Map();
   const calls = { loadFile: [] };
+  const bannerCalls = { show: [], hide: 0 };
+  let currentUrl = serverUrl;
   const appEvents = new Map();
   const webContents = {
     on(eventName, listener) {
-      listeners.set(eventName, listener);
+      // Multiple modules listen on the same events (navigation fallbacks,
+      // away watch, workspace bounce): keep them all, like a real emitter.
+      if (!listeners.has(eventName)) listeners.set(eventName, []);
+      listeners.get(eventName).push(listener);
     },
     emit(eventName, ...args) {
-      listeners.get(eventName)?.({}, ...args);
+      for (const listener of listeners.get(eventName) ?? []) listener({}, ...args);
     },
-    getURL: () => serverUrl,
+    getURL: () => currentUrl,
     setWindowOpenHandler: () => {},
   };
   const win = {
@@ -135,6 +140,19 @@ function loadNavigationHarness({
       chooseDeepLinkStrategy: () => null,
     },
     "./workspace-chrome": { registerWorkspaceChromeHide: () => {} },
+    // The bounce's behavior is unit-tested in workspace-root-bounce.test.js;
+    // stubbed here because it would call into the stubbed ./url module. The
+    // away banner is intentionally NOT stubbed: its wiring through
+    // createWindow is what the behavior test below exercises.
+    "./workspace-root-bounce": { registerWorkspaceRootBounce: () => {} },
+    "./return_banner": {
+      createReturnBanner: () => ({
+        ensureBanner: () => {},
+        show: (bannerWin, returnUrl) => bannerCalls.show.push({ win: bannerWin, returnUrl }),
+        hide: () => bannerCalls.hide++,
+        registerIpc: () => {},
+      }),
+    },
     "./browserViewRegistry": {
       createBrowserViewRegistry: () => ({ closeAll: () => {} }),
     },
@@ -169,7 +187,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { createWindow, registerNavigationFallbacks, windows, SETUP_PAGE };";
+    "\nmodule.exports.testApi = { createWindow, registerNavigationFallbacks, windows, SETUP_PAGE, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; } };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -208,8 +226,12 @@ function loadNavigationHarness({
   return {
     api,
     calls,
+    bannerCalls,
     emit: (eventName, ...args) => webContents.emit(eventName, ...args),
     hasListener: (eventName) => listeners.has(eventName),
+    setUrl: (url) => {
+      currentUrl = url;
+    },
     win,
     cleanup: () => {
       api.windows.clear();
@@ -285,6 +307,105 @@ describe("workspace root bounce wiring (src/main.js)", () => {
       liveCode,
       /registerWorkspaceRootBounce\(\s*win\.webContents,\s*\(\)\s*=>\s*pinnedOrigin\(win\)\s*\)/,
     );
+  });
+});
+
+describe("return-to-server banner wiring (src/main.js)", () => {
+  it("registers the away watch against the window's current pinned origin", () => {
+    assert.match(
+      liveCode,
+      /registerServerAwayWatch\(\s*win\.webContents,\s*\{[\s\S]{0,400}getPinnedOrigin:\s*\(\)\s*=>\s*pinnedOrigin\(win\)/,
+      [
+        "src/main.js no longer registers registerServerAwayWatch in createWindow (it was",
+        "removed or commented out). That watch is what shows the 'return to your server?'",
+        "banner when an SSO flow navigates the window away from its server and doesn't",
+        "bring it back. Re-add the call (the behavior lives in src/away_banner.js and",
+        "src/return_banner.js); do not delete this test.",
+      ].join(" "),
+    );
+  });
+
+  it("registers the banner's IPC handlers", () => {
+    assert.match(liveCode, /returnBanner\.registerIpc\(\)/);
+  });
+
+  it("shows the banner after a foreign commit outlasts the delay, hides on return", async () => {
+    // End-to-end through the REAL createWindow + away_banner (return_banner
+    // stubbed): the regression this guards is the banner never appearing
+    // because a listener wasn't wired, the pin wasn't read, or the delay
+    // option never reached the watch.
+    const harness = loadNavigationHarness({ registerFallbacks: false });
+    harness.api.setAwayBannerDelayMs(5);
+    harness.api.createWindow("https://host.example/ml/omnigents");
+
+    // SSO navigates the window to the IdP and leaves it there.
+    harness.setUrl("https://company.okta.com/login");
+    harness.emit("did-navigate", "https://company.okta.com/login", 200, "OK");
+    await new Promise((resolve) => {
+      setTimeout(resolve, 30);
+    });
+
+    // The window never committed an on-server page in this scenario, so the
+    // offer falls back to the stored server URL.
+    assert.equal(harness.bannerCalls.show.length, 1);
+    assert.equal(harness.bannerCalls.show[0].win, harness.win);
+    assert.equal(harness.bannerCalls.show[0].returnUrl, "https://host.example/ml/omnigents");
+
+    // Coming back to the server hides the banner.
+    harness.setUrl("https://host.example/ml/omnigents");
+    harness.emit("did-navigate", "https://host.example/ml/omnigents", 200, "OK");
+    assert.equal(harness.bannerCalls.hide, 1);
+    harness.cleanup();
+  });
+
+  it("never offers a same-origin SSO gate page as the return target", async () => {
+    // Regression: the Databricks workspace login page (login.html) is served
+    // on the SAME origin as the pinned server. An origin-only watch recorded
+    // it as the return target, and the banner offered to "go back" to the
+    // login page the user was stuck behind.
+    const harness = loadNavigationHarness({ registerFallbacks: false });
+    harness.api.setAwayBannerDelayMs(5);
+    harness.api.createWindow("https://host.example/ml/omnigents");
+
+    harness.setUrl("https://host.example/ml/omnigents");
+    harness.emit("did-navigate", "https://host.example/ml/omnigents", 200, "OK");
+    harness.setUrl("https://host.example/login.html?next_url=%2Fml%2Fomnigents");
+    harness.emit(
+      "did-navigate",
+      "https://host.example/login.html?next_url=%2Fml%2Fomnigents",
+      200,
+      "OK",
+    );
+    harness.setUrl("https://company.okta.com/login");
+    harness.emit("did-navigate", "https://company.okta.com/login", 200, "OK");
+    await new Promise((resolve) => {
+      setTimeout(resolve, 30);
+    });
+
+    assert.equal(harness.bannerCalls.show.length, 1);
+    assert.equal(harness.bannerCalls.show[0].returnUrl, "https://host.example/ml/omnigents");
+    // Clean up the episode (hides the banner, cancels any re-arm).
+    harness.setUrl("https://host.example/ml/omnigents");
+    harness.emit("did-navigate", "https://host.example/ml/omnigents", 200, "OK");
+    harness.cleanup();
+  });
+
+  it("does not show the banner for a quick SSO round-trip", async () => {
+    const harness = loadNavigationHarness({ registerFallbacks: false });
+    harness.api.setAwayBannerDelayMs(50);
+    harness.api.createWindow("https://host.example/ml/omnigents");
+
+    harness.setUrl("https://company.okta.com/login");
+    harness.emit("did-navigate", "https://company.okta.com/login", 200, "OK");
+    // The flow hands back to the server before the delay elapses.
+    harness.setUrl("https://host.example/ml/omnigents");
+    harness.emit("did-navigate", "https://host.example/ml/omnigents", 200, "OK");
+    await new Promise((resolve) => {
+      setTimeout(resolve, 100);
+    });
+
+    assert.equal(harness.bannerCalls.show.length, 0);
+    harness.cleanup();
   });
 });
 

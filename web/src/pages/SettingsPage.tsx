@@ -852,7 +852,7 @@ function AppearanceSection() {
         <UiCodeFontWeightControl />
       </div>
 
-      <div className="mt-4 flex items-center justify-end">
+      <div className="mt-8 flex items-center justify-end">
         <Dialog open={isResetDialogOpen} onOpenChange={setIsResetDialogOpen}>
           <DialogTrigger asChild>
             <Button
