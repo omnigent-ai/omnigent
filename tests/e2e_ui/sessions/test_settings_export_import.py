@@ -8,7 +8,6 @@ and applies an exported settings file, restoring every preference immediately.
 
 from __future__ import annotations
 
-import json
 from playwright.sync_api import Page, expect
 
 

@@ -36,12 +36,12 @@ import {
   useEffect,
   useId,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import {
   ArchiveRestoreIcon,
   AlertTriangleIcon,
-  CheckIcon,
   DownloadIcon,
   KeyRoundIcon,
   Loader2Icon,
