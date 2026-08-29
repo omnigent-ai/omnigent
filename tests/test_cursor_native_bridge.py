@@ -10,6 +10,7 @@ The clear now floods ``Backspace`` until the pane stops changing.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import click
@@ -145,12 +146,7 @@ def test_inject_user_message_clears_before_pasting(
     the composer, which then prepended (blocked) the next web-UI message. The
     Backspace flood must precede ``load-buffer``/``paste-buffer``.
     """
-    bridge_dir = tmp_path / "bridge"
-    write_tmux_target(
-        bridge_dir,
-        socket_path=Path(_SOCK),
-        tmux_target=_TARGET,
-    )
+    bridge_dir = _prepare_bridge(tmp_path, monkeypatch)
     # Pane always reports an idle marker: _settle_pane returns immediately, the
     # clear settles at once, and the paste-commit poll sees the needle.
     captured = _install_fake_tmux(monkeypatch, pane_captures=["Add a follow-up hello marker"])
@@ -174,11 +170,35 @@ def test_inject_user_message_clears_before_pasting(
 _IDLE = "Add a follow-up"
 
 
-def _prepare_bridge(tmp_path: Path) -> Path:
+def _prepare_bridge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Write a tmux target so ``_wait_for_tmux_info`` resolves in-process."""
-    bridge_dir = tmp_path / "bridge"
+    # Production bridge paths must live below the validated cursor root.  Keep
+    # this fixture in the same shape while still isolating each test.
+    root = tmp_path / "omnigent-test" / "cursor-native"
+    monkeypatch.setattr(cursor_native_bridge, "_BRIDGE_ROOT", root)
+    bridge_dir = root / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path(_SOCK), tmux_target=_TARGET)
     return bridge_dir
+
+
+def test_mcp_bridge_rejects_symlinked_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bearer-token files must not be redirected through a pre-existing symlink."""
+    root = tmp_path / "omnigent-test" / "cursor-native"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root.parent.mkdir(parents=True)
+    try:
+        os.symlink(outside, root, target_is_directory=True)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"symlinks unavailable: {error}")
+    monkeypatch.setattr(cursor_native_bridge, "_BRIDGE_ROOT", root)
+
+    with pytest.raises(RuntimeError, match="is a symlink"):
+        cursor_native_bridge.write_mcp_bridge_config(root / "session")
+
+    assert not list(outside.iterdir())
 
 
 class TestInjectModelGate:
@@ -194,7 +214,7 @@ class TestInjectModelGate:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A landed filter ("Models matching") commits the selection with Enter."""
-        bridge_dir = _prepare_bridge(tmp_path)
+        bridge_dir = _prepare_bridge(tmp_path, monkeypatch)
         monkeypatch.setattr(
             cursor_native_bridge,
             "_live_cursor_model_options",
@@ -235,7 +255,7 @@ class TestInjectModelGate:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """ "No matches" fails loudly, dismisses the picker, and never presses Enter."""
-        bridge_dir = _prepare_bridge(tmp_path)
+        bridge_dir = _prepare_bridge(tmp_path, monkeypatch)
         monkeypatch.setattr(
             cursor_native_bridge,
             "_live_cursor_model_options",
@@ -262,7 +282,7 @@ class TestInjectModelGate:
         pane`` check would pass — but with a "No matches" result and no "Models
         matching" header the gate must refuse to press Enter.
         """
-        bridge_dir = _prepare_bridge(tmp_path)
+        bridge_dir = _prepare_bridge(tmp_path, monkeypatch)
         monkeypatch.setattr(
             cursor_native_bridge,
             "_live_cursor_model_options",
@@ -282,7 +302,7 @@ class TestInjectModelGate:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A fuzzy top result cannot silently select a different catalog row."""
-        bridge_dir = _prepare_bridge(tmp_path)
+        bridge_dir = _prepare_bridge(tmp_path, monkeypatch)
         monkeypatch.setattr(
             cursor_native_bridge,
             "_live_cursor_model_options",

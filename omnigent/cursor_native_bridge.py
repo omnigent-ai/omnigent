@@ -119,10 +119,13 @@ def bridge_root() -> Path:
 
 
 def _ensure_dir(path: Path) -> None:
-    """Create *path* (and parents) with owner-only permissions."""
-    path.mkdir(parents=True, exist_ok=True)
-    with contextlib.suppress(OSError):
-        os.chmod(path, 0o700)
+    """Create or validate *path* before writing token-bearing bridge files."""
+    # ``bridge.json`` contains a bearer token.  Validate the complete ancestor
+    # chain instead of trusting pre-existing parents, which may be symlinks or
+    # writable by another user on a shared host.
+    from omnigent.claude_native_bridge import _ensure_secure_dir
+
+    _ensure_secure_dir(path)
 
 
 #: File the runner drops into a fork's bridge dir holding the prior-conversation
