@@ -1,11 +1,12 @@
-"""E2E: the Settings → Appearance font-family field re-fonts the UI and persists.
+"""E2E: the Settings → Appearance font-family picker re-fonts the UI and persists.
 
 The font-family control lives on the Settings page (``pages/SettingsPage.tsx``,
-``UiFontFamilyControl``): a free-text input (Cursor-style) plus a ``Reset``
-button under a ``role="group"`` labelled "Font family". Typing a name writes the
-choice to ``localStorage["omnigent:ui-font-family"]`` and applies it as the
-``--ui-font-family`` custom property on ``<html>`` (see
-``lib/uiFontPreferences.ts``). A blank field is "System default": the property is
+``UiFontFamilyControl``): a searchable combobox plus a ``Reset`` button under a
+``role="group"`` labelled "Font family". The combobox lists a few common families
+and offers whatever the user types as its own entry, so an unlisted font is still
+reachable. Choosing a name writes it to ``localStorage["omnigent:ui-font-family"]``
+and applies it as the ``--ui-font-family`` custom property on ``<html>`` (see
+``lib/uiFontPreferences.ts``). The "System" entry is the default: the property is
 removed and the ``html`` rule falls back to ``var(--font-sans)``.
 
 Because the whole rem-based UI inherits its font from the root ``html`` rule
@@ -21,6 +22,8 @@ from __future__ import annotations
 from playwright.sync_api import Page, expect
 
 STORAGE_KEY = "omnigent:ui-font-family"
+# Substring match: the real placeholder ends in a non-ASCII ellipsis.
+SEARCH_PLACEHOLDER = "Search or type a font"
 
 
 def _ui_font_family(page: Page) -> str:
@@ -42,36 +45,45 @@ def _open_appearance(page: Page, base_url: str) -> None:
     expect(page.get_by_role("group", name="Font family", exact=True)).to_be_visible(timeout=30_000)
 
 
-def test_ui_font_family_applies_and_persists(page: Page, seeded_session: tuple[str, str]) -> None:
-    """Typing a family updates the applied property + value live and survives reload.
+def _pick_typed_family(page: Page, family: str) -> None:
+    """Open the combobox, type ``family``, and take the "use what I typed" entry."""
+    page.get_by_test_id("ui-font-family-combobox").click()
+    page.get_by_placeholder(SEARCH_PLACEHOLDER).fill(family)
+    page.get_by_test_id("ui-font-family-combobox-use-typed").click()
 
-    A fresh context has no stored preference → empty field, no ``--ui-font-family``
-    override (the UI uses the system stack). Typing a name applies the property and
-    persists the choice; a page reload restores it (no reset, no flash to default).
+
+def test_ui_font_family_applies_and_persists(page: Page, seeded_session: tuple[str, str]) -> None:
+    """Choosing a family updates the applied property + trigger and survives reload.
+
+    A fresh context has no stored preference → the combobox reads "System" and no
+    ``--ui-font-family`` override is applied (the UI uses the system stack).
+    Choosing a name applies the property and persists the choice; a page reload
+    restores it (no reset, no flash to default).
     """
     base_url, _session_id = seeded_session
     _open_appearance(page, base_url)
 
-    value = page.get_by_test_id("ui-font-family-input")
+    trigger = page.get_by_test_id("ui-font-family-combobox")
 
-    # Fresh context → empty field, nothing stored, no override applied.
-    expect(value).to_have_value("")
+    # Fresh context → default entry selected, nothing stored, no override applied.
+    expect(trigger).to_have_text("System")
     assert _stored_family(page) is None, "expected no persisted family on a fresh load"
     assert _ui_font_family(page) == "", "fresh load should apply no family override"
 
-    # → "Georgia": the field, the applied property, and storage all move together.
-    # The applied value leads with the chosen family and appends the system stack
-    # (so an uninstalled/partial name degrades to the default sans, not serif), so
-    # the resolved custom property starts with — rather than equals — "Georgia".
-    value.fill("Georgia")
-    expect(value).to_have_value("Georgia")
-    assert _stored_family(page) == '"Georgia"', "the typed family was not persisted"
-    assert _ui_font_family(page).startswith("Georgia"), "root family did not track the typed name"
+    # → "Georgia": unlisted, so it arrives through the typed entry. The trigger,
+    # the applied property, and storage all move together. The applied value leads
+    # with the chosen family and appends the system stack (so an uninstalled or
+    # partial name degrades to the default sans, not serif), so the resolved
+    # custom property starts with — rather than equals — "Georgia".
+    _pick_typed_family(page, "Georgia")
+    expect(trigger).to_have_text("Georgia")
+    assert _stored_family(page) == '"Georgia"', "the chosen family was not persisted"
+    assert _ui_font_family(page).startswith("Georgia"), "root family did not track the choice"
 
     # The choice survives a full reload (persisted + re-applied before paint).
     page.reload()
     expect(page.get_by_role("group", name="Font family", exact=True)).to_be_visible(timeout=30_000)
-    expect(page.get_by_test_id("ui-font-family-input")).to_have_value("Georgia")
+    expect(page.get_by_test_id("ui-font-family-combobox")).to_have_text("Georgia")
     assert _ui_font_family(page).startswith("Georgia"), "family was not restored after reload"
 
 
@@ -86,16 +98,17 @@ def test_ui_font_family_reset_restores_system_default(
     page.evaluate(f"() => window.localStorage.setItem('{STORAGE_KEY}', '\"Georgia\"')")
     _open_appearance(page, base_url)
 
-    value = page.get_by_test_id("ui-font-family-input")
+    trigger = page.get_by_test_id("ui-font-family-combobox")
     reset = page.get_by_test_id("ui-font-family-reset")
 
     # The seeded family renders and is applied to the root (leading the appended
     # system-stack fallback, so the resolved value starts with "Georgia").
-    expect(value).to_have_value("Georgia")
+    expect(trigger).to_have_text("Georgia")
     assert _ui_font_family(page).startswith("Georgia")
 
-    # → Reset: the field clears, the override is removed, and the key is cleared.
+    # → Reset: the trigger returns to "System", the override is removed, and the
+    # key is cleared.
     reset.click()
-    expect(value).to_have_value("")
+    expect(trigger).to_have_text("System")
     assert _ui_font_family(page) == "", "the family override was not removed on reset"
     assert _stored_family(page) is None, "reset did not clear the persisted family"

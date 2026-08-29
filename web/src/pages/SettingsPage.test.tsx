@@ -4,7 +4,7 @@
 // Archived sessions list (which moved here out of the sidebar).
 
 import type { ReactNode } from "react";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -37,6 +37,7 @@ const mocks = vi.hoisted(() => ({
   projectNames: [] as string[],
   hasNextPage: false,
   fetchNextPage: vi.fn(),
+  useConversationsCalls: vi.fn(),
 }));
 
 vi.mock("next-themes", () => ({
@@ -63,24 +64,30 @@ vi.mock("@/hooks/useConversations", async () => {
   // A stateful mock that emulates useInfiniteQuery pagination: it tracks how
   // many pages are "loaded" and reveals the next on fetchNextPage, so a click
   // on "Load more" re-renders with more rows (as the real hook would).
-  const { useState } = await import("react");
+  const { useEffect, useState } = await import("react");
   return {
     PROJECT_LABEL_KEY: "omni_project",
     // The Archived view drives the visible list from this hook; filter on the
     // fourth (`project`) arg so the mock mirrors the server-side ?project=
     // scoping.
     useConversations: (
-      _searchQuery?: string,
+      searchQuery = "",
       _includeArchived?: boolean,
       _options?: unknown,
       project?: string,
     ) => {
+      mocks.useConversationsCalls(searchQuery, _includeArchived, _options, project);
       // `mocks.pages` (array of per-page row arrays) drives multi-page tests;
       // otherwise serve a single page of `mocks.conversations`.
       const source = mocks.pages ?? [mocks.conversations];
       const [shown, setShown] = useState(1);
+      useEffect(() => setShown(1), [searchQuery, project]);
       const pages = source.slice(0, shown).map((rows) => ({
-        data: project ? rows.filter((c) => c.labels?.["omni_project"] === project) : rows,
+        data: rows.filter((c) => {
+          const matchesProject = !project || c.labels?.["omni_project"] === project;
+          const haystack = `${c.title ?? ""} ${c.search_snippet ?? ""}`.toLowerCase();
+          return matchesProject && (!searchQuery || haystack.includes(searchQuery.toLowerCase()));
+        }),
       }));
       return {
         data: { pages },
@@ -202,6 +209,20 @@ function renderPage(path = "/settings") {
   );
 }
 
+async function chooseFont(comboboxTestId: string, label: string) {
+  fireEvent.click(screen.getByTestId(comboboxTestId));
+  fireEvent.click(await screen.findByTestId(`${comboboxTestId}-option-${label}`));
+}
+
+/** Pick an off-list font by typing its name into the search box. */
+async function typeFont(comboboxTestId: string, family: string) {
+  fireEvent.click(screen.getByTestId(comboboxTestId));
+  fireEvent.change(await screen.findByPlaceholderText(/search or type a font/i), {
+    target: { value: family },
+  });
+  fireEvent.click(await screen.findByTestId(`${comboboxTestId}-use-typed`));
+}
+
 beforeEach(() => {
   mocks.setTheme.mockReset();
   mocks.archiveMutate.mockReset();
@@ -209,6 +230,7 @@ beforeEach(() => {
   mocks.bulkArchiveMutate.mockReset();
   mocks.bulkDeleteMutate.mockReset();
   mocks.fetchNextPage.mockReset();
+  mocks.useConversationsCalls.mockReset();
   mocks.theme = "system";
   mocks.accountsEnabled = true;
   mocks.loginUrl = "/login";
@@ -486,20 +508,17 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("ui-font-size-inc")).not.toBeDisabled();
   });
 
-  it("shows the empty font family default and applies + persists a typed name", () => {
+  it("selects and persists an interface font from the combobox", async () => {
     localStorage.clear();
     document.documentElement.style.removeProperty("--ui-font-family");
     renderPage("/settings/appearance");
-    const input = screen.getByTestId("ui-font-family-input") as HTMLInputElement;
-    // No stored preference → empty input, System-default placeholder, no override.
-    expect(input.value).toBe("");
-    expect(input.placeholder).toBe("System default");
+    const combobox = screen.getByTestId("ui-font-family-combobox");
+    expect(combobox).toHaveTextContent("System");
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
-    // Reset has nothing to do at the default.
     expect(screen.getByTestId("ui-font-family-reset")).toBeDisabled();
 
-    fireEvent.change(input, { target: { value: "Inter" } });
-    expect(input.value).toBe("Inter");
+    await chooseFont("ui-font-family-combobox", "Inter");
+    expect(combobox).toHaveTextContent("Inter");
     // The choice is persisted so it survives a refresh...
     expect(localStorage.getItem("omnigent:ui-font-family")).toBe(JSON.stringify("Inter"));
     // ...and applied live to the document root, with the system stack appended
@@ -513,18 +532,16 @@ describe("SettingsPage", () => {
   it("reset restores the system default font family", () => {
     localStorage.setItem("omnigent:ui-font-family", JSON.stringify("Georgia"));
     renderPage("/settings/appearance");
-    const input = screen.getByTestId("ui-font-family-input") as HTMLInputElement;
-    // The control reflects the stored preference on mount.
-    expect(input.value).toBe("Georgia");
+    expect(screen.getByTestId("ui-font-family-combobox")).toHaveTextContent("Georgia");
 
     fireEvent.click(screen.getByTestId("ui-font-family-reset"));
-    // Reset clears the field, the applied property, and the stored key.
-    expect(input.value).toBe("");
+    // Reset clears the selection, the applied property, and the stored key.
+    expect(screen.getByTestId("ui-font-family-combobox")).toHaveTextContent("System");
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
     expect(localStorage.getItem("omnigent:ui-font-family")).toBeNull();
   });
 
-  it("resets every appearance preference back to product defaults", () => {
+  it("resets every appearance preference back to product defaults", async () => {
     localStorage.clear();
     renderPage("/settings/appearance");
 
@@ -540,14 +557,10 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
-    fireEvent.change(screen.getByTestId("ui-font-family-input") as HTMLInputElement, {
-      target: { value: "Inter" },
-    });
+    await chooseFont("ui-font-family-combobox", "Inter");
     fireEvent.click(screen.getByTestId("code-font-size-inc"));
     fireEvent.click(screen.getByTestId("code-font-size-inc"));
-    fireEvent.change(screen.getByTestId("code-font-family-input") as HTMLInputElement, {
-      target: { value: "Fira Code" },
-    });
+    await chooseFont("code-font-family-combobox", "Fira Code");
     fireEvent.click(screen.getByTestId("heavier-code-text-toggle"));
 
     // Sanity: the non-default choices were persisted.
@@ -567,9 +580,9 @@ describe("SettingsPage", () => {
 
     // Fonts are back to their defaults.
     expect((screen.getByTestId("ui-font-size-input") as HTMLInputElement).value).toBe("13");
-    expect((screen.getByTestId("ui-font-family-input") as HTMLInputElement).value).toBe("");
+    expect(screen.getByTestId("ui-font-family-combobox")).toHaveTextContent("System");
     expect((screen.getByTestId("code-font-size-input") as HTMLInputElement).value).toBe("13");
-    expect((screen.getByTestId("code-font-family-input") as HTMLInputElement).value).toBe("");
+    expect(screen.getByTestId("code-font-family-combobox")).toHaveTextContent("Editor default");
     expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("13px");
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
     expect(localStorage.getItem("omnigent:ui-font-size")).toBeNull();
@@ -695,33 +708,43 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("10");
   });
 
-  it("shows the empty code font family default and applies + persists a typed name", () => {
+  it("applies an off-list code font typed into the search box", async () => {
     localStorage.clear();
     renderPage("/settings/appearance");
-    const input = screen.getByTestId("code-font-family-input") as HTMLInputElement;
-    // No stored preference → empty input, editor-default placeholder.
-    expect(input.value).toBe("");
-    expect(input.placeholder).toBe("Editor default");
-    // Reset has nothing to do at the default.
+    expect(screen.getByTestId("code-font-family-combobox")).toHaveTextContent("Editor default");
     expect(screen.getByTestId("code-font-family-reset")).toBeDisabled();
 
-    fireEvent.change(input, { target: { value: "Fira Code" } });
-    expect(input.value).toBe("Fira Code");
+    await typeFont("code-font-family-combobox", "Recursive Mono");
+    expect(screen.getByTestId("code-font-family-combobox")).toHaveTextContent("Recursive Mono");
+    expect(screen.queryByTestId("code-font-family-input")).toBeNull();
     // The choice is persisted under the code-font family key so it survives a refresh.
-    expect(localStorage.getItem("omnigent:code-font-family")).toBe(JSON.stringify("Fira Code"));
+    expect(localStorage.getItem("omnigent:code-font-family")).toBe(
+      JSON.stringify("Recursive Mono"),
+    );
     expect(screen.getByTestId("code-font-family-reset")).not.toBeDisabled();
+  });
+
+  it("offers a curated font by name instead of re-adding it as a typed entry", async () => {
+    localStorage.clear();
+    renderPage("/settings/appearance");
+    fireEvent.click(screen.getByTestId("code-font-family-combobox"));
+    fireEvent.change(await screen.findByPlaceholderText(/search or type a font/i), {
+      target: { value: "menlo" },
+    });
+    expect(screen.queryByTestId("code-font-family-combobox-use-typed")).toBeNull();
+    fireEvent.click(screen.getByTestId("code-font-family-combobox-option-Menlo"));
+    expect(localStorage.getItem("omnigent:code-font-family")).toBe(JSON.stringify("Menlo"));
   });
 
   it("reset restores the default code font family", () => {
     localStorage.setItem("omnigent:code-font-family", JSON.stringify("JetBrains Mono"));
     renderPage("/settings/appearance");
-    const input = screen.getByTestId("code-font-family-input") as HTMLInputElement;
     // The control reflects the stored preference on mount.
-    expect(input.value).toBe("JetBrains Mono");
+    expect(screen.getByTestId("code-font-family-combobox")).toHaveTextContent("JetBrains Mono");
 
     fireEvent.click(screen.getByTestId("code-font-family-reset"));
     // Reset clears the field and the stored key.
-    expect(input.value).toBe("");
+    expect(screen.getByTestId("code-font-family-combobox")).toHaveTextContent("Editor default");
     expect(localStorage.getItem("omnigent:code-font-family")).toBeNull();
   });
 
@@ -745,6 +768,64 @@ describe("SettingsPage", () => {
     localStorage.setItem("omnigent:code-font-weight", "100");
     renderPage("/settings/appearance");
     expect(screen.getByTestId("heavier-code-text-toggle")).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("tracks the heavier code weight in the preview", () => {
+    localStorage.clear();
+    renderPage("/settings/appearance");
+    const preview = screen.getByTestId("code-font-preview");
+    expect(preview).toHaveStyle({ fontWeight: "400" });
+
+    fireEvent.click(screen.getByTestId("heavier-code-text-toggle"));
+    expect(preview).toHaveStyle({ fontWeight: "500" });
+  });
+
+  it("updates the code preview through the curated font selection path", async () => {
+    renderPage("/settings/appearance");
+    await chooseFont("code-font-family-combobox", "Fira Code");
+
+    const preview = screen.getByTestId("code-font-preview");
+    expect(preview).toHaveStyle({ fontFamily: "Fira Code, var(--font-mono)" });
+    expect(localStorage.getItem("omnigent:code-font-family")).toBe(JSON.stringify("Fira Code"));
+  });
+
+  it("advertises the appearance controls as clickable on hover", () => {
+    renderPage("/settings/appearance");
+    // Bare <button>s, so they don't inherit the shared Button's cursor.
+    expect(screen.getByTestId("ui-font-size-inc")).toHaveClass("cursor-pointer");
+    expect(screen.getByTestId("code-font-size-dec")).toHaveClass("cursor-pointer");
+    expect(screen.getByTestId("ui-font-family-combobox")).toHaveClass("cursor-pointer");
+  });
+
+  it("marks the typography groups up as headings, not as another option row", () => {
+    renderPage("/settings/appearance");
+    for (const name of [/^Interface$/, /^Editor & terminal$/]) {
+      expect(screen.getByRole("heading", { level: 3, name })).toBeInTheDocument();
+    }
+  });
+
+  it("updates the code preview for a font typed into the search box", async () => {
+    localStorage.clear();
+    renderPage("/settings/appearance");
+    await typeFont("code-font-family-combobox", "Recursive Mono");
+
+    expect(screen.getByTestId("code-font-preview")).toHaveStyle({
+      fontFamily: "Recursive Mono, var(--font-mono)",
+    });
+  });
+
+  it("renders the preview with the persisted code font and size", () => {
+    localStorage.setItem("omnigent:code-font-family", JSON.stringify("JetBrains Mono"));
+    localStorage.setItem("omnigent:code-font-size", "17");
+    renderPage("/settings/appearance");
+
+    const preview = screen.getByTestId("code-font-preview");
+    expect(preview).toHaveStyle({
+      fontFamily: "JetBrains Mono, var(--font-mono)",
+      fontSize: "17px",
+    });
+    // Preflight styles `code` itself, so styling only the <pre> has no effect.
+    expect(preview.tagName).toBe("CODE");
   });
 
   it("defaults bare /settings to Account when a login session exists, else Appearance", async () => {
@@ -921,6 +1002,84 @@ describe("SettingsPage", () => {
     });
     // Unarchiving opens the restored session (the mock mutate runs onSuccess).
     expect(screen.getByTestId("location").textContent).toBe("/c/conv_archived");
+  });
+
+  it("debounces archived-session search before querying", () => {
+    vi.useFakeTimers();
+    try {
+      renderPage("/settings/archived");
+      fireEvent.change(screen.getByRole("searchbox", { name: "Search archived sessions" }), {
+        target: { value: "needle" },
+      });
+
+      expect(mocks.useConversationsCalls).not.toHaveBeenCalledWith(
+        "needle",
+        true,
+        undefined,
+        undefined,
+      );
+      act(() => vi.advanceTimersByTime(299));
+      expect(mocks.useConversationsCalls).not.toHaveBeenCalledWith(
+        "needle",
+        true,
+        undefined,
+        undefined,
+      );
+      act(() => vi.advanceTimersByTime(1));
+      expect(mocks.useConversationsCalls).toHaveBeenCalledWith(
+        "needle",
+        true,
+        undefined,
+        undefined,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("combines archived project filtering with search", () => {
+    vi.useFakeTimers();
+    try {
+      mocks.projectNames = ["Alpha", "Beta"];
+      mocks.conversations = [
+        conv("a1", { archived: true, title: "Release notes", labels: { omni_project: "Alpha" } }),
+        conv("a2", { archived: true, title: "Planning", labels: { omni_project: "Alpha" } }),
+        conv("b1", { archived: true, title: "Release notes", labels: { omni_project: "Beta" } }),
+      ];
+      renderPage("/settings/archived");
+
+      fireEvent.change(screen.getByTestId("archived-project-filter"), {
+        target: { value: "project:Alpha" },
+      });
+      fireEvent.change(screen.getByRole("searchbox", { name: "Search archived sessions" }), {
+        target: { value: "release" },
+      });
+      act(() => vi.advanceTimersByTime(300));
+
+      expect(mocks.useConversationsCalls).toHaveBeenCalledWith("release", true, undefined, "Alpha");
+      const rows = screen.getAllByTestId("archived-row");
+      expect(rows).toHaveLength(1);
+      expect(within(rows[0]).getByText("Release notes")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows a search-specific empty state for archived sessions", () => {
+    vi.useFakeTimers();
+    try {
+      mocks.conversations = [conv("old", { archived: true, title: "Old chat" })];
+      renderPage("/settings/archived");
+
+      fireEvent.change(screen.getByRole("searchbox", { name: "Search archived sessions" }), {
+        target: { value: "missing" },
+      });
+      act(() => vi.advanceTimersByTime(300));
+
+      expect(screen.getByText("No archived sessions match.")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("deletes an archived session after confirming, with no row-click navigation", () => {
