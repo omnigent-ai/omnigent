@@ -821,8 +821,8 @@ function AppearanceSection() {
       applyImportedSettings(imported);
 
       // Apply DOM side-effects so imported settings take effect immediately.
-      const themeMode = imported.settings["theme"];
-      if (themeMode) setTheme(themeMode);
+      const themeMode = imported.settings["web-theme"];
+      if (themeMode) setTheme(JSON.parse(themeMode));
       applyDesktopUiFontSize(readUiFontSizePx());
       applyUiFontFamily(readUiFontFamily());
       applyThemePalette(readThemePalette());

@@ -122,7 +122,7 @@ def test_import_restores_localstorage_settings(
 def test_export_and_import_preserve_theme_mode(
     page: Page, seeded_session: tuple[str, str]
 ) -> None:
-    """The theme key (next-themes) is included in export/import."""
+    """The web-theme key (next-themes) is included in export/import."""
     base_url, _session_id = seeded_session
     _open_appearance(page, base_url)
 
@@ -131,7 +131,7 @@ def test_export_and_import_preserve_theme_mode(
     expect(page.get_by_test_id("theme-dark")).to_have_attribute("aria-checked", "true")
 
     # Verify theme was written to localStorage.
-    theme = page.evaluate("() => window.localStorage.getItem('theme')")
+    theme = page.evaluate("() => window.localStorage.getItem('web-theme')")
     assert theme == '"dark"'
 
     # Change to light.
@@ -139,7 +139,7 @@ def test_export_and_import_preserve_theme_mode(
     expect(page.get_by_test_id("theme-light")).to_have_attribute("aria-checked", "true")
 
     # Restore dark theme (simulating import).
-    page.evaluate("() => window.localStorage.setItem('theme', '\"dark\"')")
+    page.evaluate("() => window.localStorage.setItem('web-theme', '\"dark\"')")
     page.reload()
     expect(page.get_by_role("group", name="Interface font size", exact=True)).to_be_visible(
         timeout=30_000
@@ -174,7 +174,7 @@ def test_import_flow_with_file_upload(page: Page, seeded_session: tuple[str, str
         "settings": {
             "omnigent:ui-font-size": "18",
             "omnigent:terminal-theme": '"dark"',
-            "theme": '"dark"',
+            "web-theme": '"dark"',
         },
     }
 

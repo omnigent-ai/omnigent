@@ -18,7 +18,7 @@ const EXPORTABLE_KEYS = [
   "omnigent:default-workspace-panel",
   "omnigent:hide-unconfigured-harnesses",
   "omnigent:default-base-branch",
-  "theme",
+  "web-theme",
 ] as const;
 
 const CURRENT_VERSION = 1;
