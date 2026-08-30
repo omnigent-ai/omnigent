@@ -25,10 +25,10 @@ previous paragraph's buffered tail and inserts a ``\\n\\n`` separator.
 These tests drive the REAL Codex executor session (with the app-server
 subprocess boundary stubbed, exactly like ``tests/inner/test_codex_executor``)
 with the two-paragraph reasoning stream from the bug report, then fold the
-executor's output through the REAL client ``BlockStream`` via the documented
-executor-event → SSE-event mapping. They assert on the user-visible rendered
-reasoning text, so they fail for this bug specifically and pass once the
-executor emits the per-item boundary.
+executor's output through the REAL ``ExecutorAdapter._translate_event``
+mapping, the REAL client SSE parser, and the REAL client ``BlockStream``.
+They assert on the user-visible rendered reasoning text, so they fail for
+this bug specifically and pass once the executor emits the per-item boundary.
 
 Journey (user-observable)
 -------------------------
@@ -53,26 +53,16 @@ from unittest.mock import AsyncMock
 from omnigent_client._blocks import ReasoningChunk as ReasoningChunkBlock
 from omnigent_client._events import (
     MessageDone,
-    ReasoningDelta,
-    ReasoningStarted,
-    ReasoningSummaryDelta,
     ResponseCompleted,
     ResponseCreated,
-    TextDelta,
 )
+from omnigent_client._sse import _parse_event
 from omnigent_client._stream import BlockStream
 from omnigent_client._types import Response
 
 from omnigent.inner.codex_executor import _CodexAppServerSession
-from omnigent.inner.executor import (
-    ReasoningChunk as ExecReasoningChunk,
-)
-from omnigent.inner.executor import (
-    TextChunk as ExecTextChunk,
-)
-from omnigent.inner.executor import (
-    TurnComplete,
-)
+from omnigent.inner.executor import Executor, TurnComplete
+from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
 # The exact reasoning text from the bug report's screenshot.
 _PARA_1 = (
@@ -197,33 +187,44 @@ async def _codex_turn_events() -> list[Any]:
     return events
 
 
-def _to_client_events(executor_events: list[Any]) -> list[Any]:
-    """Map executor events onto the client SSE events, verbatim.
+class _RecordingCtx:
+    """Minimal TurnContext stand-in that records the adapter's SSE emits."""
 
-    Mirrors the workflow's ``_event_to_sse_dict`` mapping (see
-    ``omnigent/runtime/harnesses/_executor_adapter.py``):
-    ``reasoning_started`` → ``response.reasoning.started``,
-    ``reasoning_text`` → ``response.reasoning_text.delta``,
-    ``reasoning_summary`` → ``response.reasoning_summary_text.delta``,
-    ``TextChunk`` → ``response.output_text.delta``.
+    def __init__(self) -> None:
+        self.response_id = "resp_1"
+        self.emitted: list[Any] = []
+        self.provider_usage: dict[str, Any] | None = None
+
+    def emit(self, event: Any) -> None:
+        self.emitted.append(event)
+
+
+def _to_client_events(executor_events: list[Any]) -> list[Any]:
+    """Map executor events onto client SSE events through the REAL pipeline.
+
+    Each executor event goes through the real
+    ``ExecutorAdapter._translate_event`` (producing the typed server SSE
+    events), then each server event's wire form is parsed by the real client
+    SSE parser — so a regression in either mapping fails these tests too.
 
     :param executor_events: Events yielded by ``run_turn``.
     :returns: The equivalent ``omnigent_client`` event stream.
     """
+    adapter = ExecutorAdapter(executor_factory=Executor)
+    ctx = _RecordingCtx()
+    final_text = ""
+    for event in executor_events:
+        if isinstance(event, TurnComplete):
+            final_text = event.response
+        adapter._translate_event(event, ctx)  # deliberate white-box drive of the real mapping
     response = Response(id="resp_1", status="completed", model="codex-test")
     out: list[Any] = [ResponseCreated(response=response)]
-    for event in executor_events:
-        if isinstance(event, ExecReasoningChunk):
-            if event.event_type == "reasoning_started":
-                out.append(ReasoningStarted())
-            elif event.event_type == "reasoning_summary":
-                out.append(ReasoningSummaryDelta(delta=event.delta))
-            else:
-                out.append(ReasoningDelta(delta=event.delta))
-        elif isinstance(event, ExecTextChunk):
-            out.append(TextDelta(delta=event.text))
-        elif isinstance(event, TurnComplete):
-            out.append(MessageDone(content=[{"type": "output_text", "text": event.response}]))
+    for server_event in ctx.emitted:
+        payload = server_event.model_dump(mode="json", exclude_none=True)
+        client_event = _parse_event(server_event.type, payload)
+        if client_event is not None:
+            out.append(client_event)
+    out.append(MessageDone(content=[{"type": "output_text", "text": final_text}]))
     out.append(ResponseCompleted(response=response))
     return out
 
