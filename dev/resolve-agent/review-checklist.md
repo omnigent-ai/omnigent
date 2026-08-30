@@ -35,6 +35,14 @@ what to look for, and why it's wrong.
   `subprocess.*` that drops the inherited environment strips `PATH`, auth, and
   proxy vars — extend `os.environ.copy()` instead of replacing it.
 
+## Fix reach
+
+- **A new knob/override must reach every sibling call path with the same failure
+  mode.** A fix that makes one entry point configurable while sibling paths on the
+  same resource keep the old hardcoded value (e.g. the pre-message slash-command
+  inject on the same slow pane) still fails the reported journey. Check every
+  caller that shares the constant/gate the fix touched.
+
 ## Config / data safety
 
 - **A "clear/reset" must not clobber unrelated config.** An edit that rewrites a

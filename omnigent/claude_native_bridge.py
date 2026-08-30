@@ -32,6 +32,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -132,6 +133,12 @@ _MAX_CONCURRENT_MCP_REQUESTS = 64
 # ``tmux.json`` after the Claude terminal launches; the harness
 # tails it and shells out to tmux.
 _TMUX_READY_TIMEOUT_S = 30.0
+# Operator override for the message-delivery readiness budget. A healthy
+# prompt can legitimately outlast the default — e.g. resuming a session
+# with a very large transcript renders the composer only after the
+# transcript loads — and without a knob every delivery fails at the
+# default budget until the render completes.
+_READY_TIMEOUT_ENV_VAR = "OMNIGENT_CLAUDE_READY_TIMEOUT_S"
 _TMUX_SEND_TIMEOUT_S = 5.0
 # Claude Code renders this prompt glyph in its input box once the TUI
 # is interactive. We poll ``capture-pane`` for it before injecting the
@@ -3059,11 +3066,42 @@ def write_tmux_target(
     _write_json_file(bridge_dir / _TMUX_FILE, payload)
 
 
+def _delivery_ready_timeout_s() -> float:
+    """Resolve the message-delivery readiness budget.
+
+    Honors the operator's :data:`_READY_TIMEOUT_ENV_VAR` override so a
+    slow-but-healthy prompt render (e.g. resuming a session with a very
+    large transcript) can be given more than the default budget. A
+    malformed, non-finite, or non-positive value logs a diagnostic and
+    falls back to the default rather than breaking delivery.
+
+    :returns: The readiness budget in seconds, e.g. ``30.0``.
+    """
+    raw = os.environ.get(_READY_TIMEOUT_ENV_VAR)
+    if raw is None:
+        return _TMUX_READY_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    # Reject non-finite and non-positive too: ``float("inf"/"nan")`` parses
+    # without ValueError but would wedge or instantly fail every delivery.
+    if not math.isfinite(value) or value <= 0:
+        _logger.warning(
+            "claude-native: ignoring invalid %s=%r; using %ss",
+            _READY_TIMEOUT_ENV_VAR,
+            raw,
+            _TMUX_READY_TIMEOUT_S,
+        )
+        return _TMUX_READY_TIMEOUT_S
+    return value
+
+
 def inject_user_message(
     bridge_dir: Path,
     *,
     content: str,
-    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+    timeout_s: float | None = None,
 ) -> None:
     r"""
     Deliver a user message into the Claude terminal via tmux send-keys.
@@ -3104,12 +3142,18 @@ def inject_user_message(
     :param content: User text from the Omnigent web UI. Must be non-empty.
     :param timeout_s: Seconds to wait for each readiness gate
         (``tmux.json`` advertised, then prompt rendered), e.g. ``30.0``.
+        ``None`` (the default) uses the operator-configurable budget —
+        the ``OMNIGENT_CLAUDE_READY_TIMEOUT_S`` environment variable when
+        set, else 30s — so a slow-but-healthy prompt render (a
+        large-session resume) can be accommodated without a code change.
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in time,
         if Claude's input prompt never renders, if a ``tmux send-keys``
         invocation fails, or if the draft never leaves the input box
         after repeated submit Enters (message not delivered).
     """
+    if timeout_s is None:
+        timeout_s = _delivery_ready_timeout_s()
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     # A surface left occupying the composer swallows everything typed
     # below — and hides the input box, wedging the readiness gate — so
@@ -3333,7 +3377,7 @@ def inject_slash_command(
     bridge_dir: Path,
     *,
     command: str,
-    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+    timeout_s: float | None = None,
     auto_confirm: bool = False,
     confirm_hint: str | None = None,
 ) -> None:
@@ -3350,6 +3394,10 @@ def inject_slash_command(
     :param command: Single-line slash command including the leading
         ``/``, e.g. ``"/effort high"``.
     :param timeout_s: Seconds to wait for ``tmux.json``, e.g. ``30.0``.
+        ``None`` (the default) uses the same operator-configurable budget
+        as :func:`inject_user_message` — a routed ``/model`` switch runs
+        on the same slowly-rendering pane right before the message, so
+        it must honor the same readiness override.
     :param auto_confirm: If ``True``, accept the default option of the TUI
         confirmation dialog the command pops (e.g. ``/effort`` when
         switching invalidates the prompt cache). HACK — the chat UI has no
@@ -3373,6 +3421,8 @@ def inject_slash_command(
         raise ValueError(f"slash command must start with '/'; got {command!r}")
     if "\n" in command:
         raise ValueError("slash command must be a single line")
+    if timeout_s is None:
+        timeout_s = _delivery_ready_timeout_s()
     dialog_hint: str | None = None
     if auto_confirm:
         if not confirm_hint:

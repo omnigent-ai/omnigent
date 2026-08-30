@@ -3690,6 +3690,166 @@ def test_inject_user_message_raises_when_draft_never_submits(
         inject_user_message(bridge_dir, content="fix the flaky test")
 
 
+def test_inject_user_message_default_ready_budget_honors_env_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``OMNIGENT_CLAUDE_READY_TIMEOUT_S`` governs the default readiness budget.
+
+    A slow-but-healthy prompt render (e.g. a large-session resume) can
+    legitimately outlast the built-in budget; the operator override must
+    reach the readiness gate when the executor calls the helper with the
+    default budget. A never-ready pane with a small override times out at
+    the override, not at the 30s constant.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setenv("OMNIGENT_CLAUDE_READY_TIMEOUT_S", "0.2")
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Always report an empty (never-ready) pane.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns "".
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    started = time.monotonic()
+    # Deliberately no ``timeout_s=``: the executor calls it this way, and the
+    # override must apply exactly there.
+    with pytest.raises(RuntimeError, match=r"did not become ready within 0\.2s"):
+        inject_user_message(bridge_dir, content="hi")
+    assert time.monotonic() - started < 5.0, (
+        "the env override was not honored; the delivery waited on the hardcoded default budget"
+    )
+
+
+def test_inject_user_message_explicit_timeout_wins_over_env_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A caller-supplied ``timeout_s`` is not overridden by the environment.
+
+    Call sites that pass a deliberate budget (e.g. a short UI-path wait)
+    must keep it; the env knob only replaces the *default*.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setenv("OMNIGENT_CLAUDE_READY_TIMEOUT_S", "90")
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Always report an empty (never-ready) pane.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns "".
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match=r"did not become ready within 0\.3s"):
+        inject_user_message(bridge_dir, content="hi", timeout_s=0.3)
+    assert time.monotonic() - started < 5.0
+
+
+@pytest.mark.parametrize("raw", ["", "soon", "inf", "nan", "-5", "0"])
+def test_delivery_ready_timeout_rejects_invalid_env_values(
+    monkeypatch: pytest.MonkeyPatch,
+    raw: str,
+) -> None:
+    """
+    Malformed, non-finite, or non-positive overrides fall back to the default.
+
+    ``float("inf")`` would wedge every delivery forever and ``0``/negative
+    would instantly fail all of them, so both count as malformed and must
+    not break the delivery path.
+    """
+    monkeypatch.setenv("OMNIGENT_CLAUDE_READY_TIMEOUT_S", raw)
+    assert (
+        claude_native_bridge._delivery_ready_timeout_s()
+        == claude_native_bridge._TMUX_READY_TIMEOUT_S
+    )
+
+
+def test_delivery_ready_timeout_defaults_when_env_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the override the budget is the module default."""
+    monkeypatch.delenv("OMNIGENT_CLAUDE_READY_TIMEOUT_S", raising=False)
+    assert (
+        claude_native_bridge._delivery_ready_timeout_s()
+        == claude_native_bridge._TMUX_READY_TIMEOUT_S
+    )
+
+
+def test_inject_slash_command_default_ready_budget_honors_env_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``OMNIGENT_CLAUDE_READY_TIMEOUT_S`` also governs the slash-command budget.
+
+    A routed ``/model`` switch runs on the same slowly-rendering pane
+    right before the message inject, so a raised readiness budget must
+    reach it too — otherwise a model-routing turn still trips the built-in
+    wall before the message's raised budget is ever consulted. A missing
+    ``tmux.json`` with a small override times out at the override, not at
+    the 30s constant.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setenv("OMNIGENT_CLAUDE_READY_TIMEOUT_S", "0.2")
+    bridge_dir = tmp_path / "bridge"
+    started = time.monotonic()
+    # Deliberately no ``timeout_s=``: the executor's routed ``/model``
+    # switch calls it this way, and the override must apply exactly there.
+    with pytest.raises(claude_native_bridge.TmuxSessionNotAdvertised):
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/model opus")
+    assert time.monotonic() - started < 5.0, (
+        "the env override was not honored; the slash command waited on the hardcoded budget"
+    )
+
+
+def test_inject_slash_command_explicit_timeout_wins_over_env_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller-supplied ``timeout_s`` is not overridden by the environment."""
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setenv("OMNIGENT_CLAUDE_READY_TIMEOUT_S", "90")
+    bridge_dir = tmp_path / "bridge"
+    started = time.monotonic()
+    with pytest.raises(claude_native_bridge.TmuxSessionNotAdvertised):
+        claude_native_bridge.inject_slash_command(
+            bridge_dir, command="/model opus", timeout_s=0.2
+        )
+    assert time.monotonic() - started < 5.0
+
+
 def test_inject_interrupt_sends_escape_keystroke(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
