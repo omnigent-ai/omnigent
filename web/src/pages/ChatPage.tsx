@@ -110,11 +110,14 @@ import { getCurrentAuthorId } from "@/lib/identity";
 import { retrySession } from "@/lib/sessionsApi";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import {
+  clearPendingInitialPrompt,
   composerAttachmentKey,
-  consumePendingInitialPrompt,
+  peekPendingInitialPrompt,
   type PendingInitialPrompt,
   type PendingUserMessage,
   type QueuedMessage,
+  type SendAttemptResult,
+  type SendOptions,
   useChatStore,
 } from "@/store/chatStore";
 import {
@@ -687,6 +690,16 @@ function truncateTitle(raw: string, max = 60): string {
   return slice.slice(0, cut).join("").trimEnd() + "…";
 }
 
+interface InitialPromptDeliveryEntry {
+  promise: Promise<"delivered" | "cancelled" | "failed">;
+  cancel: () => void;
+}
+
+// ChatPage can unmount while a retry is sleeping. Share the one active loop
+// across component instances so a remount observes it instead of replaying the
+// same prompt concurrently.
+const initialPromptDeliveries = new Map<string, InitialPromptDeliveryEntry>();
+
 /**
  * Single component that drives the chat surface. Streaming + history
  * state lives in `useChatStore` (a Zustand store at module scope), so
@@ -700,38 +713,36 @@ export function ChatPage() {
   const appName = useAppName();
   // Optional first message handed off by the landing composer through the
   // shared chatStore (keyed by conversation id), not router state — router state
-  // doesn't survive the embed's host-provided routing. Consumed read-once
-  // in the effect below so a refresh/back can't replay it, then held here
-  // so the auto-send effect re-runs once it's resolved.
-  // Bundled with the conversation id it was consumed for so the auto-send
-  // gate can reject a prompt that no longer matches the active session (the
+  // doesn't survive the embed's host-provided routing. Read non-destructively
+  // in the effect below (the store entry is the only copy of the user's text
+  // and is dropped only once delivery settles), then held here so the
+  // delivery effect re-runs once it's resolved.
+  // Bundled with the conversation id it was read for so the delivery gate
+  // can reject a prompt that no longer matches the active session (the
   // session-switch leak — see shouldSendInitialPrompt). `null` until the
-  // consume effect runs (or when no prompt was carried).
+  // read effect runs (or when no prompt was carried).
   const [initialPrompt, setInitialPrompt] = useState<{
     conversationId: string;
     prompt: PendingInitialPrompt;
   } | null>(null);
-  // The conversation id we already auto-sent an initial prompt for, or
-  // null. NOT a bare boolean: ChatPage stays mounted across `/c/:a` →
-  // `/c/:b` (no route `key`), so a boolean once-guard would latch true
-  // after the first auto-send and silently drop the prompt for every
+  // The conversation id whose initial-prompt delivery is in flight (or
+  // done), or null. NOT a bare boolean: ChatPage stays mounted across
+  // `/c/:a` → `/c/:b` (no route `key`), so a boolean once-guard would latch
+  // true after the first delivery and silently drop the prompt for every
   // subsequent new chat created without a full page reload. Keying the
   // guard by conversation id resets it per session while still covering
-  // StrictMode's double-invoke and re-renders within one session.
+  // StrictMode's double-invoke and re-renders within one session — and,
+  // because it is set synchronously before the first dispatch, it is what
+  // stops a retrying delivery from being started twice for one session.
   const initialPromptSentForConvRef = useRef<string | null>(null);
-  // Caches the consumed prompt keyed by conversation id so the consume
-  // effect is idempotent under StrictMode's setup→cleanup→setup
-  // double-invoke. `consumePendingInitialPrompt` is destructive (get +
-  // delete): the first invocation drains the store map, so a naive second
-  // invocation would read null and last-write-wins would settle
-  // `initialPrompt` to null — silently dropping the prompt in dev. By
-  // memoizing the first result per conv id, the second invocation reuses
-  // it. Keyed by id (not a bare value) so it still re-consumes for the
-  // next conversation when ChatPage stays mounted across `/c/:a` → `/c/:b`.
-  const consumedInitialPromptRef = useRef<{
-    conversationId: string;
-    prompt: PendingInitialPrompt | null;
-  } | null>(null);
+  // True while the first message is still being delivered (including the
+  // waits between retries, when nothing else in the UI would show activity
+  // — the runner is offline, so the liveness-derived shimmer is suppressed).
+  const [deliveringInitialPrompt, setDeliveringInitialPrompt] = useState(false);
+  // The session the user is looking at right now, readable from async code
+  // that outlives a render (the delivery loop's cancellation check).
+  const activeConvIdRef = useRef<string | null>(urlConvId ?? null);
+  activeConvIdRef.current = urlConvId ?? null;
   const {
     data: agents,
     error: agentsError,
@@ -779,24 +790,26 @@ export function ChatPage() {
   }, [redirectToConversationId, urlConvId, navigate]);
 
   // Pull the first message the landing composer stashed for this conversation,
-  // if any. Read-once (consume deletes), so a refresh/back can't replay
-  // it. Runs in an effect (not render) because consume mutates the store
-  // map — calling it during render would double-consume under StrictMode.
-  // The per-conv-id cache (consumedInitialPromptRef) makes the consume
-  // idempotent across StrictMode's double-invoke: the first run drains the
-  // map and caches the result; the second run reuses the cache instead of
-  // re-consuming (which would read null and drop the prompt). Resetting to
-  // null when no prompt is pending clears a prior conversation's value
-  // when ChatPage stays mounted across `/c/:a` → `/c/:b`.
+  // if any. The read is non-destructive, so it is idempotent under
+  // StrictMode's double-invoke and — more importantly — survives anything
+  // that re-runs it before the message reaches the server (a remount, a
+  // failed bind, a navigate-away and back). The store entry is dropped by
+  // the delivery effect below, once the POST settles or delivery is finally
+  // given up on. Resetting to null when no prompt is pending clears a prior
+  // conversation's value when ChatPage stays mounted across `/c/:a` → `/c/:b`.
   useEffect(() => {
     if (!urlConvId) {
       setInitialPrompt(null);
+      setDeliveringInitialPrompt(false);
       return;
     }
-    const cached = consumedInitialPromptRef.current;
-    const prompt =
-      cached?.conversationId === urlConvId ? cached.prompt : consumePendingInitialPrompt(urlConvId);
-    consumedInitialPromptRef.current = { conversationId: urlConvId, prompt };
+    const prompt = peekPendingInitialPrompt(urlConvId);
+    const deliveryInFlight = initialPromptDeliveries.has(urlConvId);
+    setDeliveringInitialPrompt(prompt !== null && deliveryInFlight);
+    // Still pending with no loop on the job means a previous delivery stopped.
+    if (prompt !== null && !deliveryInFlight) {
+      initialPromptSentForConvRef.current = null;
+    }
     setInitialPrompt(prompt === null ? null : { conversationId: urlConvId, prompt });
   }, [urlConvId]);
 
@@ -926,19 +939,29 @@ export function ChatPage() {
   // empty composer. Posting through chatStore.send is
   // agent-agnostic: event agents run a turn; native terminal agents
   // (Claude Code / Codex) have the runner inject the text into their
-  // CLI. The consume effect above already read-once-deleted the prompt
-  // from the store, so a refresh/back has nothing to replay. The ref
-  // guard (set synchronously before send, keyed by conversation id) also
-  // covers StrictMode's setup→cleanup→setup double-invoke: it persists
-  // across the remount, so the second setup short-circuits and the prompt
-  // sends once — while still resetting for the next conversation, since
-  // ChatPage stays mounted across `/c/:a` → `/c/:b`.
+  // CLI.
+  //
+  // A single attempt isn't enough: when several sessions are created in a
+  // burst on one host, the runner can take 30s+ to register, past the
+  // server's own hold, and the POST 503s. `deliverInitialPrompt` retries on
+  // a bounded backoff until the POST settles, then drops the store entry;
+  // until it does, the entry stays put so nothing between here and the
+  // server can lose the user's text. The ref guard (set synchronously
+  // before the first dispatch, keyed by conversation id) covers StrictMode's
+  // setup→cleanup→setup double-invoke AND keeps a second delivery loop from
+  // ever running for the same session — while still resetting for the next
+  // conversation, since ChatPage stays mounted across `/c/:a` → `/c/:b`.
   useEffect(() => {
+    const existingDelivery =
+      urlConvId === undefined ? undefined : initialPromptDeliveries.get(urlConvId);
     if (
       !shouldSendInitialPrompt({
         initialPrompt: initialPrompt?.prompt.text ?? null,
         promptConversationId: initialPrompt?.conversationId ?? null,
-        sentForConversationId: initialPromptSentForConvRef.current,
+        // A remounted observer must attach to the existing loop even though
+        // this component already marked the conversation as started.
+        sentForConversationId:
+          existingDelivery === undefined ? initialPromptSentForConvRef.current : null,
         conversationId: urlConvId,
         loadingConversation,
         agentId,
@@ -950,9 +973,63 @@ export function ChatPage() {
     // re-check to narrow the types for send()/the template literal. The
     // predicate already guarantees these, so this never fires at runtime.
     if (initialPrompt === null || !agentId || !urlConvId) return;
-    initialPromptSentForConvRef.current = urlConvId;
-    const { send, sendSlashCommand } = useChatStore.getState();
-    dispatchInitialPrompt(initialPrompt.prompt, agentId, send, sendSlashCommand);
+    const convId = urlConvId;
+    const prompt = initialPrompt.prompt;
+    initialPromptSentForConvRef.current = convId;
+    setDeliveringInitialPrompt(true);
+    let ownsDelivery = false;
+    let delivery = existingDelivery;
+    if (delivery === undefined) {
+      ownsDelivery = true;
+      let cancelled = false;
+      const { send, sendSlashCommand } = useChatStore.getState();
+      const promise = deliverInitialPrompt({
+        prompt,
+        agentId,
+        send,
+        sendSlashCommand,
+        // `send` pins the active store session, so leaving this component or
+        // switching chats cancels before another attempt can target elsewhere.
+        isCancelled: () => cancelled || activeConvIdRef.current !== convId,
+      }).then((outcome) => {
+        if (outcome !== "cancelled") {
+          clearPendingInitialPrompt(convId);
+          if (outcome === "failed") stashUndeliveredPrompt(convId, prompt.text);
+        }
+        return outcome;
+      });
+      const entry: InitialPromptDeliveryEntry = {
+        promise: promise.finally(() => {
+          if (initialPromptDeliveries.get(convId) === entry) {
+            initialPromptDeliveries.delete(convId);
+          }
+        }),
+        cancel: () => {
+          cancelled = true;
+        },
+      };
+      initialPromptDeliveries.set(convId, entry);
+      delivery = entry;
+    }
+
+    let observerCancelled = false;
+    void delivery.promise.then((outcome) => {
+      if (observerCancelled) return;
+      setDeliveringInitialPrompt(false);
+      if (outcome === "cancelled") {
+        const pending = peekPendingInitialPrompt(convId);
+        if (pending !== null && activeConvIdRef.current === convId) {
+          initialPromptSentForConvRef.current = null;
+          setInitialPrompt({ conversationId: convId, prompt: pending });
+        }
+        return;
+      }
+      setInitialPrompt((current) => (current?.conversationId === convId ? null : current));
+    });
+    return () => {
+      observerCancelled = true;
+      if (ownsDelivery) delivery.cancel();
+    };
   }, [initialPrompt, urlConvId, loadingConversation, agentId]);
 
   // Open state owned here (not inside MainAgentSurface) so the dialog
@@ -1056,16 +1133,18 @@ export function ChatPage() {
   const spinUpInFlight =
     sandboxLaunching ||
     Boolean(chatTerminalFirst?.isTerminalFirst && chatTerminalFirst.terminalStartingUp);
-  const showsWorking = computeShowsWorking(sessionStatus, {
-    hasPendingElicitation,
-    runnerOnline,
-    backgroundTaskCount,
-    // Optimistic: light up the moment this client dispatches, without waiting
-    // for the server's ``running``. The sidebar row already reads this same
-    // flag (``isStartingUp`` in Sidebar.tsx), so the two agreed only once the
-    // server confirmed; now they agree immediately.
-    localSendInFlight: status === "streaming" && !spinUpInFlight,
-  });
+  const showsWorking =
+    deliveringInitialPrompt ||
+    computeShowsWorking(sessionStatus, {
+      hasPendingElicitation,
+      runnerOnline,
+      backgroundTaskCount,
+      // Optimistic: light up the moment this client dispatches, without waiting
+      // for the server's ``running``. The sidebar row already reads this same
+      // flag (``isStartingUp`` in Sidebar.tsx), so the two agreed only once the
+      // server confirmed; now they agree immediately.
+      localSendInFlight: status === "streaming" && !spinUpInFlight,
+    });
 
   // A fork of a coding session carries the source id in this label (set by
   // fork_conversation). It is provenance — it persists after the clone is
@@ -1362,7 +1441,7 @@ export function ChatPage() {
       runnerOnline={runnerOnline}
       liveness={liveness}
       agentsError={agentsError}
-      disabled={!agentId || agentsError !== null}
+      disabled={!agentId || agentsError !== null || deliveringInitialPrompt}
       onSend={onSend}
       onSendSlashCommand={onSendSlashCommand}
       onStop={onStop}
@@ -5748,10 +5827,10 @@ export function computeShowsWorking(
  *   means the user switched sessions before the auto-send fired, so the
  *   prompt would leak into the now-active session.
  * @param params.sentForConversationId The conversation id the guard ref
- *   already auto-sent for, or ``null``. When it equals ``conversationId``
- *   the prompt was already dispatched for this session and must not
- *   resend; a different id (a later new chat reusing the mounted
- *   ChatPage) does not block.
+ *   already started delivery for, or ``null``. When it equals
+ *   ``conversationId`` a delivery loop already owns this session and must
+ *   not be started twice; a different id (a later new chat reusing the
+ *   mounted ChatPage) does not block.
  * @param params.conversationId Active session id from the URL, or
  *   ``null``/``undefined`` on the new-chat landing, e.g. ``"conv_abc"``.
  * @param params.loadingConversation ``true`` while the snapshot hydrates.
@@ -5822,25 +5901,144 @@ export function shouldSendResumePrompt(params: {
  * against the runner's real merged skill list once it registers.
  * Exported for unit testing.
  *
- * @param prompt The consumed pending prompt, e.g.
+ * @param prompt The pending prompt, e.g.
  *   ``{ text: "/review-pr 123", skill: { name: "review-pr", args: "123" } }``.
  * @param agentId Resolved agent id, e.g. ``"ag_abc123"``.
- * @param send ``chatStore.send`` — posts a plain user message. Always
- *   called with no files: the landing composer has no attachments.
+ * @param send ``chatStore.send`` — posts a plain user message.
  * @param sendSlashCommand ``chatStore.sendSlashCommand`` — posts a
  *   ``slash_command`` event.
+ * @param opts Forwarded to the store action; ``retryPending`` marks an
+ *   attempt the caller will retry, so the store keeps quiet about the
+ *   failure.
+ * @returns Whether the POST settled, can be retried safely, or is terminal.
  */
 export function dispatchInitialPrompt(
   prompt: PendingInitialPrompt,
   agentId: string,
-  send: (text: string, agentId: string, files: File[]) => Promise<void>,
-  sendSlashCommand: (name: string, args: string, agentId: string) => Promise<void>,
-): void {
-  if (prompt.skill) {
-    void sendSlashCommand(prompt.skill.name, prompt.skill.args, agentId);
-  } else {
-    void send(prompt.text, agentId, prompt.files ?? []);
+  send: (
+    text: string,
+    agentId: string,
+    files: File[],
+    opts?: SendOptions,
+  ) => Promise<SendAttemptResult>,
+  sendSlashCommand: (
+    name: string,
+    args: string,
+    agentId: string,
+    opts?: SendOptions,
+  ) => Promise<SendAttemptResult>,
+  opts?: SendOptions,
+): Promise<SendAttemptResult> {
+  return prompt.skill
+    ? sendSlashCommand(prompt.skill.name, prompt.skill.args, agentId, opts)
+    : send(prompt.text, agentId, prompt.files ?? [], opts);
+}
+
+/**
+ * Backoff before each retry of the landing composer's first message, in ms.
+ *
+ * The first attempt is immediate, so a normal ~6s runner start is entirely
+ * unaffected — the server absorbs that race by holding ``POST /events``
+ * open. These waits only come into play once a hold has already timed out,
+ * and together with each attempt's own server-side hold they cover the
+ * 30s+ runner starts seen when several sessions launch on one host at once.
+ */
+export const INITIAL_PROMPT_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000, 15_000];
+
+/**
+ * Deliver the landing composer's first message, retrying a failed POST on
+ * a bounded backoff.
+ *
+ * Attempts are strictly sequential — the next one starts only after the
+ * previous has resolved as *not settled* — so a retry can never race a
+ * late success into a duplicate message. Cancellation (the user left the
+ * session) is honoured only between attempts, for the same reason: an
+ * in-flight dispatch must report its outcome before the loop stops, or
+ * the caller couldn't tell "nothing landed" from "it landed after we
+ * stopped watching". Exported for unit testing.
+ *
+ * @param params.prompt The pending prompt to deliver.
+ * @param params.agentId Resolved agent id, e.g. ``"ag_abc123"``.
+ * @param params.send ``chatStore.send``.
+ * @param params.sendSlashCommand ``chatStore.sendSlashCommand``.
+ * @param params.isCancelled Polled between attempts; ``true`` stops the loop.
+ * @param params.retryDelaysMs Backoff overrides (tests).
+ * @param params.sleep Timer override (tests).
+ * @returns ``"delivered"`` once the POST settled, ``"cancelled"`` when the
+ *   loop stopped with nothing delivered, or ``"failed"`` when every
+ *   attempt failed — the last of which surfaced the error to the user.
+ */
+export async function deliverInitialPrompt(params: {
+  prompt: PendingInitialPrompt;
+  agentId: string;
+  send: (
+    text: string,
+    agentId: string,
+    files: File[],
+    opts?: SendOptions,
+  ) => Promise<SendAttemptResult>;
+  sendSlashCommand: (
+    name: string,
+    args: string,
+    agentId: string,
+    opts?: SendOptions,
+  ) => Promise<SendAttemptResult>;
+  isCancelled?: () => boolean;
+  retryDelaysMs?: number[];
+  sleep?: (ms: number) => Promise<void>;
+}): Promise<"delivered" | "cancelled" | "failed"> {
+  const delays = params.retryDelaysMs ?? INITIAL_PROMPT_RETRY_DELAYS_MS;
+  const sleep =
+    params.sleep ??
+    ((ms: number) =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, ms);
+      }));
+  const maxAttempts = delays.length + 1;
+  // Sequential by design: each attempt must resolve before the next starts,
+  // or a retry could race a late success into a duplicate message — hence
+  // the awaits in the loop below.
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const isFinal = attempt === maxAttempts - 1;
+    // The store actions settle their own failures; a rejection here would
+    // be an unexpected one, and treating it as "not settled" keeps the loop
+    // (and the caller's bookkeeping) alive rather than stranding the prompt.
+    // eslint-disable-next-line no-await-in-loop
+    const result = await dispatchInitialPrompt(
+      params.prompt,
+      params.agentId,
+      params.send,
+      params.sendSlashCommand,
+      // Only the final attempt lets the store paint the failure: an error
+      // block per attempt would stack failures the next attempt resolves.
+      { retryPending: !isFinal },
+    ).catch((): SendAttemptResult => "terminal_failure");
+    if (result === "settled") return "delivered";
+    if (result === "terminal_failure") return "failed";
+    if (isFinal) return "failed";
+    if (params.isCancelled?.() === true) return "cancelled";
+    // eslint-disable-next-line no-await-in-loop
+    await sleep(delays[attempt] ?? 0);
+    if (params.isCancelled?.() === true) return "cancelled";
   }
+  return "failed";
+}
+
+/**
+ * Park an undelivered first message in the session's composer draft.
+ *
+ * Last line of defence for requirement "never lose what the user typed":
+ * when every delivery attempt failed, the error block explains why and the
+ * text comes back in the composer the next time the session is opened
+ * (it is also in the session's ArrowUp prompt history). Never overwrites an
+ * existing draft — the user may have typed something since.
+ *
+ * @param conversationId Session the prompt was meant for, e.g. ``"conv_abc"``.
+ * @param text The undelivered message text.
+ */
+export function stashUndeliveredPrompt(conversationId: string, text: string): void {
+  if (!text || getSessionDraft(conversationId) !== undefined) return;
+  setSessionDraft(conversationId, { text, files: [] });
 }
 
 /**

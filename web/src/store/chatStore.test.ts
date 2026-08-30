@@ -55,7 +55,8 @@ import type { TerminalInfo } from "@/hooks/useTerminals";
 import { terminalsQueryKey } from "@/hooks/useTerminals";
 import { type ChildSessionInfo, childSessionsQueryKey } from "@/hooks/useChildSessions";
 import {
-  consumePendingInitialPrompt,
+  clearPendingInitialPrompt,
+  peekPendingInitialPrompt,
   handleSessionEvent,
   isStaleCompletedResponse,
   initChatStore,
@@ -2196,9 +2197,10 @@ describe("chatStore — send (first-send ordering)", () => {
       return defaultFetchHandler(input, init);
     });
 
-    await useChatStore.getState().send("hi", "agent_xyz");
+    const result = await useChatStore.getState().send("hi", "agent_xyz");
 
     const state = useChatStore.getState();
+    expect(result).toBe("retryable_failure");
     // Optimistic bubble rolled back, turn settled to idle.
     expect(state.pendingUserMessages).toEqual([]);
     expect(state.status).toBe("idle");
@@ -2213,6 +2215,105 @@ describe("chatStore — send (first-send ordering)", () => {
       message: "The runner didn't come online in time. Please try again.",
       code: "",
     });
+  });
+
+  it("keeps only a retryable runner-unavailable attempt silent and draft-free", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      status: "idle",
+      blocks: [],
+      failedSendDraft: null,
+    });
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/events")) {
+        return mockResponse(
+          { error: { code: "runner_unavailable", message: "No runner bound for session" } },
+          { ok: false, status: 503 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const result = await useChatStore
+      .getState()
+      .send("hi", "agent_xyz", [], { retryPending: true });
+
+    const state = useChatStore.getState();
+    expect(result).toBe("retryable_failure");
+    expect(state.blocks.filter((block) => block.type === "error")).toEqual([]);
+    expect(state.failedSendDraft).toBeNull();
+  });
+
+  it("surfaces an ambiguous failure even when a caller requested retries", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      status: "idle",
+      blocks: [],
+      failedSendDraft: null,
+    });
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/events")) {
+        return Promise.reject(new TypeError("response lost after send"));
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const result = await useChatStore
+      .getState()
+      .send("do this once", "agent_xyz", [], { retryPending: true });
+
+    const state = useChatStore.getState();
+    expect(result).toBe("terminal_failure");
+    expect(state.failedSendDraft).toMatchObject({
+      conversationId: "conv_existing",
+      text: "do this once",
+    });
+    expect(state.blocks.filter((block) => block.type === "error")).toHaveLength(1);
+  });
+
+  it("settles post-persistence runner failures without restoring a duplicate draft", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      status: "idle",
+      blocks: [],
+      failedSendDraft: null,
+    });
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/events")) {
+        return mockResponse(
+          {
+            error: {
+              code: "runner_unavailable",
+              message: "Runner is unreachable; message was persisted but could not be delivered.",
+            },
+          },
+          { ok: false, status: 503 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const result = await useChatStore
+      .getState()
+      .send("do this once", "agent_xyz", [], { retryPending: true });
+
+    const state = useChatStore.getState();
+    expect(result).toBe("settled");
+    expect(state.failedSendDraft).toBeNull();
+    expect(state.pendingUserMessages).toHaveLength(1);
+    expect(state.pendingUserMessages[0]?.posted).toBe(true);
+    expect(state.blocks.filter((block) => block.type === "error")).toMatchObject([
+      {
+        message: "Runner is unreachable; message was persisted but could not be delivered.",
+        code: "runner_unavailable",
+      },
+    ]);
   });
 
   it("carries a non-runner send failure's own message into the error block", async () => {
@@ -2236,9 +2337,10 @@ describe("chatStore — send (first-send ordering)", () => {
       return defaultFetchHandler(input, init);
     });
 
-    await useChatStore.getState().send("hi", "agent_xyz");
+    const result = await useChatStore.getState().send("hi", "agent_xyz");
 
     const errorBlocks = useChatStore.getState().blocks.filter((b) => b.type === "error");
+    expect(result).toBe("terminal_failure");
     expect(errorBlocks).toHaveLength(1);
     expect(errorBlocks[0]).toMatchObject({
       type: "error",
@@ -9129,36 +9231,62 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 });
 
 // The first-message handoff from the landing composer to ChatPage. The
-// read-once delete is what replaces the old router-state clear: it must
-// return the prompt exactly once so a refresh/back can't replay it.
+// read is deliberately NON-destructive: the entry is the only copy of the
+// user's typed text, so it must survive every re-read between arriving on
+// the chat page and the message settling on the server. Only an explicit
+// clear (after delivery) drops it, which is what stops a replay.
 describe("pending initial prompt transport", () => {
-  it("returns the stashed prompt exactly once, then null", () => {
+  it("returns the stashed prompt on every read until it is cleared", () => {
     setPendingInitialPrompt("conv_abc", { text: "read the README", skill: null });
-    // First consume yields the stashed prompt verbatim.
-    expect(consumePendingInitialPrompt("conv_abc")).toEqual({
+    // Repeated reads all yield the stashed prompt verbatim — a remount, a
+    // failed bind, or a StrictMode double-invoke must not drain it.
+    expect(peekPendingInitialPrompt("conv_abc")).toEqual({
       text: "read the README",
       skill: null,
     });
-    // Second consume yields null — the delete prevents a replay.
-    expect(consumePendingInitialPrompt("conv_abc")).toBeNull();
+    expect(peekPendingInitialPrompt("conv_abc")).toEqual({
+      text: "read the README",
+      skill: null,
+    });
+    clearPendingInitialPrompt("conv_abc");
+    // Cleared once delivery settled — a refresh/back can't replay it.
+    expect(peekPendingInitialPrompt("conv_abc")).toBeNull();
   });
 
   it("returns null for a conversation with no pending prompt", () => {
-    expect(consumePendingInitialPrompt("conv_never_set")).toBeNull();
+    expect(peekPendingInitialPrompt("conv_never_set")).toBeNull();
+  });
+
+  it("survives a re-read after a failed startup request re-runs the page", () => {
+    // A supporting request that 500s while the runner boots (the terminals
+    // listing, say) re-renders — and can remount — the chat page, which
+    // re-reads the prompt. Under the old read-once transport that second
+    // read drained the map and the typed text was gone for good.
+    setPendingInitialPrompt("conv_slow_runner", { text: "read the README", skill: null });
+    expect(peekPendingInitialPrompt("conv_slow_runner")).not.toBeNull();
+    expect(peekPendingInitialPrompt("conv_slow_runner")).toEqual({
+      text: "read the README",
+      skill: null,
+    });
+    clearPendingInitialPrompt("conv_slow_runner");
   });
 
   it("ignores a blank prompt so a blank message never auto-sends", () => {
     setPendingInitialPrompt("conv_blank", { text: "", skill: null });
-    // Nothing was stored, so the consume reads null.
-    expect(consumePendingInitialPrompt("conv_blank")).toBeNull();
+    // Nothing was stored, so the read yields null.
+    expect(peekPendingInitialPrompt("conv_blank")).toBeNull();
   });
 
   it("keys prompts by conversation id so they don't cross sessions", () => {
     setPendingInitialPrompt("conv_a", { text: "prompt for A", skill: null });
     setPendingInitialPrompt("conv_b", { text: "prompt for B", skill: null });
-    // Each conversation consumes only its own prompt.
-    expect(consumePendingInitialPrompt("conv_b")).toEqual({ text: "prompt for B", skill: null });
-    expect(consumePendingInitialPrompt("conv_a")).toEqual({ text: "prompt for A", skill: null });
+    // Each conversation reads only its own prompt, and clearing one leaves
+    // the other pending.
+    expect(peekPendingInitialPrompt("conv_b")).toEqual({ text: "prompt for B", skill: null });
+    clearPendingInitialPrompt("conv_b");
+    expect(peekPendingInitialPrompt("conv_b")).toBeNull();
+    expect(peekPendingInitialPrompt("conv_a")).toEqual({ text: "prompt for A", skill: null });
+    clearPendingInitialPrompt("conv_a");
   });
 
   it("carries a matched skill invocation through intact", () => {
@@ -9170,10 +9298,11 @@ describe("pending initial prompt transport", () => {
       text: "/review-pr 123 focus on auth",
       skill: { name: "review-pr", args: "123 focus on auth" },
     });
-    expect(consumePendingInitialPrompt("conv_skill")).toEqual({
+    expect(peekPendingInitialPrompt("conv_skill")).toEqual({
       text: "/review-pr 123 focus on auth",
       skill: { name: "review-pr", args: "123 focus on auth" },
     });
+    clearPendingInitialPrompt("conv_skill");
   });
 });
 

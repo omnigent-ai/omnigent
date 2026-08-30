@@ -136,7 +136,17 @@ export interface SendOptions {
    * `send` already set `conversationId` before the callback.
    */
   onConversationCreated?: (conversationId: string) => void;
+  /**
+   * The initial-prompt delivery loop can retry a proven-safe
+   * runner-unavailable 503. Suppresses that transient attempt's draft and
+   * error surface; all other failures remain terminal and visible because
+   * their server-acceptance state may be ambiguous.
+   */
+  retryPending?: boolean;
 }
+
+/** Result of one message or slash-command POST attempt. */
+export type SendAttemptResult = "settled" | "retryable_failure" | "terminal_failure";
 
 /**
  * A user message awaiting its `session.input.consumed` event.
@@ -643,7 +653,15 @@ export interface AppChatState {
 
 /** Actions exposed on the root store. */
 export interface ChatActions {
-  send: (text: string, agentId: string, files?: File[], opts?: SendOptions) => Promise<void>;
+  /**
+   * Post a user message and classify whether a failed attempt is safe to retry.
+   */
+  send: (
+    text: string,
+    agentId: string,
+    files?: File[],
+    opts?: SendOptions,
+  ) => Promise<SendAttemptResult>;
   /**
    * Queue a message client-side instead of POSTing it now, for a send made
    * while the agent is busy. The head is flushed automatically (FIFO, one per
@@ -703,13 +721,14 @@ export interface ChatActions {
    *
    * :param name: Skill name without the leading ``/``, e.g. ``"grill-me"``.
    * :param args: Raw argument text typed after the command, ``""`` if none.
+   * :returns: The same retry classification as ``send``.
    */
   sendSlashCommand: (
     name: string,
     args: string,
     agentId: string,
     opts?: SendOptions,
-  ) => Promise<void>;
+  ) => Promise<SendAttemptResult>;
   stop: () => void;
   switchTo: (conversationId: string | null) => Promise<void>;
   submitApproval: (
@@ -1273,21 +1292,36 @@ export function setPendingInitialPrompt(
 }
 
 /**
- * Read and remove the pending first message for a conversation. Read-once
- * (get + delete): the delete is what prevents a refresh/back from
- * replaying the prompt, replacing the old `navigate(..., { state: null })`
- * clear.
+ * Read the pending first message for a conversation WITHOUT removing it.
  *
- * @param conversationId The conversation id to consume for, e.g.
+ * Non-destructive on purpose: the entry is the only copy of the user's
+ * typed text, so it must survive everything between arriving on
+ * `/c/:id` and the message actually reaching the server — a ChatPage
+ * remount, a StrictMode double-invoke, a failed session bind, a
+ * supporting request 500ing while the runner boots, or a navigate-away
+ * and back. Only `clearPendingInitialPrompt` (called once delivery
+ * succeeds or is finally given up on) drops it, which is also what
+ * keeps a refresh/back from replaying an already-sent prompt.
+ *
+ * @param conversationId The conversation id to read for, e.g.
  *   `"conv_abc123"`.
- * @returns The stashed prompt, or `null` when none was set (or it was
- *   already consumed).
+ * @returns The stashed prompt, or `null` when none is pending.
  */
-export function consumePendingInitialPrompt(conversationId: string): PendingInitialPrompt | null {
-  const prompt = pendingInitialPrompts.get(conversationId);
-  if (prompt === undefined) return null;
+export function peekPendingInitialPrompt(conversationId: string): PendingInitialPrompt | null {
+  return pendingInitialPrompts.get(conversationId) ?? null;
+}
+
+/**
+ * Drop the pending first message for a conversation.
+ *
+ * Called once the message has settled on the server, or once delivery
+ * has been given up on and the failure surfaced to the user — never
+ * merely because it was read.
+ *
+ * @param conversationId The conversation id to clear, e.g. `"conv_abc123"`.
+ */
+export function clearPendingInitialPrompt(conversationId: string): void {
   pendingInitialPrompts.delete(conversationId);
-  return prompt;
 }
 
 export const useChatStore = create<ChatState>((_rootSet, get) => ({
@@ -1640,6 +1674,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // The session this send actually posts to, once resolved. Read in the
     // catch to decide whether a failure may touch the active session's UI.
     let postedSessionId: string | null = null;
+    // Only the server's explicit pre-acceptance runner-unavailable response
+    // is safe to replay. Other failures may follow server acceptance.
+    let result: SendAttemptResult = "terminal_failure";
 
     try {
       await waitForPrior();
@@ -1684,6 +1721,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           content: serverContent,
         },
       });
+      result = "settled";
       // Policy denied the input — the server returned immediately
       // without starting a turn or persisting the user message, so
       // no session.input.consumed will reconcile this exact optimistic
@@ -1731,6 +1769,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch (err) {
       const { message, code } = describeSendFailure(err);
+      const retryableFailure = isSafeInitialPromptRetry(err);
+      const persistedFailure = isPersistedRunnerFailure(err);
+      const suppressFailure = opts?.retryPending === true && retryableFailure;
+      result = persistedFailure
+        ? "settled"
+        : retryableFailure
+          ? "retryable_failure"
+          : "terminal_failure";
       // Hand the failed message back to the composer so the user can retry it —
       // a failed send has no server-side record, so nothing else would restore
       // it. Keyed by the session it was meant for, so it lands in the right
@@ -1738,7 +1784,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // (`failedSendDraft` is conversation-scoped); the composer reads whichever
       // conversation is active and guards on the id before restoring.
       const draftSessionId = postedSessionId ?? submitConversationId;
-      if (draftSessionId !== null && (text.trim() !== "" || (files?.length ?? 0) > 0)) {
+      if (
+        !suppressFailure &&
+        !persistedFailure &&
+        draftSessionId !== null &&
+        (text.trim() !== "" || (files?.length ?? 0) > 0)
+      ) {
         setterFor(draftSessionId)({
           failedSendDraft: { conversationId: draftSessionId, text, files: files ?? [] },
         });
@@ -1751,12 +1802,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const failSet = postedSessionId === null ? setActive : setterFor(postedSessionId);
       const failGet = (): ChatState =>
         postedSessionId === null ? get() : (setterForState(postedSessionId) ?? get());
-      // Roll back the optimistic bubble — no server idle will fire.
+      // A post-persistence forwarding failure has a durable server item even
+      // though the POST failed. Keep its optimistic bubble until snapshot
+      // reconciliation; restoring the same text would invite a duplicate.
       failSet((s) => ({
-        pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+        pendingUserMessages: persistedFailure
+          ? s.pendingUserMessages.map((p) => (p.tempId === tempId ? { ...p, posted: true } : p))
+          : s.pendingUserMessages.filter((p) => p.tempId !== tempId),
       }));
       if (!alreadyStreaming) {
-        if (failGet().activeResponse !== null) {
+        if (suppressFailure) {
+          // The bounded initial-prompt retry loop owns the final error surface.
+        } else if (failGet().activeResponse !== null) {
           // A response bubble already exists (the turn started, then failed)
           // — mark it failed so the error rides on that bubble.
           finalizeActive(failSet, "failed", message, null);
@@ -1773,7 +1830,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           backgroundTaskCount: 0,
           backgroundTasks: [],
         });
-      } else {
+      } else if (!suppressFailure) {
         // Sent alongside an already-streaming turn (or a stranded latch): the
         // bubble is rolled back above, so without a block the message vanishes
         // with no trace — the failure mode that makes this class of bug so hard
@@ -1787,6 +1844,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // failed POST can't stall the chain forever.
       releaseSend();
     }
+    return result;
   },
 
   sendSlashCommand: async (name, args, agentId, opts) => {
@@ -1832,6 +1890,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
     // The session this command actually posts to, once resolved.
     let postedSessionId: string | null = null;
+    // Retry classification mirrors `send`.
+    let result: SendAttemptResult = "terminal_failure";
 
     try {
       await waitForPrior();
@@ -1845,6 +1905,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         type: "slash_command",
         data: { kind: "skill", name, arguments: args },
       });
+      result = "settled";
       if (postResult.denied) {
         // Denied commands publish no receipt, so nothing will pop the
         // optimistic echo — roll it back here alongside the status settle.
@@ -1879,20 +1940,36 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      const retryableFailure = isSafeInitialPromptRetry(err);
+      const persistedFailure = isPersistedRunnerFailure(err);
+      const suppressFailure = opts?.retryPending === true && retryableFailure;
+      result = persistedFailure
+        ? "settled"
+        : retryableFailure
+          ? "retryable_failure"
+          : "terminal_failure";
       // Settle the conversation this command targeted, wherever the user is
       // now: its echo must roll back and its status must not stay "streaming"
       // forever. A throw from session setup itself (`postedSessionId` never
       // resolved) has no target conversation, so it belongs to the active one —
       // the landing composer's own failure. Mirrors `send`'s catch.
       const failSet = postedSessionId === null ? setActive : setterFor(postedSessionId);
-      // Roll back the optimistic echo — no receipt will reconcile it.
+      const draftSessionId = postedSessionId ?? submitConversationId;
+      if (!suppressFailure && !persistedFailure && draftSessionId !== null) {
+        setterFor(draftSessionId)({
+          failedSendDraft: { conversationId: draftSessionId, text: commandText, files: [] },
+        });
+      }
+      // Keep an echo the server says it persisted; snapshots reconcile it.
       failSet((s) => ({
-        pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+        pendingUserMessages: persistedFailure
+          ? s.pendingUserMessages.map((p) => (p.tempId === tempId ? { ...p, posted: true } : p))
+          : s.pendingUserMessages.filter((p) => p.tempId !== tempId),
       }));
       if (!alreadyStreaming) {
-        finalizeActive(failSet, "failed", message, null);
+        if (!suppressFailure) finalizeActive(failSet, "failed", message, null);
         failSet({ status: "idle" });
-      } else {
+      } else if (!suppressFailure) {
         // Same as `send`: surface the failure without settling a turn that may
         // still be live, so a failed command can't vanish silently.
         const { code } = describeSendFailure(err);
@@ -1901,6 +1978,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     } finally {
       releaseSend();
     }
+    return result;
   },
 
   stop: () => {
@@ -6126,6 +6204,30 @@ function finalizeActive(
 const RUNNER_UNAVAILABLE_CODE = "runner_unavailable";
 
 /**
+ * Only this exact legacy response proves the event was rejected before
+ * persistence. The server also uses `runner_unavailable` after persistence
+ * when forwarding fails, so status and code alone are unsafe to replay.
+ */
+function isSafeInitialPromptRetry(err: unknown): boolean {
+  return (
+    err instanceof ApiError &&
+    err.status === 503 &&
+    err.code === RUNNER_UNAVAILABLE_CODE &&
+    err.message === "No runner bound for session"
+  );
+}
+
+/** The server persisted this input before its runner forward failed. */
+function isPersistedRunnerFailure(err: unknown): boolean {
+  return (
+    err instanceof ApiError &&
+    err.status === 503 &&
+    err.code === RUNNER_UNAVAILABLE_CODE &&
+    err.message.startsWith("Runner is unreachable; message was persisted")
+  );
+}
+
+/**
  * Turn a thrown send failure into user-facing banner text + a code.
  *
  * The runner-unavailable 503 gets self-explanatory copy (and no raw code in
@@ -6135,7 +6237,7 @@ const RUNNER_UNAVAILABLE_CODE = "runner_unavailable";
  * when present for debuggability.
  */
 function describeSendFailure(err: unknown): { message: string; code: string } {
-  if (err instanceof ApiError && err.code === RUNNER_UNAVAILABLE_CODE) {
+  if (isSafeInitialPromptRetry(err)) {
     return {
       message: "The runner didn't come online in time. Please try again.",
       code: "",
