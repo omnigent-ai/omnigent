@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import { clearSessionDrafts, hasSessionDraft } from "@/lib/sessionDrafts";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
@@ -105,6 +106,23 @@ function textarea() {
   return screen.getByLabelText("Message the agent") as HTMLTextAreaElement;
 }
 
+function forceDesktopCoarsePointer(): () => void {
+  const original = window.matchMedia;
+  window.matchMedia = ((query: string) => ({
+    matches: query.includes("pointer: coarse"),
+    media: query,
+    onchange: null,
+    addListener: () => {},
+    removeListener: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    dispatchEvent: () => false,
+  })) as typeof window.matchMedia;
+  return () => {
+    window.matchMedia = original;
+  };
+}
+
 /** The currently highlighted menu row, or null when none is highlighted. */
 function activeRow(): HTMLElement | null {
   return document.querySelector('[data-active="true"]');
@@ -112,6 +130,12 @@ function activeRow(): HTMLElement | null {
 
 function renderWithTooltips(ui: ReactElement) {
   return render(<TooltipProvider>{ui}</TooltipProvider>);
+}
+
+function tooltipKeys(tooltip: HTMLElement): string[] {
+  return Array.from(tooltip.querySelectorAll('[data-slot="kbd"]')).map(
+    (key) => key.textContent ?? "",
+  );
 }
 
 describe("Composer session drafts", () => {
@@ -181,6 +205,94 @@ describe("Composer growth layout", () => {
       "[&::-webkit-scrollbar]:hidden",
     );
     expect(ta.parentElement).toHaveClass("overflow-hidden");
+  });
+});
+
+describe("Composer send shortcut", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    clearSessionDrafts();
+    useChatStore.setState({
+      conversationId: "conv_shortcut",
+      skills: [{ name: "deslop", description: "Remove AI slop" }],
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    clearSessionDrafts();
+  });
+
+  it("keeps Enter and the legacy Mod+Enter alias in default mode", () => {
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    fireEvent.change(textarea(), { target: { value: "legacy alias" } });
+    fireEvent.keyDown(textarea(), { key: "Enter", metaKey: true });
+    expect(onSend).toHaveBeenCalledWith("legacy alias", undefined);
+
+    fireEvent.change(textarea(), { target: { value: "default shortcut" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(onSend).toHaveBeenLastCalledWith("default shortcut", undefined);
+  });
+
+  it("uses Mod+Enter after the alternate preference is restored", () => {
+    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    fireEvent.change(textarea(), { target: { value: "alternate shortcut" } });
+
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(textarea(), { key: "Enter", metaKey: true });
+    expect(onSend.mock.calls[0]?.[0]).toBe("alternate shortcut");
+  });
+
+  it("shows the alternate Send shortcut in the button tooltip", async () => {
+    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "ready to send" } });
+
+    fireEvent.pointerMove(screen.getByRole("button", { name: "Send" }), {
+      pointerType: "mouse",
+    });
+    const tooltip = await screen.findByRole("tooltip");
+
+    expect(within(tooltip).getByText("Send")).toBeInTheDocument();
+    expect(tooltipKeys(tooltip)).toEqual(["Ctrl", "↵"]);
+  });
+
+  it("keeps Enter native and hides its hint on a desktop-width coarse pointer", () => {
+    const restorePointer = forceDesktopCoarsePointer();
+    const onSend = vi.fn();
+    try {
+      render(<Composer {...composerProps({ onSend })} />);
+      fireEvent.change(textarea(), { target: { value: "/des" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(textarea().value).toBe("/des");
+      expect(onSend).not.toHaveBeenCalled();
+
+      fireEvent.focus(screen.getByRole("button", { name: "Send" }));
+      expect(screen.queryByRole("tooltip")).toBeNull();
+    } finally {
+      restorePointer();
+    }
+  });
+
+  it("keeps plain Enter completion while Mod+Enter bypasses an open slash menu", () => {
+    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    fireEvent.change(textarea(), { target: { value: "/des" } });
+
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(textarea().value).toBe("/deslop ");
+    expect(onSend).not.toHaveBeenCalled();
+
+    fireEvent.change(textarea(), { target: { value: "/des" } });
+    fireEvent.keyDown(textarea(), { key: "Enter", ctrlKey: true });
+    expect(onSend.mock.calls[0]?.[0]).toBe("/des");
   });
 });
 

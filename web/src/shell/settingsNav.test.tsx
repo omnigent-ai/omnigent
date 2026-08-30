@@ -15,7 +15,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 const mocks = vi.hoisted(() => ({
   accountsEnabled: false,
   // login_url: non-null for any sign-in mode (accounts OR OIDC), null in
-  // header mode. Gates the Account section + the bare-/settings default.
+  // header mode. Gates the Account section.
   loginUrl: null as string | null,
   // single_user: the server's explicit single-user marker. A multi-user
   // header-auth deploy reports false even though it has no accounts / login,
@@ -246,6 +246,7 @@ describe("SettingsSidebarBody", () => {
       "href",
       "/c/conv_123?file=foo.ts",
     );
+    expect(screen.getByTestId("settings-nav-general")).toHaveAttribute("aria-current", "page");
   });
 
   it("DOES close the sidebar when a section is tapped (drills into content)", () => {
@@ -349,12 +350,12 @@ describe("useSettingsRoute", () => {
   it("redirects a direct /settings/members or /settings/sharing to the default section in single-user mode", () => {
     // Explicit single-user local runtime (single_user marker): Members and
     // Sharing are hidden, so a direct hit to either falls back to the default
-    // section (Appearance). Policies stays valid — it's functional single-user.
+    // section (General). Policies stays valid — it's functional single-user.
     mocks.accountsEnabled = false;
     mocks.loginUrl = null;
     mocks.singleUser = true;
-    expect(routeHook("/settings/members")).toEqual({ inSettings: true, section: "appearance" });
-    expect(routeHook("/settings/sharing")).toEqual({ inSettings: true, section: "appearance" });
+    expect(routeHook("/settings/members")).toEqual({ inSettings: true, section: "general" });
+    expect(routeHook("/settings/sharing")).toEqual({ inSettings: true, section: "general" });
     expect(routeHook("/settings/policies")).toEqual({ inSettings: true, section: "policies" });
   });
 
@@ -365,7 +366,7 @@ describe("useSettingsRoute", () => {
     expect(routeHook("/policies").inSettings).toBe(false);
   });
 
-  it("keeps recognizing the other settings sections and their bare-path default", () => {
+  it("keeps explicit settings sections and defaults bare or unknown sections to General", () => {
     expect(routeHook("/settings/appearance")).toEqual({
       inSettings: true,
       section: "appearance",
@@ -374,17 +375,18 @@ describe("useSettingsRoute", () => {
       inSettings: true,
       section: "updates",
     });
-    // Bare /settings: in-settings, defaulting to Appearance in header mode
-    // (no login session — loginUrl null per beforeEach).
-    expect(routeHook("/settings")).toEqual({ inSettings: true, section: "appearance" });
+    expect(routeHook("/settings")).toEqual({ inSettings: true, section: "general" });
+    expect(routeHook("/settings/not-a-section")).toEqual({
+      inSettings: true,
+      section: "general",
+    });
     // A non-settings route is out of settings.
     expect(routeHook("/inbox").inSettings).toBe(false);
   });
 
-  it("defaults bare /settings to Account when a login session exists", () => {
-    // login_url set (accounts OR OIDC) → Account is the landing section.
+  it("keeps General as the bare settings default when a login session exists", () => {
     mocks.loginUrl = "/login";
-    expect(routeHook("/settings")).toEqual({ inSettings: true, section: "account" });
+    expect(routeHook("/settings")).toEqual({ inSettings: true, section: "general" });
   });
 
   it("matches the settings segment under an embed basename", () => {

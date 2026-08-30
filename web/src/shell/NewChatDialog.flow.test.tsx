@@ -1869,6 +1869,9 @@ describe("create-session input on touch-primary devices", () => {
       // intercepted, so the composer still holds the user's draft.
       expect(authenticatedFetch).not.toHaveBeenCalled();
       expect(navigateMock).not.toHaveBeenCalled();
+
+      fireEvent.focus(screen.getByTestId("new-chat-landing-submit"));
+      expect(screen.queryByRole("tooltip")).toBeNull();
     } finally {
       matchMediaSpy.mockRestore();
     }

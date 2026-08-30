@@ -93,6 +93,7 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
+import { MOD_KEY } from "@/components/KeyboardShortcut";
 import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
 import { changePassword, logout } from "@/lib/accountsApi";
 import { getCurrentIsAdmin, getCurrentUserId, resolveIdentity } from "@/lib/identity";
@@ -169,6 +170,10 @@ import {
 } from "@/lib/transcriptViewPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import {
+  readSubmitWithModEnter,
+  writeSubmitWithModEnter,
+} from "@/lib/composerSendShortcutPreferences";
 import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import {
   DEFAULT_HIDE_UNCONFIGURED_HARNESSES,
@@ -1086,14 +1091,50 @@ function AlwaysSteerControl() {
   );
 }
 
+function ComposerSendShortcutControl() {
+  const [enabled, setEnabled] = useState(() => readSubmitWithModEnter());
+  const labelId = useId();
+  const descriptionId = useId();
+  const toggle = useCallback((next: boolean) => {
+    setEnabled(next);
+    writeSubmitWithModEnter(next);
+  }, []);
+
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span id={labelId} className="text-ui font-medium">
+          Submit with {MOD_KEY} + Enter on desktop
+        </span>
+        <div id={descriptionId} className="text-ui text-muted-foreground">
+          <p>Off: Enter submits and Shift+Enter inserts a newline.</p>
+          <p>On: Enter inserts a newline and {MOD_KEY}+Enter submits.</p>
+        </div>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        aria-describedby={descriptionId}
+        checked={enabled}
+        onCheckedChange={toggle}
+        data-testid="composer-submit-with-mod-enter-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.submit_with_mod_enter"
+      />
+    </div>
+  );
+}
+
 /** App-wide behavior settings. */
 function GeneralSection() {
   return (
     <Section title="General" description="Configure general Omnigent behavior.">
       <div className="flex flex-col gap-3">
         <h2 className="text-ui font-medium">Composer</h2>
-        <div className="rounded-xl border border-border bg-card px-4 py-3">
-          <AlwaysSteerControl />
+        <div className="rounded-xl border border-border bg-card p-4">
+          <ComposerSendShortcutControl />
+          <div className="mt-4 border-t border-border pt-4">
+            <AlwaysSteerControl />
+          </div>
         </div>
       </div>
     </Section>
