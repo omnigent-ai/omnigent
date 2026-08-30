@@ -4,7 +4,7 @@ import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
@@ -157,6 +157,37 @@ describe("Composer session drafts", () => {
 
     fireEvent.submit(textarea().closest("form")!);
     await waitFor(() => expect(hasSessionDraft("conv_draft")).toBe(false));
+  });
+
+  it("consumes one unchanged draft only once when submit is re-entered", () => {
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    const form = textarea().closest("form")!;
+    fireEvent.change(textarea(), { target: { value: "send once" } });
+
+    act(() => {
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend).toHaveBeenCalledWith("send once", undefined);
+  });
+
+  it("allows two intentional submits with identical text", async () => {
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    const form = textarea().closest("form")!;
+
+    fireEvent.change(textarea(), { target: { value: "same text" } });
+    fireEvent.submit(form);
+    await Promise.resolve();
+    fireEvent.change(textarea(), { target: { value: "same text" } });
+    fireEvent.submit(form);
+
+    expect(onSend).toHaveBeenCalledTimes(2);
+    expect(onSend).toHaveBeenNthCalledWith(1, "same text", undefined);
+    expect(onSend).toHaveBeenNthCalledWith(2, "same text", undefined);
   });
 });
 

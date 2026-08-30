@@ -969,11 +969,8 @@ export function ChatPage() {
   // would replay into whatever session is active when a runner next comes
   // online — leaking the message into a different conversation. Keyed by
   // session id, it only ever replays into the clone it was meant for.
-  const [pendingResumePrompt, setPendingResumePrompt] = useState<{
-    sessionId: string;
-    text: string;
-    files: File[];
-  } | null>(null);
+  const [pendingResumePrompt, setPendingResumePrompt] = useState<ResumePrompt | null>(null);
+  const sentResumePromptRef = useRef<ResumePrompt | null>(null);
 
   // Replay the queued message once the picker's bind brings the runner
   // online — but ONLY while still viewing the session it was pinned to.
@@ -982,9 +979,19 @@ export function ChatPage() {
   // effect uses. If the user switched away before the clone started, the
   // prompt stays pinned and waits; it never floats into another session.
   useEffect(() => {
-    if (pendingResumePrompt === null || !agentId || !urlConvId) return;
-    if (pendingResumePrompt.sessionId !== urlConvId) return;
-    if (runnerOnline !== true) return;
+    if (
+      !shouldSendResumePrompt({
+        pendingPrompt: pendingResumePrompt,
+        sentPrompt: sentResumePromptRef.current,
+        conversationId: urlConvId,
+        agentId,
+        runnerOnline,
+      })
+    ) {
+      return;
+    }
+    if (pendingResumePrompt === null || !agentId) return;
+    sentResumePromptRef.current = pendingResumePrompt;
     const { text, files } = pendingResumePrompt;
     setPendingResumePrompt(null);
     void useChatStore.getState().send(text, agentId, files);
@@ -4450,6 +4457,7 @@ export function Composer({
   valueRef.current = value;
   const filesRef = useRef(files);
   filesRef.current = files;
+  const submitGuardRef = useRef(false);
   // Guards against React StrictMode double-invoke in development:
   // setup → cleanup → setup runs cleanup before the user has touched
   // the input, which would delete the draft. Only save when the user
@@ -4640,6 +4648,15 @@ export function Composer({
   // Depends on mentionedItems (from the hook above), so it's computed here.
   const hasDraft = value.trim().length > 0 || files.length > 0 || mentionedItems.length > 0;
   const showInterruptButton = isWorking && !hasDraft;
+
+  // Keep one draft consumed until React commits its changed/cleared state.
+  // A microtask is too short here: browsers can run it between two delivered
+  // form events, before the controlled textarea has committed its empty value.
+  // Once any draft part changes, a new submit is allowed—even with identical
+  // text—so an intentional second entry remains distinct.
+  useEffect(() => {
+    submitGuardRef.current = false;
+  }, [value, files, mentionedItems]);
 
   // Drain externally-queued attachments (file viewer "Attach to agent") into
   // the local mention chips, deduping against what's already tagged, then
@@ -4910,6 +4927,11 @@ export function Composer({
       hasPendingElicitation
     )
       return;
+
+    // A key event and the form submit can reach this callback before React
+    // commits the cleared draft. Treat those re-entrant calls as one submit.
+    if (submitGuardRef.current) return;
+    submitGuardRef.current = true;
 
     // A send is actually happening: report it for both pointer clicks (which
     // reach here via the form submit) and Enter-key sends. Placed after the
@@ -5763,6 +5785,27 @@ export function shouldSendInitialPrompt(params: {
   if (!params.conversationId || params.loadingConversation || !params.agentId) {
     return false;
   }
+  return true;
+}
+
+interface ResumePrompt {
+  sessionId: string;
+  text: string;
+  files: File[];
+}
+
+/** Gate resume delivery by object identity so one effect replay cannot resend it. */
+export function shouldSendResumePrompt(params: {
+  pendingPrompt: ResumePrompt | null;
+  sentPrompt: ResumePrompt | null;
+  conversationId: string | null | undefined;
+  agentId: string | null;
+  runnerOnline: boolean | undefined;
+}): boolean {
+  const { pendingPrompt } = params;
+  if (pendingPrompt === null || pendingPrompt === params.sentPrompt) return false;
+  if (pendingPrompt.sessionId !== params.conversationId) return false;
+  if (!params.agentId || params.runnerOnline !== true) return false;
   return true;
 }
 
