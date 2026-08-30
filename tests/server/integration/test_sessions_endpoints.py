@@ -27,6 +27,7 @@ import pytest
 from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
 from omnigent.llms.context_window import ModelPricing
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
+from omnigent.server import message_idempotency
 from omnigent.server.background_session_titles import BackgroundTitleRequest
 from omnigent.server.routes._sessions.helpers import (
     _NativeTerminalEnsureOutcome,
@@ -290,6 +291,130 @@ async def test_background_title_failure_does_not_break_subsequent_user_turn(
         await fake_runner.aclose()
 
     assert len(forwarded_requests) == 2
+
+
+async def test_message_client_event_id_replays_once_but_distinct_ids_dispatch_twice(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    forwarded: list[httpx.Request] = []
+
+    def forward(request: httpx.Request) -> httpx.Response:
+        forwarded.append(request)
+        return httpx.Response(202, json={"queued": True})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(forward),
+        base_url="http://runner",
+    )
+
+    async def get_runner_client(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client",
+        get_runner_client,
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    def event(event_id: str) -> dict[str, Any]:
+        return {
+            "type": "message",
+            "client_event_id": event_id,
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "same request"}],
+            },
+        }
+
+    try:
+        first = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json=event("logical-one"),
+        )
+        message_idempotency.reset_for_tests()  # simulate a different AP process
+        replay = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json=event("logical-one"),
+        )
+        intentional = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json=event("logical-two"),
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert first.status_code == replay.status_code == intentional.status_code == 202
+    assert replay.json() == {**first.json(), "idempotency_replayed": True}
+    assert intentional.json()["item_id"] != first.json()["item_id"]
+    assert len([r for r in forwarded if r.url.path.endswith("/events")]) == 2
+
+
+async def test_native_same_id_replay_calls_runner_once_without_new_reconciliation(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native receipt dedupe stops at the API-to-runner dispatch boundary."""
+    from omnigent.runtime import pending_inputs
+
+    pending_inputs.reset_for_tests()
+    forwarded: list[httpx.Request] = []
+
+    def forward(request: httpx.Request) -> httpx.Response:
+        forwarded.append(request)
+        if request.url.path.endswith("/resources/terminals"):
+            return httpx.Response(200, json={"resource": "view"})
+        return httpx.Response(202, json={"queued": True})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(forward),
+        base_url="http://runner",
+    )
+
+    async def get_runner_client(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client",
+        get_runner_client,
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+    )
+    event = {
+        "type": "message",
+        "client_event_id": "native-logical-submit",
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "send once"}],
+        },
+    }
+    try:
+        first = await client.post(f"/v1/sessions/{session['id']}/events", json=event)
+        replay = await client.post(f"/v1/sessions/{session['id']}/events", json=event)
+    finally:
+        await fake_runner.aclose()
+
+    assert first.status_code == replay.status_code == 202
+    assert replay.json() == {**first.json(), "idempotency_replayed": True}
+    assert len([r for r in forwarded if r.url.path.endswith("/events")]) == 1
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["pending_inputs"] == [
+        {
+            "pending_id": first.json()["pending_id"],
+            "content": event["data"]["content"],
+        }
+    ]
 
 
 async def test_initial_item_schedules_background_semantic_title(
@@ -1455,18 +1580,25 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
         )
         session = await _create_session(client, agent["id"])
 
-        resp = await client.post(
-            f"/v1/sessions/{session['id']}/events",
-            json={
-                "type": "slash_command",
-                "data": {
-                    "kind": "skill",
-                    "name": "grill-me",
-                    "arguments": "review this rollout",
-                },
+        event = {
+            "type": "slash_command",
+            "client_event_id": "skill-logical-submit",
+            "data": {
+                "kind": "skill",
+                "name": "grill-me",
+                "arguments": "review this rollout",
             },
+        }
+        resp = await client.post(f"/v1/sessions/{session['id']}/events", json=event)
+        message_idempotency.reset_for_tests()
+        replay = await client.post(f"/v1/sessions/{session['id']}/events", json=event)
+        intentional = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={**event, "client_event_id": "skill-intentional-repeat"},
         )
         assert resp.status_code == 202, resp.text
+        assert replay.json() == {**resp.json(), "idempotency_replayed": True}
+        assert intentional.status_code == 202, intentional.text
     finally:
         await fake_runner.aclose()
 
@@ -1476,8 +1608,11 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     items_resp = await client.get(f"/v1/sessions/{session['id']}/items")
     assert items_resp.status_code == 200, items_resp.text
     items = items_resp.json()["data"]
-    visible = next(item for item in items if item["type"] == "slash_command")
-    meta = next(item for item in items if item["type"] == "message" and item.get("is_meta"))
+    visible_items = [item for item in items if item["type"] == "slash_command"]
+    meta_items = [item for item in items if item["type"] == "message" and item.get("is_meta")]
+    assert len(visible_items) == len(meta_items) == 2
+    visible = visible_items[0]
+    meta = meta_items[0]
     assert visible["name"] == "grill-me"
     assert visible["kind"] == "skill"
     assert visible["arguments"] == "review this rollout"
@@ -1489,21 +1624,20 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     assert "<user_request>\nreview this rollout\n</user_request>" in text
     assert "Use the load_skill tool" not in text
 
-    assert forwarded == [
-        {
-            "type": "message",
-            "role": "user",
-            "content": meta["content"],
-            "agent_id": agent["id"],
-            "model": "skill-agent",
-            "has_mcp_servers": False,
-            # The forwarded message is the meta item; its store id lets the
-            # runner dedup it on a cold-cache history reload.
-            "persisted_item_id": meta["id"],
-        }
-    ]
+    assert len(forwarded) == 2
+    assert forwarded[0] == {
+        "type": "message",
+        "role": "user",
+        "content": meta["content"],
+        "agent_id": agent["id"],
+        "model": "skill-agent",
+        "has_mcp_servers": False,
+        # The forwarded message is the meta item; its store id lets the
+        # runner dedup it on a cold-cache history reload.
+        "persisted_item_id": meta["id"],
+    }
     event_types = [event["type"] for _, event in published]
-    assert event_types == ["response.output_item.done"]
+    assert event_types == ["response.output_item.done", "response.output_item.done"]
     assert published[0][1]["item"]["type"] == "slash_command"
     assert published[0][1]["item"]["id"] == visible["id"]
 

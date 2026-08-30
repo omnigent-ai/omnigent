@@ -1668,6 +1668,7 @@ describe("chatStore — send (first-send ordering)", () => {
     );
     expect(eventBody).toEqual({
       type: "message",
+      client_event_id: expect.any(String),
       data: {
         role: "user",
         content: [{ type: "input_text", text: "hi" }],
@@ -2152,6 +2153,102 @@ describe("chatStore — send (first-send ordering)", () => {
     await sendPromise;
   });
 
+  it("reconciles a durable replay whose original input is already committed", async () => {
+    seedSession("conv_replay", [userMessage("resp_original", "do this once")]);
+    await useChatStore.getState().switchTo("conv_replay");
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_replay/events")) {
+        return mockResponse({
+          queued: false,
+          item_id: "msg_resp_original_user",
+          idempotency_replayed: true,
+        });
+      }
+      return base(input, init);
+    });
+
+    await useChatStore
+      .getState()
+      .send("do this once", "agent_xyz", [], { clientEventId: "logical-submit" });
+
+    const state = useChatStore.getState();
+    expect(state.pendingUserMessages).toEqual([]);
+    expect(state.blocks.filter((block) => block.type === "user_message")).toHaveLength(1);
+  });
+
+  it("keeps a replay bubble when reconciliation fails, then merges once", async () => {
+    seedSession("conv_replay_fetch", []);
+    await useChatStore.getState().switchTo("conv_replay_fetch");
+    const base = fetchMock.getMockImplementation()!;
+    let failItemsFetch = true;
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_replay_fetch/events")) {
+        return mockResponse({
+          queued: false,
+          item_id: "msg_resp_original_user",
+          idempotency_replayed: true,
+        });
+      }
+      if (url.includes("/v1/sessions/conv_replay_fetch/items") && failItemsFetch) {
+        return mockResponse({}, { ok: false, status: 503 });
+      }
+      return base(input, init);
+    });
+
+    await useChatStore
+      .getState()
+      .send("do this once", "agent_xyz", [], { clientEventId: "logical-submit" });
+    expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
+
+    seedSessionItems("conv_replay_fetch", [userMessage("resp_original", "do this once")]);
+    failItemsFetch = false;
+    await useChatStore
+      .getState()
+      .send("do this once", "agent_xyz", [], { clientEventId: "logical-submit" });
+
+    const state = useChatStore.getState();
+    expect(state.pendingUserMessages).toEqual([]);
+    expect(state.blocks.filter((block) => block.type === "user_message")).toHaveLength(1);
+  });
+
+  it("rekeys a native durable replay to its original pending input", async () => {
+    seedSession("conv_native_replay", []);
+    await useChatStore.getState().switchTo("conv_native_replay");
+    seedPendingInputs("conv_native_replay", [
+      {
+        pending_id: "pending_original",
+        content: [{ type: "input_text", text: "do this once" }],
+      },
+    ]);
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_native_replay/events")) {
+        return mockResponse({
+          queued: true,
+          pending_id: "pending_original",
+          idempotency_replayed: true,
+        });
+      }
+      return base(input, init);
+    });
+
+    await useChatStore
+      .getState()
+      .send("do this once", "agent_xyz", [], { clientEventId: "logical-submit" });
+
+    expect(useChatStore.getState().pendingUserMessages).toMatchObject([
+      {
+        tempId: "pending_original",
+        posted: true,
+        content: [{ type: "input_text", text: "do this once" }],
+      },
+    ]);
+  });
+
   it("rolls back the optimistic message bubble when postEvent throws", async () => {
     useChatStore.setState({
       conversationId: "conv_existing",
@@ -2170,6 +2267,66 @@ describe("chatStore — send (first-send ordering)", () => {
     // The bubble pushed before the POST is removed on failure — no server
     // idle will fire to reconcile it.
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+  });
+
+  it.each([
+    [408, "request_timeout"],
+    [500, "internal_error"],
+    [409, "message_event_pending"],
+    [409, "message_event_uncertain"],
+  ] as const)("preserves the logical submit id after ambiguous HTTP %i", async (status, code) => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      failedSendDraft: null,
+    });
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/events")) {
+        return mockResponse(
+          { error: { code, message: "delivery outcome is unknown" } },
+          { ok: false, status },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().send("do this once", "agent_xyz");
+
+    const request = fetchMock.mock.calls.find(
+      ([input, init]) =>
+        String(input).endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST",
+    );
+    const submittedId = JSON.parse((request?.[1]?.body as string) ?? "{}").client_event_id;
+    expect(useChatStore.getState().failedSendDraft?.clientEventId).toBe(submittedId);
+    expect(useChatStore.getState().uncertainDelivery).toMatchObject({
+      clientEventId: submittedId,
+      text: "do this once",
+    });
+  });
+
+  it("abandons the logical submit id after a terminal HTTP 4xx", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      failedSendDraft: null,
+    });
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/events")) {
+        return mockResponse(
+          { error: { code: "invalid_input", message: "message rejected" } },
+          { ok: false, status: 422 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().send("fix before retry", "agent_xyz");
+
+    const failedDraft = useChatStore.getState().failedSendDraft;
+    expect(failedDraft?.text).toBe("fix before retry");
+    expect(failedDraft).not.toHaveProperty("clientEventId");
   });
 
   it("surfaces a visible error block with friendly copy when the runner is unavailable (503)", async () => {
@@ -2200,6 +2357,12 @@ describe("chatStore — send (first-send ordering)", () => {
     const result = await useChatStore.getState().send("hi", "agent_xyz");
 
     const state = useChatStore.getState();
+    const messageRequest = fetchMock.mock.calls.find(
+      ([input, init]) =>
+        String(input).endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST",
+    );
+    const submittedId = JSON.parse((messageRequest?.[1]?.body as string) ?? "{}").client_event_id;
+    expect(state.failedSendDraft?.clientEventId).toBe(submittedId);
     expect(result).toBe("retryable_failure");
     // Optimistic bubble rolled back, turn settled to idle.
     expect(state.pendingUserMessages).toEqual([]);
@@ -2450,7 +2613,11 @@ describe("chatStore — send (first-send ordering)", () => {
 
 describe("chatStore — sendSlashCommand", () => {
   /** Parse the JSON body of the single POST /events call. */
-  function lastEventBody(): { type: string; data: Record<string, unknown> } {
+  function lastEventBody(): {
+    type: string;
+    data: Record<string, unknown>;
+    client_event_id?: string;
+  } {
     const post = fetchMock.mock.calls.find(
       ([u, init]) =>
         String(u).endsWith("/events") && (init as RequestInit | undefined)?.method === "POST",
@@ -2465,15 +2632,37 @@ describe("chatStore — sendSlashCommand", () => {
       abortController: new AbortController(),
     });
 
-    await useChatStore.getState().sendSlashCommand("grill-me", "review this plan", "agent_xyz");
+    await useChatStore.getState().sendSlashCommand("grill-me", "review this plan", "agent_xyz", {
+      clientEventId: "skill-logical-submit",
+    });
 
     // The wire shape must match the REPL's: type=slash_command, kind=skill,
     // name without leading slash, and the raw argument text. A regression to
     // a plaintext message would set type="message" and fail here.
     expect(lastEventBody()).toEqual({
       type: "slash_command",
+      client_event_id: "skill-logical-submit",
       data: { kind: "skill", name: "grill-me", arguments: "review this plan" },
     });
+  });
+
+  it("gives separate identical skill invocations distinct identities", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+
+    await useChatStore.getState().sendSlashCommand("grill-me", "same request", "agent_xyz");
+    await useChatStore.getState().sendSlashCommand("grill-me", "same request", "agent_xyz");
+
+    const skillEvents = fetchMock.mock.calls
+      .filter(
+        ([input, init]) =>
+          String(input).endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST",
+      )
+      .map(([, init]) => JSON.parse(String(init?.body)));
+    expect(skillEvents).toHaveLength(2);
+    expect(skillEvents[0].client_event_id).not.toBe(skillEvents[1].client_event_id);
   });
 
   it("sends empty arguments when the skill is invoked with no args", async () => {
@@ -2737,6 +2926,7 @@ describe("chatStore — send while streaming (queueing)", () => {
     const body = JSON.parse((events[0]![1] as RequestInit).body as string);
     expect(body).toEqual({
       type: "message",
+      client_event_id: expect.any(String),
       data: { role: "user", content: [{ type: "input_text", text: "queue me" }] },
     });
 
@@ -2960,6 +3150,13 @@ describe("chatStore — send while streaming (queueing)", () => {
     await useChatStore.getState().send("does this vanish?", "agent_xyz");
 
     const state = useChatStore.getState();
+    const messageRequest = fetchMock.mock.calls.find(
+      ([input, init]) =>
+        String(input) === "/v1/sessions/conv_abc/events" && init?.method === "POST",
+    );
+    const submittedId = JSON.parse((messageRequest?.[1]?.body as string) ?? "{}").client_event_id;
+    expect(submittedId).toEqual(expect.any(String));
+    expect(state.failedSendDraft?.clientEventId).toBe(submittedId);
     const errorBlocks = state.blocks.filter((b) => b.type === "error");
     expect(errorBlocks).toHaveLength(1);
     expect(errorBlocks[0]).toMatchObject({ type: "error", message: "network down" });
@@ -9241,10 +9438,12 @@ describe("pending initial prompt transport", () => {
     // Repeated reads all yield the stashed prompt verbatim — a remount, a
     // failed bind, or a StrictMode double-invoke must not drain it.
     expect(peekPendingInitialPrompt("conv_abc")).toEqual({
+      clientEventId: expect.any(String),
       text: "read the README",
       skill: null,
     });
     expect(peekPendingInitialPrompt("conv_abc")).toEqual({
+      clientEventId: expect.any(String),
       text: "read the README",
       skill: null,
     });
@@ -9265,6 +9464,7 @@ describe("pending initial prompt transport", () => {
     setPendingInitialPrompt("conv_slow_runner", { text: "read the README", skill: null });
     expect(peekPendingInitialPrompt("conv_slow_runner")).not.toBeNull();
     expect(peekPendingInitialPrompt("conv_slow_runner")).toEqual({
+      clientEventId: expect.any(String),
       text: "read the README",
       skill: null,
     });
@@ -9282,10 +9482,18 @@ describe("pending initial prompt transport", () => {
     setPendingInitialPrompt("conv_b", { text: "prompt for B", skill: null });
     // Each conversation reads only its own prompt, and clearing one leaves
     // the other pending.
-    expect(peekPendingInitialPrompt("conv_b")).toEqual({ text: "prompt for B", skill: null });
+    expect(peekPendingInitialPrompt("conv_b")).toEqual({
+      clientEventId: expect.any(String),
+      text: "prompt for B",
+      skill: null,
+    });
     clearPendingInitialPrompt("conv_b");
     expect(peekPendingInitialPrompt("conv_b")).toBeNull();
-    expect(peekPendingInitialPrompt("conv_a")).toEqual({ text: "prompt for A", skill: null });
+    expect(peekPendingInitialPrompt("conv_a")).toEqual({
+      clientEventId: expect.any(String),
+      text: "prompt for A",
+      skill: null,
+    });
     clearPendingInitialPrompt("conv_a");
   });
 
@@ -9299,6 +9507,7 @@ describe("pending initial prompt transport", () => {
       skill: { name: "review-pr", args: "123 focus on auth" },
     });
     expect(peekPendingInitialPrompt("conv_skill")).toEqual({
+      clientEventId: expect.any(String),
       text: "/review-pr 123 focus on auth",
       skill: { name: "review-pr", args: "123 focus on auth" },
     });
@@ -11124,7 +11333,7 @@ describe("chatStore — background cross-session flush", () => {
     expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["mine"]);
   });
 
-  it("leaves a message queued when its background POST fails", async () => {
+  it("blocks automatic retries after a terminal background POST failure", async () => {
     seedConversationsCache([conv("conv_active", "running"), conv("conv_bg", "idle")]);
     useChatStore.setState({
       conversationId: "conv_active",
@@ -11133,7 +11342,7 @@ describe("chatStore — background cross-session flush", () => {
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (/\/v1\/sessions\/conv_bg\/events$/.test(url) && init?.method === "POST") {
-        return mockResponse({}, { ok: false, status: 500 });
+        return mockResponse({}, { ok: false, status: 409 });
       }
       return defaultFetchHandler(input, init);
     });
@@ -11142,8 +11351,48 @@ describe("chatStore — background cross-session flush", () => {
     await tick();
     await tick();
 
-    // POST failed → the message is re-queued for the next trigger to retry.
+    // A terminal POST failure requeues the message but blocks automatic retry.
     expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["retry-me"]);
+    expect(useChatStore.getState().queuedMessages[0]?.retryBlocked).toBe(true);
+    const requestBody = JSON.parse(
+      (fetchMock.mock.calls.find(
+        ([input, init]) =>
+          String(input) === "/v1/sessions/conv_bg/events" && init?.method === "POST",
+      )?.[1]?.body as string) ?? "{}",
+    );
+    expect(useChatStore.getState().queuedMessages[0]?.clientEventId).toBe(
+      requestBody.client_event_id,
+    );
+  });
+
+  it("checks an uncertain queued delivery with the same logical id", async () => {
+    useChatStore.setState({
+      conversationId: "conv_bg",
+      boundAgentId: "agent_xyz",
+      abortController: new AbortController(),
+      queuedMessages: [
+        {
+          queueId: "q_1",
+          text: "retry-me",
+          conversationId: "conv_bg",
+          clientEventId: "logical-submit",
+          retryBlocked: true,
+          deliveryUncertain: true,
+        },
+      ],
+    });
+
+    useChatStore.getState().steerMessage("q_1");
+    await tick();
+    await tick();
+
+    const requestBody = JSON.parse(
+      (fetchMock.mock.calls.find(
+        ([input, init]) =>
+          String(input) === "/v1/sessions/conv_bg/events" && init?.method === "POST",
+      )?.[1]?.body as string) ?? "{}",
+    );
+    expect(requestBody.client_event_id).toBe("logical-submit");
   });
 
   it("does not re-POST a just-failed conversation within its cooldown", async () => {
@@ -11169,6 +11418,14 @@ describe("chatStore — background cross-session flush", () => {
     await tick();
     await tick();
     expect(posts).toBe(1);
+    const firstRequest = fetchMock.mock.calls.find(
+      ([input, init]) => String(input) === "/v1/sessions/conv_bg/events" && init?.method === "POST",
+    );
+    const firstSubmittedId = JSON.parse(
+      (firstRequest?.[1]?.body as string) ?? "{}",
+    ).client_event_id;
+    expect(useChatStore.getState().queuedMessages[0]?.clientEventId).toBe(firstSubmittedId);
+    expect(useChatStore.getState().queuedMessages[0]?.retryBlocked).not.toBe(true);
 
     // Immediate re-triggers (mirroring the effect firing on every re-queue)
     // must NOT POST again while the conversation is in cooldown.

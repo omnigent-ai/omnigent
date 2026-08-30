@@ -19,6 +19,7 @@ import {
   collectPendingElicitations,
   computeIsWorking,
   computeShowsWorking,
+  confirmUncertainDeliveryReplacement,
   containsMarkdownTable,
   deliverInitialPrompt,
   dispatchInitialPrompt,
@@ -59,6 +60,42 @@ function composerState(permissionLevel: number | null) {
   const canSubmit = !isReadOnly;
   return { isReadOnly, canType, canSubmit };
 }
+
+describe("uncertain delivery replacement", () => {
+  it("requires explicit duplicate-risk confirmation for a changed payload", () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+
+    expect(confirmUncertainDeliveryReplacement({ text: "original", files: [] }, "edited", [])).toBe(
+      false,
+    );
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("may duplicate work"));
+    confirm.mockRestore();
+  });
+
+  it("requires confirmation when uncertain attachments change", () => {
+    const original = new File(["a"], "original.txt", { type: "text/plain" });
+    const replacement = new File(["b"], "replacement.txt", { type: "text/plain" });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+
+    expect(
+      confirmUncertainDeliveryReplacement({ text: "same", files: [original] }, "same", [
+        replacement,
+      ]),
+    ).toBe(false);
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("may duplicate work"));
+    confirm.mockRestore();
+  });
+
+  it("safe-retries an unchanged payload without confirmation", () => {
+    const confirm = vi.spyOn(window, "confirm");
+
+    expect(
+      confirmUncertainDeliveryReplacement({ text: "original", files: [] }, "original", []),
+    ).toBe(true);
+    expect(confirm).not.toHaveBeenCalled();
+    confirm.mockRestore();
+  });
+});
 
 describe("Composer permission gating", () => {
   it("read-only (level 1) disables textarea and submit", () => {
@@ -1521,6 +1558,11 @@ describe("deliverInitialPrompt", () => {
       (call) => (call[3] as { retryPending: boolean }).retryPending,
     );
     expect(retryFlags).toEqual([true, true, false]);
+    const clientEventIds = send.mock.calls.map(
+      (call) => (call[3] as { clientEventId: string }).clientEventId,
+    );
+    expect(new Set(clientEventIds).size).toBe(1);
+    expect(clientEventIds[0]).toEqual(expect.any(String));
   });
 
   it("never retries a terminal or ambiguously accepted failure", async () => {
@@ -1725,6 +1767,7 @@ describe("shouldSendResumePrompt", () => {
     sessionId: "conv_abc",
     text: "continue",
     files: [],
+    clientEventId: "event-first",
   };
   const ready = {
     pendingPrompt,
@@ -1737,10 +1780,11 @@ describe("shouldSendResumePrompt", () => {
   it("claims a ready prompt once", () => {
     expect(shouldSendResumePrompt(ready)).toBe(true);
     expect(shouldSendResumePrompt({ ...ready, sentPrompt: pendingPrompt })).toBe(false);
+    expect(shouldSendResumePrompt({ ...ready, sentPrompt: { ...pendingPrompt } })).toBe(false);
   });
 
   it("allows a later intentional prompt with identical content", () => {
-    const laterPrompt = { ...pendingPrompt };
+    const laterPrompt = { ...pendingPrompt, clientEventId: "event-later" };
     expect(
       shouldSendResumePrompt({
         ...ready,

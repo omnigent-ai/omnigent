@@ -10,6 +10,8 @@
 // helpers below convert at the boundary so callers never see raw
 // wire fields.
 
+import { nanoid } from "nanoid";
+
 import type { ConversationItem } from "./conversationItems";
 import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
@@ -75,6 +77,8 @@ export interface PostEventResponse {
    * events.
    */
   pendingId?: string;
+  /** True when the server returned a prior submit's durable outcome. */
+  idempotencyReplayed?: boolean;
   /** True only when retry performed a usable runner or terminal recovery. */
   recovered?: boolean;
   /** Machine-readable recovery outcome for retry_session control events. */
@@ -417,6 +421,7 @@ function postEventResponseFromWire(wire: {
   item_id?: string;
   denied?: boolean;
   pending_id?: string;
+  idempotency_replayed?: boolean;
   recovered?: boolean;
   recovery?: PostEventResponse["recovery"];
 }): PostEventResponse {
@@ -425,6 +430,7 @@ function postEventResponseFromWire(wire: {
     itemId: wire.item_id,
     denied: wire.denied,
     pendingId: wire.pending_id,
+    idempotencyReplayed: wire.idempotency_replayed,
     recovered: wire.recovered,
     recovery: wire.recovery,
   };
@@ -1019,10 +1025,14 @@ export async function postEvent(
   sessionId: string,
   event: SessionEventInput,
 ): Promise<PostEventResponse> {
+  const eventWithIdentity: SessionEventInput =
+    event.type === "message" && event.client_event_id === undefined
+      ? { ...event, client_event_id: createClientEventId() }
+      : event;
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/events`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(event),
+    body: JSON.stringify(eventWithIdentity),
   });
   // Throw a typed ApiError (not the bare status line) so callers can branch
   // on `code` — e.g. surface a friendly "runner didn't come online" message
@@ -1034,10 +1044,15 @@ export async function postEvent(
       item_id?: string;
       denied?: boolean;
       pending_id?: string;
+      idempotency_replayed?: boolean;
       recovered?: boolean;
       recovery?: PostEventResponse["recovery"];
     },
   );
+}
+
+export function createClientEventId(): string {
+  return `event_${nanoid()}`;
 }
 
 /**

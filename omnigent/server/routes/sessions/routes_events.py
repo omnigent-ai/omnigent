@@ -36,7 +36,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
-from omnigent.server import presence
+from omnigent.server import message_idempotency, presence
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -571,6 +571,27 @@ def register_events_routes(
                 parse_client_side_tool_specs(body.tools)
             except ValueError as exc:
                 raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        if body.type in {"message", _SLASH_COMMAND_TYPE} and body.client_event_id is not None:
+            fingerprint = message_idempotency.event_fingerprint(
+                body.model_dump(
+                    mode="json",
+                    exclude={"client_event_id", "created_by"},
+                    exclude_none=True,
+                ),
+                created_by,
+            )
+            event_without_identity = body.model_copy(update={"client_event_id": None})
+
+            async def dispatch_logical_event() -> dict[str, bool | str]:
+                return await post_event(request, session_id, event_without_identity)
+
+            return await message_idempotency.run_once(
+                conversation_store,
+                session_id,
+                body.client_event_id,
+                fingerprint,
+                dispatch_logical_event,
+            )
         if body.type == _RETRY_SESSION_TYPE:
             return await _retry_session_single_flight(
                 request=request,
@@ -1941,9 +1962,10 @@ def register_events_routes(
         # Native-terminal web message: hand back the pending-input id. It
         # identifies the snapshot's replayed bubble on rebind and is the
         # cleared_pending_id the consume event carries to drop it. Clients
-        # may adopt it onto their optimistic bubble for id-based dedupe;
-        # the first-party web client keeps its client temp id (React-key
-        # stability) and relies on stableKey + FIFO instead.
+        # may adopt it onto their optimistic bubble for id-based dedupe. The
+        # first-party web client normally keeps its temporary React key, but
+        # adopts this id when reconciling a durable replay whose original SSE
+        # event may have crossed the failed HTTP response.
         if dispatch.pending_id is not None:
             response["pending_id"] = dispatch.pending_id
         return response

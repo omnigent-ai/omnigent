@@ -21,6 +21,7 @@ from sqlalchemy import (
     text,
     update,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import QueryableAttribute, Session, aliased, load_only
 from sqlalchemy.sql.selectable import Subquery
 
@@ -34,6 +35,7 @@ from omnigent.db.db_models import (
     SqlConversationItem,
     SqlConversationLabel,
     SqlConversationMetadata,
+    SqlMessageEventReceipt,
     SqlPolicy,
     SqlProject,
     SqlSessionPermission,
@@ -91,6 +93,7 @@ from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
     ConversationStore,
     CreatedSession,
+    MessageEventReceipt,
     SessionConnectivity,
     pinned_label_key,
 )
@@ -2111,6 +2114,145 @@ class SqlAlchemyConversationStore(ConversationStore):
                 conv_row.next_position = next_pos
 
         return persisted
+
+    def claim_message_event(
+        self,
+        conversation_id: str,
+        client_event_id: str,
+        fingerprint: str,
+        *,
+        owner_id: str = "legacy",
+        lease_expires_at: int = 0,
+    ) -> tuple[bool, MessageEventReceipt]:
+        """Atomically insert or read a durable message-event receipt."""
+        now = now_epoch()
+        workspace_id = current_workspace_id()
+        fingerprint_bytes = bytes.fromhex(fingerprint)
+        row = SqlMessageEventReceipt(
+            workspace_id=workspace_id,
+            conversation_id=conversation_id,
+            client_event_id=client_event_id,
+            fingerprint=fingerprint_bytes,
+            status="pending",
+            outcome=None,
+            owner_id=owner_id,
+            lease_expires_at=lease_expires_at,
+            created_at=now,
+            updated_at=now,
+        )
+        with self._conv_session("claim_message_event") as session:
+            session.add(row)
+            try:
+                session.flush()
+            except IntegrityError:
+                session.rollback()
+                existing = session.get(
+                    SqlMessageEventReceipt,
+                    (workspace_id, conversation_id, client_event_id),
+                )
+                if existing is None:
+                    raise
+                return False, self._message_event_receipt(existing)
+        return True, MessageEventReceipt(
+            fingerprint=fingerprint,
+            status="pending",
+            outcome=None,
+            owner_id=owner_id,
+            lease_expires_at=lease_expires_at,
+        )
+
+    def get_message_event(
+        self,
+        conversation_id: str,
+        client_event_id: str,
+    ) -> MessageEventReceipt | None:
+        """Read the latest durable state for one logical submission."""
+        with self._conv_session("get_message_event") as session:
+            row = session.get(
+                SqlMessageEventReceipt,
+                (current_workspace_id(), conversation_id, client_event_id),
+            )
+            return self._message_event_receipt(row) if row is not None else None
+
+    def complete_message_event(
+        self,
+        conversation_id: str,
+        client_event_id: str,
+        fingerprint: str,
+        *,
+        status: str,
+        outcome: dict[str, bool | str] | None,
+    ) -> None:
+        """Persist a claimed message event's terminal outcome."""
+        if status not in {"completed", "failed", "uncertain"}:
+            raise ValueError(f"unsupported message receipt status: {status}")
+        if (status == "completed") != (outcome is not None):
+            raise ValueError(
+                "completed receipts require an outcome; failed/uncertain receipts forbid one"
+            )
+        encoded_outcome = (
+            json.dumps(outcome, separators=(",", ":"), sort_keys=True)
+            if outcome is not None
+            else None
+        )
+        with self._conv_session("complete_message_event") as session:
+            result = session.execute(
+                update(SqlMessageEventReceipt)
+                .where(
+                    SqlMessageEventReceipt.workspace_id == current_workspace_id(),
+                    SqlMessageEventReceipt.conversation_id == conversation_id,
+                    SqlMessageEventReceipt.client_event_id == client_event_id,
+                    SqlMessageEventReceipt.fingerprint == bytes.fromhex(fingerprint),
+                    SqlMessageEventReceipt.status == "pending",
+                )
+                .values(
+                    status=status,
+                    outcome=encoded_outcome,
+                    updated_at=now_epoch(),
+                )
+            )
+            if result.rowcount != 1:
+                raise RuntimeError(
+                    "message receipt was not pending when its terminal outcome was stored"
+                )
+
+    def abandon_message_event(
+        self,
+        conversation_id: str,
+        client_event_id: str,
+        fingerprint: str,
+    ) -> None:
+        """Release a claim after a definite pre-dispatch failure."""
+        with self._conv_session("abandon_message_event") as session:
+            result = session.execute(
+                delete(SqlMessageEventReceipt).where(
+                    SqlMessageEventReceipt.workspace_id == current_workspace_id(),
+                    SqlMessageEventReceipt.conversation_id == conversation_id,
+                    SqlMessageEventReceipt.client_event_id == client_event_id,
+                    SqlMessageEventReceipt.fingerprint == bytes.fromhex(fingerprint),
+                    SqlMessageEventReceipt.status == "pending",
+                )
+            )
+            if result.rowcount != 1:
+                raise RuntimeError(
+                    "message receipt was not pending when its claim was released"
+                )
+
+    @staticmethod
+    def _message_event_receipt(row: SqlMessageEventReceipt) -> MessageEventReceipt:
+        outcome: dict[str, bool | str] | None = None
+        if row.outcome is not None:
+            decoded = json.loads(row.outcome)
+            if not isinstance(decoded, dict):
+                raise ValueError("message receipt outcome must be an object")
+            outcome = decoded
+        return MessageEventReceipt(
+            fingerprint=bytes(row.fingerprint).hex(),
+            status=row.status,
+            outcome=outcome,
+            owner_id=row.owner_id or "legacy",
+            lease_expires_at=row.lease_expires_at or 0,
+        )
 
     def list_projects(
         self,
@@ -4178,6 +4320,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 delete(SqlConversationLabel).where(
                     SqlConversationLabel.workspace_id == current_workspace_id(),
                     SqlConversationLabel.conversation_id.in_(subtree_ids),
+                )
+            )
+            ap_sess.execute(
+                delete(SqlMessageEventReceipt).where(
+                    SqlMessageEventReceipt.workspace_id == current_workspace_id(),
+                    SqlMessageEventReceipt.conversation_id.in_(subtree_ids),
                 )
             )
             ap_sess.execute(

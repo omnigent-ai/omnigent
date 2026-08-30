@@ -107,7 +107,7 @@ import {
   liveCandidateAssistantIndex,
 } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
-import { retrySession } from "@/lib/sessionsApi";
+import { createClientEventId, retrySession } from "@/lib/sessionsApi";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import {
   clearPendingInitialPrompt,
@@ -674,6 +674,26 @@ export function shouldQueueSend(
   return isBusy || hasQueued;
 }
 
+export function confirmUncertainDeliveryReplacement(
+  uncertainDelivery: { text: string; files: File[] } | null,
+  messageText: string,
+  files: File[],
+): boolean {
+  if (
+    uncertainDelivery === null ||
+    (uncertainDelivery.text === messageText &&
+      uncertainDelivery.files.length === files.length &&
+      uncertainDelivery.files.every((file, index) => file === files[index]))
+  ) {
+    return true;
+  }
+  return window.confirm(
+    "Delivery of the original message is uncertain. Sending this edited message " +
+      "will use a new identity and may duplicate work if the original was delivered. " +
+      "Send as a new message anyway?",
+  );
+}
+
 // Author labels render only in a shared session; ChatPage provides the
 // value and UserBubble reads it, so the gate lives in one place.
 const SessionSharedContext = createContext(false);
@@ -994,7 +1014,9 @@ export function ChatPage() {
       }).then((outcome) => {
         if (outcome !== "cancelled") {
           clearPendingInitialPrompt(convId);
-          if (outcome === "failed") stashUndeliveredPrompt(convId, prompt.text);
+          if (outcome === "failed") {
+            stashUndeliveredPrompt(convId, prompt.text, prompt.files ?? []);
+          }
         }
         return outcome;
       });
@@ -1069,9 +1091,9 @@ export function ChatPage() {
     }
     if (pendingResumePrompt === null || !agentId) return;
     sentResumePromptRef.current = pendingResumePrompt;
-    const { text, files } = pendingResumePrompt;
+    const { text, files, clientEventId } = pendingResumePrompt;
     setPendingResumePrompt(null);
-    void useChatStore.getState().send(text, agentId, files);
+    void useChatStore.getState().send(text, agentId, files, { clientEventId });
   }, [pendingResumePrompt, runnerOnline, agentId, urlConvId]);
 
   // Opened when the user tries to interact with an unreachable session
@@ -1319,15 +1341,21 @@ export function ChatPage() {
   const isUnreachable =
     !sandboxLaunching && (liveness.kind === "host_offline" || liveness.kind === "local_stranded");
 
-  function onSend(text: string, files?: File[]) {
+  function onSend(text: string, files?: File[], retryClientEventId?: string) {
     if (!agentId) return;
+    const clientEventId = retryClientEventId ?? createClientEventId();
     // An unbound coding clone (fork-source label) needs a directory before
     // it can run: open the picker and stash this message to replay after
     // the bind. Pin the prompt to THIS session so it replays here, never
     // into a session the user may switch to first; carry any attachments
     // so the replay sends the same payload.
     if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
-      setPendingResumePrompt({ sessionId: urlConvId, text, files: files ?? [] });
+      setPendingResumePrompt({
+        sessionId: urlConvId,
+        text,
+        files: files ?? [],
+        clientEventId,
+      });
       setResumeDirDialogOpen(true);
       return;
     }
@@ -1352,10 +1380,11 @@ export function ChatPage() {
         readAlwaysSteer(),
       )
     ) {
-      chat.enqueueMessage(text, files);
+      chat.enqueueMessage(text, files, clientEventId);
       return;
     }
     void useChatStore.getState().send(text, agentId, files, {
+      clientEventId,
       onConversationCreated: (newId) => {
         // Eager URL update: the moment the server tells us this
         // conversation's id, promote `/` → `/c/:newId`. Replace (not
@@ -1366,10 +1395,11 @@ export function ChatPage() {
     });
   }
 
-  function onSendSlashCommand(name: string, args: string) {
+  function onSendSlashCommand(name: string, args: string, clientEventId?: string) {
     if (!agentId) return;
-    // Slash commands aren't replayed (an edge), but still route an unbound
-    // coding clone to the directory picker so it isn't a dead end.
+    // Keep the restored logical identity through reconnect checks and the
+    // store boundary. Still route an unbound coding clone to the directory
+    // picker so it isn't a dead end.
     if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
       setResumeDirDialogOpen(true);
       return;
@@ -1379,6 +1409,7 @@ export function ChatPage() {
       return;
     }
     void useChatStore.getState().sendSlashCommand(name, args, agentId, {
+      clientEventId,
       onConversationCreated: (newId) => {
         navigate(`/c/${newId}`, { replace: true });
       },
@@ -1679,14 +1710,14 @@ interface MainAgentSurfaceProps {
   liveness: SessionLiveness;
   agentsError: unknown;
   disabled: boolean;
-  onSend: (text: string, files?: File[]) => void;
+  onSend: (text: string, files?: File[], clientEventId?: string) => void;
   /**
    * Invoke a skill via the `slash_command` event path. Gated off inside
    * `MainAgentSurface` for terminal-first (native) sessions, where `/skill`
    * is sent as plaintext for the vendor TUI to handle. See
    * `ComposerProps.onSendSlashCommand`.
    */
-  onSendSlashCommand?: (name: string, args: string) => void;
+  onSendSlashCommand?: (name: string, args: string, clientEventId?: string) => void;
   onStop: () => void;
   onShowReconnectHelp: () => void;
   agents: Agent[] | undefined;
@@ -2082,9 +2113,9 @@ function MainAgentSurface({
   const handleSendSlashCommand = useMemo(
     () =>
       onSendSlashCommand && !isNativeWrapper
-        ? (name: string, args: string) => {
+        ? (name: string, args: string, clientEventId?: string) => {
             setSendScrollNonce((n) => n + 1);
-            onSendSlashCommand(name, args);
+            onSendSlashCommand(name, args, clientEventId);
           }
         : undefined,
     [onSendSlashCommand, isNativeWrapper],
@@ -3744,7 +3775,7 @@ interface ComposerProps {
   /** Local stream OR cross-client `session.status: running`. */
   isWorking: boolean;
   disabled: boolean;
-  onSend: (text: string, files?: File[]) => void;
+  onSend: (text: string, files?: File[], clientEventId?: string) => void;
   /**
    * Send a recognised skill as a `slash_command` event (the REPL's wire
    * shape) instead of plaintext. When present and the typed command names
@@ -3753,7 +3784,7 @@ interface ComposerProps {
    * native-terminal sessions, which always send `/skill` as plaintext so
    * the vendor TUI loads the skill itself.
    */
-  onSendSlashCommand?: (name: string, args: string) => void;
+  onSendSlashCommand?: (name: string, args: string, clientEventId?: string) => void;
   onStop: () => void;
   agents: Agent[] | undefined;
   selectedAgentId: string | null;
@@ -4419,6 +4450,7 @@ export function Composer({
   // Text + attachments handed back by a send that failed before the server
   // took ownership. Drained below so the message can be retried.
   const failedSendDraft = useChatStore((s) => s.failedSendDraft);
+  const uncertainDelivery = useChatStore((s) => s.uncertainDelivery);
   // The conversation whose draft the composer's value/files currently hold.
   // Trails `conversationId` by one commit across a session switch; see the
   // draft-restore effect.
@@ -4537,6 +4569,11 @@ export function Composer({
   const filesRef = useRef(files);
   filesRef.current = files;
   const submitGuardRef = useRef(false);
+  const retryDraftRef = useRef<{
+    clientEventId: string;
+    text: string;
+    files: File[];
+  } | null>(null);
   // Guards against React StrictMode double-invoke in development:
   // setup → cleanup → setup runs cleanup before the user has touched
   // the input, which would delete the draft. Only save when the user
@@ -4555,6 +4592,7 @@ export function Composer({
 
   useEffect(() => {
     const restored = conversationId ? getSessionDraft(conversationId) : undefined;
+    retryDraftRef.current = null;
     setValue(restored?.text ?? "");
     setFiles(restored?.files ?? []);
     dirtyRef.current = false;
@@ -4782,19 +4820,41 @@ export function Composer({
     // conversation's draft and wrongly conclude the user is mid-sentence,
     // dropping the failed message on the way back to the session it failed in.
     if (settledConversationId !== conversationId) return;
-    useChatStore.setState({ failedSendDraft: null });
     // The user started something new while the send was in flight — their
     // in-progress text wins over a clobbering restore.
-    if (valueRef.current.trim() !== "" || filesRef.current.length > 0) return;
+    if (valueRef.current.trim() !== "" || filesRef.current.length > 0) {
+      retryDraftRef.current =
+        failedSendDraft.clientEventId !== undefined
+          ? {
+              clientEventId: failedSendDraft.clientEventId,
+              text: failedSendDraft.text,
+              files: failedSendDraft.files,
+            }
+          : null;
+      return;
+    }
+    useChatStore.setState({ failedSendDraft: null });
     setValue(failedSendDraft.text);
     dirtyRef.current = true;
+    let restoredFiles: File[] = [];
+    let filesRejected = false;
     if (failedSendDraft.files.length > 0) {
       const { accepted, errors } = validateAttachments(failedSendDraft.files);
+      restoredFiles = accepted;
+      filesRejected = errors.length > 0;
       setFiles(accepted);
       setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
     }
+    retryDraftRef.current =
+      failedSendDraft.clientEventId !== undefined && !filesRejected
+        ? {
+            clientEventId: failedSendDraft.clientEventId,
+            text: failedSendDraft.text,
+            files: restoredFiles,
+          }
+        : null;
     if (!isMobileRef.current) textareaRef.current?.focus();
-  }, [failedSendDraft, conversationId, settledConversationId]);
+  }, [failedSendDraft, conversationId, settledConversationId, value, files]);
 
   /**
    * Execute a slash command by name + optional argument string.
@@ -5017,6 +5077,35 @@ export function Composer({
     // guard so guarded no-ops don't emit, matching the disabled Send button.
     trackClick("chat.composer.send", "button");
 
+    const prepareRetry = (
+      messageText: string,
+      messageFiles: File[],
+    ): { confirmed: false } | { confirmed: true; clientEventId?: string } => {
+      const retryDraft = retryDraftRef.current ?? uncertainDelivery;
+      const retryPayloadMatches =
+        retryDraft !== null &&
+        retryDraft.text === messageText &&
+        retryDraft.files.length === messageFiles.length &&
+        retryDraft.files.every((file, index) => file === messageFiles[index]);
+      if (!confirmUncertainDeliveryReplacement(uncertainDelivery, messageText, messageFiles)) {
+        // No send occurred, so a second click must be allowed to reopen the
+        // explicit duplicate-risk decision without requiring another edit.
+        submitGuardRef.current = false;
+        return { confirmed: false };
+      }
+      const replacesUncertainDelivery =
+        uncertainDelivery !== null &&
+        (uncertainDelivery.text !== messageText ||
+          uncertainDelivery.files.length !== messageFiles.length ||
+          uncertainDelivery.files.some((file, index) => file !== messageFiles[index]));
+      if (replacesUncertainDelivery) {
+        useChatStore.setState({ uncertainDelivery: null });
+      }
+      const clientEventId = retryPayloadMatches ? retryDraft.clientEventId : undefined;
+      retryDraftRef.current = null;
+      return { confirmed: true, clientEventId };
+    };
+
     // Slash command path: the first token must read as "/name" (the shared
     // isSlashCommandText guard — file paths like "/Users/foo/bar.txt" don't
     // match, while args after the name may carry paths or URLs, e.g.
@@ -5064,8 +5153,10 @@ export function Composer({
       // don't apply to a slash command (no content field) — clear them.
       if (onSendSlashCommand && parts[0] in slashCommands) {
         const skillArgs = trimmed.slice(parts[0].length).trim();
+        const retry = prepareRetry(trimmed, []);
+        if (!retry.confirmed) return;
         appendEntry(trimmed);
-        onSendSlashCommand(parts[0].slice(1), skillArgs);
+        onSendSlashCommand(parts[0].slice(1), skillArgs, retry.clientEventId);
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
@@ -5095,12 +5186,18 @@ export function Composer({
     // workspace file/folder from this marker; no upload happens.
     const messageText =
       buildMentionPreamble(mentionedItems, sessionHarness) + quotePreamble + trimmed;
+    const retry = prepareRetry(messageText, files);
+    if (!retry.confirmed) return;
     // Sending while a prior response is streaming is fine — the
     // server queues the message and delivers it to the running task
     // (or starts a fresh one once the current drains). Escape still
     // interrupts.
     if (trimmed) appendEntry(trimmed);
-    onSend(messageText, files.length > 0 ? files : undefined);
+    if (retry.clientEventId === undefined) {
+      onSend(messageText, files.length > 0 ? files : undefined);
+    } else {
+      onSend(messageText, files.length > 0 ? files : undefined, retry.clientEventId);
+    }
     dirtyRef.current = true;
     setValue("");
     setFiles([]);
@@ -5410,6 +5507,9 @@ export function Composer({
             ref={textareaRef}
             value={value}
             onChange={(e) => {
+              if (retryDraftRef.current !== null && e.target.value !== retryDraftRef.current.text) {
+                retryDraftRef.current = null;
+              }
               setValue(e.target.value);
               dirtyRef.current = true;
               if (commandError !== null) setCommandError(null);
@@ -5871,9 +5971,10 @@ interface ResumePrompt {
   sessionId: string;
   text: string;
   files: File[];
+  clientEventId: string;
 }
 
-/** Gate resume delivery by object identity so one effect replay cannot resend it. */
+/** Gate resume delivery by logical identity so one effect replay cannot resend it. */
 export function shouldSendResumePrompt(params: {
   pendingPrompt: ResumePrompt | null;
   sentPrompt: ResumePrompt | null;
@@ -5882,7 +5983,9 @@ export function shouldSendResumePrompt(params: {
   runnerOnline: boolean | undefined;
 }): boolean {
   const { pendingPrompt } = params;
-  if (pendingPrompt === null || pendingPrompt === params.sentPrompt) return false;
+  if (pendingPrompt === null || pendingPrompt.clientEventId === params.sentPrompt?.clientEventId) {
+    return false;
+  }
   if (pendingPrompt.sessionId !== params.conversationId) return false;
   if (!params.agentId || params.runnerOnline !== true) return false;
   return true;
@@ -5988,6 +6091,7 @@ export async function deliverInitialPrompt(params: {
   sleep?: (ms: number) => Promise<void>;
 }): Promise<"delivered" | "cancelled" | "failed"> {
   const delays = params.retryDelaysMs ?? INITIAL_PROMPT_RETRY_DELAYS_MS;
+  const clientEventId = params.prompt.clientEventId ?? createClientEventId();
   const sleep =
     params.sleep ??
     ((ms: number) =>
@@ -6011,7 +6115,7 @@ export async function deliverInitialPrompt(params: {
       params.sendSlashCommand,
       // Only the final attempt lets the store paint the failure: an error
       // block per attempt would stack failures the next attempt resolves.
-      { retryPending: !isFinal },
+      { retryPending: !isFinal, clientEventId },
     ).catch((): SendAttemptResult => "terminal_failure");
     if (result === "settled") return "delivered";
     if (result === "terminal_failure") return "failed";
@@ -6036,9 +6140,13 @@ export async function deliverInitialPrompt(params: {
  * @param conversationId Session the prompt was meant for, e.g. ``"conv_abc"``.
  * @param text The undelivered message text.
  */
-export function stashUndeliveredPrompt(conversationId: string, text: string): void {
-  if (!text || getSessionDraft(conversationId) !== undefined) return;
-  setSessionDraft(conversationId, { text, files: [] });
+export function stashUndeliveredPrompt(
+  conversationId: string,
+  text: string,
+  files: File[] = [],
+): void {
+  if ((!text && files.length === 0) || getSessionDraft(conversationId) !== undefined) return;
+  setSessionDraft(conversationId, { text, files });
 }
 
 /**

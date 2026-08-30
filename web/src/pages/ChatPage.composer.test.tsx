@@ -8,7 +8,12 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
-import { clearSessionDrafts, hasSessionDraft } from "@/lib/sessionDrafts";
+import {
+  clearSessionDrafts,
+  getSessionDraft,
+  hasSessionDraft,
+  setSessionDraft,
+} from "@/lib/sessionDrafts";
 import { setOmnigentHostConfig } from "@/lib/host";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 
@@ -141,12 +146,17 @@ function tooltipKeys(tooltip: HTMLElement): string[] {
 describe("Composer session drafts", () => {
   beforeEach(() => {
     clearSessionDrafts();
-    useChatStore.setState({ conversationId: "conv_draft" });
+    useChatStore.setState({
+      conversationId: "conv_draft",
+      failedSendDraft: null,
+      uncertainDelivery: null,
+    });
   });
 
   afterEach(() => {
     cleanup();
     clearSessionDrafts();
+    vi.restoreAllMocks();
   });
 
   it("publishes unfinished text for the sidebar and clears it after send", async () => {
@@ -188,6 +198,126 @@ describe("Composer session drafts", () => {
     expect(onSend).toHaveBeenCalledTimes(2);
     expect(onSend).toHaveBeenNthCalledWith(1, "same text", undefined);
     expect(onSend).toHaveBeenNthCalledWith(2, "same text", undefined);
+  });
+
+  it("reuses the logical submit id for an unchanged ambiguous-failure retry", async () => {
+    const onSend = vi.fn();
+    useChatStore.setState({
+      failedSendDraft: {
+        conversationId: "conv_draft",
+        text: "retry exactly",
+        files: [],
+        clientEventId: "logical-submit",
+      },
+    });
+    render(<Composer {...composerProps({ onSend })} />);
+
+    await waitFor(() => expect(textarea()).toHaveValue("retry exactly"));
+    fireEvent.submit(textarea().closest("form")!);
+
+    expect(onSend).toHaveBeenCalledWith("retry exactly", undefined, "logical-submit");
+  });
+
+  it("abandons the retry id when the restored message is edited", async () => {
+    const onSend = vi.fn();
+    useChatStore.setState({
+      failedSendDraft: {
+        conversationId: "conv_draft",
+        text: "retry exactly",
+        files: [],
+        clientEventId: "logical-submit",
+      },
+    });
+    render(<Composer {...composerProps({ onSend })} />);
+
+    await waitFor(() => expect(textarea()).toHaveValue("retry exactly"));
+    fireEvent.change(textarea(), { target: { value: "intentional new submit" } });
+    fireEvent.submit(textarea().closest("form")!);
+
+    expect(onSend).toHaveBeenCalledWith("intentional new submit", undefined);
+  });
+
+  it("does not discard failed files when a files-only draft is occupied", async () => {
+    const existing = new File(["existing"], "existing.png", { type: "image/png" });
+    const undelivered = new File(["retry"], "retry.png", { type: "image/png" });
+    setSessionDraft("conv_draft", { text: "", files: [existing] });
+    useChatStore.setState({
+      failedSendDraft: {
+        conversationId: "conv_draft",
+        text: "",
+        files: [undelivered],
+      },
+    });
+
+    render(<Composer {...composerProps()} />);
+    await waitFor(() => {
+      expect(useChatStore.getState().failedSendDraft?.files).toEqual([undelivered]);
+    });
+    expect(getSessionDraft("conv_draft")?.files).toEqual([existing]);
+  });
+
+  it("keeps uncertainty confirmation when a different draft is occupied", async () => {
+    const onSend = vi.fn();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    setSessionDraft("conv_draft", { text: "new draft", files: [] });
+    useChatStore.setState({
+      failedSendDraft: {
+        conversationId: "conv_draft",
+        text: "possibly delivered",
+        files: [],
+        clientEventId: "uncertain-event",
+      },
+      uncertainDelivery: {
+        conversationId: "conv_draft",
+        text: "possibly delivered",
+        files: [],
+        clientEventId: "uncertain-event",
+      },
+    });
+
+    render(<Composer {...composerProps({ onSend })} />);
+    await waitFor(() => expect(textarea()).toHaveValue("new draft"));
+    fireEvent.submit(textarea().closest("form")!);
+
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("may duplicate work"));
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("blocks an edited uncertain retry until replacement is confirmed", async () => {
+    const onSend = vi.fn();
+    const confirm = vi
+      .spyOn(window, "confirm")
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true);
+    useChatStore.setState({
+      failedSendDraft: {
+        conversationId: "conv_draft",
+        text: "possibly delivered",
+        files: [],
+        clientEventId: "uncertain-event",
+      },
+      uncertainDelivery: {
+        conversationId: "conv_draft",
+        text: "possibly delivered",
+        files: [],
+        clientEventId: "uncertain-event",
+      },
+    });
+
+    render(<Composer {...composerProps({ onSend })} />);
+    await waitFor(() => expect(textarea()).toHaveValue("possibly delivered"));
+    fireEvent.change(textarea(), { target: { value: "intentional replacement" } });
+
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend).not.toHaveBeenCalled();
+    expect(useChatStore.getState().uncertainDelivery?.clientEventId).toBe("uncertain-event");
+    expect(confirm).toHaveBeenCalledTimes(1);
+
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend).toHaveBeenCalledWith("intentional replacement", undefined);
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(useChatStore.getState().uncertainDelivery).toBeNull();
   });
 });
 
@@ -380,6 +510,8 @@ describe("Composer slash-command menu", () => {
     // without invoking store actions like compact().
     useChatStore.setState({
       conversationId: "conv_test",
+      failedSendDraft: null,
+      uncertainDelivery: null,
       skills: [
         { name: "deep-research", description: "Run a deep research sweep" },
         { name: "deslop", description: "Remove AI slop" },
@@ -538,6 +670,8 @@ describe("Composer slash-command submit routing", () => {
   beforeEach(() => {
     useChatStore.setState({
       conversationId: "conv_test",
+      failedSendDraft: null,
+      uncertainDelivery: null,
       skills: [
         { name: "deep-research", description: "Run a deep research sweep" },
         { name: "deslop", description: "Remove AI slop" },
@@ -562,7 +696,7 @@ describe("Composer slash-command submit routing", () => {
     fireEvent.change(ta, { target: { value: "/deslop fix the bug" } });
     fireEvent.keyDown(ta, { key: "Enter" });
 
-    expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "fix the bug");
+    expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "fix the bug", undefined);
     // It's a slash_command event, NOT a plaintext message.
     expect(onSend).not.toHaveBeenCalled();
   });
@@ -579,7 +713,7 @@ describe("Composer slash-command submit routing", () => {
     fireEvent.change(ta, { target: { value: "/deslop fix src/foo.ts" } });
     fireEvent.keyDown(ta, { key: "Enter" });
 
-    expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "fix src/foo.ts");
+    expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "fix src/foo.ts", undefined);
     expect(onSend).not.toHaveBeenCalled();
   });
 
@@ -606,9 +740,92 @@ describe("Composer slash-command submit routing", () => {
     fireEvent.change(ta, { target: { value: "/deslop " } });
     fireEvent.keyDown(ta, { key: "Enter" });
 
-    expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "");
+    expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "", undefined);
     // Took the event path, not the plaintext fallback.
     expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("reuses the prior identity for an unchanged restored uncertain skill", async () => {
+    const onSendSlashCommand = vi.fn();
+    const confirm = vi.spyOn(window, "confirm");
+    useChatStore.setState({
+      failedSendDraft: {
+        conversationId: "conv_test",
+        text: "/deslop fix the bug",
+        files: [],
+        clientEventId: "skill-logical-submit",
+      },
+      uncertainDelivery: {
+        conversationId: "conv_test",
+        text: "/deslop fix the bug",
+        files: [],
+        clientEventId: "skill-logical-submit",
+      },
+    });
+
+    render(<Composer {...composerProps({ onSendSlashCommand })} />);
+    await waitFor(() => expect(textarea()).toHaveValue("/deslop fix the bug"));
+    fireEvent.submit(textarea().closest("form")!);
+
+    expect(confirm).not.toHaveBeenCalled();
+    expect(onSendSlashCommand).toHaveBeenCalledWith(
+      "deslop",
+      "fix the bug",
+      "skill-logical-submit",
+    );
+  });
+
+  it("confirms an edited uncertain skill before sending a fresh identity", async () => {
+    const onSendSlashCommand = vi.fn();
+    const confirm = vi
+      .spyOn(window, "confirm")
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true);
+    useChatStore.setState({
+      failedSendDraft: {
+        conversationId: "conv_test",
+        text: "/deslop original",
+        files: [],
+        clientEventId: "skill-logical-submit",
+      },
+      uncertainDelivery: {
+        conversationId: "conv_test",
+        text: "/deslop original",
+        files: [],
+        clientEventId: "skill-logical-submit",
+      },
+    });
+
+    render(<Composer {...composerProps({ onSendSlashCommand })} />);
+    await waitFor(() => expect(textarea()).toHaveValue("/deslop original"));
+    fireEvent.change(textarea(), { target: { value: "/deslop replacement" } });
+
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSendSlashCommand).not.toHaveBeenCalled();
+    expect(useChatStore.getState().uncertainDelivery?.clientEventId).toBe("skill-logical-submit");
+    expect(confirm).toHaveBeenCalledTimes(1);
+
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSendSlashCommand).toHaveBeenCalledTimes(1);
+    expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "replacement", undefined);
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(useChatStore.getState().uncertainDelivery).toBeNull();
+  });
+
+  it("treats separate identical skill submits as distinct actions", async () => {
+    const onSendSlashCommand = vi.fn();
+    render(<Composer {...composerProps({ onSendSlashCommand })} />);
+    const form = textarea().closest("form")!;
+
+    fireEvent.change(textarea(), { target: { value: "/deslop same request" } });
+    fireEvent.submit(form);
+    await Promise.resolve();
+    fireEvent.change(textarea(), { target: { value: "/deslop same request" } });
+    fireEvent.submit(form);
+
+    expect(onSendSlashCommand).toHaveBeenCalledTimes(2);
+    expect(onSendSlashCommand).toHaveBeenNthCalledWith(1, "deslop", "same request", undefined);
+    expect(onSendSlashCommand).toHaveBeenNthCalledWith(2, "deslop", "same request", undefined);
   });
 
   it("falls through to plaintext onSend for an unknown command", () => {

@@ -62,6 +62,7 @@ import {
   ApiError,
   approve as approveElicitation,
   bindOnlyOnlineRunner,
+  createClientEventId,
   createSession,
   getSessionSlim,
   fetchSessionItemsPage,
@@ -128,6 +129,8 @@ import { isSystemUserContent } from "@/lib/systemMessage";
 import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
 
 export interface SendOptions {
+  /** Identity of this logical submit, retained through transport retries. */
+  clientEventId?: string;
   /**
    * Fires synchronously after `createSession` returns for a brand-new
    * session (before the first message is posted). Callers use this
@@ -165,6 +168,8 @@ export type SendAttemptResult = "settled" | "retryable_failure" | "terminal_fail
  */
 export interface PendingUserMessage {
   tempId: string;
+  /** Logical submit identity, retained across ambiguous replay attempts. */
+  clientEventId?: string;
   content: MessageContentBlock[];
   /** Client epoch seconds stamped ONCE at send time — the optimistic
    *  bubble's display timestamp. Stamping here (not at render or
@@ -200,6 +205,14 @@ export interface PendingUserMessage {
 export interface QueuedMessage {
   /** Client-only id, e.g. `q_1`. */
   queueId: string;
+  /** Stable identity retained until this logical submit is accepted or abandoned. */
+  clientEventId?: string;
+  /** Terminal delivery error that requires an explicit user retry. */
+  deliveryError?: string;
+  /** Prevent automatic FIFO flush until the user edits or explicitly retries. */
+  retryBlocked?: boolean;
+  /** Delivery may already have happened; retries must retain clientEventId. */
+  deliveryUncertain?: boolean;
   /** Fully-assembled message text (mentions/quotes already applied). */
   text: string;
   /** Attachments to send with the message. */
@@ -426,7 +439,19 @@ export interface ConversationState {
    * into — but the landing path binds a session first, so the reported flow
    * is covered.
    */
-  failedSendDraft: { conversationId: string; text: string; files: File[] } | null;
+  failedSendDraft: {
+    conversationId: string;
+    text: string;
+    files: File[];
+    clientEventId?: string;
+  } | null;
+  /** Delivery risk retained independently from draft restoration and ID reuse. */
+  uncertainDelivery: {
+    conversationId: string;
+    clientEventId: string;
+    text: string;
+    files: File[];
+  } | null;
   /**
    * When a send last latched THIS conversation's `status` to "streaming", or
    * `null`. Conversation-scoped, not a module global, because `status` is now
@@ -667,7 +692,7 @@ export interface ChatActions {
    * while the agent is busy. The head is flushed automatically (FIFO, one per
    * turn) when the session next goes idle — see the `session_status` handler.
    */
-  enqueueMessage: (text: string, files?: File[]) => void;
+  enqueueMessage: (text: string, files?: File[], clientEventId?: string) => void;
   /** Remove a queued message by id (the strip's per-row delete). */
   dequeueMessage: (queueId: string) => void;
   /**
@@ -1252,6 +1277,8 @@ function scheduleWorkspaceFilesystemInvalidation(sessionId: string): void {
  * the vendor CLI interprets slash commands itself.
  */
 export interface PendingInitialPrompt {
+  /** Stable identity reused by the bounded initial-prompt delivery loop. */
+  clientEventId?: string;
   /** Sanitized full text the user typed, e.g. `"/review-pr 123"`. */
   text: string;
   /** Matched bundled-skill invocation, or `null` for a plain message. */
@@ -1288,7 +1315,10 @@ export function setPendingInitialPrompt(
   prompt: PendingInitialPrompt,
 ): void {
   if (!prompt.text) return;
-  pendingInitialPrompts.set(conversationId, prompt);
+  pendingInitialPrompts.set(conversationId, {
+    ...prompt,
+    clientEventId: prompt.clientEventId ?? createClientEventId(),
+  });
 }
 
 /**
@@ -1359,6 +1389,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   streamBudgetExceeded: false,
   streamBudgetBannerDismissed: false,
   failedSendDraft: null,
+  uncertainDelivery: null,
   sendLatchedAt: null,
   llmModel: null,
   pendingModelChange: null,
@@ -1380,7 +1411,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   abortController: null,
   historyGeneration: 0,
 
-  enqueueMessage: (text, files) => {
+  enqueueMessage: (text, files, clientEventId = createClientEventId()) => {
     const { conversationId, boundAgentId } = get();
     if (conversationId === null) return;
     queueSeq += 1;
@@ -1390,6 +1421,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ...s.queuedMessages,
         {
           queueId,
+          clientEventId,
           text,
           conversationId,
           ...(boundAgentId !== null ? { agentId: boundAgentId } : {}),
@@ -1445,7 +1477,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (target === undefined || agentId === null) return;
     // Remove BEFORE the POST so a concurrent flush can't also send it.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId) });
-    void s.send(target.text, agentId, target.files);
+    void s.send(target.text, agentId, target.files, {
+      clientEventId:
+        target.retryBlocked === true && target.deliveryUncertain !== true
+          ? createClientEventId()
+          : (target.clientEventId ?? createClientEventId()),
+    });
   },
 
   clearQueuedMessages: (conversationId) => {
@@ -1489,10 +1526,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // so an undrained message from another conversation can sit at index 0; a
     // head-only guard would let it block this conversation's messages forever.
     const head = s.queuedMessages.find((m) => m.conversationId === s.conversationId);
-    if (head === undefined) return;
+    if (head === undefined || head.retryBlocked === true) return;
     // Remove it BEFORE the POST so a re-entrant flush can't double-send.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
-    void s.send(head.text, head.agentId ?? s.boundAgentId, head.files);
+    void s.send(head.text, head.agentId ?? s.boundAgentId, head.files, {
+      clientEventId: head.clientEventId ?? createClientEventId(),
+    });
   },
 
   flushBackgroundQueues: () => {
@@ -1536,7 +1575,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const cooldownUntil = backgroundFlushCooldownUntil.get(conversationId);
       if (cooldownUntil !== undefined && cooldownUntil > now) continue;
       const head = get().queuedMessages.find((m) => m.conversationId === conversationId);
-      if (head === undefined) continue;
+      if (head === undefined || head.retryBlocked === true) continue;
+      const claimedHead = {
+        ...head,
+        clientEventId: head.clientEventId ?? createClientEventId(),
+      };
 
       // Remove BEFORE the work starts so a re-entrant trigger can't double-send.
       backgroundFlushInFlight.add(conversationId);
@@ -1567,28 +1610,41 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         await waitForPrior();
         // Reuse prior successful uploads so cooldown-paced retries do not
         // orphan blobs that already landed.
-        const fileBlocks = await uploadFileBlocks(conversationId, head.files ?? []);
+        const fileBlocks = await uploadFileBlocks(conversationId, claimedHead.files ?? []);
         const content: ContentBlock[] = [
           ...fileBlocks,
-          ...(head.text.trim() ? [{ type: "input_text" as const, text: head.text }] : []),
+          ...(claimedHead.text.trim()
+            ? [{ type: "input_text" as const, text: claimedHead.text }]
+            : []),
         ];
         await postEvent(conversationId, {
           type: "message",
+          client_event_id: claimedHead.clientEventId,
           data: { role: "user", content },
         });
       })()
-        .catch(() => {
+        .catch((err: unknown) => {
           backgroundFlushCooldownUntil.set(
             conversationId,
             Date.now() + BACKGROUND_FLUSH_COOLDOWN_MS,
           );
+          const retryBlocked = err instanceof ApiError && err.status !== 408 && err.status < 500;
+          const deliveryUncertain = isUncertainDeliveryError(err);
+          const requeuedHead = retryBlocked
+            ? {
+                ...claimedHead,
+                retryBlocked: true,
+                ...(deliveryUncertain ? { deliveryUncertain: true } : {}),
+                deliveryError: err.message,
+              }
+            : claimedHead;
           setActive((st) => {
             const idx = st.queuedMessages.findIndex((m) => m.conversationId === conversationId);
             const at = idx === -1 ? st.queuedMessages.length : idx;
             return {
               queuedMessages: [
                 ...st.queuedMessages.slice(0, at),
-                head,
+                requeuedHead,
                 ...st.queuedMessages.slice(at),
               ],
             };
@@ -1607,6 +1663,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (!agentId) {
       throw new Error("chatStore.send: no agentId");
     }
+    const clientEventId = opts?.clientEventId ?? createClientEventId();
     // Sending while a response is already streaming is allowed — the
     // session API queues item-typed events and the server delivers them
     // into the running task's inbox. Keep `activeResponse` untouched in
@@ -1644,6 +1701,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ...s.pendingUserMessages,
         {
           tempId,
+          clientEventId,
           content,
           createdAtS: Math.floor(Date.now() / 1000),
           ...(selfAuthor !== null ? { author: selfAuthor } : {}),
@@ -1716,11 +1774,15 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
       const postResult = await postEvent(sessionId, {
         type: "message",
+        client_event_id: clientEventId,
         data: {
           role: "user",
           content: serverContent,
         },
       });
+      setterFor(sessionId)((state) =>
+        state.uncertainDelivery?.clientEventId === clientEventId ? { uncertainDelivery: null } : {},
+      );
       result = "settled";
       // Policy denied the input — the server returned immediately
       // without starting a turn or persisting the user message, so
@@ -1743,6 +1805,20 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           }
           return patch;
         });
+      } else if (postResult.idempotencyReplayed) {
+        // The server accepted this logical submit on an earlier HTTP attempt.
+        // No second consumed event is emitted for a durable replay, so
+        // reconcile the original committed/pending input instead of stranding
+        // this retry's optimistic bubble.
+        await reconcileReplayedSubmit(
+          sessionId,
+          tempId,
+          postResult.pendingId,
+          postResult.itemId,
+          clientEventId,
+          setterFor(sessionId),
+          () => setterForState(sessionId) ?? get(),
+        );
       } else {
         // POST accepted: the server can now account for this message
         // (native: pending_inputs replay until the round-trip commits it;
@@ -1790,8 +1866,24 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         draftSessionId !== null &&
         (text.trim() !== "" || (files?.length ?? 0) > 0)
       ) {
+        const deliveryUncertain = isUncertainDeliveryError(err);
         setterFor(draftSessionId)({
-          failedSendDraft: { conversationId: draftSessionId, text, files: files ?? [] },
+          failedSendDraft: {
+            conversationId: draftSessionId,
+            text,
+            files: files ?? [],
+            ...(shouldPreserveClientEventId(err) ? { clientEventId } : {}),
+          },
+          ...(deliveryUncertain
+            ? {
+                uncertainDelivery: {
+                  conversationId: draftSessionId,
+                  clientEventId,
+                  text,
+                  files: files ?? [],
+                },
+              }
+            : {}),
         });
       }
       // Settle the conversation this send targeted, wherever the user is now:
@@ -1851,6 +1943,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (!agentId) {
       throw new Error("chatStore.sendSlashCommand: no agentId");
     }
+    const clientEventId = opts?.clientEventId ?? createClientEventId();
     // Mirror `send`'s lifecycle scaffolding (streaming flag + send-chain
     // serialization) so a skill invocation behaves like any other turn.
     const alreadyStreaming = get().status === "streaming";
@@ -1875,6 +1968,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ...s.pendingUserMessages,
         {
           tempId,
+          clientEventId,
           content: [{ type: "input_text" as const, text: commandText }],
           createdAtS: Math.floor(Date.now() / 1000),
           ...(selfAuthor !== null ? { author: selfAuthor } : {}),
@@ -1904,7 +1998,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const postResult = await postEvent(sessionId, {
         type: "slash_command",
         data: { kind: "skill", name, arguments: args },
+        client_event_id: clientEventId,
       });
+      setterFor(sessionId)((state) =>
+        state.uncertainDelivery?.clientEventId === clientEventId ? { uncertainDelivery: null } : {},
+      );
       result = "settled";
       if (postResult.denied) {
         // Denied commands publish no receipt, so nothing will pop the
@@ -1956,8 +2054,24 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const failSet = postedSessionId === null ? setActive : setterFor(postedSessionId);
       const draftSessionId = postedSessionId ?? submitConversationId;
       if (!suppressFailure && !persistedFailure && draftSessionId !== null) {
+        const deliveryUncertain = isUncertainDeliveryError(err);
         setterFor(draftSessionId)({
-          failedSendDraft: { conversationId: draftSessionId, text: commandText, files: [] },
+          failedSendDraft: {
+            conversationId: draftSessionId,
+            text: commandText,
+            files: [],
+            ...(shouldPreserveClientEventId(err) ? { clientEventId } : {}),
+          },
+          ...(deliveryUncertain
+            ? {
+                uncertainDelivery: {
+                  conversationId: draftSessionId,
+                  clientEventId,
+                  text: commandText,
+                  files: [],
+                },
+              }
+            : {}),
         });
       }
       // Keep an echo the server says it persisted; snapshots reconcile it.
@@ -3862,6 +3976,73 @@ async function rehydrateWindowOnReconnect(
       historyGeneration: s.historyGeneration + 1,
     };
   });
+}
+
+/**
+ * Reconcile a successful durable replay with the optimistic bubble created by
+ * the retrying HTTP attempt.
+ */
+async function reconcileReplayedSubmit(
+  id: string,
+  tempId: string,
+  pendingId: string | undefined,
+  committedItemId: string | undefined,
+  clientEventId: string,
+  set: Setter,
+  get: Getter,
+): Promise<void> {
+  // Never remove the only visible copy merely because the receipt says the
+  // original attempt completed. The committed item still has to be observed
+  // successfully below; a failed snapshot/items fetch leaves this bubble as
+  // the user's evidence that the message exists.
+  set((state) => {
+    const index = state.pendingUserMessages.findIndex((pending) => pending.tempId === tempId);
+    if (index === -1) return {};
+    if (pendingId === undefined) {
+      const replayed = state.pendingUserMessages[index]!;
+      return {
+        pendingUserMessages: state.pendingUserMessages.map((pending, at) =>
+          at === index ? { ...replayed, posted: true } : pending,
+        ),
+      };
+    }
+    // A cold snapshot may already have restored this pending id. Keep one
+    // canonical bubble rather than introducing duplicate keys.
+    const alreadyPresent = state.pendingUserMessages.some(
+      (pending, at) => at !== index && pending.tempId === pendingId,
+    );
+    if (alreadyPresent) {
+      return {
+        pendingUserMessages: [
+          ...state.pendingUserMessages.slice(0, index),
+          ...state.pendingUserMessages.slice(index + 1),
+        ],
+      };
+    }
+    const replayed = state.pendingUserMessages[index]!;
+    return {
+      pendingUserMessages: [
+        ...state.pendingUserMessages.slice(0, index),
+        { ...replayed, tempId: pendingId, posted: true },
+        ...state.pendingUserMessages.slice(index + 1),
+      ],
+    };
+  });
+
+  // The original consumed event may have crossed the failed HTTP response and
+  // is not re-emitted for a receipt replay. Only this successful snapshot +
+  // items reconciliation is allowed to replace the optimistic bubble.
+  await reconcileOnReconnect(id, set, get);
+  if (
+    committedItemId !== undefined &&
+    get().blocks.some((block) => block.ctx.itemId === committedItemId)
+  ) {
+    set((state) => ({
+      pendingUserMessages: state.pendingUserMessages.filter(
+        (pending) => pending.tempId !== tempId && pending.clientEventId !== clientEventId,
+      ),
+    }));
+  }
 }
 
 /**
@@ -6247,6 +6428,27 @@ function describeSendFailure(err: unknown): { message: string; code: string } {
     return { message: err.message, code: err.code ?? "" };
   }
   return { message: err instanceof Error ? err.message : String(err), code: "" };
+}
+
+function shouldPreserveClientEventId(err: unknown): boolean {
+  if (!(err instanceof ApiError)) return true;
+  return (
+    err.status === 408 ||
+    err.status >= 500 ||
+    err.code === "wrong_replica" ||
+    err.code === "message_event_pending" ||
+    err.code === "message_event_uncertain"
+  );
+}
+
+function isUncertainDeliveryError(err: unknown): boolean {
+  if (!(err instanceof ApiError)) return true;
+  return (
+    err.status === 408 ||
+    err.status >= 500 ||
+    err.code === "message_event_pending" ||
+    err.code === "message_event_uncertain"
+  );
 }
 
 /**

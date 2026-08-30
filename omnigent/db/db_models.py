@@ -27,6 +27,7 @@ from sqlalchemy import (
     true,
 )
 from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
+from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from omnigent.db.compression import CompressedText
@@ -35,6 +36,12 @@ from omnigent.db.compression import CompressedText
 # but MySQL cannot index a BLOB without a key-prefix length, so use fixed-length
 # BINARY(32) there — an exact fit for the digest and fully indexable.
 _CKSUM32 = LargeBinary(32).with_variant(MySQLBinary(32), "mysql")
+# MySQL's default text collation is commonly case-insensitive. Event ids are
+# opaque and case-sensitive, so their primary-key comparison must be binary.
+_CASE_SENSITIVE_ID128 = String(128).with_variant(
+    MySQLVarchar(128, collation="utf8mb4_bin"),
+    "mysql",
+)
 
 
 # Hex length of a bare uuid4 id, the canonical Python-side form.
@@ -953,6 +960,42 @@ class SqlConversationItem(ConversationBase):
             name="ck_conversation_items_type",
         ),
         CheckConstraint("status IN (1, 2, 3, 4)", name="ck_conversation_items_status"),
+    )
+
+
+class SqlMessageEventReceipt(ConversationBase):
+    """Durable identity and outcome for one client-submitted message event."""
+
+    __tablename__ = "message_event_receipts"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    client_event_id: Mapped[str] = mapped_column(_CASE_SENSITIVE_ID128, primary_key=True)
+    fingerprint: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Nullable for mixed-version deploys: the previous binary inserts neither.
+    owner_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'completed', 'failed', 'uncertain')",
+            name="ck_message_event_receipts_status",
+        ),
+        CheckConstraint(
+            "(status = 'completed' AND outcome IS NOT NULL) OR "
+            "(status IN ('pending', 'failed', 'uncertain') AND outcome IS NULL)",
+            name="ck_message_event_receipts_outcome",
+        ),
     )
 
 

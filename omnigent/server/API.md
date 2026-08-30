@@ -849,6 +849,7 @@ Content-Type: application/json
 
 {
   "type": "message",
+  "client_event_id": "fd8f77ef-258f-41d7-bd88-4fd6325b8e33",
   "data": {
     "role": "user",
     "content": [{"type": "input_text", "text": "What about hotels?"}]
@@ -974,25 +975,54 @@ Request body matches `SessionEventInput`:
     against the item-type's Pydantic data class for non-interrupt
     types (400 on schema mismatch).
 
+  client_event_id (string, optional)
+    Identity of one logical `"message"` or `"slash_command"` submit.
+    Reusing the same id and payload does not forward or persist the event
+    again; completed attempts return their original outcome. Two intentional
+    submits, including identical text or commands, must use different ids.
+    Older clients may omit this field; their behavior is unchanged.
+
 202 Accepted
 {"queued": true}                            # regular queued item events
 {"queued": false}                           # "interrupt" and status/control bypasses
 {"queued": false, "item_id": "item_..."}    # "external_conversation_item"
 {"queued": true, "pending_id": "pending_..."} # native-terminal "message" (see below)
+{"queued": true, ..., "idempotency_replayed": true} # prior durable outcome replay
 
 400 Bad Request — unknown `type`, or `data` fails the per-type schema
+409 Conflict — inspect error.code:
+  message_event_identity_conflict  id was reused for different content
+  message_event_failed             original attempt definitively failed
+  message_event_pending            another owner is actively processing it
+  message_event_uncertain          owner lease expired before a durable outcome
 404 Not Found — no session with that id
 422 Unprocessable Entity — request body fails Pydantic validation
 ```
 
+The receipt provides at-most-once API-to-runner dispatch for one
+`(session, client_event_id, payload)` across response-loss retries, replicas,
+and AP restarts. It does not claim end-to-end exactly-once transcript
+reconciliation. If AP stops after the runner may have accepted an event but
+before the receipt outcome commits, the receipt fails closed as
+`message_event_uncertain`: the identity is preserved and AP refuses to dispatch
+it again.
+
+Receipts currently remain until their session is deleted. Bounded tombstone
+retention is explicit follow-up work. A safe compactor must retain identity,
+fingerprint, and terminal state for at least the maximum supported
+offline/client retry window; deleting earlier reopens the duplicate-dispatch
+hole. This API does not promise a time after which an id may be safely reused.
+
 **Native-terminal `message` events return `pending_id`.** On
-claude-native / codex-native sessions a web-composer `message` is NOT
-persisted at POST time (the transcript forwarder is the single writer);
-the server records it in an in-memory pending-inputs index and returns
-its `pending_id`. The id is what makes the bubble durable across a
-rebind: it (a) re-hydrates from the snapshot's `pending_inputs` (the
-replayed bubble carries the id) and (b) is dropped by id when the
-matching `session.input.consumed` arrives carrying `cleared_pending_id`.
+claude-native / codex-native sessions a web-composer `message` is NOT persisted
+at POST time (the transcript forwarder is the single writer). The existing
+in-memory pending-input index returns a `pending_id`; snapshots and
+`session.input.consumed` use that id to reconcile optimistic bubbles while AP
+remains alive. This PR intentionally does not change that transcript path.
+Pending attachments and authorship do not survive an AP restart. Closing that
+existing limitation safely requires propagating `client_event_id` through the
+runner, terminal, and transcript and atomically appending the transcript item
+with its receipt update in a separate design.
 A client *may* adopt the id onto its live optimistic bubble for id-based
 dedupe; the first-party web client deliberately does NOT (it keeps a
 client temp id for React-key stability and relies on a stable key +

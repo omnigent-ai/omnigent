@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from alembic import command
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine, event, inspect, text
 
 from omnigent.db.utils import (
     _LAKEBASE_POOL_RECYCLE_SECONDS,
@@ -369,6 +369,54 @@ def _make_db_at_unknown_revision(db_path: Path, revision: str) -> str:
     finally:
         engine.dispose()
     return uri
+
+
+def test_message_event_receipt_migration_round_trip(tmp_path: Path) -> None:
+    db_path = tmp_path / "message-receipts.db"
+    uri = _make_db_at_revision(db_path, "e5d9bc8ac650")
+    engine = create_engine(uri)
+    config = _build_alembic_config(uri)
+    try:
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "f6a7b8c9d0e1")
+        inspector = inspect(engine)
+        assert "message_event_receipts" in inspector.get_table_names()
+        columns = {
+            column["name"]: column
+            for column in inspector.get_columns("message_event_receipts")
+        }
+        assert columns["owner_id"]["nullable"] is True
+        assert columns["lease_expires_at"]["nullable"] is True
+        assert {
+            constraint["name"] for constraint in inspector.get_check_constraints(
+                "message_event_receipts"
+            )
+        } == {
+            "ck_message_event_receipts_outcome",
+            "ck_message_event_receipts_status",
+        }
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO message_event_receipts "
+                    "(workspace_id, conversation_id, client_event_id, fingerprint, "
+                    "status, outcome, created_at, updated_at) "
+                    "VALUES (0, :conversation_id, 'old-writer', :fingerprint, "
+                    "'uncertain', NULL, 1, 1)"
+                ),
+                {
+                    "conversation_id": bytes.fromhex("11" * 16),
+                    "fingerprint": bytes.fromhex("22" * 32),
+                },
+            )
+
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.downgrade(config, "e5d9bc8ac650")
+        assert "message_event_receipts" not in inspect(engine).get_table_names()
+    finally:
+        engine.dispose()
 
 
 def test_initialize_or_verify_schema_initializes_fresh_db(

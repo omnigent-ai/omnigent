@@ -66,6 +66,10 @@ class ErrorCode:
     INVALID_INPUT = "invalid_input"
     ALREADY_EXISTS = "already_exists"
     CONFLICT = "conflict"
+    MESSAGE_EVENT_IDENTITY_CONFLICT = "message_event_identity_conflict"
+    MESSAGE_EVENT_FAILED = "message_event_failed"
+    MESSAGE_EVENT_PENDING = "message_event_pending"
+    MESSAGE_EVENT_UNCERTAIN = "message_event_uncertain"
     INTERNAL_ERROR = "internal_error"
     HARNESS_PROTOCOL_VIOLATION = "harness_protocol_violation"
     RUNNER_UNAVAILABLE = "runner_unavailable"
@@ -85,6 +89,10 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     ErrorCode.INVALID_INPUT: 400,
     ErrorCode.ALREADY_EXISTS: 409,
     ErrorCode.CONFLICT: 409,
+    ErrorCode.MESSAGE_EVENT_IDENTITY_CONFLICT: 409,
+    ErrorCode.MESSAGE_EVENT_FAILED: 409,
+    ErrorCode.MESSAGE_EVENT_PENDING: 409,
+    ErrorCode.MESSAGE_EVENT_UNCERTAIN: 409,
     ErrorCode.INTERNAL_ERROR: 500,
     # Harness protocol violations are server-side bugs in the
     # harness implementation — surface as 500 (no client action

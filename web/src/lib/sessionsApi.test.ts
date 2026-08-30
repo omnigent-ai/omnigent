@@ -856,7 +856,7 @@ describe("fetchSessionItemsPage", () => {
 });
 
 describe("postEvent", () => {
-  it("POSTs the event body verbatim and returns {queued, itemId}", async () => {
+  it("adds a logical submit id to message events and returns {queued, itemId}", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: true, item_id: "ci_123" }));
     const event = {
       type: "message",
@@ -868,8 +868,70 @@ describe("postEvent", () => {
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_abc/events");
     expect(init.method).toBe("POST");
-    expect(JSON.parse(init.body as string)).toEqual(event);
+    expect(JSON.parse(init.body as string)).toEqual({
+      ...event,
+      client_event_id: expect.any(String),
+    });
     expect(out).toEqual({ queued: true, itemId: "ci_123" });
+  });
+
+  it("preserves an explicit client event id across transport handling", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: true, item_id: "ci_123" }));
+    const event = {
+      type: "message",
+      client_event_id: "logical-submit",
+      data: { role: "user" as const, content: [{ type: "input_text" as const, text: "hi" }] },
+    };
+
+    await postEvent("conv_abc", event);
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual(event);
+  });
+
+  it("generates distinct opaque ids for intentional identical submits", async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockJsonResponse({ queued: true, item_id: "ci_1" }))
+      .mockResolvedValueOnce(mockJsonResponse({ queued: true, item_id: "ci_2" }));
+    const event = {
+      type: "message" as const,
+      data: {
+        role: "user" as const,
+        content: [{ type: "input_text" as const, text: "same text" }],
+      },
+    };
+
+    await postEvent("conv_abc", event);
+    await postEvent("conv_abc", event);
+
+    const ids = fetchMock.mock.calls.map(([, init]) => {
+      const body = JSON.parse((init as RequestInit).body as string);
+      return body.client_event_id as string;
+    });
+    expect(ids[0]).toMatch(/^event_[A-Za-z0-9_-]+$/);
+    expect(ids[1]).not.toBe(ids[0]);
+  });
+
+  it("parses the durable replay marker", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        queued: true,
+        pending_id: "pending_abc123",
+        idempotency_replayed: true,
+      }),
+    );
+
+    const out = await postEvent("conv_native", {
+      type: "message",
+      client_event_id: "logical-submit",
+      data: { role: "user", content: [{ type: "input_text", text: "hi" }] },
+    });
+
+    expect(out).toMatchObject({
+      queued: true,
+      pendingId: "pending_abc123",
+      idempotencyReplayed: true,
+    });
   });
 
   it("surfaces 4xx as a thrown error (does not silently swallow)", async () => {

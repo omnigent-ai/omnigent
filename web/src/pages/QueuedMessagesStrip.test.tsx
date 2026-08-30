@@ -37,6 +37,26 @@ describe("QueuedMessagesStrip", () => {
     expect(screen.getByText("second")).toBeInTheDocument();
   });
 
+  it("marks a terminal delivery failure as needing attention", () => {
+    render(
+      <TooltipProvider>
+        <QueuedMessagesStrip
+          messages={[
+            {
+              ...msg("q_1", "retry me"),
+              retryBlocked: true,
+              deliveryError: "Original delivery is uncertain",
+            },
+          ]}
+          onDelete={vi.fn()}
+          onEdit={vi.fn()}
+        />
+      </TooltipProvider>,
+    );
+
+    expect(screen.getByLabelText("Queued message needs attention")).toBeInTheDocument();
+  });
+
   it("calls onDelete with the row's queueId when its remove button is clicked", () => {
     const onDelete = vi.fn();
     render(

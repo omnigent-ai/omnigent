@@ -1231,6 +1231,9 @@ class SessionEventInput(BaseModel):
         ``{"role": "user", "content": [{"type": "input_text",
         "text": "Hello"}]}``. For ``"interrupt"`` this is
         typically ``{}``.
+    :param client_event_id: Optional identity for one logical client
+        submit. Replays of the same message with the same id share
+        one dispatch; separate submits must use separate ids.
     :param tools: Optional OpenAI function-tool dicts registered
         when this event creates a new task. Mirrors
         :attr:`CreateResponseRequest.tools`, e.g. ``[{"type":
@@ -1247,6 +1250,7 @@ class SessionEventInput(BaseModel):
     # Defaults to {} for payload-less control events (interrupt,
     # stop_session); item-typed events still fail loud per-type.
     data: dict[str, Any] = Field(default_factory=dict)
+    client_event_id: str | None = Field(default=None, min_length=1, max_length=128)
     model_override: str | None = None
     tools: list[dict[str, Any]] | None = None
     created_by: str | None = None

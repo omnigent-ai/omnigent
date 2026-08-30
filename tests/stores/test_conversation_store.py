@@ -102,6 +102,105 @@ def test_get_nonexistent(conversation_store: SqlAlchemyConversationStore) -> Non
     assert conversation_store.get_conversation("c55a64c3f6f954fe0fc8738ba3f45f26") is None
 
 
+def test_message_event_receipt_lifecycle(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+    fingerprint = "ab" * 32
+    claimed, pending = conversation_store.claim_message_event(
+        conv.id,
+        "CaseSensitiveEvent",
+        fingerprint,
+        owner_id="replica-a",
+        lease_expires_at=1234,
+    )
+    assert claimed is True
+    assert pending.status == "pending"
+
+    outcome = {"queued": True, "pending_id": "pending-1"}
+    conversation_store.complete_message_event(
+        conv.id,
+        "CaseSensitiveEvent",
+        fingerprint,
+        status="completed",
+        outcome=outcome,
+    )
+    claimed_again, completed = conversation_store.claim_message_event(
+        conv.id,
+        "CaseSensitiveEvent",
+        fingerprint,
+    )
+    assert claimed_again is False
+    assert completed.status == "completed"
+    assert completed.outcome == outcome
+
+    # Opaque ids remain case-sensitive even under a case-insensitive DB collation.
+    lower_claimed, _ = conversation_store.claim_message_event(
+        conv.id,
+        "casesensitiveevent",
+        fingerprint,
+    )
+    assert lower_claimed is True
+
+
+def test_message_event_terminal_transition_is_compare_and_set(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+    fingerprint = "cd" * 32
+    conversation_store.claim_message_event(conv.id, "event", fingerprint)
+    conversation_store.complete_message_event(
+        conv.id,
+        "event",
+        fingerprint,
+        status="uncertain",
+        outcome=None,
+    )
+    with pytest.raises(RuntimeError, match="was not pending"):
+        conversation_store.complete_message_event(
+            conv.id,
+            "event",
+            fingerprint,
+            status="completed",
+            outcome={"queued": True},
+        )
+    assert conversation_store.get_message_event(conv.id, "event").status == "uncertain"
+
+
+def test_message_event_claim_is_atomic_across_store_instances(db_uri: str) -> None:
+    import threading
+
+    first_store = SqlAlchemyConversationStore(db_uri)
+    second_store = SqlAlchemyConversationStore(db_uri)
+    conv = first_store.create_conversation()
+    barrier = threading.Barrier(2)
+    results: list[tuple[bool, str]] = []
+    errors: list[Exception] = []
+    lock = threading.Lock()
+
+    def claim(store: SqlAlchemyConversationStore) -> None:
+        try:
+            barrier.wait()
+            claimed, receipt = store.claim_message_event(conv.id, "event", "ef" * 32)
+            with lock:
+                results.append((claimed, receipt.status))
+        except Exception as exc:
+            with lock:
+                errors.append(exc)
+
+    threads = [
+        threading.Thread(target=claim, args=(first_store,)),
+        threading.Thread(target=claim, args=(second_store,)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert errors == []
+    assert sorted(results) == [(False, "pending"), (True, "pending")]
+
+
 def test_rename_conversation_if_title_matches_is_atomic(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

@@ -191,6 +191,17 @@ class CreatedSession:
 
 
 @dataclass(frozen=True)
+class MessageEventReceipt:
+    """Durable state for one logical client message submission."""
+
+    fingerprint: str
+    status: str
+    outcome: dict[str, bool | str] | None
+    owner_id: str
+    lease_expires_at: int
+
+
+@dataclass(frozen=True)
 class SessionConnectivity:
     """
     The minimal session fields the sidebar's online-dot needs.
@@ -624,6 +635,55 @@ class ConversationStore(ABC):
         :returns: The persisted :class:`ConversationItem` list
             with store-assigned IDs and timestamps.
         """
+        ...
+
+    @abstractmethod
+    def claim_message_event(
+        self,
+        conversation_id: str,
+        client_event_id: str,
+        fingerprint: str,
+        *,
+        owner_id: str = "legacy",
+        lease_expires_at: int = 0,
+    ) -> tuple[bool, MessageEventReceipt]:
+        """Atomically claim a logical message submission.
+
+        The boolean is true only for the caller that inserted the receipt.
+        Replays receive the existing durable state.
+        """
+        ...
+
+    @abstractmethod
+    def get_message_event(
+        self,
+        conversation_id: str,
+        client_event_id: str,
+    ) -> MessageEventReceipt | None:
+        """Read the latest durable state for one logical submission."""
+        ...
+
+    @abstractmethod
+    def complete_message_event(
+        self,
+        conversation_id: str,
+        client_event_id: str,
+        fingerprint: str,
+        *,
+        status: str,
+        outcome: dict[str, bool | str] | None,
+    ) -> None:
+        """Persist the terminal outcome of a claimed logical message."""
+        ...
+
+    @abstractmethod
+    def abandon_message_event(
+        self,
+        conversation_id: str,
+        client_event_id: str,
+        fingerprint: str,
+    ) -> None:
+        """Release a claim after a definite pre-dispatch failure."""
         ...
 
     @abstractmethod

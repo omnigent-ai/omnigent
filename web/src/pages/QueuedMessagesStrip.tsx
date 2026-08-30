@@ -9,7 +9,14 @@ import {
   useSensor,
   useSensors,
 } from "@dnd-kit/core";
-import { ArrowUpIcon, ClockIcon, GripVerticalIcon, PencilIcon, Trash2Icon } from "lucide-react";
+import {
+  ArrowUpIcon,
+  CircleAlertIcon,
+  ClockIcon,
+  GripVerticalIcon,
+  PencilIcon,
+  Trash2Icon,
+} from "lucide-react";
 
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { QueuedMessage } from "@/store/chatStore";
@@ -89,6 +96,19 @@ function QueuedRow({
       ) : (
         <ClockIcon className="size-3.5 shrink-0" aria-hidden="true" />
       )}
+      {message.retryBlocked === true ? (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <CircleAlertIcon
+              aria-label="Queued message needs attention"
+              className="size-3.5 shrink-0 text-destructive"
+            />
+          </TooltipTrigger>
+          <TooltipContent side="top">
+            {message.deliveryError ?? "Delivery failed. Edit or send again to retry."}
+          </TooltipContent>
+        </Tooltip>
+      ) : null}
       <span className="min-w-0 flex-1 truncate">{message.text}</span>
       {/* Always visible (not hover-gated) so the actions are discoverable;
           they brighten on hover/focus. */}
@@ -97,32 +117,42 @@ function QueuedRow({
           <TooltipTrigger asChild>
             <button
               type="button"
-              aria-label="Send queued message now"
+              aria-label={
+                message.deliveryUncertain === true
+                  ? "Check queued message delivery"
+                  : "Send queued message now"
+              }
               className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
               onClick={() => onSteer(message.queueId)}
             >
               <ArrowUpIcon className="size-3.5" aria-hidden="true" />
             </button>
           </TooltipTrigger>
-          <TooltipContent side="top">Send now</TooltipContent>
+          <TooltipContent side="top">
+            {message.deliveryUncertain === true ? "Check delivery (safe retry)" : "Send now"}
+          </TooltipContent>
         </Tooltip>
       ) : null}
-      <button
-        type="button"
-        aria-label="Edit queued message"
-        className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
-        onClick={() => onEdit(message.queueId)}
-      >
-        <PencilIcon className="size-3.5" aria-hidden="true" />
-      </button>
-      <button
-        type="button"
-        aria-label="Remove queued message"
-        className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
-        onClick={() => onDelete(message.queueId)}
-      >
-        <Trash2Icon className="size-3.5" aria-hidden="true" />
-      </button>
+      {message.deliveryUncertain !== true ? (
+        <>
+          <button
+            type="button"
+            aria-label="Edit queued message"
+            className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
+            onClick={() => onEdit(message.queueId)}
+          >
+            <PencilIcon className="size-3.5" aria-hidden="true" />
+          </button>
+          <button
+            type="button"
+            aria-label="Remove queued message"
+            className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
+            onClick={() => onDelete(message.queueId)}
+          >
+            <Trash2Icon className="size-3.5" aria-hidden="true" />
+          </button>
+        </>
+      ) : null}
     </div>
   );
 }
