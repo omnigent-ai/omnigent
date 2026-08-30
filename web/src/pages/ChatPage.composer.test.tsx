@@ -51,7 +51,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
 }));
 import type { ElicitationBlock } from "@/lib/blocks";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { Composer, isSubagentRoutingEligible, shouldQueueSend } from "./ChatPage";
+import { Composer, computeIsWorking, isSubagentRoutingEligible, shouldQueueSend } from "./ChatPage";
 import type { Session } from "@/lib/types";
 import type { QueuedMessage } from "@/store/chatStore";
 import {
@@ -1647,6 +1647,14 @@ describe("Composer pending elicitation", () => {
     // the lock test above left a per-session draft behind for "conv_test".
     useChatStore.setState({ conversationId: "conv_interrupt", blocks: [elicitationBlock()] });
     render(<Composer {...composerProps({ isWorking: true, status: "streaming" })} />);
+    expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
+  });
+
+  it("keeps ChatPage's waiting elicitation interruptible", () => {
+    // The locked textarea cannot strand a waiting turn without its Stop action.
+    useChatStore.setState({ conversationId: "conv_wiring", blocks: [elicitationBlock()] });
+    const isWorking = computeIsWorking("waiting");
+    render(<Composer {...composerProps({ isWorking, status: "streaming" })} />);
     expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
   });
 
