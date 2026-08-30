@@ -851,7 +851,7 @@ function AppearanceSection() {
           <div className="flex flex-col gap-3">
             <span className="text-ui font-medium">Theme</span>
             <p className="text-sm text-muted-foreground">
-              Light and dark mode are controlled by the host application.
+              Light and dark mode are configured in Databricks preferences.
               {themeSettingsUrl ? (
                 <>
                   {" "}
@@ -859,7 +859,7 @@ function AppearanceSection() {
                     href={themeSettingsUrl}
                     className="font-medium text-primary underline underline-offset-2 hover:text-primary/80"
                   >
-                    Change it in your settings
+                    Click to open Databricks user preferences page.
                   </a>
                   .
                 </>
