@@ -2118,6 +2118,7 @@ function ArchivedSection() {
   const [retentionDays, setRetentionDays] = useState<number | null>(() => readRetentionDays());
   const [deleteExpiredOpen, setDeleteExpiredOpen] = useState(false);
   const bulkDelete = useBulkDeleteConversations();
+  const viewerId = useViewerId();
 
   const namesQuery = useArchivedProjectNames();
   const projectNames = useMemo(() => namesQuery.data ?? [], [namesQuery.data]);
@@ -2151,6 +2152,14 @@ function ArchivedSection() {
       return archivedAt < cutoff;
     });
   }, [archived, cutoff]);
+
+  // Filter expired sessions to only owned ones (same pattern as ArchivedBulkActionBar)
+  const ownedExpiredSessions = useMemo(() => {
+    return expiredSessions.filter((c) => {
+      const owner = c.owner;
+      return owner === null || owner === viewerId;
+    });
+  }, [expiredSessions, viewerId]);
 
   const groupedArchived = useMemo(() => {
     const now = new Date();
@@ -2295,13 +2304,13 @@ function ArchivedSection() {
         />
       )}
 
-      {expiredSessions.length > 0 && (
+      {ownedExpiredSessions.length > 0 && (
         <div className="mb-4 flex items-center gap-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2">
           <ClockIcon className="size-4 shrink-0 text-destructive" />
           <span className="text-ui flex-1">
-            {expiredSessions.length === 1
+            {ownedExpiredSessions.length === 1
               ? "1 expired session"
-              : `${expiredSessions.length} expired sessions`}{" "}
+              : `${ownedExpiredSessions.length} expired sessions`}{" "}
             {listQuery.hasNextPage ? "on loaded pages " : ""}past the {retentionDays}-day retention
             period.
           </span>
@@ -2320,9 +2329,9 @@ function ArchivedSection() {
               <DialogHeader>
                 <DialogTitle>Delete expired sessions?</DialogTitle>
                 <DialogDescription>
-                  {expiredSessions.length === 1
-                    ? "1 archived session"
-                    : `${expiredSessions.length} archived sessions`}{" "}
+                  {ownedExpiredSessions.length === 1
+                    ? "1 owned archived session"
+                    : `${ownedExpiredSessions.length} owned archived sessions`}{" "}
                   older than {retentionDays} days {listQuery.hasNextPage ? "on loaded pages " : ""}
                   will be permanently deleted. This cannot be undone.
                   {listQuery.hasNextPage && (
@@ -2345,14 +2354,14 @@ function ArchivedSection() {
                   variant="destructive"
                   disabled={bulkDelete.isPending}
                   onClick={() => {
-                    bulkDelete.mutate({ ids: expiredSessions.map((c) => c.id) });
+                    bulkDelete.mutate({ ids: ownedExpiredSessions.map((c) => c.id) });
                     setDeleteExpiredOpen(false);
                   }}
                 >
                   Delete{" "}
-                  {expiredSessions.length === 1
+                  {ownedExpiredSessions.length === 1
                     ? "1 session"
-                    : `${expiredSessions.length} sessions`}
+                    : `${ownedExpiredSessions.length} sessions`}
                 </Button>
               </DialogFooter>
             </DialogContent>
