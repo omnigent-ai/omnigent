@@ -6328,6 +6328,10 @@ def usage(limit: int, server: str | None, as_json: bool) -> None:
         # Replace the sessions list with de-duplicated sessions
         report["sessions"] = deduped_sessions
 
+        # Remove per-page breakdowns from JSON output (they're partial and recomputed for display)
+        report.pop("harness_breakdown", None)
+        report.pop("model_breakdown", None)
+
     if as_json:
         click.echo(json.dumps(report, indent=2))
         return
