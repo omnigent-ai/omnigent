@@ -121,6 +121,8 @@ def _build_usage_report(
     include_page_details: bool = False,
     limit: int = 50,
     after: str | None = None,
+    updated_at_min: int | None = None,
+    updated_at_max: int | None = None,
 ) -> UsageReport:
     """
     Build the usage report: a daily-rollup cost summary plus session detail.
@@ -167,6 +169,8 @@ def _build_usage_report(
         kind="default",
         order="desc",
         sort_by="updated_at",
+        updated_at_min=updated_at_min,
+        updated_at_max=updated_at_max,
     )
     for conv in page.data:
         if conv.agent_id is None:
@@ -210,6 +214,8 @@ def _build_usage_report(
                 kind="default",
                 order="desc",
                 sort_by="updated_at",
+                updated_at_min=updated_at_min,
+                updated_at_max=updated_at_max,
             )
             for conv in breakdown_page.data:
                 if conv.agent_id is None:
@@ -275,6 +281,8 @@ def create_usage_router(
         request: Request,
         limit: int = 50,
         after: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
     ) -> UsageReport:
         """
         Aggregate the calling user's LLM spend across their sessions.
@@ -288,10 +296,35 @@ def create_usage_router(
             max 200).
         :param after: Cursor for pagination — the last session ID from the
             previous page.
+        :param since: Filter sessions with updated_at >= this date (ISO 8601
+            format: YYYY-MM-DD). ``None`` disables the lower bound.
+        :param until: Filter sessions with updated_at <= this date (ISO 8601
+            format: YYYY-MM-DD). ``None`` disables the upper bound.
         """
         user_id = require_user(request, auth_provider)
         # Clamp limit to [1, 200]
         clamped_limit = max(1, min(limit, 200))
+
+        # Convert ISO date strings to Unix epoch timestamps
+        updated_at_min: int | None = None
+        updated_at_max: int | None = None
+        if since:
+            try:
+                dt = datetime.strptime(since, "%Y-%m-%d").replace(
+                    hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
+                )
+                updated_at_min = int(dt.timestamp())
+            except ValueError:
+                pass  # Invalid date format, ignore
+        if until:
+            try:
+                dt = datetime.strptime(until, "%Y-%m-%d").replace(
+                    hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc
+                )
+                updated_at_max = int(dt.timestamp())
+            except ValueError:
+                pass  # Invalid date format, ignore
+
         return await asyncio.to_thread(
             _build_usage_report,
             conversation_store,
@@ -299,6 +332,8 @@ def create_usage_router(
             include_page_details=flags.enabled(Feature.USAGE_PAGE),
             limit=clamped_limit,
             after=after,
+            updated_at_min=updated_at_min,
+            updated_at_max=updated_at_max,
         )
 
     return router

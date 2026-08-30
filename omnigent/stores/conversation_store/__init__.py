@@ -648,6 +648,8 @@ class ConversationStore(ABC):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        updated_at_min: int | None = None,
+        updated_at_max: int | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -758,6 +760,12 @@ class ConversationStore(ABC):
             Powers the ``(agent, title)`` child-session lookup in
             ``sys_session_send`` so the server can resolve the target
             in a single indexed query instead of fetching all children.
+        :param updated_at_min: When set, only return conversations whose
+            ``updated_at`` is >= this Unix epoch timestamp. ``None`` disables
+            the lower bound. Powers the usage page date-range filtering.
+        :param updated_at_max: When set, only return conversations whose
+            ``updated_at`` is <= this Unix epoch timestamp. ``None`` disables
+            the upper bound. Powers the usage page date-range filtering.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """

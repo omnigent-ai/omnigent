@@ -2240,6 +2240,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        updated_at_min: int | None = None,
+        updated_at_max: int | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -2546,6 +2548,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                         )
                     )
                 )
+            if updated_at_min is not None:
+                stmt = stmt.where(SqlConversation.updated_at >= updated_at_min)
+            if updated_at_max is not None:
+                stmt = stmt.where(SqlConversation.updated_at <= updated_at_max)
             if after:
                 stmt = self._apply_cursor(
                     stmt,

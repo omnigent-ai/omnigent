@@ -7,7 +7,7 @@ import { UsageBreakdownCharts } from "@/components/usage/UsageBreakdownCharts";
 import { UsageSessionTable } from "@/components/usage/UsageSessionTable";
 import { useUsageReport } from "@/hooks/useUsageReport";
 import { formatSessionCostUsd } from "@/lib/formatCost";
-import type { DailyCost, SessionUsage } from "@/lib/usageApi";
+import type { DailyCost } from "@/lib/usageApi";
 import { cn } from "@/lib/utils";
 
 type RangeKey = "7d" | "30d" | "90d" | "all" | "custom";
@@ -61,28 +61,18 @@ function filterDailyCosts(
   });
 }
 
-function filterSessions(
-  sessions: SessionUsage[],
-  since: string | null,
-  until: string | null,
-): SessionUsage[] {
-  if (!since && !until) return sessions;
-  const sinceEpoch = since ? new Date(since + "T00:00:00Z").getTime() / 1000 : 0;
-  const untilEpoch = until ? new Date(until + "T23:59:59Z").getTime() / 1000 : Infinity;
-  return sessions.filter((s) => s.updatedAt >= sinceEpoch && s.updatedAt <= untilEpoch);
-}
-
 export function UsagePage() {
-  const { data, isLoading, isError, refetch, fetchNextPage, hasNextPage, isFetchingNextPage } =
-    useUsageReport();
-  const { trackClick } = useOmnigentAnalytics();
-
   const [rangeKey, setRangeKey] = useState<RangeKey>("30d");
   const [customStart, setCustomStart] = useState(() => daysAgoIso(30));
   const [customEnd, setCustomEnd] = useState(todayIso);
 
   const today = todayIso();
   const { since, until } = rangeToWindow(rangeKey, customStart, customEnd);
+
+  // Pass date range to hook - it will reset the query when the range changes
+  const { data, isLoading, isError, refetch, fetchNextPage, hasNextPage, isFetchingNextPage } =
+    useUsageReport(since, until);
+  const { trackClick } = useOmnigentAnalytics();
 
   // Flatten pages and extract first page summary data
   const firstPage = data?.pages[0];
@@ -93,16 +83,12 @@ export function UsagePage() {
     [firstPage, since, until],
   );
 
-  const filteredSessions = useMemo(
-    () => filterSessions(allSessions, since, until),
-    [allSessions, since, until],
-  );
-
+  // Sessions are already filtered server-side - no need for client-side filtering
   const totalCost = useMemo(() => {
     const fromDaily = filteredCosts.reduce((sum, d) => sum + d.costUsd, 0);
     if (fromDaily > 0) return fromDaily;
-    return filteredSessions.reduce((sum, s) => sum + s.costUsd, 0);
-  }, [filteredCosts, filteredSessions]);
+    return allSessions.reduce((sum, s) => sum + s.costUsd, 0);
+  }, [filteredCosts, allSessions]);
 
   return (
     <PageScroll>
@@ -192,7 +178,7 @@ export function UsagePage() {
                 {formatSessionCostUsd(totalCost)}
               </p>
               <p className="mt-0.5 text-xs text-muted-foreground">
-                {filteredSessions.length} session{filteredSessions.length !== 1 && "s"}
+                {allSessions.length} session{allSessions.length !== 1 && "s"}
                 {hasNextPage && " (showing partial results)"}
               </p>
             </div>
@@ -209,7 +195,7 @@ export function UsagePage() {
 
             <section>
               <h2 className="mb-3 text-sm font-medium text-muted-foreground">Sessions</h2>
-              <UsageSessionTable sessions={filteredSessions} />
+              <UsageSessionTable sessions={allSessions} />
               {hasNextPage && (
                 <div className="mt-4 flex justify-center">
                   <button

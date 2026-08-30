@@ -71,12 +71,16 @@ export interface UsageReport {
 export interface FetchUsageReportParams {
   limit?: number;
   after?: string | null;
+  since?: string | null;
+  until?: string | null;
 }
 
 export async function fetchUsageReport(params?: FetchUsageReportParams): Promise<UsageReport> {
   const searchParams = new URLSearchParams();
   if (params?.limit) searchParams.set("limit", String(params.limit));
   if (params?.after) searchParams.set("after", params.after);
+  if (params?.since) searchParams.set("since", params.since);
+  if (params?.until) searchParams.set("until", params.until);
   const query = searchParams.toString();
   const url = query ? `/v1/usage?${query}` : "/v1/usage";
 
