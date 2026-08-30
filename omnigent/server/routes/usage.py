@@ -157,6 +157,7 @@ def _build_usage_report(
     cost_30d = conversation_store.sum_daily_cost(rollup_user, _day_offset(today, days=29))
     total = conversation_store.sum_daily_cost(rollup_user, _EPOCH_DAY)
 
+    # Load one page of sessions for the session list
     sessions: list[SessionUsage] = []
     page = conversation_store.list_conversations(
         limit=limit,
@@ -195,6 +196,38 @@ def _build_usage_report(
             )
         )
 
+    # For breakdown charts, aggregate across ALL sessions (not just this page)
+    harness_breakdown: dict[str, float] = {}
+    model_breakdown: dict[str, float] = {}
+    if include_page_details:
+        breakdown_after: str | None = None
+        while True:
+            breakdown_page = conversation_store.list_conversations(
+                limit=200,
+                after=breakdown_after,
+                accessible_by=user_id,
+                has_agent_id=True,
+                kind="default",
+                order="desc",
+                sort_by="updated_at",
+            )
+            for conv in breakdown_page.data:
+                if conv.agent_id is None:
+                    continue
+                usage = load_session_usage(conv.id, conversation_store)
+                # Aggregate by harness
+                harness = _resolve_session_harness(conv)
+                if harness:
+                    cost = _session_cost(usage)
+                    harness_breakdown[harness] = harness_breakdown.get(harness, 0.0) + cost
+                # Aggregate by model
+                models = _session_models(usage)
+                for model, model_cost in models.items():
+                    model_breakdown[model] = model_breakdown.get(model, 0.0) + model_cost
+            if not breakdown_page.has_more:
+                break
+            breakdown_after = breakdown_page.last_id
+
     daily_costs_raw = (
         conversation_store.list_daily_costs(rollup_user, _EPOCH_DAY)
         if include_page_details
@@ -210,6 +243,8 @@ def _build_usage_report(
         sessions=sessions,
         sessions_has_more=page.has_more,
         sessions_last_id=page.last_id,
+        harness_breakdown=harness_breakdown,
+        model_breakdown=model_breakdown,
     )
 
 

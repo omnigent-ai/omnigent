@@ -202,7 +202,10 @@ export function UsagePage() {
               <CostTimelineChart dailyCosts={filteredCosts} />
             </section>
 
-            <UsageBreakdownCharts sessions={filteredSessions} />
+            <UsageBreakdownCharts
+              harnessBreakdown={firstPage.harnessBreakdown}
+              modelBreakdown={firstPage.modelBreakdown}
+            />
 
             <section>
               <h2 className="mb-3 text-sm font-medium text-muted-foreground">Sessions</h2>

@@ -59,6 +59,10 @@ def test_usage_page_route_and_navigation_are_available_when_feature_is_on(
             "total_cost_usd": 0.0,
             "daily_costs": [],
             "sessions": [],
+            "sessions_has_more": False,
+            "sessions_last_id": None,
+            "harness_breakdown": {},
+            "model_breakdown": {},
         }
     )
 
@@ -101,6 +105,10 @@ def test_session_table_shows_other_harnesses_badge(
                     "agent_name": None,
                 },
             ],
+            "sessions_has_more": False,
+            "sessions_last_id": "conv_abc",
+            "harness_breakdown": {"claude-sdk": 1.50},
+            "model_breakdown": {"claude-opus-4-8": 1.50},
         }
     )
 
@@ -132,6 +140,10 @@ def _setup_usage_page(page: Page, live_server: str) -> None:
             "total_cost_usd": 0.0,
             "daily_costs": [],
             "sessions": [],
+            "sessions_has_more": False,
+            "sessions_last_id": None,
+            "harness_breakdown": {},
+            "model_breakdown": {},
         }
     )
 

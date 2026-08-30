@@ -2672,6 +2672,12 @@ class UsageReport(BaseModel):
     :param sessions_has_more: Whether more sessions exist beyond this page.
     :param sessions_last_id: ID of the last session in the page, for cursor
         pagination. ``None`` if the page is empty.
+    :param harness_breakdown: Cost aggregated by harness across all user
+        sessions, for the breakdown chart. Keys are harness names (e.g.
+        ``"claude-sdk"``); values are total USD cost.
+    :param model_breakdown: Cost aggregated by model across all user sessions,
+        for the breakdown chart. Keys are model IDs (e.g. ``"claude-opus-4-8"``);
+        values are total USD cost.
     """
 
     object: Literal["usage_report"] = "usage_report"
@@ -2683,6 +2689,8 @@ class UsageReport(BaseModel):
     sessions: list[SessionUsage] = Field(default_factory=list)
     sessions_has_more: bool = False
     sessions_last_id: str | None = None
+    harness_breakdown: dict[str, float] = Field(default_factory=dict)
+    model_breakdown: dict[str, float] = Field(default_factory=dict)
 
 
 # ── Permissions ────────────────────────────────────────────────────

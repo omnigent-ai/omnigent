@@ -29,6 +29,8 @@ interface UsageReportWire {
   sessions: SessionUsageWire[];
   sessions_has_more: boolean;
   sessions_last_id: string | null;
+  harness_breakdown: Record<string, number>;
+  model_breakdown: Record<string, number>;
 }
 
 // ── App types (camelCase) ───────────────────────────────────────
@@ -60,6 +62,8 @@ export interface UsageReport {
   sessions: SessionUsage[];
   sessionsHasMore: boolean;
   sessionsLastId: string | null;
+  harnessBreakdown: Record<string, number>;
+  modelBreakdown: Record<string, number>;
 }
 
 // ── Fetch ───────────────────────────────────────────────────────
@@ -99,5 +103,7 @@ export async function fetchUsageReport(params?: FetchUsageReportParams): Promise
     })),
     sessionsHasMore: wire.sessions_has_more ?? false,
     sessionsLastId: wire.sessions_last_id ?? null,
+    harnessBreakdown: wire.harness_breakdown ?? {},
+    modelBreakdown: wire.model_breakdown ?? {},
   };
 }
