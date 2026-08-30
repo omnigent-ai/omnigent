@@ -2114,3 +2114,55 @@ def test_ensure_agy_feedback_survey_disabled_write_failure_never_raises(
     leftover = [p.name for p in settings.parent.iterdir() if p.name != settings.name]
     assert leftover == []
     assert "could not write" in caplog.text
+
+
+# ── owner-pid marker + orphan prune (bridge-dir reaping) ────────────────────
+
+
+def test_prepare_bridge_dir_writes_owner_pid_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prepare_bridge_dir records the creating pid so the periodic sweep can
+    prune the dir only when its owner is provably dead."""
+    import os
+
+    monkeypatch.setattr(_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+
+    bridge_dir = _mod.prepare_bridge_dir("bridge_owner")
+
+    assert (bridge_dir / "owner.pid").read_text(encoding="utf-8").strip() == str(os.getpid())
+
+
+def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prune removes only provably-dead-owner dirs; live and unmarked survive."""
+    import os
+    import subprocess
+    import sys
+
+    root = tmp_path / "antigravity-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(_mod, "_BRIDGE_ROOT", root)
+
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    dead_dir = root / "deadowner"
+    dead_dir.mkdir()
+    (dead_dir / "owner.pid").write_text(str(dead.pid), encoding="utf-8")
+
+    live_dir = root / "liveowner"
+    live_dir.mkdir()
+    (live_dir / "owner.pid").write_text(str(os.getpid()), encoding="utf-8")
+
+    unmarked_dir = root / "unmarked"
+    unmarked_dir.mkdir()
+
+    pruned = _mod.prune_orphaned_bridge_dirs()
+
+    assert pruned == 1
+    assert not dead_dir.exists()
+    assert live_dir.exists()
+    assert unmarked_dir.exists()

@@ -9212,3 +9212,54 @@ def test_inject_user_message_whitespace_only_content_submits_blind(
 
     # Whitespace-only content has no identifiable needle — must not raise.
     inject_user_message(bridge_dir, content="   \n  \n  ")
+
+
+# ── owner-pid marker + orphan prune (bridge-dir reaping) ────────────────────
+
+
+def test_prepare_bridge_dir_writes_owner_pid_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prepare_bridge_dir records the creating pid so the periodic sweep can
+    prune the dir only when its owner is provably dead."""
+    from omnigent.claude_native_bridge import prepare_bridge_dir
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "claude-native")
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+
+    bridge_dir = prepare_bridge_dir("conv_owner", workspace=tmp_path)
+
+    assert (bridge_dir / "owner.pid").read_text(encoding="utf-8").strip() == str(os.getpid())
+
+
+def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prune removes only provably-dead-owner dirs; live and unmarked survive."""
+    from omnigent.claude_native_bridge import prune_orphaned_bridge_dirs
+
+    root = tmp_path / "claude-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", root)
+
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    dead_dir = root / "deadowner"
+    dead_dir.mkdir()
+    (dead_dir / "owner.pid").write_text(str(dead.pid), encoding="utf-8")
+
+    live_dir = root / "liveowner"
+    live_dir.mkdir()
+    (live_dir / "owner.pid").write_text(str(os.getpid()), encoding="utf-8")
+
+    unmarked_dir = root / "unmarked"
+    unmarked_dir.mkdir()
+
+    pruned = prune_orphaned_bridge_dirs()
+
+    assert pruned == 1
+    assert not dead_dir.exists()
+    assert live_dir.exists()
+    assert unmarked_dir.exists()
