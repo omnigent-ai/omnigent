@@ -175,3 +175,90 @@ def test_custom_date_end_auto_adjusts_when_start_exceeds_end(page: Page, live_se
     start_input.fill(new_start)
 
     expect(end_input).to_have_value(new_start)
+
+
+def test_pagination_load_more_button_appears_and_loads_next_page(
+    page: Page,
+    live_server: str,
+) -> None:
+    """Load More button appears when sessions_has_more is true and fetches next page."""
+    _stub_server_info(page, usage_page=True)
+    now = int(time.time())
+
+    first_page = json.dumps(
+        {
+            "cost_today": 2.50,
+            "cost_last_7d": 2.50,
+            "cost_last_30d": 2.50,
+            "total_cost_usd": 2.50,
+            "daily_costs": [],
+            "sessions": [
+                {
+                    "id": "conv_page1",
+                    "created_at": now - 3600,
+                    "updated_at": now,
+                    "title": "Session from page 1",
+                    "cost_usd": 1.25,
+                    "models": {"claude-opus-4-8": 1.25},
+                    "harness": "claude-sdk",
+                    "other_harnesses": None,
+                    "llm_model": "claude-opus-4-8",
+                    "agent_name": None,
+                },
+            ],
+            "sessions_has_more": True,
+            "sessions_last_id": "conv_page1",
+        }
+    )
+
+    second_page = json.dumps(
+        {
+            "cost_today": 2.50,
+            "cost_last_7d": 2.50,
+            "cost_last_30d": 2.50,
+            "total_cost_usd": 2.50,
+            "daily_costs": [],
+            "sessions": [
+                {
+                    "id": "conv_page2",
+                    "created_at": now - 7200,
+                    "updated_at": now - 100,
+                    "title": "Session from page 2",
+                    "cost_usd": 1.25,
+                    "models": {"claude-opus-4-8": 1.25},
+                    "harness": "claude-sdk",
+                    "other_harnesses": None,
+                    "llm_model": "claude-opus-4-8",
+                    "agent_name": None,
+                },
+            ],
+            "sessions_has_more": False,
+            "sessions_last_id": "conv_page2",
+        }
+    )
+
+    request_count = 0
+
+    def handle_usage(route: Route) -> None:
+        nonlocal request_count
+        request_count += 1
+        url = route.request.url
+        if "after=" in url:
+            route.fulfill(status=200, content_type="application/json", body=second_page)
+        else:
+            route.fulfill(status=200, content_type="application/json", body=first_page)
+
+    page.route("**/v1/usage*", handle_usage)
+    page.goto(f"{live_server}/usage")
+
+    expect(page.get_by_role("heading", name="Usage", exact=True)).to_be_visible(timeout=30_000)
+    expect(page.get_by_text("Session from page 1")).to_be_visible()
+
+    load_more_button = page.get_by_role("button", name="Load More")
+    expect(load_more_button).to_be_visible()
+
+    load_more_button.click()
+    expect(page.get_by_text("Session from page 2")).to_be_visible(timeout=10_000)
+    expect(load_more_button).not_to_be_visible()
+
+    assert request_count == 2
