@@ -132,7 +132,7 @@ def find_leaked_omnigent_processes(data_dir: Path | str) -> list[psutil.Process]
 
 def reap_leaked_omnigent_processes(
     data_dir: Path | str, *, timeout: float = _REAP_TIMEOUT_S
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     """Terminate every Omnigent process attributable to *data_dir*.
 
     TERM first (a daemon's clean shutdown also stops the children it
@@ -140,12 +140,14 @@ def reap_leaked_omnigent_processes(
 
     :param data_dir: The session's throwaway ``OMNIGENT_DATA_DIR``.
     :param timeout: Seconds to wait between TERM and KILL.
-    :returns: Command lines of the reaped processes, for reporting.
+    :returns: ``(reaped, survivors)`` command lines: processes confirmed
+        gone, and any that outlived even SIGKILL (e.g. stuck in
+        uninterruptible sleep) so a genuine non-reap stays visible.
     """
     leaked = find_leaked_omnigent_processes(data_dir)
     if not leaked:
-        return []
-    cmdlines = [" ".join(_proc_argv(proc)) for proc in leaked]
+        return [], []
+    cmdline_by_pid = {proc.pid: " ".join(_proc_argv(proc)) for proc in leaked}
     for proc in leaked:
         with contextlib.suppress(psutil.Error, OSError):
             proc.terminate()
@@ -153,5 +155,7 @@ def reap_leaked_omnigent_processes(
     for proc in alive:
         with contextlib.suppress(psutil.Error, OSError):
             proc.kill()
-    psutil.wait_procs(alive, timeout=_KILL_WAIT_S)
-    return cmdlines
+    _, survivors = psutil.wait_procs(alive, timeout=_KILL_WAIT_S)
+    survivor_pids = {proc.pid for proc in survivors}
+    reaped = [cmd for pid, cmd in cmdline_by_pid.items() if pid not in survivor_pids]
+    return reaped, [cmdline_by_pid[pid] for pid in survivor_pids]

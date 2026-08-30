@@ -199,7 +199,7 @@ def test_pytest_run_leaves_no_omnigent_processes(tmp_path: Path) -> None:
     nested_test = tmp_path / "leak_probe_test.py"
     nested_test.write_text(_NESTED_LEAKY_TEST, encoding="utf-8")
 
-    env = dict(os.environ)
+    env = os.environ.copy()
     # Confine the nested run's mkdtemp'd OMNIGENT_DATA_DIR to a private
     # TMPDIR so survivors are attributable to THIS run and nothing else.
     env["TMPDIR"] = str(tmp_root)

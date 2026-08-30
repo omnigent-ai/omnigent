@@ -138,9 +138,11 @@ def pytest_unconfigure(config: pytest.Config) -> None:
     """
     from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 
-    reaped = reap_leaked_omnigent_processes(_TEST_OMNIGENT_DATA_DIR)
+    reaped, survivors = reap_leaked_omnigent_processes(_TEST_OMNIGENT_DATA_DIR)
     for cmdline in reaped:
         print(f"\nreaped leaked omnigent process: {cmdline}", file=sys.stderr)
+    for cmdline in survivors:
+        print(f"\nUNREAPED omnigent process survived SIGKILL: {cmdline}", file=sys.stderr)
     shutil.rmtree(_TEST_OMNIGENT_DATA_DIR, ignore_errors=True)
 
 

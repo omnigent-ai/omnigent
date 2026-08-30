@@ -171,8 +171,9 @@ def test_reap_terminates_leaked_process(data_dir: Path) -> None:
     """reap TERMs an attributed process and reports its command line."""
     child = _spawn(_SLEEP_CHILD, "omnigent-daemon-marker", f"{data_dir}/chat.db")
     try:
-        reaped = reap_leaked_omnigent_processes(data_dir, timeout=10)
+        reaped, survivors = reap_leaked_omnigent_processes(data_dir, timeout=10)
         assert any("omnigent-daemon-marker" in cmd for cmd in reaped)
+        assert survivors == []
         child.wait(timeout=10)
         assert not psutil.pid_exists(child.pid) or child.poll() is not None
     finally:
@@ -185,8 +186,9 @@ def test_reap_escalates_to_kill(data_dir: Path) -> None:
     try:
         # Give the child a beat to install its SIGTERM handler.
         time.sleep(1.0)
-        reaped = reap_leaked_omnigent_processes(data_dir, timeout=2)
+        reaped, survivors = reap_leaked_omnigent_processes(data_dir, timeout=2)
         assert any("omnigent-daemon-marker" in cmd for cmd in reaped)
+        assert survivors == []
         child.wait(timeout=10)
         assert child.poll() is not None
     finally:
@@ -195,4 +197,4 @@ def test_reap_escalates_to_kill(data_dir: Path) -> None:
 
 def test_reap_with_no_leaks_returns_empty(data_dir: Path) -> None:
     """No attributed processes → no-op, empty report."""
-    assert reap_leaked_omnigent_processes(data_dir, timeout=1) == []
+    assert reap_leaked_omnigent_processes(data_dir, timeout=1) == ([], [])
