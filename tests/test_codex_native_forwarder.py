@@ -3297,3 +3297,52 @@ def test_thread_started_is_ephemeral_false_for_missing_thread() -> None:
     """Event with params but no thread is not ephemeral."""
     event = {"method": "thread/started", "params": {}}
     assert fwd._thread_started_is_ephemeral(event) is False
+
+
+_CODEX_0151_STARTUP_TITLE_THREAD = {
+    "id": "01a051a0-e5dc-79e3-bdd3-cceeda4b6a16",
+    "ephemeral": True,
+    "historyMode": "legacy",
+    "path": None,
+    "cliVersion": "0.151.0",
+    "source": "vscode",
+    "threadSource": "system",
+    "status": {"type": "idle"},
+    "turns": [],
+}
+
+
+def test_housekeeping_true_for_captured_codex_0151_startup_thread() -> None:
+    """The captured startup title thread cannot rotate the user session."""
+    assert fwd._thread_started_is_housekeeping(
+        _make_thread_started(dict(_CODEX_0151_STARTUP_TITLE_THREAD))
+    )
+
+
+def test_housekeeping_true_for_system_thread_without_ephemeral_marker() -> None:
+    """The system ownership marker remains sufficient if Codex changes flags."""
+    thread = dict(_CODEX_0151_STARTUP_TITLE_THREAD)
+    thread["ephemeral"] = False
+    assert fwd._thread_started_is_housekeeping(_make_thread_started(thread))
+
+
+def test_housekeeping_false_for_real_user_thread() -> None:
+    """A persistent user thread still represents a genuine ``/clear``."""
+    event = _make_thread_started(
+        {
+            "id": "01a051a0-ddda-78c0-a62c-71af8c6ae60d",
+            "ephemeral": False,
+            "path": "/sessions/rollout-user.jsonl",
+            "threadSource": "user",
+        }
+    )
+    assert fwd._thread_started_is_housekeeping(event) is False
+
+
+def test_housekeeping_false_for_non_started_event() -> None:
+    """Only thread-start notifications participate in rotation filtering."""
+    event = {
+        "method": "thread/updated",
+        "params": {"thread": {"id": "system", "threadSource": "system"}},
+    }
+    assert fwd._thread_started_is_housekeeping(event) is False

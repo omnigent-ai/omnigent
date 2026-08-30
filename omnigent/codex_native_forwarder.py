@@ -2014,11 +2014,9 @@ async def _maybe_rotate_session_on_thread_started(
     # its own Omnigent child session by ``_handle_event``.
     if _thread_started_is_subagent(event):
         return False
-    # Codex CLI 0.150.1 emits a second ``thread/started`` mid-turn for an
-    # internal system/housekeeping thread (``ephemeral=true``, ``path=null``).
-    # That thread is never persistable and cannot host goals; rotating onto it
-    # strands the real turn's output as stale. Ignore all ephemeral threads.
-    if _thread_started_is_ephemeral(event):
+    # Codex emits non-user housekeeping threads during startup and mid-turn.
+    # They cannot host the session and must never be treated as ``/clear``.
+    if _thread_started_is_housekeeping(event):
         return False
     old_delta_coalescer = target.delta_coalescer
     await old_delta_coalescer.flush()
@@ -7003,6 +7001,28 @@ def _thread_started_is_ephemeral(event: CodexMessage) -> bool:
     if not isinstance(thread, dict):
         return False
     return thread.get("ephemeral") is True
+
+
+def _thread_started_is_housekeeping(event: CodexMessage) -> bool:
+    """Return whether ``thread/started`` announces an internal Codex thread.
+
+    Codex 0.150 marks mid-turn housekeeping threads as ephemeral. Codex 0.151
+    also labels startup title-generation threads with ``threadSource=system``.
+    Neither represents a user ``/clear`` and neither may own the Omnigent
+    session.
+
+    :param event: Codex app-server notification envelope.
+    :returns: ``True`` for an ephemeral or system-owned started thread.
+    """
+    if _thread_started_is_ephemeral(event):
+        return True
+    if event.get("method") != "thread/started":
+        return False
+    params = event.get("params")
+    if not isinstance(params, dict):
+        return False
+    thread = params.get("thread")
+    return isinstance(thread, dict) and thread.get("threadSource") == "system"
 
 
 async def wait_for_thread_started(

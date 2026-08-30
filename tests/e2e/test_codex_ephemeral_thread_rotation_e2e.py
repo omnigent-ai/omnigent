@@ -327,3 +327,19 @@ async def test_rotation_preserves_workspace_cwd(tmp_path: Path) -> None:
     assert state is not None
     assert state.thread_id == "0195dddd-real-clear-thread"
     assert state.cwd == workspace
+
+
+async def test_system_title_thread_does_not_rotate_without_ephemeral_flag(tmp_path: Path) -> None:
+    """Codex startup title generation is internal even if its flag changes."""
+    ap = _RecordingAP()
+    bridge_dir = _seed_bridge(tmp_path)
+    target = _make_target(ap)
+    thread = _ephemeral_system_thread()
+    thread["ephemeral"] = False
+
+    rotated = await _rotate(ap, target, bridge_dir, _thread_started(thread))
+
+    assert rotated is False
+    assert ap.created_sessions() == []
+    assert target.session_id == PARENT_SESSION
+    assert target.thread_id == PARENT_THREAD
