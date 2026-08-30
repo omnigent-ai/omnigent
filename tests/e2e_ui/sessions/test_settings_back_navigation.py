@@ -19,6 +19,43 @@ from __future__ import annotations
 
 from playwright.sync_api import Page, expect
 
+_NATIVE_OPEN_PATH_INIT_SCRIPT = """
+window.__nativeOpenPathListener = null;
+window.__documentLoadMarker = crypto.randomUUID();
+window.omnigentDesktop = {
+  kind: "electron",
+  setBadgeCount() {},
+  notify() { return Promise.resolve(true); },
+  onOpenPath(callback) {
+    window.__nativeOpenPathListener = callback;
+    return () => {
+      if (window.__nativeOpenPathListener === callback) {
+        window.__nativeOpenPathListener = null;
+      }
+    };
+  },
+};
+"""
+
+
+def test_native_open_path_navigates_to_settings_without_reload(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The desktop bridge's basename-less ``/settings`` path routes in place."""
+    base_url, session_id = seeded_session
+    page.add_init_script(_NATIVE_OPEN_PATH_INIT_SCRIPT)
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page).to_have_url(f"{base_url}/c/{session_id}")
+    page.wait_for_function("typeof window.__nativeOpenPathListener === 'function'")
+    load_marker = page.evaluate("window.__documentLoadMarker")
+
+    page.evaluate("window.__nativeOpenPathListener('/settings')")
+
+    expect(page).to_have_url(f"{base_url}/settings", timeout=30_000)
+    expect(page.get_by_role("link", name="Back", exact=True)).to_be_visible(timeout=30_000)
+    assert page.evaluate("window.__documentLoadMarker") == load_marker
+
 
 def test_settings_back_returns_to_conversation(
     page: Page,
