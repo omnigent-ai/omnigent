@@ -2021,6 +2021,12 @@ export function NewChatLandingScreen() {
   // Project driving this visit, when the sidebar's per-project "new session"
   // pencil landed here with a `?project=` query param. Empty otherwise.
   const projectParam = searchParams.get("project") ?? "";
+  // Host driving this visit via `?host=<host_id>` (e.g. a deep link that
+  // targets a specific registered host). Takes precedence over the
+  // last-choice/first-online default and over `?project=`'s stored host, but
+  // only when the referenced host is actually online — an unknown or offline
+  // id falls through to the existing default logic untouched.
+  const hostParam = searchParams.get("host") ?? "";
   // Project prefill source: a project-driven visit seeds the composer from the
   // project's stored defaults (host / working directory / agent / worktree).
   // `?project=` carries the project NAME, so resolve it to the first-class id
@@ -2646,9 +2652,25 @@ export function NewChatLandingScreen() {
   // already in state (or restored from the in-memory draft) is never
   // overridden. Holds off while a project prefill is deciding.
   useEffect(() => {
-    if (!prefillSettled) return;
     if (sandboxSelected) return;
     if (selectedHostId !== null) return;
+
+    // A `?host=` deep link wins over both the persisted last choice and
+    // `?project=`'s stored host — but only when it resolves to a currently
+    // online host; otherwise fall through to the existing default logic.
+    // Checked ahead of `prefillSettled` deliberately: the project-prefill
+    // effect writes its own stored host into `selectedHostId` in the same
+    // tick it flips `prefillSettled` to true, which would otherwise win the
+    // race and block this branch from ever running.
+    if (hostParam !== "") {
+      const linked = (hosts ?? []).find((h) => h.host_id === hostParam && h.status === "online");
+      if (linked) {
+        setSelectedHostId(linked.host_id);
+        return;
+      }
+    }
+
+    if (!prefillSettled) return;
 
     // Read the persisted pick once, as a mount-time seed — deliberately NOT a
     // dependency: it only matters until the slot is filled, and re-running on
@@ -2698,6 +2720,7 @@ export function NewChatLandingScreen() {
     info,
     prefillSettled,
     defaultSandboxProvider,
+    hostParam,
   ]);
 
   // Fall back to the host's home directory when it has no recorded recents, so
