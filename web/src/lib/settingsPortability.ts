@@ -12,12 +12,15 @@ const EXPORTABLE_KEYS = [
   "omnigent:ui-font-family",
   "omnigent:code-font-size",
   "omnigent:code-font-family",
+  "omnigent:code-font-weight",
   "omnigent:terminal-theme",
   "omnigent:ui-theme-palette",
   "omnigent:custom-theme",
   "omnigent:default-workspace-panel",
+  "omnigent:default-transcript-view",
   "omnigent:hide-unconfigured-harnesses",
   "omnigent:default-base-branch",
+  "omnigent:always-use-worktree",
   "web-theme",
 ] as const;
 
@@ -42,9 +45,9 @@ function isExportedSettings(value: unknown): value is ExportedSettings {
 }
 
 /**
- * Collect all non-empty exportable settings from localStorage into a
- * downloadable JSON blob. Returns `null` when there's nothing to export
- * (everything is at the default / unset).
+ * Collect all exportable settings from localStorage into a downloadable JSON
+ * blob. Exports even when all values are at defaults so that a fully-default
+ * device can export and share its baseline.
  */
 export function collectSettings(): ExportedSettings | null {
   if (typeof window === "undefined") return null;
@@ -57,7 +60,6 @@ export function collectSettings(): ExportedSettings | null {
   } catch {
     return null;
   }
-  if (Object.keys(settings).length === 0) return null;
   return { version: CURRENT_VERSION, settings };
 }
 
@@ -105,12 +107,24 @@ export function readSettingsFile(file: File): Promise<ExportedSettings> {
 }
 
 /**
- * Write imported settings into localStorage. Returns the number of keys
+ * Write imported settings into localStorage, clearing all exportable keys
+ * first to ensure a true overwrite (not merge). Returns the number of keys
  * written.
  */
 export function applyImportedSettings(imported: ExportedSettings): number {
   if (typeof window === "undefined") return 0;
   const allowedKeys = new Set<string>(EXPORTABLE_KEYS);
+
+  // Clear all exportable keys first to honor the "overwrite" contract.
+  for (const key of EXPORTABLE_KEYS) {
+    try {
+      window.localStorage.removeItem(key);
+    } catch {
+      // Swallow individual removal failures.
+    }
+  }
+
+  // Write imported values.
   let count = 0;
   for (const [key, value] of Object.entries(imported.settings)) {
     if (!allowedKeys.has(key)) continue;

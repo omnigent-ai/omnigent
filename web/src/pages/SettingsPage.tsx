@@ -67,6 +67,7 @@ import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
 import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
+import { isThemeMode } from "@/components/theme/themeMode";
 import {
   ModePreview,
   PaletteChip,
@@ -823,7 +824,7 @@ function AppearanceSection() {
       // Apply DOM side-effects so imported settings take effect immediately.
       // Note: web-theme is stored as plain string by next-themes, not JSON.
       const themeMode = imported.settings["web-theme"];
-      if (themeMode) setTheme(themeMode);
+      if (themeMode && isThemeMode(themeMode)) setTheme(themeMode);
       applyDesktopUiFontSize(readUiFontSizePx());
       applyUiFontFamily(readUiFontFamily());
       applyThemePalette(readThemePalette());
