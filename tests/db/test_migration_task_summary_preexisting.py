@@ -4,7 +4,7 @@ Revision ``za2b3c4d5e6f`` runs an unconditional ``ALTER TABLE
 omnigent_conversation_metadata ADD COLUMN task_summary``.  On a real database
 that sits at ``d5e9f1a2b3c4`` (one step before that revision) but already carries
 a ``task_summary`` column — e.g. a database that was patched outside of Alembic
-during a hotfix — the automatic startup upgrade to head (``e5d9bc8ac650``) aborts
+during a hotfix — the automatic startup upgrade to head (``zb3c4d5e6f7g``) aborts
 with::
 
     sqlite3.OperationalError: duplicate column name: task_summary
@@ -41,7 +41,7 @@ from omnigent.db.utils import (
 # Revision one step before ``za2b3c4d5e6f`` (which adds ``task_summary``).
 _REVISION_BEFORE_TASK_SUMMARY = "d5e9f1a2b3c4"
 # Current head at the time this bug was filed; asserted as the reachable target.
-_EXPECTED_HEAD = "e5d9bc8ac650"
+_EXPECTED_HEAD = "zb3c4d5e6f7g"
 
 _METADATA_TABLE = "omnigent_conversation_metadata"
 
