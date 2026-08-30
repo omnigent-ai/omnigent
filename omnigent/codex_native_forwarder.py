@@ -2049,6 +2049,47 @@ async def _maybe_rotate_session_on_thread_started(
     return True
 
 
+def _replacement_session_lineage(old: _JsonObject) -> _JsonObject:
+    """Build trusted create fields that preserve a rotated session's identity.
+
+    ``POST /v1/sessions`` derives ``kind`` from ``parent_session_id``. A
+    replacement created without it silently demotes a sub-agent to a top-level
+    session, leaving its parent waiting on an abandoned child.
+
+    ``host_id`` is intentionally omitted because the existing runner is bound
+    after creation; including a host would launch a second runner. Named
+    sub-agents also omit stored terminal arguments because the server derives
+    those from the trusted sub-agent specification.
+
+    :param old: Session snapshot being rotated away from.
+    :returns: Valid ``SessionCreateRequest`` fields to carry to the replacement.
+    """
+    body: _JsonObject = {}
+    parent_session_id = old.get("parent_session_id")
+    if isinstance(parent_session_id, str) and parent_session_id:
+        body["parent_session_id"] = parent_session_id
+    sub_agent_name = old.get("sub_agent_name")
+    if "parent_session_id" in body and isinstance(sub_agent_name, str) and sub_agent_name:
+        body["sub_agent_name"] = sub_agent_name
+    workspace = old.get("workspace")
+    if isinstance(workspace, str) and workspace:
+        body["workspace"] = workspace
+    if "sub_agent_name" not in body:
+        launch_args = old.get("terminal_launch_args")
+        if isinstance(launch_args, list) and all(isinstance(arg, str) for arg in launch_args):
+            body["terminal_launch_args"] = launch_args
+    for key in (
+        "model_override",
+        "reasoning_effort",
+        "cost_control_mode_override",
+        "subagent_routing_override",
+    ):
+        value = old.get(key)
+        if isinstance(value, str) and value:
+            body[key] = value
+    return body
+
+
 async def _create_thread_replacement_session(
     *,
     client: httpx.AsyncClient,
@@ -2091,13 +2132,9 @@ async def _create_thread_replacement_session(
     if CODEX_NATIVE_BRIDGE_ID_LABEL_KEY not in labels:
         labels[CODEX_NATIVE_BRIDGE_ID_LABEL_KEY] = old_session_id
 
-    create_resp = await client.post(
-        "/v1/sessions",
-        json={
-            "agent_id": agent_id,
-            "labels": labels,
-        },
-    )
+    create_body: _JsonObject = {"agent_id": agent_id, "labels": labels}
+    create_body.update(_replacement_session_lineage(old))
+    create_resp = await client.post("/v1/sessions", json=create_body)
     create_resp.raise_for_status()
     created = create_resp.json()
     new_session_id = created.get("id")

@@ -64,10 +64,16 @@ class _RecordingAP:
     assert whether a rotation was performed at all.
     """
 
-    def __init__(self) -> None:
-        """Initialize with empty POST/PATCH records."""
+    def __init__(self, snapshot: dict | None = None) -> None:
+        """Initialize with empty records and an optional session snapshot."""
         self.posts: list[tuple[str, dict]] = []
         self.patches: list[tuple[str, dict]] = []
+        self.snapshot = snapshot or {
+            "id": PARENT_SESSION,
+            "agent_id": "ag_codex_native",
+            "runner_id": "runner_1",
+            "labels": {},
+        }
 
     async def get(self, url: str) -> httpx.Response:
         """Return the parent session snapshot for any GET.
@@ -77,12 +83,7 @@ class _RecordingAP:
         """
         return httpx.Response(
             200,
-            json={
-                "id": PARENT_SESSION,
-                "agent_id": "ag_codex_native",
-                "runner_id": "runner_1",
-                "labels": {},
-            },
+            json=self.snapshot,
             request=httpx.Request("GET", url),
         )
 
@@ -343,3 +344,73 @@ async def test_system_title_thread_does_not_rotate_without_ephemeral_flag(tmp_pa
     assert ap.created_sessions() == []
     assert target.session_id == PARENT_SESSION
     assert target.thread_id == PARENT_THREAD
+
+
+async def test_rotated_subagent_replacement_stays_a_subagent(tmp_path: Path) -> None:
+    """A genuine thread rotation preserves the sub-agent's parent lineage."""
+    ap = _RecordingAP(
+        snapshot={
+            "id": "conv_child",
+            "agent_id": "ag_polly",
+            "runner_id": "runner_1",
+            "labels": {"omnigent.wrapper": "codex-native-ui"},
+            "kind": "sub_agent",
+            "parent_session_id": "conv_orchestrator",
+            "sub_agent_name": "codex",
+            "workspace": "/workspace/project",
+            "model_override": "gpt-5.1-codex-max",
+            "reasoning_effort": "high",
+        }
+    )
+    bridge_dir = _seed_bridge(tmp_path)
+    target = _make_target(ap)
+    event = _thread_started(
+        {
+            "id": "0195dddd-subagent-clear-thread",
+            "ephemeral": False,
+            "path": "/rollout/0195dddd.jsonl",
+            "threadSource": "user",
+        }
+    )
+
+    assert await _rotate(ap, target, bridge_dir, event) is True
+    body = ap.created_sessions()[0]
+    assert body["parent_session_id"] == "conv_orchestrator"
+    assert body["sub_agent_name"] == "codex"
+    assert body["workspace"] == "/workspace/project"
+    assert body["model_override"] == "gpt-5.1-codex-max"
+    assert body["reasoning_effort"] == "high"
+    assert "kind" not in body
+    assert "host_id" not in body
+
+
+async def test_rotated_top_level_session_does_not_invent_parent(tmp_path: Path) -> None:
+    """A top-level rotation remains top-level and keeps its launch arguments."""
+    ap = _RecordingAP(
+        snapshot={
+            "id": PARENT_SESSION,
+            "agent_id": "ag_codex_native",
+            "runner_id": "runner_1",
+            "labels": {},
+            "kind": "default",
+            "parent_session_id": None,
+            "sub_agent_name": None,
+            "terminal_launch_args": ["--dangerously-bypass-approvals-and-sandbox"],
+        }
+    )
+    bridge_dir = _seed_bridge(tmp_path)
+    target = _make_target(ap)
+    event = _thread_started(
+        {
+            "id": "0195eeee-top-level-clear",
+            "ephemeral": False,
+            "path": "/rollout/0195eeee.jsonl",
+            "threadSource": "user",
+        }
+    )
+
+    assert await _rotate(ap, target, bridge_dir, event) is True
+    body = ap.created_sessions()[0]
+    assert "parent_session_id" not in body
+    assert "sub_agent_name" not in body
+    assert body["terminal_launch_args"] == ["--dangerously-bypass-approvals-and-sandbox"]

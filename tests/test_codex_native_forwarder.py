@@ -3346,3 +3346,63 @@ def test_housekeeping_false_for_non_started_event() -> None:
         "params": {"thread": {"id": "system", "threadSource": "system"}},
     }
     assert fwd._thread_started_is_housekeeping(event) is False
+
+
+def test_replacement_lineage_preserves_subagent_parent_and_name() -> None:
+    """A rotated sub-agent remains attached to the parent that spawned it."""
+    lineage = fwd._replacement_session_lineage(
+        {
+            "kind": "sub_agent",
+            "parent_session_id": "conv_orchestrator",
+            "sub_agent_name": "codex",
+            "workspace": "/workspace/project",
+            "model_override": "gpt-5.1-codex-max",
+            "reasoning_effort": "high",
+        }
+    )
+    assert lineage == {
+        "parent_session_id": "conv_orchestrator",
+        "sub_agent_name": "codex",
+        "workspace": "/workspace/project",
+        "model_override": "gpt-5.1-codex-max",
+        "reasoning_effort": "high",
+    }
+
+
+def test_replacement_lineage_omits_untrusted_or_server_derived_fields() -> None:
+    """Rotation must not launch another runner or replay stored child arguments."""
+    lineage = fwd._replacement_session_lineage(
+        {
+            "kind": "sub_agent",
+            "parent_session_id": "conv_orchestrator",
+            "sub_agent_name": "codex",
+            "host_id": "host_123",
+            "git_branch": "fix/thing",
+            "title": "codex:worker",
+            "terminal_launch_args": ["--dangerously-bypass-approvals-and-sandbox"],
+        }
+    )
+    assert lineage == {
+        "parent_session_id": "conv_orchestrator",
+        "sub_agent_name": "codex",
+    }
+
+
+def test_replacement_lineage_keeps_top_level_launch_args() -> None:
+    """A top-level replacement keeps the terminal arguments it owns."""
+    assert fwd._replacement_session_lineage(
+        {"terminal_launch_args": ["--dangerously-bypass-approvals-and-sandbox"]}
+    ) == {"terminal_launch_args": ["--dangerously-bypass-approvals-and-sandbox"]}
+
+
+def test_replacement_lineage_ignores_malformed_values() -> None:
+    """Malformed snapshot fields are not reflected into a create request."""
+    assert fwd._replacement_session_lineage(
+        {
+            "parent_session_id": 17,
+            "sub_agent_name": "codex",
+            "workspace": None,
+            "terminal_launch_args": ["--ok", 3],
+            "reasoning_effort": "high",
+        }
+    ) == {"reasoning_effort": "high"}
