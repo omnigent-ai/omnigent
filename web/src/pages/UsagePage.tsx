@@ -86,10 +86,7 @@ export function UsagePage() {
 
   // Flatten pages and extract first page summary data
   const firstPage = data?.pages[0];
-  const allSessions = useMemo(
-    () => data?.pages.flatMap((page) => page.sessions) ?? [],
-    [data],
-  );
+  const allSessions = useMemo(() => data?.pages.flatMap((page) => page.sessions) ?? [], [data]);
 
   const filteredCosts = useMemo(
     () => (firstPage ? filterDailyCosts(firstPage.dailyCosts, since, until) : []),
