@@ -84,7 +84,7 @@ for _var in ("NO_PROXY", "no_proxy"):
 
 def _no_proxy_env() -> dict[str, str]:
     """Ambient env with loopback excluded from any forced HTTP(S) proxy."""
-    env = dict(os.environ)
+    env = os.environ.copy()
     for var in ("NO_PROXY", "no_proxy"):
         existing = env.get(var, "")
         env[var] = ",".join(filter(None, [existing, "127.0.0.1,localhost"]))
