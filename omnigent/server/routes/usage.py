@@ -200,39 +200,20 @@ def _build_usage_report(
             )
         )
 
-    # For breakdown charts, aggregate across ALL sessions (not just this page)
+    # Compute breakdown charts from the sessions we already loaded (not a separate scan).
+    # This avoids the O(N) full-session scan that defeated pagination's purpose.
+    # Breakdown charts will show partial data when more pages exist.
     harness_breakdown: dict[str, float] = {}
     model_breakdown: dict[str, float] = {}
-    if include_page_details:
-        breakdown_after: str | None = None
-        while True:
-            breakdown_page = conversation_store.list_conversations(
-                limit=200,
-                after=breakdown_after,
-                accessible_by=user_id,
-                has_agent_id=True,
-                kind="default",
-                order="desc",
-                sort_by="updated_at",
-                updated_at_min=updated_at_min,
-                updated_at_max=updated_at_max,
+    for session in sessions:
+        # Aggregate by harness
+        if session.harness:
+            harness_breakdown[session.harness] = (
+                harness_breakdown.get(session.harness, 0.0) + session.cost_usd
             )
-            for conv in breakdown_page.data:
-                if conv.agent_id is None:
-                    continue
-                usage = load_session_usage(conv.id, conversation_store)
-                # Aggregate by harness
-                harness = _resolve_session_harness(conv)
-                if harness:
-                    cost = _session_cost(usage)
-                    harness_breakdown[harness] = harness_breakdown.get(harness, 0.0) + cost
-                # Aggregate by model
-                models = _session_models(usage)
-                for model, model_cost in models.items():
-                    model_breakdown[model] = model_breakdown.get(model, 0.0) + model_cost
-            if not breakdown_page.has_more:
-                break
-            breakdown_after = breakdown_page.last_id
+        # Aggregate by model
+        for model, model_cost in session.models.items():
+            model_breakdown[model] = model_breakdown.get(model, 0.0) + model_cost
 
     daily_costs_raw = (
         conversation_store.list_daily_costs(rollup_user, _EPOCH_DAY)

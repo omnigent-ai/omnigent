@@ -188,10 +188,17 @@ export function UsagePage() {
               <CostTimelineChart dailyCosts={filteredCosts} />
             </section>
 
-            <UsageBreakdownCharts
-              harnessBreakdown={firstPage.harnessBreakdown}
-              modelBreakdown={firstPage.modelBreakdown}
-            />
+            <div>
+              {hasNextPage && (
+                <p className="mb-2 text-xs text-muted-foreground">
+                  Based on {allSessions.length} loaded sessions (more available)
+                </p>
+              )}
+              <UsageBreakdownCharts
+                harnessBreakdown={firstPage.harnessBreakdown}
+                modelBreakdown={firstPage.modelBreakdown}
+              />
+            </div>
 
             <section>
               <h2 className="mb-3 text-sm font-medium text-muted-foreground">Sessions</h2>
