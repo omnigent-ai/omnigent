@@ -67,7 +67,6 @@ import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
 import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
-import { isThemeMode } from "@/components/theme/themeMode";
 import {
   ModePreview,
   PaletteChip,
@@ -113,6 +112,7 @@ import { useNavigate } from "@/lib/routing";
 import { useSettingsRoute } from "@/shell/settingsNav";
 import { ImportSessionsPanel } from "@/shell/ImportSessionsPanel";
 import {
+  isThemeMode,
   normalizeResolvedTheme,
   normalizeThemeMode,
   type ThemeMode,
