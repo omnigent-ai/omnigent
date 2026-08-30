@@ -7821,7 +7821,7 @@
             "additionalProperties": {
               "type": "number"
             },
-            "description": "Cost aggregated by harness from the loaded sessions in this response, for the breakdown chart. Reflects only the current page; load more pages to see a more complete breakdown. Keys are harness names (e.g. `\"claude-sdk\"`); values are total USD cost.",
+            "description": "**All-time** cost aggregated by harness across all user sessions (pre-computed, not date-filtered), for the breakdown chart. Keys are harness names (e.g. `\"claude-sdk\"`); values are total USD cost. Sessions without a resolved harness are omitted. Shows the user's overall cost distribution regardless of `since`/`until` filters.",
             "title": "Harness Breakdown",
             "type": "object"
           },
@@ -7829,7 +7829,7 @@
             "additionalProperties": {
               "type": "number"
             },
-            "description": "Cost aggregated by model from the loaded sessions in this response, for the breakdown chart. Reflects only the current page; load more pages to see a more complete breakdown. Keys are model IDs (e.g. `\"claude-opus-4-8\"`); values are total USD cost.",
+            "description": "**All-time** cost aggregated by model across all user sessions (pre-computed, not date-filtered), for the breakdown chart. Keys are model IDs (e.g. `\"claude-opus-4-8\"`); values are total USD cost. Shows the user's overall cost distribution regardless of `since`/`until` filters.",
             "title": "Model Breakdown",
             "type": "object"
           },
@@ -7840,7 +7840,7 @@
             "type": "string"
           },
           "sessions": {
-            "description": "Per-session detail, newest activity first.",
+            "description": "Per-session detail, newest activity first. **Pagination caveat:** sessions are sorted by `updated_at` (mutable), so if a session's `updated_at` changes between page fetches (e.g., a new turn updates an older session), it may skip forward past the cursor and be omitted from later pages. This is inherent to paginating on a mutable sort key; ID-based de-duplication on the client mitigates duplicates but cannot recover skipped rows.",
             "items": {
               "$ref": "#/components/schemas/SessionUsage"
             },

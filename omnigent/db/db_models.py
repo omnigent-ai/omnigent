@@ -1365,6 +1365,53 @@ class SqlUserDailyCost(OmnigentBase):
     updated_at: Mapped[int] = mapped_column(Integer)
 
 
+class SqlUserUsageSummary(OmnigentBase):
+    """
+    SQLAlchemy model for the ``user_usage_summary`` table.
+
+    Pre-computed per-user aggregation of harness and model cost breakdowns,
+    enabling O(1) breakdown queries on ``GET /v1/usage`` instead of scanning
+    all sessions on every request. Updated incrementally as session usage
+    changes, tracking each session's contribution so we can subtract the old
+    value and add the new value when a session's usage is updated.
+
+    One row per ``user_id``. Maintained by
+    :meth:`ConversationStore.update_usage_summary_for_session` called after
+    :meth:`ConversationStore.increment_session_usage`.
+
+    Breakdowns are all-time aggregates (not date-filtered). Date-range filters
+    on ``/v1/usage`` apply to the daily cost timeline and session list, but
+    breakdown charts show the user's overall cost distribution.
+
+    :param user_id: The user whose usage is summarized (session creator).
+    :param harness_breakdown: JSON mapping harness names (e.g. ``"claude-sdk"``)
+        to total USD cost across all the user's sessions.
+    :param model_breakdown: JSON mapping model IDs (e.g. ``"claude-opus-4-8"``)
+        to total USD cost across all the user's sessions.
+    :param needs_rebuild: Boolean flag indicating the cache is stale and should
+        be rebuilt on next request. Set to ``True`` when any session usage changes.
+    :param total_sessions: Count of sessions that have contributed to this summary.
+    :param last_updated_at: Unix epoch seconds when last rebuilt.
+    """
+
+    __tablename__ = "user_usage_summary"
+
+    # Tenant partition key
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    user_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    harness_breakdown: Mapped[str] = mapped_column(Text, nullable=False, server_default="{}")
+    model_breakdown: Mapped[str] = mapped_column(Text, nullable=False, server_default="{}")
+    needs_rebuild: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=true())
+    total_sessions: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    last_updated_at: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+
+
 class SqlScheduledTask(OmnigentBase):
     """
     SQLAlchemy model for the ``scheduled_tasks`` table.

@@ -200,43 +200,34 @@ def _build_usage_report(
             )
         )
 
-    # Compute breakdown charts across ALL matching sessions (not just the current page).
-    # This requires loading all matching sessions, but we only need minimal fields
-    # (id, harness, cost, models) and we reuse sessions already loaded for the page.
-    # For efficiency, we load additional sessions without full details (no tree traversal).
-    harness_breakdown: dict[str, float] = {}
-    model_breakdown: dict[str, float] = {}
+    # Get breakdown charts from pre-computed cache (O(1)), or rebuild if stale (O(N) but only once).
+    # Breakdowns show all-time cost distribution (not date-filtered), enabling fast reads.
+    cached = conversation_store.get_usage_summary(rollup_user) if include_page_details else None
+    if cached:
+        # Cache hit - serve from pre-computed summary (O(1))
+        harness_breakdown, model_breakdown = cached
+    else:
+        # Cache miss or stale - rebuild from all sessions (O(N) but only when needed)
+        harness_breakdown: dict[str, float] = {}
+        model_breakdown: dict[str, float] = {}
+        total_session_count = 0
 
-    # Start with sessions from the current page
-    seen_ids: set[str] = {s.id for s in sessions}
-    for session in sessions:
-        if session.harness:
-            harness_breakdown[session.harness] = (
-                harness_breakdown.get(session.harness, 0.0) + session.cost_usd
-            )
-        for model, model_cost in session.models.items():
-            model_breakdown[model] = model_breakdown.get(model, 0.0) + model_cost
-
-    # Load remaining sessions (if any) with minimal overhead - no tree traversal,
-    # just enough to get harness and cost breakdown
-    if page.has_more:
-        remaining_cursor = page.last_id
-        while remaining_cursor:
-            remaining_page = conversation_store.list_conversations(
-                limit=200,  # Batch size for aggregation
-                after=remaining_cursor,
+        # Scan all user sessions to rebuild breakdown
+        rebuild_cursor: str | None = None
+        while True:
+            rebuild_page = conversation_store.list_conversations(
+                limit=200,
+                after=rebuild_cursor,
                 accessible_by=user_id,
                 has_agent_id=True,
                 kind="default",
                 order="desc",
                 sort_by="updated_at",
-                updated_at_min=updated_at_min,
-                updated_at_max=updated_at_max,
             )
-            for conv in remaining_page.data:
-                if conv.id in seen_ids or conv.agent_id is None:
+            for conv in rebuild_page.data:
+                if conv.agent_id is None:
                     continue
-                seen_ids.add(conv.id)
+                total_session_count += 1
 
                 usage = load_session_usage(conv.id, conversation_store)
                 primary_harness = _resolve_session_harness(conv) if include_page_details else None
@@ -250,9 +241,18 @@ def _build_usage_report(
                 for model, model_cost in session_models.items():
                     model_breakdown[model] = model_breakdown.get(model, 0.0) + model_cost
 
-            if not remaining_page.has_more:
+            if not rebuild_page.has_more:
                 break
-            remaining_cursor = remaining_page.last_id
+            rebuild_cursor = rebuild_page.last_id
+
+        # Cache the rebuilt summary for future requests
+        if include_page_details:
+            conversation_store.set_usage_summary(
+                rollup_user,
+                harness_breakdown,
+                model_breakdown,
+                total_session_count,
+            )
 
     daily_costs_raw = (
         conversation_store.list_daily_costs(rollup_user, _EPOCH_DAY)
@@ -334,16 +334,26 @@ def create_usage_router(
                     hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
                 )
                 updated_at_min = int(dt.timestamp())
-            except ValueError:
-                pass  # Invalid date format, ignore
+            except ValueError as e:
+                from fastapi import HTTPException
+
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Invalid 'since' date format: {since}. Expected YYYY-MM-DD.",
+                ) from e
         if until:
             try:
                 dt = datetime.strptime(until, "%Y-%m-%d").replace(
                     hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc
                 )
                 updated_at_max = int(dt.timestamp())
-            except ValueError:
-                pass  # Invalid date format, ignore
+            except ValueError as e:
+                from fastapi import HTTPException
+
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Invalid 'until' date format: {until}. Expected YYYY-MM-DD.",
+                ) from e
 
         return await asyncio.to_thread(
             _build_usage_report,

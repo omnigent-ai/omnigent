@@ -2668,18 +2668,26 @@ class UsageReport(BaseModel):
     :param cost_last_7d: Total spend over the last 7 UTC days (incl. today).
     :param cost_last_30d: Total spend over the last 30 UTC days (incl. today).
     :param total_cost_usd: All-time total spend from the daily rollup.
-    :param sessions: Per-session detail, newest activity first.
+    :param sessions: Per-session detail, newest activity first. **Pagination
+        caveat:** sessions are sorted by ``updated_at`` (mutable), so if a
+        session's ``updated_at`` changes between page fetches (e.g., a new turn
+        updates an older session), it may skip forward past the cursor and be
+        omitted from later pages. This is inherent to paginating on a mutable
+        sort key; ID-based de-duplication on the client mitigates duplicates
+        but cannot recover skipped rows.
     :param sessions_has_more: Whether more sessions exist beyond this page.
     :param sessions_last_id: ID of the last session in the page, for cursor
         pagination. ``None`` if the page is empty.
-    :param harness_breakdown: Cost aggregated by harness **across all user
-        sessions** matching the query filters (not just the current page), for
-        the breakdown chart. Keys are harness names (e.g. ``"claude-sdk"``);
-        values are total USD cost. Sessions without a resolved harness are omitted.
-    :param model_breakdown: Cost aggregated by model **across all user sessions**
-        matching the query filters (not just the current page), for the breakdown
-        chart. Keys are model IDs (e.g. ``"claude-opus-4-8"``); values are total
-        USD cost.
+    :param harness_breakdown: **All-time** cost aggregated by harness across
+        all user sessions (pre-computed, not date-filtered), for the breakdown
+        chart. Keys are harness names (e.g. ``"claude-sdk"``); values are total
+        USD cost. Sessions without a resolved harness are omitted. Shows the
+        user's overall cost distribution regardless of ``since``/``until`` filters.
+    :param model_breakdown: **All-time** cost aggregated by model across all
+        user sessions (pre-computed, not date-filtered), for the breakdown chart.
+        Keys are model IDs (e.g. ``"claude-opus-4-8"``); values are total USD cost.
+        Shows the user's overall cost distribution regardless of ``since``/``until``
+        filters.
     """
 
     object: Literal["usage_report"] = "usage_report"

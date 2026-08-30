@@ -101,10 +101,16 @@ export function UsagePage() {
     };
   }, [firstPage]);
 
-  // Total cost from daily rollup (authoritative)
+  // Total cost from daily rollup (authoritative), with fallback to session sum
   const totalCost = useMemo(() => {
-    return filteredCosts.reduce((sum, d) => sum + d.costUsd, 0);
-  }, [filteredCosts]);
+    const rolledUp = filteredCosts.reduce((sum, d) => sum + d.costUsd, 0);
+    // Fallback to session sum when daily rollup is empty (can happen when rollup
+    // is unpopulated or range excludes days with spend but includes sessions)
+    if (rolledUp === 0 && allSessions.length > 0) {
+      return allSessions.reduce((sum, s) => sum + s.costUsd, 0);
+    }
+    return rolledUp;
+  }, [filteredCosts, allSessions]);
 
   return (
     <PageScroll>
