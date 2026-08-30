@@ -1742,6 +1742,88 @@ class TestCodexExecutor(unittest.TestCase):
 
         _run(_t())
 
+    def test_app_server_run_turn_new_reasoning_item_emits_started_marker(self):
+        """A reasoning delta with a new itemId marks a paragraph boundary and
+        must emit a reasoning_started marker between the items, so downstream
+        reducers flush the prior paragraph's tail and insert a separator
+        (instead of rendering "...folder names.I have the runner...")."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+
+            async def _inject() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {
+                        "method": "item/reasoning/textDelta",
+                        "params": {"turnId": "turn-1", "itemId": "rs-1", "delta": "para one."},
+                    }
+                )
+                session._events.put_nowait(
+                    {
+                        "method": "item/reasoning/textDelta",
+                        "params": {"turnId": "turn-1", "itemId": "rs-1", "delta": " more of one."},
+                    }
+                )
+                session._events.put_nowait(
+                    {
+                        "method": "item/reasoning/textDelta",
+                        "params": {"turnId": "turn-1", "itemId": "rs-2", "delta": "para two."},
+                    }
+                )
+                session._events.put_nowait(
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "turnId": "turn-1",
+                            "item": {
+                                "id": "msg-1",
+                                "type": "agentMessage",
+                                "phase": "final_answer",
+                                "text": "Answer.",
+                            },
+                        },
+                    }
+                )
+
+            inject_task = asyncio.create_task(_inject())
+            events = [
+                event
+                async for event in session.run_turn(
+                    messages=[{"role": "user", "content": "question"}],
+                    tools=[],
+                    system_prompt="",
+                    model="gpt-5.4-mini",
+                    cwd=".",
+                    sandbox="workspace-write",
+                )
+            ]
+            await inject_task
+
+            reasoning = [(e.event_type, e.delta) for e in events if isinstance(e, ReasoningChunk)]
+            # No marker before the first item or between same-item deltas;
+            # exactly one marker at the rs-1 -> rs-2 boundary.
+            self.assertEqual(
+                reasoning,
+                [
+                    ("reasoning_text", "para one."),
+                    ("reasoning_text", " more of one."),
+                    ("reasoning_started", ""),
+                    ("reasoning_text", "para two."),
+                ],
+            )
+
+        _run(_t())
+
     def test_stderr_loop_handles_oversized_lines(self):
         async def _t():
             session = _CodexAppServerSession(
