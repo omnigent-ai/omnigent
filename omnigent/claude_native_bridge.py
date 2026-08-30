@@ -132,7 +132,10 @@ _MAX_CONCURRENT_MCP_REQUESTS = 64
 # ``tmux.json`` after the Claude terminal launches; the harness
 # tails it and shells out to tmux.
 _TMUX_READY_TIMEOUT_S = 30.0
-_TMUX_SEND_TIMEOUT_S = 5.0
+# Per-command tmux budget. 10s matches every other native bridge: a tmux
+# server starved by parallel worker boots on a large worktree can stall
+# past 5s while still healthy, and a shorter budget kills the delivery.
+_TMUX_SEND_TIMEOUT_S = 10.0
 # Claude Code renders this prompt glyph in its input box once the TUI
 # is interactive. We poll ``capture-pane`` for it before injecting the
 # first message so keystrokes typed during Claude's boot aren't dropped.
