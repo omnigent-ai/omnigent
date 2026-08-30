@@ -23,8 +23,11 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable
-from typing import Literal, NamedTuple, Protocol
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Literal, NamedTuple, Protocol
+
+if TYPE_CHECKING:
+    from omnigent.onboarding.ambient import DetectedProvider
 
 from omnigent.onboarding.configure_models import (
     build_gateway_provider_entry,
@@ -260,7 +263,9 @@ class DetectedCredential(NamedTuple):
     env_var: str | None
 
 
-def detect_adoptable_credentials() -> list[DetectedCredential]:
+def detect_adoptable_credentials(
+    detected: Sequence[DetectedProvider] | None = None,
+) -> list[DetectedCredential]:
     """Return credentials already on the host the UI can offer to adopt.
 
     Wraps the existing ambient detection (:func:`ambient.detect_providers`),
@@ -270,13 +275,14 @@ def detect_adoptable_credentials() -> list[DetectedCredential]:
     and adopt it by reference. Never raises (a detection failure yields an empty
     list rather than crashing the readiness/adopt path).
     """
-    try:
-        from omnigent.onboarding.ambient import detect_providers
+    if detected is None:
+        try:
+            from omnigent.onboarding.ambient import detect_providers
 
-        detected = detect_providers()
-    except Exception:
-        _logger.debug("detect_adoptable_credentials: detection failed", exc_info=True)
-        return []
+            detected = detect_providers()
+        except Exception:
+            _logger.debug("detect_adoptable_credentials: detection failed", exc_info=True)
+            return []
 
     result: list[DetectedCredential] = []
     seen: set[tuple[str, str]] = set()

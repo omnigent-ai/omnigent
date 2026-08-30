@@ -9,6 +9,7 @@ import {
   useHosts,
   useInstallHarness,
   useInstallingHarnesses,
+  useProviderInventory,
   useStoreCredential,
 } from "./useHosts";
 
@@ -498,6 +499,51 @@ describe("useDetectedCredentials", () => {
     const disabled = renderHook(() => useDetectedCredentials("host_1", false), { wrapper });
     const noHost = renderHook(() => useDetectedCredentials(null, true), { wrapper });
     await Promise.resolve();
+    expect(fetchMock).not.toHaveBeenCalled();
+    disabled.unmount();
+    noHost.unmount();
+  });
+});
+
+describe("useProviderInventory", () => {
+  it("fetches the host provider inventory without background polling", async () => {
+    const provider = {
+      id: "claude",
+      display_name: "Claude",
+      kind: "subscription",
+      origin: "detected",
+      source: "claude CLI login",
+      configuration_state: "valid",
+      error: null,
+      families: ["anthropic"],
+      surfaces: ["anthropic"],
+      default_for: ["anthropic"],
+      default_models: {},
+      cli: "claude",
+      profile: null,
+      model_provider: null,
+      capabilities: {
+        model_discovery: "supported",
+        usage_status: "unsupported",
+        multiple_profiles: "unsupported",
+        interactive_cli: "supported",
+      },
+    };
+    fetchMock.mockResolvedValueOnce(mockResponse({ providers: [provider] }));
+
+    const { result } = renderHook(() => useProviderInventory("host_1", true), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/hosts/host_1/providers");
+    expect(result.current.data).toEqual([provider]);
+  });
+
+  it("does not fetch while closed or without a host", async () => {
+    const disabled = renderHook(() => useProviderInventory("host_1", false), { wrapper });
+    const noHost = renderHook(() => useProviderInventory(null, true), { wrapper });
+    await Promise.resolve();
+
     expect(fetchMock).not.toHaveBeenCalled();
     disabled.unmount();
     noHost.unmount();

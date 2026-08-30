@@ -1509,12 +1509,37 @@ def test_detect_credentials_round_trip() -> None:
         credentials=[
             {"family": "anthropic", "source": "$ANTHROPIC_API_KEY", "env_var": "ANTHROPIC_API_KEY"}
         ],
+        providers=[
+            {
+                "id": "claude",
+                "display_name": "Claude",
+                "kind": "subscription",
+                "origin": "detected",
+                "source": "claude CLI login",
+                "configuration_state": "valid",
+                "error": None,
+                "families": ["anthropic"],
+                "surfaces": ["anthropic"],
+                "default_for": ["anthropic"],
+                "default_models": {},
+                "cli": "claude",
+                "profile": None,
+                "model_provider": None,
+                "capabilities": {
+                    "model_discovery": "supported",
+                    "usage_status": "unsupported",
+                    "multiple_profiles": "unsupported",
+                    "interactive_cli": "supported",
+                },
+            }
+        ],
     )
     decoded = decode_host_frame(encode_host_frame(result))
     assert isinstance(decoded, HostDetectCredentialsResultFrame)
     assert decoded.credentials == [
         {"family": "anthropic", "source": "$ANTHROPIC_API_KEY", "env_var": "ANTHROPIC_API_KEY"}
     ]
+    assert decoded.providers == result.providers
 
 
 def test_detect_credentials_result_drops_malformed_entries() -> None:
@@ -1534,6 +1559,51 @@ def test_detect_credentials_result_drops_malformed_entries() -> None:
     decoded = decode_host_frame(encoded)
     assert isinstance(decoded, HostDetectCredentialsResultFrame)
     assert decoded.credentials == [{"family": "anthropic", "source": "$X", "env_var": "X"}]
+    assert decoded.providers == []
+
+
+def test_detect_credentials_result_drops_unknown_provider_fields() -> None:
+    """Provider rows are rebuilt from an allowlist, excluding credential material."""
+    provider = {
+        "id": "work",
+        "display_name": "Work",
+        "kind": "gateway",
+        "origin": "configured",
+        "source": "config",
+        "configuration_state": "valid",
+        "error": None,
+        "families": ["openai"],
+        "surfaces": ["openai", "pi"],
+        "default_for": ["openai"],
+        "default_models": {"openai": "model-a"},
+        "cli": None,
+        "profile": None,
+        "model_provider": None,
+        "capabilities": {
+            "model_discovery": "supported",
+            "usage_status": "unsupported",
+            "multiple_profiles": "unknown",
+            "interactive_cli": "unsupported",
+        },
+        "api_key": "must-not-cross-the-tunnel",
+        "base_url": "https://private.example",
+    }
+
+    decoded = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.detect_credentials_result",
+                "request_id": "r2",
+                "credentials": [],
+                "providers": [provider],
+            }
+        )
+    )
+
+    assert isinstance(decoded, HostDetectCredentialsResultFrame)
+    assert len(decoded.providers) == 1
+    assert "api_key" not in decoded.providers[0]
+    assert "base_url" not in decoded.providers[0]
 
 
 def test_fs_request_round_trip() -> None:

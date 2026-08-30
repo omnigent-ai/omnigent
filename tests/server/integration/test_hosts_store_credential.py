@@ -50,6 +50,28 @@ pytestmark = [
 
 _HOST_ID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
 _HOST_NAME = "credential-test-laptop"
+_PROVIDER = {
+    "id": "claude",
+    "display_name": "Claude",
+    "kind": "subscription",
+    "origin": "detected",
+    "source": "claude CLI login",
+    "configuration_state": "valid",
+    "error": None,
+    "families": ["anthropic"],
+    "surfaces": ["anthropic"],
+    "default_for": ["anthropic"],
+    "default_models": {},
+    "cli": "claude",
+    "profile": None,
+    "model_provider": None,
+    "capabilities": {
+        "model_discovery": "supported",
+        "usage_status": "unsupported",
+        "multiple_profiles": "unsupported",
+        "interactive_cli": "supported",
+    },
+}
 
 
 @pytest.fixture(autouse=True)
@@ -161,6 +183,7 @@ async def cred_setup(
                                         "env_var": "ANTHROPIC_API_KEY",
                                     }
                                 ],
+                                providers=[_PROVIDER],
                             )
                         ),
                     }
@@ -572,4 +595,20 @@ async def test_detect_credentials_hidden_when_flag_off(
     )
     async with AsyncClient(transport=ASGITransport(app=off_app), base_url="http://test") as client:
         resp = await client.get(f"/v1/hosts/{_HOST_ID}/credentials/detected")
+        providers_resp = await client.get(f"/v1/hosts/{_HOST_ID}/providers")
     assert resp.status_code == 404
+    assert providers_resp.status_code == 404
+
+
+async def test_provider_inventory_returns_host_configuration(
+    cred_setup: tuple[
+        FastAPI, HostRegistry, list[HostStoreSecretFrame], dict[str, dict[str, Any]]
+    ],
+) -> None:
+    """The provider route reuses the host's non-secret setup inventory."""
+    app, _reg, _received, _replies = cred_setup
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(f"/v1/hosts/{_HOST_ID}/providers")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"object": "provider_inventory", "providers": [_PROVIDER]}

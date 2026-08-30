@@ -785,10 +785,13 @@ class HostDetectCredentialsResultFrame:
     :param request_id: Correlates to the :class:`HostDetectCredentialsFrame`.
     :param credentials: List of ``{"family": ..., "source": ..., "env_var": ...}``
         dicts (non-secret). Empty when nothing adoptable was found.
+    :param providers: Sanitized provider inventory from the host's effective
+        Omnigent configuration. Empty for older hosts.
     """
 
     request_id: str
     credentials: list[dict[str, str | None]] = field(default_factory=list)
+    providers: list[_JsonObject] = field(default_factory=list)
 
 
 @dataclass
@@ -1300,6 +1303,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.DETECT_CREDENTIALS_RESULT.value,
                 "request_id": frame.request_id,
                 "credentials": frame.credentials,
+                "providers": frame.providers,
             }
         )
     if isinstance(frame, HostFsRequestFrame):
@@ -1963,7 +1967,90 @@ def _decode_detect_credentials_result(msg: _JsonObject) -> HostDetectCredentials
     return HostDetectCredentialsResultFrame(
         request_id=_required_str(msg, "request_id"),
         credentials=creds,
+        providers=_decode_provider_inventory(msg.get("providers")),
     )
+
+
+_PROVIDER_CAPABILITY_VALUES = frozenset({"supported", "unsupported", "unknown"})
+
+
+def _decode_provider_inventory(raw: object) -> list[_JsonObject]:
+    """Allowlist non-secret fields from host-reported provider rows."""
+    if not isinstance(raw, list):
+        return []
+    providers: list[_JsonObject] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        required = (
+            "id",
+            "display_name",
+            "kind",
+            "origin",
+            "source",
+            "configuration_state",
+        )
+        if not all(isinstance(item.get(key), str) for key in required):
+            continue
+        if item.get("origin") not in {"configured", "detected"}:
+            continue
+        if item.get("configuration_state") not in {"valid", "invalid"}:
+            continue
+        string_lists: dict[str, list[str]] = {}
+        valid = True
+        for key in ("families", "surfaces", "default_for"):
+            value = item.get(key)
+            if not isinstance(value, list) or not all(isinstance(member, str) for member in value):
+                valid = False
+                break
+            string_lists[key] = list(value)
+        raw_models = item.get("default_models")
+        if not valid or not isinstance(raw_models, dict):
+            continue
+        default_models = {
+            key: value
+            for key, value in raw_models.items()
+            if isinstance(key, str) and isinstance(value, str)
+        }
+        if len(default_models) != len(raw_models):
+            continue
+        raw_capabilities = item.get("capabilities")
+        if not isinstance(raw_capabilities, dict):
+            continue
+        capability_names = (
+            "model_discovery",
+            "usage_status",
+            "multiple_profiles",
+            "interactive_cli",
+        )
+        capabilities: dict[str, str] = {}
+        for name in capability_names:
+            value = raw_capabilities.get(name)
+            if not isinstance(value, str) or value not in _PROVIDER_CAPABILITY_VALUES:
+                valid = False
+                break
+            capabilities[name] = value
+        if not valid:
+            continue
+        optional_strings: dict[str, str | None] = {}
+        for key in ("error", "cli", "profile", "model_provider"):
+            value = item.get(key)
+            if value is not None and not isinstance(value, str):
+                valid = False
+                break
+            optional_strings[key] = value
+        if not valid:
+            continue
+        providers.append(
+            {
+                **{key: item[key] for key in required},
+                **string_lists,
+                "default_models": default_models,
+                **optional_strings,
+                "capabilities": capabilities,
+            }
+        )
+    return providers
 
 
 def _decode_fs_request(msg: _JsonObject) -> HostFsRequestFrame:

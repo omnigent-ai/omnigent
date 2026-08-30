@@ -92,6 +92,7 @@ from omnigent.host.git_worktree import (
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.inner import _proc
+from omnigent.onboarding.ambient import detect_providers
 from omnigent.onboarding.harness_auth import (
     adopt_env_credential,
     detect_adoptable_credentials,
@@ -108,6 +109,7 @@ from omnigent.onboarding.harness_readiness import (
     harness_is_configured,
 )
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
+from omnigent.onboarding.provider_inventory import build_provider_inventory
 from omnigent.process_logging import (
     LOG_TTY_FD_ENV_VAR,
     PROCESS_LOG_FILE_ENV_VAR,
@@ -2536,12 +2538,25 @@ class HostProcess:
         :param frame: The detect request (carries only a request id).
         :returns: Result frame with the non-secret credential descriptors.
         """
-        detected = detect_adoptable_credentials()
+        try:
+            ambient = detect_providers()
+        except Exception:  # a status read must always settle
+            _logger.exception("Failed to detect ambient providers")
+            ambient = []
+        detected = detect_adoptable_credentials(ambient)
+        try:
+            providers = [
+                entry.as_dict() for entry in build_provider_inventory(detected=list(ambient))
+            ]
+        except Exception:  # malformed config must not hang the UI
+            _logger.exception("Failed to build provider inventory")
+            providers = []
         return HostDetectCredentialsResultFrame(
             request_id=frame.request_id,
             credentials=[
                 {"family": d.family, "source": d.source, "env_var": d.env_var} for d in detected
             ],
+            providers=providers,
         )
 
     def _handle_fs_request(self, frame: HostFsRequestFrame) -> HostFsResultFrame:

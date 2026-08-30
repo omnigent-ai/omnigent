@@ -277,6 +277,7 @@ export function useStoreCredential(hostId: string) {
       );
       // A written/adopted credential changes what's adoptable — refetch it.
       void queryClient.invalidateQueries({ queryKey: ["detected-credentials", hostId] });
+      void queryClient.invalidateQueries({ queryKey: ["provider-inventory", hostId] });
     },
   });
 }
@@ -286,6 +287,52 @@ export interface DetectedCredential {
   family: string;
   source: string;
   env_var: string | null;
+}
+
+export type ProviderCapabilitySupport = "supported" | "unsupported" | "unknown";
+
+export interface ProviderCapabilities {
+  model_discovery: ProviderCapabilitySupport;
+  usage_status: ProviderCapabilitySupport;
+  multiple_profiles: ProviderCapabilitySupport;
+  interactive_cli: ProviderCapabilitySupport;
+}
+
+/** Non-secret provider metadata reported by the selected host. */
+export interface ProviderInventoryEntry {
+  id: string;
+  display_name: string;
+  kind: string;
+  origin: "configured" | "detected";
+  source: string;
+  configuration_state: "valid" | "invalid";
+  error: string | null;
+  families: string[];
+  surfaces: string[];
+  default_for: string[];
+  default_models: Record<string, string>;
+  cli: string | null;
+  profile: string | null;
+  model_provider: string | null;
+  capabilities: ProviderCapabilities;
+}
+
+/** Fetch provider configuration on demand; no background CLI polling. */
+export function useProviderInventory(hostId: string | null | undefined, enabled: boolean) {
+  return useQuery({
+    queryKey: ["provider-inventory", hostId],
+    queryFn: async (): Promise<ProviderInventoryEntry[]> => {
+      const res = await authenticatedFetch(
+        `/v1/hosts/${encodeURIComponent(hostId ?? "")}/providers`,
+      );
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      const body = (await res.json()) as { providers?: ProviderInventoryEntry[] };
+      return Array.isArray(body.providers) ? body.providers : [];
+    },
+    enabled: enabled && !!hostId,
+    staleTime: 60_000,
+    refetchInterval: false,
+  });
 }
 
 /**

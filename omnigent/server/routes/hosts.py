@@ -393,7 +393,7 @@ async def _proxy_detect_credentials(
 
     :param host_registry: Server-side registry; used to enqueue the frame.
     :param host_conn: Live host connection.
-    :returns: Dict with a ``credentials`` list of non-secret descriptors.
+    :returns: Dict with non-secret ``credentials`` and ``providers`` lists.
     :raises HTTPException: 504 on timeout, 502 on connection drop.
     """
     request_id = secrets.token_hex(8)
@@ -1523,6 +1523,38 @@ def create_hosts_router(
         return {
             "object": "detected_credentials",
             "credentials": result.get("credentials") or [],
+        }
+
+    @router.get("/hosts/{host_id}/providers")
+    async def list_host_providers(
+        request: Request,
+        host_id: str,
+    ) -> dict[str, Any]:
+        """List the connected host's configured and ambient providers.
+
+        Uses the same host-side provider parsing and ambient detection as Omni
+        Setup. The response contains only display metadata and conservative
+        capability states; credentials, secret references, and endpoints never
+        cross the tunnel.
+        """
+        if not flags.enabled(Feature.HARNESS_INSTALL):
+            raise HTTPException(status_code=404, detail="not found")
+
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+
+        conn = host_registry.get(host.host_id)
+        if conn is None:
+            raise _host_absent_error(host)
+
+        result = await _proxy_detect_credentials(host_registry=host_registry, host_conn=conn)
+        return {
+            "object": "provider_inventory",
+            "providers": result.get("providers") or [],
         }
 
     @router.get("/hosts/{host_id}/worktrees")

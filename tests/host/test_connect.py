@@ -3029,12 +3029,17 @@ def test_handle_detect_credentials_returns_non_secret_descriptors(
 ) -> None:
     """The detect handler returns the core's descriptors as plain dicts."""
     import omnigent.host.connect as connect
-    from omnigent.onboarding.harness_auth import DetectedCredential
 
     monkeypatch.setattr(
         connect,
-        "detect_adoptable_credentials",
-        lambda: [DetectedCredential("anthropic", "$ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY")],
+        "detect_providers",
+        lambda: [SimpleNamespace(family="anthropic", kind="key", source="$ANTHROPIC_API_KEY")],
+    )
+    provider = {"id": "claude", "kind": "subscription"}
+    monkeypatch.setattr(
+        connect,
+        "build_provider_inventory",
+        lambda *, detected: [SimpleNamespace(as_dict=lambda: provider)],
     )
     host = _make_host_process()
     result = host._handle_detect_credentials(HostDetectCredentialsFrame(request_id="d1"))
@@ -3042,6 +3047,7 @@ def test_handle_detect_credentials_returns_non_secret_descriptors(
     assert result.credentials == [
         {"family": "anthropic", "source": "$ANTHROPIC_API_KEY", "env_var": "ANTHROPIC_API_KEY"}
     ]
+    assert result.providers == [provider]
 
 
 # --- Fail-loud on permanent tunnel failures ----------------------------
