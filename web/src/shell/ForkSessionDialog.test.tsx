@@ -706,13 +706,14 @@ describe("ForkSessionDialog", () => {
       expect(screen.queryByTestId("fork-session-advanced-content")).not.toBeInTheDocument();
     });
 
-    it("forks, navigates immediately, and fires the runner launch in the background", async () => {
+    it("forks, awaits runner launch, then navigates", async () => {
       forkSessionMock.mockResolvedValue({
         id: "conv_fork",
       } as unknown as Awaited<ReturnType<typeof forkSession>>);
-      // Launch never resolves: proves navigation does NOT await it (the old
-      // awaited flow blocked the modal here — the freeze report).
-      launchRunnerMock.mockReturnValue(new Promise(() => {}));
+      // Launch resolves successfully. The dialog waits for it to complete
+      // before navigating, ensuring the worktree is created and workspace
+      // is updated before the user sees the forked session.
+      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
 
       const { invalidateSpy } = renderDialog(CODING);
 
@@ -724,9 +725,9 @@ describe("ForkSessionDialog", () => {
       // Name left blank (optional) → undefined so the server derives it.
       // Coding SDK source, no agent switch → no run-config section, empty config.
       expect(forkSessionMock).toHaveBeenCalledWith("conv_src", undefined, undefined, undefined, {});
-      // Navigation happens even though the launch promise is still pending.
+      // Navigation happens after the launch completes.
       await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
-      // The launch was kicked off (in the background) on the prefilled host/dir.
+      // The launch was called on the prefilled host/dir.
       expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", "/repo", undefined);
       expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
     });
