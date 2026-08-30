@@ -23,6 +23,9 @@ from pathlib import Path
 from setuptools import setup
 from setuptools.command.build_py import build_py
 
+_MINIMUM_NODE_VERSION = (22, 13, 0)
+_MINIMUM_NODE_VERSION_TEXT = ".".join(str(part) for part in _MINIMUM_NODE_VERSION)
+
 
 class _GenerateBuildInfo(build_py):
     """Subclass of ``build_py`` that writes ``_build_info.py``.
@@ -125,7 +128,7 @@ class _GenerateBuildInfo(build_py):
           ``OMNIGENT_BUILD_WEB_UI=1`` forces a rebuild. This keeps
           repeat ``uv sync`` fast for backend devs (build once, reuse)
           while letting release builds force a fresh bundle.
-        - Otherwise the build MUST succeed: a Node.js older than 22.12
+        - Otherwise the build MUST succeed: a Node.js older than 22.13
           (or absent), a missing pnpm, or a failing ``pnpm install`` /
           ``pnpm --filter web run build`` aborts the install with an
           actionable error. Omnigent needs Node 22 LTS + pnpm at
@@ -142,7 +145,7 @@ class _GenerateBuildInfo(build_py):
         confirmation before downloading the pinned pnpm, which a
         non-interactive install can never answer.
 
-        :raises SystemExit: If the on-PATH Node.js is older than 22.12
+        :raises SystemExit: If the on-PATH Node.js is older than 22.13
             (or absent), pnpm is not on PATH (and corepack can't supply
             it), or the web UI build fails, and no skip condition applies.
         """
@@ -167,8 +170,8 @@ class _GenerateBuildInfo(build_py):
         )
         if bundle.is_file() and not force:
             return
-        # Vite 8 and oxlint support Node 22.12 and newer. Keep this a
-        # minimum so newer LTS releases remain usable.
+        # pnpm 11.15.1 requires Node 22.13 and is stricter than Vite 8 and
+        # oxlint. Enforce the effective toolchain floor before invoking pnpm.
         node_version = _require_supported_node()
 
         # pnpm first; fall back to corepack (bundled with Node 22+),
@@ -225,9 +228,11 @@ class _GenerateBuildInfo(build_py):
         except (subprocess.SubprocessError, OSError) as exc:
             raise SystemExit(
                 f"omnigent build: web UI build failed on Node.js {node_version} "
-                f"({exc}). Fix the failure above and rerun the install. If "
+                f"({_subprocess_failure_details(exc)}). Fix the failure above "
+                "and rerun the install. If "
                 "this Node.js release is incompatible with pnpm or Vite, "
-                "install Node 22 LTS and retry. To deliberately install "
+                f"upgrade to Node.js {_MINIMUM_NODE_VERSION_TEXT} or newer and "
+                "retry. To deliberately install "
                 "without the web UI (API-only server), set "
                 "OMNIGENT_SKIP_WEB_UI=true."
             ) from exc
@@ -265,14 +270,14 @@ class _GenerateBuildInfo(build_py):
 
 
 def _require_supported_node() -> str:
-    """Return the Node.js version or abort when it is older than 22.12.
+    """Return the Node.js version or abort when it is older than 22.13.
 
-    Vite 8 and oxlint declare Node 22.12 as their minimum on the
-    project's supported 22+ line. Newer Node releases remain valid.
+    The pinned pnpm 11.15.1 requires Node 22.13. Newer Node releases
+    remain valid.
 
     :returns: The normalized Node.js version string.
     :raises SystemExit: If ``node`` is missing, ``node --version`` fails,
-        or the reported version is older than 22.12.
+        or the reported version is older than 22.13.
     """
     import shutil
 
@@ -280,9 +285,9 @@ def _require_supported_node() -> str:
     if node is None:
         raise SystemExit(
             "omnigent build: Node.js not found on PATH, so the web UI "
-            "cannot be built. Node.js 22.12 or newer is required. Install "
-            "Node 22 LTS from https://nodejs.org/en/download and retry, "
-            "or run with OMNIGENT_SKIP_WEB_UI=true to skip the web UI "
+            f"cannot be built. Node.js {_MINIMUM_NODE_VERSION_TEXT} or newer "
+            "is required. Install it from https://nodejs.org/en/download and "
+            "retry, or run with OMNIGENT_SKIP_WEB_UI=true to skip the web UI "
             "build."
         )
     try:
@@ -296,8 +301,9 @@ def _require_supported_node() -> str:
     except (subprocess.SubprocessError, OSError) as exc:
         raise SystemExit(
             f"omnigent build: could not determine the Node.js version "
-            f"(`node --version` failed: {exc}). Node.js 22.12 or newer "
-            "is required. Install Node 22 LTS and retry, or run with "
+            f"(`node --version` failed: {exc}). Node.js "
+            f"{_MINIMUM_NODE_VERSION_TEXT} or newer is required. Install it "
+            "from https://nodejs.org/en/download and retry, or run with "
             "OMNIGENT_SKIP_WEB_UI=true to skip the web UI build."
         ) from exc
     # ``node --version`` prints ``v22.14.0``.
@@ -309,17 +315,32 @@ def _require_supported_node() -> str:
     except ValueError:
         raise SystemExit(
             f"omnigent build: could not parse Node.js version "
-            f"{version_str or 'unknown'}. Node.js 22.12 or newer is "
-            "required. Install Node 22 LTS and retry, or run with "
+            f"{version_str or 'unknown'}. Node.js "
+            f"{_MINIMUM_NODE_VERSION_TEXT} or newer is required. Install it "
+            "from https://nodejs.org/en/download and retry, or run with "
             "OMNIGENT_SKIP_WEB_UI=true to skip the web UI build."
         ) from None
-    if version_parts < (22, 12, 0):
+    if version_parts < _MINIMUM_NODE_VERSION:
         raise SystemExit(
-            f"omnigent build: Node.js 22.12 or newer is required but found "
-            f"Node.js {version_str}. Install Node 22 LTS and retry, or run "
-            "with OMNIGENT_SKIP_WEB_UI=true to skip the web UI build."
+            f"omnigent build: Node.js {_MINIMUM_NODE_VERSION_TEXT} or newer "
+            f"is required but found Node.js {version_str}. Upgrade from "
+            "https://nodejs.org/en/download and retry, or run with "
+            "OMNIGENT_SKIP_WEB_UI=true to skip the web UI build."
         )
     return version_str
+
+
+def _subprocess_failure_details(exc: BaseException) -> str:
+    """Return an actionable subprocess failure summary, including stderr."""
+    details = str(exc)
+    stderr = getattr(exc, "stderr", None)
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode(errors="replace")
+    if isinstance(stderr, str):
+        stderr = stderr.strip()
+        if stderr and stderr not in details:
+            details = f"{details}; stderr: {stderr}"
+    return details
 
 
 def _git_sha() -> str:
