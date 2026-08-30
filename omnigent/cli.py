@@ -6299,9 +6299,25 @@ def usage(limit: int, server: str | None, as_json: bool) -> None:
         timeout=60.0,
         trust_env=_trust_env_for(base_url),
     ) as client:
-        resp = client.get("/v1/usage")
+        # Fetch all sessions via pagination
+        resp = client.get("/v1/usage", params={"limit": 200})
         resp.raise_for_status()
         report = resp.json()
+
+        # Accumulate all pages of sessions
+        all_sessions = list(report.get("sessions", []))
+        while report.get("sessions_has_more", False):
+            after = report.get("sessions_last_id")
+            if not after:
+                break
+            resp = client.get("/v1/usage", params={"limit": 200, "after": after})
+            resp.raise_for_status()
+            page = resp.json()
+            all_sessions.extend(page.get("sessions", []))
+            report = page  # Update to get the latest has_more/last_id
+
+        # Replace the sessions list with all accumulated sessions
+        report["sessions"] = all_sessions
 
     if as_json:
         click.echo(json.dumps(report, indent=2))
