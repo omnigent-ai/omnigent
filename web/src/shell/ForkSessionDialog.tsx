@@ -1031,29 +1031,34 @@ export function ForkSessionForm({
         const baseOnSource =
           onSourceHost &&
           (workspaceTrimmed === sourceRepo || workspaceTrimmed === sourceWorkspaceNorm);
-        void launchRunner(
-          selectedHostId,
-          fork.id,
-          // Recreating a deleted source worktree launches from the REPO
-          // path (the server derives the worktree directory from the
-          // branch), exactly like the renamed-branch path.
-          recreateSourceWorktree ? workspaceTrimmed : effectiveWorkspace,
-          trimmedBranch !== "" && (!usingSourceWorktree || recreateSourceWorktree)
-            ? recreateSourceWorktree
-              ? // The branch survives its deleted directory — recreate the
-                // worktree by checking the existing branch back out (no base:
-                // nothing new is forked).
-                { branchName: trimmedBranch, existingBranch: true }
-              : {
-                  branchName: trimmedBranch,
-                  baseBranch: baseOnSource && sourceBranch ? sourceBranch : undefined,
-                }
-            : undefined,
-        ).catch((e) => {
-          // Swallow: recovery is the unbound-fork picker on the session
-          // page. Logged so a failed launch isn't entirely silent.
-          console.warn(`Clone ${fork.id}: background runner launch failed`, e);
-        });
+        // Wait for the runner launch to complete before navigating.
+        // This ensures the worktree is created and workspace is updated
+        // before the user sees the forked session.
+        try {
+          await launchRunner(
+            selectedHostId,
+            fork.id,
+            // Recreating a deleted source worktree launches from the REPO
+            // path (the server derives the worktree directory from the
+            // branch), exactly like the renamed-branch path.
+            recreateSourceWorktree ? workspaceTrimmed : effectiveWorkspace,
+            trimmedBranch !== "" && (!usingSourceWorktree || recreateSourceWorktree)
+              ? recreateSourceWorktree
+                ? // The branch survives its deleted directory — recreate the
+                  // worktree by checking the existing branch back out (no base:
+                  // nothing new is forked).
+                  { branchName: trimmedBranch, existingBranch: true }
+                : {
+                    branchName: trimmedBranch,
+                    baseBranch: baseOnSource && sourceBranch ? sourceBranch : undefined,
+                  }
+              : undefined,
+          );
+        } catch (e) {
+          // Launch failed, but the fork was created. The session page
+          // will show the directory picker for rebinding.
+          console.warn(`Clone ${fork.id}: runner launch failed`, e);
+        }
       }
       // Fire-and-forget: the sidebar refresh must not gate navigation.
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
