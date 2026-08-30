@@ -2405,8 +2405,7 @@ def _prepare_messages(
     Build system instructions and Responses API input items.
 
     Resolves content references and counts system token budget.
-    Extracted from ``_call_llm_maybe_compact`` for reuse by the
-    executor path.
+    Shared by the executor and explicit compaction paths.
 
     :param spec: The parsed AgentSpec.
     :param llm_config: LLM configuration.

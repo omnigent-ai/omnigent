@@ -1048,6 +1048,20 @@ class _RecordingTurnContext:
         self.emitted.append(event)
 
 
+def test_translate_compaction_failed_emits_terminal_sse() -> None:
+    """Harness compaction failures reach clients as the existing failed event."""
+    from omnigent.inner.executor import CompactionFailed
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+
+    adapter._translate_event(CompactionFailed(), ctx)  # type: ignore[arg-type]
+
+    assert len(ctx.emitted) == 1
+    assert ctx.emitted[0].type == "response.compaction.failed"
+
+
 def test_translate_event_mcp_tool_call_request_emits_observed_with_bare_name() -> None:
     """
     A ``ToolCallRequest`` carrying an MCP-prefixed name emits

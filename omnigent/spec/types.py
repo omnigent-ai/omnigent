@@ -647,14 +647,15 @@ class CompactionConfig:
     """
     Context compaction configuration.
 
-    Controls when the agent compacts its conversation history to
-    stay within the LLM's context window. Compaction is layered:
+    Controls server-side compaction of persisted conversation history.
+    Stateful harnesses own automatic compaction of their live context;
+    this configuration applies to the explicit server compaction path.
+    Compaction is layered:
     (1) clear tool result bodies, (2) LLM summarization, (3)
     truncation as emergency fallback.
 
-    :param trigger_threshold: Fraction of the model's context window
-        at which proactive compaction fires, e.g. ``0.8`` means fire
-        at 80% of the window.
+    :param trigger_threshold: Fraction of the model's context window used
+        to calculate the explicit compaction target budget, e.g. ``0.8``.
     :param recent_window: Number of recent LLM iterations to protect
         from compaction. Items within this window are never cleared or
         summarized — the agent always has verbatim access to its most

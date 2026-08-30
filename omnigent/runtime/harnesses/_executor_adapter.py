@@ -24,6 +24,7 @@ from fastapi import Response
 from omnigent.errors import ElicitationDeclinedError
 from omnigent.inner.executor import (
     CompactionComplete,
+    CompactionFailed,
     CompactionStarted,
     Executor,
     ExecutorConfig,
@@ -826,6 +827,14 @@ class ExecutorAdapter(HarnessApp):
             ctx.emit(
                 CompactionInProgressEvent(
                     type="response.compaction.in_progress",
+                )
+            )
+        elif isinstance(event, CompactionFailed):
+            from omnigent.server.schemas import CompactionFailedEvent
+
+            ctx.emit(
+                CompactionFailedEvent(
+                    type="response.compaction.failed",
                 )
             )
         elif isinstance(event, CompactionComplete):

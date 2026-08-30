@@ -680,6 +680,9 @@ class _AgentsSessionState:
     :param rollback_to_item_count: When non-``None``, the next
         ``run_turn`` rewinds the SDK session to this length
         before starting. Set by :meth:`interrupt_session`.
+    :param compaction_failed: Set when the SDK's harness-owned compaction
+        request fails. The next executor event drain publishes a terminal
+        compaction-failed event and clears this flag.
     """
 
     sdk_session: _SDKSession
@@ -694,6 +697,7 @@ class _AgentsSessionState:
     history_cursor: int = 0
     run_item_count_before: int | None = None
     rollback_to_item_count: int | None = None
+    compaction_failed: bool = False
 
 
 # ``_sanitize_replay_item`` walks replay values recursively. At the
@@ -1147,7 +1151,7 @@ class OpenAIAgentsSDKExecutor(Executor):
             return state
 
         underlying = _SanitizingSession(agents_sdk.SQLiteSession(session_key))
-        sdk_session: _SDKSession = underlying
+        state = _AgentsSessionState(sdk_session=underlying)
         # Wrap with compaction session when the client targets a real
         # HTTP endpoint. Skip for bare object() clients in unit tests
         # that lack base_url.
@@ -1175,13 +1179,14 @@ class OpenAIAgentsSDKExecutor(Executor):
                         try:
                             await super().run_compaction(args)
                         except Exception:  # noqa: BLE001
-                            logger.debug(
+                            state.compaction_failed = True
+                            logger.warning(
                                 "Compaction call failed (endpoint may not support "
                                 "responses.compact), continuing without compaction",
                                 exc_info=True,
                             )
 
-                sdk_session = cast(
+                state.sdk_session = cast(
                     _SDKSession,
                     _SafeCompactionSession(
                         session_id=session_key,
@@ -1194,7 +1199,6 @@ class OpenAIAgentsSDKExecutor(Executor):
                     "Compaction session setup failed, falling back to plain session: %s",
                     exc,
                 )
-        state = _AgentsSessionState(sdk_session=sdk_session)
         self._session_states[session_key] = state
         return state
 
@@ -1883,6 +1887,12 @@ class OpenAIAgentsSDKExecutor(Executor):
                 if cached_tok:
                     turn_usage["cache_read_input_tokens"] = cached_tok
         _notify_usage_from_dict(model=model, usage=turn_usage)
+
+        if state.compaction_failed:
+            from omnigent.inner.executor import CompactionFailed
+
+            state.compaction_failed = False
+            yield CompactionFailed()
 
         # Emit CompactionComplete if the SDK compacted this turn.
         if result is not None:

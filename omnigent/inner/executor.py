@@ -239,6 +239,15 @@ class CompactionStarted(ExecutorEvent):
 
 
 @dataclass
+class CompactionFailed(ExecutorEvent):
+    """The harness attempted to compact its context but could not.
+
+    The current turn may still complete successfully. Clients use this event
+    to clear compaction progress and expose the failed recovery attempt.
+    """
+
+
+@dataclass
 class CompactionComplete(ExecutorEvent):
     """The harness compacted its internal context.
 

@@ -7,6 +7,7 @@ import types
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -3183,5 +3184,67 @@ def test_no_compaction_item_no_compaction_event() -> None:
 
         compaction_events = [e for e in events if isinstance(e, CompactionComplete)]
         assert len(compaction_events) == 0
+
+    _run(_t())
+
+
+def test_compaction_failure_is_observable_and_non_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A rejected responses.compact call is surfaced without killing the turn."""
+    from agents.memory import OpenAIResponsesCompactionSession
+
+    from omnigent.inner.executor import CompactionFailed
+
+    async def _fail_compaction(self: object, args: object = None) -> None:
+        del self, args
+        raise RuntimeError("responses.compact unavailable")
+
+    monkeypatch.setattr(
+        OpenAIResponsesCompactionSession,
+        "run_compaction",
+        _fail_compaction,
+    )
+
+    async def _t() -> None:
+        executor = OpenAIAgentsSDKExecutor(
+            client=SimpleNamespace(base_url="https://gateway.example/v1")
+        )
+        sdk = _fake_agents_sdk()
+        state = executor._get_or_create_session_state(sdk, "s_compact_fail")
+
+        with caplog.at_level("WARNING"):
+            await state.sdk_session.run_compaction()
+
+        assert state.compaction_failed
+        assert "continuing without compaction" in caplog.text
+
+        _FakeRunner.next_result = _FakeResult(
+            events=[],
+            final_output="turn still completed",
+            raw_responses=[_nonempty_raw_response()],
+        )
+        with patch(
+            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            return_value=sdk,
+        ):
+            events = await _collect(
+                executor.run_turn(
+                    [
+                        {
+                            "role": "user",
+                            "content": "hi",
+                            "session_id": "s_compact_fail",
+                        }
+                    ],
+                    [],
+                    "Be helpful.",
+                )
+            )
+
+        assert len([event for event in events if isinstance(event, CompactionFailed)]) == 1
+        assert len([event for event in events if isinstance(event, TurnComplete)]) == 1
+        assert not state.compaction_failed
 
     _run(_t())
