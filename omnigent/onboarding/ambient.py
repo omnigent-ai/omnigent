@@ -182,35 +182,8 @@ def codex_auth_has_credential(auth_path: Path) -> bool:
         when it is missing, unreadable, not valid JSON, not a JSON object, or
         carries no credential field.
     """
-    try:
-        raw = auth_path.read_text(encoding="utf-8")
-    except OSError:
-        # Missing or unreadable file — no login.
-        return False
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        # Malformed JSON — treat as no usable login rather than crash.
-        return False
-    if not isinstance(data, dict):
-        return False
-    # apikey mode: a baked-in OpenAI API key.
-    api_key = data.get("OPENAI_API_KEY")
-    if isinstance(api_key, str) and api_key.strip():
-        return True
-    # chatgpt / OAuth mode: an access token, or a refresh token the CLI can
-    # exchange for a fresh access token.
-    tokens = data.get("tokens")
-    if isinstance(tokens, dict):
-        for field in ("access_token", "refresh_token"):
-            value = tokens.get(field)
-            if isinstance(value, str) and value.strip():
-                return True
-    # Enterprise / external-token integrations.
-    personal_access_token = data.get("personal_access_token")
-    if isinstance(personal_access_token, str) and personal_access_token.strip():
-        return True
-    return False
+    # Delegate so the credential set can never drift from the mode resolver.
+    return codex_auth_effective_mode(auth_path) is not None
 
 
 def codex_auth_effective_mode(auth_path: Path) -> str | None:
