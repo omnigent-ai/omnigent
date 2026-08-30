@@ -83,12 +83,25 @@ export function UsagePage() {
     [firstPage, since, until],
   );
 
-  // Sessions are already filtered server-side - no need for client-side filtering
+  // Aggregate breakdowns across ALL loaded pages (not just first page)
+  const { harnessBreakdown, modelBreakdown } = useMemo(() => {
+    const harness: Record<string, number> = {};
+    const model: Record<string, number> = {};
+    for (const page of data?.pages ?? []) {
+      for (const [key, cost] of Object.entries(page.harnessBreakdown)) {
+        harness[key] = (harness[key] ?? 0) + cost;
+      }
+      for (const [key, cost] of Object.entries(page.modelBreakdown)) {
+        model[key] = (model[key] ?? 0) + cost;
+      }
+    }
+    return { harnessBreakdown: harness, modelBreakdown: model };
+  }, [data]);
+
+  // Total cost from daily rollup (authoritative)
   const totalCost = useMemo(() => {
-    const fromDaily = filteredCosts.reduce((sum, d) => sum + d.costUsd, 0);
-    if (fromDaily > 0) return fromDaily;
-    return allSessions.reduce((sum, s) => sum + s.costUsd, 0);
-  }, [filteredCosts, allSessions]);
+    return filteredCosts.reduce((sum, d) => sum + d.costUsd, 0);
+  }, [filteredCosts]);
 
   return (
     <PageScroll>
@@ -191,12 +204,13 @@ export function UsagePage() {
             <div>
               {hasNextPage && (
                 <p className="mb-2 text-xs text-muted-foreground">
-                  Based on {allSessions.length} loaded sessions (more available)
+                  Based on {allSessions.length} loaded sessions. Load more to see complete
+                  breakdown.
                 </p>
               )}
               <UsageBreakdownCharts
-                harnessBreakdown={firstPage.harnessBreakdown}
-                modelBreakdown={firstPage.modelBreakdown}
+                harnessBreakdown={harnessBreakdown}
+                modelBreakdown={modelBreakdown}
               />
             </div>
 
