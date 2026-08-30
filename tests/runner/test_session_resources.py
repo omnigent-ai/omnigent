@@ -27,6 +27,7 @@ from omnigent.entities.session_resources import (
 )
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment, create_os_environment
+from omnigent.inner.sandbox import _default_sandbox_for_platform
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import create_runner_app
 from omnigent.runner import resource_registry as resource_registry_mod
@@ -532,6 +533,10 @@ class _SwitchableServerClient:
         return self._Response({})
 
 
+# This test needs a real sandbox distinct from "none" on the current host.
+_NATIVE_SANDBOX_TYPE = _default_sandbox_for_platform().type
+
+
 @pytest.mark.asyncio
 async def test_reset_state_rematerializes_env_from_new_agent_spec(tmp_path: Path) -> None:
     """``POST /reset-state`` makes the next filesystem access resolve the
@@ -550,7 +555,7 @@ async def test_reset_state_rematerializes_env_from_new_agent_spec(tmp_path: Path
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
-    # Two agents with DISTINCT sandboxes so the captured spec is unambiguous.
+    # Use the native backend so materialization works off Linux too.
     spec_a = AgentSpec(
         spec_version=1,
         name="agent_a",
@@ -562,7 +567,7 @@ async def test_reset_state_rematerializes_env_from_new_agent_spec(tmp_path: Path
         os_env=OSEnvSpec(
             type="caller_process",
             cwd=".",
-            sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
+            sandbox=OSEnvSandboxSpec(type=_NATIVE_SANDBOX_TYPE),
         ),
     )
 
@@ -619,11 +624,11 @@ async def test_reset_state_rematerializes_env_from_new_agent_spec(tmp_path: Path
         resp2 = await c.get(env_path)
         assert resp2.status_code == 200, resp2.text
 
-    # After the reset the next access resolved agent_b (sandbox=linux_bwrap).
+    # After the reset the next access resolved agent_b (the native sandbox).
     # If reset-state had NOT dropped the spec/snapshot caches, this would
     # still be agent_a/"none" — the cross-agent sandbox leak this guards.
     assert captured_specs[-1].name == "agent_b"
-    assert captured_specs[-1].os_env.sandbox.type == "linux_bwrap"
+    assert captured_specs[-1].os_env.sandbox.type == _NATIVE_SANDBOX_TYPE
 
 
 @pytest.mark.asyncio

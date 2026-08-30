@@ -241,6 +241,12 @@ function fakeResponse(status: number, json: () => Promise<unknown>): Response {
   return { status, json } as unknown as Response;
 }
 
+// Keep local-host labels deterministic across CI and developer operating systems.
+Object.defineProperty(window.navigator, "userAgent", {
+  value: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 jsdom",
+  configurable: true,
+});
+
 describe("displayNameForHost", () => {
   const local = { host_id: "host_local", name: "HR4V76FMWY" };
 
