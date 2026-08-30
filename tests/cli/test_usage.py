@@ -173,7 +173,7 @@ class _PaginatedClient:
                     "sessions_last_id": "conv_page1_b",
                 }
             )
-        elif params.get("after") == "conv_page1_b":
+        if params.get("after") == "conv_page1_b":
             # Second page
             return _FakeResponse(
                 {
@@ -258,7 +258,7 @@ class _DuplicatingClient:
                     "sessions_last_id": "conv_b",
                 }
             )
-        elif params.get("after") == "conv_b":
+        if params.get("after") == "conv_b":
             # Second page - conv_b appears again due to updated_at changing
             return _FakeResponse(
                 {
