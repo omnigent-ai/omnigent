@@ -125,9 +125,9 @@ class _GenerateBuildInfo(build_py):
           ``OMNIGENT_BUILD_WEB_UI=1`` forces a rebuild. This keeps
           repeat ``uv sync`` fast for backend devs (build once, reuse)
           while letting release builds force a fresh bundle.
-        - Otherwise the build MUST succeed: a missing Node.js 22+,
-          a missing pnpm, or a failing ``pnpm install`` / ``pnpm
-          --filter web run build`` aborts the install with an
+        - Otherwise the build MUST succeed: a Node.js older than 22.12
+          (or absent), a missing pnpm, or a failing ``pnpm install`` /
+          ``pnpm --filter web run build`` aborts the install with an
           actionable error. Omnigent needs Node 22 LTS + pnpm at
           runtime anyway (the Claude / Codex / Pi harness CLIs are
           npm packages, and the web UI is a pnpm workspace), so a
@@ -142,9 +142,9 @@ class _GenerateBuildInfo(build_py):
         confirmation before downloading the pinned pnpm, which a
         non-interactive install can never answer.
 
-        :raises SystemExit: If Node.js < 22 (or absent), pnpm is not
-            on PATH (and corepack can't supply it), or the web UI
-            build fails, and no skip condition applies.
+        :raises SystemExit: If the on-PATH Node.js is older than 22.12
+            (or absent), pnpm is not on PATH (and corepack can't supply
+            it), or the web UI build fails, and no skip condition applies.
         """
         import os
         import shutil
@@ -167,12 +167,9 @@ class _GenerateBuildInfo(build_py):
         )
         if bundle.is_file() and not force:
             return
-        # Enforce the Node.js 22 LTS floor up front. The web UI's
-        # toolchain (pnpm@11, Vite 8, oxlint) and the runtime harness
-        # CLIs all require Node 22; building on an older Node fails
-        # deep inside the toolchain with an opaque error, so we fail
-        # fast here with a single actionable message instead.
-        _require_node_22()
+        # Vite 8 and oxlint support Node 22.12 and newer. Keep this a
+        # minimum so newer LTS releases remain usable.
+        node_version = _require_supported_node()
 
         # pnpm first; fall back to corepack (bundled with Node 22+),
         # which downloads the pnpm version pinned by the root
@@ -227,12 +224,12 @@ class _GenerateBuildInfo(build_py):
             )
         except (subprocess.SubprocessError, OSError) as exc:
             raise SystemExit(
-                f"omnigent build: web UI build failed ({exc}). Fix the "
-                "failure above (it usually means Node.js is older than "
-                "the required 22 LTS, pnpm is missing, or `pnpm install` "
-                "could not reach the npm registry) and rerun the install. "
-                "To deliberately install without the web UI (API-only "
-                "server), set OMNIGENT_SKIP_WEB_UI=true."
+                f"omnigent build: web UI build failed on Node.js {node_version} "
+                f"({exc}). Fix the failure above and rerun the install. If "
+                "this Node.js release is incompatible with pnpm or Vite, "
+                "install Node 22 LTS and retry. To deliberately install "
+                "without the web UI (API-only server), set "
+                "OMNIGENT_SKIP_WEB_UI=true."
             ) from exc
 
     def _write_build_info(self) -> None:
@@ -267,17 +264,15 @@ class _GenerateBuildInfo(build_py):
         )
 
 
-def _require_node_22() -> None:
-    """Abort the build unless Node.js >= 22 is on PATH.
+def _require_supported_node() -> str:
+    """Return the Node.js version or abort when it is older than 22.12.
 
-    The web UI toolchain (pnpm 11, Vite 8, oxlint) and the runtime
-    harness CLIs (Claude / Codex / Pi, all npm packages) require Node 22
-    LTS. Building on an older Node fails deep inside the toolchain with
-    an opaque error; this check fails fast with a single actionable
-    message instead.
+    Vite 8 and oxlint declare Node 22.12 as their minimum on the
+    project's supported 22+ line. Newer Node releases remain valid.
 
-    :raises SystemExit: If ``node`` is missing or reports a major
-        version below 22.
+    :returns: The normalized Node.js version string.
+    :raises SystemExit: If ``node`` is missing, ``node --version`` fails,
+        or the reported version is older than 22.12.
     """
     import shutil
 
@@ -285,13 +280,10 @@ def _require_node_22() -> None:
     if node is None:
         raise SystemExit(
             "omnigent build: Node.js not found on PATH, so the web UI "
-            "cannot be built. Omnigent requires Node.js 22 LTS or newer "
-            "(the web UI toolchain — pnpm 11 / Vite 8 / oxlint — and the "
-            "Claude / Codex / Pi harness CLIs all need it). Install it "
-            "from https://nodejs.org/en/download (the 22 LTS line or "
-            "newer) and rerun the install. To deliberately install "
-            "without the web UI (API-only server), set "
-            "OMNIGENT_SKIP_WEB_UI=true."
+            "cannot be built. Node.js 22.12 or newer is required. Install "
+            "Node 22 LTS from https://nodejs.org/en/download and retry, "
+            "or run with OMNIGENT_SKIP_WEB_UI=true to skip the web UI "
+            "build."
         )
     try:
         result = subprocess.run(
@@ -304,30 +296,30 @@ def _require_node_22() -> None:
     except (subprocess.SubprocessError, OSError) as exc:
         raise SystemExit(
             f"omnigent build: could not determine the Node.js version "
-            f"(`node --version` failed: {exc}). Omnigent requires "
-            "Node.js 22 LTS or newer. Ensure Node 22+ is installed and "
-            "on PATH, then rerun the install. To deliberately install "
-            "without the web UI (API-only server), set "
-            "OMNIGENT_SKIP_WEB_UI=true."
+            f"(`node --version` failed: {exc}). Node.js 22.12 or newer "
+            "is required. Install Node 22 LTS and retry, or run with "
+            "OMNIGENT_SKIP_WEB_UI=true to skip the web UI build."
         ) from exc
-    # ``node --version`` prints ``v22.14.0``; split off the leading ``v``
-    # and read the major. A non-numeric result is treated as too old.
+    # ``node --version`` prints ``v22.14.0``.
     version_str = result.stdout.strip().lstrip("v")
     try:
-        major = int(version_str.split(".")[0])
+        version_parts = tuple(int(part) for part in version_str.split(".")[:3])
+        if len(version_parts) != 3:
+            raise ValueError
     except ValueError:
-        major = -1
-    if major < 22:
         raise SystemExit(
-            f"omnigent build: Node.js {version_str or 'unknown'} is "
-            f"installed, but Omnigent requires Node.js 22 LTS or newer "
-            "(the web UI toolchain — pnpm 11 / Vite 8 / oxlint — and "
-            "the Claude / Codex / Pi harness CLIs all need Node 22+). "
-            "Upgrade from https://nodejs.org/en/download (pick the 22 "
-            "LTS line or newer) and rerun the install. To deliberately "
-            "install without the web UI (API-only server), set "
-            "OMNIGENT_SKIP_WEB_UI=true."
+            f"omnigent build: could not parse Node.js version "
+            f"{version_str or 'unknown'}. Node.js 22.12 or newer is "
+            "required. Install Node 22 LTS and retry, or run with "
+            "OMNIGENT_SKIP_WEB_UI=true to skip the web UI build."
+        ) from None
+    if version_parts < (22, 12, 0):
+        raise SystemExit(
+            f"omnigent build: Node.js 22.12 or newer is required but found "
+            f"Node.js {version_str}. Install Node 22 LTS and retry, or run "
+            "with OMNIGENT_SKIP_WEB_UI=true to skip the web UI build."
         )
+    return version_str
 
 
 def _git_sha() -> str:
