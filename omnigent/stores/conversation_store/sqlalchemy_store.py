@@ -1694,6 +1694,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                     stmt = pg_insert(SqlUserUsageSummary)
                 stmt = stmt.values(
                     user_id=user_id,
+                    harness_breakdown="{}",  # MySQL forbids TEXT defaults
+                    model_breakdown="{}",
+                    total_sessions=0,
                     needs_rebuild=True,
                     last_updated_at=0,
                 )
@@ -1709,6 +1712,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                     session.add(
                         SqlUserUsageSummary(
                             user_id=user_id,
+                            harness_breakdown="{}",  # MySQL forbids TEXT defaults
+                            model_breakdown="{}",
+                            total_sessions=0,
                             needs_rebuild=True,
                             last_updated_at=0,
                         )

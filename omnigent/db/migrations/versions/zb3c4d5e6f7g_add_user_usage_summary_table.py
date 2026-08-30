@@ -65,15 +65,13 @@ def upgrade() -> None:
             sa.Column("user_id", sa.String(255), primary_key=True, nullable=False),
             sa.Column(
                 "harness_breakdown",
-                sa.Text(),  # JSON stored as text for broad compatibility
+                sa.Text(),  # JSON stored as text (MySQL forbids TEXT defaults)
                 nullable=False,
-                server_default="{}",
             ),
             sa.Column(
                 "model_breakdown",
                 sa.Text(),
                 nullable=False,
-                server_default="{}",
             ),
             sa.Column(
                 "needs_rebuild",

@@ -1405,8 +1405,9 @@ class SqlUserUsageSummary(OmnigentBase):
         default=current_workspace_id,
     )
     user_id: Mapped[str] = mapped_column(String(255), primary_key=True)
-    harness_breakdown: Mapped[str] = mapped_column(Text, nullable=False, server_default="{}")
-    model_breakdown: Mapped[str] = mapped_column(Text, nullable=False, server_default="{}")
+    # MySQL forbids TEXT column defaults; application provides "{}" via UPSERT
+    harness_breakdown: Mapped[str] = mapped_column(Text, nullable=False)
+    model_breakdown: Mapped[str] = mapped_column(Text, nullable=False)
     needs_rebuild: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=true())
     total_sessions: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     last_updated_at: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
