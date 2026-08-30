@@ -1,16 +1,16 @@
 // Layout regression tests for the project-folder header's icon/chevron.
 // Desired behaviour: a project folder shows its folder icon by default and,
-// on desktop hover/focus, swaps that folder icon for a chevron *in place*
-// (rather than trailing the name). On mobile (no hover) the folder icon
+// on hover-capable desktop, swaps that folder icon for a chevron *in place*
+// (rather than trailing the name). Without hover at any width, the folder icon
 // stays put and the trailing chevron is shown instead. Plain section headers
-// with no leading icon keep the old behaviour: a trailing chevron revealed on
-// desktop hover/focus. These tests lock that structure in:
+// with no leading icon follow the same capability gate. These tests lock that
+// structure in:
 //   1. The project header renders the folder icon and an overlaid chevron in
 //      the icon slot; the folder fades out and the chevron fades in on
-//      desktop hover/focus.
-//   2. The project header's trailing chevron is mobile-only (`md:hidden`).
+//      hover-capable desktop.
+//   2. The project header's trailing chevron stays visible without hover.
 //   3. A header without a leading icon (the "Projects" group header) keeps a
-//      hover-revealed trailing chevron and does NOT swap an icon.
+//      capability-gated trailing chevron and does NOT swap an icon.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
@@ -116,7 +116,38 @@ function classOf(el: Element): string {
   return el.getAttribute("class") ?? "";
 }
 
+function stubInputScenario(
+  width: number,
+  anyCoarse: boolean,
+  canHover: boolean,
+  coarsePrimary = anyCoarse,
+  anyHover = canHover,
+) {
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    configurable: true,
+    value: (query: string) => ({
+      matches: query.split(/\s+and\s+/).every((condition) => {
+        const normalized = condition.trim();
+        if (normalized === "(pointer: coarse)") return coarsePrimary;
+        if (normalized === "(any-pointer: coarse)") return anyCoarse;
+        if (normalized === "(hover: hover)") return canHover;
+        if (normalized === "(any-hover: hover)") return anyHover;
+        const min = normalized.match(/^\(min-width: ([\d.]+)px\)$/);
+        if (min) return width >= parseFloat(min[1]);
+        const max = normalized.match(/^\(max-width: ([\d.]+)px\)$/);
+        if (max) return width <= parseFloat(max[1]);
+        return false;
+      }),
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    }),
+  });
+}
+
 beforeEach(() => {
+  stubInputScenario(1280, false, true);
   mockConversations([]);
 });
 
@@ -125,9 +156,15 @@ afterEach(() => {
 });
 
 describe("project folder header icon/chevron", () => {
-  it("shows the folder icon and overlays a chevron that swaps on desktop hover/focus", () => {
+  // These are class-contract tests: jsdom does not evaluate @media (hover:hover).
+  // The recorded sidebar-project-row-fixes.gif demo is the behavioral guardrail.
+  it("preserves the folder-to-chevron swap on a wide hover-capable device", () => {
     renderSidebar();
     const header = headerButton("My Project");
+
+    expect(window.matchMedia("(min-width: 768px)").matches).toBe(true);
+    expect(window.matchMedia("(any-pointer: coarse)").matches).toBe(false);
+    expect(window.matchMedia("(hover: hover)").matches).toBe(true);
 
     // Project folders are real rows, not muted section labels: use the shared
     // text-ui compact treatment with 8px insets/gap and foreground text.
@@ -148,37 +185,51 @@ describe("project folder header icon/chevron", () => {
     expect(folder).not.toBeNull();
     expect(folder).toHaveClass("text-muted-foreground");
 
-    // The folder icon sits in a wrapper that fades out on desktop hover/focus.
+    // Only a hover-capable desktop fades the folder out of its icon slot.
     const folderWrapper = folder.parentElement as HTMLElement;
-    expect(classOf(folderWrapper)).toMatch(/md:group-hover:opacity-0/);
-    expect(classOf(folderWrapper)).toMatch(/md:group-focus-visible:opacity-0/);
+    expect(folderWrapper).toHaveClass(
+      "[@media(hover:hover)]:md:group-hover:opacity-0",
+      "[@media(hover:hover)]:md:group-focus-visible:opacity-0",
+    );
+    expect(folderWrapper).not.toHaveClass("md:group-hover:opacity-0");
 
     // A chevron shares the icon slot (absolute), hidden by default and fading
     // in on desktop hover/focus so it takes the folder's place.
     const chevrons = Array.from(header.querySelectorAll(".lucide-chevron-right"));
     const swap = chevrons.find((c) => classOf(c).includes("absolute")) as HTMLElement;
     expect(swap).toBeTruthy();
-    expect(classOf(swap)).toMatch(/opacity-0/);
-    expect(classOf(swap)).toMatch(/md:group-hover:opacity-100/);
-    expect(classOf(swap)).toMatch(/md:group-focus-visible:opacity-100/);
+    expect(swap).toHaveClass(
+      "hidden",
+      "md:flex",
+      "opacity-0",
+      "[@media(hover:hover)]:md:group-hover:opacity-100",
+      "[@media(hover:hover)]:md:group-focus-visible:opacity-100",
+    );
+    expect(swap).not.toHaveClass("md:group-hover:opacity-100");
 
     // The swap chevron lives in the same icon slot as the folder (not trailing
     // the title), so it overlays the folder position.
     expect(swap.parentElement).toBe(folderWrapper.parentElement);
   });
 
-  it("keeps the project header's trailing chevron mobile-only", () => {
+  it.each([
+    ["narrow", 390],
+    ["wide", 1024],
+  ])("keeps the trailing caret visible on a %s coarse-pointer device", (_label, width) => {
+    stubInputScenario(width, true, false);
     renderSidebar();
     const header = headerButton("My Project");
 
+    expect(window.matchMedia("(any-pointer: coarse)").matches).toBe(true);
+    expect(window.matchMedia("(hover: hover)").matches).toBe(false);
+    expect(window.matchMedia("(pointer: coarse) and (hover: hover)").matches).toBe(false);
+    expect(window.matchMedia("(min-width: 768px)").matches).toBe(width >= 768);
+
     const chevrons = Array.from(header.querySelectorAll(".lucide-chevron-right"));
-    // Two chevrons: the in-slot swap (absolute) and the trailing one.
     const trailing = chevrons.find((c) => !classOf(c).includes("absolute")) as HTMLElement;
     expect(trailing).toBeTruthy();
-    // Trailing chevron is hidden on desktop (the swap replaces it there) and
-    // shown on mobile where there's no hover.
-    expect(classOf(trailing)).toMatch(/md:hidden/);
-    expect(classOf(trailing)).not.toMatch(/md:group-hover:opacity-100/);
+    expect(trailing).toHaveClass("[@media(hover:hover)]:md:hidden");
+    expect(trailing).not.toHaveClass("md:hidden");
   });
 
   it("highlights the project row instead of global New session for a project-scoped composer", () => {
@@ -240,7 +291,8 @@ describe("project folder header icon/chevron", () => {
     expect(action.querySelector("svg")).toBeNull();
   });
 
-  it("leaves iconless section headers with a hover-revealed trailing chevron and no swap", () => {
+  it("keeps an iconless header caret visible on a wide coarse-pointer device", () => {
+    stubInputScenario(1024, true, false);
     renderSidebar();
     // The "Projects" group header carries no leading icon.
     const header = headerButton("Projects");
@@ -252,12 +304,16 @@ describe("project folder header icon/chevron", () => {
     expect(header.querySelector(".lucide-folder")).toBeNull();
 
     const chevrons = Array.from(header.querySelectorAll(".lucide-chevron-right"));
-    // Exactly one chevron (no in-slot swap), and it is the classic
-    // desktop-hover-revealed trailing caret — not mobile-only.
+    // Exactly one chevron (no in-slot swap), with its desktop fade gated on
+    // hover capability so a wide touch device keeps the caret visible.
     expect(chevrons).toHaveLength(1);
     const [chevron] = chevrons;
     expect(classOf(chevron)).not.toMatch(/\babsolute\b/);
-    expect(classOf(chevron)).not.toMatch(/md:hidden/);
-    expect(classOf(chevron)).toMatch(/md:group-hover:opacity-100/);
+    expect(chevron).toHaveClass(
+      "[@media(hover:hover)]:md:opacity-0",
+      "[@media(hover:hover)]:md:group-hover:opacity-100",
+      "[@media(hover:hover)]:md:group-focus-visible:opacity-100",
+    );
+    expect(chevron).not.toHaveClass("md:opacity-0");
   });
 });

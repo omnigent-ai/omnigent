@@ -284,6 +284,13 @@ describe("SettingsPage", () => {
     expect(mocks.setTheme).toHaveBeenCalledWith("dark");
   });
 
+  it("shows matching arrows for the two swipe directions", () => {
+    renderPage("/settings/appearance");
+
+    expect(screen.getByText(/Swipe left/).textContent).toBe("Swipe left ←");
+    expect(screen.getByText(/Swipe right/).textContent).toBe("Swipe right →");
+  });
+
   it("renders the Terminal theme radiogroup with auto selected by default", () => {
     renderPage("/settings/appearance");
     expect(screen.getByRole("radiogroup", { name: "Terminal theme" })).toBeInTheDocument();

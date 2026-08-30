@@ -1,6 +1,8 @@
 import "@testing-library/jest-dom/vitest";
 import { vi } from "vitest";
 
+import { MD_MIN_WIDTH_QUERY } from "@/lib/breakpoints";
+
 // The @lobehub icon packages have broken nested-module resolution
 // under vitest; stub presentational glyphs so component modules that
 // import them can still load in tests. (The Antigravity glyph additionally
@@ -81,7 +83,9 @@ if (typeof globalThis.ResizeObserver === "undefined") {
 Object.defineProperty(window, "matchMedia", {
   writable: true,
   value: (query: string) => ({
-    matches: false,
+    // Preserve the pre-min-width desktop default without changing capability,
+    // color-scheme, or reduced-motion queries.
+    matches: query === MD_MIN_WIDTH_QUERY,
     media: query,
     onchange: null,
     addListener: () => {},

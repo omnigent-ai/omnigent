@@ -18,7 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 
 const runnerHealthState = vi.hoisted(() => ({
@@ -497,7 +497,33 @@ function withWindowOrigin(origin: string, run: () => void) {
   }
 }
 
+// Evaluate min-/max-width media queries against a simulated viewport width,
+// so each test runs at an explicit real-browser width instead of inheriting
+// the global test-setup mock (which answers false to every query).
+function stubViewportWidth(width: number) {
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    configurable: true,
+    value: (query: string) => ({
+      matches: (() => {
+        const min = query.match(/^\(min-width: ([\d.]+)px\)$/);
+        if (min) return width >= parseFloat(min[1]);
+        const max = query.match(/^\(max-width: ([\d.]+)px\)$/);
+        if (max) return width <= parseFloat(max[1]);
+        return false;
+      })(),
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    }),
+  });
+}
+
 beforeEach(() => {
+  // Default to a mobile width: these suites were written against a sidebar
+  // that starts closed. Tests that need desktop semantics (hover peek)
+  // re-pin a desktop width themselves.
+  stubViewportWidth(375);
   runnerHealthState.runnerOnline = undefined;
   useConvMock.mockReset();
   useTerminalsMock.mockReset();
@@ -551,7 +577,10 @@ beforeEach(() => {
   });
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 describe("AppShell header", () => {
   it("renders the sidebar toggle on all pages", () => {
@@ -1830,8 +1859,13 @@ describe("Workspace rail maximize", () => {
     // armed from INSIDE it. Armed from the title-bar trigger (outside), a pointer
     // that never crosses the card leaves it with no pointerenter and therefore no
     // pointerleave, so the card used to sit open indefinitely.
+    // Hover peek is a desktop affordance; at a desktop width the sidebar
+    // starts open, so collapse it first to expose the peek trigger.
+    stubViewportWidth(1280);
     mockConversations([{ id: "conv_abc", permission_level: null }]);
     renderShell("/c/conv_abc");
+    fireEvent.keyDown(document, { code: "BracketLeft", metaKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
 
     fireEvent.pointerEnter(screen.getByRole("button", { name: /open sidebar/i }));
     await waitFor(() => expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "true"));
@@ -1846,8 +1880,13 @@ describe("Workspace rail maximize", () => {
   it("keeps peeking while the pointer is over the card itself", async () => {
     // The other half: dismissal must not be so eager that moving onto the card —
     // the entire point of peeking — closes it.
+    // Same desktop setup as above: collapse the open-by-default sidebar to
+    // expose the peek trigger.
+    stubViewportWidth(1280);
     mockConversations([{ id: "conv_abc", permission_level: null }]);
     renderShell("/c/conv_abc");
+    fireEvent.keyDown(document, { code: "BracketLeft", metaKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
 
     fireEvent.pointerEnter(screen.getByRole("button", { name: /open sidebar/i }));
     await waitFor(() => expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "true"));
@@ -2491,6 +2530,68 @@ describe("FilesPanel visibility", () => {
 });
 
 describe("Right workspace card visibility", () => {
+  it("aborts an active resize when the workspace panel closes", () => {
+    stubViewportWidth(1440);
+    vi.stubGlobal("innerWidth", 1440);
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_drag_close", permission_level: null }]);
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_drag_close",
+        agentId: "ag_owner",
+        agentName: "developer",
+        runnerId: null,
+        status: "idle",
+        createdAt: 0,
+        title: null,
+        labels: {},
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: 4,
+        parentSessionId: null,
+        subAgentName: null,
+        kind: "default",
+      },
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_drag_close");
+
+    const separator = screen.getByRole("separator", { name: "Resize panel" });
+    Object.assign(separator, {
+      setPointerCapture: vi.fn(),
+      hasPointerCapture: () => true,
+      releasePointerCapture: vi.fn(),
+    });
+
+    fireEvent.pointerDown(separator, { pointerId: 9, pointerType: "touch", button: 0 });
+    fireEvent.pointerMove(separator, { pointerId: 9, pointerType: "touch", clientX: 1200 });
+
+    expect(document.body.style.cursor).toBe("col-resize");
+    expect(document.body.style.userSelect).toBe("none");
+    expect(
+      [...document.body.children].some(
+        (child) => child instanceof HTMLElement && child.style.zIndex === "2147483647",
+      ),
+    ).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+
+    expect(screen.queryByRole("separator", { name: "Resize panel" })).toBeNull();
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+    expect(
+      [...document.body.children].some(
+        (child) => child instanceof HTMLElement && child.style.zIndex === "2147483647",
+      ),
+    ).toBe(false);
+    expect(readSessionWorkspaceState("conv_drag_close").widthPx).toBeUndefined();
+  });
+
   it("reserves the visible pane width plus its two desktop margins from the header", () => {
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null, home: null },
@@ -3712,13 +3813,9 @@ describe("AppShell share action", () => {
 });
 
 describe("Mobile header actions menu", () => {
-  // On mobile (`< md`) the Share / Clone / Agent-info buttons collapse
-  // into a single three-dot "Session actions" menu, gated by the same
-  // permission booleans as the desktop buttons. jsdom doesn't apply the
-  // responsive CSS, so both the desktop buttons and the mobile trigger are in
-  // the DOM here — we assert on the menu's testid'd trigger and its menuitems
-  // (which carry distinct `mobile-*` testids so they never collide with the
-  // desktop buttons' `*-header` testids).
+  // On mobile (`< md`) header actions live in a three-dot menu. Top-level
+  // owner actions share the breadcrumb's conversation menu; sessions without
+  // that row use the standalone "Session actions" trigger.
 
   /** An agent with one MCP server and one policy → agent-info affordance shown. */
   const agentWithInfo: Agent = {
@@ -3731,7 +3828,9 @@ describe("Mobile header actions menu", () => {
 
   /** Open the three-dot menu (Radix opens on pointerdown, not click). */
   function openActionsMenu() {
-    const trigger = screen.getByTestId("session-actions-menu");
+    const trigger =
+      screen.queryByTestId("session-actions-menu") ??
+      screen.getByTestId("header-conversation-actions");
     fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
     return trigger;
   }

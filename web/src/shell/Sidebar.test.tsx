@@ -218,10 +218,13 @@ function renderSidebar(
   open = true,
   initialEntry = "/",
   onOpenSearch?: () => void,
-  info?: ServerInfo,
+  infoOrPeek?: ServerInfo | boolean,
+  explicitPeek = false,
 ) {
+  const info = typeof infoOrPeek === "boolean" ? undefined : infoOrPeek;
+  const peek = typeof infoOrPeek === "boolean" ? infoOrPeek : explicitPeek;
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const sidebar = <Sidebar open={open} onClose={vi.fn()} onOpenSearch={onOpenSearch} />;
+  const sidebar = <Sidebar open={open} peek={peek} onClose={vi.fn()} onOpenSearch={onOpenSearch} />;
   return render(
     <QueryClientProvider client={qc}>
       <TooltipProvider>
@@ -263,7 +266,44 @@ function closeProjectsMenu() {
   fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
 }
 
+// Evaluate min-/max-width media queries against a simulated viewport width,
+// so each test runs at an explicit real-browser width instead of inheriting
+// the global test-setup mock (which answers false to every query).
+function stubViewportWidth(
+  width: number,
+  anyCoarse = false,
+  coarsePrimary = anyCoarse,
+  canHover = false,
+  anyHover = canHover,
+) {
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    configurable: true,
+    value: (query: string) => ({
+      matches: query.split(/\s+and\s+/).every((condition) => {
+        const normalized = condition.trim();
+        if (normalized === "(pointer: coarse)") return coarsePrimary;
+        if (normalized === "(any-pointer: coarse)") return anyCoarse;
+        if (normalized === "(hover: hover)") return canHover;
+        if (normalized === "(any-hover: hover)") return anyHover;
+        const min = normalized.match(/^\(min-width: ([\d.]+)px\)$/);
+        if (min) return width >= parseFloat(min[1]);
+        const max = normalized.match(/^\(max-width: ([\d.]+)px\)$/);
+        if (max) return width <= parseFloat(max[1]);
+        return false;
+      }),
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    }),
+  });
+}
+
 beforeEach(() => {
+  // Default to a desktop width: these suites assert hover affordances
+  // (session tooltips, project flyouts) that are gated off on mobile. Tests
+  // that need a mobile width re-pin it themselves.
+  stubViewportWidth(1280);
   useConvMock.mockReset();
   useHostsMock.mockReset();
   useHostsMock.mockReturnValue({ data: [] });
@@ -288,6 +328,87 @@ function seedPins(ids: string[]) {
   pinnedIdsRef.current = ids;
 }
 afterEach(cleanup);
+
+describe("Sidebar resize handle geometry", () => {
+  it("positions the seam handle outside flex layout and the clipped content", () => {
+    mockConversations([]);
+    renderSidebar();
+
+    const sidebar = screen.getByLabelText("Conversations");
+    const handle = screen.getByTestId("sidebar-resize-handle");
+    const clippedContent = screen.getByTestId("sidebar-clipped-content");
+
+    expect(handle.parentElement).toBe(sidebar);
+    expect(clippedContent.parentElement).toBe(sidebar);
+    expect(sidebar).toHaveClass("md:flex-row");
+    expect(sidebar).not.toHaveClass("md:overflow-hidden");
+    expect(clippedContent).toHaveClass("md:overflow-hidden");
+    expect(handle).toHaveClass("md:absolute", "md:inset-y-0");
+    expect(handle).not.toHaveClass("shrink-0", "md:order-2");
+    expect(clippedContent).not.toHaveClass("md:order-1");
+  });
+
+  it("anchors the hit box at the seam without reserving flex space", () => {
+    mockConversations([conv("edge-session", "Claude Code")]);
+    renderSidebar();
+
+    // Effective offsets, not class names: the border box's right edge sits at
+    // seam + |insetInlineEnd|, so the hit box spans
+    // [seam − inward reach, seam + outward reach] with the 4px painted strip
+    // flush at the seam (outward reach − end padding = 0). Margins must stay
+    // absent — on an absolutely positioned right-anchored box a negative
+    // marginInlineStart is absorbed by the auto left inset and shifts the
+    // whole box inward over the rows' hover kebab.
+    const handle = screen.getByTestId("sidebar-resize-handle");
+    expect(handle.style.paddingInlineStart).toBe("5px");
+    expect(handle.style.paddingInlineEnd).toBe("11px");
+    expect(handle.style.insetInlineEnd).toBe("-11px");
+    expect(handle.style.marginInlineStart).toBe("");
+    expect(handle.style.marginInlineEnd).toBe("");
+    const outwardReach = -Number.parseFloat(handle.style.insetInlineEnd);
+    const boxWidth =
+      Number.parseFloat(handle.style.paddingInlineStart) +
+      4 +
+      Number.parseFloat(handle.style.paddingInlineEnd);
+    expect(outwardReach).toBeLessThanOrEqual(11);
+    expect(boxWidth - outwardReach).toBeLessThanOrEqual(9); // inward reach clears the kebab
+    expect(outwardReach - Number.parseFloat(handle.style.paddingInlineEnd)).toBe(0);
+    expect(handle).toHaveClass("md:absolute");
+    expect(handle).not.toHaveClass("md:right-0");
+    expect(screen.getByText("edge-session")).not.toBe(handle);
+  });
+
+  it("keeps the painted separator strip unchanged", () => {
+    mockConversations([]);
+    renderSidebar();
+
+    const handle = screen.getByTestId("sidebar-resize-handle");
+    expect(handle).toHaveClass(
+      "z-10",
+      "hidden",
+      "w-1",
+      "cursor-col-resize",
+      "transition-colors",
+      "hover:bg-primary/30",
+      "active:bg-primary/50",
+      "md:absolute",
+      "md:inset-y-0",
+      "md:block",
+    );
+    expect(handle).not.toHaveClass("absolute", "inset-y-0", "right-0");
+    expect(handle.style.width).toBe("");
+    expect(handle.style.backgroundClip).toBe("content-box");
+  });
+
+  it("restores desktop overflow clipping for the rounded peek card", () => {
+    mockConversations([]);
+    renderSidebar(false, "/", undefined, true);
+
+    const sidebar = screen.getByLabelText("Conversations");
+    expect(sidebar).toHaveClass("is-peek", "rounded-xl", "md:overflow-hidden");
+    expect(screen.queryByTestId("sidebar-resize-handle")).toBeNull();
+  });
+});
 
 describe("Sidebar session list", () => {
   it("uses the interface text token for the empty session-list state", () => {
@@ -398,6 +519,22 @@ describe("Sidebar session list", () => {
 
     const slot = screen.getByTestId("session-state-badge").parentElement!;
     expect(slot).toHaveClass("right-1", "w-6", "justify-center");
+  });
+
+  it("shifts a row's dot marker clear of the persistent touch-tablet controls", () => {
+    // On a hover-incapable md+ device the pin + kebab stay visible (there is
+    // no hover to reveal them), so the badge can't share their right-1 anchor:
+    // it moves left of the control column (right-14) instead of being
+    // hover-faded away, and the row reserves width for both persistently.
+    mockConversations([
+      conv("conv_running", "Claude Code", { title: "Running row", status: "running" }),
+    ]);
+    renderSidebar();
+
+    const slot = screen.getByTestId("session-state-badge").parentElement!;
+    expect(slot).toHaveClass("[@media(hover:none)]:md:right-14");
+    const row = screen.getByRole("link", { name: /Running row/ });
+    expect(row.className).toContain("[@media(hover:none)]:md:pr-21");
   });
 
   it("does not constrain a row's awaiting pill to the dot slot", () => {
@@ -1469,9 +1606,10 @@ describe("Sidebar project sections", () => {
   });
 
   it("closes the mobile overlay when the project pencil is tapped", () => {
-    // jsdom's matchMedia mock reports non-desktop, so isMobileViewport() is
-    // true: a plain pencil tap must close the full-screen sidebar overlay,
-    // otherwise the pre-filed new-session page is left hidden behind it.
+    // At a phone width isMobileViewport() is true: a plain pencil tap must
+    // close the full-screen sidebar overlay, otherwise the pre-filed
+    // new-session page is left hidden behind it.
+    stubViewportWidth(375);
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
@@ -1818,8 +1956,74 @@ describe("Sidebar collapsed project marker", () => {
     expect(slot).toHaveClass("w-6", "justify-center");
     // Folder headers use px-2, so on desktop the slot trims the trailing
     // padding to the rows' right-1 (4px) edge. (The header also carries a
-    // kebab, so the mobile reserve is mr-14 and the -mr-1 is md-gated.)
+    // kebab, so the mobile reserve is mr-8 and the -mr-1 is md-gated.)
     expect(slot).toHaveClass("md:-mr-1");
+  });
+
+  it("reserves one action slot for the marker on a narrow coarse-pointer device", () => {
+    stubViewportWidth(390, true);
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_running", "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        status: "running",
+      }),
+    ]);
+    renderSidebar();
+
+    expect(window.matchMedia("(any-pointer: coarse)").matches).toBe(true);
+    const slot = screen.getByTestId("session-state-badge").parentElement!;
+    expect(slot).toHaveClass("w-6", "mr-8", "md:-mr-1");
+    expect(slot).not.toHaveClass("mr-14");
+  });
+
+  it("keeps the marker at its rest offset on a wide coarse-pointer device without hover", () => {
+    stubViewportWidth(810, true);
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_running", "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        status: "running",
+      }),
+    ]);
+    renderSidebar();
+
+    expect(window.matchMedia("(min-width: 768px)").matches).toBe(true);
+    expect(window.matchMedia("(any-pointer: coarse)").matches).toBe(true);
+    expect(window.matchMedia("(hover: hover)").matches).toBe(false);
+    expect(window.matchMedia("(pointer: coarse) and (hover: hover)").matches).toBe(false);
+    const slot = screen.getByTestId("session-state-badge").parentElement!;
+    expect(slot).toHaveClass("w-6", "mr-8", "md:-mr-1");
+    expect(slot).not.toHaveClass("mr-14");
+  });
+
+  it("keeps the marker hidden while an open project menu is outside the header", async () => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_running", "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        status: "running",
+      }),
+    ]);
+    renderSidebar();
+
+    const header = screen.getByRole("button", { name: /^Customer X/ });
+    const trigger = screen.getByRole("button", { name: "Project actions for Customer X" });
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+    await screen.findByTestId("rename-project");
+
+    fireEvent.pointerLeave(header.closest("section")!);
+    fireEvent.blur(trigger);
+    expect(trigger).toHaveAttribute("data-state", "open");
+    const slot = screen.getByTestId("session-state-badge").parentElement!;
+    const markerGroup = slot.closest<HTMLElement>('[class~="group/header"]');
+    const triggerGroup = trigger.closest<HTMLElement>('[class~="group/header"]');
+    expect(markerGroup).not.toBeNull();
+    expect(triggerGroup).toBe(markerGroup);
+    expect(markerGroup).toHaveClass("group/header");
+    expect(markerGroup).toContainElement(trigger);
+    expect(markerGroup).toContainElement(slot);
+    expect(slot).toHaveClass("md:group-has-[[data-state=open]]/header:opacity-0");
   });
 
   // The "awaiting" pill is wider than the dot markers; constraining it to the
@@ -1927,9 +2131,9 @@ describe("Sidebar pin marker visibility", () => {
 
     const pinned = screen.getByText("Pinned").closest("section")!;
     const pinButton = within(pinned).getByTestId("quick-pin-conversation");
-    // Hover-gated like every other row (no persistent opacity-100 marker), and
-    // the control unpins.
-    expect(pinButton.className).toContain("md:opacity-0");
+    // Hover-gated like every other row (no persistent opacity-100 marker) —
+    // only where hover exists — and the control unpins.
+    expect(pinButton.className).toContain("[@media(hover:hover)]:md:opacity-0");
     expect(pinButton).toHaveAttribute("aria-label", "Unpin conversation");
   });
 
@@ -1938,8 +2142,9 @@ describe("Sidebar pin marker visibility", () => {
     renderSidebar();
 
     const pinButton = screen.getByTestId("quick-pin-conversation");
-    // Unpinned: hover-gated reveal (opacity-0 until group-hover).
-    expect(pinButton.className).toContain("md:opacity-0");
+    // Unpinned: hover-gated reveal (opacity-0 until group-hover), gated on
+    // hover capability so touch tablets keep the control visible.
+    expect(pinButton.className).toContain("[@media(hover:hover)]:md:opacity-0");
   });
 });
 
