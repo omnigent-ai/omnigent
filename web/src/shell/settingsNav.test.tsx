@@ -75,6 +75,14 @@ describe("settingsNavGroups", () => {
     });
   });
 
+  it("includes Providers in the General settings navigation", () => {
+    const general = settingsNavGroups(false, false).find((group) => group.title === "General");
+
+    expect(general?.items).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: "providers", label: "Providers" })]),
+    );
+  });
+
   it("flags Keyboard shortcuts as hidden on mobile, but not the other items", () => {
     const items = settingsNavGroups(false, false).flatMap((g) => g.items);
     const shortcuts = items.find((i) => i.id === "shortcuts");
@@ -312,6 +320,13 @@ describe("useSettingsRoute", () => {
     );
     return renderHook(() => useSettingsRoute(), { wrapper: w }).result.current;
   }
+
+  it("resolves /settings/providers as the Providers section", () => {
+    expect(routeHook("/settings/providers")).toEqual({
+      inSettings: true,
+      section: "providers",
+    });
+  });
 
   it("treats /settings/members and /settings/policies as in-settings sections on an accounts deploy", () => {
     // The core of the fix: Members / Policies now live UNDER /settings, so the

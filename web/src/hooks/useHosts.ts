@@ -291,6 +291,9 @@ export interface DetectedCredential {
 
 export type ProviderCapabilitySupport = "supported" | "unsupported" | "unknown";
 
+export type ProviderConnectionState =
+  "connected" | "authentication_required" | "misconfigured" | "unavailable" | "unknown";
+
 export interface ProviderCapabilities {
   model_discovery: ProviderCapabilitySupport;
   usage_status: ProviderCapabilitySupport;
@@ -315,6 +318,10 @@ export interface ProviderInventoryEntry {
   profile: string | null;
   model_provider: string | null;
   capabilities: ProviderCapabilities;
+  /** Conservative status derived from silent, provider-specific local evidence. */
+  connection_state: ProviderConnectionState;
+  /** Non-secret explanation; never implies a live vendor check occurred. */
+  connection_detail: string;
 }
 
 /** Fetch provider configuration on demand; no background CLI polling. */

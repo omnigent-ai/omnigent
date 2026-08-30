@@ -14,6 +14,9 @@
  *   default transcript view, Workspace panel default, and UI/code font controls.
  * - **Git** — Git behavior: the global "always use a random worktree" default
  *   and the default base branch pre-filled when naming a new worktree branch.
+ * - **Providers** — the model providers configured on or safely detected for
+ *   the selected host, with conservative local connection evidence and a
+ *   Manage affordance that reuses the harness setup checklist for CLI rows.
  * - **Keyboard shortcuts** — the full shortcuts reference, shown inline.
  * - **Account** — only when the accounts auth provider is active. Absorbs
  *   the old sidebar AccountMenu: signed-in identity, change password, and
@@ -114,6 +117,7 @@ import { absoluteTime } from "@/lib/relativeTime";
 import { useNavigate } from "@/lib/routing";
 import { useSettingsRoute } from "@/shell/settingsNav";
 import { ImportSessionsPanel } from "@/shell/ImportSessionsPanel";
+import { ProvidersSection } from "@/pages/ProvidersSection";
 import { isThemeMode, normalizeThemeMode, type ThemeMode } from "@/components/theme/themeMode";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import {
@@ -304,6 +308,7 @@ export function SettingsPage() {
       {section === "appearance" && <AppearanceSection />}
       {section === "general" && <GeneralSection />}
       {section === "git" && <GitSection />}
+      {section === "providers" && <ProvidersSection />}
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "import" && <ImportSection />}
       {section === "account" && hasAuthSession && <AccountSection />}

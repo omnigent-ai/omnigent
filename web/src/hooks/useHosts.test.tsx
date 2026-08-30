@@ -528,6 +528,8 @@ describe("useProviderInventory", () => {
         multiple_profiles: "unsupported",
         interactive_cli: "supported",
       },
+      connection_state: "connected",
+      connection_detail: "A usable claude credential is configured locally.",
     };
     fetchMock.mockResolvedValueOnce(mockResponse({ providers: [provider] }));
 
