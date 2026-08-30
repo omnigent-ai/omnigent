@@ -129,6 +129,7 @@ from omnigent.server.routes._sessions.helpers import (
     _background_task_delivery_status,
     _build_actor,
     _build_skill_slash_command_policy_body,
+    _collect_descendant_conversation_ids,
     _dispatch_skill_slash_command_to_runner,
     _evaluate_output_policy,
     _forward_session_change_to_runner,
@@ -224,6 +225,85 @@ _retry_recovery_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
 _retry_recovery_tasks: dict[str, asyncio.Task[dict[str, bool | str]]] = {}
+
+
+async def _forward_interrupt(
+    session_id: str,
+    runner_router: RunnerRouter | None,
+) -> bool:
+    """Forward one interrupt and publish it only after confirmed delivery.
+
+    :param session_id: Session receiving the interrupt.
+    :param runner_router: Router used to resolve the session's runner.
+    :returns: Whether a runner accepted the interrupt.
+    """
+    _interrupt_fenced_sessions.add(session_id)
+    runner_client = await _get_runner_client(session_id, runner_router)
+    interrupt_delivered = False
+    if runner_client is not None:
+        try:
+            interrupt_resp = await runner_client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={"type": "interrupt"},
+                timeout=5.0,
+            )
+            interrupt_delivered = interrupt_resp.status_code < 400
+        except (httpx.HTTPError, ConnectionError):
+            # WSTunnelTransport raises bare ConnectionError on tunnel close.
+            _logger.exception(
+                "Interrupt forward failed for %r",
+                session_id,
+            )
+    if not interrupt_delivered:
+        # The turn keeps running and nothing else lifts the fence — remove it
+        # so the turn's remaining output isn't dropped.
+        _interrupt_fenced_sessions.discard(session_id)
+    else:
+        _publish_interrupted(session_id)
+    return interrupt_delivered
+
+
+async def _interrupt_descendants(
+    session_id: str,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+) -> None:
+    """Best-effort interrupt every sub-agent below a session.
+
+    The parent interrupt is attempted before this function runs, which normally
+    prevents new children while the descendant snapshot is collected. If that
+    attempt failed, existing descendants are still interrupted best-effort.
+
+    :param session_id: Root session whose descendants should stop.
+    :param conversation_store: Store used to walk the sub-agent tree.
+    :param runner_router: Router used to resolve each descendant runner.
+    """
+    try:
+        descendant_ids = await _collect_descendant_conversation_ids(
+            conversation_store,
+            session_id,
+        )
+    except Exception:
+        _logger.exception(
+            "Could not enumerate sub-agent descendants while interrupting %r",
+            session_id,
+        )
+        return
+
+    async def _best_effort_interrupt(descendant_id: str) -> None:
+        try:
+            await _forward_interrupt(descendant_id, runner_router)
+        except Exception:
+            _interrupt_fenced_sessions.discard(descendant_id)
+            _logger.exception(
+                "Could not interrupt sub-agent descendant %r of %r",
+                descendant_id,
+                session_id,
+            )
+
+    await asyncio.gather(
+        *(_best_effort_interrupt(descendant_id) for descendant_id in descendant_ids)
+    )
 
 
 def _retry_recovery_lock(session_id: str) -> asyncio.Lock:
@@ -852,36 +932,17 @@ def register_events_routes(
             return wake_conv, _client
 
         if body.type == _INTERRUPT_TYPE:
-            # Fence the cancelled turn (see _interrupt_fenced_sessions).
-            _interrupt_fenced_sessions.add(session_id)
-            runner_client = await _get_runner_client(
+            interrupt_delivered = await _forward_interrupt(session_id, runner_router)
+            await _interrupt_descendants(
                 session_id,
+                conversation_store,
                 runner_router,
             )
-            interrupt_delivered = False
-            if runner_client is not None:
-                try:
-                    interrupt_resp = await runner_client.post(
-                        f"/v1/sessions/{session_id}/events",
-                        json={"type": "interrupt"},
-                        timeout=5.0,
-                    )
-                    interrupt_delivered = interrupt_resp.status_code < 400
-                except (httpx.HTTPError, ConnectionError):
-                    # WSTunnelTransport raises bare ConnectionError on tunnel close.
-                    _logger.exception(
-                        "Interrupt forward failed for %r",
-                        session_id,
-                    )
             if not interrupt_delivered:
-                # The turn keeps running and nothing else lifts the fence —
-                # remove it so the turn's remaining output isn't dropped.
-                _interrupt_fenced_sessions.discard(session_id)
                 raise OmnigentError(
                     f"Could not interrupt session {session_id!r}: no runner confirmed delivery.",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
-            _publish_interrupted(session_id)
             return {"queued": False}
         if body.type == _STOP_SESSION_TYPE:
             # Terminating the whole session (not just the current turn)

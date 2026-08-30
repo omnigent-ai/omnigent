@@ -4756,6 +4756,93 @@ async def test_post_interrupt_without_data_field_is_accepted(
     assert interrupted == []
 
 
+async def test_post_interrupt_reaches_nested_and_concurrently_spawned_subagents(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stopping a parent interrupts its complete sub-agent tree.
+
+    The runner creates one last child while accepting the parent's interrupt,
+    exercising the spawn-vs-cancel race. Descendant discovery must happen after
+    the parent receives cancellation so that child is included alongside an
+    already-running child and grandchild.
+    """
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions, routes_events
+
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.create_conversation(
+        kind="sub_agent",
+        title="child",
+        parent_conversation_id=parent["id"],
+        agent_id=agent["id"],
+    )
+    grandchild = store.create_conversation(
+        kind="sub_agent",
+        title="grandchild",
+        parent_conversation_id=child.id,
+        agent_id=agent["id"],
+    )
+    forwarded: list[tuple[str, dict[str, Any]]] = []
+    late_child_id: str | None = None
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        nonlocal late_child_id
+        target_id = request.url.path.split("/")[3]
+        forwarded.append((target_id, json.loads(request.content)))
+        if target_id == parent["id"] and late_child_id is None:
+            late_child_id = store.create_conversation(
+                kind="sub_agent",
+                title="late-child",
+                parent_conversation_id=parent["id"],
+                agent_id=agent["id"],
+            ).id
+        return httpx.Response(202)
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+
+    async def _fake_get_runner_client(
+        session_id: str,
+        runner_router: object,
+    ) -> httpx.AsyncClient | None:
+        del runner_router
+        # One unavailable direct child must not shield its running child or
+        # sibling from the subtree interrupt.
+        return None if session_id == child.id else fake_runner
+
+    published: list[str] = []
+    monkeypatch.setattr(routes_events, "_get_runner_client", _fake_get_runner_client)
+    monkeypatch.setattr(
+        routes_events,
+        "_publish_interrupted",
+        lambda session_id, response_id=None: published.append(session_id),
+    )
+    try:
+        response = await client.post(
+            f"/v1/sessions/{parent['id']}/events",
+            json={"type": "interrupt", "data": {}},
+        )
+        assert response.status_code == 202, response.text
+        assert late_child_id is not None
+        expected_ids = {parent["id"], child.id, grandchild.id, late_child_id}
+        delivered_ids = expected_ids - {child.id}
+        assert {session_id for session_id, _body in forwarded} == delivered_ids
+        assert set(published) == delivered_ids
+        assert all(body == {"type": "interrupt"} for _session_id, body in forwarded)
+        assert delivered_ids <= _interrupt_fenced_sessions
+        assert child.id not in _interrupt_fenced_sessions
+    finally:
+        _interrupt_fenced_sessions.difference_update(
+            {parent["id"], child.id, grandchild.id, late_child_id}
+        )
+        await fake_runner.aclose()
+
+
 async def test_post_external_output_text_delta_carries_streaming_identifiers(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
