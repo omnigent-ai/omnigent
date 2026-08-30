@@ -1,4 +1,4 @@
-"""E2E: Settings → Chat "Always steer" dispatches busy follow-ups now."""
+"""E2E: Settings → General "Always steer" dispatches busy follow-ups now."""
 
 from __future__ import annotations
 
@@ -29,15 +29,16 @@ def _wait_for(page: Page, predicate: Callable[[], bool], *, timeout_s: float = 3
     raise AssertionError(f"condition not met within {timeout_s:.0f}s")
 
 
-def _open_chat_settings(page: Page, base_url: str, *, from_chat: bool = False) -> Locator:
+def _open_general_settings(page: Page, base_url: str, *, from_chat: bool = False) -> Locator:
     if from_chat:
         page.get_by_test_id("settings-button").click()
     else:
         page.goto(f"{base_url}/settings/appearance")
-    chat_link = page.get_by_test_id("settings-nav-chat")
-    expect(chat_link).to_be_visible(timeout=30_000)
-    chat_link.click()
-    expect(page).to_have_url(re.compile(r"/settings/chat$"))
+    general_link = page.get_by_test_id("settings-nav-general")
+    expect(general_link).to_be_visible(timeout=30_000)
+    general_link.click()
+    expect(page).to_have_url(re.compile(r"/settings/general$"))
+    expect(page.get_by_role("heading", name="Composer", exact=True)).to_be_visible()
     toggle = page.get_by_test_id("always-steer-toggle")
     expect(toggle).to_be_visible()
     return toggle
@@ -99,7 +100,7 @@ def test_always_steer_persists_and_posts_a_busy_followup(
     """A reloaded opt-in sends through the real server while the turn is gated."""
     base_url, session_id, mock_url = paused_mid_turn_session
 
-    toggle = _open_chat_settings(page, base_url)
+    toggle = _open_general_settings(page, base_url)
     expect(toggle).to_have_attribute("aria-checked", "false")
     assert page.evaluate(f"localStorage.getItem('{_STORAGE_KEY}')") is None
 
@@ -131,7 +132,7 @@ def test_always_steer_persists_and_posts_a_busy_followup(
 
     page.reload()
     expect(page.get_by_text(_DIRECT_FOLLOWUP, exact=True)).to_be_visible(timeout=30_000)
-    toggle = _open_chat_settings(page, base_url, from_chat=True)
+    toggle = _open_general_settings(page, base_url, from_chat=True)
     expect(toggle).to_have_attribute("aria-checked", "true")
 
 
@@ -154,7 +155,7 @@ def test_existing_queue_still_drains_in_order_after_enabling_always_steer(
     expect(queue).to_contain_text(_EARLIER_QUEUED)
     assert posts == [_INITIAL_ORDERING]
 
-    toggle = _open_chat_settings(page, base_url, from_chat=True)
+    toggle = _open_general_settings(page, base_url, from_chat=True)
     expect(toggle).to_have_attribute("aria-checked", "false")
     toggle.click()
     expect(toggle).to_have_attribute("aria-checked", "true")

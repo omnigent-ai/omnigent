@@ -9,6 +9,7 @@
  *
  * Sections:
  *
+ * - **General** — app-wide behavior preferences.
  * - **Appearance** — theme mode (System / Light / Dark), terminal theme,
  *   default transcript view, Workspace panel default, and UI/code font controls.
  * - **Git** — Git behavior: the global "always use a random worktree" default
@@ -294,7 +295,7 @@ export function SettingsPage() {
   return (
     <PageScroll contentClassName="px-8" extraBottom="2.5rem">
       {section === "appearance" && <AppearanceSection />}
-      {section === "chat" && <ChatSection />}
+      {section === "general" && <GeneralSection />}
       {section === "git" && <GitSection />}
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "import" && <ImportSection />}
@@ -1079,18 +1080,21 @@ function AlwaysSteerControl() {
         onCheckedChange={toggle}
         data-testid="always-steer-toggle"
         className="mt-0.5 shrink-0"
-        componentId="settings.chat.always_steer"
+        componentId="settings.general.always_steer"
       />
     </div>
   );
 }
 
-/** Chat behavior settings. */
-function ChatSection() {
+/** App-wide behavior settings. */
+function GeneralSection() {
   return (
-    <Section title="Chat" description="Configure how Omnigent handles your messages.">
-      <div className="flex flex-col gap-8">
-        <AlwaysSteerControl />
+    <Section title="General" description="Configure general Omnigent behavior.">
+      <div className="flex flex-col gap-3">
+        <h2 className="text-ui font-medium">Composer</h2>
+        <div className="rounded-xl border border-border bg-card px-4 py-3">
+          <AlwaysSteerControl />
+        </div>
       </div>
     </Section>
   );
