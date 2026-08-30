@@ -162,10 +162,7 @@ describe("SettingsSidebarBody", () => {
     expect(screen.getByTestId("settings-nav-appearance").querySelector("svg")).toHaveClass(
       "ui-icon",
     );
-    expect(screen.getByTestId("settings-nav-general")).toHaveAttribute(
-      "href",
-      "/settings/general",
-    );
+    expect(screen.getByTestId("settings-nav-general")).toHaveAttribute("href", "/settings/general");
   });
 
   it("uses the shared row geometry with normal-weight labels", () => {
