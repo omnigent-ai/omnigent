@@ -93,22 +93,13 @@ export function UsagePage() {
     [firstPage, since, until],
   );
 
-  // Recompute breakdowns from de-duplicated sessions (not page breakdowns, which can double-count)
+  // Extract breakdowns from first page (server computes across ALL sessions, not just loaded pages)
   const { harnessBreakdown, modelBreakdown } = useMemo(() => {
-    const harness: Record<string, number> = {};
-    const model: Record<string, number> = {};
-    for (const session of allSessions) {
-      // Aggregate harness cost
-      if (session.harness) {
-        harness[session.harness] = (harness[session.harness] ?? 0) + session.costUsd;
-      }
-      // Aggregate model costs
-      for (const [modelKey, cost] of Object.entries(session.models)) {
-        model[modelKey] = (model[modelKey] ?? 0) + cost;
-      }
-    }
-    return { harnessBreakdown: harness, modelBreakdown: model };
-  }, [allSessions]);
+    return {
+      harnessBreakdown: firstPage?.harnessBreakdown ?? {},
+      modelBreakdown: firstPage?.modelBreakdown ?? {},
+    };
+  }, [firstPage]);
 
   // Total cost from daily rollup (authoritative)
   const totalCost = useMemo(() => {
@@ -204,7 +195,7 @@ export function UsagePage() {
               </p>
               <p className="mt-0.5 text-xs text-muted-foreground">
                 {allSessions.length} session{allSessions.length !== 1 && "s"}
-                {hasNextPage && " (showing partial results)"}
+                {hasNextPage && " loaded"}
               </p>
             </div>
 
@@ -214,12 +205,6 @@ export function UsagePage() {
             </section>
 
             <div>
-              {hasNextPage && (
-                <p className="mb-2 text-xs text-muted-foreground">
-                  Based on {allSessions.length} loaded sessions. Load more to see complete
-                  breakdown.
-                </p>
-              )}
               <UsageBreakdownCharts
                 harnessBreakdown={harnessBreakdown}
                 modelBreakdown={modelBreakdown}

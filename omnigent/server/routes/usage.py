@@ -200,20 +200,59 @@ def _build_usage_report(
             )
         )
 
-    # Compute breakdown charts from the sessions we already loaded (not a separate scan).
-    # This avoids the O(N) full-session scan that defeated pagination's purpose.
-    # Breakdown charts will show partial data when more pages exist.
+    # Compute breakdown charts across ALL matching sessions (not just the current page).
+    # This requires loading all matching sessions, but we only need minimal fields
+    # (id, harness, cost, models) and we reuse sessions already loaded for the page.
+    # For efficiency, we load additional sessions without full details (no tree traversal).
     harness_breakdown: dict[str, float] = {}
     model_breakdown: dict[str, float] = {}
+
+    # Start with sessions from the current page
+    seen_ids: set[str] = {s.id for s in sessions}
     for session in sessions:
-        # Aggregate by harness
         if session.harness:
             harness_breakdown[session.harness] = (
                 harness_breakdown.get(session.harness, 0.0) + session.cost_usd
             )
-        # Aggregate by model
         for model, model_cost in session.models.items():
             model_breakdown[model] = model_breakdown.get(model, 0.0) + model_cost
+
+    # Load remaining sessions (if any) with minimal overhead - no tree traversal,
+    # just enough to get harness and cost breakdown
+    if page.has_more:
+        remaining_cursor = page.last_id
+        while remaining_cursor:
+            remaining_page = conversation_store.list_conversations(
+                limit=200,  # Batch size for aggregation
+                after=remaining_cursor,
+                accessible_by=user_id,
+                has_agent_id=True,
+                kind="default",
+                order="desc",
+                sort_by="updated_at",
+                updated_at_min=updated_at_min,
+                updated_at_max=updated_at_max,
+            )
+            for conv in remaining_page.data:
+                if conv.id in seen_ids or conv.agent_id is None:
+                    continue
+                seen_ids.add(conv.id)
+
+                usage = load_session_usage(conv.id, conversation_store)
+                primary_harness = _resolve_session_harness(conv) if include_page_details else None
+                session_cost = _session_cost(usage)
+                session_models = _session_models(usage)
+
+                if primary_harness:
+                    harness_breakdown[primary_harness] = (
+                        harness_breakdown.get(primary_harness, 0.0) + session_cost
+                    )
+                for model, model_cost in session_models.items():
+                    model_breakdown[model] = model_breakdown.get(model, 0.0) + model_cost
+
+            if not remaining_page.has_more:
+                break
+            remaining_cursor = remaining_page.last_id
 
     daily_costs_raw = (
         conversation_store.list_daily_costs(rollup_user, _EPOCH_DAY)
