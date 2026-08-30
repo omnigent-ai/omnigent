@@ -14,6 +14,19 @@ import {
 
 const STORAGE_KEY = "omnigent:ui-theme-palette";
 
+function contrastRatio(first: string, second: string): number {
+  const luminance = (hex: string) => {
+    const channel = (offset: number) => {
+      const value = Number.parseInt(hex.slice(offset, offset + 2), 16) / 255;
+      return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+    };
+    return channel(1) * 0.2126 + channel(3) * 0.7152 + channel(5) * 0.0722;
+  };
+  const lighter = Math.max(luminance(first), luminance(second));
+  const darker = Math.min(luminance(first), luminance(second));
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
 afterEach(() => {
   localStorage.clear();
   setEmbedScopeRoot(null);
@@ -117,6 +130,16 @@ describe("themePalette", () => {
       expect(palette.dark.bg).toMatch(/^#|rgb/);
       expect(palette.tokens.light.shellBackground.length).toBeGreaterThan(0);
       expect(palette.tokens.dark.shellBackground.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("keeps text selection at WCAG AA contrast in every palette", () => {
+    for (const palette of PALETTES) {
+      for (const tokens of [palette.tokens.light, palette.tokens.dark]) {
+        expect(
+          contrastRatio(tokens.selectionBackground, tokens.selectionForeground),
+        ).toBeGreaterThanOrEqual(4.5);
+      }
     }
   });
 });

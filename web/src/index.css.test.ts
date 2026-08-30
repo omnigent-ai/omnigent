@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "./components/ui/tooltip";
 import type * as UseTerminalsModule from "./hooks/useTerminals";
+import { themePalettes } from "./lib/themePalette";
 import { UI_FONT_SIZE_DEFAULT, UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN } from "./lib/uiFontPreferences";
 import { WorkspacePanel } from "./shell/WorkspacePanel";
 
@@ -837,13 +838,30 @@ describe("index.css mobile sidebar glass chip opacity", () => {
 });
 
 describe("index.css text selection colors", () => {
-  const selectionRule = cssSource.match(/::selection\s*\{([^}]*)\}/)?.[1];
+  // The sidebar's low-alpha active-item wash was barely visible as selection.
+  // Selection now uses dedicated palette tokens.
+  const selectionRule = cssSource.match(/(?<!-moz-)::selection\s*\{([^}]*)\}/)?.[1];
+  const mozSelectionRule = cssSource.match(/::-moz-selection\s*\{([^}]*)\}/)?.[1];
 
-  it("matches the active sidebar item in every color mode", () => {
-    expect(selectionRule).toContain("background: var(--sidebar-active)");
-    expect(selectionRule).toContain("color: var(--sidebar-active-foreground)");
-    expect(selectionRule).not.toContain("--brand-accent");
-    expect(cssSource).not.toContain(".dark ::selection");
+  it("uses the dedicated selection tokens, not the sidebar-active wash", () => {
+    expect(selectionRule).toContain("background: var(--selection-background)");
+    expect(selectionRule).toContain("color: var(--selection-foreground)");
+    expect(selectionRule).not.toContain("--sidebar-active");
+  });
+
+  it("defines a matching ::-moz-selection rule (Firefox ignores unprefixed ::selection)", () => {
+    expect(mozSelectionRule).toBeTruthy();
+    expect(mozSelectionRule).toContain("background: var(--selection-background)");
+    expect(mozSelectionRule).toContain("color: var(--selection-foreground)");
+  });
+
+  it("defines --selection-background/--selection-foreground for every palette, in both light and dark", () => {
+    // Count every built-in plus Custom in light and dark modes.
+    const expectedRuleCount = (themePalettes.length + 1) * 2;
+    const backgroundCount = cssSource.split("--selection-background:").length - 1;
+    const foregroundCount = cssSource.split("--selection-foreground:").length - 1;
+    expect(backgroundCount).toBe(expectedRuleCount);
+    expect(foregroundCount).toBe(expectedRuleCount);
   });
 });
 

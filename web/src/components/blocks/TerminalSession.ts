@@ -50,7 +50,11 @@ export function terminalTheme(isDark: boolean): ITheme {
         foreground: "#e4e4e7",
         cursor: "#22d3ee",
         cursorAccent: bg,
-        selectionBackground: "#22d3ee33",
+        // Solid (not the prior translucent wash) so selected text stays
+        // legible regardless of what's underneath; selectionForeground
+        // guarantees contrast instead of leaving the original glyph color.
+        selectionBackground: "#1e9aae",
+        selectionForeground: "#111318",
         black: "#09090b",
         brightBlack: "#71717a",
       }
@@ -59,7 +63,8 @@ export function terminalTheme(isDark: boolean): ITheme {
         foreground: "#18181b",
         cursor: "#0891b2",
         cursorAccent: bg,
-        selectionBackground: "#0891b233",
+        selectionBackground: "#0891b2",
+        selectionForeground: "#111318",
         black: "#18181b",
         brightBlack: "#e4e4e7",
         // CLIs that assume a dark terminal paint primary text with ANSI

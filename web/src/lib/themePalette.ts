@@ -95,6 +95,8 @@ export interface PaletteTokens {
   sidebarActiveForeground: string;
   sidebarBackground: string;
   shellBackground: string;
+  selectionBackground: string;
+  selectionForeground: string;
 }
 
 export const PALETTE_TOKEN_CSS_NAMES = {
@@ -133,6 +135,8 @@ export const PALETTE_TOKEN_CSS_NAMES = {
   sidebarActiveForeground: "sidebar-active-foreground",
   sidebarBackground: "sidebar-background",
   shellBackground: "shell-background",
+  selectionBackground: "selection-background",
+  selectionForeground: "selection-foreground",
 } as const satisfies Record<keyof PaletteTokens, string>;
 
 type PaletteTokenInput = Pick<
@@ -154,6 +158,8 @@ type PaletteTokenInput = Pick<
   | "ring"
   | "sidebar"
   | "shellBackground"
+  | "selectionBackground"
+  | "selectionForeground"
 > &
   Partial<PaletteTokens>;
 
@@ -238,6 +244,8 @@ export const PALETTES: readonly PaletteMeta[] = [
         sidebarActiveForeground: "#651249",
         sidebarBackground: "linear-gradient(90deg, #fffefe, #fcf6fa)",
         shellBackground: "var(--background)",
+        selectionBackground: "#e5639d",
+        selectionForeground: "#111318",
       }),
       dark: paletteTokens({
         background: "#0e1013",
@@ -273,6 +281,8 @@ export const PALETTES: readonly PaletteMeta[] = [
           "linear-gradient(transparent 35%, rgba(92, 48, 108, 0.2)), linear-gradient(135deg, rgba(255, 255, 255, 0.04), transparent 60%)",
         shellBackground:
           "radial-gradient(rgba(100, 40, 180, 0.12), transparent 50%), radial-gradient(at 80% 20%, rgba(80, 30, 140, 0.08), transparent 45%), linear-gradient(145deg, #1a0e2d, #0e1418, #130e1b)",
+        selectionBackground: "#a02f63",
+        selectionForeground: "#ffffff",
       }),
     },
   },
@@ -308,6 +318,8 @@ export const PALETTES: readonly PaletteMeta[] = [
         brandAccent: "#d6409f",
         sidebar: "#f3f0fa",
         shellBackground: "linear-gradient(160deg, #faf8ff 0%, #f5f1fd 50%, #f3eefb 100%)",
+        selectionBackground: "#dd64b2",
+        selectionForeground: "#111318",
       }),
       dark: paletteTokens({
         background: "#282a36",
@@ -330,6 +342,8 @@ export const PALETTES: readonly PaletteMeta[] = [
         sidebar: "rgba(33, 34, 44, 0.8)",
         shellBackground:
           "radial-gradient(ellipse at 20% 40%, rgba(189, 147, 249, 0.14) 0%, transparent 50%), radial-gradient(ellipse at 80% 20%, rgba(255, 121, 198, 0.1) 0%, transparent 45%), linear-gradient(160deg, #2a2c3a 0%, #282a36 55%, #21222c 100%)",
+        selectionBackground: "#94527e",
+        selectionForeground: "#ffffff",
       }),
     },
   },
@@ -364,6 +378,8 @@ export const PALETTES: readonly PaletteMeta[] = [
         ring: "#0969da",
         sidebar: "#f6f8fa",
         shellBackground: "linear-gradient(180deg, #fbfcfd 0%, #f6f8fa 100%)",
+        selectionBackground: "#5094e4",
+        selectionForeground: "#111318",
       }),
       dark: paletteTokens({
         background: "#0d1117",
@@ -385,6 +401,8 @@ export const PALETTES: readonly PaletteMeta[] = [
         sidebar: "rgba(13, 17, 23, 0.75)",
         sidebarPrimaryForeground: "#0d1117",
         shellBackground: "linear-gradient(160deg, #0d1117 0%, #0a0e14 100%)",
+        selectionBackground: "#3a6aa2",
+        selectionForeground: "#ffffff",
       }),
     },
   },
@@ -420,6 +438,8 @@ export const PALETTES: readonly PaletteMeta[] = [
         brandAccent: "#ea76cb",
         sidebar: "#e6e9ef",
         shellBackground: "linear-gradient(160deg, #f2f3f7 0%, #eff1f5 60%, #e9ecf2 100%)",
+        selectionBackground: "#a770f1",
+        selectionForeground: "#111318",
       }),
       dark: paletteTokens({
         background: "#1e1e2e",
@@ -441,6 +461,8 @@ export const PALETTES: readonly PaletteMeta[] = [
         sidebar: "rgba(24, 24, 37, 0.8)",
         shellBackground:
           "radial-gradient(ellipse at 20% 30%, rgba(203, 166, 247, 0.12) 0%, transparent 55%), radial-gradient(ellipse at 80% 20%, rgba(245, 194, 231, 0.08) 0%, transparent 45%), linear-gradient(160deg, #232336 0%, #1e1e2e 60%, #181825 100%)",
+        selectionBackground: "#746292",
+        selectionForeground: "#ffffff",
       }),
     },
   },
@@ -475,6 +497,8 @@ export const PALETTES: readonly PaletteMeta[] = [
         ring: "#d65d0e",
         sidebar: "#f4e8bc",
         shellBackground: "linear-gradient(160deg, #fbf3cd 0%, #fbf1c7 55%, #f7ecbb 100%)",
+        selectionBackground: "#e18946",
+        selectionForeground: "#111318",
       }),
       dark: paletteTokens({
         background: "#282828",
@@ -496,6 +520,8 @@ export const PALETTES: readonly PaletteMeta[] = [
         sidebar: "rgba(29, 32, 33, 0.8)",
         shellBackground:
           "radial-gradient(ellipse at 20% 30%, rgba(254, 128, 25, 0.1) 0%, transparent 55%), radial-gradient(ellipse at 80% 20%, rgba(250, 189, 47, 0.07) 0%, transparent 45%), linear-gradient(160deg, #32302f 0%, #282828 60%, #1d2021 100%)",
+        selectionBackground: "#935420",
+        selectionForeground: "#ffffff",
       }),
     },
   },
@@ -531,6 +557,8 @@ export const PALETTES: readonly PaletteMeta[] = [
         sidebar: "#e5e9f0",
         sidebarAccent: "#d8dee9",
         shellBackground: "linear-gradient(160deg, #eceff4 0%, #e5e9f0 55%, #d8dee9 100%)",
+        selectionBackground: "#89a2c2",
+        selectionForeground: "#111318",
       }),
       dark: paletteTokens({
         background: "#2e3440",
@@ -552,6 +580,8 @@ export const PALETTES: readonly PaletteMeta[] = [
         sidebar: "rgba(46, 52, 64, 0.8)",
         shellBackground:
           "radial-gradient(ellipse at 20% 30%, rgba(136, 192, 208, 0.12) 0%, transparent 55%), radial-gradient(ellipse at 80% 20%, rgba(94, 129, 172, 0.08) 0%, transparent 45%), linear-gradient(160deg, #434c5e 0%, #2e3440 60%, #2e3440 100%)",
+        selectionBackground: "#526c7a",
+        selectionForeground: "#ffffff",
       }),
     },
   },

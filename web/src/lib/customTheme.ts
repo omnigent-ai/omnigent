@@ -414,6 +414,8 @@ function rebaseVariant(
     sidebarActiveForeground: base.sidebarActiveForeground,
     sidebarBackground: base.sidebarBackground,
     shellBackground: base.shellBackground,
+    selectionBackground: base.selectionBackground,
+    selectionForeground: base.selectionForeground,
   };
 }
 

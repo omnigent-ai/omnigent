@@ -955,11 +955,15 @@ aside[aria-label="Workspace"][data-maximized] {
   .xterm {
     font-family: var(--font-mono);
   }
-  /* Text selection mirrors the sidebar's active-item treatment in every
-   * palette and color mode. */
+  /* Selection needs solid, high-contrast palette tokens rather than the
+   * sidebar's low-alpha active-item wash. */
   ::selection {
-    background: var(--sidebar-active);
-    color: var(--sidebar-active-foreground);
+    background: var(--selection-background);
+    color: var(--selection-foreground);
+  }
+  ::-moz-selection {
+    background: var(--selection-background);
+    color: var(--selection-foreground);
   }
 }
 
