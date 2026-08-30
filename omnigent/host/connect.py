@@ -3116,6 +3116,23 @@ class HostProcess:
         self._reaper_task = asyncio.create_task(
             self._orphan_reaper_loop(), name="host-orphan-reaper"
         )
+        # Reap per-session native-harness bridge dirs orphaned by a runner
+        # that died uncleanly (crash / SIGKILL / host restart mid-run). The
+        # runner performs the same sweep at its own startup, but after a
+        # crash no new runner may ever launch on this machine, so the host
+        # (re)start is the reliable moment to reclaim them. Best-effort and
+        # off-loop: a sweep failure must never block host registration.
+        from omnigent.native_bridge_common import reap_orphaned_native_bridge_dirs
+
+        try:
+            reaped_bridge_dirs = await asyncio.to_thread(reap_orphaned_native_bridge_dirs)
+            if reaped_bridge_dirs:
+                _logger.info(
+                    "Reaped %d orphaned native bridge dir(s) from prior runs",
+                    reaped_bridge_dirs,
+                )
+        except Exception:  # noqa: BLE001 — housekeeping must never block registration
+            _logger.debug("native bridge-dir orphan sweep failed", exc_info=True)
         # Detect wake from system suspend (laptop sleep) and force-drop the
         # then-dead tunnel so the reconnect loop reattaches within seconds
         # instead of waiting out the ~90s keepalive ping timeout.

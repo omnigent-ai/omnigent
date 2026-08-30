@@ -3999,6 +3999,56 @@ def test_run_host_process_announces_session_log_dir_on_start(
     assert "This host's log: ~/.omnigent/logs/host/host-" in out
 
 
+async def test_run_sweeps_orphaned_native_bridge_dirs_on_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host startup reclaims native bridge dirs orphaned by a crashed runner.
+
+    A runner that dies uncleanly (SIGKILL / crash / host restart mid-run)
+    never runs its explicit-delete cleanup, and if no new runner ever
+    launches on the machine the runner-side startup sweep never fires
+    either — so ``~/.omnigent`` grows without bound. The host daemon's own
+    (re)start is the reliable moment to reap: ``run()`` must invoke the
+    cross-harness bridge-dir sweep before entering the connect loop.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
+    sweeps: list[int] = []
+    monkeypatch.setattr(
+        "omnigent.native_bridge_common.reap_orphaned_native_bridge_dirs",
+        lambda: sweeps.append(1) or 3,
+    )
+    host = _host()
+
+    await host.run()
+
+    assert sweeps == [1]
+
+
+async def test_run_survives_a_failing_native_bridge_dir_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raising bridge-dir sweep must not abort host startup.
+
+    The sweep is best-effort housekeeping; a broken bridge module or an
+    unreadable bridge root must never prevent the host from registering.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
+
+    def _boom() -> int:
+        raise OSError("bridge root unreadable")
+
+    monkeypatch.setattr(
+        "omnigent.native_bridge_common.reap_orphaned_native_bridge_dirs",
+        _boom,
+    )
+    host = _host()
+
+    # Startup completes (run returns via the clean cancel) despite the raise.
+    await host.run()
+
+
 async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
     tmp_path: Path,
 ) -> None:
