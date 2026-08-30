@@ -188,8 +188,7 @@ class _PaginatedClient:
                     "sessions_last_id": "conv_page2_a",
                 }
             )
-        else:
-            raise AssertionError(f"Unexpected pagination state: {params}")
+        raise AssertionError(f"Unexpected pagination state: {params}")
 
 
 @pytest.fixture()
@@ -275,8 +274,7 @@ class _DuplicatingClient:
                     "sessions_last_id": "conv_c",
                 }
             )
-        else:
-            raise AssertionError(f"Unexpected pagination state: {params}")
+        raise AssertionError(f"Unexpected pagination state: {params}")
 
 
 @pytest.fixture()
