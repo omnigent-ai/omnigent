@@ -27,6 +27,8 @@ interface UsageReportWire {
   total_cost_usd: number;
   daily_costs: DailyCostWire[];
   sessions: SessionUsageWire[];
+  sessions_has_more: boolean;
+  sessions_last_id: string | null;
 }
 
 // ── App types (camelCase) ───────────────────────────────────────
@@ -56,12 +58,25 @@ export interface UsageReport {
   totalCostUsd: number;
   dailyCosts: DailyCost[];
   sessions: SessionUsage[];
+  sessionsHasMore: boolean;
+  sessionsLastId: string | null;
 }
 
 // ── Fetch ───────────────────────────────────────────────────────
 
-export async function fetchUsageReport(): Promise<UsageReport> {
-  const res = await authenticatedFetch("/v1/usage");
+export interface FetchUsageReportParams {
+  limit?: number;
+  after?: string | null;
+}
+
+export async function fetchUsageReport(params?: FetchUsageReportParams): Promise<UsageReport> {
+  const searchParams = new URLSearchParams();
+  if (params?.limit) searchParams.set("limit", String(params.limit));
+  if (params?.after) searchParams.set("after", params.after);
+  const query = searchParams.toString();
+  const url = query ? `/v1/usage?${query}` : "/v1/usage";
+
+  const res = await authenticatedFetch(url);
   if (!res.ok) throw new Error(`Usage fetch failed: ${res.status}`);
   const wire: UsageReportWire = await res.json();
   return {
@@ -82,5 +97,7 @@ export async function fetchUsageReport(): Promise<UsageReport> {
       llmModel: s.llm_model ?? null,
       agentName: s.agent_name ?? null,
     })),
+    sessionsHasMore: wire.sessions_has_more ?? false,
+    sessionsLastId: wire.sessions_last_id ?? null,
   };
 }

@@ -73,7 +73,8 @@ function filterSessions(
 }
 
 export function UsagePage() {
-  const { data, isLoading, isError, refetch } = useUsageReport();
+  const { data, isLoading, isError, refetch, fetchNextPage, hasNextPage, isFetchingNextPage } =
+    useUsageReport();
   const { trackClick } = useOmnigentAnalytics();
 
   const [rangeKey, setRangeKey] = useState<RangeKey>("30d");
@@ -83,14 +84,21 @@ export function UsagePage() {
   const today = todayIso();
   const { since, until } = rangeToWindow(rangeKey, customStart, customEnd);
 
+  // Flatten pages and extract first page summary data
+  const firstPage = data?.pages[0];
+  const allSessions = useMemo(
+    () => data?.pages.flatMap((page) => page.sessions) ?? [],
+    [data],
+  );
+
   const filteredCosts = useMemo(
-    () => (data ? filterDailyCosts(data.dailyCosts, since, until) : []),
-    [data, since, until],
+    () => (firstPage ? filterDailyCosts(firstPage.dailyCosts, since, until) : []),
+    [firstPage, since, until],
   );
 
   const filteredSessions = useMemo(
-    () => (data ? filterSessions(data.sessions, since, until) : []),
-    [data, since, until],
+    () => filterSessions(allSessions, since, until),
+    [allSessions, since, until],
   );
 
   const totalCost = useMemo(() => {
@@ -179,7 +187,7 @@ export function UsagePage() {
           </div>
         )}
 
-        {data && (
+        {firstPage && (
           <div className="flex flex-col gap-8">
             <div className="rounded-lg border border-border bg-card p-4">
               <p className="text-xs text-muted-foreground">Total cost</p>
@@ -188,6 +196,7 @@ export function UsagePage() {
               </p>
               <p className="mt-0.5 text-xs text-muted-foreground">
                 {filteredSessions.length} session{filteredSessions.length !== 1 && "s"}
+                {hasNextPage && " (showing partial results)"}
               </p>
             </div>
 
@@ -201,6 +210,28 @@ export function UsagePage() {
             <section>
               <h2 className="mb-3 text-sm font-medium text-muted-foreground">Sessions</h2>
               <UsageSessionTable sessions={filteredSessions} />
+              {hasNextPage && (
+                <div className="mt-4 flex justify-center">
+                  <button
+                    type="button"
+                    className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
+                    onClick={() => {
+                      trackClick("usage.load_more", "button");
+                      void fetchNextPage();
+                    }}
+                    disabled={isFetchingNextPage}
+                  >
+                    {isFetchingNextPage ? (
+                      <span className="flex items-center gap-2">
+                        <Loader2Icon className="h-4 w-4 animate-spin" />
+                        Loading...
+                      </span>
+                    ) : (
+                      "Load More"
+                    )}
+                  </button>
+                </div>
+              )}
             </section>
           </div>
         )}

@@ -2669,6 +2669,9 @@ class UsageReport(BaseModel):
     :param cost_last_30d: Total spend over the last 30 UTC days (incl. today).
     :param total_cost_usd: All-time total spend from the daily rollup.
     :param sessions: Per-session detail, newest activity first.
+    :param sessions_has_more: Whether more sessions exist beyond this page.
+    :param sessions_last_id: ID of the last session in the page, for cursor
+        pagination. ``None`` if the page is empty.
     """
 
     object: Literal["usage_report"] = "usage_report"
@@ -2678,6 +2681,8 @@ class UsageReport(BaseModel):
     total_cost_usd: float = 0.0
     daily_costs: list[DailyCost] = Field(default_factory=list)
     sessions: list[SessionUsage] = Field(default_factory=list)
+    sessions_has_more: bool = False
+    sessions_last_id: str | None = None
 
 
 # ── Permissions ────────────────────────────────────────────────────
