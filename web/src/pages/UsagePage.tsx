@@ -76,27 +76,39 @@ export function UsagePage() {
 
   // Flatten pages and extract first page summary data
   const firstPage = data?.pages[0];
-  const allSessions = useMemo(() => data?.pages.flatMap((page) => page.sessions) ?? [], [data]);
+
+  // De-duplicate sessions by ID (cursor pagination on mutable updated_at can repeat rows)
+  const allSessions = useMemo(() => {
+    const flat = data?.pages.flatMap((page) => page.sessions) ?? [];
+    const seen = new Set<string>();
+    return flat.filter((session) => {
+      if (seen.has(session.id)) return false;
+      seen.add(session.id);
+      return true;
+    });
+  }, [data]);
 
   const filteredCosts = useMemo(
     () => (firstPage ? filterDailyCosts(firstPage.dailyCosts, since, until) : []),
     [firstPage, since, until],
   );
 
-  // Aggregate breakdowns across ALL loaded pages (not just first page)
+  // Recompute breakdowns from de-duplicated sessions (not page breakdowns, which can double-count)
   const { harnessBreakdown, modelBreakdown } = useMemo(() => {
     const harness: Record<string, number> = {};
     const model: Record<string, number> = {};
-    for (const page of data?.pages ?? []) {
-      for (const [key, cost] of Object.entries(page.harnessBreakdown)) {
-        harness[key] = (harness[key] ?? 0) + cost;
+    for (const session of allSessions) {
+      // Aggregate harness cost
+      if (session.harness) {
+        harness[session.harness] = (harness[session.harness] ?? 0) + session.costUsd;
       }
-      for (const [key, cost] of Object.entries(page.modelBreakdown)) {
-        model[key] = (model[key] ?? 0) + cost;
+      // Aggregate model costs
+      for (const [modelKey, cost] of Object.entries(session.models)) {
+        model[modelKey] = (model[modelKey] ?? 0) + cost;
       }
     }
     return { harnessBreakdown: harness, modelBreakdown: model };
-  }, [data]);
+  }, [allSessions]);
 
   // Total cost from daily rollup (authoritative)
   const totalCost = useMemo(() => {

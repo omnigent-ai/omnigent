@@ -6316,8 +6316,17 @@ def usage(limit: int, server: str | None, as_json: bool) -> None:
             all_sessions.extend(page.get("sessions", []))
             report = page  # Update to get the latest has_more/last_id
 
-        # Replace the sessions list with all accumulated sessions
-        report["sessions"] = all_sessions
+        # De-duplicate sessions by ID (cursor pagination on mutable updated_at can repeat rows)
+        seen_ids: set[str] = set()
+        deduped_sessions = []
+        for session in all_sessions:
+            session_id = session.get("id")
+            if session_id and session_id not in seen_ids:
+                seen_ids.add(session_id)
+                deduped_sessions.append(session)
+
+        # Replace the sessions list with de-duplicated sessions
+        report["sessions"] = deduped_sessions
 
     if as_json:
         click.echo(json.dumps(report, indent=2))
