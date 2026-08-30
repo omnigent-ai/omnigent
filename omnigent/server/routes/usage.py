@@ -202,51 +202,58 @@ def _build_usage_report(
 
     # Get breakdown charts from pre-computed cache (O(1)), or rebuild if stale (O(N) but only once).
     # Breakdowns show all-time cost distribution (not date-filtered), enabling fast reads.
-    cached = conversation_store.get_usage_summary(rollup_user) if include_page_details else None
-    if cached:
-        # Cache hit - serve from pre-computed summary (O(1))
-        harness_breakdown, model_breakdown = cached
-    else:
-        # Cache miss or stale - rebuild from all sessions (O(N) but only when needed)
+    # Only compute breakdowns when include_page_details=True (web UI with USAGE_PAGE flag).
+    # CLI and other non-page consumers get empty breakdowns (they don't use them anyway).
+    if not include_page_details:
+        # CLI and non-page paths: skip breakdown computation entirely
         harness_breakdown: dict[str, float] = {}
         model_breakdown: dict[str, float] = {}
-        total_session_count = 0
+    else:
+        # Web UI path: use cache or rebuild
+        cached = conversation_store.get_usage_summary(rollup_user)
+        if cached:
+            # Cache hit - serve from pre-computed summary (O(1))
+            harness_breakdown, model_breakdown = cached
+        else:
+            # Cache miss or stale - rebuild from all sessions (O(N) but only when needed)
+            harness_breakdown = {}
+            model_breakdown = {}
+            total_session_count = 0
 
-        # Scan all user sessions to rebuild breakdown
-        rebuild_cursor: str | None = None
-        while True:
-            rebuild_page = conversation_store.list_conversations(
-                limit=200,
-                after=rebuild_cursor,
-                accessible_by=user_id,
-                has_agent_id=True,
-                kind="default",
-                order="desc",
-                sort_by="updated_at",
-            )
-            for conv in rebuild_page.data:
-                if conv.agent_id is None:
-                    continue
-                total_session_count += 1
+            # Scan all user sessions to rebuild breakdown
+            rebuild_cursor: str | None = None
+            while True:
+                rebuild_page = conversation_store.list_conversations(
+                    limit=200,
+                    after=rebuild_cursor,
+                    accessible_by=user_id,
+                    has_agent_id=True,
+                    kind="default",
+                    order="desc",
+                    sort_by="updated_at",
+                )
+                for conv in rebuild_page.data:
+                    if conv.agent_id is None:
+                        continue
+                    total_session_count += 1
 
-                usage = load_session_usage(conv.id, conversation_store)
-                primary_harness = _resolve_session_harness(conv) if include_page_details else None
-                session_cost = _session_cost(usage)
-                session_models = _session_models(usage)
+                    usage = load_session_usage(conv.id, conversation_store)
+                    primary_harness = _resolve_session_harness(conv)
+                    session_cost = _session_cost(usage)
+                    session_models = _session_models(usage)
 
-                if primary_harness:
-                    harness_breakdown[primary_harness] = (
-                        harness_breakdown.get(primary_harness, 0.0) + session_cost
-                    )
-                for model, model_cost in session_models.items():
-                    model_breakdown[model] = model_breakdown.get(model, 0.0) + model_cost
+                    if primary_harness:
+                        harness_breakdown[primary_harness] = (
+                            harness_breakdown.get(primary_harness, 0.0) + session_cost
+                        )
+                    for model, model_cost in session_models.items():
+                        model_breakdown[model] = model_breakdown.get(model, 0.0) + model_cost
 
-            if not rebuild_page.has_more:
-                break
-            rebuild_cursor = rebuild_page.last_id
+                if not rebuild_page.has_more:
+                    break
+                rebuild_cursor = rebuild_page.last_id
 
-        # Cache the rebuilt summary for future requests
-        if include_page_details:
+            # Cache the rebuilt summary for future requests
             conversation_store.set_usage_summary(
                 rollup_user,
                 harness_breakdown,

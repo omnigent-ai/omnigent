@@ -1,7 +1,7 @@
 """Add user_usage_summary table for pre-computed breakdowns.
 
 Revision ID: zb3c4d5e6f7g
-Revises: za2b3c4d5e6f
+Revises: e5d9bc8ac650
 Create Date: 2026-08-30 00:00:00.000000
 
 Adds a new ``user_usage_summary`` table to store pre-aggregated usage breakdowns
@@ -84,16 +84,8 @@ def upgrade() -> None:
             sa.Column("total_sessions", sa.Integer(), nullable=False, server_default="0"),
             sa.Column("last_updated_at", sa.Integer(), nullable=False, server_default="0"),
         )
-        # Index for efficient lookups by user_id (already primary key, but explicit for clarity)
-        op.create_index(
-            "ix_user_usage_summary_user_id",
-            "user_usage_summary",
-            ["user_id"],
-            unique=True,
-        )
 
 
 def downgrade() -> None:
     """Drop ``user_usage_summary`` table."""
-    op.drop_index("ix_user_usage_summary_user_id", table_name="user_usage_summary")
     op.drop_table("user_usage_summary")
