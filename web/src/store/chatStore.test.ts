@@ -3688,7 +3688,7 @@ describe("chatStore — stop", () => {
     expect(controller.signal.aborted).toBe(false);
   });
 
-  it("clears local working state immediately while the interrupt ack is pending", () => {
+  it("keeps working state until a confirmed interruption event arrives", () => {
     useChatStore.setState({
       conversationId: "conv_abc",
       pendingUserMessages: [
@@ -3706,21 +3706,18 @@ describe("chatStore — stop", () => {
     useChatStore.getState().stop();
 
     const state = useChatStore.getState();
-    expect(state.pendingUserMessages).toEqual([]);
-    expect(state.status).toBe("idle");
-    expect(state.sessionStatus).toBe("idle");
+    expect(state.pendingUserMessages).toHaveLength(1);
+    expect(state.status).toBe("streaming");
+    expect(state.sessionStatus).toBe("running");
     expect(state.activeResponse).toEqual({
       responseId: "resp_1",
-      state: "cancelled",
+      state: "streaming",
       error: null,
     });
-    expect(readConversationRows()[0]?.status).toBe("idle");
+    expect(readConversationRows()[0]?.status).toBe("running");
   });
 
-  it("leaves a non-streaming activeResponse untouched on stop", () => {
-    // Pins the `state === "streaming"` guard: stop() still clears the working
-    // state, but must NOT overwrite a non-streaming activeResponse (dropping the
-    // guard would clobber a completed response with a cancelled decoration).
+  it("does not mutate a non-streaming activeResponse before confirmation", () => {
     useChatStore.setState({
       conversationId: "conv_abc",
       pendingUserMessages: [
@@ -3735,16 +3732,35 @@ describe("chatStore — stop", () => {
     useChatStore.getState().stop();
 
     const state = useChatStore.getState();
-    expect(state.pendingUserMessages).toEqual([]);
-    expect(state.status).toBe("idle");
-    expect(state.sessionStatus).toBe("idle");
-    // Untouched — the guard skipped the cancelled overwrite.
+    expect(state.pendingUserMessages).toHaveLength(1);
+    expect(state.status).toBe("streaming");
+    expect(state.sessionStatus).toBe("running");
     expect(state.activeResponse).toEqual({
       responseId: "resp_1",
       state: "completed",
       error: null,
     });
-    expect(readConversationRows()[0]?.status).toBe("idle");
+    expect(readConversationRows()[0]?.status).toBe("running");
+  });
+
+  it("surfaces a failed interrupt without hiding the running turn", async () => {
+    fetchMock.mockRejectedValueOnce(new Error("runner did not confirm delivery"));
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      status: "streaming",
+      sessionStatus: "running",
+    });
+
+    useChatStore.getState().stop();
+    await tick();
+
+    const state = useChatStore.getState();
+    expect(state.status).toBe("streaming");
+    expect(state.sessionStatus).toBe("running");
+    expect(state.blocks.at(-1)).toMatchObject({
+      type: "error",
+      message: "Stop failed: runner did not confirm delivery",
+    });
   });
 
   it("no-op when no session is bound", () => {

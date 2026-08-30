@@ -852,7 +852,6 @@ def register_events_routes(
             return wake_conv, _client
 
         if body.type == _INTERRUPT_TYPE:
-            _publish_interrupted(session_id)
             # Fence the cancelled turn (see _interrupt_fenced_sessions).
             _interrupt_fenced_sessions.add(session_id)
             runner_client = await _get_runner_client(
@@ -878,6 +877,11 @@ def register_events_routes(
                 # The turn keeps running and nothing else lifts the fence —
                 # remove it so the turn's remaining output isn't dropped.
                 _interrupt_fenced_sessions.discard(session_id)
+                raise OmnigentError(
+                    f"Could not interrupt session {session_id!r}: no runner confirmed delivery.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
+            _publish_interrupted(session_id)
             return {"queued": False}
         if body.type == _STOP_SESSION_TYPE:
             # Terminating the whole session (not just the current turn)

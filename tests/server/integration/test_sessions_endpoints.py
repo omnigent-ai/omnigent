@@ -4747,18 +4747,13 @@ async def test_post_interrupt_without_data_field_is_accepted(
         f"/v1/sessions/{session['id']}/events",
         json={"type": "interrupt"},
     )
-    # 202 (not 422) proves ``data`` defaults to ``{}`` at the schema
-    # layer; a 422 here means the pydantic default regressed and every
-    # deployed bare-control client breaks again.
-    assert resp.status_code == 202, resp.text
-    assert resp.json() == {"queued": False}
-    # The interrupt actually took effect (not just validated): the
-    # route published the cancellation signal for the web turn.
+    # A runner is not bound in this schema test. 503 (rather than 422) proves
+    # ``data`` defaulted to ``{}`` and routing reached delivery handling.
+    assert resp.status_code == 503, resp.text
+    # No runner is bound in this schema test, so the request is accepted but
+    # must not publish a terminal cancellation signal that did not land.
     interrupted = [e for _sid, e in published if e.get("type") == "session.interrupted"]
-    assert len(interrupted) == 1, (
-        f"expected one session.interrupted publish for a bare interrupt "
-        f"event, got types {[e.get('type') for _sid, e in published]!r}"
-    )
+    assert interrupted == []
 
 
 async def test_post_external_output_text_delta_carries_streaming_identifiers(
@@ -8180,17 +8175,11 @@ async def test_interrupt_on_claude_native_session_skips_idle_publish_on_runner_f
 ) -> None:
     """
     If the runner couldn't deliver the Escape (e.g. tmux pane gone),
-    Omnigent must NOT lie to the UI by publishing idle. The spinner spins
-    is the right signal — it tells the user the cancel didn't land.
+    Omnigent must not publish terminal interruption or idle state when the
+    runner rejected the request.
 
-    After the interrupt-unification refactor the Omnigent side no longer
-    publishes ``session.status: idle`` itself at all. Idle on a
-    claude-native interrupt now comes from the runner's PTY activity
-    watcher once the pane quiesces after the Escape (a failed Escape
-    naturally surfaces as "no idle" — the pane keeps changing). This
-    test acts as a regression guard against re-adding an AP-side idle
-    publish — if someone reintroduces the pre-refactor "publish idle on
-    2xx" logic, the 503 path here would start leaking idle.
+    The server publishes idle only after a runner 2xx confirms delivery. A
+    rejected Escape must return a retryable error and emit no terminal state.
     """
     from omnigent.runtime import session_stream, set_runner_client
 
@@ -8229,17 +8218,14 @@ async def test_interrupt_on_claude_native_session_skips_idle_publish_on_runner_f
             f"/v1/sessions/{session['id']}/events",
             json={"type": "interrupt", "data": {}},
         )
-        assert resp.status_code == 202, resp.text
+        assert resp.status_code == 503, resp.text
     finally:
         await fake_runner.aclose()
         set_runner_client(None)
 
-    # interrupted still fires (the UI marks the bubble cancelled);
-    # idle does not (the Escape didn't land).
+    # Neither terminal signal fires because the Escape did not land.
     interrupted = [e for e in published if e.get("type") == "session.interrupted"]
-    assert interrupted, (
-        f"session.interrupted should still publish on runner failure; got {published!r}"
-    )
+    assert not interrupted, f"failed interrupt must not publish completion; got {published!r}"
     idle_status = [
         e for e in published if e.get("type") == "session.status" and e.get("status") == "idle"
     ]
@@ -8598,9 +8584,7 @@ async def test_interrupt_forward_failure_lifts_stop_fence(
             f"/v1/sessions/{session_id}/events",
             json={"type": "interrupt", "data": {}},
         )
-        # Interrupt is best-effort and still ACKs (the UI already marked the
-        # bubble interrupted); the fence removal below is the fix under test.
-        assert resp.status_code == 202, resp.text
+        assert resp.status_code == 503, resp.text
         assert session_id not in _interrupt_fenced_sessions, (
             "a failed interrupt forward must remove the fence it installed — "
             "leaving it set drops the rest of the still-running turn"

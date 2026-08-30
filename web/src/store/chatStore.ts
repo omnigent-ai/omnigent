@@ -1914,50 +1914,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   stop: () => {
     const sessionId = get().conversationId;
     if (!sessionId) return;
-    // Fire-and-forget interrupt; the server emits session.interrupted
-    // + response.incomplete on the open stream, which the pump
-    // translates into the cancelled bubble decoration. We deliberately
-    // do NOT abort the local SSE stream — it remains open across
-    // turns; switchTo or tab unload is the only thing that tears it
-    // down.
-    void interruptSession(sessionId).catch(() => {
-      // Interrupt is best-effort. A network failure here means the
-      // user's cancel won't reach the server, but the local UI already
-      // reflects the user's stop request below.
+    // Keep the local stream open and let the server's confirmed
+    // session.interrupted event settle the turn for every viewer.
+    void interruptSession(sessionId).catch((err) => {
+      const { message, code } = describeSendFailure(err);
+      setterFor(sessionId)((s) => ({
+        blocks: [...s.blocks, makeClientErrorBlock(`Stop failed: ${message}`, code)],
+      }));
     });
-    setActive((s) => {
-      if (s.conversationId !== sessionId) return {};
-      const patch: Partial<ChatState> = {
-        pendingUserMessages: [],
-        status: "idle",
-        sessionStatus: "idle",
-        backgroundTaskCount: 0,
-        backgroundTasks: [],
-        blockedOn: null,
-      };
-      if (s.activeResponse?.state === "streaming") {
-        patch.activeResponse = {
-          ...s.activeResponse,
-          state: "cancelled",
-          error: null,
-        };
-      }
-      return patch;
-    });
-    // Optimistic, unbacked write: unlike the session.status SSE caller, no
-    // server event backs this, so a poll that interleaves while the turn is
-    // genuinely still running may briefly revert the sidebar dot — the helper's
-    // "never fights the poller" contract doesn't hold here. Self-corrects on the
-    // real idle event.
-    patchConversationStatusInCache(sessionId, "idle");
-    // Mirror the session.status handler: a sub-agent's row lives in its parent's
-    // child-sessions list, not the sidebar, so refresh the rail in lockstep.
-    const snapshot = queryClient?.getQueryData<Session>(["session", sessionId]);
-    if (snapshot?.parentSessionId) {
-      queryClient?.invalidateQueries({
-        queryKey: childSessionsQueryKey(snapshot.parentSessionId),
-      });
-    }
   },
 
   switchTo: async (conversationId) => {
