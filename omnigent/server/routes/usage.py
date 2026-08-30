@@ -200,9 +200,9 @@ def _build_usage_report(
             )
         )
 
-    # Get breakdown charts from pre-computed cache (O(1)), or rebuild if stale (O(N) but only once).
+    # Get breakdown charts from pre-computed cache (O(1)), or rebuild if stale (O(N) once).
     # Breakdowns show all-time cost distribution (not date-filtered), enabling fast reads.
-    # Only compute breakdowns when include_page_details=True (web UI with USAGE_PAGE flag).
+    # Only compute when include_page_details=True (web UI with USAGE_PAGE flag).
     # CLI and other non-page consumers get empty breakdowns (they don't use them anyway).
     if not include_page_details:
         # CLI and non-page paths: skip breakdown computation entirely
