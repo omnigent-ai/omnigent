@@ -815,3 +815,93 @@ def test_run_turn_warns_once_when_tools_declared(
 
     warnings = [rec for rec in caplog.records if "tool-injection bridge" in rec.message]
     assert len(warnings) == 1, "should warn exactly once across both turns"
+
+
+# ---------------------------------------------------------------------------
+# Interrupt: signalling is not stopping
+# ---------------------------------------------------------------------------
+
+
+class _InterruptibleProcess:
+    """A subprocess stub whose exit can be withheld, like a wedged CLI."""
+
+    def __init__(self, *, exits_on: str | None) -> None:
+        self._exits_on = exits_on
+        self.returncode: int | None = None
+        self.signals: list[str] = []
+        self._exited = asyncio.Event()
+
+    def terminate(self) -> None:
+        self.signals.append("SIGTERM")
+        if self._exits_on == "SIGTERM":
+            self.returncode = -15
+            self._exited.set()
+
+    def kill(self) -> None:
+        self.signals.append("SIGKILL")
+        if self._exits_on == "SIGKILL":
+            self.returncode = -9
+            self._exited.set()
+
+    async def wait(self) -> int | None:
+        await self._exited.wait()
+        return self.returncode
+
+
+def _interrupt(process: _InterruptibleProcess) -> bool:
+    ex = KimiExecutor(binary_path="kimi")
+    ex._active_process = process  # type: ignore[assignment]
+    return asyncio.run(ex.interrupt_session("s1"))
+
+
+def test_interrupt_confirms_the_process_actually_exited() -> None:
+    process = _InterruptibleProcess(exits_on="SIGTERM")
+
+    assert _interrupt(process) is True
+    assert process.signals == ["SIGTERM"]
+
+
+def test_interrupt_escalates_to_kill_when_sigterm_is_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A process that ignores SIGTERM keeps producing the turn; without the
+    # escalation the interrupt would report success while the work continued.
+    monkeypatch.setattr(kimi_executor, "_INTERRUPT_TERM_GRACE_S", 0.01)
+    process = _InterruptibleProcess(exits_on="SIGKILL")
+
+    assert _interrupt(process) is True
+    assert process.signals == ["SIGTERM", "SIGKILL"]
+
+
+def test_interrupt_reports_failure_when_the_process_survives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No fake cancellation: an unkillable process must not read as stopped.
+    monkeypatch.setattr(kimi_executor, "_INTERRUPT_TERM_GRACE_S", 0.01)
+    monkeypatch.setattr(kimi_executor, "_INTERRUPT_KILL_GRACE_S", 0.01)
+    process = _InterruptibleProcess(exits_on=None)
+
+    assert _interrupt(process) is False
+    assert process.signals == ["SIGTERM", "SIGKILL"]
+
+
+def test_interrupt_without_a_running_process_is_a_no_op() -> None:
+    ex = KimiExecutor(binary_path="kimi")
+
+    assert asyncio.run(ex.interrupt_session("s1")) is False
+
+    finished = _InterruptibleProcess(exits_on=None)
+    finished.returncode = 0
+    ex._active_process = finished  # type: ignore[assignment]
+    assert asyncio.run(ex.interrupt_session("s1")) is False
+    assert finished.signals == []
+
+
+def test_the_escalation_fits_the_adapter_interrupt_budget() -> None:
+    # The adapter gives an interrupt _INTERRUPT_SLICE_S before it moves on to
+    # the reap; an escalation that outlived that budget would be cut off
+    # mid-way and leave the process running.
+    from omnigent.runtime.harnesses._executor_adapter import _INTERRUPT_SLICE_S
+
+    total = kimi_executor._INTERRUPT_TERM_GRACE_S + kimi_executor._INTERRUPT_KILL_GRACE_S
+    assert total < _INTERRUPT_SLICE_S

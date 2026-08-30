@@ -85,6 +85,10 @@ from omnigent.inner.executor import (
 
 _logger = logging.getLogger(__name__)
 
+# Keep both grace periods inside the adapter's interrupt slice so reap still runs.
+_INTERRUPT_TERM_GRACE_S = 1.5
+_INTERRUPT_KILL_GRACE_S = 0.5
+
 # Per-line cap for the stdout StreamReader. Kimi emits whole messages (not
 # deltas), so a single JSONL line can be large; 16 MiB keeps a big file-read
 # tool result or long assistant message from overrunning asyncio's 64 KiB
@@ -565,20 +569,40 @@ class KimiExecutor(Executor):
         """
         self._session_id = None
 
-    async def interrupt_session(self, session_key: str) -> bool:  # noqa: ARG002 — best-effort process terminate
-        """Terminate the active kimi process, if any.
+    async def interrupt_session(self, session_key: str) -> bool:  # noqa: ARG002 — per-turn subprocess model
+        """Stop the active kimi process, and confirm that it stopped.
 
-        Returns True when a process was actually signalled. The next
-        ``run_turn`` will start a fresh process (and a fresh ``-S``
-        resume if the cached id is still valid).
+        Signalling is not stopping: a process that ignores ``SIGTERM`` keeps
+        producing the turn while its stream reader waits for more output, so
+        reporting success on the signal alone would claim a cancellation that
+        never happened. This waits for the exit, escalates to ``SIGKILL``, and
+        returns whether the process is actually gone. The whole sequence fits
+        inside the adapter's interrupt budget (``_INTERRUPT_SLICE_S``).
+
+        :param session_key: Inner session key (unused — the per-turn
+            subprocess model keeps one active process per executor).
+        :returns: ``True`` when no process is running any more, ``False`` when
+            one survived even the kill, so the caller can surface an
+            unconfirmed interrupt instead of a false idle.
         """
         process = self._active_process
         if process is None or process.returncode is not None:
             return False
         with contextlib.suppress(ProcessLookupError):
             process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=_INTERRUPT_TERM_GRACE_S)
             return True
-        return False
+        except asyncio.TimeoutError:
+            _logger.warning("kimi executor: process ignored SIGTERM; escalating to SIGKILL")
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=_INTERRUPT_KILL_GRACE_S)
+        except asyncio.TimeoutError:
+            _logger.error("kimi executor: process survived SIGKILL; interrupt unconfirmed")
+            return False
+        return True
 
     async def enqueue_session_message(
         self,
