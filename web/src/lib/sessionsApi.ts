@@ -382,6 +382,39 @@ export class ApiError extends Error {
   }
 }
 
+// Session creation may wait for a host wake or runner initialization, but it
+// must eventually return control to New Chat. Browser fetch has no default
+// deadline, so a connection lost mid-request otherwise leaves it loading forever.
+const SESSION_CREATE_TIMEOUT_MS = 5 * 60 * 1_000;
+const SESSION_CREATE_TIMEOUT_MESSAGE =
+  "Session creation timed out. Check the host or provider connection, then try again.";
+
+async function withSessionCreateTimeout<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(SESSION_CREATE_TIMEOUT_MESSAGE));
+      controller.abort();
+    }, SESSION_CREATE_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([operation(controller.signal), timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/** Send a session-create request with the shared host-startup deadline. */
+export function createSessionRequest(
+  input: RequestInfo | URL,
+  init: RequestInit,
+): Promise<Response> {
+  return withSessionCreateTimeout((signal) => authenticatedFetch(input, { ...init, signal }));
+}
+
 /**
  * Build an {@link ApiError} from a non-OK response, preferring the
  * server's `error.message` / `error.code` over the bare status line.
@@ -486,7 +519,7 @@ export async function createSession(
   if (options.title !== undefined) {
     body.title = options.title;
   }
-  const res = await authenticatedFetch("/v1/sessions", {
+  const res = await createSessionRequest("/v1/sessions", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
     body: JSON.stringify(body),
@@ -577,7 +610,7 @@ export async function createBundledSession(
   const form = new FormData();
   form.append("metadata", JSON.stringify(metadata));
   form.append("bundle", bundle);
-  const res = await authenticatedFetch("/v1/sessions", {
+  const res = await createSessionRequest("/v1/sessions", {
     method: "POST",
     headers: { "X-Omnigent-Client": getClientSurface() },
     body: form,

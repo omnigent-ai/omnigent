@@ -79,7 +79,6 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import { authenticatedFetch } from "@/lib/identity";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { isComposerSendKey, readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
@@ -246,7 +245,12 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { AgentRowTooltip } from "@/components/AgentHoverCard";
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
-import { createBundledSession, importLocalSessions, launchRunner } from "@/lib/sessionsApi";
+import {
+  createBundledSession,
+  createSessionRequest,
+  importLocalSessions,
+  launchRunner,
+} from "@/lib/sessionsApi";
 
 // Short picker-row blurbs — the spec descriptions are long paragraphs that
 // truncate badly in the dropdown; other dialogs keep the server values.
@@ -4126,7 +4130,7 @@ export function NewChatLandingScreen() {
                 item.parent_session_id == null &&
                 item.agent_id === effectiveAgentId &&
                 item.host_id === selectedHostId;
-        const createRequest = authenticatedFetch("/v1/sessions", {
+        const createRequest = createSessionRequest("/v1/sessions", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({

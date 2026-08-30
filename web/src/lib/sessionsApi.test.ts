@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   approve,
   bindOnlyOnlineRunner,
+  createBundledSession,
   createSession,
   fetchSessionItemsPage,
   forkSession,
@@ -188,6 +189,28 @@ describe("createSession", () => {
     await expect(createSession("missing")).rejects.toThrow(/404/);
   });
 
+  it("aborts and rejects when session creation never responds", async () => {
+    vi.useFakeTimers();
+    try {
+      let signal: AbortSignal | undefined;
+      fetchMock.mockImplementationOnce((_input: RequestInfo | URL, init?: RequestInit) => {
+        signal = init?.signal ?? undefined;
+        return new Promise<Response>(() => {});
+      });
+
+      const pending = createSession("agent_xyz");
+      const rejected = expect(pending).rejects.toThrow(
+        "Session creation timed out. Check the host or provider connection, then try again.",
+      );
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1_000);
+
+      await rejected;
+      expect(signal?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("forward-compat: reads queued_items from the snapshot when present", async () => {
     const queued = [{ type: "message", data: { role: "user", content: [] } }];
     fetchMock.mockResolvedValueOnce(
@@ -260,6 +283,31 @@ describe("createSession", () => {
 
     const session = await createSession("agent_xyz");
     expect(session.activeResponseId).toBeNull();
+  });
+});
+
+describe("createBundledSession", () => {
+  it("aborts and rejects when multipart session creation never responds", async () => {
+    vi.useFakeTimers();
+    try {
+      let signal: AbortSignal | undefined;
+      fetchMock.mockImplementationOnce((_input: RequestInfo | URL, init?: RequestInit) => {
+        signal = init?.signal ?? undefined;
+        return new Promise<Response>(() => {});
+      });
+
+      const bundle = new File(["bundle"], "agent.tar.gz", { type: "application/gzip" });
+      const pending = createBundledSession(bundle);
+      const rejected = expect(pending).rejects.toThrow(
+        "Session creation timed out. Check the host or provider connection, then try again.",
+      );
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1_000);
+
+      await rejected;
+      expect(signal?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
