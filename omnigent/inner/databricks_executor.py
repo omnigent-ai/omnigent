@@ -271,15 +271,10 @@ def databricks_bearer_token_command(
     When the caller knows a token command that already worked (the one ucode
     recorded, say), it runs last, once the named profile has yielded nothing.
 
-    **Ambient bearer.** ``DATABRICKS_BEARER`` may be a deliberate injection (a
-    CI/runner that already resolved a token for a profile that cannot mint
-    one) or a stale export lingering in the user's shell — the env var cannot
-    say which. So the configured profile is consulted first and the bearer
-    only backstops a profile that yields no token: a working ``auth login``
-    always wins over a possibly-dead ambient credential, while an injected
-    bearer still carries a mint-less environment. That first mint is bounded
-    (``--timeout``) and quiet, so a profile with no usable OAuth state fails
-    fast to the bearer instead of hanging on the CLI's interactive acquire.
+    **Ambient bearer.** Prefer the configured profile because
+    ``DATABRICKS_BEARER`` may be stale. Bound and silence that mint attempt so
+    a profile without usable OAuth state quickly falls back to the bearer,
+    preserving deliberately injected credentials in mint-less environments.
 
     :param host: Databricks workspace host, e.g.
         ``"https://example.databricks.com"``.
