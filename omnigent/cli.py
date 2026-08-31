@@ -3570,6 +3570,8 @@ class _CliRunnerProcess:
         ``"runner_0123456789abcdef"``.
     :param tunnel_token: Secret token that binds the tunnel to
         ``runner_id``, e.g. ``"uA6Zz..."``.
+    :param log_path: Captured runner log file when the process was
+        started with ``capture_logs=True``; ``None`` otherwise.
     """
 
     proc: subprocess.Popen[bytes]

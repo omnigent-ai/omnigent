@@ -88,9 +88,49 @@ logger = logging.getLogger(__name__)
 # freshly-launched ``omnigent run`` sessions don't burn a
 # fixed 500 ms before noticing the server is ready, then back off
 # slightly while still remaining responsive on slower cold starts.
+# Boots that outlive the slow window are cold starts on a loaded
+# machine where sub-100ms detection no longer matters; polling drops
+# to the slow interval so many concurrent boots (e2e shards) don't
+# starve each other with probe traffic.
 _SERVER_READY_INITIAL_POLL_SECONDS = 0.05
 _SERVER_READY_BACKOFF_POLL_SECONDS = 0.1
 _SERVER_READY_FAST_POLL_WINDOW_SECONDS = 1.0
+_SERVER_READY_SLOW_POLL_WINDOW_SECONDS = 5.0
+_SERVER_READY_SLOW_POLL_SECONDS = 0.5
+
+
+def _server_ready_poll_interval(elapsed: float) -> float:
+    """
+    Choose the readiness-probe sleep for a boot *elapsed* seconds in.
+
+    Three tiers: probe aggressively inside the fast window (a healthy
+    boot becomes ready within a second and should be noticed at once),
+    back off slightly through the slow window, then settle at the slow
+    interval. Each ``httpx.get`` probe costs real CPU (a fresh client +
+    transport per call), so a boot that is *already* slow — a loaded CI
+    box running several boots at once — must not keep probing at 10Hz
+    and steal cycles from the very server process it is waiting on.
+
+    :param elapsed: Seconds since polling began, e.g. ``2.5``.
+    :returns: Seconds to sleep before the next probe.
+    """
+    if elapsed < _SERVER_READY_FAST_POLL_WINDOW_SECONDS:
+        return _SERVER_READY_INITIAL_POLL_SECONDS
+    if elapsed < _SERVER_READY_SLOW_POLL_WINDOW_SECONDS:
+        return _SERVER_READY_BACKOFF_POLL_SECONDS
+    return _SERVER_READY_SLOW_POLL_SECONDS
+
+
+# The local-boot budget: how long ``omnigent run`` waits for its own
+# spawned server + runner before giving up. This is a last-resort
+# guard against a genuinely wedged boot, so it must sit ABOVE every
+# consumer-facing launch budget (the REPL e2e tests hold boot to
+# 60-120s) — otherwise a merely-slow boot on a loaded machine is
+# killed by this internal budget first and reported as a hard
+# "Server failed to start", turning boot starvation into a spurious
+# failure. Matches the 120s launch budget the REPL e2e tests hold
+# boot to (tests/e2e/test_repl_approval_e2e.py::_LAUNCH_TIMEOUT).
+_LOCAL_BOOT_TIMEOUT_SECONDS = 120.0
 
 # Remote ``--server`` runners are disposable subprocesses created for
 # the CLI session. A one-second grace gives SIGTERM enough time to
@@ -223,12 +263,16 @@ class LocalServer:
         sibling of the server by :func:`_start_local_server`.
         ``None`` when no runner was started (shouldn't happen in
         normal operation).
+    :param runner_log_path: Captured runner log file, the durable
+        record of a runner crash-at-spawn. ``None`` when the runner
+        was not started with log capture.
     """
 
     proc: subprocess.Popen[bytes]
     log_path: Path
     runner_id: str | None = None
     runner_proc: subprocess.Popen[bytes] | None = None
+    runner_log_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -1972,33 +2016,33 @@ def _poll_remote_runner(
     status_url = f"{base_url}/v1/runners/{runner_id}/status"
     last_error: httpx.HTTPError | None = None
     last_status: int | None = None
-    while time.monotonic() < deadline:
-        if runner_proc.poll() is not None:
-            raise click.ClickException(
-                f"Local runner exited early with code {runner_proc.returncode}."
-                f"{format_runner_log_tail(log_path)}"
-            )
-        try:
-            resp = httpx.get(status_url, headers=headers, timeout=2.0)
-            if resp.status_code == 200 and resp.json().get("online") is True:
-                return
-            last_status = resp.status_code
-            if resp.status_code in {401, 403}:
+    # One client for the whole wait: constructing a fresh client (and
+    # its transport/SSL context) per probe costs CPU each probe, which
+    # at the fast poll rate steals cycles from the booting runner this
+    # loop is waiting on. Ambient proxy env stays honored (trust_env
+    # default) because the server here is remote, not loopback.
+    with httpx.Client(headers=headers, timeout=2.0) as client:
+        while time.monotonic() < deadline:
+            if runner_proc.poll() is not None:
                 raise click.ClickException(
-                    f"Remote runner status check was rejected ({resp.status_code}); "
-                    f"run `{cli_invocation()} login <server-url>` "
-                    "or check remote auth credentials."
+                    f"Local runner exited early with code {runner_proc.returncode}."
                     f"{format_runner_log_tail(log_path)}"
                 )
-        except httpx.HTTPError as exc:
-            last_error = exc
-        elapsed = time.monotonic() - start
-        poll_interval = (
-            _SERVER_READY_INITIAL_POLL_SECONDS
-            if elapsed < _SERVER_READY_FAST_POLL_WINDOW_SECONDS
-            else _SERVER_READY_BACKOFF_POLL_SECONDS
-        )
-        time.sleep(poll_interval)
+            try:
+                resp = client.get(status_url)
+                if resp.status_code == 200 and resp.json().get("online") is True:
+                    return
+                last_status = resp.status_code
+                if resp.status_code in {401, 403}:
+                    raise click.ClickException(
+                        f"Remote runner status check was rejected ({resp.status_code}); "
+                        f"run `{cli_invocation()} login <server-url>` "
+                        "or check remote auth credentials."
+                        f"{format_runner_log_tail(log_path)}"
+                    )
+            except httpx.HTTPError as exc:
+                last_error = exc
+            time.sleep(_server_ready_poll_interval(time.monotonic() - start))
     detail = ""
     if last_status is not None:
         detail = f" Last status check returned HTTP {last_status}."
@@ -3668,10 +3712,13 @@ def _start_local_server(
         log_path=log_path,
         runner_id=runner_id,
         runner_proc=runner.proc,
+        runner_log_path=runner.log_path,
     )
 
 
-def _wait_for_server(port: int, server: LocalServer, timeout: float = 45.0) -> None:
+def _wait_for_server(
+    port: int, server: LocalServer, timeout: float = _LOCAL_BOOT_TIMEOUT_SECONDS
+) -> None:
     """
     Poll until the server responds.
 
@@ -3685,30 +3732,43 @@ def _wait_for_server(port: int, server: LocalServer, timeout: float = 45.0) -> N
     base_url = f"http://127.0.0.1:{port}"
     start = time.monotonic()
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if server.proc.poll() is not None:
-            _raise_server_failed(server)
-        try:
-            resp = httpx.get(f"{base_url}/health", timeout=2.0)
-            if resp.status_code == 200:
-                runner_id = server.runner_id
-                if runner_id is None:
-                    return
-                runner_resp = httpx.get(
-                    f"{base_url}/v1/runners/{runner_id}/status",
-                    timeout=2.0,
+    # One client for the whole wait: constructing a fresh client (and
+    # its transport/SSL context) per probe costs ~20ms of CPU each,
+    # which at the fast poll rate becomes a significant share of a
+    # loaded machine's cycles — stolen from the very server/runner
+    # processes this loop is waiting on.
+    with httpx.Client(base_url=base_url, timeout=2.0, trust_env=False) as client:
+        while time.monotonic() < deadline:
+            if server.proc.poll() is not None:
+                _raise_server_failed(server)
+            runner_proc = server.runner_proc
+            if runner_proc is not None and runner_proc.poll() is not None:
+                # The sibling runner died; without this check the loop
+                # waits out the full boot budget before failing with a
+                # generic message that blames the (healthy) server.
+                from omnigent._runner_startup import format_runner_log_tail
+
+                raise click.ClickException(
+                    f"Local runner exited early with code {runner_proc.returncode} "
+                    f"while waiting for the server to become ready.\n"
+                    f"  Server log:  {server.log_path}"
+                    f"{format_runner_log_tail(server.runner_log_path)}"
                 )
-                if runner_resp.status_code == 200 and runner_resp.json()["online"] is True:
-                    return
-        except httpx.ConnectError:
-            pass
-        elapsed = time.monotonic() - start
-        poll_interval = (
-            _SERVER_READY_INITIAL_POLL_SECONDS
-            if elapsed < _SERVER_READY_FAST_POLL_WINDOW_SECONDS
-            else _SERVER_READY_BACKOFF_POLL_SECONDS
-        )
-        time.sleep(poll_interval)
+            try:
+                resp = client.get("/health")
+                if resp.status_code == 200:
+                    runner_id = server.runner_id
+                    if runner_id is None:
+                        return
+                    runner_resp = client.get(f"/v1/runners/{runner_id}/status")
+                    if runner_resp.status_code == 200 and runner_resp.json().get("online") is True:
+                        return
+            except httpx.TransportError:
+                # Refused connects AND transient timeouts (a loaded boot
+                # can be slow to accept) ride the retry loop instead of
+                # aborting the whole wait.
+                pass
+            time.sleep(_server_ready_poll_interval(time.monotonic() - start))
     _raise_server_failed(server)
 
 

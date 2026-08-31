@@ -20,6 +20,11 @@ what to look for, and why it's wrong.
   machine and flakes in CI where that var is exported.
 - **No order-dependence / shared mutable state** across tests — a test that only
   passes after another ran, or mutates a module/global without restoring it.
+- **Subprocess-boot tests must strip runner-scoped ambient env.** A test that
+  spawns a fresh `omnigent` boot (REPL/server/runner) and passes `**os.environ`
+  inherits `OMNIGENT_RUNNER_*` / `RUNNER_SERVER_URL` when run inside a hosted
+  Omnigent runner, silently rewiring the boot it was supposed to perform from
+  scratch. Strip every runner-scoped variable in the child env.
 
 ## UI / affordances
 

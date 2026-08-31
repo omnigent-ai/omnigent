@@ -76,6 +76,16 @@ _ASGIApp: TypeAlias = ASGIApp
 # while still backing off enough not to hammer a slow server.
 _INITIAL_RECONNECT_DELAY_S = 0.5
 _MAX_RECONNECT_DELAY_S = 10.0
+# Before the FIRST successful upgrade the peer is almost always a
+# sibling server still booting (connection refused), and the parent
+# CLI is blocked on this runner coming online. A refused TCP connect
+# costs the server nothing, so retry often: letting the backoff
+# escalate to the 10 s cap here leaves a multi-second dead tail
+# between "server finally ready" and "runner notices", which under
+# load is the difference between a boot fitting its launch budget
+# and starving past it. The cap applies pre-jitter: ±50% jitter can
+# stretch an individual boot-phase sleep to ~3 s.
+_MAX_INITIAL_CONNECT_DELAY_S = 2.0
 _RECONNECT_JITTER_FRACTION = 0.5
 _FATAL_SERVER_CLOSE_CODES = {4001, 4002, 4004, 4500}
 # Both 401 and 403 are treated as refreshable: the server may return 403
@@ -549,8 +559,12 @@ async def serve_tunnel(
         # Match the host tunnel (connect.py): escalate the backoff only on
         # non-recycle failures. A routine ingress recycle keeps reconnecting
         # promptly at the base delay instead of doubling toward the cap.
+        # Cap the boot-phase backoff lower: until the first successful
+        # upgrade, the failure mode is a sibling server still booting,
+        # and the parent CLI's launch budget is burning.
         if not recycle:
-            delay_s = min(delay_s * 2, _MAX_RECONNECT_DELAY_S)
+            cap = _MAX_RECONNECT_DELAY_S if ever_connected else _MAX_INITIAL_CONNECT_DELAY_S
+            delay_s = min(delay_s * 2, cap)
 
 
 def _invalidate_auth_token_factory(factory: Callable[[], str | None] | None) -> bool:

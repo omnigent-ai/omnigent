@@ -18,6 +18,8 @@ from omnigent.chat import (
     _SERVER_READY_BACKOFF_POLL_SECONDS,
     _SERVER_READY_FAST_POLL_WINDOW_SECONDS,
     _SERVER_READY_INITIAL_POLL_SECONDS,
+    _SERVER_READY_SLOW_POLL_SECONDS,
+    _SERVER_READY_SLOW_POLL_WINDOW_SECONDS,
     ChatOverrides,
     _apply_overrides_to_raw,
     _chat_via_daemon,
@@ -33,6 +35,7 @@ from omnigent.chat import (
     _query_sessions_once,
     _raise_server_failed,
     _remote_headers,
+    _server_ready_poll_interval,
     _spec_used_families,
     _start_local_server,
     _validate_agent_spec,
@@ -237,6 +240,7 @@ def test_wait_for_server_uses_fast_poll_before_backoff(
     server = SimpleNamespace(
         proc=SimpleNamespace(poll=lambda: None),
         runner_id=None,
+        runner_proc=SimpleNamespace(poll=lambda: None),
         log_path=Path("/tmp/server.log"),
     )
     monotonic_values = iter(
@@ -253,17 +257,29 @@ def test_wait_for_server_uses_fast_poll_before_backoff(
         """Record each poll interval the helper chooses."""
         sleep_calls.append(seconds)
 
-    def _fake_get(url: str, timeout: float) -> _Resp:
-        """Fail twice, then report ready on the third probe."""
-        del url, timeout
-        http_calls["count"] += 1
-        if http_calls["count"] < 3:
-            raise __import__("httpx").ConnectError("not ready")
-        return _Resp(200)
+    class _FakeClient:
+        """Client stub: fail twice, then report ready on the third probe."""
+
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> _FakeClient:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def get(self, path: str) -> _Resp:
+            """Fail twice, then report ready."""
+            del path
+            http_calls["count"] += 1
+            if http_calls["count"] < 3:
+                raise httpx.ConnectError("not ready")
+            return _Resp(200)
 
     monkeypatch.setattr("omnigent.chat.time.monotonic", _fake_monotonic)
     monkeypatch.setattr("omnigent.chat.time.sleep", _fake_sleep)
-    monkeypatch.setattr("omnigent.chat.httpx.get", _fake_get)
+    monkeypatch.setattr("omnigent.chat.httpx.Client", _FakeClient)
 
     _wait_for_server(8123, server, timeout=5.0)
 
@@ -277,6 +293,56 @@ def test_wait_for_server_uses_fast_poll_before_backoff(
     )
     assert _SERVER_READY_INITIAL_POLL_SECONDS < _SERVER_READY_BACKOFF_POLL_SECONDS
     assert _SERVER_READY_FAST_POLL_WINDOW_SECONDS == 1.0
+
+
+def test_server_ready_poll_interval_slows_down_on_cold_boots() -> None:
+    """
+    Readiness probing must relax for boots that outlive the slow window.
+
+    A boot that is already several seconds in is a cold start on a
+    loaded machine; probing it at 10Hz steals CPU from the very
+    server/runner processes the loop is waiting on (each probe costs
+    real cycles), which under concurrent e2e shard load compounds into
+    boot starvation. The three-tier schedule keeps sub-second boots
+    snappy while easing off on the slow tail.
+    """
+    assert _server_ready_poll_interval(0.0) == _SERVER_READY_INITIAL_POLL_SECONDS, (
+        "sub-window probes must stay aggressive for fast boots"
+    )
+    assert (
+        _server_ready_poll_interval(_SERVER_READY_FAST_POLL_WINDOW_SECONDS)
+        == _SERVER_READY_BACKOFF_POLL_SECONDS
+    ), "past the fast window the probe interval must back off"
+    assert (
+        _server_ready_poll_interval(_SERVER_READY_SLOW_POLL_WINDOW_SECONDS)
+        == _SERVER_READY_SLOW_POLL_SECONDS
+    ), "a boot slower than the slow window must be probed gently"
+    assert (
+        _SERVER_READY_INITIAL_POLL_SECONDS
+        < _SERVER_READY_BACKOFF_POLL_SECONDS
+        < _SERVER_READY_SLOW_POLL_SECONDS
+    )
+
+
+def test_local_boot_budget_covers_consumer_launch_budgets() -> None:
+    """
+    The CLI's internal local-boot budget must not undercut its consumers.
+
+    The REPL e2e tests hold ``omnigent run`` boot to a 60-120s launch
+    budget. When ``_wait_for_server``'s default timeout sat below that
+    (45s), a merely-slow boot on a loaded machine was killed by the
+    internal budget first and misreported as a hard "Server failed to
+    start" — boot starvation counted as failure. The internal budget is
+    a last-resort wedge guard, so it must sit at or above every
+    consumer-facing launch budget.
+    """
+    import inspect
+
+    default_timeout = inspect.signature(_wait_for_server).parameters["timeout"].default
+    assert default_timeout >= 120.0, (
+        "the internal local-boot budget must cover the slowest consumer "
+        "launch budget (the REPL e2e tests wait up to 120s for boot)"
+    )
 
 
 def test_raise_server_failed_truncates_log_to_tail(tmp_path: Path) -> None:
@@ -371,6 +437,7 @@ def test_wait_for_server_waits_for_runner_tunnel_status(
     server = SimpleNamespace(
         proc=SimpleNamespace(poll=lambda: None),
         runner_id="runner_wait_test",
+        runner_proc=SimpleNamespace(poll=lambda: None),
         log_path=Path("/tmp/server.log"),
     )
     monotonic_values = iter([0.0, 0.0, 0.2, 0.2, 0.3])
@@ -386,19 +453,31 @@ def test_wait_for_server_waits_for_runner_tunnel_status(
         """Record the poll interval chosen while runner is offline."""
         sleep_calls.append(seconds)
 
-    def _fake_get(url: str, timeout: float) -> _Resp:
-        """Report server readiness immediately but runner online later."""
-        del timeout
-        requested_urls.append(url)
-        if url.endswith("/health"):
-            return _Resp(200)
-        if url.endswith("/v1/runners/runner_wait_test/status"):
-            return _Resp(200, next(status_bodies))
-        raise AssertionError(f"unexpected URL: {url}")
+    class _FakeClient:
+        """Client stub reporting server ready immediately, runner later."""
+
+        def __init__(self, *, base_url: str = "", **_kwargs: object) -> None:
+            self._base_url = base_url
+
+        def __enter__(self) -> _FakeClient:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def get(self, path: str) -> _Resp:
+            """Report server readiness immediately but runner online later."""
+            url = self._base_url + path
+            requested_urls.append(url)
+            if url.endswith("/health"):
+                return _Resp(200)
+            if url.endswith("/v1/runners/runner_wait_test/status"):
+                return _Resp(200, next(status_bodies))
+            raise AssertionError(f"unexpected URL: {url}")
 
     monkeypatch.setattr("omnigent.chat.time.monotonic", _fake_monotonic)
     monkeypatch.setattr("omnigent.chat.time.sleep", _fake_sleep)
-    monkeypatch.setattr("omnigent.chat.httpx.get", _fake_get)
+    monkeypatch.setattr("omnigent.chat.httpx.Client", _FakeClient)
 
     _wait_for_server(8123, server, timeout=5.0)
 
@@ -409,6 +488,132 @@ def test_wait_for_server_waits_for_runner_tunnel_status(
         "http://127.0.0.1:8123/health",
         "http://127.0.0.1:8123/v1/runners/runner_wait_test/status",
     ]
+
+
+def test_wait_for_server_retries_through_transient_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A probe timeout must ride the retry loop, not abort the wait.
+
+    A loaded boot can accept the TCP connect and then be too slow to
+    answer within the probe timeout; ``httpx`` raises ``ReadTimeout``
+    (a ``TransportError`` that is *not* a ``ConnectError``). Treating
+    that as fatal turns a merely-slow boot into a hard failure.
+    """
+
+    class _Resp:
+        """Minimal response stub exposing ``status_code``."""
+
+        def __init__(self, status_code: int) -> None:
+            self.status_code = status_code
+
+    server = SimpleNamespace(
+        proc=SimpleNamespace(poll=lambda: None),
+        runner_id=None,
+        runner_proc=SimpleNamespace(poll=lambda: None),
+        log_path=Path("/tmp/server.log"),
+    )
+    http_calls = {"count": 0}
+
+    class _FakeClient:
+        """Client stub: time out twice, then report ready."""
+
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> _FakeClient:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def get(self, path: str) -> _Resp:
+            """Raise ReadTimeout twice, then report ready."""
+            del path
+            http_calls["count"] += 1
+            if http_calls["count"] < 3:
+                raise httpx.ReadTimeout("probe timed out")
+            return _Resp(200)
+
+    monkeypatch.setattr("omnigent.chat.time.monotonic", lambda: 0.0)
+    monkeypatch.setattr("omnigent.chat.time.sleep", lambda _s: None)
+    monkeypatch.setattr("omnigent.chat.httpx.Client", _FakeClient)
+
+    _wait_for_server(8123, server, timeout=5.0)
+
+    assert http_calls["count"] == 3, (
+        "Expected the wait loop to retry through transient probe "
+        "timeouts until the server reports ready."
+    )
+
+
+def test_wait_for_server_fails_fast_when_runner_dies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A dead sibling runner must fail the wait immediately.
+
+    Without this, a runner that crashes at spawn leaves the loop
+    polling a healthy server (whose runner will never come online)
+    for the full boot budget, then blames the server generically.
+    """
+
+    class _Resp:
+        """Minimal response stub exposing status and JSON body."""
+
+        def __init__(self, status_code: int, body: dict[str, bool] | None = None) -> None:
+            self.status_code = status_code
+            self._body = body
+
+        def json(self) -> dict[str, bool]:
+            """Return the scripted response body."""
+            assert self._body is not None
+            return self._body
+
+    server = SimpleNamespace(
+        proc=SimpleNamespace(poll=lambda: None),
+        runner_id="runner_dead_test",
+        runner_proc=SimpleNamespace(poll=lambda: 1, returncode=1),
+        log_path=Path("/tmp/server.log"),
+        runner_log_path=Path("/tmp/runner-dead.log"),
+    )
+
+    class _FakeClient:
+        """Healthy server whose runner never reports online."""
+
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> _FakeClient:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def get(self, path: str) -> _Resp:
+            """Report the server healthy but the runner offline."""
+            if path.endswith("/health"):
+                return _Resp(200)
+            return _Resp(200, {"online": False})
+
+    clock = {"now": 0.0}
+
+    def _advancing_monotonic() -> float:
+        """Advance so the wait's deadline eventually passes."""
+        clock["now"] += 0.1
+        return clock["now"]
+
+    monkeypatch.setattr("omnigent.chat.time.monotonic", _advancing_monotonic)
+    monkeypatch.setattr("omnigent.chat.time.sleep", lambda _s: None)
+    monkeypatch.setattr("omnigent.chat.httpx.Client", _FakeClient)
+
+    with pytest.raises(click.ClickException, match="runner exited early with code 1") as exc_info:
+        _wait_for_server(8123, server, timeout=5.0)
+    # The runner's own captured log is the durable record of a
+    # crash-at-spawn, so the error must point at it, not only at the
+    # (healthy) server's log.
+    assert "/tmp/runner-dead.log" in exc_info.value.message
 
 
 def test_start_local_server_spawns_runner_as_sibling(
@@ -549,15 +754,27 @@ def test_wait_for_remote_runner_uses_status_endpoint_and_auth(
         """Record the chosen poll interval."""
         sleep_calls.append(seconds)
 
-    def _fake_get(url: str, *, headers: dict[str, str], timeout: float) -> _Resp:
-        """Return offline once, then online."""
-        del timeout
-        requested.append((url, headers))
-        return _Resp(next(status_bodies))
+    class _FakeClient:
+        """Shared-client stub recording each status probe with its headers."""
+
+        def __init__(self, *, headers: dict[str, str], timeout: float) -> None:
+            del timeout
+            self._headers = headers
+
+        def __enter__(self) -> _FakeClient:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def get(self, url: str) -> _Resp:
+            """Return offline once, then online."""
+            requested.append((url, self._headers))
+            return _Resp(next(status_bodies))
 
     monkeypatch.setattr("omnigent.chat.time.monotonic", _fake_monotonic)
     monkeypatch.setattr("omnigent.chat.time.sleep", _fake_sleep)
-    monkeypatch.setattr("omnigent.chat.httpx.get", _fake_get)
+    monkeypatch.setattr("omnigent.chat.httpx.Client", _FakeClient)
 
     _wait_for_remote_runner(
         "https://example.databricksapps.com",
@@ -603,18 +820,24 @@ def test_wait_for_remote_runner_fails_loud_on_auth_rejection(
 
     proc = SimpleNamespace(poll=lambda: None, returncode=None)
 
-    def _fake_get(url: str, *, headers: dict[str, str], timeout: float) -> _Resp:
-        """Return an auth rejection for the status endpoint.
+    class _FakeClient:
+        """Client stub returning an auth rejection for the status endpoint."""
 
-        :param url: Status endpoint URL.
-        :param headers: Auth headers passed by the caller.
-        :param timeout: Per-request timeout.
-        :returns: A 401 response.
-        """
-        del url, headers, timeout
-        return _Resp()
+        def __init__(self, **_kwargs: object) -> None:
+            pass
 
-    monkeypatch.setattr("omnigent.chat.httpx.get", _fake_get)
+        def __enter__(self) -> _FakeClient:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def get(self, url: str) -> _Resp:
+            """Return a 401 response."""
+            del url
+            return _Resp()
+
+    monkeypatch.setattr("omnigent.chat.httpx.Client", _FakeClient)
 
     with pytest.raises(click.ClickException, match="status check was rejected \\(401\\)"):
         _wait_for_remote_runner(
@@ -676,12 +899,26 @@ def test_wait_for_remote_runner_timeout_surfaces_log_path(
         """
         return next(monotonic_values)
 
+    class _FakeClient:
+        """Client stub whose probes always report the runner offline."""
+
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> _FakeClient:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def get(self, url: str) -> _Resp:
+            """Return an offline status response."""
+            del url
+            return _Resp()
+
     monkeypatch.setattr("omnigent.chat.time.monotonic", _fake_monotonic)
     monkeypatch.setattr("omnigent.chat.time.sleep", lambda _s: None)
-    monkeypatch.setattr(
-        "omnigent.chat.httpx.get",
-        lambda *_a, **_k: _Resp(),
-    )
+    monkeypatch.setattr("omnigent.chat.httpx.Client", _FakeClient)
 
     with pytest.raises(click.ClickException) as exc_info:
         _wait_for_remote_runner(
@@ -731,14 +968,26 @@ def test_wait_for_remote_runner_early_exit_surfaces_log_path(
     monkeypatch.setattr("omnigent.chat.time.monotonic", lambda: 0.0)
     monkeypatch.setattr("omnigent.chat.time.sleep", lambda _s: None)
 
-    def _fake_get(*_a, **_k):
-        """Status probe never invoked because the runner is dead.
+    class _FakeClient:
+        """Client stub that must never be probed: the runner is dead."""
 
-        :raises AssertionError: If the poll loop reaches httpx.
-        """
-        raise AssertionError("should not reach httpx when runner already exited")
+        def __init__(self, **_kwargs: object) -> None:
+            pass
 
-    monkeypatch.setattr("omnigent.chat.httpx.get", _fake_get)
+        def __enter__(self) -> _FakeClient:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def get(self, url: str) -> object:
+            """Fail the test if the poll loop reaches httpx.
+
+            :raises AssertionError: Always.
+            """
+            raise AssertionError("should not reach httpx when runner already exited")
+
+    monkeypatch.setattr("omnigent.chat.httpx.Client", _FakeClient)
 
     with pytest.raises(click.ClickException) as exc_info:
         _wait_for_remote_runner(

@@ -236,6 +236,135 @@ async def test_serve_tunnel_resets_backoff_after_successful_connection(
 
 
 @pytest.mark.asyncio
+async def test_serve_tunnel_caps_backoff_low_until_first_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Before the first successful upgrade the backoff must stay small.
+
+    During boot the peer is a sibling server still starting (connection
+    refused) and the parent CLI's launch budget is burning while it
+    waits for this runner to come online. Escalating to the full 10s
+    reconnect cap in that phase leaves a multi-second dead tail between
+    "server ready" and "runner notices" — under load that tail is the
+    difference between a boot fitting its launch budget and starving
+    past it. A refused TCP connect costs the server nothing, so the
+    boot-phase cap is deliberately low.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    attempts = {"count": 0}
+    sleeps: list[float] = []
+
+    async def _serve_once(*_args: Any, **_kwargs: Any) -> None:
+        """Refuse the connection until the test has seen enough retries.
+
+        :raises ConnectionError: While the fake server is "booting".
+        :raises asyncio.CancelledError: To end the test afterwards.
+        """
+        attempts["count"] += 1
+        if attempts["count"] <= 8:
+            raise ConnectionError("connection refused — server still booting")
+        raise asyncio.CancelledError
+
+    async def _sleep(delay: float) -> None:
+        """Record reconnect delays without waiting.
+
+        :param delay: Delay passed to ``asyncio.sleep``.
+        :returns: None.
+        """
+        sleeps.append(delay)
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+    # Pin jitter to 0 so sleep delays are the unjittered backoff curve.
+    monkeypatch.setattr(serve_module.random, "uniform", lambda *_args, **_kw: 0.0)
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_boot_backoff_cap",
+            runner_version="0.1.0",
+        )
+
+    assert sleeps, "expected reconnect sleeps while the server was 'booting'"
+    # Pin the boot-phase cap literally: this delay is a consumer-facing
+    # boot-latency contract (a runner must notice "server ready" within
+    # ~2s), so a drifted constant should fail loudly, not be re-derived.
+    cap = serve_module._MAX_INITIAL_CONNECT_DELAY_S
+    assert cap == 2.0
+    assert all(delay <= cap for delay in sleeps), (
+        f"boot-phase reconnect backoff exceeded the initial-connect cap {cap}s: {sleeps}"
+    )
+    # The escalation must actually reach (and hold at) the boot cap,
+    # not the full 10s reconnect cap.
+    assert sleeps[-1] == cap
+    assert cap < serve_module._MAX_RECONNECT_DELAY_S
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_releases_boot_backoff_cap_after_first_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After the first successful upgrade the backoff may escalate past 2s.
+
+    The low boot-phase cap exists only while the sibling server is
+    still starting. Once a connection has succeeded, reconnect storms
+    must be allowed to back off toward the full 10s cap — holding the
+    2s cap forever would hammer a struggling server.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    outcomes = iter(["clean"] + ["error"] * 6 + ["stop"])
+    sleeps: list[float] = []
+
+    async def _serve_once(*_args: Any, on_connected: Any = None, **_kwargs: Any) -> None:
+        """Connect once cleanly, then fail repeatedly.
+
+        :raises ConnectionError: On the post-connect attempts.
+        :raises asyncio.CancelledError: To end the test afterwards.
+        """
+        outcome = next(outcomes)
+        if outcome == "clean":
+            if on_connected is not None:
+                on_connected()
+            return
+        if outcome == "stop":
+            raise asyncio.CancelledError
+        raise ConnectionError("post-connect outage")
+
+    async def _sleep(delay: float) -> None:
+        """Record reconnect delays without waiting.
+
+        :param delay: Delay passed to ``asyncio.sleep``.
+        :returns: None.
+        """
+        sleeps.append(delay)
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+    # Pin jitter to 0 so sleep delays are the unjittered backoff curve.
+    monkeypatch.setattr(serve_module.random, "uniform", lambda *_args, **_kw: 0.0)
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_boot_cap_release",
+            runner_version="0.1.0",
+        )
+
+    # Once connected, escalation walks past the 2s boot cap to the
+    # full reconnect cap: 0.5 -> 1 -> 2 -> 4 -> 8 -> 10 (held).
+    assert max(sleeps) > serve_module._MAX_INITIAL_CONNECT_DELAY_S, (
+        f"post-connect backoff never released past the boot cap: {sleeps}"
+    )
+    assert max(sleeps) <= serve_module._MAX_RECONNECT_DELAY_S
+
+
+@pytest.mark.asyncio
 async def test_serve_tunnel_fails_loud_on_protocol_rejection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
