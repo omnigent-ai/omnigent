@@ -5136,58 +5136,6 @@ def create_runner_app(
             },
         )
 
-    async def _apply_claude_native_plan_verdict(
-        conv_id: str,
-        data: Mapping[str, object],
-    ) -> None:
-        """
-        Key a web-UI plan verdict into Claude Code's plan-review dialog.
-
-        Claude Code ignores a ``PermissionRequest`` hook's ``allow`` for
-        ``ExitPlanMode``, so a plan approved in the web UI never reaches the
-        pane and the session stays parked on the TUI dialog. Best-effort:
-        :func:`inject_plan_verdict` no-ops unless that dialog is on screen,
-        so a non-plan verdict (or one already answered in the terminal)
-        presses nothing.
-
-        :param conv_id: Session/conversation identifier, e.g.
-            ``"conv_abc123"``.
-        :param data: The approval payload, e.g.
-            ``{"elicitation_id": "elicit_claude_ab12", "action": "accept",
-            "content": {"allow_all_edits": True}}``.
-        :returns: None.
-        """
-        from omnigent.claude_native_bridge import (
-            bridge_dir_for_bridge_id,
-            inject_plan_verdict,
-        )
-
-        content = data.get("content")
-        if data.get("action") != "accept":
-            verdict = "reject"
-        elif isinstance(content, dict) and content.get("allow_all_edits") is True:
-            verdict = "auto"
-        else:
-            verdict = "manual"
-        try:
-            bridge_id = await _claude_native_bridge_id_for_session(
-                server_client=server_client,
-                session_id=conv_id,
-            )
-            # Short timeout: a missing tmux.json means no pane to answer.
-            await asyncio.to_thread(
-                inject_plan_verdict,
-                bridge_dir_for_bridge_id(bridge_id),
-                verdict=verdict,
-                timeout_s=1.0,
-            )
-        except Exception:  # noqa: BLE001 — best-effort; TUI can still answer
-            _logger.debug(
-                "claude-native plan verdict not applied",
-                exc_info=True,
-                extra={"session_id": conv_id},
-            )
-
     async def _handle_cursor_native_model_change(
         conv_id: str,
         model: str | None,
@@ -8099,8 +8047,6 @@ def create_runner_app(
             _data = body.get("data") or body
             _elicit_action = _data.get("action", "")
             pending_approvals.resolve(_data.get("elicitation_id", ""), _elicit_action == "accept")
-            if _session_harness_name(conversation_id) == "claude-native":
-                await _apply_claude_native_plan_verdict(conversation_id, _data)
             if _elicit_action == "decline":
                 try:
                     _int_client = await process_manager.get_client(conversation_id, "any")

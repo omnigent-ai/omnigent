@@ -1307,6 +1307,12 @@ async def test_permission_request_hook_surfaces_exit_plan_mode_input(
     # without the allow_all_edits flag.
     assert resp.json()["hookSpecificOutput"]["decision"] == {
         "behavior": "allow",
+        # ExitPlanMode is a requiresUserInteraction tool: Claude Code coerces a
+        # bare allow back to an interactive prompt unless the decision echoes
+        # ``updatedInput``. It mirrors the model's own tool_input (a no-op to
+        # the plan), and its presence is what lets a web-UI approval exit plan
+        # mode with no TUI keystroke.
+        "updatedInput": payload["tool_input"],
         "updatedPermissions": [{"type": "setMode", "mode": "default", "destination": "session"}],
     }
 
@@ -1369,6 +1375,9 @@ async def test_permission_request_hook_exit_plan_mode_auto_accept_round_trip(
     assert decision["updatedPermissions"] == [
         {"type": "setMode", "mode": "auto", "destination": "session"}
     ]
+    # updatedInput rides along on the auto path too — the requiresUserInteraction
+    # escape hatch is mode-independent.
+    assert decision["updatedInput"] == payload["tool_input"]
 
 
 async def test_permission_request_hook_decline_forwards_feedback_message(
