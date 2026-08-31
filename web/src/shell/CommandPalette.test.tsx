@@ -37,12 +37,18 @@ function renderPalette(overrides: Partial<ComponentProps<typeof CommandPalette>>
   const props = {
     open: true,
     onOpenChange: vi.fn(),
+    mode: "commands" as const,
     onToggleLeftSidebar: vi.fn(),
     onToggleRightSidebar: vi.fn(),
     ...overrides,
   };
   render(<CommandPalette {...props} />);
   return props;
+}
+
+/** Sessions mode — what ⌘⇧F opens. */
+function renderSearch(overrides: Partial<ComponentProps<typeof CommandPalette>> = {}) {
+  return renderPalette({ mode: "sessions", ...overrides });
 }
 
 beforeEach(() => {
@@ -52,10 +58,10 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
-describe("CommandPalette — sessions", () => {
+describe("CommandPalette — sessions mode", () => {
   it("lists sessions by display label with their agent type", () => {
     setSessions([conv("c1", "Fix the parser", "research-agent"), conv("c2", null)]);
-    renderPalette();
+    renderSearch();
 
     expect(screen.getByText("Fix the parser")).toBeTruthy();
     expect(screen.getByText("research-agent")).toBeTruthy();
@@ -66,7 +72,7 @@ describe("CommandPalette — sessions", () => {
   it("navigates to the session and closes when an item is selected", () => {
     setSessions([conv("c1", "Fix the parser")]);
     const onOpenChange = vi.fn();
-    renderPalette({ onOpenChange });
+    renderSearch({ onOpenChange });
 
     fireEvent.click(screen.getByText("Fix the parser"));
 
@@ -78,7 +84,7 @@ describe("CommandPalette — sessions", () => {
     vi.useFakeTimers();
     try {
       setSessions([conv("c1", "Fix the parser")]);
-      renderPalette();
+      renderSearch();
 
       // Empty query on mount → shares AppShell's `["conversations","",true]` entry.
       expect(useConversations).toHaveBeenCalledWith("", true);
@@ -93,38 +99,33 @@ describe("CommandPalette — sessions", () => {
         vi.advanceTimersByTime(300);
       });
       // After the 300ms debounce, the typed query drives a server search with
-      // archived rows included (filtered client-side) — proving the palette
-      // searches the server, not a page.
+      // archived rows included (filtered client-side) — proving search hits the
+      // server, not a page.
       expect(useConversations).toHaveBeenCalledWith("deploy", true);
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it("renders the Sessions group above Actions", () => {
-    setSessions([conv("c1", "Fix the parser")]);
-    renderPalette();
+  it("lists every match with no Actions group in the way", () => {
+    const many = Array.from({ length: 8 }, (_, i) => conv(`c${i}`, `Session ${i}`, "agent"));
+    setSessions(many);
+    renderSearch();
 
-    // Group order matters: the palette doubles as the sidebar's session-search
-    // entry point, so Sessions must come before the static Actions.
-    const headings = screen.getAllByText(/^(Sessions|Actions)$/).map((el) => el.textContent);
-    expect(headings).toEqual(["Sessions", "Actions"]);
+    // Sessions mode is only sessions: no cap on the idle list (nothing below it
+    // to keep above the fold) and no Actions group competing for the space.
+    expect(screen.getByText("Session 0")).toBeTruthy();
+    expect(screen.getByText("Session 7")).toBeTruthy();
+    expect(screen.queryByText("Actions")).toBeNull();
+    expect(screen.queryByText("New chat")).toBeNull();
   });
 
-  it("caps the session list to 5 while the query is empty, lifting it on type", () => {
+  it("still highlights matches after the query lands", () => {
     vi.useFakeTimers();
     try {
-      const many = Array.from({ length: 8 }, (_, i) => conv(`c${i}`, `Session ${i}`, "agent"));
-      setSessions(many);
-      renderPalette();
+      setSessions([conv("c5", "Session 5", "agent")]);
+      renderSearch();
 
-      // Empty query: only the first 5 recent sessions show, so the Actions
-      // group below stays visible without scrolling.
-      expect(screen.getByText("Session 0")).toBeTruthy();
-      expect(screen.getByText("Session 4")).toBeTruthy();
-      expect(screen.queryByText("Session 5")).toBeNull();
-
-      // Typing lifts the cap — finding a specific session is now the point.
       fireEvent.change(screen.getByTestId("command-palette-input"), {
         target: { value: "session" },
       });
@@ -134,7 +135,6 @@ describe("CommandPalette — sessions", () => {
       // The label is now split around the highlighted query term
       // (`<mark>Session</mark> 5`), so match on the row's combined text.
       expect(labelRow("Session 5")).toBeTruthy();
-      expect(labelRow("Session 7")).toBeTruthy();
     } finally {
       vi.useRealTimers();
     }
@@ -147,26 +147,28 @@ describe("CommandPalette — sessions", () => {
       },
       isFetching: false,
     });
-    renderPalette();
+    renderSearch();
 
     expect(screen.getAllByText("One")).toHaveLength(1);
     expect(screen.getByText("Two")).toBeTruthy();
   });
 
-  it("indents session rows so their label aligns with the icon-prefixed actions", () => {
-    setSessions([conv("c1", "Fix the parser")]);
-    renderPalette();
+  it("uses the search placeholder", () => {
+    renderSearch();
 
-    // Session items carry no leading icon, so they're padded to line up with
-    // the Action rows' icon + gap. Assert the class so the alignment can't
-    // silently regress.
-    const item = screen.getByText("Fix the parser").closest("[data-slot=command-item]");
-    expect(item?.className).toContain("pl-6");
+    expect(screen.getByPlaceholderText("Search sessions")).toBeTruthy();
+  });
+
+  it("shows a sessions-specific empty state", () => {
+    setSessions([]);
+    renderSearch();
+
+    expect(screen.getByText("No sessions found")).toBeTruthy();
   });
 });
 
 describe("CommandPalette — match preview", () => {
-  // Drive a debounced query through so the palette highlights against it.
+  // Drive a debounced query through so the rows highlight against it.
   function search(term: string) {
     fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value: term } });
     act(() => {
@@ -179,7 +181,7 @@ describe("CommandPalette — match preview", () => {
 
   it("shows the content snippet as a second line when the match is in the body", () => {
     setSessions([conv("c1", "Hello", "cursor", "…can you fix the what if I switch…")]);
-    renderPalette();
+    renderSearch();
     search("what");
 
     // The title stays as the primary line; the snippet shows where it matched.
@@ -189,7 +191,7 @@ describe("CommandPalette — match preview", () => {
 
   it("highlights the query term in both the title and the snippet", () => {
     setSessions([conv("c1", "what model", "cursor", "Hello what model are you using?")]);
-    renderPalette();
+    renderSearch();
     search("what");
 
     // Every occurrence of the query renders inside a <mark> (title + snippet).
@@ -200,7 +202,7 @@ describe("CommandPalette — match preview", () => {
 
   it("omits the snippet line for a title-only match (no search_snippet)", () => {
     setSessions([conv("c1", "deploy runbook", "agent", null)]);
-    renderPalette();
+    renderSearch();
     search("deploy");
 
     expect(screen.getByText(/deploy/)).toBeTruthy();
@@ -210,10 +212,10 @@ describe("CommandPalette — match preview", () => {
 });
 
 describe("CommandPalette — input", () => {
-  it("uses the sessions-first placeholder", () => {
+  it("uses the commands placeholder in commands mode", () => {
     renderPalette();
 
-    expect(screen.getByPlaceholderText("Search sessions or run a command")).toBeTruthy();
+    expect(screen.getByPlaceholderText("Run a command")).toBeTruthy();
   });
 });
 
@@ -276,7 +278,7 @@ describe("CommandPalette — mobile full-screen sheet", () => {
     try {
       setMobile(true);
       setSessions([conv("c1", "Fix the parser")]);
-      renderPalette();
+      renderSearch();
 
       fireEvent.change(screen.getByTestId("command-palette-input"), {
         target: { value: "deploy" },
@@ -291,7 +293,7 @@ describe("CommandPalette — mobile full-screen sheet", () => {
   });
 });
 
-describe("CommandPalette — actions", () => {
+describe("CommandPalette — commands mode", () => {
   it("lists the built-in action commands", () => {
     renderPalette();
 
@@ -300,6 +302,23 @@ describe("CommandPalette — actions", () => {
     expect(screen.getByText("Go to Settings")).toBeTruthy();
     expect(screen.getByText("Toggle conversations sidebar")).toBeTruthy();
     expect(screen.getByText("Toggle workspace sidebar")).toBeTruthy();
+  });
+
+  it("never lists sessions, and never asks the server for any", () => {
+    setSessions([conv("c1", "Fix the parser")]);
+    renderPalette();
+
+    // The whole point of the split: ⌘K is commands only, so the sessions half
+    // isn't mounted and no session request is issued.
+    expect(screen.queryByText("Fix the parser")).toBeNull();
+    expect(screen.queryByText("Sessions")).toBeNull();
+    expect(useConversations).not.toHaveBeenCalled();
+  });
+
+  it("uses the command placeholder", () => {
+    renderPalette();
+
+    expect(screen.getByPlaceholderText("Run a command")).toBeTruthy();
   });
 
   it("runs a navigation action and closes the palette", () => {
@@ -334,18 +353,14 @@ describe("CommandPalette — actions", () => {
     expect(screen.getByText("Go to Settings")).toBeTruthy();
     expect(screen.queryByText("New chat")).toBeNull();
   });
-});
 
-describe("CommandPalette — empty state", () => {
-  it("shows an empty state when nothing matches", () => {
-    setSessions([]);
+  it("shows a commands-specific empty state when nothing matches", () => {
     renderPalette();
 
-    // A query that matches no action and no session.
     fireEvent.change(screen.getByTestId("command-palette-input"), {
       target: { value: "zzzznomatch" },
     });
 
-    expect(screen.getByText("No results found")).toBeTruthy();
+    expect(screen.getByText("No commands found")).toBeTruthy();
   });
 });

@@ -1,20 +1,24 @@
-// Global command palette (⌘K). Two command groups, Sessions first:
+// The keyboard-driven overlay, in two modes on two separate keys — the split VS
+// Code makes between its Command Palette and its Search view:
 //
-//   • Sessions — fuzzy session switching from the SAME server-search source the
-//     sidebar uses (`useConversations(query)` → `GET /v1/sessions?search_query=`),
-//     debounced. Not a static first page: a user with hundreds of sessions must
-//     find any of them, which client-side filtering over one page cannot do.
-//     Listed first: the palette doubles as the sidebar's "Search" entry point,
-//     so finding a session is the primary task; the static actions sit below.
-//     Capped to a few recent sessions while the query is empty (see
-//     IDLE_SESSION_LIMIT) so Actions stays visible without scrolling; typing
-//     lifts the cap.
-//   • Actions — static app commands (new chat, navigate, toggle panels).
-//     Filtered client-side against the live query.
+//   • "commands" (⌘K) — static app commands (new chat, navigate, toggle
+//     panels), filtered client-side. No session lookup happens in this mode.
+//   • "sessions" (⌘⇧F) — fuzzy session switching from the SAME server-search
+//     source the sidebar's magnifier targets (`useConversations(query)` →
+//     `GET /v1/sessions?search_query=`), debounced. Not a static first page: a
+//     user with hundreds of sessions must find any of them, which client-side
+//     filtering over one page cannot do. It matches chat content, not just
+//     titles, and renders the matching line — closer to VS Code's ⌘⇧F than to
+//     its file quick-open.
+//
+// Keeping the two apart means neither task pushes the other below the fold, and
+// the sidebar's magnifier lands on a search surface rather than a command list.
+//
+// Both modes share this dialog, the debounce, and the cmdk config. Only the
+// sessions mode mounts `SessionResults`, so ⌘K never issues a session request.
 //
 // cmdk's own filtering is disabled (`shouldFilter={false}`): the server filters
-// sessions, and we filter the (tiny, static) action list ourselves so both
-// groups react to the same input.
+// sessions, and we filter the (tiny, static) action list ourselves.
 
 import type React from "react";
 import { useEffect, useMemo, useState } from "react";
@@ -44,9 +48,14 @@ import {
 } from "@/components/ui/command";
 import { conversationDisplayLabel, getConversationAgentType } from "./sidebarNav";
 
+/** Which task the overlay is open for. Set by whichever hotkey opened it. */
+export type CommandPaletteMode = "commands" | "sessions";
+
 export interface CommandPaletteProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /** Commands (⌘K) or session search (⌘⇧F). */
+  mode: CommandPaletteMode;
   /** Flip the left (Conversations) sidebar — owned by AppShell. */
   onToggleLeftSidebar: () => void;
   /** Flip the right (Workspace) sidebar — owned by AppShell. */
@@ -94,13 +103,78 @@ function HighlightedText({ text, query }: { text: string; query: string }): Reac
   });
 }
 
-/** How many recent sessions to show before the user types, so the Actions
-    group stays visible without scrolling. Typing lifts the cap. */
-const IDLE_SESSION_LIMIT = 5;
+/** The sessions half. Mounted only in that mode, which is what keeps the ⌘K
+    palette from issuing a session request. */
+function SessionResults({
+  query,
+  onSelect,
+}: {
+  /** Debounced — this is what drives the server request. */
+  query: string;
+  onSelect: (id: string) => void;
+}) {
+  // includeArchived=true shares the sidebar's cache key; archived rows are
+  // filtered out below so search only lists active sessions.
+  const { data, isFetching } = useConversations(query, true);
+
+  const sessions = useMemo(() => {
+    const seen = new Set<string>();
+    const out: { id: string; label: string; agent: string; snippet: string | null }[] = [];
+    for (const page of data?.pages ?? []) {
+      for (const c of page.data) {
+        if (c.archived) continue;
+        if (seen.has(c.id)) continue;
+        seen.add(c.id);
+        out.push({
+          id: c.id,
+          label: conversationDisplayLabel(c),
+          agent: getConversationAgentType(c),
+          // Present only when the match was in chat content (not the title);
+          // the server omits it otherwise. Shown as a dimmed second line.
+          snippet: c.search_snippet ?? null,
+        });
+      }
+    }
+    return out;
+  }, [data]);
+
+  return (
+    <>
+      <CommandEmpty>{isFetching && query ? "Searching…" : "No sessions found"}</CommandEmpty>
+      {sessions.length > 0 && (
+        <CommandGroup heading="Sessions">
+          {sessions.map((s) => (
+            <CommandItem
+              key={s.id}
+              value={s.id}
+              onSelect={() => onSelect(s.id)}
+              className="items-start"
+            >
+              <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                <span className="truncate text-left">
+                  <HighlightedText text={s.label} query={query} />
+                </span>
+                {s.snippet && (
+                  // Where the match was found in the chat body — the session is
+                  // often unidentifiable from the title alone.
+                  <span className="truncate text-left text-muted-foreground text-sm">
+                    <HighlightedText text={s.snippet} query={query} />
+                  </span>
+                )}
+              </div>
+              <span className="ml-2 shrink-0 text-sm text-muted-foreground">{s.agent}</span>
+            </CommandItem>
+          ))}
+        </CommandGroup>
+      )}
+    </>
+  );
+}
 
 export function CommandPalette({
   open,
   onOpenChange,
+  mode,
   onToggleLeftSidebar,
   onToggleRightSidebar,
 }: CommandPaletteProps) {
@@ -109,7 +183,8 @@ export function CommandPalette({
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
 
-  // Reset the query when the palette closes so it reopens clean.
+  // Reset the query when the overlay closes so it reopens clean — including
+  // when it reopens in the other mode, where the old query would be nonsense.
   useEffect(() => {
     if (!open) {
       setQuery("");
@@ -181,35 +256,6 @@ export function CommandPalette({
     );
   }, [actions, query]);
 
-  // includeArchived=true shares the sidebar's cache key; archived rows are
-  // filtered out below so the palette only lists active sessions.
-  const { data, isFetching } = useConversations(debouncedQuery, true);
-
-  const sessions = useMemo(() => {
-    const seen = new Set<string>();
-    const out: { id: string; label: string; agent: string; snippet: string | null }[] = [];
-    for (const page of data?.pages ?? []) {
-      for (const c of page.data) {
-        if (c.archived) continue;
-        if (seen.has(c.id)) continue;
-        seen.add(c.id);
-        out.push({
-          id: c.id,
-          label: conversationDisplayLabel(c),
-          agent: getConversationAgentType(c),
-          // Present only when the match was in chat content (not the title);
-          // the server omits it otherwise. Shown as a dimmed second line.
-          snippet: c.search_snippet ?? null,
-        });
-      }
-    }
-    // With no query the palette shows the full session page, which pushes the
-    // Actions group below the fold. Cap the idle list to the few most-recent
-    // sessions so both groups fit without scrolling; once the user types, show
-    // every match (finding a specific session is then the point).
-    return debouncedQuery ? out : out.slice(0, IDLE_SESSION_LIMIT);
-  }, [data, debouncedQuery]);
-
   const runAction = (action: ActionCommand): void => {
     close();
     action.run();
@@ -219,6 +265,9 @@ export function CommandPalette({
     close();
     navigate(`/c/${id}`);
   };
+
+  const sessionsMode = mode === "sessions";
+  const title = sessionsMode ? "Search sessions" : "Command palette";
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -250,12 +299,12 @@ export function CommandPalette({
         }
         showCloseButton={false}
       >
-        <DialogTitle className="sr-only">Command palette</DialogTitle>
+        <DialogTitle className="sr-only">{title}</DialogTitle>
         {/* shouldFilter=false: the server filters sessions and we filter actions
             (see file header). vimBindings=false: keep Ctrl+K/J from doubling as
             list-nav on Win/Linux, where Ctrl+K is also the opener. */}
         {/* Command's base class is `size-full`, so it already fills the sheet. */}
-        <Command shouldFilter={false} vimBindings={false} label="Command palette">
+        <Command shouldFilter={false} vimBindings={false} label={title}>
           {isMobile ? (
             // Search field and an explicit close button share a top row; the
             // full-screen sheet has no ⌘K/Esc affordance the way the desktop
@@ -265,7 +314,7 @@ export function CommandPalette({
                 <CommandInput
                   value={query}
                   onValueChange={setQuery}
-                  placeholder="Search sessions or run a command"
+                  placeholder={sessionsMode ? "Search sessions" : "Run a command"}
                   data-testid="command-palette-input"
                 />
               </div>
@@ -283,55 +332,34 @@ export function CommandPalette({
             <CommandInput
               value={query}
               onValueChange={setQuery}
-              placeholder="Search sessions or run a command"
+              placeholder={sessionsMode ? "Search sessions" : "Run a command"}
               data-testid="command-palette-input"
             />
           )}
           <CommandList className={isMobile ? "max-h-none flex-1" : undefined}>
-            <CommandEmpty>
-              {isFetching && debouncedQuery ? "Searching…" : "No results found"}
-            </CommandEmpty>
-            {sessions.length > 0 && (
-              <CommandGroup heading="Sessions">
-                {sessions.map((s) => (
-                  // pl-6 indents the label to line up with the icon-prefixed
-                  // Action rows below (their 16px icon + 8px gap), so the two
-                  // groups read as one aligned column.
-                  <CommandItem
-                    key={s.id}
-                    value={s.id}
-                    onSelect={() => goToSession(s.id)}
-                    className="items-start pl-6"
-                  >
-                    <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                      <span className="truncate text-left">
-                        <HighlightedText text={s.label} query={debouncedQuery} />
-                      </span>
-                      {s.snippet && (
-                        // Where the match was found in the chat body — the
-                        // session is often unidentifiable from the title alone.
-                        <span className="truncate text-left text-muted-foreground text-sm">
-                          <HighlightedText text={s.snippet} query={debouncedQuery} />
-                        </span>
-                      )}
-                    </div>
-                    <span className="ml-2 shrink-0 text-sm text-muted-foreground">{s.agent}</span>
-                  </CommandItem>
-                ))}
-              </CommandGroup>
-            )}
-            {filteredActions.length > 0 && (
-              <CommandGroup heading="Actions">
-                {filteredActions.map((a) => {
-                  const Icon = a.icon;
-                  return (
-                    <CommandItem key={a.id} value={`action:${a.id}`} onSelect={() => runAction(a)}>
-                      <Icon />
-                      <span className="flex-1 truncate text-left">{a.label}</span>
-                    </CommandItem>
-                  );
-                })}
-              </CommandGroup>
+            {sessionsMode ? (
+              <SessionResults query={debouncedQuery} onSelect={goToSession} />
+            ) : (
+              <>
+                <CommandEmpty>No commands found</CommandEmpty>
+                {filteredActions.length > 0 && (
+                  <CommandGroup heading="Actions">
+                    {filteredActions.map((a) => {
+                      const Icon = a.icon;
+                      return (
+                        <CommandItem
+                          key={a.id}
+                          value={`action:${a.id}`}
+                          onSelect={() => runAction(a)}
+                        >
+                          <Icon />
+                          <span className="flex-1 truncate text-left">{a.label}</span>
+                        </CommandItem>
+                      );
+                    })}
+                  </CommandGroup>
+                )}
+              </>
             )}
           </CommandList>
         </Command>
