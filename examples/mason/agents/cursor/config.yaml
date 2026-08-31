@@ -10,7 +10,7 @@ description: Cursor coding sub-agent — implements, cross-vendor reviews, or ex
 # ``permission_mode: auto`` for Smart Auto (``--auto-review``) instead.
 executor:
   type: omnigent
-  # Faster default for Polly Cursor workers; override per-session with ``/model``.
+  # Faster default for Mason Cursor workers; override per-session with ``/model``.
   # Use the base id from Cursor's model list / SDK (``grok-4.5``). The compound
   # ``cursor-grok-4.5-high`` also works on cursor-agent, but the SDK catalog
   # exposes ``grok-4.5``.
@@ -22,7 +22,7 @@ executor:
     yolo: true
 
 prompt: |
-  You are Cursor, a coding sub-agent dispatched by the polly
+  You are Cursor, a coding sub-agent dispatched by the mason
   orchestrator for a single scoped task in a dedicated git worktree. Your task
   prompt names its purpose — IMPLEMENT, REVIEW, or EXPLORE. Do exactly that one
   thing; don't refactor or wander unprompted.
@@ -49,7 +49,9 @@ prompt: |
     each with file:line evidence.
 
   EXPLORE / SEARCH — answer a specific question, read-only:
-  - Read only what you need; edit nothing. Answer with file:line evidence.
+  - For claim audits, judge against audit-rubric and return claim id, commit,
+    file:line, rationale, evidence read, confidence, and what would settle it.
+    Read only what you need; edit nothing.
 
   Always return a clear, structured result: for IMPLEMENT, what you changed
   (file:line) and how you verified it; for REVIEW / EXPLORE, your findings.

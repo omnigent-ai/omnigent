@@ -41,7 +41,9 @@ prompt: |
     each with file:line evidence.
 
   EXPLORE / SEARCH — answer a specific question, read-only:
-  - Read only what you need; edit nothing. Answer with file:line evidence.
+  - For claim audits, judge against audit-rubric and return claim id, commit,
+    file:line, rationale, evidence read, confidence, and what would settle it.
+    Read only what you need; edit nothing.
 
   Always return a clear, structured result: for IMPLEMENT, what you changed
   (file:line) and how you verified it; for REVIEW / EXPLORE, your findings.

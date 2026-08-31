@@ -10,7 +10,8 @@ _BUNDLE = Path(__file__).resolve().parents[3] / "examples" / "mason"
 _WORKERS = {
     "claude_code": "claude-native", "codex": "codex-native",
     "opencode": "opencode-native", "cursor": "cursor-native",
-    "hermes": "hermes-native", "agy": "antigravity-native", "pi": "pi",
+    "codex_sol": "codex-native", "hermes": "hermes-native",
+    "agy": "antigravity-native", "pi": "pi",
 }
 
 
@@ -33,6 +34,9 @@ def test_mason_codex_defaults_are_load_bearing(mason: AgentSpec) -> None:
     codex = next(a for a in mason.sub_agents if a.name == "codex")
     assert codex.executor.model == "gpt-5.6-luna"
     assert codex.executor.reasoning_effort == "high"
+    sol = next(a for a in mason.sub_agents if a.name == "codex_sol")
+    assert sol.executor.model == "gpt-5.6-sol"
+    assert sol.executor.reasoning_effort == "high"
 
 
 def test_mason_workflow_grants_and_skills(mason: AgentSpec) -> None:
@@ -44,3 +48,11 @@ def test_mason_workflow_grants_and_skills(mason: AgentSpec) -> None:
         "work-package-planning",
     ]
     assert all(skill.content and skill.skill_dir.name == skill.name for skill in mason.skills)
+
+
+def test_mason_has_no_polly_leak() -> None:
+    assert not any(
+        "polly" in path.read_text().lower()
+        for path in _BUNDLE.rglob("*")
+        if path.is_file()
+    )

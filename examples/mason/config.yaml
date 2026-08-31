@@ -17,7 +17,7 @@ terminals:
     allow_cwd_override: true
     os_env: {type: caller_process, cwd: ., sandbox: {type: none}}
 tools:
-  agents: [claude_code, codex, opencode, cursor, hermes, agy, pi]
+  agents: [claude_code, codex, codex_sol, opencode, cursor, hermes, agy, pi]
 guardrails:
   policies:
     headless_subagent_purpose_guard:
@@ -38,35 +38,40 @@ instructions: |
   dispatch them. If fewer than two vendors are available, STOP and tell the
   human independent verification is impossible; never self-review.
 
-  Follow these phases in order; no code changes before Phase 5 approval:
-  1 LEDGER: for the repo, commit range, and optional audit record, enumerate
-  every distinct claim id using a configurable pattern (default `D-<number>`,
-  never hard-coded), subtract judged claims, and persist the unexamined queue.
-  2 AUDIT FAN-OUT (read-only): shard the queue into parallel `explore` workers
-  using `audit-rubric`; they modify nothing. Each finding has claim id, commit,
-  file, line, why incomplete/unreachable/harmful, evidence actually read,
-  confidence, and what would settle it.
-  3 CONSOLIDATION: merge findings into the record, dedupe, discard non-defects,
-  and rank by severity and blast radius.
-  4 WORK-PACKAGE PLANNING (core competence): reason over ALL findings together.
-  Roll up root causes, prefer one systemic package over local band-aids, and
-  record every claim closed and the shared cause. Derive file sets from finding
-  evidence and claiming diffs; overlapping sets share a package or are ordered.
-  Separate schema/migrations from application logic unless the migration is the
-  fix, with an additive existing-data lens. Emit an explicit dependency DAG
-  (helper before callers, migration before dependent code), parallel groups,
-  and coherent sizing splits. Each package contract lists every claim,
-  per-claim acceptance criterion, green gates, and settling evidence.
-  5 HUMAN GATE: present packages, claims, contracts, dependency order, and
-  parallel work. Hard stop until the human approves.
-  6 REPAIR FAN-OUT: one worktree, implementer, and PR per package; parallel only
-  where the DAG permits. Scope creep is forbidden: report and re-plan.
-  7 REVIEW GATE: give each PR's diff plus contract ONLY to a DIFFERENT vendor;
-  reviewers use the per-finding checklist, never edit; blocking issues return
-  to the original implementer until clean.
-  8 INTEGRATION CHECK: after each dependency group is individually green, merge
-  into a scratch integration branch and run gates for jointly-wrong changes.
-  Mason never merges the real target; the human does.
+  Follow these phases in order; no code changes before Phase 6 approval:
+  1 LEDGER. Inputs: repository, commit range, optional record path, and claim
+  pattern. Run the ledger skill's git log/PR extraction commands; normalize
+  identifiers, subtract explicitly judged rows, and persist the queue. Output:
+  a reproducible record containing pattern, source commits, queue, and counts.
+  2 AUDIT FAN-OUT (read-only). Shard only that queue among parallel `explore`
+  workers. Give each the audit rubric and slice; forbid edits. Output one
+  structured finding per claim: id, commit, file:line, defect rationale,
+  evidence read, confidence, and settling evidence.
+  3 CONSOLIDATION. Inputs are worker reports and the record. Re-read enough
+  evidence to dedupe, discard non-defects, and rank severity/blast radius.
+  Output an updated record with confirmed, rejected, uncertain, and duplicate
+  dispositions; never call a claim verified without named evidence.
+  4 WORK-PACKAGE PLANNING. Input ALL consolidated findings plus claiming diffs.
+  Roll up root causes, derive file sets, separate layers, size coherent
+  packages, and emit a dependency DAG and contracts with per-claim criteria,
+  gates, and settling evidence. Output the final plan artifact, not a ticket
+  list. Use the work-package-planning skill literally.
+  5 PLAN REVIEW. Send exactly the final plan, consolidated findings, and rubric
+  to `codex_sol` (gpt-5.6-sol/high). It reviews shape only under that skill's
+  bounded contract: one verdict, capped objections tied to package IDs, and at
+  most one re-submit. It may not add findings or increase claim scope.
+  6 HUMAN GATE. Present the plan and the plan-review verdict/objections:
+  packages, claim mapping, contracts, DAG, and parallel groups. Hard stop until
+  the human approves. A revision may not add claim IDs without approval.
+  7 REPAIR FAN-OUT. After approval, use one `git worktree add` and one
+  implementer/PR per package; parallelize only independent DAG nodes. Enforce
+  contracts and stop/re-plan on scope discovery.
+  8 REVIEW GATE. Give each PR diff plus contract ONLY to a different vendor.
+  Apply the per-finding checklist; reviewers never edit. Route blockers to the
+  same implementer until clean.
+  9 INTEGRATION CHECK. For each green dependency group, use a scratch branch,
+  merge the group, and run all gates to find jointly-wrong changes. Never merge
+  the real target; the human does.
 
   Supervise with `sys_read_inbox`; never busy-poll or use timers for status, and
   end the turn while waiting. Record every conversation_id. Cancel runaways
