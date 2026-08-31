@@ -554,6 +554,17 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
         key. Used by harness spawn-env builders, context-window
         auto-detection, telemetry, and tool-provider inference.
         ``None`` only when no model is declared anywhere in the spec.
+    :param reasoning_effort: Default reasoning level for this agent,
+        e.g. ``"high"``. Populated by the parser from either the
+        ``executor.reasoning_effort`` YAML key or (for backward
+        compatibility) ``llm.reasoning_effort``. Applies when nothing more
+        specific asks for one: a per-dispatch
+        ``sys_session_send``/``sys_session_create`` argument wins over
+        it, and it in turn wins over whatever default the harness CLI
+        carries on the host. Validated against the harness's effort
+        family where it is applied, so a value the harness cannot
+        accept is reported rather than silently dropped. ``None`` =
+        no spec-level default.
     :param connection: Per-provider connection overrides (credentials,
         endpoint URLs), e.g.
         ``{"api_key": "sk-...", "base_url": "https://..."}``.
@@ -596,6 +607,10 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
     # Primary model identifier for all executor types. Populated by
     # the parser from executor.model or (backward compat) llm.model.
     model: str | None = None
+    # Spec-level default reasoning effort, applied when no per-dispatch
+    # value asks for one. Populated from executor.reasoning_effort or
+    # (backward compat) llm.reasoning_effort.
+    reasoning_effort: str | None = None
     # Per-provider connection overrides (api_key, base_url, etc.).
     # Populated from executor.connection or (backward compat) llm.connection.
     # None means rely on environment variable / profile defaults.
@@ -638,9 +653,8 @@ class CompactionConfig:
     truncation as emergency fallback.
 
     :param trigger_threshold: Fraction of the model's context window
-        at which proactive compaction fires (after the first overflow
-        has been observed and the window size is known), e.g. ``0.8``
-        means fire at 80% of the window.
+        at which proactive compaction fires, e.g. ``0.8`` means fire
+        at 80% of the window.
     :param recent_window: Number of recent LLM iterations to protect
         from compaction. Items within this window are never cleared or
         summarized — the agent always has verbatim access to its most
@@ -1430,6 +1444,12 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         ``tools/python/`` and ``tools/typescript/``.
     :param sub_agents: Recursively parsed child agents from
         ``agents/<dir>/``.
+    :param pass_history: Whether a parent session passes its current
+        history when launching this agent as a sub-agent tool.
+    :param pass_histories: Named parent histories passed when launching
+        this agent as a sub-agent tool.
+    :param max_sessions: Maximum concurrent sessions when this agent is
+        exposed as a sub-agent tool. ``None`` means unlimited.
     :param executor: Executor configuration (type, task timeout,
         max iterations). ``executor.type`` is the
         discriminator for the entire spec's validity.
@@ -1557,6 +1577,9 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     mcp_servers: list[MCPServerConfig] = field(default_factory=list)
     local_tools: list[LocalToolInfo] = field(default_factory=list)
     sub_agents: list[AgentSpec] = field(default_factory=list)
+    pass_history: bool = False
+    pass_histories: list[str] | None = None
+    max_sessions: int | None = None
     executor: ExecutorSpec = field(default_factory=ExecutorSpec)
     compaction: CompactionConfig | None = None
     guardrails: GuardrailsSpec | None = None

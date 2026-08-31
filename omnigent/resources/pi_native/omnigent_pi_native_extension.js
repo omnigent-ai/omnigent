@@ -1037,6 +1037,7 @@ function startInboxPoller(
   handleInterrupt,
   handleCompact,
   handleModelChange,
+  handleThinkingLevelChange,
 ) {
   if (!config || !config.inboxDir || pi.__omnigentInboxPoller) return;
   // Bound the dedup set (FIFO eviction) — delivered files are unlinked, so a
@@ -1164,6 +1165,17 @@ function startInboxPoller(
         handleModelChange(
           typeof payload.model === "string" ? payload.model : undefined,
         );
+      }
+      if (payload.type === "thinking_level_change") {
+        // Point-in-time: one delivery attempt, then always consume the file.
+        // Pi's setThinkingLevel is async but fire-and-forget here — success is
+        // visible in Pi's TUI menu and the returned promise is discarded.
+        if (
+          typeof handleThinkingLevelChange === "function" &&
+          typeof payload.thinkingLevel === "string"
+        ) {
+          handleThinkingLevelChange(payload.thinkingLevel);
+        }
       }
       if (id !== null) rememberSeen(id);
       try {
@@ -1755,6 +1767,7 @@ module.exports = function (pi) {
       (customInstructions) =>
         triggerCompaction(config, latestContext, customInstructions),
       (model) => applyModelChange(pi, config, latestContext, model),
+      (level) => pi.setThinkingLevel(level),
     );
     const nativeSessionId =
       ctx && ctx.sessionManager && ctx.sessionManager.getSessionId

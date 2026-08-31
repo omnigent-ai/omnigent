@@ -26,6 +26,11 @@ _ATTACHMENT_MARKER_RE = re.compile(
     rf"^(?:\[Attached(?: file)?: .+\]|{UNRESOLVED_ATTACHMENT_MARKER_PATTERN})$"
 )
 
+# Generated titles stay compact by default, while explicit user formats and
+# manually assigned titles have room for structured identifiers.
+DEFAULT_GENERATED_TITLE_MAX_CHARS = 100
+USER_SESSION_TITLE_MAX_CHARS = 200
+
 # ── Conversation ──────────────────────────────────────
 
 

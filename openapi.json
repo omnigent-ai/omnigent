@@ -23,6 +23,7 @@
           },
           "end_index": {
             "description": "0-based absolute character offset (exclusive) within the file where the anchor range ends.",
+            "format": "int64",
             "title": "End Index",
             "type": "integer"
           },
@@ -33,6 +34,7 @@
           },
           "start_index": {
             "description": "0-based absolute character offset (inclusive) within the file where the anchor range begins.",
+            "format": "int64",
             "title": "Start Index",
             "type": "integer"
           }
@@ -57,6 +59,7 @@
           },
           "created_at": {
             "description": "Unix epoch timestamp of creation.",
+            "format": "int64",
             "title": "Created At",
             "type": "integer"
           },
@@ -141,6 +144,7 @@
           "updated_at": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -153,6 +157,7 @@
           "version": {
             "default": 1,
             "description": "Monotonic version counter. Starts at 1, incremented on each update.",
+            "format": "int64",
             "title": "Version",
             "type": "integer"
           }
@@ -170,7 +175,7 @@
         "description": "Request body for the current-agent automatic rename endpoint.",
         "properties": {
           "title": {
-            "maxLength": 60,
+            "maxLength": 100,
             "minLength": 2,
             "title": "Title",
             "type": "string"
@@ -425,6 +430,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -460,6 +466,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -565,6 +572,7 @@
           },
           "created_at": {
             "description": "Unix epoch timestamp of child creation.",
+            "format": "int64",
             "title": "Created At",
             "type": "integer"
           },
@@ -652,6 +660,7 @@
           "pending_elicitations_count": {
             "default": 0,
             "description": "Number of approval / input prompts the child is currently blocked on, read from the server's `omnigent.runtime.pending_elicitations` index. `> 0` means the sub-agent is parked awaiting user input \u2014 the Agents rail renders an \"awaiting input\" badge so a fanned-out sub-agent that needs attention is visible without opening its chat. Mirrors `SessionListItem.pending_elicitations_count`.",
+            "format": "int64",
             "title": "Pending Elicitations Count",
             "type": "integer"
           },
@@ -728,6 +737,7 @@
           },
           "updated_at": {
             "description": "Unix epoch timestamp of the child's most recent update.",
+            "format": "int64",
             "title": "Updated At",
             "type": "integer"
           }
@@ -775,6 +785,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -809,6 +820,7 @@
           "created_at": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -835,6 +847,7 @@
           },
           "time_used_seconds": {
             "description": "Wall-clock seconds spent on this goal, e.g. `60`.",
+            "format": "int64",
             "minimum": 0.0,
             "title": "Time Used Seconds",
             "type": "integer"
@@ -843,6 +856,7 @@
             "anyOf": [
               {
                 "exclusiveMinimum": 0.0,
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -854,6 +868,7 @@
           },
           "tokens_used": {
             "description": "Tokens spent while pursuing this goal, e.g. `1024`.",
+            "format": "int64",
             "minimum": 0.0,
             "title": "Tokens Used",
             "type": "integer"
@@ -861,6 +876,7 @@
           "updated_at": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -924,6 +940,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -962,6 +979,7 @@
           "total_tokens": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -1027,12 +1045,14 @@
           },
           "token_count": {
             "description": "Approximate token count of the summary text, for budget tracking, e.g. `342`.",
+            "format": "int64",
             "title": "Token Count",
             "type": "integer"
           },
           "window_id": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -1056,6 +1076,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -1084,6 +1105,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -1116,6 +1138,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -1171,6 +1194,7 @@
         "properties": {
           "created_at": {
             "description": "Unix epoch timestamp of creation.",
+            "format": "int64",
             "title": "Created At",
             "type": "integer"
           },
@@ -1426,6 +1450,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -1454,6 +1479,7 @@
         "properties": {
           "cost_usd": {
             "default": 0.0,
+            "format": "double",
             "title": "Cost Usd",
             "type": "number"
           },
@@ -1490,6 +1516,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -1622,6 +1649,24 @@
       "ElicitationResolvedEvent": {
         "description": "Signal that a previously-published elicitation is no longer\noutstanding, even though no UI `approval` verdict was\ndelivered through `POST /v1/sessions/{id}/events`.\n\nEmitted by the runner when its own `_pending_approvals`\nFuture is popped without a verdict (the runner's wait timed\nout, the turn was cancelled, the harness exited) so the AP\nserver's `omnigent.runtime.pending_elicitations`\nindex can decrement the sidebar badge in lockstep with the\nunderlying awaiter's lifecycle. Without this signal, the AP\nserver has no way to learn that the prompt is dead and the\nbadge stays stuck.\n\nIdempotent on the consumer side: the Omnigent server's index\ndecrement is a no-op when the id isn't tracked, so the\nrunner can fire-and-forget on every Future cleanup.",
         "properties": {
+          "action": {
+            "anyOf": [
+              {
+                "enum": [
+                  "accept",
+                  "decline",
+                  "cancel"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional MCP verdict recorded when the resolution carried a human decision (`\"accept\"` / `\"decline\"` / `\"cancel\"`). `None` for resolutions without a verdict \u2014 timeout, severed wait, or a runner that predates verdict carriage \u2014 so consumers can say \"no verdict was recorded\" rather than guessing one.",
+            "title": "Action"
+          },
           "elicitation_id": {
             "description": "Correlation id of the elicitation being cleared, e.g. `\"elicit_abc123\"`. Must match the id of a prior `ElicitationRequestEvent`.",
             "title": "Elicitation Id",
@@ -1630,6 +1675,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -1755,6 +1801,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -1820,6 +1867,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -1855,6 +1903,7 @@
           "completed_at": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -1880,6 +1929,7 @@
           "created_at": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2085,6 +2135,7 @@
         "properties": {
           "level": {
             "description": "Numeric permission level: `1` = read, `2` = edit, `3` = manage.",
+            "format": "int64",
             "maximum": 3.0,
             "minimum": 1.0,
             "title": "Level",
@@ -2122,6 +2173,7 @@
           "last_event_seq": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2135,6 +2187,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2233,6 +2286,18 @@
             "title": "Source",
             "type": "string"
           },
+          "title": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
           "workspace": {
             "anyOf": [
               {
@@ -2258,6 +2323,7 @@
         "description": "Result of importing or locating one source session.",
         "properties": {
           "item_count": {
+            "format": "int64",
             "title": "Item Count",
             "type": "integer"
           },
@@ -2279,6 +2345,31 @@
         "title": "ImportSessionResponse",
         "type": "object"
       },
+      "ImportedSessionRef": {
+        "description": "One freshly imported session: its new id plus display title.\n\n`title` is `None` when the session has no native title and no first user\nmessage to synthesize from; the UI falls back to a placeholder.",
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "ImportedSessionRef",
+        "type": "object"
+      },
       "InProgressEvent": {
         "description": "Event emitted once the task transitions to in-progress.\n\nAlways follows `response.created` (and `response.queued`\nfor background tasks).",
         "properties": {
@@ -2289,6 +2380,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2337,6 +2429,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2390,6 +2483,85 @@
           "workspace"
         ],
         "title": "LaunchRunnerRequest",
+        "type": "object"
+      },
+      "LocalImportRequest": {
+        "description": "Request to import the caller's recent local harness sessions from a host.\n\nUnlike `/imports` (the CLI posts already-normalized items), the server\nasks the chosen host to read + normalize its own transcripts over the\ntunnel \u2014 the transcripts live on the caller's machine, not the server.",
+        "properties": {
+          "host_id": {
+            "title": "Host Id",
+            "type": "string"
+          },
+          "limit": {
+            "default": 10,
+            "format": "int64",
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "enum": [
+                  "claude",
+                  "codex",
+                  "kimi",
+                  "kiro",
+                  "opencode",
+                  "pi",
+                  "qwen"
+                ],
+                "type": "string"
+              },
+              {
+                "const": "all",
+                "type": "string"
+              }
+            ],
+            "title": "Source"
+          }
+        },
+        "required": [
+          "host_id",
+          "source"
+        ],
+        "title": "LocalImportRequest",
+        "type": "object"
+      },
+      "LocalImportResponse": {
+        "description": "Batch result for `POST /v1/imports/local`.",
+        "properties": {
+          "already_imported": {
+            "format": "int64",
+            "title": "Already Imported",
+            "type": "integer"
+          },
+          "failed": {
+            "format": "int64",
+            "title": "Failed",
+            "type": "integer"
+          },
+          "imported": {
+            "format": "int64",
+            "title": "Imported",
+            "type": "integer"
+          },
+          "sessions": {
+            "items": {
+              "$ref": "#/components/schemas/ImportedSessionRef"
+            },
+            "title": "Sessions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "imported",
+          "already_imported",
+          "failed",
+          "sessions"
+        ],
+        "title": "LocalImportResponse",
         "type": "object"
       },
       "MCPServerSummary": {
@@ -2556,6 +2728,7 @@
           "cache_creation_input_tokens": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2568,6 +2741,7 @@
           "cache_read_input_tokens": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2580,6 +2754,7 @@
           "input_tokens": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2592,6 +2767,7 @@
           "output_tokens": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2604,6 +2780,7 @@
           "total_cost_usd": {
             "anyOf": [
               {
+                "format": "double",
                 "type": "number"
               },
               {
@@ -2616,6 +2793,7 @@
           "total_tokens": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2774,6 +2952,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2809,6 +2988,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2856,6 +3036,7 @@
           "index": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2882,6 +3063,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2964,6 +3146,7 @@
           },
           "level": {
             "description": "Numeric permission level (1=read, 2=edit, 3=manage).",
+            "format": "int64",
             "title": "Level",
             "type": "integer"
           },
@@ -3004,6 +3187,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -3106,6 +3290,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -3135,6 +3320,7 @@
         "properties": {
           "last_seen": {
             "description": "Wall-clock baseline in seconds, e.g. `1717000000`. Marking seen sets this to \"now\"; marking unread pins it to `updated_at - 1` so the row reads unseen.",
+            "format": "int64",
             "title": "Last Seen",
             "type": "integer"
           },
@@ -3213,6 +3399,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -3246,6 +3433,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -3280,6 +3468,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -3355,6 +3544,7 @@
           "completed_at": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -3379,6 +3569,7 @@
           },
           "created_at": {
             "description": "Unix epoch timestamp of creation.",
+            "format": "int64",
             "title": "Created At",
             "type": "integer"
           },
@@ -3421,7 +3612,7 @@
               }
             ],
             "default": null,
-            "description": "Per-request system instructions override, or `None`.",
+            "description": "Per-request system instructions composed additively with the agent's own, or `None`.",
             "title": "Instructions"
           },
           "model": {
@@ -3546,11 +3737,13 @@
         "properties": {
           "attempt": {
             "description": "1-based count of the upcoming attempt (i.e. attempt that will run AFTER this delay), e.g. `2` for the first retry.",
+            "format": "int64",
             "title": "Attempt",
             "type": "integer"
           },
           "delay_seconds": {
             "description": "Seconds the producer will sleep before retrying, rounded to two decimals, e.g. `1.5`.",
+            "format": "double",
             "title": "Delay Seconds",
             "type": "number"
           },
@@ -3560,12 +3753,14 @@
           },
           "max_attempts": {
             "description": "Total tries allowed by the retry policy, e.g. `3`. Lets clients render \"attempt 2 of 3\".",
+            "format": "int64",
             "title": "Max Attempts",
             "type": "integer"
           },
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -4161,6 +4356,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -4198,6 +4394,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -4248,6 +4445,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -4289,6 +4487,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -4355,6 +4554,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -4395,9 +4595,55 @@
             "description": "Built-in agent to bind the fork to, switching it away from the source's agent/harness (e.g. fork a Claude session into a Codex one, or a Claude-SDK session into Claude Code). When `None`, the fork keeps the source's agent. Must be a built-in agent (one listed by `GET /v1/agents`).",
             "title": "Agent Id"
           },
+          "codex_bypass_sandbox": {
+            "default": false,
+            "description": "Opt-in for the DANGEROUS codex-native full-bypass (`--dangerously-bypass-approvals-and-sandbox`) on the fork. The source's bypass label is ALWAYS dropped on a fork (a bypass-armed source can never silently re-arm its clone), so this is the only way a fork enables it \u2014 an explicit, banner-gated opt-in from the dialog, mirroring the new-session approval selector. `True` stamps `omnigent.codex_native.bypass_sandbox` on the fork; `False` / omitted leaves the fork in Codex's normal approval/sandbox stance. Only meaningful for a codex-native target; ignored otherwise.",
+            "title": "Codex Bypass Sandbox",
+            "type": "boolean"
+          },
+          "model_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-session LLM model override to apply to the fork, e.g. `\"claude-opus-4-7\"`. **Omitting** the field inherits the source's model (same as today, within the same provider family); an explicit value overrides it, and a clear alias (`\"default\"`, `\"off\"`, `\"reset\"`) resets the fork to the bound agent's default. Validated against a conservative model-id charset. Set by the web fork dialog's model picker.",
+            "title": "Model Override"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-session reasoning-effort override to apply to the fork, e.g. `\"high\"`. **Omitting** the field inherits the source's effort; an explicit value overrides it, and a clear alias (`\"default\"`, `\"off\"`, `\"reset\"`) resets it. Validated against the shared effort vocabulary; provider support is enforced at launch. Set by the web fork dialog's effort picker.",
+            "title": "Reasoning Effort"
+          },
+          "terminal_launch_args": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-session native-terminal pass-through args to apply to the fork, e.g. `[\"--permission-mode\", \"auto\"]` (the fork dialog's permission-/approval-mode selector). **Omitting** the field keeps today's behavior \u2014 the source's args are carried on a same-agent fork and dropped on an agent switch. A list (including `[]`, which clears them) replaces them wholesale. Bounds (count / length) are validated server-side.",
+            "title": "Terminal Launch Args"
+          },
           "title": {
             "anyOf": [
               {
+                "maxLength": 200,
                 "type": "string"
               },
               {
@@ -4462,6 +4708,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -4507,6 +4754,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -4594,6 +4842,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -4622,6 +4871,7 @@
         "properties": {
           "requested_at": {
             "description": "Unix epoch seconds when the interrupt request reached the server, e.g. `1704067200`.",
+            "format": "int64",
             "title": "Requested At",
             "type": "integer"
           },
@@ -4744,12 +4994,14 @@
           "comments_count": {
             "default": 0,
             "description": "Total number of review comments (any status) on this session. Together with `comments_updated_at` it forms a change fingerprint: an add or edit bumps the timestamp, a delete changes the count, so the web client can invalidate its cached comment list when either field changes in a `WS /v1/sessions/updates` frame. `0` when the session has no comments or the server has no comment store wired.",
+            "format": "int64",
             "title": "Comments Count",
             "type": "integer"
           },
           "comments_updated_at": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -4761,6 +5013,7 @@
           },
           "created_at": {
             "description": "Unix epoch seconds of creation.",
+            "format": "int64",
             "title": "Created At",
             "type": "integer"
           },
@@ -4851,12 +5104,14 @@
           "pending_elicitations_count": {
             "default": 0,
             "description": "Number of approval prompts currently waiting on this session. Powers the sidebar's \"needs attention\" badge so a user with several sessions running can tell which ones are blocked on them without opening each chat. Sourced from the Omnigent server's in-memory `omnigent.runtime.pending_elicitations` index, which mirrors every `response.elicitation_request` event passing through `session_stream` and decrements when a verdict is dispatched. `0` when the session has no outstanding elicitations.",
+            "format": "int64",
             "title": "Pending Elicitations Count",
             "type": "integer"
           },
           "permission_level": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -4950,12 +5205,14 @@
           },
           "updated_at": {
             "description": "Unix epoch seconds of last update.",
+            "format": "int64",
             "title": "Updated At",
             "type": "integer"
           },
           "viewer_last_seen": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5005,6 +5262,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5053,6 +5311,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5088,6 +5347,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5127,6 +5387,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5162,6 +5423,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5257,6 +5519,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5292,6 +5555,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5331,6 +5595,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5513,6 +5778,7 @@
           "background_task_count": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5540,6 +5806,7 @@
           "context_window": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5563,6 +5830,7 @@
           },
           "created_at": {
             "description": "Unix epoch seconds of creation.",
+            "format": "int64",
             "title": "Created At",
             "type": "integer"
           },
@@ -5676,6 +5944,7 @@
           "last_total_tokens": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5764,6 +6033,7 @@
           "permission_level": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5931,6 +6201,7 @@
           "total_cost_usd": {
             "anyOf": [
               {
+                "format": "double",
                 "type": "number"
               },
               {
@@ -5943,6 +6214,7 @@
           "updated_at": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6013,6 +6285,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6061,6 +6334,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6090,6 +6364,7 @@
           "background_task_count": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6162,6 +6437,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6216,6 +6492,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6267,6 +6544,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6317,6 +6595,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6352,6 +6631,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6392,6 +6672,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6442,11 +6723,13 @@
           "cost_usd": {
             "default": 0.0,
             "description": "Authoritative cumulative USD spend for this session's subtree.",
+            "format": "double",
             "title": "Cost Usd",
             "type": "number"
           },
           "created_at": {
             "description": "Unix epoch seconds of creation.",
+            "format": "int64",
             "title": "Created At",
             "type": "integer"
           },
@@ -6479,6 +6762,7 @@
           },
           "models": {
             "additionalProperties": {
+              "format": "double",
               "type": "number"
             },
             "description": "Per-model recorded cost, keyed by the raw harness model id (e.g. `{\"claude-opus-4-8\": 14.03}`). Empty when no per-model cost was recorded. May not sum to `cost_usd` (see above).",
@@ -6513,6 +6797,7 @@
           },
           "updated_at": {
             "description": "Unix epoch seconds of last activity.",
+            "format": "int64",
             "title": "Updated At",
             "type": "integer"
           }
@@ -6531,6 +6816,7 @@
           "context_tokens": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6544,6 +6830,7 @@
           "context_window": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6562,6 +6849,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6574,6 +6862,7 @@
           "total_cost_usd": {
             "anyOf": [
               {
+                "format": "double",
                 "type": "number"
               },
               {
@@ -6645,6 +6934,7 @@
             "anyOf": [
               {
                 "exclusiveMinimum": 0.0,
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6923,6 +7213,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6953,6 +7244,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6987,6 +7279,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -7027,6 +7320,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -7061,6 +7355,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -7424,6 +7719,7 @@
           "title": {
             "anyOf": [
               {
+                "maxLength": 200,
                 "type": "string"
               },
               {
@@ -7525,18 +7821,21 @@
           "cache_creation_input_tokens": {
             "default": 0,
             "description": "Prompt tokens written to the provider prompt cache (cache creation), billed at a premium rate. Like `cache_read_input_tokens`, this is separate from `input_tokens`; `0` when not reported.",
+            "format": "int64",
             "title": "Cache Creation Input Tokens",
             "type": "integer"
           },
           "cache_read_input_tokens": {
             "default": 0,
             "description": "Prompt tokens served from a provider prompt cache (cache hit), billed at a reduced rate. Reported by Anthropic-style providers as a count *separate* from `input_tokens` (which carries only the non-cached portion); `0` when the provider does not break out cache usage. Consumed by the cache-aware server-side cost path.",
+            "format": "int64",
             "title": "Cache Read Input Tokens",
             "type": "integer"
           },
           "context_tokens": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -7550,6 +7849,7 @@
           "cost_usd": {
             "anyOf": [
               {
+                "format": "double",
                 "type": "number"
               },
               {
@@ -7563,6 +7863,7 @@
           "input_tokens": {
             "default": 0,
             "description": "Number of input (prompt) tokens consumed.",
+            "format": "int64",
             "title": "Input Tokens",
             "type": "integer"
           },
@@ -7582,6 +7883,7 @@
           "output_tokens": {
             "default": 0,
             "description": "Number of output (completion) tokens generated.",
+            "format": "int64",
             "title": "Output Tokens",
             "type": "integer"
           },
@@ -7592,6 +7894,7 @@
           "total_tokens": {
             "default": 0,
             "description": "Sum of input and output tokens across all LLM sub-calls for this turn (billing total).",
+            "format": "int64",
             "title": "Total Tokens",
             "type": "integer"
           }
@@ -7605,6 +7908,7 @@
           "reasoning_tokens": {
             "default": 0,
             "description": "Number of tokens consumed by chain-of-thought reasoning.",
+            "format": "int64",
             "title": "Reasoning Tokens",
             "type": "integer"
           }
@@ -7618,18 +7922,21 @@
           "cost_last_30d": {
             "default": 0.0,
             "description": "Total spend over the last 30 UTC days (incl. today).",
+            "format": "double",
             "title": "Cost Last 30D",
             "type": "number"
           },
           "cost_last_7d": {
             "default": 0.0,
             "description": "Total spend over the last 7 UTC days (incl. today).",
+            "format": "double",
             "title": "Cost Last 7D",
             "type": "number"
           },
           "cost_today": {
             "default": 0.0,
             "description": "Total spend on the current UTC day.",
+            "format": "double",
             "title": "Cost Today",
             "type": "number"
           },
@@ -7657,6 +7964,7 @@
           "total_cost_usd": {
             "default": 0.0,
             "description": "All-time total spend from the daily rollup.",
+            "format": "double",
             "title": "Total Cost Usd",
             "type": "number"
           }
@@ -7680,6 +7988,7 @@
                   "type": "string"
                 },
                 {
+                  "format": "int64",
                   "type": "integer"
                 }
               ]
@@ -8730,6 +9039,48 @@
           }
         },
         "summary": "Import Session",
+        "tags": [
+          "imports"
+        ]
+      }
+    },
+    "/v1/imports/local": {
+      "post": {
+        "description": "Import the caller's recent local transcripts from a chosen host.\n\nThe transcripts live on the caller's machine, so the read happens on\nthe connected host over its tunnel \u2014 the server can't see them. The\nhost enumerates + normalizes the most recent sessions; the server\nimports those not already imported. Drives the web \"Import sessions\"\nbutton.\n\nNot atomic: each session is persisted as its frame arrives. If the host\ndrops mid-stream this raises after the sessions read so far are already\ncommitted; a retry is idempotent (they come back as already-imported).",
+        "operationId": "import_local_sessions_v1_imports_local_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LocalImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LocalImportResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Local Sessions",
         "tags": [
           "imports"
         ]
@@ -13145,7 +13496,7 @@
     },
     "/v1/sessions/{source_id}/fork": {
       "post": {
-        "description": "Fork an existing session into a new session.\n\nDeep-copies the source session's conversation items and\nclones the agent into a new session. When `body.agent_id`\nis set, the fork binds that built-in agent instead of the\nsource's \u2014 switching harness (e.g. Claude-SDK \u2192 Claude Code,\nor Claude \u2192 Codex). The source's model settings carry over\nonly within the same provider family; a same-family native\ntarget also carries conversation history (the runner rebuilds\nits transcript). The REPL/CLI binds the fork to its runner via\n`PATCH /v1/sessions/{id}` after creation.\n\nWhen `body.up_to_response_id` is set, only history up to and\nincluding that response is copied into the fork (a \"fork from\nthis response\"); a native target then rebuilds its transcript\nfrom the truncated items instead of resuming the source's full\nnative transcript.\n\nA sub-agent source is allowed, which is how a sub-agent is\npromoted to a session of its own: the fork is always a fresh\ntop-level conversation (no parent, its own spawn-tree root, its\nown owner grant), so it appears in the sidebar and outlives the\nparent. The source keeps running under its parent untouched,\nand the fork does not adopt the source's own children.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionForkRequest`.\n\n**Returns:** A `SessionResponse` describing the newly created fork (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if *source_id* does not exist or `body.agent_id` is not a bindable built-in agent; 403 if the caller lacks read access; 400 if the source has no agent binding, or `body.up_to_response_id` names no response in the source session.",
+        "description": "Fork an existing session into a new session.\n\nDeep-copies the source session's conversation items and\nclones the agent into a new session. When `body.agent_id`\nis set, the fork binds that built-in agent instead of the\nsource's \u2014 switching harness (e.g. Claude-SDK \u2192 Claude Code,\nor Claude \u2192 Codex). The source's model settings carry over\nonly within the same provider family; a same-family native\ntarget also carries conversation history (the runner rebuilds\nits transcript). The REPL/CLI binds the fork to its runner via\n`PATCH /v1/sessions/{id}` after creation.\n\nWhen `body.up_to_response_id` is set, only history up to and\nincluding that response is copied into the fork (a \"fork from\nthis response\"); a native target then rebuilds its transcript\nfrom the truncated items instead of resuming the source's full\nnative transcript.\n\nThe dialog's run-config picks (`body.model_override`,\n`body.reasoning_effort`, `body.terminal_launch_args` \u2014 the\npermission-/approval-mode selector) override what the fork would\notherwise inherit. Each is opt-in: a field omitted from the request\nkeeps the inherited value (model/effort within the same provider\nfamily; launch args on a same-agent fork), while a field present\nwins \u2014 a clear alias (`\"default\"`) resets to the bound agent's\ndefault, and an explicit launch-args list also drops the source's\ncopied permission-mode / codex-bypass labels so they can't shadow\nthe freshly chosen mode.\n\nA sub-agent source is allowed, which is how a sub-agent is\npromoted to a session of its own: the fork is always a fresh\ntop-level conversation (no parent, its own spawn-tree root, its\nown owner grant), so it appears in the sidebar and outlives the\nparent. The source keeps running under its parent untouched,\nand the fork does not adopt the source's own children.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionForkRequest`.\n\n**Returns:** A `SessionResponse` describing the newly created fork (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if *source_id* does not exist or `body.agent_id` is not a bindable built-in agent; 403 if the caller lacks read access; 400 if the source has no agent binding, or `body.up_to_response_id` names no response in the source session.",
         "operationId": "fork_session_v1_sessions__source_id__fork_post",
         "parameters": [
           {

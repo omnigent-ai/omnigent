@@ -16,6 +16,12 @@ vi.mock("@/shell/AppShell", () => ({
 vi.mock("@/pages/ChatPage", () => ({ ChatPage: () => <div>chat page</div> }));
 vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div> }));
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
+vi.mock("@/pages/SettingsPage", async () => {
+  const { useLocation } = await import("react-router-dom");
+  return {
+    SettingsPage: () => <div data-testid="settings-location">{useLocation().pathname}</div>,
+  };
+});
 
 import App from "./App";
 
@@ -33,6 +39,16 @@ function renderUsageRoute(enabled: boolean) {
   );
 }
 
+function renderRoute(path: string) {
+  return render(
+    <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+      <MemoryRouter initialEntries={[path]}>
+        <App />
+      </MemoryRouter>
+    </CapabilitiesProvider>,
+  );
+}
+
 describe("Usage release feature route", () => {
   it("does not register /usage while the feature is off", async () => {
     renderUsageRoute(false);
@@ -44,5 +60,21 @@ describe("Usage release feature route", () => {
     renderUsageRoute(true);
     expect(await screen.findByText("usage page")).toBeInTheDocument();
     expect(screen.queryByText("not found")).toBeNull();
+  });
+});
+
+describe("Settings routes", () => {
+  it("redirects bare settings to the canonical General section", async () => {
+    renderRoute("/settings");
+
+    expect(await screen.findByTestId("settings-location")).toHaveTextContent("/settings/general");
+  });
+
+  it("preserves an explicit settings section", async () => {
+    renderRoute("/settings/appearance");
+
+    expect(await screen.findByTestId("settings-location")).toHaveTextContent(
+      "/settings/appearance",
+    );
   });
 });

@@ -60,7 +60,9 @@ in `web/` when needed — `node_modules/` is missing, or `package.json` /
 `pnpm-lock.yaml` is newer than it — so a fresh checkout or a new dependency
 doesn't make Vite fail its dependency scan. Output streams into the `vite` pane.
 
-Open the UI at the `ui` URL shown in the header (the Vite dev server).
+Once Vite begins serving, omnidev opens the `ui` URL shown in the header in
+your default browser. If the platform browser launcher is unavailable, startup
+continues and the combined log tells you to open that URL manually.
 
 ## Isolation
 

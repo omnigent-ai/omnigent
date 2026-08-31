@@ -57,6 +57,16 @@ PRIMARY_SESSION_ID_ENV_VAR = "OMNIGENT_RUNNER_PRIMARY_SESSION_ID"
 USER_ID_ENV_VAR = "OMNIGENT_USER_ID"
 _user_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_user_id", default=None)
 
+# Origin deployment identity for the workspace_id/app_name columns. The
+# multi-tenant managed service stamps a per-request ``record.workspace_id`` (via
+# its logging ContextFilter), so the sink prefers that; the values below are the
+# process-constant fallback for single-tenant deployments -- the DATABRICKS_* env
+# a Databricks App injects, else parsed from the server URL a runner/host
+# connected to an App carries. All absent on OSS/local (columns stay null).
+ORIGIN_WORKSPACE_ID_ENV_VAR = "DATABRICKS_WORKSPACE_ID"
+APP_NAME_ENV_VAR = "DATABRICKS_APP_NAME"
+SERVER_URL_ENV_VAR = "RUNNER_SERVER_URL"
+
 # Batching / delivery defaults.
 _BATCH_MAX_RECORDS = 100
 _FLUSH_INTERVAL_S = 2.0
@@ -223,6 +233,56 @@ def current_user_id() -> str | None:
     return _user_id_var.get() or os.environ.get(USER_ID_ENV_VAR) or None
 
 
+def _clean(value: object) -> str | None:
+    """Coerce a missing/blank record attribute to ``None`` so a fallback engages.
+
+    The managed service's logging filter sets ``record.workspace_id`` to ``""``
+    (present-but-empty) for records emitted outside a workspace-bound request, so
+    an empty value must fall through to the process-constant fallback, not win.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _parse_databricks_app_host(url: str | None) -> tuple[str | None, str | None]:
+    """Parse ``(app_name, workspace_id)`` from a Databricks Apps server URL.
+
+    Apps URLs are ``https://<app_name>-<workspace_id>.<region>.databricksapps.com``;
+    the app name may itself contain hyphens, so split on the last one and require a
+    numeric workspace-id suffix. ``(None, None)`` for any non-Apps URL -- the
+    managed service (``dbc-<hash>...``), localhost, or a custom domain.
+    """
+    if not url:
+        return None, None
+    host = urllib.parse.urlparse(url).hostname or ""
+    if not host.endswith(".databricksapps.com"):
+        return None, None
+    label = host.split(".", 1)[0]
+    app_name, sep, workspace_id = label.rpartition("-")
+    if not sep or not app_name or not workspace_id.isdigit():
+        return None, None
+    return app_name, workspace_id
+
+
+def _process_identity() -> tuple[str | None, str | None]:
+    """Best-available ``(workspace_id, app_name)`` for single-tenant deployments.
+
+    The fallback the sink applies when a record carries no per-request identity:
+    the ``DATABRICKS_*`` env (a Databricks App injects it; a host connected to a
+    managed service resolves its workspace id and publishes it there, and injects
+    it into each runner it spawns), else the values parsed from the server URL a
+    runner/host connected to an App carries. ``(None, None)`` on the managed
+    service (which supplies identity per-record) and on OSS/local. Read fresh per
+    call, not cached: the host resolves and sets the env after import.
+    """
+    url_app, url_ws = _parse_databricks_app_host(os.environ.get(SERVER_URL_ENV_VAR))
+    workspace_id = _clean(os.environ.get(ORIGIN_WORKSPACE_ID_ENV_VAR)) or url_ws
+    app_name = _clean(os.environ.get(APP_NAME_ENV_VAR)) or url_app
+    return workspace_id, app_name
+
+
 def debug_event(
     event_name: str,
     *,
@@ -241,12 +301,15 @@ def debug_event(
             "tool_call_dispatched", session_id=session_id,
             tool_call_id=tc.id, model=model))
 
-    ``session_id``/``turn_id`` are populated only from what the callsite passes;
-    ``user_id`` additionally has an ambient fallback the sink applies when the
-    record carries none (a request-scoped ContextVar on the server, the
-    ``OMNIGENT_USER_ID`` env on the runner/host). Freeform ``_logger.debug("…")``
-    calls need no ``extra``; they ship with null correlation columns and an empty
-    attributes map.
+    ``turn_id`` is populated only from what the callsite passes. ``session_id``
+    is likewise callsite-driven, but the sink additionally falls back to the
+    runner's primary (parent) conversation id when a record carries none (see
+    :func:`record_to_row`); that fallback is runner-only, so on the server an
+    unthreaded ``session_id`` stays null. ``user_id`` has its own ambient
+    fallback (a request-scoped ContextVar on the server, the ``OMNIGENT_USER_ID``
+    env on the runner/host). Freeform ``_logger.debug("…")`` calls need no
+    ``extra``; they ship with null correlation columns and an empty attributes
+    map.
     """
     extra: dict[str, object] = {"event_name": event_name, "attributes": dict(attributes)}
     if session_id is not None:
@@ -278,9 +341,25 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
     ``client_time`` is epoch microseconds and ``attributes`` a plain object --
     the two shapes the ZeroBus JSON path requires for the ``TIMESTAMP`` and
     ``MAP<STRING,STRING>`` columns respectively.
+
+    ``session_id`` is taken from what the callsite threaded via ``extra`` and,
+    failing that, falls back to the runner's primary (parent) conversation id
+    (:func:`runner_primary_session_id`). That fallback reads a runner-only env
+    that is absent on the multi-tenant server, so a server record with no
+    explicit id stays null rather than risk cross-request mis-attribution --
+    this is deliberate; do NOT add an ambient request-scoped fallback here. On a
+    runner, a co-located subagent turn whose log is not threaded can be
+    attributed to the parent conversation, an accepted trade-off.
+
+    ``workspace_id``/``app_name`` describe the record's origin deployment: the
+    managed service stamps ``record.workspace_id`` per request (so it wins),
+    while single-tenant deployments fall back to the process-constant
+    :func:`_process_identity`. ``app_name`` has no per-request source, so it is
+    null on the managed service.
     """
+    workspace_id, app_name = _process_identity()
     return {
-        "session_id": getattr(record, "session_id", None),
+        "session_id": getattr(record, "session_id", None) or runner_primary_session_id(),
         "turn_id": getattr(record, "turn_id", None),
         "source": source,
         "event_name": getattr(record, "event_name", None),
@@ -295,6 +374,8 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
         "attributes": _attributes(record),
         "log_id": uuid.uuid4().hex,
         "user_id": getattr(record, "user_id", None) or current_user_id(),
+        "workspace_id": _clean(getattr(record, "workspace_id", None)) or workspace_id,
+        "app_name": _clean(getattr(record, "app_name", None)) or app_name,
     }
 
 

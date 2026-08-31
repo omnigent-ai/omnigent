@@ -153,6 +153,17 @@ export const CLAUDE_NATIVE_EFFORTS: { value: string; label: string }[] = [
   { value: "max", label: "Max" },
 ];
 
+/** Pi thinking level options for the new-session picker. Mirrors PI_EFFORTS server-side. */
+export const PI_NATIVE_EFFORTS: { value: string; label: string }[] = [
+  { value: "none", label: "None" },
+  { value: "minimal", label: "Minimal" },
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+  { value: "xhigh", label: "xHigh" },
+  { value: "max", label: "Max" },
+];
+
 /**
  * A labeled configuration row: bold label + muted sub-description on the left,
  * the control on the right. Mirrors the "Configure …" modal layout.

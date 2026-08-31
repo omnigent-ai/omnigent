@@ -145,6 +145,21 @@ _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE: str = "external_reasoning_effort_change"
 _EXTERNAL_SUBAGENT_START_TYPE: str = "external_subagent_start"
 
 
+_EXTERNAL_ACP_SUBAGENT_START_TYPE: str = "external_acp_subagent_start"
+
+
+# Stable id an ACP agent gave the sub-agent it spawned (Devin's ``agentId``);
+# the idempotency key for the child row. Unlike the native families there is no
+# ``omnigent.wrapper`` value: an ACP sub-agent runs the SAME harness as its
+# parent, so leaving the wrapper unset lets the child's harness resolve to the
+# parent's (e.g. ``devin``) and the UI label it accordingly, instead of
+# mislabeling it as another vendor.
+_ACP_SUBAGENT_ID_LABEL_KEY = "omnigent.acp.subagent_id"
+
+
+_ACP_SUBAGENT_DESCRIPTION_LABEL_KEY = "omnigent.acp.subagent_description"
+
+
 _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE = "claude-code-native-ui-subagent"
 
 
@@ -443,6 +458,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_SESSION_TITLE_TYPE,
     _EXTERNAL_SESSION_TODOS_TYPE,
     _EXTERNAL_SUBAGENT_START_TYPE,
+    _EXTERNAL_ACP_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
     _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
@@ -526,6 +542,12 @@ _session_mcp_startup_cache: dict[str, dict[str, McpServerStartup]] = {}
 
 
 _runner_skills_cache: dict[str, list[SkillSummary]] = {}
+
+
+# Sessions whose cached skills need a re-fetch but should keep serving until it
+# lands. A browser reload asks for one, and dropping the entry outright would
+# empty the composer's slash-command menu for the reload that requested it.
+_runner_skills_stale: set[str] = set()
 
 
 _runner_skills_inflight: dict[str, asyncio.Task[None]] = {}
@@ -669,9 +691,6 @@ _RUNNER_SESSION_INIT_TIMEOUT_S = 10.0
 
 
 _STOP_RUNNER_RESULT_TIMEOUT_S = 10.0
-
-
-_COMPACT_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
 
 # Derived from the fork_history capability axis (see harness_capabilities). A
@@ -847,7 +866,6 @@ __all__ = [
     "_CODEX_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY",
     "_CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",
     "_CODEX_NATIVE_WRAPPER_LABEL_VALUE",
-    "_COMPACT_LOCKS",
     "_COMPACT_TYPE",
     "_CURSOR_FORK_HISTORY_HARNESSES",
     "_CURSOR_NATIVE_HARNESS",
@@ -963,6 +981,7 @@ __all__ = [
     "_runner_relay_tasks",
     "_runner_skills_cache",
     "_runner_skills_inflight",
+    "_runner_skills_stale",
     "_server_host_registry",
     "_server_runner_router",
     "_session_active_response_cache",

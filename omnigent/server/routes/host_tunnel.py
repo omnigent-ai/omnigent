@@ -35,6 +35,8 @@ from omnigent.host.frames import (
     HostFsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostImportLocalDoneFrame,
+    HostImportLocalSessionFrame,
     HostInstallHarnessResultFrame,
     HostLaunchRunnerResultFrame,
     HostListDirResultFrame,
@@ -153,7 +155,19 @@ def create_host_tunnel_router(
             host_id = uuid_to_bytes(host_id).hex()
         except InvalidUuidError:
             _logger.warning("Refusing host tunnel: malformed host id %r", host_id)
-            await ws.close(code=4003, reason="invalid host id")
+            # Refuse with a real HTTP 400 + body rather than a bare pre-accept
+            # close: the latter reaches the client as an opaque 403 (empty
+            # body), indistinguishable from an auth failure. A 400 that names
+            # the problem lets the host surface an actionable error.
+            await _refuse_upgrade(
+                ws,
+                status=400,
+                reason=(
+                    f"Invalid host id {host_id!r}: host ids must be UUIDs. Set "
+                    "OMNIGENT_HOST_ID to a UUID (or unset it to have one "
+                    "generated) and reconnect."
+                ),
+            )
             return
 
         # Authenticate from the handshake BEFORE accepting the upgrade,
@@ -735,6 +749,34 @@ async def _receive_loop(
                         "routable_models": frame.routable_models,
                         "error": frame.error,
                     }
+                )
+            continue
+        if isinstance(frame, HostImportLocalSessionFrame):
+            queue = conn.pending_import_local.get(frame.request_id)
+            if queue is not None:
+                s = frame.session
+                queue.put_nowait(
+                    (
+                        "session",
+                        {
+                            "total": frame.total,
+                            "external_session_id": s.external_session_id,
+                            "workspace": s.workspace,
+                            "items": s.items,
+                            "title": s.title,
+                            "source": s.source,
+                        },
+                    )
+                )
+            continue
+        if isinstance(frame, HostImportLocalDoneFrame):
+            queue = conn.pending_import_local.get(frame.request_id)
+            if queue is not None:
+                queue.put_nowait(
+                    (
+                        "done",
+                        {"status": frame.status, "error": frame.error, "failed": frame.failed},
+                    )
                 )
             continue
 

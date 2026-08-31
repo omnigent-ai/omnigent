@@ -34,8 +34,12 @@ jobs:
     name: Re-run failed CI for the PR head
     permissions:
       actions: write        # gh run rerun
-      pull-requests: read   # resolve the PR head SHA
-      issues: write         # react to the comment + post the result
+      # `write`, not `read`: besides resolving the PR head SHA, the final
+      # `gh pr comment` posts via the GraphQL `addComment` mutation, which is
+      # authorised by the pull-requests scope -- `issues: write` does NOT cover
+      # it, and the step dies with "Resource not accessible by integration".
+      pull-requests: write  # resolve the PR head SHA + post the result comment
+      issues: write         # react to the triggering comment
     # PR comment, body starts with `/rerun`, not a bot, in this repo, AND the
     # commenter is the PR author or has write access. `issue.user.login` is the
     # PR author; `comment.user.login` is the commenter.

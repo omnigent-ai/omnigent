@@ -34,8 +34,21 @@ import { CapabilitiesContext } from "./lib/CapabilitiesContext";
 import { createBootServerInfo } from "./lib/bootCapabilities";
 import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { EmbeddedProvider } from "./lib/embedded";
-import { type OmnigentHostConfig, setEmbedRoot, setOmnigentHostConfig } from "./lib/host";
+import {
+  type OmnigentHostConfig,
+  setEmbedRoot,
+  setEmbedScopeRoot,
+  setOmnigentHostConfig,
+} from "./lib/host";
 import { resolveIdentity } from "./lib/identity";
+import {
+  applyDesktopUiFontSize,
+  applyUiFontFamily,
+  readUiFontFamily,
+  readUiFontSizePx,
+} from "./lib/uiFontPreferences";
+import { applyThemePalette, readThemePalette } from "./lib/themePalette";
+import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
 import {
   type RoutingApi,
   RoutingProvider,
@@ -159,6 +172,22 @@ function OmnigentProviders({
     setEmbedRoot(el);
   }, []);
 
+  // The outer `.omnigent-app` scope root is where the scoped `:root` tokens
+  // live, so per-device preferences (UI font, color palette, custom theme) must
+  // be applied here — standalone main.tsx applies them to <html> at boot; the
+  // embed applies them once the scope root mounts. The inner `scopeRef` runs
+  // first (child refs fire before parent refs), so `getEmbedRoot()` is already
+  // set for the palette's dark-mode attribute stamping.
+  const scopeRootRef = useCallback((el: HTMLDivElement | null) => {
+    setEmbedScopeRoot(el);
+    if (el) {
+      applyDesktopUiFontSize(readUiFontSizePx());
+      applyUiFontFamily(readUiFontFamily());
+      applyThemePalette(readThemePalette());
+      applyCustomTheme(readCustomTheme());
+    }
+  }, []);
+
   return (
     // Two nested wrappers on purpose:
     //   - `.omnigent-app` (outer) is the scope anchor. The scoped stylesheet
@@ -169,7 +198,7 @@ function OmnigentProviders({
     //     the Radix portal root, so both the app and its overlays read the dark
     //     token overrides. Light mode = no class → inherits the scope root's
     //     light tokens.
-    <div className="omnigent-app" style={{ height: "100%", width: "100%" }}>
+    <div ref={scopeRootRef} className="omnigent-app" style={{ height: "100%", width: "100%" }}>
       <div
         ref={scopeRef}
         className={isDarkMode ? "dark" : undefined}

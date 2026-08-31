@@ -61,7 +61,7 @@ function clamp(w: number, minPx = MIN_WIDTH_PX, reservedPx = 0): number {
 // memory lets the resize handler re-derive the effective width from it —
 // restoring the larger choice when space returns — without touching disk.
 // Both start null: the active session's saved width is loaded once the hook
-// learns its conversationId (see loadSession), since the width is per-session.
+// learns its storage key (see loadSession), since width is scoped by the caller.
 let currentSessionId: string | null = null;
 let preferredWidth: number | null = null;
 let storedWidth: number | null = null;
@@ -95,9 +95,8 @@ function subscribe(cb: () => void): () => void {
   return () => listeners.delete(cb);
 }
 
-// Re-seed the module store from a session's saved width. Called when the
-// active conversation changes so each session restores its own width (and a
-// session with no saved width falls back to the viewport-derived default).
+// Re-seed the module store from a storage key's saved width. A key with no
+// saved width falls back to the viewport-derived default.
 function loadSession(sessionId: string | null): void {
   if (sessionId === currentSessionId) return;
   currentSessionId = sessionId;
@@ -134,19 +133,23 @@ function getServerSnapshot(): number | null {
  * handle element. Intended for desktop-only use — callers should not render
  * the handle on mobile.
  *
- * `sessionId` scopes the persisted width: each conversation remembers its own
- * rail width. Pass `null` when there is no active conversation (the panel then
- * uses the default width and resizes are not persisted).
+ * `sessionId` scopes the persisted width. AppShell passes the root session so
+ * one agent tree shares a rail width. Pass `null` when there is no active
+ * conversation (the panel then uses the default width and resizes are not
+ * persisted).
  *
  * `reservedPx` is layout width the panel may not claim — the open sidebar. It
  * tightens the ceiling without touching the persisted preference, so opening
  * the sidebar temporarily shrinks the panel and collapsing it restores the
  * user's width.
+ *
+ * `persistEnabled` disables manual resizing while the storage key is tentative.
  */
 export function useResizableInlinePanel(
   sessionId: string | null,
   minWidthPx = MIN_WIDTH_PX,
   reservedPx = 0,
+  persistEnabled = true,
 ) {
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
   // On a session switch the module store still holds the previous session's
@@ -178,6 +181,8 @@ export function useResizableInlinePanel(
   minWidthRef.current = minWidthPx;
   const reservedRef = useRef(reservedPx);
   reservedRef.current = reservedPx;
+  const persistEnabledRef = useRef(persistEnabled);
+  persistEnabledRef.current = persistEnabled;
 
   // While dragging, a transparent full-window overlay sits above the panel so
   // the pointer stream keeps reaching the parent document. Without it, dragging
@@ -229,17 +234,19 @@ export function useResizableInlinePanel(
 
   const onMouseDown = useCallback(
     (e: React.MouseEvent) => {
+      if (!persistEnabled) return;
       e.preventDefault();
       setIsDragging(true);
       addDragOverlay();
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
     },
-    [addDragOverlay],
+    [addDragOverlay, persistEnabled],
   );
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
+      if (!persistEnabled) return;
       const step = 20;
       if (e.key === "ArrowLeft") {
         e.preventDefault();
@@ -255,7 +262,7 @@ export function useResizableInlinePanel(
         );
       }
     },
-    [resolvedWidth],
+    [persistEnabled, resolvedWidth],
   );
 
   // Drag listeners live only while a drag is active — no idle window-level
@@ -269,7 +276,7 @@ export function useResizableInlinePanel(
 
     function flush() {
       frame = 0;
-      if (pending === null) return;
+      if (pending === null || !persistEnabledRef.current) return;
       setStoredWidth(clamp(pending, minWidthRef.current, reservedRef.current));
       pending = null;
     }
@@ -284,7 +291,7 @@ export function useResizableInlinePanel(
       flush();
       setIsDragging(false);
       removeDragOverlay();
-      persistStoredWidth();
+      if (persistEnabledRef.current) persistStoredWidth();
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     }
@@ -311,7 +318,8 @@ export function useResizableInlinePanel(
       role: "separator" as const,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize panel",
-      tabIndex: 0,
+      "aria-disabled": !persistEnabled,
+      tabIndex: persistEnabled ? 0 : -1,
     },
   };
 }

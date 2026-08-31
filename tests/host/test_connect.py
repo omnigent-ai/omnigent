@@ -36,6 +36,7 @@ from omnigent.host.frames import (
     HostDetectCredentialsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostImportLocalFrame,
     HostInstallHarnessFrame,
     HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
@@ -796,6 +797,60 @@ async def _cancel(task: asyncio.Task[None]) -> None:
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
+
+
+def test_unavailable_harness_quick_probe_is_ttl_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The quick probe resolves each unavailable harness once per TTL.
+
+    The readiness loop wakes every 5s; re-probing every unavailable
+    harness with a full shutil.which PATH scan on each wakeup burns a
+    sustained CPU core on hosts where each PATH stat is expensive. Within
+    the TTL the cached verdict serves the cadence; expiry re-probes so a
+    new install still surfaces.
+    """
+    from omnigent.host import connect as connect_mod
+
+    calls: list[str] = []
+    monkeypatch.setattr(connect_mod, "harness_is_configured", lambda h: calls.append(h) or False)
+    connect_mod._invalidate_quick_probe_cache()
+    try:
+        previous = {"goose-native": False, "qwen-native": False}
+
+        # Burst of quick probes well inside the TTL.
+        for _ in range(12):
+            assert connect_mod._unavailable_harness_became_ready(previous) is False
+        # Each harness resolved exactly ONCE — the cadence served from cache.
+        assert sorted(calls) == ["goose-native", "qwen-native"]
+
+        # A harness that becomes configured is seen once the verdict expires.
+        monkeypatch.setattr(connect_mod, "harness_is_configured", lambda h: h == "goose-native")
+        monkeypatch.setattr(connect_mod, "HARNESS_READINESS_QUICK_PROBE_CACHE_TTL_S", 0.0)
+        assert connect_mod._unavailable_harness_became_ready(previous) is True
+    finally:
+        connect_mod._invalidate_quick_probe_cache()
+        monkeypatch.undo()
+
+
+def test_quick_probe_cache_survives_configured_flip_within_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Within the TTL a cached miss is authoritative — an external install
+    surfaces on the next expiry, not the next 5s tick."""
+    from omnigent.host import connect as connect_mod
+
+    state = {"configured": False}
+    monkeypatch.setattr(connect_mod, "harness_is_configured", lambda _h: state["configured"])
+    connect_mod._invalidate_quick_probe_cache()
+    try:
+        assert connect_mod._unavailable_harness_became_ready({"goose-native": False}) is False
+        state["configured"] = True
+        # Still inside the TTL: cached miss wins.
+        assert connect_mod._unavailable_harness_became_ready({"goose-native": False}) is False
+        # Expiry re-probes and sees the install.
+        monkeypatch.setattr(connect_mod, "HARNESS_READINESS_QUICK_PROBE_CACHE_TTL_S", 0.0)
+        assert connect_mod._unavailable_harness_became_ready({"goose-native": False}) is True
+    finally:
+        connect_mod._invalidate_quick_probe_cache()
 
 
 async def test_live_host_refreshes_harness_readiness_without_reconnect(
@@ -3102,7 +3157,7 @@ class _ConnectSpy:
         return _HandshakeFailingConnect(exc)
 
 
-def _invalid_status(status_code: int) -> InvalidStatus:
+def _invalid_status(status_code: int, body: bytes = b"") -> InvalidStatus:
     """Build a real :class:`InvalidStatus` for a rejected WS upgrade.
 
     Matches what ``websockets`` raises when the server answers the
@@ -3110,10 +3165,13 @@ def _invalid_status(status_code: int) -> InvalidStatus:
 
     :param status_code: HTTP status on the upgrade response, e.g.
         ``403``.
+    :param body: Optional response body the server sent with the refusal
+        (what ``_refuse_upgrade`` emits), so a test can assert it is
+        surfaced to the operator.
     :returns: An ``InvalidStatus`` whose ``response.status_code`` is
         *status_code*.
     """
-    return InvalidStatus(Response(status_code, "", Headers()))
+    return InvalidStatus(Response(status_code, "", Headers(), body))
 
 
 def _patch_connect(monkeypatch: pytest.MonkeyPatch, spy: _ConnectSpy) -> None:
@@ -3800,6 +3858,26 @@ def test_run_host_process_exits_nonzero_on_fatal(
     # The actionable message reached stderr (banner + the 403 cause).
     assert "Could not connect" in err
     assert "HTTP 403" in err
+
+
+async def test_run_host_process_invalid_host_id_exits_actionably(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A malformed configured identity is a user error, not a CLI crash."""
+    monkeypatch.setenv("OMNIGENT_HOST_ID", "not-a-uuid")
+    monkeypatch.setenv("OMNIGENT_HOST_NAME", "managed-test")
+
+    with pytest.raises(SystemExit) as excinfo:
+        run_host_process(
+            server_url="https://app.example.databricks.com",
+            config_path=tmp_path / "config.yaml",
+        )
+
+    assert excinfo.value.code == HOST_FATAL_EXIT_CODE
+    err = capsys.readouterr().err
+    assert "Could not start host" in err
+    assert "OMNIGENT_HOST_ID" in err
+    assert "not-a-uuid" in err
 
 
 def test_run_host_process_announces_session_log_dir_on_start(
@@ -4746,3 +4824,371 @@ def test_post_connect_auth_rejection_escalates_without_going_fatal(
     assert "omnigent login http://localhost:8000" in escalated
     assert "no longer a transient network blip" in escalated
     assert host._auth_retry_streak == _AUTH_REJECT_ESCALATE_ATTEMPTS
+
+
+async def test_fatal_upgrade_error_surfaces_server_refusal_body() -> None:
+    """A refusal that carries a body (what ``_refuse_upgrade`` sends, e.g. the
+    server's malformed-host-id 400) is surfaced verbatim — the client passes the
+    server's own reason through instead of guessing from the status code.
+    """
+    host = _make_host_process()
+    server_reason = (
+        "Invalid host id 'superagent-databricks-host': host ids must be UUIDs. "
+        "Set OMNIGENT_HOST_ID to a UUID (or unset it to have one generated) and reconnect."
+    )
+    err = host._fatal_upgrade_error(_invalid_status(400, server_reason.encode()))
+    assert err is not None  # 400 is a permanent refusal, not retried
+    assert server_reason in str(err)
+    assert "HTTP 400" in str(err)
+
+
+async def test_fatal_upgrade_error_bodyless_4xx_falls_back_to_generic() -> None:
+    """A permanent 4xx with no body (a bare pre-accept close carries none) still
+    yields an actionable, generic message rather than an empty one.
+    """
+    host = _make_host_process()
+    err = host._fatal_upgrade_error(_invalid_status(400))
+    assert err is not None
+    assert "HTTP 400" in str(err)
+    assert "the server rejected the host tunnel request" in str(err)
+
+
+async def test_handle_launch_supersedes_previous_runner_for_same_session(
+    tmp_path: Path,
+) -> None:
+    """A relaunch for a session tears down that session's previous runner.
+
+    The server rotates the binding token on every relaunch, so without
+    this the host accumulates one live runner per attempt — each with a
+    transcript forwarder tailing the same session (the #5182 leak).
+    """
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        return original_popen(
+            ["sleep", "30"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        first = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_a",
+                binding_token="tok_a",
+                workspace=str(workspace),
+                session_id="conv_super",
+            )
+        )
+        first_handle = host._runners[first.runner_id]
+        second = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_b",
+                binding_token="tok_b",
+                workspace=str(workspace),
+                session_id="conv_super",
+            )
+        )
+
+    assert first.status == "launched" and second.status == "launched"
+    # The superseded runner is untracked at once; its termination runs
+    # detached, so poll-wait briefly for the process to go down.
+    assert first.runner_id not in host._runners
+    for _ in range(70):
+        if first_handle.proc.poll() is not None:
+            break
+        await asyncio.sleep(0.1)
+    assert first_handle.proc.poll() is not None, (
+        "the previous runner for the session must be terminated on relaunch"
+    )
+    assert second.runner_id in host._runners
+    _cleanup_host(host)
+
+
+async def test_handle_launch_leaves_other_sessions_runners_alone(
+    tmp_path: Path,
+) -> None:
+    """Supersession is scoped to the frame's session: no cross-session kills."""
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        return original_popen(
+            ["sleep", "30"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        first = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_a",
+                binding_token="tok_a2",
+                workspace=str(workspace),
+                session_id="conv_one",
+            )
+        )
+        second = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_b",
+                binding_token="tok_b2",
+                workspace=str(workspace),
+                session_id="conv_two",
+            )
+        )
+
+    assert first.runner_id in host._runners
+    assert second.runner_id in host._runners
+    assert host._runners[first.runner_id].proc.poll() is None
+    _cleanup_host(host)
+
+
+async def test_handle_launch_spawn_failure_preserves_previous_runner(
+    tmp_path: Path,
+) -> None:
+    """A failed relaunch spawn must not have killed the session's runner.
+
+    Supersession runs only after the replacement is alive: trading a
+    working runner for a spawn failure would leave the session with
+    nothing (worse than the leak this fixes).
+    """
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+    calls = {"n": 0}
+
+    def _popen_second_fails(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise OSError("fork failed")
+        return original_popen(
+            ["sleep", "30"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_popen_second_fails):
+        first = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_a",
+                binding_token="tok_keep",
+                workspace=str(workspace),
+                session_id="conv_keep",
+            )
+        )
+        second = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_b",
+                binding_token="tok_fail",
+                workspace=str(workspace),
+                session_id="conv_keep",
+            )
+        )
+
+    assert second.status == "failed"
+    assert first.runner_id in host._runners, (
+        "a failed replacement spawn must leave the previous runner tracked"
+    )
+    assert host._runners[first.runner_id].proc.poll() is None, (
+        "a failed replacement spawn must leave the previous runner alive"
+    )
+    _cleanup_host(host)
+
+
+async def test_supersede_stop_does_not_block_the_launch(
+    tmp_path: Path,
+) -> None:
+    """A SIGTERM-ignoring old runner can't head-of-line block the relaunch.
+
+    The termination round (5s grace, then SIGKILL) runs detached; the
+    launch handler must return while the stubborn process is still up.
+    """
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+    calls = {"n": 0}
+
+    def _popen_first_stubborn(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Ignores SIGTERM: only the detached round's SIGKILL ends it.
+            return original_popen(
+                ["bash", "-c", 'trap "" TERM; sleep 30'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        return original_popen(
+            ["sleep", "30"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_popen_first_stubborn):
+        first = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_a",
+                binding_token="tok_stub",
+                workspace=str(workspace),
+                session_id="conv_stub",
+            )
+        )
+        first_handle = host._runners[first.runner_id]
+        started = time.monotonic()
+        second = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_b",
+                binding_token="tok_new",
+                workspace=str(workspace),
+                session_id="conv_stub",
+            )
+        )
+        elapsed = time.monotonic() - started
+
+    assert second.status == "launched"
+    assert elapsed < 3.0, (
+        f"the launch must not wait out the old runner's termination grace (took {elapsed:.1f}s)"
+    )
+    # The stubborn process survives SIGTERM but the detached round's
+    # SIGKILL takes it down within its 5s grace + margin.
+    for _ in range(80):
+        if first_handle.proc.poll() is not None:
+            break
+        await asyncio.sleep(0.1)
+    assert first_handle.proc.poll() is not None, (
+        "the detached stop must eventually SIGKILL a SIGTERM-ignoring runner"
+    )
+    _cleanup_host(host)
+
+
+async def test_handle_import_local_all_streams_a_frame_per_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``source="all"`` streams one session frame each (tagged), then a done frame."""
+    from omnigent.host.frames import (
+        HostImportLocalDoneFrame,
+        HostImportLocalSessionFrame,
+        decode_host_frame,
+    )
+
+    host = _make_host_process()
+
+    # The cross-harness selector already merged/ranked; the handler just loads.
+    def _fake_across(*, limit: int) -> list[tuple[str, str]]:
+        return [("claude", "c1"), ("codex", "x1")]
+
+    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+        item = SimpleNamespace(
+            type="message",
+            response_id="r1",
+            data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+        )
+        return SimpleNamespace(
+            external_session_id=session_id,
+            workspace="/repo",
+            items=[item],
+            title=f"{source} title",
+            source=source,
+        )
+
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_sessions_across_harnesses", _fake_across
+    )
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+
+    sent: list[str] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            sent.append(text)
+
+    await host._handle_import_local(
+        _FakeWs(),  # type: ignore[arg-type]
+        HostImportLocalFrame(request_id="req_all", source="all", limit=5),
+    )
+
+    frames = [decode_host_frame(text) for text in sent]
+    session_frames = [f for f in frames if isinstance(f, HostImportLocalSessionFrame)]
+    done_frames = [f for f in frames if isinstance(f, HostImportLocalDoneFrame)]
+
+    # One frame per session, each tagged with its own source + title + the total.
+    assert {
+        (f.session.external_session_id, f.session.source, f.session.title) for f in session_frames
+    } == {("c1", "claude", "claude title"), ("x1", "codex", "codex title")}
+    assert all(f.total == 2 for f in session_frames)
+    assert len(done_frames) == 1 and done_frames[0].status == "ok"
+
+
+async def test_handle_import_local_reports_unreadable_sessions_as_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session that fails to load sends no frame but is counted on the done frame."""
+    from omnigent.host.frames import (
+        HostImportLocalDoneFrame,
+        HostImportLocalSessionFrame,
+        decode_host_frame,
+    )
+
+    host = _make_host_process()
+
+    def _fake_across(*, limit: int) -> list[tuple[str, str]]:
+        return [("claude", "good"), ("claude", "corrupt")]
+
+    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+        if session_id == "corrupt":
+            raise ValueError("truncated transcript")
+        item = SimpleNamespace(
+            type="message",
+            response_id="r1",
+            data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+        )
+        return SimpleNamespace(
+            external_session_id=session_id,
+            workspace="/repo",
+            items=[item],
+            title="ok",
+            source=source,
+        )
+
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_sessions_across_harnesses", _fake_across
+    )
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+
+    sent: list[str] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            sent.append(text)
+
+    await host._handle_import_local(
+        _FakeWs(),  # type: ignore[arg-type]
+        HostImportLocalFrame(request_id="req_fail", source="all", limit=5),
+    )
+
+    frames = [decode_host_frame(text) for text in sent]
+    session_frames = [f for f in frames if isinstance(f, HostImportLocalSessionFrame)]
+    done_frames = [f for f in frames if isinstance(f, HostImportLocalDoneFrame)]
+
+    # Only the readable session got a frame; the corrupt one is counted, not sent.
+    assert [f.session.external_session_id for f in session_frames] == ["good"]
+    assert len(done_frames) == 1
+    assert done_frames[0].status == "ok" and done_frames[0].failed == 1

@@ -19,7 +19,6 @@ import {
   RECONNECT_BACKOFF_MS,
   RECONNECT_STABLE_MS,
   buildAttachPath,
-  selectionHintText,
 } from "./TerminalView";
 
 const clipboardMock = vi.hoisted(() => ({
@@ -32,7 +31,6 @@ const terminalSessionMock = vi.hoisted(() => ({
   instances: [] as {
     url: string;
     container: HTMLDivElement;
-    nativeSelection: boolean;
     clipboardEnabled: boolean;
     onClipboardRequest?: (text: string) => void;
     onState: (state: ConnectionState) => void;
@@ -60,14 +58,12 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
       _isDark?: boolean,
       _onActivity?: () => void,
       _onInput?: () => void,
-      nativeSelection = false,
       clipboardEnabled = true,
       onClipboardRequest?: (text: string) => void,
     ) {
       terminalSessionMock.instances.push({
         url,
         container,
-        nativeSelection,
         clipboardEnabled,
         onClipboardRequest,
         onState,
@@ -116,28 +112,15 @@ describe("buildAttachPath", () => {
     );
   });
 
-  it("appends ?transport= when a transport override is given", () => {
-    expect(buildAttachPath("conv_abc", "terminal_bash_s1", false, undefined, "control")).toBe(
-      "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?transport=control",
-    );
-  });
-
-  it("combines read_only, slice_key, and transport params", () => {
-    const path = buildAttachPath("conv_abc", "terminal_bash_s1", true, "host_789", "control");
+  it("combines read_only and slice-key params", () => {
+    const path = buildAttachPath("conv_abc", "terminal_bash_s1", true, "host_789");
     expect(path).toContain("read_only=true");
     expect(path).toContain("omnigent_slice_key=host_789");
-    expect(path).toContain("transport=control");
   });
 
   it("omits ?omnigent_slice_key when no hostId is provided", () => {
     const path = buildAttachPath("conv_abc", "terminal_bash_s1", false);
     expect(path.includes("omnigent_slice_key")).toBe(false);
-  });
-
-  it("omits ?transport when no override is given", () => {
-    expect(buildAttachPath("conv_abc", "terminal_bash_s1", false).includes("transport")).toBe(
-      false,
-    );
   });
 
   it("url-encodes the session and terminal ids", () => {
@@ -163,41 +146,17 @@ describe("buildAttachPath", () => {
   });
 });
 
-describe("control-mode transport", () => {
-  it("forwards ?transport=control and enables native selection when transport=control", async () => {
-    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" transport="control" />);
-    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
-    const inst = terminalSessionMock.instances[0];
-    expect(inst.url).toContain("transport=control");
-    expect(inst.nativeSelection).toBe(true);
-  });
-
+describe("control-mode terminal", () => {
   it("disables clipboard bridging for read-only attaches", async () => {
-    render(
-      <TerminalView
-        sessionId="conv_abc"
-        terminalId="terminal_bash_s1"
-        transport="control"
-        readOnly
-      />,
-    );
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" readOnly />);
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
     expect(terminalSessionMock.instances[0].clipboardEnabled).toBe(false);
   });
 
-  it("hides the selection hint bar in control mode", async () => {
-    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" transport="control" />);
-    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
-    expect(screen.queryByTestId("terminal-selection-hint")).toBeNull();
-  });
-
-  it("keeps the hint bar and PTY behavior by default (no transport prop)", async () => {
+  it("does not render a legacy selection hint", async () => {
     render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
-    const inst = terminalSessionMock.instances[0];
-    expect(inst.url).not.toContain("transport");
-    expect(inst.nativeSelection).toBe(false);
-    expect(screen.getByTestId("terminal-selection-hint")).toBeInTheDocument();
+    expect(screen.queryByTestId("terminal-selection-hint")).toBeNull();
   });
 });
 
@@ -811,27 +770,5 @@ describe("automatic reconnect", () => {
     await act(async () => {});
     expect(terminalSessionMock.instances).toHaveLength(1);
     expect(screen.getByText("Bridge closed: code 4405")).toBeInTheDocument();
-  });
-});
-
-describe("selectionHintText", () => {
-  it("tells macOS users to hold Option and copy with Command", () => {
-    // On macOS the force-selection modifier is Option and Cmd+C copies
-    // (Cmd isn't forwarded to the shell). Both must appear; a regression
-    // to Shift/Ctrl here would print the wrong keys for Mac users.
-    const hint = selectionHintText(true);
-    expect(hint).toContain("⌥");
-    expect(hint).toContain("⌘C");
-  });
-
-  it("tells non-macOS users to hold Shift and copy via right-click", () => {
-    // Elsewhere the modifier is Shift, and Ctrl+C is SIGINT (not copy),
-    // so the hint must say Shift and must point at right-click → Copy
-    // rather than a Ctrl+C shortcut that would kill the user's process.
-    const hint = selectionHintText(false);
-    expect(hint).toContain("Shift");
-    expect(hint).toContain("right-click");
-    expect(hint).not.toContain("⌘");
-    expect(hint.toLowerCase()).not.toContain("ctrl");
   });
 });

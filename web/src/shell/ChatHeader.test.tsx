@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -75,6 +75,7 @@ function renderHeader(props: {
   hasRailContent?: boolean;
   showFilesPanel?: boolean;
   mobileMenu?: typeof mobileMenu;
+  onOpenSidebar?: (peek?: boolean) => void;
 }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
@@ -83,7 +84,7 @@ function renderHeader(props: {
         <TooltipProvider>
           <ChatHeader
             sidebarOpen={props.sidebarOpen}
-            onOpenSidebar={() => {}}
+            onOpenSidebar={props.onOpenSidebar ?? (() => {})}
             isChildSession={props.isChildSession ?? false}
             // Defaults to no active session: PresenceAvatars / AgentInfoButton /
             // right-panel toggle / rail entries all gate on conversationId and
@@ -187,6 +188,25 @@ describe("ChatHeader — open-sidebar toggle visibility", () => {
     // present. A regression here would hide the only way to reopen the
     // sidebar via pointer.
     expect(screen.getByRole("button", { name: "Open sidebar" })).toBeInTheDocument();
+  });
+
+  it("cancels the pending peek as soon as the toggle is pressed", () => {
+    vi.useFakeTimers();
+    const onOpenSidebar = vi.fn();
+    try {
+      renderHeader({ sidebarOpen: false, onOpenSidebar });
+      const toggle = screen.getByRole("button", { name: "Open sidebar" });
+
+      fireEvent.pointerEnter(toggle);
+      fireEvent.pointerDown(toggle);
+      act(() => vi.advanceTimersByTime(400));
+
+      expect(onOpenSidebar).not.toHaveBeenCalledWith(true);
+      fireEvent.click(toggle);
+      expect(onOpenSidebar).toHaveBeenLastCalledWith(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -454,6 +474,20 @@ describe("ChatHeader — floating mobile controls", () => {
     expect(toggle).toHaveClass("size-10");
   });
 
+  it("insets the pill's leading edge for the Chat/Terminal track", () => {
+    // The track paints its own background to its edge, so with the pill's
+    // zero padding it sat flush against the border while an icon-only
+    // neighbour cleared it by the slack in its 40px box. The inset is
+    // conditional: a lone kebab must stay the 40px circle asserted above.
+    isMobileMock.mockReturnValue(true);
+    renderHeaderWithSession(makeTerminalFirstCtx());
+
+    const cluster = screen.getByTestId("view-mode-toggle").parentElement;
+    expect(cluster).toHaveClass("max-md:has-data-[slot=view-mode-toggle]:pl-1.5");
+    // The guard keys off the track's own data-slot, so it has to be present.
+    expect(screen.getByTestId("view-mode-toggle")).toHaveAttribute("data-slot", "view-mode-toggle");
+  });
+
   it("rounds the kebab's own background so no square shows inside the pill", () => {
     // The ghost button paints `aria-expanded:bg-muted` at its rounded-lg
     // radius, which showed as a square behind the round pill once open.
@@ -508,6 +542,7 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     const trigger = screen.getByRole("button", { name: "Conversation actions" });
     expect(title).toHaveClass("min-w-0", "truncate");
     expect(title.parentElement).toBe(trigger.parentElement);
+    expect(trigger.closest("nav.conversation-breadcrumb")).not.toHaveClass("group/breadcrumb");
     expect(title.compareDocumentPosition(trigger) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 

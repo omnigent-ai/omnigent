@@ -132,7 +132,10 @@ _MAX_CONCURRENT_MCP_REQUESTS = 64
 # ``tmux.json`` after the Claude terminal launches; the harness
 # tails it and shells out to tmux.
 _TMUX_READY_TIMEOUT_S = 30.0
-_TMUX_SEND_TIMEOUT_S = 5.0
+# Per-command tmux budget. 10s matches every other native bridge: a tmux
+# server starved by parallel worker boots on a large worktree can stall
+# past 5s while still healthy, and a shorter budget kills the delivery.
+_TMUX_SEND_TIMEOUT_S = 10.0
 # Claude Code renders this prompt glyph in its input box once the TUI
 # is interactive. We poll ``capture-pane`` for it before injecting the
 # first message so keystrokes typed during Claude's boot aren't dropped.
@@ -1391,6 +1394,7 @@ def build_hook_settings(
     api_key_helper: str | None = None,
     launch_model: str | None = None,
     launch_permission_mode: str | None = None,
+    launch_bypass_permissions: bool = False,
     launch_effort: str | None = None,
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
@@ -1420,6 +1424,11 @@ def build_hook_settings(
     :param launch_permission_mode: Effective launch permission mode from
         ``--permission-mode``. Mirrored into ``permissions.defaultMode``
         for the same re-exec hardening.
+    :param launch_bypass_permissions: ``True`` when this launch requests
+        bypass mode (``--dangerously-skip-permissions`` or
+        ``--permission-mode bypassPermissions``), which sets
+        ``skipDangerousModePermissionPrompt`` so the one-time acceptance
+        dialog never blocks a host-spawned terminal.
     :param launch_effort: Effective launch effort from ``--effort``.
         Mirrored into ``effortLevel`` for restart/re-exec parity.
     :param subagent_router_dir: Directory where the runner advertises its
@@ -1673,6 +1682,14 @@ def build_hook_settings(
         settings["model"] = launch_model
     if launch_permission_mode:
         settings["permissions"] = {"defaultMode": launch_permission_mode}
+    if launch_bypass_permissions:
+        # Bypass mode shows a one-time "Bypass Permissions mode" acceptance
+        # dialog. Like the trust/onboarding gates it fires no
+        # PermissionRequest hook, so a host-spawned terminal has nobody to
+        # answer it and the session hangs with a blank web UI. Claude checks
+        # the org policy (``disableBypassPermissionsMode``) BEFORE this
+        # consent gate, so a managed host still strips bypass regardless.
+        settings["skipDangerousModePermissionPrompt"] = True
     if launch_effort and launch_effort in CLAUDE_EFFORTS:
         settings["effortLevel"] = launch_effort
     if api_key_helper:
@@ -1808,8 +1825,9 @@ def augment_claude_args(
         / ``"none"`` / list of skill names), mapped to
         ``--setting-sources`` exactly as the SDK executor maps it onto
         ``setting_sources``. Defaults to ``"all"``.
-    :param append_system_prompt: Optional framework-owned instructions to
-        append through Claude Code's native ``--append-system-prompt`` flag.
+    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
+        (author-supplied, not framework-composed) to append through Claude
+        Code's native ``--append-system-prompt`` flag.
     :param allowed_tools: Optional narrowly scoped Claude tool names to merge
         into ``--allowedTools`` without replacing the user's allowlist.
     :param subagent_router_dir: Directory advertising the runner's
@@ -1831,6 +1849,7 @@ def augment_claude_args(
         api_key_helper=api_key_helper,
         launch_model=_arg_value(claude_args, "--model"),
         launch_permission_mode=_arg_value(claude_args, "--permission-mode"),
+        launch_bypass_permissions=_args_request_bypass_permissions(claude_args),
         launch_effort=_arg_value(claude_args, "--effort"),
         subagent_router_dir=subagent_router_dir,
         turn_routing=turn_routing,
@@ -1886,6 +1905,21 @@ def _arg_value(args: tuple[str, ...], flag: str) -> str | None:
             if candidate and not candidate.startswith("--"):
                 value = candidate
     return value
+
+
+def _args_request_bypass_permissions(args: tuple[str, ...]) -> bool:
+    """Return whether ``args`` launch Claude Code in bypass-permissions mode.
+
+    Both spellings count: the standalone ``--dangerously-skip-permissions``
+    flag, and ``--permission-mode bypassPermissions`` (the form
+    ``permission_mode: bypassPermissions`` in a worker bundle becomes).
+
+    :param args: Claude CLI args, e.g. ``("--dangerously-skip-permissions",)``.
+    :returns: ``True`` when this launch requests bypass mode.
+    """
+    return "--dangerously-skip-permissions" in args or (
+        _arg_value(args, "--permission-mode") == "bypassPermissions"
+    )
 
 
 def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
@@ -2470,32 +2504,48 @@ def read_transcript_items_from_offset(
     )
 
 
-# Per-model pricing memo for transcript cost computation. Deliberately
-# NOT ``functools.lru_cache``: a transient ``fetch_model_pricing`` failure
-# returns ``None``, and lru_cache would pin that ``None`` for the model's
-# lifetime; this dict stores only successful lookups, so a later poll
-# retries a model whose first lookup failed.
-_TRANSCRIPT_PRICING_CACHE: dict[str, ModelPricing] = {}
+# Per-model pricing memo for transcript cost computation. Each successful
+# lookup is paired with the provider-config digest that produced it, so a
+# config change replaces stale pricing. ``None`` is never cached, allowing a
+# later poll to retry after a transient catalog failure.
+_TRANSCRIPT_PRICING_CACHE: dict[str, tuple[bytes, ModelPricing]] = {}
 
 
-def _transcript_model_pricing(model: str) -> ModelPricing | None:
+def _transcript_model_pricing(
+    model: str,
+    *,
+    provider_config: dict[str, object],
+    provider_config_fingerprint: bytes,
+) -> ModelPricing | None:
     """
-    Look up per-token pricing for *model*, memoizing successful results.
+    Look up per-token pricing for *model*, memoizing successful results for
+    the current provider configuration.
+
+    Checks provider config for custom pricing first (self-hosted models),
+    then falls back to catalog. This enables cost tracking for native
+    claude-native sessions using self-hosted endpoints.
 
     :param model: API model id from a transcript ``message.model``,
         e.g. ``"claude-opus-4-8"`` or ``"databricks-claude-sonnet-4-6"``.
+    :param provider_config: Parsed provider configuration for this transcript
+        scan.
+    :param provider_config_fingerprint: Digest used to invalidate pricing when
+        the provider configuration changes.
     :returns: The model's :class:`ModelPricing`, or ``None`` when pricing
         is unavailable (network error / model absent from the catalog),
         so the caller skips that message's cost.
     """
     cached = _TRANSCRIPT_PRICING_CACHE.get(model)
-    if cached is not None:
-        return cached
-    from omnigent.llms.context_window import fetch_model_pricing
+    if cached is not None and cached[0] == provider_config_fingerprint:
+        return cached[1]
+    from omnigent.llms.context_window import fetch_model_pricing_with_provider
 
-    pricing = fetch_model_pricing(model)
+    # For claude-native transcript pricing, assume claude-native harness
+    pricing = fetch_model_pricing_with_provider(
+        model, provider_config=provider_config, harness="claude-native"
+    )
     if pricing is not None:
-        _TRANSCRIPT_PRICING_CACHE[model] = pricing
+        _TRANSCRIPT_PRICING_CACHE[model] = (provider_config_fingerprint, pricing)
     return pricing
 
 
@@ -2553,6 +2603,10 @@ def compute_transcript_cumulative_cost(
         start_line=0,
     )
     from omnigent.llms.context_window import compute_llm_cost
+    from omnigent.onboarding.provider_config import load_config
+
+    provider_config = load_config()
+    provider_config_fingerprint = hashlib.sha256(repr(provider_config).encode("utf-8")).digest()
 
     # Per-``requestId`` cost (USD); last priceable record per id wins so a
     # response written across multiple transcript records is counted once.
@@ -2577,7 +2631,11 @@ def compute_transcript_cumulative_cost(
         model = _model_from_transcript_entry(entry)
         if model is None:
             continue
-        pricing = _transcript_model_pricing(model)
+        pricing = _transcript_model_pricing(
+            model,
+            provider_config=provider_config,
+            provider_config_fingerprint=provider_config_fingerprint,
+        )
         if pricing is None:
             continue
         request_id = entry.get("requestId")
@@ -3212,52 +3270,6 @@ def inject_interrupt(
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     # No ``-l``: tmux must interpret ``Escape`` as a key name.
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Escape")
-
-
-# Option-1 label in Claude Code's plan-review dialog: proof that dialog is
-# what's on screen before a verdict is keyed into it.
-_PLAN_DIALOG_MARKER = "Yes, and use auto mode"
-
-_PLAN_VERDICT_KEYS = {"auto": "1", "manual": "2", "reject": "Escape"}
-
-
-def inject_plan_verdict(
-    bridge_dir: Path,
-    *,
-    verdict: str,
-    timeout_s: float = _TMUX_READY_TIMEOUT_S,
-) -> bool:
-    """
-    Answer Claude Code's plan-review dialog by keystroke.
-
-    Claude Code ignores a ``PermissionRequest`` hook's ``allow`` for
-    ``ExitPlanMode`` — that dialog is answerable only from the TUI — so a
-    web-UI plan verdict has to be keyed in the way a local user would.
-    Every other gated tool honors the hook decision instead.
-
-    The pane check is the only guard available (the verdict carries no tool
-    identity), and it doubles as the "already answered in the terminal" case.
-
-    :param bridge_dir: Bridge directory path, e.g.
-        ``/tmp/omnigent/claude-native/<digest>``.
-    :param verdict: ``"auto"`` (approve + auto mode), ``"manual"``
-        (approve, keep approving edits), or ``"reject"``.
-    :param timeout_s: Seconds to wait for ``tmux.json``, e.g. ``1.0``.
-    :returns: ``True`` when the keystroke was sent, ``False`` when the
-        plan dialog was not showing.
-    :raises ValueError: If *verdict* is not a known option.
-    :raises RuntimeError: If the tmux target is not advertised in time,
-        or if the ``tmux send-keys`` invocation fails.
-    """
-    key = _PLAN_VERDICT_KEYS.get(verdict)
-    if key is None:
-        raise ValueError(f"unknown plan verdict {verdict!r}")
-    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    if _PLAN_DIALOG_MARKER not in _capture_pane(info["socket_path"], info["tmux_target"]):
-        return False
-    # No ``-l``: tmux must read ``Escape`` as a key name, not literal text.
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], key)
-    return True
 
 
 def kill_session(

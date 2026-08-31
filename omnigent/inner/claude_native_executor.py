@@ -126,9 +126,12 @@ class ClaudeNativeExecutor(Executor):
         :param tools: Tool schemas from Omnigent. Ignored here;
             Claude-native output/tool activity is terminal-originated
             and mirrored from Claude's transcript.
-        :param system_prompt: System prompt from the agent spec. The
-            native Claude Code terminal controls its own prompt/settings,
-            so this is ignored.
+        :param system_prompt: Per-turn composed system prompt. Ignored here:
+            claude-native delivers raw author instructions once, at terminal
+            launch, via ``--append-system-prompt`` (see
+            ``omnigent.runner.native.orchestration`` and
+            ``omnigent.claude_native``) — not per-turn through this
+            parameter.
         :param config: Per-turn executor config. Only ``config.model``
             is used: when intelligent routing picks a model for this turn,
             it arrives here (adapter maps ``request.model_override`` →
@@ -196,6 +199,10 @@ class ClaudeNativeExecutor(Executor):
                         content=text,
                     )
         except ClaudePromptTimeout as exc:
+            _logger.exception(
+                "claude-native: prompt delivery to harness timed out",
+                extra={"session_id": self._request_session_id},
+            )
             cleanup_error = self._reap_failed_turn()
             message = describe_exception(exc)
             if cleanup_error is not None:
@@ -203,6 +210,10 @@ class ClaudeNativeExecutor(Executor):
             yield ExecutorError(message=message)
             return
         except RuntimeError as exc:
+            _logger.exception(
+                "claude-native: failed to deliver message to harness",
+                extra={"session_id": self._request_session_id},
+            )
             yield ExecutorError(message=describe_exception(exc))
             return
         yield TurnComplete(response=None)

@@ -130,7 +130,7 @@ class TestResolveNativeAntigravityLaunch:
         with caplog.at_level(logging.WARNING, logger="omnigent.antigravity_native_launch"):
             resolve_native_antigravity_launch()
         records = [r.message for r in caplog.records]
-        assert any("agy OAuth credential" in m for m in records)
+        assert any("agy credential" in m for m in records)
         # Names both checked locations so the hint is correct on macOS AND Linux
         # (the Linux path is where the deploy target actually stores the token).
         assert any("antigravity-cli/antigravity-oauth-token" in m for m in records)

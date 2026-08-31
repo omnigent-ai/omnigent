@@ -31,6 +31,9 @@ from omnigent.inner.executor import (
     ExecutorEvent,
     Message,
     ReasoningChunk,
+    SubAgentCompleted,
+    SubAgentStarted,
+    SubAgentToolCall,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
@@ -56,6 +59,7 @@ _logger = logging.getLogger(__name__)
 
 # Observed tool calls use "in_progress" (distinct from "action_required" for server-dispatched).
 _OBSERVED_TOOL_CALL_STATUS = "in_progress"
+_COMPLETED_TOOL_CALL_STATUS = "completed"
 
 
 # Prefix for Claude SDK MCP-registered tool names (e.g. ``mcp__omnigent__sys_terminal_launch``).
@@ -66,8 +70,10 @@ _MCP_TOOL_NAME_PREFIX = "mcp__"
 
 # Interrupt and reap use SEPARATE budgets: the short slice keeps a wedged interrupt from
 # starving the reap (subprocess-backed executors terminate only in close/close_session).
+# _INTERRUPT_SLICE_S must exceed _PiRpcSession.close()'s inner 2.0s process.wait() so the
+# slice never fires first and inject a CancelledError that bypasses the SIGKILL fallback.
 INTERRUPT_TIMEOUT_S = 3.0
-_INTERRUPT_SLICE_S = 1.5
+_INTERRUPT_SLICE_S = 3.0
 
 # Consecutive orphaned tool callbacks (no active turn context) before forcing a Tier-1 SDK reset.
 # Reset to zero at each ``run_turn`` start so a single late straggler never trips it.
@@ -141,6 +147,14 @@ class ExecutorAdapter(HarnessApp):
         # dispatch_tool emits the function_call_output, so ToolCallComplete for these ids
         # must be suppressed in _translate_event to avoid duplicates.
         self._dispatched_call_ids: set[str] = set()
+        # Observed (harness-run) tool calls → (name, arguments) from the inline
+        # ToolCallRequest, so the matching ToolCallComplete can re-emit a *completed*
+        # function_call. The initial observed emission is status "in_progress", which
+        # the turn-persist filter drops (only completed function_calls are durable), so
+        # without the re-emission an observed tool card renders live but vanishes on
+        # reload. Dispatched calls never reach this — their ToolCallComplete
+        # short-circuits — so it is observed-only.
+        self._observed_tool_calls: dict[str, tuple[str, str]] = {}
 
     async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
         """Drive the inner executor for one turn, translating its events to Omnigent SSE.
@@ -192,6 +206,7 @@ class ExecutorAdapter(HarnessApp):
         # bounded interrupt only on abnormal exits (CancelledError, ExecutorError, etc.).
         clean_exit = False
         self._dispatched_call_ids.clear()
+        self._observed_tool_calls.clear()
 
         tracing = is_tracing_enabled()
         from omnigent.runtime.telemetry import current_session_id, session_scope
@@ -714,19 +729,37 @@ class ExecutorAdapter(HarnessApp):
             # so the post-stream dispatch reuses the same call_id for deduplication.
             # Emit bare names (strip MCP prefix) to match the Omnigent wire shape.
             tool_use_id = _call_id_from_metadata(event.metadata)
-            if tool_use_id is not None:
+            # Observed native tools already ran inside their harness. They must
+            # never enter the queue consumed by Omnigent's dispatch bridge.
+            if tool_use_id is not None and event.metadata.get("internally_executed") is not True:
                 self._pending_mcp_call_ids.append(tool_use_id)
             call_id = tool_use_id or f"call_{uuid.uuid4().hex[:12]}"
             bare_name = _strip_mcp_tool_prefix(event.name)
+            arguments_json = _serialize_args(event.args)
+            if event.metadata.get("observed_call_completed") is True:
+                # The executor already emits this call's durable completed form
+                # itself (e.g. a codex built-in re-emitted at completion). Emit it
+                # completed in one shot and drop any live entry cached from an
+                # earlier in_progress emit of the same call, so the ToolCallComplete
+                # below does not re-emit a second, duplicate completed card.
+                status = _COMPLETED_TOOL_CALL_STATUS
+                self._observed_tool_calls.pop(call_id, None)
+            else:
+                # A live observation. The turn-persist filter drops "in_progress",
+                # so remember name/args; the matching ToolCallComplete re-emits it as
+                # a durable completed function_call (see that branch) — which is what
+                # keeps an observed card from vanishing on reload.
+                status = _OBSERVED_TOOL_CALL_STATUS
+                self._observed_tool_calls[call_id] = (bare_name, arguments_json)
             ctx.emit(
                 OutputItemDoneEvent(
                     type="response.output_item.done",
                     item={
                         "id": f"fc_{uuid.uuid4().hex[:12]}",
                         "type": "function_call",
-                        "status": _OBSERVED_TOOL_CALL_STATUS,
+                        "status": status,
                         "name": bare_name,
-                        "arguments": _serialize_args(event.args),
+                        "arguments": arguments_json,
                         "call_id": call_id,
                         "agent": ctx.response_id,
                     },
@@ -739,6 +772,31 @@ class ExecutorAdapter(HarnessApp):
             call_id = _call_id_from_metadata(getattr(event, "metadata", None)) or ""
             if not call_id or call_id in self._dispatched_call_ids:
                 return
+            # A live observed call cached at ToolCallRequest is re-emitted here as a
+            # durable COMPLETED function_call so it survives reload — the in_progress
+            # one is dropped by the turn-persist filter. Same call_id → the web dedupes
+            # this with the live render into one card. A call already emitted completed
+            # (observed_call_completed) was never cached, so it is not re-emitted — that
+            # is what prevents a duplicate card. This mirrors how a dispatched call
+            # re-emits completed once its dispatch resolves.
+            observed = self._observed_tool_calls.pop(call_id, None)
+            if observed is not None:
+                observed_name, observed_args = observed
+                ctx.emit(
+                    OutputItemDoneEvent(
+                        type="response.output_item.done",
+                        item={
+                            "id": f"fc_{uuid.uuid4().hex[:12]}",
+                            "type": "function_call",
+                            "status": _COMPLETED_TOOL_CALL_STATUS,
+                            "name": observed_name,
+                            "arguments": observed_args,
+                            "call_id": call_id,
+                            "agent": ctx.response_id,
+                        },
+                    )
+                )
+            raw_args = getattr(event, "metadata", {}).get("arguments")
             item: dict[str, Any] = {
                 "id": f"fco_{uuid.uuid4().hex[:12]}",
                 "type": "function_call_output",
@@ -746,7 +804,6 @@ class ExecutorAdapter(HarnessApp):
                 # Cap the mirror; the inner SDK already consumed the full result.
                 "output": cap_tool_output(_serialize_tool_result(event)),
             }
-            raw_args = getattr(event, "metadata", {}).get("arguments")
             if isinstance(raw_args, dict):
                 item["arguments"] = raw_args
             ctx.emit(OutputItemDoneEvent(type="response.output_item.done", item=item))
@@ -774,6 +831,40 @@ class ExecutorAdapter(HarnessApp):
                     summary=event.summary,
                     summary_model=event.model,
                     compacted_messages=event.compacted_messages,
+                )
+            )
+        elif isinstance(event, SubAgentStarted):
+            from omnigent.server.schemas import SubagentStartedEvent
+
+            ctx.emit(
+                SubagentStartedEvent(
+                    type="subagent.started",
+                    child_key=event.child_key,
+                    title=event.title,
+                    task=event.task,
+                )
+            )
+        elif isinstance(event, SubAgentCompleted):
+            from omnigent.server.schemas import SubagentCompletedEvent
+
+            ctx.emit(
+                SubagentCompletedEvent(
+                    type="subagent.completed",
+                    child_key=event.child_key,
+                    ok=event.ok,
+                    summary=event.summary,
+                )
+            )
+        elif isinstance(event, SubAgentToolCall):
+            from omnigent.server.schemas import SubagentToolCallEvent
+
+            ctx.emit(
+                SubagentToolCallEvent(
+                    type="subagent.tool_call",
+                    child_key=event.child_key,
+                    call_id=event.call_id,
+                    name=event.name,
+                    arguments=_serialize_args(event.args),
                 )
             )
         # ExecutorError handled by the caller (re-raises so the

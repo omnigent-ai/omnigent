@@ -78,7 +78,7 @@ def test_dictation_streams_transcript_into_composer(
         browser, browser_context_args, base_url, session_id
     )
     try:
-        composer = page.get_by_placeholder("Ask the agent anything…")
+        composer = page.get_by_placeholder("Send a message…")
         expect(composer).to_be_visible()
 
         # The button only renders once /v1/info reports dictation_available,
@@ -121,7 +121,7 @@ def test_hotkey_toggles_dictation(
         browser, browser_context_args, base_url, session_id
     )
     try:
-        expect(page.get_by_placeholder("Ask the agent anything…")).to_be_visible()
+        expect(page.get_by_placeholder("Send a message…")).to_be_visible()
         mic = page.get_by_role("button", name="Voice dictation")
         expect(mic).to_be_visible()
         expect(mic).to_have_attribute("aria-pressed", "false")
@@ -149,7 +149,7 @@ def test_enter_while_listening_commits_text(
         browser, browser_context_args, base_url, session_id
     )
     try:
-        composer = page.get_by_placeholder("Ask the agent anything…")
+        composer = page.get_by_placeholder("Send a message…")
         expect(composer).to_be_visible()
         # Normalize the starting draft so the assertions are exact.
         composer.fill("")
@@ -190,7 +190,7 @@ def test_transcript_lands_at_the_caret(
         browser, browser_context_args, base_url, session_id
     )
     try:
-        composer = page.get_by_placeholder("Ask the agent anything…")
+        composer = page.get_by_placeholder("Send a message…")
         expect(composer).to_be_visible()
 
         # Paste a block of context, then put the caret at the very top.
@@ -242,7 +242,7 @@ def test_escape_while_listening_discards_text(
         browser, browser_context_args, base_url, session_id
     )
     try:
-        composer = page.get_by_placeholder("Ask the agent anything…")
+        composer = page.get_by_placeholder("Send a message…")
         expect(composer).to_be_visible()
         # Empty snapshot at voice start, so a correct discard empties it again.
         composer.fill("")

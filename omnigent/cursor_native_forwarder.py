@@ -669,17 +669,17 @@ def _blob_to_item(rowid: int, blob_id: str, data: object, agent_name: str) -> _M
     response_id = f"cursor:{blob_id}"[:_RESPONSE_ID_MAX_LEN]
     if role == "user":
         content = obj.get("content")
-        # cursor writes the post-/summarize history rollup as a user blob with a
-        # plain-string content (real user turns are a ``[{type:text}]`` list).
-        # Surface it as a compaction-completed signal, not a chat bubble, so the
-        # forwarder can tell the web UI the compaction actually finished.
-        if isinstance(content, str) and content.startswith(_COMPACTION_SUMMARY_PREFIX):
-            return _MirrorItem(
-                rowid=rowid,
-                item_type="compaction_completed",
-                item_data={},
-                response_id=response_id,
-            )
+        if isinstance(content, str):
+            # Cursor stores lifecycle notifications and compaction rollups as
+            # strings; real user turns use a ``[{type:text}]`` content list.
+            if content.startswith(_COMPACTION_SUMMARY_PREFIX):
+                return _MirrorItem(
+                    rowid=rowid,
+                    item_type="compaction_completed",
+                    item_data={},
+                    response_id=response_id,
+                )
+            return None
         prompt = _unwrap_user_query(_content_text(content))
         if not prompt:
             return None

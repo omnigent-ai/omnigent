@@ -48,10 +48,14 @@ description: >-
   (verdict, per-facet breakdown, journey) and the authored e2e test. It then
   checks whether an open PR already fixes the bug: if so it REVIEWS that PR by
   running the repro test against it and checking the diff; if not it audits the
-  test against the unfixed tree, root-causes and implements the fix, adds targeted
+  test against the unfixed tree (a test that PASSES there means main has since
+  fixed the bug — outcome nothing_to_fix with the fixing commit named, not a
+  manufactured fix), root-causes and implements the fix, adds targeted
   unit/regression tests at the layer it changed, re-runs the set to confirm every
-  live facet goes fail→pass, then commits, pushes, and opens a ready-for-review
-  pull request. It does not merge.
+  live facet goes fail→pass, re-records the repro drivers on the fixed tree so
+  the before/after footage pair lands in the PR's Demo section (and on the
+  Linear ticket when a key is available), then commits, pushes, and opens a
+  ready-for-review pull request. It does not merge.
 
 # Runs on the Claude Agent SDK. No model is pinned, so the configured provider's
 # default model is used. The large context window holds the repro session
@@ -64,6 +68,13 @@ executor:
 
 # The full operating procedure lives in AGENTS.md, read at startup.
 instructions: AGENTS.md
+
+# Grant sys_session_share authority to grant the __public__ sentinel (anonymous
+# read-only). The agent only shares when invoked with `public: true` (the
+# `dev/resolve.py --public` flag) — useful when running against a shared
+# `--server` so the resolve session is spectatable while it works. Still gated by
+# the server's own public-sharing switch.
+agent_session_sharing: public
 
 async: true
 cancellable: true

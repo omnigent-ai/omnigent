@@ -1300,11 +1300,12 @@ def test_ui_setup_steps_generic_for_non_installable() -> None:
         (hi.KIMI_KEY, "0.7.0", None),
         (ANTHROPIC_FAMILY, "2.1.161", None),
         (OPENAI_FAMILY, "0.137.0", None),
-        (hi.PI_KEY, "0.79.0", None),
+        (hi.PI_KEY, "0.84.2", None),
         (hi.QWEN_KEY, "0.18.1", None),
         (hi.GOOSE_KEY, "1.38.0", None),
         (hi.HERMES_KEY, "0.17.0", None),
         (hi.KIRO_KEY, "2.10.0", None),
+        (GEMINI_FAMILY, "1.1.13", None),
     ],
 )
 def test_versioned_specs_declare_bounds(
@@ -1464,19 +1465,6 @@ def test_harness_cli_installed_true_when_version_in_range(
 
     monkeypatch.setattr(hi.subprocess, "run", _run)
     assert hi.harness_cli_installed(hi.OPENCODE_KEY) is True
-
-
-def test_harness_cli_installed_ignores_upper_bound_for_unversioned_specs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Harnesses without a version declaration are not probed with ``--version``."""
-    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
-
-    def _explode(*a: object, **k: object) -> None:
-        raise AssertionError("version probe spawned for an unversioned harness")
-
-    monkeypatch.setattr(hi.subprocess, "run", _explode)
-    assert hi.harness_cli_installed(GEMINI_FAMILY) is True
 
 
 @pytest.mark.parametrize(

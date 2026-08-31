@@ -25,7 +25,7 @@ from __future__ import annotations
 from playwright.sync_api import Page, expect
 
 STORAGE_KEY = "omnigent:default-workspace-panel"
-_COMPOSER = "Ask the agent anything…"
+_COMPOSER = "Send a message…"
 
 
 def _stored_default(page: Page) -> str | None:

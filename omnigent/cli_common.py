@@ -14,6 +14,7 @@ from __future__ import annotations
 import click
 
 from omnigent._platform import IS_WINDOWS
+from omnigent.cli_invocation import cli_invocation
 
 # Click ``flag_value`` for bare ``--resume`` (no arg). Must exist before any
 # command's decorator evaluates.
@@ -36,7 +37,7 @@ def reject_native_on_windows(harness: str) -> None:
     """
     if IS_WINDOWS:
         raise click.ClickException(
-            f"`omnigent {harness}` (native tmux/PTY terminal) is not supported on "
-            "Windows. Use an SDK-based harness via `omnigent run <agent.yaml>` "
+            f"`{cli_invocation()} {harness}` (native tmux/PTY terminal) is not supported on "
+            f"Windows. Use an SDK-based harness via `{cli_invocation()} run <agent.yaml>` "
             "or the web UI."
         )

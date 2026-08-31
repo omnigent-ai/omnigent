@@ -236,6 +236,18 @@ def _create_engine(db_uri: str) -> Engine:
         engine = create_engine(
             db_uri,
             connect_args={"check_same_thread": False, "timeout": 20.0},
+            # Give SQLite a modest pool above SQLAlchemy's default
+            # QueuePool(5, 10) = 15, which the /health sidebar poll exhausts
+            # under load (surfacing as "QueuePool ... timeout" 500s).
+            # Deliberately NOT sized to the 200-token AnyIO thread limiter
+            # like the Postgres branch below: SQLite serializes at the file
+            # level, so handing out ~200 connections just lets that many
+            # worker threads thrash SQLite's page-cache mutex and burn CPU
+            # instead of queuing cheaply on the pool. ~40 total clears the
+            # exhaustion without inviting lock contention.
+            pool_size=15,
+            max_overflow=25,
+            pool_timeout=10,
         )
 
         # Apply WAL + busy_timeout on every fresh DBAPI connection
@@ -354,6 +366,11 @@ def _ensure_conversation_tables(engine: Engine) -> None:
         ensure_fts_table(engine)
 
 
+def _set_alembic_database_url(config: Config, db_uri: str) -> None:
+    """Store a database URL safely in Alembic's ConfigParser-backed config."""
+    config.set_main_option("sqlalchemy.url", db_uri.replace("%", "%%"))
+
+
 def _build_alembic_config(db_uri: str) -> Config:
     """
     Build an Alembic ``Config`` pointed at our migrations directory.
@@ -373,7 +390,7 @@ def _build_alembic_config(db_uri: str) -> Config:
 
     alembic_ini = Path(__file__).parent / "alembic.ini"
     config = Config(str(alembic_ini))
-    config.set_main_option("sqlalchemy.url", db_uri)
+    _set_alembic_database_url(config, db_uri)
     config.set_main_option("script_location", str(Path(__file__).parent / "migrations"))
     return config
 

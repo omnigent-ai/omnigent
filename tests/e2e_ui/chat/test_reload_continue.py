@@ -15,7 +15,7 @@ from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import configure_mock_llm
 
-_COMPOSER = "Ask the agent anything…"
+_COMPOSER = "Send a message…"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _USER = '[data-testid="message-bubble"][data-role="user"]'
 _WORKING = '[data-testid="working-indicator"]'

@@ -28,7 +28,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, Route, expect
 
-from tests.e2e_ui.conftest import configure_mock_llm, seed_committed_turn
+from tests.e2e_ui.conftest import configure_mock_llm, fetch_with_retry, seed_committed_turn
 
 # Unique marker so the copied-transcript assertion can't match
 # UI chrome or another test's message.
@@ -75,7 +75,7 @@ def test_clone_session_copies_transcript_and_navigates(
 
     # Seed the transcript with a uniquely-marked user turn and wait for
     # the assistant reply so the fork has BOTH roles to copy.
-    composer = page.get_by_placeholder("Ask the agent anything…")
+    composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible()
     composer.fill(f"Reply with one short word. Marker: {_MARKER}")
     page.get_by_role("button", name="Send", exact=True).click()
@@ -178,7 +178,7 @@ def test_clone_dialog_offers_cross_family_native_target_and_forks(
 
     # One marked turn so the fork has content and an assistant bubble to
     # anchor the "Fork from here" action.
-    composer = page.get_by_placeholder("Ask the agent anything…")
+    composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible()
     composer.fill(f"Reply with one short word. Marker: {_XFAM_MARKER}")
     page.get_by_role("button", name="Send", exact=True).click()
@@ -196,6 +196,17 @@ def test_clone_dialog_offers_cross_family_native_target_and_forks(
     option = page.get_by_test_id(f"fork-session-agent-option-{claude_native['id']}")
     expect(option).to_be_visible()
     option.click()
+
+    # Switching to claude-native reveals the run-config section (Model /
+    # Effort / Permissions). Pick a non-default permission mode so the fork
+    # carries the selector's ``--permission-mode`` launch args — the picker is
+    # seeded to the target harness's defaults on a cross-harness switch, so
+    # this is a deliberate change the fork body must transport.
+    perm = page.get_by_test_id("fork-session-config-permission")
+    expect(perm).to_be_visible()
+    perm.click()
+    page.get_by_role("option", name="Plan", exact=True).click()
+
     page.get_by_test_id("fork-session-submit").click()
 
     # The fork succeeds and navigates to a NEW session id.
@@ -222,6 +233,12 @@ def test_clone_dialog_offers_cross_family_native_target_and_forks(
     )
     assert labels.get("omnigent.wrapper") == "claude-code-native-ui", (
         f"fork must present as the TARGET (claude-native) harness, got {labels!r}"
+    )
+    # The run-config section's permission pick rode the fork body as launch
+    # args and persisted on the clone (the whole point of the picker).
+    assert snap.json().get("terminal_launch_args") == ["--permission-mode", "plan"], (
+        f"fork must carry the picked permission mode as launch args, "
+        f"got {snap.json().get('terminal_launch_args')!r}"
     )
 
 
@@ -299,7 +316,7 @@ def test_clone_worktree_source_prefills_repo_and_validates_directory(
         if route.request.method != "GET":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         body = response.json()
         body["host_id"] = _WT_HOST_ID
         body["workspace"] = _WT_DIR
@@ -360,7 +377,7 @@ def test_clone_worktree_source_prefills_repo_and_validates_directory(
 
     # One marked turn so the fork has content and an assistant bubble to
     # anchor the "Fork from here" action.
-    composer = page.get_by_placeholder("Ask the agent anything…")
+    composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible()
     composer.fill(f"Reply with one short word. Marker: {_WT_MARKER}")
     page.get_by_role("button", name="Send", exact=True).click()

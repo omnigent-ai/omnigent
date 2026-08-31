@@ -220,6 +220,86 @@ guardrails:
     assert engine_after.model == "claude-sonnet-4-6"
 
 
+@pytest.mark.parametrize(
+    ("harness_override", "expected_cost"),
+    [
+        (None, 1.0),
+        ("codex", 10.0),
+    ],
+)
+def test_build_pricing_uses_effective_session_harness(
+    tmp_path: Path,
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    harness_override: str | None,
+    expected_cost: float,
+) -> None:
+    """Custom pricing follows the session override, then the agent harness."""
+    agent_dir = _write_spec(
+        tmp_path,
+        """
+spec_version: 1
+name: custom-pricing-harness
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+llm:
+  model: self-hosted-model
+""",
+    )
+    spec = parse(agent_dir)
+    conv = conversation_store.create_conversation()
+    if harness_override is not None:
+        conversation_store.update_conversation(conv.id, harness_override=harness_override)
+
+    provider_config = {
+        "providers": {
+            "anthropic-local": {
+                "kind": "local",
+                "default": True,
+                "anthropic": {
+                    "base_url": "http://anthropic.local/v1",
+                    "api_key": "test",
+                    "pricing": {
+                        "input_per_million": 1.0,
+                        "output_per_million": 2.0,
+                    },
+                },
+            },
+            "openai-local": {
+                "kind": "local",
+                "default": True,
+                "openai": {
+                    "base_url": "http://openai.local/v1",
+                    "api_key": "test",
+                    "pricing": {
+                        "input_per_million": 10.0,
+                        "output_per_million": 20.0,
+                    },
+                },
+            },
+        }
+    }
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config.load_config",
+        lambda: provider_config,
+    )
+
+    engine = build_policy_engine(
+        spec=spec,
+        conversation_id=conv.id,
+        conversation_store=conversation_store,
+    )
+    engine.record_usage(
+        input_tokens=1_000_000,
+        output_tokens=0,
+        total_tokens=1_000_000,
+    )
+
+    assert engine.usage["total_cost_usd"] == pytest.approx(expected_cost)
+
+
 def test_build_resolves_model_none_without_llm_or_override(
     tmp_path: Path,
     conversation_store: SqlAlchemyConversationStore,

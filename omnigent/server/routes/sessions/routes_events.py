@@ -78,6 +78,7 @@ from omnigent.server.routes._sessions.common import (
     _ALLOWED_EVENT_TYPES,
     _APPROVAL_TYPE,
     _COMPACT_TYPE,
+    _EXTERNAL_ACP_SUBAGENT_START_TYPE,
     _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
     _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
     _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
@@ -137,6 +138,7 @@ from omnigent.server.routes._sessions.helpers import (
     _is_codex_native_subagent,
     _launch_runner_on_host,
     _parse_background_tasks,
+    _persist_external_acp_subagent_start,
     _persist_external_assistant_message,
     _persist_external_codex_approval_mode_change,
     _persist_external_codex_collaboration_mode_change,
@@ -164,7 +166,6 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_status,
     _remove_session_worktree_best_effort,
     _require_external_status_forward,
-    _run_compact_locked,
     _signal_harness_elicitation_resolved_by_id,
     _stop_session_host_runner,
     _stop_session_via_runner,
@@ -215,6 +216,7 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedEvent
 from omnigent.telemetry.events import SessionStoppedEvent as _TelSessionStoppedEvent
+from omnigent.telemetry.events import TurnEndEvent as _TelTurnEndEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.tools.client_specified import parse_client_side_tool_specs
 
@@ -547,6 +549,7 @@ def register_events_routes(
             _EXTERNAL_SESSION_TITLE_TYPE,
             _EXTERNAL_SESSION_TODOS_TYPE,
             _EXTERNAL_SUBAGENT_START_TYPE,
+            _EXTERNAL_ACP_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
             _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
@@ -1016,20 +1019,14 @@ def register_events_routes(
             # Unified control dispatch (designs/CLAUDE_NATIVE.md
             # "Control events dispatch on the runner"): forward /compact
             # to the bound runner first, regardless of harness. The
-            # runner dispatches by harness — claude-native injects
-            # /compact into the tmux pane so Claude Code compacts its
-            # own context and returns 200; other harnesses 204 no-op.
-            # The Omnigent server stays harness-agnostic: it runs its own
-            # in-process compaction only when the runner did NOT handle
-            # the control (204 / no runner bound). A 4xx/5xx from the
-            # runner (e.g. 503 when the claude-native pane isn't
-            # attached) is surfaced as an error rather than silently
-            # falling through to AP-side compaction, which would be
-            # wrong for a terminal-owned session.
+            # runner dispatches by harness — native harnesses inject
+            # /compact into the vendor TUI and return 200 on success or
+            # 5xx on failure. SDK harnesses return 204 (no-op) because
+            # their context is controlled entirely by the vendor harness.
+            # A 4xx/5xx from the runner is surfaced as an error.
             # TUI budget, not the 5s default: the claude-native handler
             # drives a delivery-verified slash-command inject, and a timeout
-            # here falls through to AP-side compaction on top of the
-            # terminal's own still-running /compact.
+            # here would surface as an error mid-TUI-compact.
             runner_result = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
@@ -1084,13 +1081,10 @@ def register_events_routes(
                     "run /compact again.",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
-            await _run_compact_locked(
-                session_id,
-                conv,
-                agent_store,
-                agent_cache,
+            raise OmnigentError(
+                "/compact is not available for this session type.",
+                code=ErrorCode.INVALID_INPUT,
             )
-            return {"queued": False}
         if body.type == "compaction":
             import uuid as _uuid
 
@@ -1249,6 +1243,22 @@ def register_events_routes(
                 background_tasks=bg_tasks,
                 blocked_on=blocked_on,
             )
+            # Emit a turn-end telemetry event for native harnesses. "idle"
+            # means the turn completed normally; "failed" means it errored.
+            # No latency or token deltas are available on this path.
+            if status in {"idle", "failed"}:
+                _tel_emit(
+                    _TelTurnEndEvent(
+                        installation_id=_get_installation_id(),
+                        session_id=session_id,
+                        status="completed" if status == "idle" else "failed",
+                        latency_ms=None,
+                        model=None,
+                        input_tokens=None,
+                        output_tokens=None,
+                        cost_usd=None,
+                    )
+                )
             forward_body = body.model_dump()
             forward_body["data"] = data
             runner_result = await _forward_session_change_to_runner(
@@ -1443,6 +1453,16 @@ def register_events_routes(
                 conversation_store,
             )
             return {"queued": False, "child_session_id": child_id}
+        if body.type == _EXTERNAL_ACP_SUBAGENT_START_TYPE:
+            child_id = await _persist_external_acp_subagent_start(
+                session_id,
+                conv,
+                body,
+                conversation_store,
+            )
+            # Returned to the runner so it can address the sub-agent's transcript
+            # items and its completion status to the child id.
+            return {"queued": False, "child_session_id": child_id}
         if body.type == "function_call_output":
             # A client-side tool's result tunneling back to a parked turn.
             # The harness scaffold resolves the parked tool Future on a
@@ -1607,6 +1627,7 @@ def register_events_routes(
                     _sf._HOST_BOUND_RUNNER_CONNECT_GRACE_S,
                     conv.runner_id,
                     session_id,
+                    extra={"session_id": session_id},
                 )
                 if _grace_host_reg is not None and _grace_host_conn is not None:
                     runner_client = await _wait_for_host_bound_runner_client(
@@ -2192,7 +2213,7 @@ def register_events_routes(
         if runner_client is not None:
             try:
                 await runner_client.delete(
-                    f"/v1/sessions/{session_id}/resources",
+                    f"/v1/sessions/{session_id}",
                     timeout=10.0,
                 )
             except (httpx.HTTPError, ConnectionError):
@@ -2230,6 +2251,8 @@ def register_events_routes(
                 delete_branch=True,
                 request=request,
                 reason="session-delete",
+                conversation_store=conversation_store,
+                exclude_conversation_id=conv.id,
             )
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.discard(session_id)

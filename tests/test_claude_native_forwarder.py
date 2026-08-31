@@ -8352,6 +8352,29 @@ def test_generic_503_without_not_confirmed_body_never_exhausts() -> None:
         assert tracker.record_failure("k", exc).exhausted is False
 
 
+def test_unbounded_transient_retries_keep_delay_capped_without_overflow() -> None:
+    # A transport-level failure is neither permanent nor not-confirmed, so it
+    # retries with no give-up budget and `attempts` grows without bound. The
+    # backoff exponent must be clamped before `2 ** n` is evaluated: min()
+    # computes both operands, so an unclamped exponent overflows float at
+    # attempt ~1025 and raises OverflowError out of record_failure.
+    tracker = forwarder._PostRetryTracker(base_delay_s=1.0, max_delay_s=30.0)
+    exc = httpx.RequestError("Databricks token refresh returned no token")
+    for _ in range(2000):
+        decision = tracker.record_failure("k", exc)
+        assert decision.exhausted is False
+        assert decision.delay_s <= 30.0
+    # The schedule still saturates at the cap instead of decaying.
+    assert decision.delay_s == 30.0
+
+
+def test_backoff_schedule_unchanged_below_the_cap() -> None:
+    tracker = forwarder._PostRetryTracker(base_delay_s=1.0, max_delay_s=30.0)
+    exc = httpx.RequestError("boom")
+    delays = [tracker.record_failure("k", exc).delay_s for _ in range(6)]
+    assert delays == [1.0, 2.0, 4.0, 8.0, 16.0, 30.0]
+
+
 def test_permanent_4xx_still_exhausts_at_three() -> None:
     tracker = forwarder._PostRetryTracker(max_permanent_attempts=3)
     exc = _http_status_error(400, {"error": "bad_request"})

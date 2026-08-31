@@ -12,6 +12,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 
+use crate::browser;
 use crate::omnigent_cmd;
 use crate::pod::Pod;
 use crate::process::ProcSpec;
@@ -141,6 +142,7 @@ impl Supervisor {
         if self.vite_enabled {
             self.prepare_vite().await;
             self.spawn(ProcId::Vite);
+            self.open_ui_when_ready();
         }
 
         loop {
@@ -167,6 +169,33 @@ impl Supervisor {
                 }
             }
         }
+    }
+
+    /// Open one browser tab after Vite starts serving the displayed UI URL.
+    fn open_ui_when_ready(&self) {
+        let addr = format!("127.0.0.1:{}", self.pod.ports.vite);
+        let host = format!("localhost:{}", self.pod.ports.vite);
+        let url = self.pod.vite_display_url();
+        let shared = self.shared.clone();
+        tokio::spawn(async move {
+            for _ in 0..120 {
+                if http_ok(&addr, "/", &host).await {
+                    shared.lock().unwrap().event(format!("opening UI {url}"));
+                    if let Err(error) = browser::open(&url).await {
+                        shared
+                            .lock()
+                            .unwrap()
+                            .event(format!("could not open UI {url}: {error:#}"));
+                    }
+                    return;
+                }
+                sleep(Duration::from_millis(250)).await;
+            }
+            shared
+                .lock()
+                .unwrap()
+                .event(format!("UI did not become ready; open {url} manually"));
+        });
     }
 
     async fn start_backend(&mut self) {
@@ -578,7 +607,7 @@ impl Supervisor {
     async fn wait_healthy(&self) -> bool {
         let addr = format!("127.0.0.1:{}", self.pod.ports.server);
         for _ in 0..120 {
-            if health_ok(&addr).await {
+            if http_ok(&addr, "/health", &addr).await {
                 return true;
             }
             sleep(Duration::from_millis(250)).await;
@@ -606,14 +635,13 @@ fn backoff_secs(attempt: u32) -> u64 {
     }
 }
 
-/// Minimal HTTP/1.0 `GET /health` returning true on a `200` status line. Avoids
-/// pulling an HTTP client dependency just for a readiness probe.
-async fn health_ok(addr: &str) -> bool {
+/// Minimal HTTP/1.0 readiness probe. Avoids an HTTP client dependency.
+async fn http_ok(addr: &str, path: &str, host: &str) -> bool {
     let Ok(Ok(mut stream)) = timeout(Duration::from_secs(1), TcpStream::connect(addr)).await else {
         return false;
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let req = format!("GET /health HTTP/1.0\r\nHost: {addr}\r\n\r\n");
+    let req = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\n\r\n");
     if stream.write_all(req.as_bytes()).await.is_err() {
         return false;
     }
@@ -622,5 +650,34 @@ async fn health_ok(addr: &str) -> bool {
         return false;
     };
     let head = String::from_utf8_lossy(&buf[..n]);
-    head.starts_with("HTTP/1.") && head.contains(" 200")
+    let status = head.lines().next().unwrap_or_default();
+    status.starts_with("HTTP/1.") && status.split_whitespace().nth(1) == Some("200")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn http_probe_sends_requested_path_and_host() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 256];
+            let n = stream.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]);
+            assert!(request.starts_with("GET /ready HTTP/1.0\r\n"));
+            assert!(request.contains("\r\nHost: localhost:5173\r\n"));
+            stream
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        assert!(http_ok(&addr.to_string(), "/ready", "localhost:5173").await);
+        server.await.unwrap();
+    }
 }

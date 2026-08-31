@@ -493,6 +493,57 @@ export async function createSession(
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }
 
+/** Local coding harnesses whose transcripts can be imported. */
+export type ImportSource = "claude" | "codex" | "kimi" | "kiro" | "opencode" | "pi" | "qwen";
+
+/** A specific harness, or "all" to import from every supported harness at once. */
+export type ImportSourceSelector = ImportSource | "all";
+
+/** One freshly imported session, for linking to it in the UI. */
+export interface ImportedSessionRef {
+  id: string;
+  /** null when the session had no native title and nothing to synthesize from. */
+  title: string | null;
+}
+
+/** Result of a batch local import (`POST /v1/imports/local`). */
+export interface LocalImportResult {
+  imported: number;
+  alreadyImported: number;
+  failed: number;
+  sessions: ImportedSessionRef[];
+}
+
+/**
+ * Import the caller's most recent local transcripts via `POST /v1/imports/local`.
+ * The chosen host reads + normalizes its own transcripts over the tunnel (the
+ * transcripts live on that machine, not the server); already-imported sessions
+ * are skipped. `source` is a specific harness or "all" for every harness at once.
+ */
+export async function importLocalSessions(
+  hostId: string,
+  source: ImportSourceSelector,
+  limit: number,
+): Promise<LocalImportResult> {
+  const res = await authenticatedFetch("/v1/imports/local", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    body: JSON.stringify({ host_id: hostId, source, limit }),
+  });
+  const wire = await readJsonOrThrow<{
+    imported: number;
+    already_imported: number;
+    failed: number;
+    sessions: { session_id: string; title: string | null }[];
+  }>(res);
+  return {
+    imported: wire.imported,
+    alreadyImported: wire.already_imported,
+    failed: wire.failed,
+    sessions: wire.sessions.map((s) => ({ id: s.session_id, title: s.title })),
+  };
+}
+
 /**
  * Create a session with an inline agent bundle via multipart
  * `POST /v1/sessions`.
@@ -557,14 +608,36 @@ export async function createBundledSession(
  * @param upToResponseId - Optional truncation point, e.g. "resp_abc". When
  *   set, the fork copies history only up to and including that response
  *   ("fork from here"); omitted, the full history is copied.
+ * @param config - Optional run-config overrides from the fork dialog's
+ *   model / effort / permission-mode pickers. Each field is opt-in: a field
+ *   left `undefined` inherits the source (model settings carry within the
+ *   same provider family), while a sent field overrides it. The
+ *   permission-/approval-mode selector rides `terminalLaunchArgs` (e.g.
+ *   `["--permission-mode", "auto"]`); `[]` clears the source's launch args.
+ *   `codexBypassSandbox: true` (Codex only) arms the dangerous full-bypass on
+ *   the fork — sent only on an explicit, banner-gated pick.
  */
 export async function forkSession(
   sourceId: string,
   title?: string,
   agentId?: string,
   upToResponseId?: string,
+  config?: {
+    modelOverride?: string;
+    reasoningEffort?: string;
+    terminalLaunchArgs?: string[];
+    codexBypassSandbox?: boolean;
+  },
 ): Promise<Session> {
-  const body: { title?: string; agent_id?: string; up_to_response_id?: string } = {};
+  const body: {
+    title?: string;
+    agent_id?: string;
+    up_to_response_id?: string;
+    model_override?: string;
+    reasoning_effort?: string;
+    terminal_launch_args?: string[];
+    codex_bypass_sandbox?: boolean;
+  } = {};
   if (title !== undefined) {
     body.title = title;
   }
@@ -573,6 +646,20 @@ export async function forkSession(
   }
   if (upToResponseId !== undefined) {
     body.up_to_response_id = upToResponseId;
+  }
+  if (config?.modelOverride !== undefined) {
+    body.model_override = config.modelOverride;
+  }
+  if (config?.reasoningEffort !== undefined) {
+    body.reasoning_effort = config.reasoningEffort;
+  }
+  if (config?.terminalLaunchArgs !== undefined) {
+    body.terminal_launch_args = config.terminalLaunchArgs;
+  }
+  // Only send the dangerous bypass opt-in when explicitly true; omitting it
+  // otherwise keeps the request minimal and the server default (no bypass).
+  if (config?.codexBypassSandbox) {
+    body.codex_bypass_sandbox = true;
   }
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sourceId)}/fork`, {
     method: "POST",

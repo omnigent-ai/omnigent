@@ -41,6 +41,7 @@ import {
   PencilIcon,
   PinIcon,
   PinOffIcon,
+  PlusIcon,
   SearchIcon,
   Settings2Icon,
   ShareIcon,
@@ -135,6 +136,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
 import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
+import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showToast } from "@/components/ui/toast";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
@@ -188,20 +190,23 @@ import {
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 
-// Positioning for a row's trailing session-state badge. Anchored at the
-// controls' right-1 edge and fades on hover so the pin + kebab take its place;
-// on mobile it sits left of the always-visible controls.
+// Positioning for a row's trailing session-state badge. Anchored at the row's
+// right-1 edge in every viewport: on desktop it fades on hover so the pin +
+// kebab take its place; on mobile those controls are gone, so the badge simply
+// holds the right edge.
 const SESSION_STATE_SLOT_CLASS =
-  "-translate-y-1/2 pointer-events-none absolute top-1/2 right-[4.5rem] flex h-5 items-center transition-opacity md:right-1 md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
+  "-translate-y-1/2 pointer-events-none absolute top-1/2 right-1 flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
 
 // Small markers (running/starting/unseen dot, or the draft pencil when there's
-// no session state) get a fixed size-6 centered box so they line up vertically
-// under the kebab. The "awaiting" pill keeps its natural width — a fixed box
-// would clip its "Needs response" label.
+// no session state) get a fixed size-6 centered box so their glyph lands 16px
+// from the right edge — lining up vertically with the desktop kebab and the
+// size-6 section-header icons above (the marker column) in every viewport. The
+// "awaiting" pill keeps its natural width — a fixed box would clip its "Needs
+// response" label.
 function isDotMarker(state: SessionState | null): boolean {
   return state === null || state.kind !== "awaiting";
 }
-const SESSION_STATE_DOT_SLOT_CLASS = "md:w-6 md:justify-center";
+const SESSION_STATE_DOT_SLOT_CLASS = "w-6 justify-center";
 
 // Match the Settings sidebar's ghost-button hover treatment across every home
 // sidebar row.
@@ -2529,7 +2534,8 @@ function SectionGroup({
   collapsed: boolean;
   onToggleCollapsed: () => void;
   /** Optional control overlaid at the group header's right edge (e.g. the
-      "collapse all projects" toggle). Hover/focus-revealed on desktop. */
+      "collapse all projects" toggle). Always shown without hover support and
+      hover/focus-revealed on hover-capable desktop displays. */
   headerAction?: ReactNode;
   /** Optional content rendered directly under the header, above the children
       (and shown even when collapsed) — e.g. the bulk-selection action bar. */
@@ -2546,14 +2552,15 @@ function SectionGroup({
           onToggleCollapsed={onToggleCollapsed}
         />
         {headerAction && (
-          // Always visible on mobile (no hover there, and the "New project"
-          // control lives here — the only way to create a project). On desktop
-          // it's hover/keyboard-focus-revealed: a group-level control is a
-          // pointer convenience there. Reveal on :focus-visible (keyboard) — NOT
+          // Always visible without hover support (no hover on phones or touch
+          // tablets, and the "New project" control lives here — the only way to
+          // create a project). On hover-capable desktop displays it's
+          // hover/keyboard-focus-revealed: a group-level control is a pointer
+          // convenience there. Reveal on :focus-visible (keyboard) — NOT
           // :focus-within — so clicking the button with the mouse doesn't leave
           // it stuck visible: React reuses the same node when it swaps
           // expand↔revert, so the clicked button keeps focus afterward.
-          <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity md:opacity-0 md:has-[:focus-visible]:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:group-hover/header:opacity-100">
+          <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity [@media(hover:hover)]:md:opacity-0 [@media(hover:hover)]:md:has-[:focus-visible]:opacity-100 [@media(hover:hover)]:md:group-has-[[data-state=open]]/header:opacity-100 [@media(hover:hover)]:md:group-hover/header:opacity-100">
             {headerAction}
           </div>
         )}
@@ -3212,10 +3219,6 @@ function ConversationRow({
   const [deleteBranch, setDeleteBranch] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
   const [leaveOpen, setLeaveOpen] = useState(false);
-  // True while an archive is in flight. Drives the "Archiving…" status
-  // row — without it the row shows nothing while the archive completes.
-  // Delete needs no counterpart: it drops its row optimistically.
-  const [isArchiving, setIsArchiving] = useState(false);
   const gitBranch = conversation.git_branch ?? null;
   // Every row action gates on ownership alone — the sidebar carries no
   // effective-permission level, so rename/share/move/drag are owner-only and
@@ -3393,21 +3396,6 @@ function ConversationRow({
     );
   }
 
-  // Archiving is a single PATCH (see runArchive); show a status row for the
-  // span instead of leaving the row looking idle. The spinner stays up until
-  // the row itself leaves the sidebar: on success the list refetches and this
-  // row unmounts (dropped from the default view), which removes the spinner
-  // with it — it is deliberately NOT cleared on PATCH-settle, or it would
-  // vanish a round-trip before the row does. On failure the flag clears and
-  // the interactive row returns so the user can retry.
-  if (isArchiving) {
-    return (
-      <li>
-        <ArchivingRow label={label} />
-      </li>
-    );
-  }
-
   function confirmDelete() {
     // Fire-and-forget: close the dialog and drop the row immediately so the
     // user isn't blocked on the (potentially slow) DELETE — server-side
@@ -3425,39 +3413,25 @@ function ConversationRow({
 
   function runArchive() {
     const nextArchived = !isArchived;
-    // Unarchiving is a quick flag flip — no status row.
-    if (!nextArchived) {
-      archive.mutate({ id: conversation.id, archived: false });
-      return;
-    }
-    // Archiving sends only the PATCH: the server stops the session (and
-    // tears down a host-spawned runner) in the background once the flag is
-    // committed. Sending a client stop too would race that one against the
-    // same runner, and the loser gets a 503 from the already-killed pane.
+    // The archive PATCH sends only the flag: the server stops the session (and
+    // tears down a host-spawned runner) in the background once it's committed.
+    // A client stop too would race that one against the same runner, and the
+    // loser gets a 503 from the already-killed pane.
     //
-    // "Archiving…" must stay up until the row actually LEAVES the sidebar,
-    // not merely until the PATCH resolves. The PATCH success only kicks off
-    // an async `["conversations"]` refetch (see useArchiveConversation); the
-    // row drops out a round-trip later, once that refetch lands and the
-    // archived row is filtered out of the rendered list. Clearing the
-    // spinner on settle (the old behavior) reopened that gap: the row flashed
-    // back to its plain, clickable form — spinner gone — while the session
-    // was still listed. So we DON'T clear it on success: this row unmounts
-    // when the refetch removes it, which tears the spinner down with it.
-    // Only an error clears the flag, restoring the interactive row for retry.
-    setIsArchiving(true);
-    archive.mutate(
-      { id: conversation.id, archived: true },
-      {
-        // Point the user at where the session went — it's no longer in
-        // the sidebar list, so surface its new home in Settings.
-        onSuccess: () => {
-          if (isActive) navigate("/", { replace: true });
-          showArchivedToast();
-        },
-        onError: () => setIsArchiving(false),
-      },
-    );
+    // The row leaves the sidebar optimistically (useArchiveConversation flips
+    // the cached `archived` flag in onMutate; the list filters archived rows
+    // out client-side), so this component unmounts on the next frame. Leaving
+    // the archived session's chat surface therefore has to happen HERE,
+    // synchronously — not in an onSuccess callback that fires a round-trip
+    // later with a stale `isActive`, which used to jump the user off whatever
+    // session they'd switched to meanwhile. Mirrors confirmDelete.
+    if (nextArchived && isActive) navigate("/", { replace: true });
+    archive.mutate({ id: conversation.id, archived: nextArchived });
+    // Point the user at where the session went — fire NOW, not in a mutate
+    // onSuccess: the optimistic overlay unmounts this row on the next frame,
+    // and per-call mutate callbacks don't fire once their observer unmounts.
+    // A failed archive reconciles the row back with its own error toast.
+    if (nextArchived) showArchivedToast();
   }
 
   function confirmLeave() {
@@ -3525,12 +3499,11 @@ function ConversationRow({
         // Full width (not 100%+1rem) so the highlight stays inset from the
         // right edge, aligning with the project/folder rows above.
         "w-full",
+        // Mobile drops the pin + kebab (see the trailing controls below), so it
+        // reserves only what the badge needs — the same width desktop uses at
+        // rest, before hover reveals the controls.
         !selectionMode &&
-          (sessionState?.kind === "awaiting"
-            ? "pr-48 md:pr-29"
-            : hasTrailingIndicator
-              ? "pr-28 md:pr-8"
-              : "pr-28 md:pr-2"),
+          (sessionState?.kind === "awaiting" ? "pr-29" : hasTrailingIndicator ? "pr-8" : "pr-2"),
         // The narrowed reserve must track exactly when the trailing controls
         // appear and the state marker fades — both keyed on `:focus-visible`.
         // `focus-within` also fires for a plain click, which shrank the reserve
@@ -3761,12 +3734,14 @@ function ConversationRow({
                 size="icon-xs"
                 aria-label="Conversation actions"
                 data-testid="conversation-actions"
-                // On mobile (no hover state) it's always visible. On desktop it
-                // stays hidden until hover / keyboard focus, with `aria-expanded`
-                // keeping it surfaced while the menu is open so the trigger
-                // doesn't vanish under the cursor.
+                // Desktop-only: the chat page's own header menu covers these
+                // per-session actions on mobile, so the row kebab is dropped
+                // there. From `md` up it stays hidden until hover / keyboard
+                // focus, with `aria-expanded` keeping it surfaced while the menu
+                // is open so the trigger doesn't vanish under the cursor.
                 className={cn(
                   "text-muted-foreground transition-opacity",
+                  "hidden md:inline-flex",
                   "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
                   "md:aria-expanded:opacity-100",
                 )}
@@ -3990,30 +3965,6 @@ function PinnedProjectFlyoutContent({
         </p>
       )}
     </HoverCardContent>
-  );
-}
-
-/**
- * In-flight status row shown while a session is being archived (the
- * archive PATCH in ConversationRow.runArchive). Delete has no
- * counterpart: it removes its row optimistically, so there is nothing
- * left to show progress on. Archive failures fall back to the
- * interactive row rather than a persistent error state, so there's no
- * retry/dismiss affordance here.
- */
-function ArchivingRow({ label }: { label: string }) {
-  return (
-    <div
-      className={cn(SIDEBAR_ROW, "flex w-full items-center text-muted-foreground opacity-70")}
-      data-testid="conversation-archiving"
-      aria-live="polite"
-    >
-      <Loader2Icon className="size-3.5 shrink-0 animate-spin" aria-hidden />
-      <span className="min-w-0 flex-1 truncate" title={label}>
-        {label}
-      </span>
-      <span className="shrink-0 text-sm">Archiving…</span>
-    </div>
   );
 }
 
@@ -4456,9 +4407,13 @@ function ProjectPickerMenu({
   const { data: projects = [] } = useProjects();
   const [search, setSearch] = useState("");
 
-  const filtered = search
-    ? projects.filter((p) => p.name.toLowerCase().includes(search.toLowerCase()))
+  const trimmed = search.trim();
+  const filtered = trimmed
+    ? projects.filter((p) => p.name.toLowerCase().includes(trimmed.toLowerCase()))
     : projects;
+  // Offer create only when the typed name isn't already an exact project.
+  const canCreate =
+    trimmed.length > 0 && !projects.some((p) => p.name.toLowerCase() === trimmed.toLowerCase());
 
   // Keep keystrokes inside the inputs from reaching the menu's typeahead /
   // navigation handlers (which would otherwise steal letters and arrows).
@@ -4472,7 +4427,7 @@ function ProjectPickerMenu({
         <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
         <input
           className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
-          placeholder="Search projects"
+          placeholder="Search or create project"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           onKeyDown={swallowKeys}
@@ -4487,10 +4442,21 @@ function ProjectPickerMenu({
             )}
           </C.Item>
         ))}
-        {filtered.length === 0 && (
+        {filtered.length === 0 && !canCreate && (
           <p className="px-2 py-1.5 text-sm text-muted-foreground">No projects yet.</p>
         )}
       </div>
+      {canCreate && (
+        <div className="border-t pt-1">
+          <C.Item className="px-2 py-1" onSelect={() => onSelect(trimmed)}>
+            <PlusIcon className="size-3.5 shrink-0 text-muted-foreground" />
+            Create{" "}
+            <span className="truncate rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
+              {trimmed}
+            </span>
+          </C.Item>
+        </div>
+      )}
       {currentProject && (
         <div className="border-t pt-1">
           <C.Item className="px-2 py-1" onSelect={() => onSelect("")}>
@@ -4565,6 +4531,7 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
       <input
         ref={inputRef}
         type="text"
+        maxLength={USER_SESSION_TITLE_MAX_CHARS}
         value={value}
         onChange={(e) => setValue(e.target.value)}
         onCompositionStart={() => {
@@ -4718,28 +4685,22 @@ function BulkActionBar({
 
   function handleArchive() {
     if (nonArchivedSelected.length === 0) return;
-    bulkArchive.mutate(
-      { ids: nonArchivedSelected.map((c) => c.id), archived: true },
-      {
-        onSuccess: () => {
-          if (activeId && nonArchivedSelected.some((c) => c.id === activeId))
-            navigate("/", { replace: true });
-          onDeselectAll();
-        },
-      },
-    );
+    // The rows leave the sidebar optimistically (useBulkArchiveConversations
+    // flips their cached `archived` flag in onMutate), so this bar unmounts
+    // with the selection. Navigate and deselect NOW rather than in a
+    // mutate-level callback — a callback on the unmounted observer never fires,
+    // and it would carry a stale `activeId` that could jump the user off a
+    // session they switched to meanwhile. Mirrors handleDelete.
+    if (activeId && nonArchivedSelected.some((c) => c.id === activeId))
+      navigate("/", { replace: true });
+    onDeselectAll();
+    bulkArchive.mutate({ ids: nonArchivedSelected.map((c) => c.id), archived: true });
   }
 
   function handleUnarchive() {
     if (archivedSelected.length === 0) return;
-    bulkArchive.mutate(
-      { ids: archivedSelected.map((c) => c.id), archived: false },
-      {
-        onSuccess: () => {
-          onDeselectAll();
-        },
-      },
-    );
+    onDeselectAll();
+    bulkArchive.mutate({ ids: archivedSelected.map((c) => c.id), archived: false });
   }
 
   function handleDelete() {

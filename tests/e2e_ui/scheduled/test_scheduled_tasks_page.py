@@ -22,7 +22,6 @@ from datetime import datetime, timedelta
 
 import httpx
 from playwright.sync_api import Page, expect
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 
 def _builtin_agent_id(base_url: str, name: str) -> str:
@@ -103,13 +102,16 @@ def _row_by_name(page: Page, name: str):
 
 
 def _pick_minute(page: Page, minute: int) -> None:
-    """Open the time picker and click a minute cell, tolerating a flickered open.
+    """Open the time picker and click a minute cell.
 
-    The picker is a Radix popover nested inside the create-task dialog; under
-    load the dialog's focus management can fire a focus/interaction-outside that
-    closes it the moment it mounts, so the minute cells unmount between a
-    visibility check and the click. Re-open from a known-closed state and retry
-    until the cell is present, then click it.
+    The time input opens the picker on focus, so by the time a caller reaches the
+    clock button the picker is already open and being dismissed by whatever the
+    caller clicked last. Radix keeps the popover mounted through its exit
+    animation, and toggling the clock mid-exit re-opens it only to have Radix
+    dismiss it again immediately — leaving the minute cells alive just until the
+    animation ends, long enough for a visibility check to pass and the click
+    after it to miss. Waiting for the exit to finish means the toggle acts on a
+    genuinely closed picker, so no re-open-and-retry is needed.
 
     Selecting a minute does not close the popover, and an open floating-ui
     popover keeps recomputing its position — leaving the dialog's submit button
@@ -129,29 +131,20 @@ def _pick_minute(page: Page, minute: int) -> None:
     :param page: Playwright page with the create/edit task dialog open.
     :param minute: Minute of the hour to select (0-59).
     """
-    trigger = page.get_by_test_id("schedule-time-picker-trigger")
-    cell = page.get_by_test_id(f"schedule-minute-{minute:02d}")
-    picker = page.get_by_test_id("schedule-time-picker")
     name_input = page.get_by_test_id("task-name-input")
-    for _ in range(5):
-        # force=True skips the actionability "stable" wait: the trigger is a
-        # tiny translate-positioned button, so a busy render loop can leave it
-        # never-quite-stable even though the toggle is a no-arg click.
-        trigger.click(force=True)
-        try:
-            expect(cell).to_be_visible(timeout=3_000)
-            cell.click(force=True)
-            break
-        except (AssertionError, PlaywrightTimeoutError):
-            # The popover flickered shut before the click landed; dismiss any
-            # partial-open state (click-outside, not Escape) and try again.
-            name_input.click(force=True)
-    else:
-        expect(cell).to_be_visible(timeout=3_000)
-        cell.click(force=True)
+    # The popover content element: it carries data-state (open/closed) and
+    # unmounts only after the exit animation finishes, so its count/state are
+    # the reliable signals for both waits below.
+    popover_content = page.locator('[data-slot="popover-content"]').filter(
+        has=page.get_by_test_id("schedule-time-picker")
+    )
+    expect(popover_content).to_have_count(0)
+    page.get_by_test_id("schedule-time-picker-trigger").click()
+    expect(popover_content).to_have_attribute("data-state", "open")
+    page.get_by_test_id(f"schedule-minute-{minute:02d}").click()
     # Dismiss the picker so its floating position stops churning the layout.
     name_input.click(force=True)
-    expect(picker).to_be_hidden(timeout=5_000)
+    expect(popover_content).to_have_count(0)
 
 
 def test_scheduled_task_rows_show_schedule_summary_and_relative_next_run(
@@ -298,15 +291,17 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     # forced click still blurs the input and closes the picker.
     page.get_by_test_id("task-name-input").click(force=True)
     expect(time_input).to_have_value("09:37 AM")
-    _pick_minute(page, 37)
-    expect(time_input).to_have_value("09:37 AM")
+    # Pick a minute the typed input did NOT already produce, so this proves the
+    # picker applied the click rather than re-reading the value typing had set.
+    _pick_minute(page, 45)
+    expect(time_input).to_have_value("09:45 AM")
     page.get_by_test_id("create-scheduled-task-submit").click()
 
     created_row = _row_by_name(page, "Typed time daily")
     expect(created_row).to_be_visible(timeout=30_000)
     # `to_contain_text`: the line may also carry the server next-run suffix.
     expect(created_row.get_by_test_id("task-schedule-line")).to_contain_text(
-        "Every day at 9:37 AM",
+        "Every day at 9:45 AM",
         timeout=30_000,
     )
 
@@ -486,10 +481,11 @@ def test_scheduled_task_model_effort_controls_hidden_for_incapable_agent(
     model/effort surface is gated on. Rather than drive the create-dialog agent
     picker into Codex (it can fold into a hover-only "More" submenu when the host
     reports it unconfigured, which is fragile to click), we SEED a task against
-    the Codex agent and open its EDIT dialog: edit mode gates the row on the
-    loaded task's agent, so the row must be absent and the "uses defaults" helper
-    hint shown instead. (Chosen because the e2e server does register Codex; the
-    seeded-edit path is the deterministic way to exercise the hidden branch.)
+    the Codex agent and open its EDIT dialog: the row gates on the selected
+    agent, which edit mode seeds from the loaded task, so the row must be absent
+    and the "uses defaults" helper hint shown instead. (Chosen because the e2e
+    server does register Codex; the seeded-edit path is the deterministic way to
+    exercise the hidden branch.)
     """
     codex_agent_id = _builtin_agent_id(live_server, "codex-native-ui")
     _create_task(live_server, codex_agent_id, "Codex daily", "FREQ=DAILY;BYHOUR=9;BYMINUTE=0")
@@ -602,6 +598,52 @@ def test_scheduled_task_edit_prefills_model_and_effort(
     expect(page.get_by_test_id("task-model-effort-row")).to_be_visible()
     expect(page.get_by_test_id("task-model-trigger")).to_have_text("Opus")
     expect(page.get_by_test_id("task-effort-trigger")).to_have_text("High")
+
+
+def test_scheduled_task_edit_switches_the_harness(
+    page: Page,
+    live_server: str,
+) -> None:
+    """The edit dialog can rebind an existing automation to another harness.
+
+    Seeds a Codex task, switches it to Claude Code through the edit dialog's
+    picker, and asserts the PERSISTED ``agent_id`` changed on the SAME task id —
+    the whole point, since recreating the task would mint a new id and drop its
+    run history. (The route tests cover what a switch does to the per-agent
+    settings stored beside the binding.)
+    """
+    codex_agent_id = _builtin_agent_id(live_server, "codex-native-ui")
+    claude_agent_id = _builtin_agent_id(live_server, "claude-native-ui")
+    task_id = _create_task(
+        live_server,
+        codex_agent_id,
+        "Switch me",
+        "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+    )
+
+    page.goto(f"{live_server}/tasks")
+    row = _row_by_name(page, "Switch me")
+    expect(row).to_be_visible(timeout=30_000)
+    row.hover()
+    row.get_by_test_id("task-row-menu").click()
+    page.get_by_test_id("task-edit").click()
+
+    dialog = page.get_by_test_id("create-scheduled-task-dialog")
+    expect(dialog).to_be_visible(timeout=30_000)
+    agent_trigger = page.get_by_test_id("task-agent-picker").get_by_test_id(
+        "new-chat-landing-agent-select"
+    )
+    # Seeded from the task's own agent, not the first listed one.
+    expect(agent_trigger).to_contain_text("Codex", timeout=30_000)
+    agent_trigger.click()
+    page.get_by_role("menuitem").filter(has_text="Claude Code").click()
+    expect(agent_trigger).to_contain_text("Claude Code")
+    page.get_by_test_id("create-scheduled-task-submit").click()
+
+    expect(dialog).to_be_hidden(timeout=30_000)
+    task = httpx.get(f"{live_server}/v1/scheduled-tasks/{task_id}", timeout=10.0).json()
+    assert task["agent_id"] == claude_agent_id, task
+    assert task["id"] == task_id, task
 
 
 # ── Permission-mode selector ───────────────────────────────────────────────

@@ -32,7 +32,7 @@ from pathlib import Path
 
 from playwright.sync_api import Page, Route, expect
 
-_COMPOSER = "Ask the agent anything…"
+_COMPOSER = "Send a message…"
 # Composer accepts image/*,application/pdf,text/*,application/json (the hidden
 # input's accept attr); a .txt file is in-scope and keeps the fixture trivial.
 # ``set_input_files`` bypasses the accept filter, but ``addFiles`` now validates
