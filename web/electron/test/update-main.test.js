@@ -268,7 +268,7 @@ describe("in-app navigation menu actions", () => {
 
     assert.equal(newSessionItem.label, "New Session");
     assert.equal(newSessionItem.accelerator, "CmdOrCtrl+N");
-    assert.equal(newWindowItem.accelerator, undefined);
+    assert.equal(newWindowItem.accelerator, "CmdOrCtrl+Shift+N");
 
     newSessionItem.click();
 
