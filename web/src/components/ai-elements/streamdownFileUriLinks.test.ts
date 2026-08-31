@@ -1,11 +1,4 @@
-// Agents routinely link a file they just wrote as a `file://` URI
-// (`[report.md](file:///abs/ws/report.md)`). Before this pass, Streamdown's
-// sanitize step stripped the `file:` href (not in its protocol allowlist)
-// ahead of the workspace-file marking pass, so the link rendered as an inert
-// "report.md [blocked]" span — the user could not open the created file at
-// all. Rewritten to the plain filesystem path, the link takes the same
-// FileViewer handover as an absolute-path link. These cases pin which
-// `file://` hrefs get rewritten and which stay for sanitize/harden to block.
+// Local file URIs should reach FileViewer; unsafe forms stay for sanitize to block.
 
 import { describe, expect, it } from "vitest";
 import { rewriteFileUriLinks } from "./streamdown-security";
@@ -21,7 +14,6 @@ function anchor(href: string): TestNode {
   return { type: "element", tagName: "a", properties: { href }, children: [] };
 }
 
-/** Runs the pass over a one-anchor tree and returns that anchor's properties. */
 function rewriteHref(href: string): Record<string, unknown> {
   const node = anchor(href);
   const tree: TestNode = {
