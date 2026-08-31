@@ -37,6 +37,7 @@ from omnigent.policies.schema import (
     StateUpdateEntry,
 )
 from omnigent.policies.types import (
+    ApprovalPresentation,
     ElicitationRequest,
     EvaluationContext,
     PolicyLLMClient,
@@ -44,6 +45,7 @@ from omnigent.policies.types import (
 )
 
 __all__ = [
+    "ApprovalPresentation",
     "ElicitationRequest",
     "EvaluationContext",
     "FunctionPolicy",

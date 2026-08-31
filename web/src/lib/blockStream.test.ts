@@ -1460,6 +1460,11 @@ describe("BlockStream — elicitation", () => {
         phase: "tool_call",
         policyName: "approve_terminal_launch",
         contentPreview: '{"tool":"sys_terminal_launch","tool_args":{"terminal":"zsh"}}',
+        approval: {
+          title: "example/repository #42",
+          href: "https://github.com/example/repository/pull/42",
+          secondaryArguments: ["grant_id"],
+        },
       },
     ]);
 
@@ -1470,6 +1475,7 @@ describe("BlockStream — elicitation", () => {
     expect(elic!.phase).toBe("tool_call");
     expect(elic!.policyName).toBe("approve_terminal_launch");
     expect(elic!.contentPreview).toContain("sys_terminal_launch");
+    expect(elic!.approval?.title).toBe("example/repository #42");
     expect(elic!.status).toBe("pending");
     expect(elic!.response).toBeNull();
     expect(elic!.ctx.responseId).toBe("resp_1");

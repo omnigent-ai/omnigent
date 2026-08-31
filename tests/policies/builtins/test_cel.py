@@ -7,6 +7,9 @@ import pytest
 pytest.importorskip("celpy", reason="cel-python not installed")
 
 from omnigent.policies.builtins.cel import cel_policy
+from omnigent.policies.function import _coerce_to_policy_result
+from omnigent.policies.types import ApprovalPresentation
+from omnigent.runtime.policies.approval import validate_approval_presentation
 
 # ── Map return: DENY ────────────────────────────────────────────
 
@@ -91,6 +94,176 @@ def test_ask_with_fallback_reason() -> None:
     )
     result = evaluate({"type": "request"})
     assert result == {"result": "ASK", "reason": "Please approve."}
+
+
+def test_broker_merge_ask_extracts_approval_presentation() -> None:
+    """The real broker field shape produces a typed approval target."""
+    evaluate = cel_policy(
+        expression="""
+        {
+          "result": "ASK",
+          "reason": "Merge this pull request?",
+          "approval": {
+            "title": event.data.arguments.repository_owner + "/" +
+                     event.data.arguments.repository_name + " #" +
+                     string(event.data.arguments.pr_number),
+            "href": "https://github.com/" +
+                    event.data.arguments.repository_owner + "/" +
+                    event.data.arguments.repository_name + "/pull/" +
+                    string(event.data.arguments.pr_number),
+            "secondary_arguments": ["grant_id", "idempotency_key"]
+          }
+        }
+        """,
+    )
+    result = evaluate(
+        {
+            "type": "tool_call",
+            "data": {
+                "name": "github_merge_pr",
+                "arguments": {
+                    "repository_owner": "acme",
+                    "repository_name": "widgets",
+                    "pr_number": 123,
+                    "grant_id": "grant_demo",
+                    "idempotency_key": "idem_demo",
+                },
+            },
+        }
+    )
+    assert result == {
+        "result": "ASK",
+        "reason": "Merge this pull request?",
+        "approval": ApprovalPresentation(
+            title="acme/widgets #123",
+            href="https://github.com/acme/widgets/pull/123",
+            secondary_arguments=("grant_id", "idempotency_key"),
+        ),
+    }
+    policy_result = _coerce_to_policy_result(result, spec_name="github_approval_gate")
+    validated = validate_approval_presentation(
+        policy_result.approval,
+        {
+            "repository_owner": "acme",
+            "repository_name": "widgets",
+            "pr_number": 123,
+            "grant_id": "grant_demo",
+            "idempotency_key": "idem_demo",
+        },
+    )
+    assert validated == result["approval"]
+
+
+def test_broker_open_pr_ask_uses_branch_target_and_repository_link() -> None:
+    """Open-PR approval describes the target before a PR number exists."""
+    evaluate = cel_policy(
+        expression="""
+        {
+          "result": "ASK",
+          "reason": "Open this pull request?",
+          "approval": {
+            "title": event.data.arguments.repository_owner + "/" +
+                     event.data.arguments.repository_name + ": " +
+                     event.data.arguments.head + " -> " +
+                     event.data.arguments.base,
+            "href": "https://github.com/" +
+                    event.data.arguments.repository_owner + "/" +
+                    event.data.arguments.repository_name,
+            "secondary_arguments": ["grant_id", "idempotency_key"]
+          }
+        }
+        """,
+    )
+    result = evaluate(
+        {
+            "type": "tool_call",
+            "data": {
+                "name": "github_open_pr",
+                "arguments": {
+                    "repository_owner": "acme",
+                    "repository_name": "widgets",
+                    "head": "feat/rate-limiter",
+                    "base": "main",
+                    "grant_id": "grant_demo",
+                    "idempotency_key": "idem_demo",
+                },
+            },
+        }
+    )
+    assert result is not None
+    assert result["approval"] == ApprovalPresentation(
+        title="acme/widgets: feat/rate-limiter -> main",
+        href="https://github.com/acme/widgets",
+        secondary_arguments=("grant_id", "idempotency_key"),
+    )
+
+
+@pytest.mark.parametrize(
+    "approval",
+    [
+        '{"href": "https://example.com"}',
+        '{"title": 42}',
+        '{"title": "target", "href": 42}',
+        '{"title": "target", "secondary_arguments": [42]}',
+    ],
+)
+def test_malformed_cel_approval_is_dropped(approval: str) -> None:
+    """Malformed display metadata never changes the ASK verdict."""
+    evaluate = cel_policy(
+        expression=f'{{"result": "ASK", "reason": "Review", "approval": {approval}}}',
+    )
+    assert evaluate({"type": "request"}) == {"result": "ASK", "reason": "Review"}
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "line\nbreak",
+        "escape\x1btitle",
+        "delete\x7ftitle",
+        "line separator\u2028title",
+        "paragraph separator\u2029title",
+        "arabic mark\u061ctitle",
+        "override\u202etitle",
+        "isolate\u2066title",
+        "mark\u200ftitle",
+        "\x1b\u202e",
+    ],
+)
+def test_cel_presentation_drops_unsafe_title_characters(title: str) -> None:
+    """CEL policy titles use the same boundary validation as Python policies."""
+    evaluate = cel_policy(
+        expression=(
+            '{"result": "ASK", "reason": "Review", '
+            '"approval": {"title": event.data.arguments.title}}'
+        ),
+    )
+    result = evaluate({"type": "tool_call", "data": {"arguments": {"title": title}}})
+    assert result is not None
+    assert validate_approval_presentation(result["approval"], {}) is None
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "example/project #451",
+        "בקשת אישור 451",
+        "طلب موافقة 451",
+    ],
+)
+def test_cel_presentation_preserves_clean_titles(title: str) -> None:
+    """Clean LTR and RTL CEL titles pass without rewriting."""
+    evaluate = cel_policy(
+        expression=(
+            '{"result": "ASK", "reason": "Review", '
+            '"approval": {"title": event.data.arguments.title}}'
+        ),
+    )
+    result = evaluate({"type": "tool_call", "data": {"arguments": {"title": title}}})
+    assert result is not None
+    assert validate_approval_presentation(result["approval"], {}) == ApprovalPresentation(
+        title=title
+    )
 
 
 # ── Map return: ALLOW ───────────────────────────────────────────

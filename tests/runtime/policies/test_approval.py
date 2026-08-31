@@ -42,13 +42,15 @@ import pytest
 
 from omnigent.errors import ElicitationDeclinedError
 from omnigent.policies.function import FunctionPolicy
-from omnigent.policies.types import ElicitationRequest, PolicyResult
+from omnigent.policies.types import ApprovalPresentation, ElicitationRequest, PolicyResult
 from omnigent.runtime.policies.approval import (
     ELICITATION_PENDING_TOOL_NAME,
     _await_elicitation,
     _is_explicit_decline,
     _parse_verdict,
     _truncate,
+    arguments_from_preview,
+    validate_approval_presentation,
 )
 from omnigent.runtime.policies.approval import (
     build_elicitation_params_json as _params_json,
@@ -109,6 +111,7 @@ def _composed_ask(
     deciding_policy: str,
     reason: str = "please approve",
     set_labels: dict[str, str] | None = None,
+    approval: ApprovalPresentation | None = None,
 ) -> PolicyResult:
     """Fabricate an engine-composed ASK result."""
     return PolicyResult(
@@ -116,6 +119,7 @@ def _composed_ask(
         reason=reason,
         set_labels=set_labels,
         deciding_policies=[deciding_policy],
+        approval=approval,
     )
 
 
@@ -317,6 +321,152 @@ def test_elicitation_request_event_shape() -> None:
     assert params["phase"] == "tool_call"
     assert params["policy_name"] == "confirm_shell"
     assert params["content_preview"] == "ls -la"
+
+
+def test_presentation_serializes_identically_for_event_and_replay_params() -> None:
+    """Fresh emission and persisted replay carry the same target shape."""
+    approval = ApprovalPresentation(
+        title="acme/widgets #123",
+        href="https://github.com/acme/widgets/pull/123",
+        secondary_arguments=("grant_id", "idempotency_key"),
+    )
+    req = ElicitationRequest(
+        message="Merge this pull request?",
+        phase="tool_call",
+        policy_names=["github_approval_gate"],
+        content_preview='{"grant_id":"grant_demo","idempotency_key":"idem_demo"}',
+        approval=approval,
+    )
+    expected = {
+        "title": approval.title,
+        "href": approval.href,
+        "secondary_arguments": ["grant_id", "idempotency_key"],
+    }
+    assert _elicitation_request_event("elicit_demo", req)["params"]["approval"] == expected
+    assert json.loads(_params_json(req))["approval"] == expected
+
+
+@pytest.mark.parametrize(
+    "href",
+    [
+        "http://github.com/org/repo",
+        "javascript:alert(1)",
+        "https://user@github.com/org/repo",
+        "github.com/org/repo",
+    ],
+)
+def test_boundary_drops_unsafe_links(href: str) -> None:
+    """Hostile policy links fall back to the plain card."""
+    candidate = ApprovalPresentation(title="target", href=href)
+    assert validate_approval_presentation(candidate, {}) is None
+
+
+def test_boundary_caps_title_and_ignores_unknown_secondary_arguments() -> None:
+    """Hierarchy is bounded and secondary fields must exist in the call."""
+    candidate = ApprovalPresentation(
+        title="x" * 300,
+        secondary_arguments=("grant_id", "missing", "grant_id"),
+    )
+    result = validate_approval_presentation(candidate, {"grant_id": "g"})
+    assert result is not None
+    assert result.title == "x" * 256
+    assert result.secondary_arguments == ("grant_id",)
+
+
+def test_boundary_drops_empty_title() -> None:
+    """A presentation without a visible target cannot replace the plain card."""
+    assert validate_approval_presentation(ApprovalPresentation(title="  "), {}) is None
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "line\nbreak",
+        "escape\x1btitle",
+        "delete\x7ftitle",
+        "line separator\u2028title",
+        "paragraph separator\u2029title",
+        "arabic mark\u061ctitle",
+        "override\u202etitle",
+        "isolate\u2066title",
+        "mark\u200ftitle",
+        "\x1b\u202e",
+    ],
+)
+def test_python_presentation_drops_unsafe_title_characters(title: str) -> None:
+    """Python policy titles cannot manipulate the primary approval line."""
+    candidate = ApprovalPresentation(title=title)
+    assert validate_approval_presentation(candidate, {}) is None
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "example/project #451",
+        "בקשת אישור 451",
+        "طلب موافقة 451",
+    ],
+)
+def test_python_presentation_preserves_clean_titles(title: str) -> None:
+    """Clean LTR and RTL titles pass without rewriting."""
+    candidate = ApprovalPresentation(title=title)
+    assert validate_approval_presentation(candidate, {}) == candidate
+
+
+def test_boundary_validates_the_stored_title_not_the_raw_one() -> None:
+    """A disallowed character the cap removes cannot drop the card.
+
+    The check must run on the capped/stripped value that is actually
+    returned, so the string validated and the string rendered agree.
+    """
+    candidate = ApprovalPresentation(title="x" * 256 + "‮" + "y" * 20)
+    result = validate_approval_presentation(candidate, {})
+    assert result is not None
+    assert result.title == "x" * 256
+    assert "‮" not in result.title
+
+
+def test_boundary_validates_the_stripped_title() -> None:
+    """Whitespace the strip removes cannot drop the card either."""
+    result = validate_approval_presentation(ApprovalPresentation(title="target\n"), {})
+    assert result is not None
+    assert result.title == "target"
+
+
+def test_boundary_still_drops_disallowed_characters_inside_the_cap() -> None:
+    """Truncating the title must not become an escape hatch."""
+    candidate = ApprovalPresentation(title="a‮b" + "x" * 300)
+    assert validate_approval_presentation(candidate, {}) is None
+
+
+# ── arguments_from_preview — both preview shapes ──────
+
+
+def test_arguments_from_preview_unwraps_the_wrapper_shape() -> None:
+    """A whole tool-call preview yields its ``arguments`` mapping."""
+    preview = json.dumps({"name": "merge_pr", "arguments": {"grant_id": "g", "pr": 451}})
+    assert arguments_from_preview(preview) == {"grant_id": "g", "pr": 451}
+
+
+def test_arguments_from_preview_accepts_the_bare_shape() -> None:
+    """A preview that is already the arguments mapping is used as-is.
+
+    The relay paths pass the arguments string straight through, so the
+    whole-dict fallback is what lets their secondary arguments resolve.
+    """
+    preview = json.dumps({"grant_id": "g", "pr": 451})
+    assert arguments_from_preview(preview) == {"grant_id": "g", "pr": 451}
+
+
+def test_arguments_from_preview_keeps_bare_name_arguments() -> None:
+    """``name`` is a legal argument name on the bare shape."""
+    assert arguments_from_preview(json.dumps({"name": "release-1.2"})) == {"name": "release-1.2"}
+
+
+@pytest.mark.parametrize("preview", ["not json", "[1, 2]", '"text"', "null", ""])
+def test_arguments_from_preview_rejects_non_objects(preview: str) -> None:
+    """Anything that is not a JSON object resolves no argument names."""
+    assert arguments_from_preview(preview) == {}
 
 
 def test_elicitation_request_event_url_mode(monkeypatch: pytest.MonkeyPatch) -> None:

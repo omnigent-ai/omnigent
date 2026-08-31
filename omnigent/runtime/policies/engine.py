@@ -333,6 +333,8 @@ class PolicyEngine:
         accumulated_state: list[StateUpdate] = []
         ask_reasons: list[str] = []
         deciding_ask_policies: list[str] = []
+        first_ask_approval = None
+        saw_ask = False
         # Sequentially accumulated data: each policy that returns data
         # has its output fed back into ctx.content so the next policy
         # in the chain transforms the already-transformed payload rather
@@ -374,6 +376,9 @@ class PolicyEngine:
                 # in the chain sees this policy's output, not the original.
                 ctx = replace(ctx, content=composed_data)
             if result.action == PolicyAction.ASK:
+                if not saw_ask:
+                    first_ask_approval = result.approval
+                    saw_ask = True
                 ask_reasons.append(
                     f"{policy.spec.name}: {result.reason or 'approval required'}",
                 )
@@ -392,6 +397,7 @@ class PolicyEngine:
                 state_updates=list(accumulated_state) if accumulated_state else None,
                 deciding_policies=deciding_ask_policies,
                 data=composed_data,
+                approval=first_ask_approval,
             )
         if not read_only:
             self.apply_label_writes(accumulated)

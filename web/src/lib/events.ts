@@ -197,6 +197,8 @@ export interface ElicitationRequest {
   policyName: string;
   /** Producer-supplied extra (policy ASK only): truncated snapshot of the gated content. */
   contentPreview: string;
+  /** Policy-supplied target hierarchy for an approval card. */
+  approval?: ApprovalPresentation | null;
   /**
    * Producer-supplied extra (claude-native only): structured
    * AskUserQuestion payload — present when the gated tool is
@@ -268,6 +270,12 @@ export interface ElicitationRequest {
    * where the allow rule is meaningful.
    */
   rememberScope?: RememberScope | null;
+}
+
+export interface ApprovalPresentation {
+  title: string;
+  href: string | null;
+  secondaryArguments: string[];
 }
 
 /**

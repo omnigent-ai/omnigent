@@ -1844,10 +1844,9 @@ def two_agent_chat_session(
 # policy gate escalates an ASK to the server and the web UI renders an
 # ``ApprovalCard`` (and the same prompt surfaces on the /inbox page).
 #
-# The mechanism is the nessie ``blast_radius`` policy with ``gate_pushes:
-# true``: a plain ``git push`` is "recoverable but outward", so the policy
-# returns ASK at the TOOL_CALL phase — before the command runs — which the
-# runner forwards to ``POST /v1/sessions/{id}/policies/evaluate``. The server
+# A CEL policy returns ASK plus an ApprovalPresentation for the deterministic
+# shell command. The runner forwards the result to
+# ``POST /v1/sessions/{id}/policies/evaluate``. The server
 # parks the gate and publishes a ``response.elicitation_request`` the snapshot
 # replays in ``pendingElicitations``. The verdict travels back through
 # ``POST /v1/sessions/{id}/elicitations/{eid}/resolve`` (what the card's
@@ -1889,14 +1888,18 @@ guardrails:
   # Generous window: the parked ASK must outlive the UI assertions.
   ask_timeout: 300
   policies:
-    blast_radius:
+    repository_write_gate:
       type: function
       function:
-        path: omnigent.inner.nessie.policies.blast_radius
+        path: omnigent.policies.builtins.cel.cel_policy
         arguments:
-          # A plain `git push` is recoverable-but-outward → ASK (vs the
-          # always-DENY catastrophic set). This is the prompt the UI renders.
-          gate_pushes: true
+          expression: >-
+            event.type == "tool_call" && event.data.name == "sys_os_shell"
+            ? {{"result": "ASK", "reason": "Push this repository?",
+               "approval": {{"title": "acme/widgets: main -> origin",
+                            "href": "https://example.com/acme/widgets",
+                            "secondary_arguments": ["command"]}}}}
+            : {{"result": "ALLOW"}}
 """
 
 
