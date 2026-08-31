@@ -245,18 +245,28 @@ describe("useWorkspaceChangedFiles gating", () => {
     );
   });
 
-  it("fetches when the runner is offline but host liveness is still unknown", async () => {
+  it("holds fetches while host liveness is unknown for an offline runner", async () => {
     // Transient window (e.g. a stream push flipped the runner before host
-    // liveness resolved): host `undefined` stays "unknown → serve" so the
-    // query fires rather than blanking the panel; if the host is really
-    // down it just 503s and shows the reconnect hint.
+    // liveness resolved): the runner is known-offline, so firing now would
+    // just 503 (and get logged server-side). Hold until the host resolves;
+    // if it comes up `true` the host tunnel serves the panel.
     onlineMock.mockReturnValue(false);
     hostOnlineMock.mockReturnValue(undefined);
     fetchMock
       .mockResolvedValueOnce(environmentResponse())
       .mockResolvedValueOnce(changedFilesResponse());
 
-    render(
+    const view = render(
+      <Wrap>
+        <ChangedFilesProbe id="conv_unknown_host" />
+      </Wrap>,
+    );
+    await flushMicrotasks();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    // Host resolves up → the held queries fire over the host tunnel.
+    hostOnlineMock.mockReturnValue(true);
+    view.rerender(
       <Wrap>
         <ChangedFilesProbe id="conv_unknown_host" />
       </Wrap>,
@@ -285,15 +295,27 @@ describe("useWorkspaceChangedFiles gating", () => {
     );
   });
 
-  it("fetches when status is unknown (undefined)", async () => {
-    // Don't block first render of healthy sessions before the
-    // sidebar's /health batch has reported.
+  it("holds fetches until runner liveness resolves, then fires", async () => {
+    // Opening a session before the first /health resolves must not fan
+    // out resource GETs: a session whose runner went away (host reboot,
+    // idle-reap) would 503 on every one, each also logged server-side.
+    // The open session is always in the health fallback poll, so the
+    // hold lasts one /health round-trip; on `true` the fetches fire.
     onlineMock.mockReturnValue(undefined);
     fetchMock
       .mockResolvedValueOnce(environmentResponse())
       .mockResolvedValueOnce(changedFilesResponse());
 
-    render(
+    const view = render(
+      <Wrap>
+        <ChangedFilesProbe id="conv_unknown" />
+      </Wrap>,
+    );
+    await flushMicrotasks();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    onlineMock.mockReturnValue(true);
+    view.rerender(
       <Wrap>
         <ChangedFilesProbe id="conv_unknown" />
       </Wrap>,

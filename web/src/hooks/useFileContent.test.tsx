@@ -373,11 +373,23 @@ describe("useFileContent gating", () => {
     );
   });
 
-  it("fetches when status is unknown (undefined)", async () => {
+  it("holds the fetch until runner liveness resolves, then fires", async () => {
+    // Unknown liveness must not fire a runner-proxied read: on a session
+    // whose runner went away the fetch would 503 (and be logged
+    // server-side). The hold lasts one /health round-trip.
     onlineMock.mockReturnValue(undefined);
     stubChatStore();
 
-    render(
+    const view = render(
+      <Wrap>
+        <Probe id="conv_unknown" path="src/a.txt" />
+      </Wrap>,
+    );
+    await flushMicrotasks();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    onlineMock.mockReturnValue(true);
+    view.rerender(
       <Wrap>
         <Probe id="conv_unknown" path="src/a.txt" />
       </Wrap>,

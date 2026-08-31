@@ -1582,12 +1582,26 @@ def create_app(
         :returns: A JSON response with the error code and message.
         """
         if exc.http_status >= 500:
-            _logger.error(
-                "Internal error: %s",
-                exc.message,
-                exc_info=exc,
-                extra={"session_id": _session_id_from_request(request)},
-            )
+            # A runner being offline is a normal operational state (host
+            # reboot, idle-reap, tunnel drop), not an internal error. Log
+            # the transient 503 codes without a traceback so genuine 500s
+            # aren't buried under per-request stack traces.
+            if exc.code in (
+                ErrorCode.RUNNER_UNAVAILABLE,
+                ErrorCode.RUNNER_CAPABILITY_MISMATCH,
+            ):
+                _logger.info(
+                    "Runner unavailable: %s",
+                    exc.message,
+                    extra={"session_id": _session_id_from_request(request)},
+                )
+            else:
+                _logger.error(
+                    "Internal error: %s",
+                    exc.message,
+                    exc_info=exc,
+                    extra={"session_id": _session_id_from_request(request)},
+                )
         elif exc.http_status == 400 and request.url.path.endswith("/policies/evaluate"):
             _logger.warning(
                 "Policy evaluate rejected 400 on %s: %s",

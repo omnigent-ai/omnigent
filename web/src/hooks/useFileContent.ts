@@ -154,7 +154,7 @@ export function useFileContent(conversationId: string | undefined, path: string 
   return useQuery({
     queryKey: ["file-content", conversationId, path],
     queryFn: () => fetchFileContent(conversationId!, path!),
-    enabled: !!conversationId && !!path && serveable !== false,
+    enabled: !!conversationId && !!path && serveable === true,
     staleTime: 5_000,
   });
 }
