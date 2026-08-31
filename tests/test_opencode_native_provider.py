@@ -650,6 +650,8 @@ def test_mcp_progress_heartbeat_lifecycle() -> None:
         assert len(written_messages) >= 2
         assert all(m["method"] == "notifications/progress" for m in written_messages)
         assert all(m["params"]["progressToken"] == "test-token" for m in written_messages)
+        progresses = [m["params"]["progress"] for m in written_messages]
+        assert all(b > a for a, b in zip(progresses, progresses[1:], strict=False))
 
         # Once exited, no more messages are emitted
         count_at_exit = len(written_messages)

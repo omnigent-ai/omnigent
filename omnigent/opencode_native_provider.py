@@ -238,7 +238,10 @@ def build_opencode_omnigent_mcp_server(
         # opencode's mcp timeout is in MILLISECONDS and flows straight into the
         # MCP SDK's per-request deadline (default 60 s). Give the client more
         # headroom than the bridge's outer relay hop so the relay's own clean
-        # timeout error always arrives before opencode kills the call.
+        # timeout error always arrives before opencode kills the call. This is
+        # server-wide, so a hung local (non-relay) tool also gets this window
+        # before the client kills it — an accepted trade-off; local tools get
+        # no heartbeat, so they stay killable at this deadline.
         "timeout": int((_TOOL_RELAY_POST_TIMEOUT_S + 30.0) * 1000),
     }
     env_value = server.get("env")
