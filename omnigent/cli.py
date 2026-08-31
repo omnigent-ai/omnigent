@@ -8506,10 +8506,12 @@ def host(
     # gates the Ctrl-C stop-server prompt so we never offer to stop a server
     # we didn't bring up.
     spawned_local_server = False
+    local_server_pid = None
     if not server:
         startup = ensure_local_omnigent_server()
         server = startup.url
         spawned_local_server = startup.spawned
+        local_server_pid = startup.pid
     record = _foreground_daemon_record(
         target=target,
         server_url=server,
@@ -8530,7 +8532,11 @@ def host(
         if remote_mode:
             _ensure_databricks_server_auth(server, non_interactive=non_interactive)
         _maybe_open_host_web_ui(server, non_interactive=non_interactive, cfg=cfg)
-        run_host_process(server_url=server, daemon_target=target)
+        run_host_process(
+            server_url=server,
+            local_server_pid=local_server_pid,
+            daemon_target=target,
+        )
         stopped_cleanly = True
     except KeyboardInterrupt:
         # Ctrl-C is the normal way to stop the foreground daemon — swallow it

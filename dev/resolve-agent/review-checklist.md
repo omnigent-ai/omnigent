@@ -20,6 +20,11 @@ what to look for, and why it's wrong.
   machine and flakes in CI where that var is exported.
 - **No order-dependence / shared mutable state** across tests — a test that only
   passes after another ran, or mutates a module/global without restoring it.
+- **Correlate host-global resources to the test's own session, never by
+  baseline-diff.** A test that picks processes/files/ports by scanning a global
+  namespace (e.g. all of `/proc`) and subtracting a "before" snapshot will match —
+  and may kill — a parallel run's resources. Key the scan to something uniquely
+  this test's (its workspace path, session tag, or registry entry).
 
 ## UI / affordances
 

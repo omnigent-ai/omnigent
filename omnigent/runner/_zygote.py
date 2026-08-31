@@ -259,6 +259,13 @@ def _run_harness_child(request: dict[str, Any]) -> None:
         flags, incl. ``--parent-pid <runner_pid>``) + ``env``.
     """
     _apply_child_env(request)
+    # Detach into an own session, mirroring the direct-exec path's
+    # ``spawn_kwargs`` (``start_new_session=True``): the harness (not the
+    # zygote's shared group) leads the group holding its vendor CLI and MCP
+    # children — the boundary the host's ownerless sweep group-kills to reap
+    # the whole tree after an unclean runner death.
+    with contextlib.suppress(OSError):
+        os.setsid()
     # The harness's OS parent is the zygote, not the runner, so its watchdog
     # must probe the runner pid explicitly rather than trust os.getppid().
     os.environ[ZYGOTE_HARNESS_FORKED_ENV_VAR] = "1"

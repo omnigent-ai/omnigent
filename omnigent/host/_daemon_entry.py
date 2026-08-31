@@ -53,11 +53,14 @@ def main() -> None:
 
     from omnigent.host.daemon_lifecycle import normalize_daemon_target
 
+    local_server_pid = None
     if args.local:
         # The daemon owns the local server: start/reuse it, then connect.
         from omnigent.host.local_server import ensure_local_omnigent_server
 
-        server_url = ensure_local_omnigent_server().url
+        startup = ensure_local_omnigent_server()
+        server_url = startup.url
+        local_server_pid = startup.pid
         daemon_target = normalize_daemon_target(None)
     else:
         server_url = args.server
@@ -65,7 +68,11 @@ def main() -> None:
 
     from omnigent.host.connect import run_host_process
 
-    run_host_process(server_url=server_url, daemon_target=daemon_target)
+    run_host_process(
+        server_url=server_url,
+        local_server_pid=local_server_pid,
+        daemon_target=daemon_target,
+    )
 
 
 if __name__ == "__main__":

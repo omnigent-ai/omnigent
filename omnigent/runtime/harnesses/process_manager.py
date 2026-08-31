@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import secrets
@@ -87,6 +88,13 @@ _HARNESS_AUTH_TOKEN_ENV = "OMNIGENT_HARNESS_AUTH_TOKEN"
 # a still-running Omnigent (leave alone) or a crashed one (kill its
 # children, remove the dir).
 _AP_PID_FILE = "AP_PID"
+# Sibling of AP_PID carrying the manager's kernel start identity, so the
+# dead-sibling gate survives pid recycling.
+_AP_IDENT_FILE = "AP_IDENT"
+# Append-only JSONL of {"pid": N, "identity": "..."} lines, one per harness
+# subprocess spawned by this instance — lets a subreaper host attribute an
+# adopted dead harness leader (whose argv is gone) back to a dead AP.
+_HARNESS_PIDS_FILE = "HARNESS_PIDS"
 
 # Mode bits applied to the per-AP subdir and the per-conversation
 # socket. Filesystem permissions + the per-AP-uuid scope are the v1
@@ -188,6 +196,26 @@ _SPAWN_POLL_INTERVAL_S = 0.05
 # normal lifecycle — if SIGTERM doesn't land in 3 s, SIGKILL is
 # the only recourse.
 _ORPHAN_SIGTERM_GRACE_S = 3.0
+
+# After SIGKILL, how long the orphan sweep polls for the processes to
+# actually disappear before keeping the instance dir for a later retry.
+# A just-SIGKILLed orphan can linger as a zombie until its reaper runs.
+_ORPHAN_KILL_VERIFY_TIMEOUT_S = 2.0
+
+# Whether the missing-lsof warning has fired; the periodic sweep would
+# otherwise repeat it every pass on hosts without lsof.
+_lsof_missing_warned = False
+
+
+def _warn_lsof_missing_once() -> None:
+    global _lsof_missing_warned
+    if _lsof_missing_warned:
+        return
+    _lsof_missing_warned = True
+    _logger.warning(
+        "lsof not found; orphaned harness instance dirs cannot be verified "
+        "and will be kept — install lsof to enable orphan cleanup"
+    )
 
 
 class NoLiveHarnessError(RuntimeError):
@@ -650,6 +678,26 @@ class HarnessProcessManager:
         """
         return _socket_path(self._instance_dir, conversation_id)
 
+    def _record_harness_spawn(self, pid: int | None) -> None:
+        """Append the spawned harness's identity to the instance dir.
+
+        Lets a subreaper host attribute this harness's adopted zombie —
+        whose argv is gone by then — back to this (possibly dead) AP.
+        Append-only JSONL; stale lines are identity-verified by readers.
+
+        :param pid: The just-spawned subprocess pid.
+        """
+        if pid is None:
+            return
+        identity = _proc.process_start_identity(pid)
+        if identity is None:
+            return
+        try:
+            with (self._instance_dir / _HARNESS_PIDS_FILE).open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"pid": pid, "identity": identity}) + "\n")
+        except OSError:
+            _logger.debug("could not record harness spawn identity", exc_info=True)
+
     async def start(self) -> None:
         """
         Initialize the per-instance dir, run the orphan sweep, and
@@ -674,6 +722,13 @@ class HarnessProcessManager:
         # uuid collided with a still-running instance — fail loud.
         sentinel = self._instance_dir / _AP_PID_FILE
         sentinel.write_text(str(os.getpid()), encoding="utf-8")
+        own_identity = _proc.process_start_identity(os.getpid())
+        if own_identity is not None:
+            # Atomic replace: a torn identity read would look like a
+            # recycled (dead) owner and could sweep a live instance dir.
+            ident_tmp = self._instance_dir / (_AP_IDENT_FILE + ".tmp")
+            ident_tmp.write_text(own_identity, encoding="utf-8")
+            os.replace(ident_tmp, self._instance_dir / _AP_IDENT_FILE)
         self._reaper_task = asyncio.create_task(
             self._idle_reaper_loop(),
             name="harness-process-manager-idle-reaper",
@@ -1233,6 +1288,7 @@ class HarnessProcessManager:
             str(parent_pid),
         ]
         process = await self._spawn_harness_process(runner_argv, effective_env)
+        self._record_harness_spawn(process.pid)
         try:
             await _wait_for_bind(process, endpoint, harness, conversation_id)
 
@@ -1318,6 +1374,10 @@ class HarnessProcessManager:
                     "Harness zygote unavailable (%s); falling back to direct exec", exc
                 )
                 self._harness_zygote_disabled = True
+        # ``spawn_kwargs`` detaches the harness into its own session, so it
+        # (not the shared AP group) leads the group holding its vendor CLI
+        # and MCP children — the boundary the orphan sweep's group kill
+        # needs to reap the whole tree after an unclean AP death.
         return await asyncio.create_subprocess_exec(
             sys.executable,
             # -P keeps the inherited workspace cwd off sys.path so it can't
@@ -1329,6 +1389,7 @@ class HarnessProcessManager:
             stdout=None,
             stderr=None,
             env=effective_env,
+            **_proc.spawn_kwargs(),
         )
 
     async def _close_entry(self, entry: _SubprocessEntry) -> None:
@@ -1464,101 +1525,414 @@ class HarnessProcessManager:
 
     async def _sweep_orphans(self) -> None:
         """
-        Kill runner processes left behind by crashed prior AP
-        instances and remove their per-instance directories.
+        Sweep dead sibling instance dirs under ``_tmp_parent``.
 
-        Iterates every ``ap-*`` subdir under ``_tmp_parent``. For
-        each, reads the ``AP_PID`` sentinel; if the recorded PID
-        is not a live process, the dir belongs to a crashed AP
-        and gets cleaned. Sibling dirs whose PIDs are still live
-        are left alone (zero-downtime restart, multi-tenant
-        same-host case).
-
-        Best-effort throughout — a permission error or unreadable
-        sentinel logs and skips the dir rather than aborting boot.
+        Delegates to :func:`sweep_orphaned_instance_dirs` so the
+        same sweep can also run without a manager instance (the
+        host daemon's periodic ownerless-tree sweep).
         """
-        if not self._tmp_parent.exists():
-            return
-        for child in self._tmp_parent.iterdir():
-            if not child.is_dir() or not child.name.startswith("ap-"):
+        await sweep_orphaned_instance_dirs(self._tmp_parent)
+
+
+async def sweep_orphaned_instance_dirs(tmp_parent: Path | None = None) -> int:
+    """
+    Kill runner processes left behind by crashed AP instances and
+    remove their per-instance directories.
+
+    Iterates every ``ap-*`` subdir under *tmp_parent*. For each, reads
+    the ``AP_PID`` sentinel; if the recorded PID is not a live process,
+    the dir belongs to a crashed AP and gets cleaned. Sibling dirs whose
+    PIDs are still live are left alone (zero-downtime restart,
+    multi-tenant same-host case).
+
+    Best-effort throughout — on a shared host, entries owned by another
+    Unix user can be unlistable or unstatable; a permission error or
+    unreadable sentinel logs and skips that entry rather than aborting
+    the sweep (or the boot that runs it).
+
+    :param tmp_parent: Parent directory holding ``ap-*`` instance dirs;
+        defaults to :func:`_default_tmp_parent`.
+    :returns: Number of orphaned instance dirs cleaned.
+    """
+    parent = tmp_parent if tmp_parent is not None else _default_tmp_parent()
+    try:
+        children = list(parent.iterdir())
+    except FileNotFoundError:
+        return 0
+    except OSError as exc:
+        _logger.warning("cannot list instance-dir parent %s: %s; skipping sweep", parent, exc)
+        return 0
+    swept = 0
+    for child in children:
+        if not child.name.startswith("ap-"):
+            continue
+        sentinel = child / _AP_PID_FILE
+        try:
+            if not child.is_dir():
                 continue
-            sentinel = child / _AP_PID_FILE
             if not sentinel.exists():
                 # No sentinel — directory either pre-dates the
                 # convention or is mid-creation. Leave alone.
                 continue
-            try:
-                pid_str = sentinel.read_text(encoding="utf-8").strip()
-                pid = int(pid_str)
-            except (OSError, ValueError) as exc:
-                _logger.warning(
-                    "could not read AP_PID sentinel at %s: %s; skipping",
-                    sentinel,
-                    exc,
-                )
-                continue
-            if _pid_alive(pid):
-                # Sibling Omnigent is still running — leave it alone.
-                continue
-            _logger.info(
-                "sweeping orphaned Omnigent instance dir %s (pid %d not running)",
-                child,
-                pid,
-            )
-            await self._kill_orphan_runners(child)
-            shutil.rmtree(child, ignore_errors=True)
-
-    async def _kill_orphan_runners(self, instance_dir: Path) -> None:
-        """
-        Send SIGTERM to runner processes whose socket lives under
-        ``instance_dir``, then escalate to SIGKILL for survivors.
-
-        Identification works by listing the socket files in the
-        dir — every active runner binds one. We don't have the
-        runner PIDs because they're orphans of a crashed AP, so
-        we shell out to ``lsof`` to find which PIDs hold each
-        socket. ``lsof`` failures fall through silently (best
-        effort).
-
-        After SIGTERM, waits :data:`_ORPHAN_SIGTERM_GRACE_S`
-        seconds, then sends SIGKILL to any runner that is still
-        alive. Prior to this escalation, orphaned
-        runners with stuck SIGTERM handlers survived the sweep
-        indefinitely.
-
-        :param instance_dir: The orphaned AP's per-instance dir
-            whose runner subprocesses to terminate.
-        """
-        all_pids: set[int] = set()
-        for socket_file in instance_dir.glob("conv-*.sock"):
-            pids = await _pids_holding_socket(socket_file)
-            for pid in pids:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                    all_pids.add(pid)
-                except ProcessLookupError:
-                    continue
-                except PermissionError:
-                    _logger.warning(
-                        "cannot signal orphan runner pid %d (permission denied)",
-                        pid,
-                    )
-                    continue
-
-        if not all_pids:
-            return
-
-        await asyncio.sleep(_ORPHAN_SIGTERM_GRACE_S)
-
-        for pid in all_pids:
-            if not _pid_alive(pid):
-                continue
+        except OSError as exc:
             _logger.warning(
-                "orphan runner pid %d survived SIGTERM; escalating to SIGKILL",
-                pid,
+                "could not stat instance dir %s: %s; skipping",
+                child,
+                exc,
             )
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            continue
+        if _ap_owner_is_dead(child) is not True:
+            # Sibling Omnigent still running, or unverifiable — leave it.
+            continue
+        _logger.info("sweeping orphaned Omnigent instance dir %s", child)
+        if await _kill_orphan_runners(child):
+            shutil.rmtree(child, ignore_errors=True)
+            swept += 1
+        else:
+            # The dir is the only record pointing at these processes; keep
+            # it so a later sweep retries instead of leaking them untracked.
+            _logger.warning(
+                "kept orphaned instance dir %s: termination not yet verified",
+                child,
+            )
+    return swept
+
+
+async def _kill_orphan_runners(instance_dir: Path) -> bool:
+    """
+    Send SIGTERM to runner process trees whose socket lives under
+    ``instance_dir``, then escalate to SIGKILL for survivors.
+
+    Identification works by listing the socket files in the
+    dir — every active runner binds one. We don't have the
+    runner PIDs because they're orphans of a crashed AP, so
+    we shell out to ``lsof`` to find which PIDs hold each
+    socket, then snapshot each holder's group members so the
+    whole tree is tracked per member.
+
+    Member identities of each holder's group are snapshotted and —
+    critically — persisted into the instance dir
+    (:data:`_REAP_STATE_FILE`) BEFORE anything is signaled, so a later
+    pass still knows the tree even after the socket-holding leader exits
+    and lsof finds nothing. Both the initial SIGTERM and the escalation
+    are strictly per-member and identity-verified — this fallback tier
+    never signals a numeric pid or pgid it has not re-verified. Survivors
+    outliving every recorded member are the subreaper host's to drain;
+    the dir is released only when every recorded member is definitively
+    gone.
+
+    :param instance_dir: The orphaned AP's per-instance dir
+        whose runner subprocesses to terminate.
+    :returns: ``True`` when every tracked process is confirmed
+        gone (or none were found); ``False`` when a socket
+        lookup failed or a survivor may remain — the caller
+        must keep the dir so a later sweep retries.
+    """
+    groups = _load_reap_state(instance_dir)
+    if groups is None:
+        _logger.warning(
+            "unreadable reap state under %s; keeping the dir untouched",
+            instance_dir,
+        )
+        return False
+    pending_signals: list[tuple[int, str]] = []
+    lookup_failed = False
+    for socket_file in instance_dir.glob("conv-*.sock"):
+        pids = await _pids_holding_socket(socket_file)
+        if pids is None:
+            lookup_failed = True
+            continue
+        for pid in pids:
+            snapshot = _holder_group_snapshot(pid)
+            if snapshot is None:
+                # The holder's tree could not be completely snapshotted:
+                # signaling it anyway would leave survivors escalation
+                # cannot verify. Keep the dir and retry.
+                lookup_failed = True
+                continue
+            pgid, members = snapshot
+            if not members:
+                continue  # holder already gone
+            groups.setdefault(pgid, {}).update(members)
+            pending_signals.extend(members.items())
+
+    if pending_signals:
+        # Write-ahead: identities must be durable before the first signal,
+        # or a crash mid-reap would strand survivors with no record.
+        if not _save_reap_state(instance_dir, groups):
+            _logger.warning(
+                "could not persist reap state under %s; deferring signals",
+                instance_dir,
+            )
+            return False
+        # Per-member verified delivery: an unpinned numeric pgid could be
+        # recycled during persistence; this tier never signals a name it
+        # has not re-verified. Survivors that outlive the recorded members
+        # belong to the subreaper host's adopted reaper.
+        for member, identity in pending_signals:
+            _proc.kill_verified(member, identity, signal.SIGTERM)
+
+    tracked_any = any(members for members in groups.values())
+    if tracked_any:
+        await asyncio.sleep(_ORPHAN_SIGTERM_GRACE_S)
+        # Fallback-tier escalation: strictly per-pid on the recorded,
+        # identity-verified members — no group signal, so no
+        # pgid-continuity assumption. On subreaper hosts survivors that
+        # outlive every recorded member reparent to the host and are
+        # drained by its adopted-orphan reaper instead.
+        kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
+        for members in groups.values():
+            for pid, identity in members.items():
+                if _proc.process_identity_state(pid, identity) != "match":
+                    continue
+                _logger.warning(
+                    "orphan runner pid %d survived SIGTERM; escalating to SIGKILL",
+                    pid,
+                )
+                _proc.kill_verified(pid, identity, kill_sig)
+        deadline = time.monotonic() + _ORPHAN_KILL_VERIFY_TIMEOUT_S
+        while not _reap_state_settled(groups):
+            if time.monotonic() >= deadline:
+                _save_reap_state(instance_dir, groups)
+                return False
+            await asyncio.sleep(0.1)
+
+    if lookup_failed:
+        if tracked_any:
+            _save_reap_state(instance_dir, groups)
+        return False
+    for pgid in groups:
+        if pgid <= 0:
+            continue
+        # This tier signals only recorded members, so no userspace scan
+        # can prove the group empty (a relay forks a replacement after
+        # each pid listing). The kernel's own group check is the only
+        # sound delete gate: retain the evidence unless killpg reports the
+        # group provably absent (ESRCH). A recorded member's zombie keeps
+        # the group present until a foreign reaper collects it — release
+        # then lags that collection, which is a bounded, dir-only cost.
+        present = _proc.group_kernel_present(pgid)
+        if present is not False:
+            _logger.warning(
+                "group %d under %s still present after all recorded members "
+                "exited; keeping instance dir",
+                pgid,
+                instance_dir,
+            )
+            _save_reap_state(instance_dir, groups)
+            return False
+    # Positive-absence backstop, independent of lsof's ambiguous exit
+    # status: a live runner always listens on its conv socket, so any
+    # socket still accepting connections proves a survivor lsof missed.
+    for socket_file in instance_dir.glob("conv-*.sock"):
+        if await _can_connect_uds(socket_file):
+            _logger.warning(
+                "socket %s still accepts connections; keeping instance dir",
+                socket_file,
+            )
+            return False
+    return True
+
+
+def _holder_group_snapshot(pid: int) -> tuple[int, dict[int, str]] | None:
+    """
+    Snapshot the socket holder's group and its member identities.
+
+    Taken while the holder still proves ownership (it holds a conv socket
+    under a dead-AP dir), so the recorded ``pid -> start-identity`` map is
+    a safe kill/verify list even after the holder itself exits. When the
+    holder shares OUR group (legacy topology) group operations are off the
+    table — a group signal would hit ourselves — so only the holder is
+    tracked and signaled, under the sentinel pgid ``0``.
+
+    :param pid: The socket-holding process id.
+    :returns: ``(pgid, members)`` — pgid ``0`` for an ungrouped holder;
+        empty members when the holder is definitively gone; ``None`` when
+        the tree could not be completely snapshotted — the caller must
+        not signal it.
+    """
+    if pid <= 0:
+        return (0, {})
+    if hasattr(os, "getpgid"):
+        try:
+            pgid = os.getpgid(pid)
+            own_group = pgid == os.getpgid(0)
+        except ProcessLookupError:
+            return (0, {})
+        except OSError:
+            return None
+        if not own_group:
+            members = _proc.group_member_identities(pgid)
+            if members is None:
+                return None
+            return (pgid, members)
+    identity = _proc.process_start_identity(pid)
+    if identity is None:
+        # Gone or unreadable: lsof re-resolves a gone holder to nothing on
+        # the next pass, and an unreadable one must not be signaled blind.
+        return None
+    return (0, {pid: identity})
+
+
+def harness_spawn_record_matches(pid: int, identity: str | None) -> bool:
+    """
+    Whether ``(pid, identity)`` was spawned by a now-dead AP instance.
+
+    Used by the subreaper host to attribute an adopted dead harness
+    leader back to a crashed AP: scans ``ap-*`` dirs whose owner is
+    provably dead and matches the recorded spawn identities. A recycled
+    pid never matches.
+
+    :param pid: The adopted leader's pid.
+    :param identity: Its start identity, or ``None`` when unreadable.
+    :returns: ``True`` on a verified match.
+    """
+    if identity is None:
+        return False
+    parent = _default_tmp_parent()
+    try:
+        children = list(parent.iterdir())
+    except OSError:
+        return False
+    for child in children:
+        if not child.name.startswith("ap-"):
+            continue
+        try:
+            if _ap_owner_is_dead(child) is not True:
+                continue
+            lines = (child / _HARNESS_PIDS_FILE).read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if record.get("pid") == pid and record.get("identity") == identity:
+                return True
+    return False
+
+
+def _ap_owner_is_dead(instance_dir: Path) -> bool | None:
+    """
+    Whether the instance dir's recorded AP owner is provably dead.
+
+    Identity-anchored when an ``AP_IDENT`` sibling exists (recycled pids
+    read as dead, unverifiable ones as unknown); legacy dirs fall back to
+    raw pid liveness, which can only err toward "alive" (retention).
+
+    :param instance_dir: An ``ap-*`` instance dir.
+    :returns: ``True`` dead, ``False`` alive, ``None`` unknown/unmarked.
+    """
+    try:
+        pid = int((instance_dir / _AP_PID_FILE).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    identity: str | None
+    try:
+        identity = (instance_dir / _AP_IDENT_FILE).read_text(encoding="utf-8").strip()
+    except OSError:
+        identity = None
+    if identity:
+        state = _proc.process_identity_state(pid, identity)
+        if state == "match":
+            return False
+        if state == "gone":
+            return True
+        return None
+    return not _pid_alive(pid)
+
+
+_REAP_STATE_FILE = "REAP_STATE"
+
+
+def _load_reap_state(instance_dir: Path) -> dict[int, dict[int, str]] | None:
+    """
+    Load the persisted ``pgid -> {pid: identity}`` reap bookkeeping.
+
+    The state outlives the sweep process, so a later pass still knows
+    which tree it SIGTERMed even after lsof can no longer see a holder.
+    A missing file is an empty state; an unreadable or malformed one is
+    indeterminate — prior tracking may exist but cannot be recovered, so
+    the caller must not proceed to signal or delete.
+
+    :param instance_dir: The orphaned AP's per-instance dir.
+    :returns: Recorded groups (sentinel pgid ``0`` holds ungrouped pids),
+        or ``None`` when the state is indeterminate.
+    """
+    try:
+        payload = json.loads((instance_dir / _REAP_STATE_FILE).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    groups: dict[int, dict[int, str]] = {}
+    for pgid_str, members in payload.items():
+        try:
+            pgid = int(pgid_str)
+        except ValueError:
+            return None  # a corrupt row may hide a recorded member
+        if not isinstance(members, dict):
+            return None
+        parsed: dict[int, str] = {}
+        for pid_str, identity in members.items():
+            try:
+                member = int(pid_str)
+            except ValueError:
+                return None
+            if not isinstance(identity, str) or not identity:
+                return None
+            parsed[member] = identity
+        if parsed:
+            groups[pgid] = parsed
+    return groups
+
+
+def _save_reap_state(instance_dir: Path, groups: dict[int, dict[int, str]]) -> bool:
+    """
+    Persist the reap bookkeeping into the instance dir.
+
+    :param instance_dir: The orphaned AP's per-instance dir.
+    :param groups: Current ``pgid -> {pid: identity}`` tracking.
+    :returns: ``True`` if the state is durably written — a precondition
+        for signaling anything it records.
+    """
+    payload = {
+        str(pgid): {str(pid): identity for pid, identity in members.items()}
+        for pgid, members in groups.items()
+        if members
+    }
+    try:
+        tmp = instance_dir / (_REAP_STATE_FILE + ".tmp")
+        tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        os.replace(tmp, instance_dir / _REAP_STATE_FILE)
+    except OSError:
+        _logger.warning("could not persist reap state under %s", instance_dir, exc_info=True)
+        return False
+    return True
+
+
+def _reap_state_settled(groups: dict[int, dict[int, str]]) -> bool:
+    """
+    Whether every recorded member is definitively dead.
+
+    An unreaped zombie counts as settled: its identity still reads as
+    ``"match"`` on Linux, but it holds no resources — only an exit status
+    whose collection belongs to a FOREIGN reaper (init, or a subreaper
+    host) on its own schedule. Gating on ``"gone"`` alone made dir
+    release wait on that schedule and time out under load.
+
+    :param groups: Current ``pgid -> {pid: identity}`` tracking.
+    :returns: ``True`` only on positive verification of death.
+    """
+    for members in groups.values():
+        for pid, identity in members.items():
+            state = _proc.process_identity_state(pid, identity)
+            if state != "gone" and not _proc.process_is_zombie(pid):
+                return False
+    return True
 
 
 def _pid_alive(pid: int) -> bool:
@@ -1594,7 +1968,7 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-async def _pids_holding_socket(socket_path: Path) -> list[int]:
+async def _pids_holding_socket(socket_path: Path) -> list[int] | None:
     """
     Return the OS PIDs that have ``socket_path`` open.
 
@@ -1603,12 +1977,12 @@ async def _pids_holding_socket(socket_path: Path) -> list[int]:
     portability across Linux + macOS without a third-party dep
     (``psutil`` would also work but adds an install).
 
-    Returns an empty list on any subprocess error so the caller
-    can keep going — orphan cleanup is best-effort.
-
     :param socket_path: The socket file to look up holders for.
     :returns: List of holding PIDs (often a single one — the
-        bound runner).
+        bound runner); an empty list when none hold it; ``None``
+        when the lookup itself failed (``lsof`` missing or
+        erroring) — the caller must not treat that as "no
+        holders" and destroy its retry metadata.
     """
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -1618,11 +1992,26 @@ async def _pids_holding_socket(socket_path: Path) -> list[int]:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
+    except FileNotFoundError:
+        _warn_lsof_missing_once()
+        return None
     except OSError:
-        return []
-    stdout, _ = await proc.communicate()
-    if proc.returncode != 0:
-        return []
+        return None
+    try:
+        stdout, _ = await proc.communicate()
+    except asyncio.CancelledError:
+        # Cancellation (sweep timeout, shutdown) must not leave the lsof
+        # helper running past the caller's subprocess-op guard.
+        with contextlib.suppress(OSError, ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await proc.wait()
+        raise
+    # lsof exits 1 both for "no holders" and some errors; with empty output
+    # it is read as "no holders" (matching its normal not-found behavior),
+    # while >1 is a real failure.
+    if proc.returncode is not None and proc.returncode > 1:
+        return None
     pids: list[int] = []
     for line in stdout.decode("utf-8", errors="replace").splitlines():
         line = line.strip()
