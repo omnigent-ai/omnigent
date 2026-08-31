@@ -321,12 +321,11 @@ _SHARE_PUBLIC_POLICY = "public"
 _WEB_FETCH_TOOLS = frozenset({"web_fetch"})
 
 # Priority 5f.1b: web_search — the first-party search builtin. Runner-local
-# so a non-OpenAI model's web_search function call resolves to the spec's
-# configured backend (google / perplexity / nimble) via WebSearchTool.invoke.
-# (OpenAI models use the native web_search_preview passthrough and never reach
-# this path.) Without this entry the call fell through to the spec-callable
-# branch and errored "tool unavailable" — the gap behind the non-OpenAI
-# web_search known-failure.
+# so non-OpenAI-harness web_search calls resolve to the spec's configured
+# backend (google / perplexity / nimble) via WebSearchTool.invoke.
+# (OpenAI Responses-compatible harnesses use the native web_search_preview
+# passthrough and never reach this path.) Without this entry the call fell
+# through to the spec-callable branch and errored "tool unavailable".
 _WEB_SEARCH_TOOLS = frozenset({"web_search"})
 
 # nimble_research — Nimble Agent API v2 research runs (start → poll → result).
