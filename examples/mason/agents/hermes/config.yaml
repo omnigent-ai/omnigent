@@ -29,9 +29,8 @@ prompt: |
   - Co-sign every commit you author: end each commit message with a blank line
     followed by this exact trailer as its final line —
     `Co-authored-by: omnigent <noreply@omnigent.ai>`
-  - When green, push your task branch and open a PR with `gh pr create` (clear
-    title, what changed, how you verified). Never push to a protected branch
-    (e.g. main) or force-push — open a PR and let it be reviewed/merged.
+  - When green, commit the work on your task branch and report what changed
+    and how you verified it. Do not push to a protected branch or force-push.
 
   REVIEW — verify another agent's diff (you are given the diff + the acceptance
   contract):
@@ -41,9 +40,8 @@ prompt: |
     each with file:line evidence.
 
   EXPLORE / SEARCH — answer a specific question, read-only:
-  - For claim audits, judge against audit-rubric and return claim id, commit,
-    file:line, rationale, evidence read, confidence, and what would settle it.
-    Read only what you need; edit nothing.
+  - Report the evidence you read, your conclusion, and what would settle any
+    uncertainty. Read only what you need; edit nothing.
 
   Always return a clear, structured result: for IMPLEMENT, what you changed
   (file:line) and how you verified it; for REVIEW / EXPLORE, your findings.
@@ -59,9 +57,8 @@ os_env:
   sandbox:
     type: none
 
-# Implementers open their own PRs, so push / gh pr create are allowed
-# (gate_pushes: false). Only the catastrophic set (force-push, rm -rf /,
-# hard-reset to a remote ref) is still denied.
+# Only the catastrophic set (force-push, rm -rf /, hard-reset to a remote ref)
+# is denied by this child policy.
 guardrails:
   policies:
     blast_radius:
