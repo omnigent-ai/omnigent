@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
@@ -40,6 +40,7 @@ class _FakeConversation:
     workspace: str | None = None
     host_id: str | None = None
     git_branch: str | None = None
+    labels: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -47,6 +48,7 @@ class _FakeAgent:
     id: str
     bundle_location: str | None = None
     session_id: str | None = None
+    name: str = "assistant"
 
 
 class FakeAgentStore:
@@ -147,6 +149,8 @@ class FakeConversationStore:
         self.create_workspace_ids: list[int] = []
         self._seq = 0
         self.fail_create = fail_create
+        self.label_writes: dict[str, dict[str, str]] = {}
+        self._by_id: dict[str, _FakeConversation] = {}
 
     def create_conversation(self, **kwargs: Any) -> _FakeConversation:
         self.create_workspace_ids.append(current_workspace_id())
@@ -161,11 +165,15 @@ class FakeConversationStore:
             git_branch=kwargs.get("git_branch"),
         )
         self.created.append(kwargs)
+        self._by_id[conv.id] = conv
         return conv
 
     def update_conversation(self, conversation_id: str, **kwargs: Any) -> _FakeConversation:
         self.updated.append({"id": conversation_id, **kwargs})
         return _FakeConversation(id=conversation_id, agent_id="")
+
+    def set_labels(self, conversation_id: str, labels: dict[str, str]) -> None:
+        self.label_writes[conversation_id] = dict(labels)
 
     def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
         return _FakeConversation(id=conversation_id, agent_id="ag_1")
@@ -555,6 +563,87 @@ async def test_no_reasoning_effort_when_spec_has_none() -> None:
     await _drain()
 
     assert not any("reasoning_effort" in u for u in conv_store.updated)
+
+
+@pytest.mark.asyncio
+async def test_native_wrapper_task_stamps_terminal_first_labels() -> None:
+    """A native-CLI (Pi) automation session gets the terminal-first labels.
+
+    Interactive New Chat stamps ``omnigent.ui = terminal`` + the wrapper label
+    so the web UI shows the Chat/Terminal switcher; the fire path must stamp the
+    same labels or the session renders Chat-only with no way to its terminal.
+    """
+    from omnigent.native_coding_agents import PI_NATIVE_AGENT_NAME
+
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        agent_store=FakeAgentStore(
+            {"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/hash", name=PI_NATIVE_AGENT_NAME)}
+        ),
+        agent_cache=FakeAgentCache(harness="pi-native"),
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(deps, launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.label_writes["conv_1"] == {
+        "omnigent.ui": "terminal",
+        "omnigent.wrapper": PI_NATIVE_AGENT_NAME,
+    }
+
+
+@pytest.mark.asyncio
+async def test_non_native_host_bound_task_stamps_repl_terminal_label() -> None:
+    """A non-native SDK automation on a host gets ``omnigent.ui = terminal``.
+
+    Its runner auto-creates the omnigent REPL terminal, so the switcher must be
+    available from creation — mirroring ``_repl_terminal_ui_labels``.
+    """
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/hash")}),
+        agent_cache=FakeAgentCache(harness="claude-sdk"),
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(deps, launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.label_writes["conv_1"] == {"omnigent.ui": "terminal"}
+
+
+@pytest.mark.asyncio
+async def test_task_without_agent_cache_stamps_no_labels() -> None:
+    """No agent cache → no label resolution → Chat-only, fire still succeeds."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    # Default _deps leaves agent_cache=None.
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert conv_store.label_writes == {}
 
 
 @pytest.mark.asyncio
