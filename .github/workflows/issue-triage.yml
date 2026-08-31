@@ -778,7 +778,7 @@ jobs:
         github.event_name == 'issues' &&
         !endsWith(github.event.issue.user.login, '[bot]') &&
         (
-          (github.event.action == 'opened' && needs.triage.result == 'success') ||
+          github.event.action == 'opened' ||
           github.event.action == 'edited'
         )
       )

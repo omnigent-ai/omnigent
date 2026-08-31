@@ -33,6 +33,13 @@ class ExpiredIssue:
     deadline: date
 
 
+class ExpiryBatchError(RuntimeError):
+    def __init__(self, failures: tuple[tuple[int, Exception], ...]) -> None:
+        self.failures = failures
+        details = "; ".join(f"#{number}: {error}" for number, error in failures)
+        super().__init__(f"Failed to process {len(failures)} needs-info issue(s): {details}")
+
+
 def expired_issue(
     issue: Mapping[str, object],
     comments: tuple[Mapping[str, object], ...],
@@ -62,24 +69,37 @@ def process_expired_issues(
     apply: bool,
 ) -> tuple[ExpiredIssue, ...]:
     expired = []
+    failures = []
     for listed in client.open_issues_with_label("needs-info"):
         issue_number = int(listed["number"])
-        issue = client.issue_data(issue_number)
-        comments = client.issue_comments(issue_number)
-        candidate = expired_issue(issue, comments, today)
-        if candidate is None:
-            continue
-        expired.append(candidate)
-        if apply:
-            close_marker = _close_comment_marker(candidate.deadline)
-            already_commented = any(
-                _is_bot_comment(comment)
-                and str(comment.get("body", "")).partition("\n")[0] == close_marker
-                for comment in comments
-            )
-            if not already_commented:
-                client.comment_on_issue(issue_number, _close_comment(candidate.deadline))
-            client.close_issue(issue_number)
+        try:
+            issue = client.issue_data(issue_number)
+            comments = client.issue_comments(issue_number)
+            candidate = expired_issue(issue, comments, today)
+            if candidate is None:
+                continue
+            if apply:
+                # Narrow the window in which an author response or label change
+                # could race with closure.
+                issue = client.issue_data(issue_number)
+                comments = client.issue_comments(issue_number)
+                candidate = expired_issue(issue, comments, today)
+                if candidate is None:
+                    continue
+                close_marker = _close_comment_marker(candidate.deadline)
+                already_commented = any(
+                    _is_bot_comment(comment)
+                    and str(comment.get("body", "")).partition("\n")[0] == close_marker
+                    for comment in comments
+                )
+                if not already_commented:
+                    client.comment_on_issue(issue_number, _close_comment(candidate.deadline))
+                client.close_issue(issue_number)
+            expired.append(candidate)
+        except Exception as error:
+            failures.append((issue_number, error))
+    if failures:
+        raise ExpiryBatchError(tuple(failures))
     return tuple(expired)
 
 
@@ -117,6 +137,8 @@ def _deadline(comment: Mapping[str, object]) -> date | None:
         return None
     try:
         metadata = json.loads(first_line[len(prefix) : -4])
+        if not isinstance(metadata, Mapping):
+            return None
         if metadata.get("information_status") != "needs_info":
             return None
         return date.fromisoformat(str(metadata["needs_info_deadline"]))

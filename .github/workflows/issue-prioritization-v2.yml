@@ -17,33 +17,46 @@ permissions:
   contents: read
   issues: write
 
+concurrency:
+  group: issue-prioritization-v2-${{ inputs.issue_number }}
+  cancel-in-progress: false
+
 jobs:
   prioritize:
-    if: vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
       UV_INDEX_URL: https://pypi.org/simple
       PIP_INDEX_URL: https://pypi.org/simple
     steps:
-      - name: Check out default branch
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          persist-credentials: false
-
       - name: Reopen for author follow-up
         if: inputs.reopen_closed
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}
-        run: gh issue reopen "$ISSUE_NUMBER" --repo "$REPO"
+        run: |
+          set -euo pipefail
+          state=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json state --jq '.state')
+          if [ "$state" = "CLOSED" ]; then
+            gh issue reopen "$ISSUE_NUMBER" --repo "$REPO"
+          else
+            echo "Issue #$ISSUE_NUMBER is already open."
+          fi
+
+      - name: Check out default branch
+        if: vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
 
       - name: Install uv
+        if: vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true'
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
 
       - name: Grade, label, and comment
+        if: vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true'
         env:
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
@@ -69,7 +82,7 @@ jobs:
             --mode apply
 
       - name: Upload decision artifact
-        if: always()
+        if: always() && vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: issue-priority-v2-${{ inputs.issue_number }}-${{ github.run_id }}

@@ -105,7 +105,9 @@ A daily expiry workflow previews bot-managed `needs-info` deadlines. Set
 scheduled runs close eligible reports. It closes on the day after the displayed
 deadline, requires both Bug and `needs-info`, and excludes security/pinned
 issues, untrusted marker comments, and reports with a newer author response. A
-later author comment reopens the issue and runs V2 again.
+later author comment reopens the issue and, while V2 is enabled, runs it again.
+Reopening remains available during a V2 rollback so closed reports are not
+trapped behind the classifier switch.
 
 ## Databricks dry-run
 

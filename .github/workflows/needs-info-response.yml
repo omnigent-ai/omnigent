@@ -22,5 +22,7 @@ jobs:
     uses: ./.github/workflows/issue-prioritization-v2.yml
     with:
       issue_number: ${{ github.event.issue.number }}
-      reopen_closed: ${{ github.event.issue.state == 'closed' }}
+      # Re-check live state inside the called workflow. The expiry worker may
+      # close the issue after this webhook payload was created.
+      reopen_closed: true
     secrets: inherit

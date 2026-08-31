@@ -36,6 +36,18 @@ def test_github_events_share_one_v2_workflow() -> None:
     assert "workflow_call:" in reusable
     assert "--remove-label needs-info" not in response
     assert "reopen_closed:" in response
+    assert "reopen_closed: true" in response
+    assert "group: issue-prioritization-v2-${{ inputs.issue_number }}" in reusable
+    assert "  prioritize:\n    if: vars.ISSUE_PRIORITIZATION_V2_ENABLED" not in reusable
+    assert reusable.count("if: vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true'") == 3
+    assert "if: always() && vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true'" in reusable
+
+
+def test_v2_still_runs_when_legacy_intake_fails() -> None:
+    intake = (WORKFLOWS / "issue-triage.yml").read_text()
+    prioritize = intake.split("  prioritize-v2:", 1)[1]
+
+    assert "needs.triage.result == 'success'" not in prioritize
 
 
 def test_needs_info_expiry_is_gated_and_previewable() -> None:
