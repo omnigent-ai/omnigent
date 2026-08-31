@@ -626,8 +626,6 @@ def test_mcp_progress_heartbeat_lifecycle() -> None:
     import threading
     import time
 
-    from omnigent.claude_native_bridge import _McpProgressHeartbeat
-
     lock = threading.Lock()
     written_messages: list[dict[str, object]] = []
 
@@ -645,7 +643,7 @@ def test_mcp_progress_heartbeat_lifecycle() -> None:
     bridge_mod._write_jsonrpc = fake_write
     try:
         # With interval = 0.05s, should emit progress notifications
-        with _McpProgressHeartbeat("test-token", lock, interval_s=0.05):
+        with bridge_mod._McpProgressHeartbeat("test-token", lock, interval_s=0.05):
             time.sleep(0.12)
         assert len(written_messages) >= 2
         assert all(m["method"] == "notifications/progress" for m in written_messages)
