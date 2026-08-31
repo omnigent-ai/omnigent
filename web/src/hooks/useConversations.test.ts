@@ -1440,6 +1440,80 @@ describe("useBulkArchiveConversations", () => {
       total: 2,
     });
   });
+
+  it("keeps successful archives and reverts only failed ids on partial failure", async () => {
+    // conv_a archives OK; conv_b fails.
+    fetchMock.mockImplementation((url: string) =>
+      Promise.resolve(
+        url.endsWith("/conv_a")
+          ? mockResponse({
+              id: "conv_a",
+              object: "conversation",
+              title: "A",
+              created_at: 0,
+              updated_at: 10,
+              labels: {},
+            })
+          : mockResponse({}, { ok: false, status: 500 }),
+      ),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const key = ["conversations", "", true];
+    queryClient.setQueryData(key, {
+      pages: [
+        {
+          data: [
+            {
+              id: "conv_a",
+              object: "conversation",
+              title: "A",
+              created_at: 0,
+              updated_at: 0,
+              labels: {},
+              permission_level: null,
+              status: "idle",
+              archived: false,
+            },
+            {
+              id: "conv_b",
+              object: "conversation",
+              title: "B",
+              created_at: 0,
+              updated_at: 0,
+              labels: {},
+              permission_level: null,
+              status: "idle",
+              archived: false,
+            },
+          ],
+          first_id: "conv_a",
+          last_id: "conv_b",
+          has_more: false,
+        },
+      ],
+      pageParams: [undefined],
+    });
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useBulkArchiveConversations(), { wrapper });
+
+    result.current.mutate({ ids: ["conv_a", "conv_b"], archived: true });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    // The successful archive stays archived; only the failed one reverts — and
+    // neither is resurrected by a ["conversations"] refetch. That refetch off
+    // the lagging search index is exactly what would have brought conv_a back
+    // as archived:false, the regression this snapshot-scoped reconcile guards.
+    const rows = (
+      queryClient.getQueryData(key) as {
+        pages: { data: { id: string; archived?: boolean }[] }[];
+      }
+    ).pages[0].data;
+    const archivedById = Object.fromEntries(rows.map((r) => [r.id, r.archived]));
+    expect(archivedById).toEqual({ conv_a: true, conv_b: false });
+    expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
+  });
 });
 
 describe("useBulkDeleteConversations", () => {
@@ -2129,6 +2203,51 @@ describe("useArchiveConversation", () => {
     // success — that would race the search-index reindex and bounce the row
     // back into the sidebar until the index caught up.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
+    expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
+  });
+
+  it("rolls the flag back from the snapshot when the PATCH fails, without a list refetch", async () => {
+    // The archive PATCH fails.
+    fetchMock.mockResolvedValueOnce(mockResponse({ error: "nope" }, { ok: false, status: 500 }));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const key = ["conversations", "", true];
+    queryClient.setQueryData(key, {
+      pages: [
+        {
+          data: [
+            {
+              id: "conv_a",
+              object: "conversation",
+              title: "A",
+              created_at: 0,
+              updated_at: 0,
+              labels: {},
+              permission_level: null,
+              status: "idle",
+              archived: false,
+            },
+          ],
+          first_id: "conv_a",
+          last_id: "conv_a",
+          has_more: false,
+        },
+      ],
+      pageParams: [undefined],
+    });
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useArchiveConversation(), { wrapper });
+
+    result.current.mutate({ id: "conv_a", archived: true });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    // The optimistic overlay is rolled back from the snapshot — the row is
+    // visible again (archived:false) — and the rollback did NOT refetch the
+    // search-indexed list (which would have raced the reindex).
+    const rows = (queryClient.getQueryData(key) as { pages: { data: { archived?: boolean }[] }[] })
+      .pages[0].data;
+    expect(rows[0].archived).toBe(false);
     expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
   });
 });
