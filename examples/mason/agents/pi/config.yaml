@@ -60,9 +60,6 @@ os_env:
 # Only the catastrophic set (force-push, rm -rf /, hard-reset to a remote ref)
 # is denied by this child policy.
 guardrails:
-  # Pi is the only mason child gated on the runner ASK path (claude_code /
-  # codex gate via their native hooks, which wait a day) — match that window
-  # instead of auto-denying while the human reads the approval card.
   policies:
     blast_radius:
       type: function

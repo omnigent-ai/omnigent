@@ -15,6 +15,8 @@ Problems outside the contract are reported as `DISCOVERED — OUT OF SCOPE` and
 do not add work. Allow at most two fix-task rounds per work item; after three
 failed gate runs, escalate to the human.
 
-Create the handoff with `git diff <base>...HEAD` and append the contract only.
-Require an explicit result for every acceptance item and finish with
+Create the handoff with `git diff <tracking-branch>...HEAD` and append the
+contract only. Here `<tracking-branch>` is the work item's fork point: the
+tracking branch from which its worktree branch was cut. Require an explicit
+result for every acceptance item and finish with
 `BLOCKERS: ...`, `NON_BLOCKING: ...`, and `SUGGESTIONS: ...`.

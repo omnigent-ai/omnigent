@@ -4,8 +4,7 @@ description: Gate and repository guidance for work in the RecordFlow repository.
 ---
 # RecordFlow repository guidance
 
-Use this skill for work in the regular RecordFlow repository. It does not
-apply to a quarantine branch.
+Use this skill for work in the regular RecordFlow repository.
 
 ## Gates
 

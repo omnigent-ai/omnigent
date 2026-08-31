@@ -33,26 +33,48 @@ def test_mason_spec_and_roster(mason: AgentSpec) -> None:
 
 
 def test_mason_uses_one_final_pull_request(mason: AgentSpec) -> None:
-    assert "integration branch" in mason.instructions
-    assert "git switch -c <tracking-branch> <base-branch>" in mason.instructions
-    assert "git worktree add -b <work-item-branch> <path> <tracking-branch>" in mason.instructions
-    assert "git merge --no-ff <work-item-branch>" in mason.instructions
-    assert "git merge --abort" in mason.instructions
-    assert "re-dispatch the affected work item" in mason.instructions
-    assert "gh pr create --base <base-branch> --head <tracking-branch>" in mason.instructions
-    assert "exactly ONE pull request" in mason.instructions
-    assert "single PR is ready for approval and merge" in mason.instructions
+    instructions = " ".join(mason.instructions.split())
+    assert "integration branch" in instructions
+    assert (
+        "git worktree add -b <tracking-branch> <integration-path> <base-branch>"
+        in instructions
+    )
+    assert (
+        "git worktree add -b <work-item-branch> <path> <tracking-branch>"
+        in instructions
+    )
+    assert "git -C <integration-path> merge --no-ff <work-item-branch>" in instructions
+    assert "git -C <integration-path> merge --abort" in instructions
+    assert "re-dispatch the affected" in instructions
+    assert "gh pr create --base <base-branch> --head <tracking-branch>" in instructions
+    assert "exactly ONE pull request" in instructions
+    assert "single PR is ready for approval and merge" in instructions
 
 
 def test_mason_requires_explicit_plan_approval(mason: AgentSpec) -> None:
-    assert "PLAN APPROVAL GATE (hard stop)" in mason.instructions
-    assert "Then STOP and end the turn" in mason.instructions
-    assert "explicit affirmative approval" in mason.instructions
-    assert "does NOT create" in mason.instructions
-    assert "Human questions, corrections, or requested changes mean revise" in mason.instructions
-    assert "This human-driven plan loop has no bound" in mason.instructions
-    assert "Never infer approval from silence" in mason.instructions
-    assert "only read-only `explore` or `search` workers" in mason.instructions
+    instructions = " ".join(mason.instructions.split())
+    assert "PLAN APPROVAL GATE (hard stop)" in instructions
+    assert "Then STOP and end the turn" in instructions
+    assert "explicit affirmative approval" in instructions
+    assert "does NOT create" in instructions
+    assert "Human questions, corrections, or requested changes mean revise" in instructions
+    assert "This human-driven plan loop has no bound" in instructions
+    assert "Never infer approval from silence" in instructions
+    assert "only read-only `explore` or `search` workers" in instructions
+
+
+def test_mason_dispatch_and_integration_guardrails(mason: AgentSpec) -> None:
+    config = (_BUNDLE / "config.yaml").read_text()
+    assert "args.purpose" in mason.instructions
+    assert "task-based `title`" in mason.instructions
+    assert "same agent and same title continues" in mason.instructions
+    assert "SAME turn" in mason.instructions
+    assert "dispatches are already in flight" in mason.instructions
+    assert mason.guardrails is not None
+    assert mason.guardrails.policies is not None
+    assert "blast_radius" in {policy.name for policy in mason.guardrails.policies}
+    assert "dispatch_tools: [sys_session_send]" in config
+    assert "sys_session_create" not in config
 
 
 def test_mason_codex_pins_are_load_bearing(mason: AgentSpec) -> None:
@@ -64,7 +86,7 @@ def test_mason_codex_pins_are_load_bearing(mason: AgentSpec) -> None:
     assert sol.executor.reasoning_effort == "high"
 
 
-def test_mason_has_exactly_the_general_skills(mason: AgentSpec) -> None:
+def test_mason_has_exactly_two_skills(mason: AgentSpec) -> None:
     assert mason.os_env is not None and mason.os_env.sandbox.type == "none"
     assert mason.terminals and "shell" in mason.terminals
     assert mason.async_enabled and mason.timers
