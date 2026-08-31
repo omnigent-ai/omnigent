@@ -72,7 +72,7 @@ import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { agentRootName, forkTargetCarriesHistory, harnessFamily } from "@/lib/forkHarness";
-import { checkHostDirectory } from "@/hooks/useHostFilesystem";
+import { checkHostDirectory, hostDirectoryMissing } from "@/hooks/useHostFilesystem";
 import { getCliServerUrl } from "@/lib/host";
 import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 import { WorkspacePathField } from "./WorkspacePathField";
@@ -973,11 +973,24 @@ export function ForkSessionForm({
       // launch below is detached and its failure is swallowed, so a
       // nonexistent path would otherwise leave a clone that silently
       // never starts.
+      let recreateSourceWorktree = false;
       if (isCodingSource && selectedHostId) {
         const problem = await checkHostDirectory(selectedHostId, effectiveWorkspace);
         if (problem !== null) {
-          setError(problem);
-          return;
+          // Deleted source worktree + untouched name: recreate the worktree
+          // at the same path/branch instead of erroring — the host's
+          // create-worktree handles an already-existing branch (no -b).
+          // Only this exact case falls back; every other problem (offline
+          // host, unlistable path, network) still aborts the fork (#5031).
+          if (
+            usingSourceWorktree &&
+            (await hostDirectoryMissing(selectedHostId, effectiveWorkspace))
+          ) {
+            recreateSourceWorktree = true;
+          } else {
+            setError(problem);
+            return;
+          }
         }
       }
       const trimmed = title.trim();
@@ -1013,12 +1026,20 @@ export function ForkSessionForm({
         void launchRunner(
           selectedHostId,
           fork.id,
-          effectiveWorkspace,
-          trimmedBranch !== "" && !usingSourceWorktree
-            ? {
-                branchName: trimmedBranch,
-                baseBranch: baseOnSource && sourceBranch ? sourceBranch : undefined,
-              }
+          // Recreating a deleted source worktree launches from the REPO
+          // path (the server derives the worktree directory from the
+          // branch), exactly like the renamed-branch path.
+          recreateSourceWorktree ? workspaceTrimmed : effectiveWorkspace,
+          trimmedBranch !== "" && (!usingSourceWorktree || recreateSourceWorktree)
+            ? recreateSourceWorktree
+              ? // The branch survives its deleted directory — recreate the
+                // worktree by checking the existing branch back out (no base:
+                // nothing new is forked).
+                { branchName: trimmedBranch, existingBranch: true }
+              : {
+                  branchName: trimmedBranch,
+                  baseBranch: baseOnSource && sourceBranch ? sourceBranch : undefined,
+                }
             : undefined,
         ).catch((e) => {
           // Swallow: recovery is the unbound-fork picker on the session

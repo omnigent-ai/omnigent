@@ -1068,6 +1068,39 @@ def test_create_worktree_frame_optional_base_defaults_none() -> None:
     assert decoded.base_branch is None
 
 
+def test_create_worktree_frame_existing_branch_round_trip() -> None:
+    """Verify existing_branch=True survives encode → decode.
+
+    A dropped flag would make the host try to CREATE the branch (with
+    ``-b``), which fails because it already exists — the deleted-worktree
+    recreate would break.
+    """
+    original = HostCreateWorktreeFrame(
+        request_id="req_wt_3",
+        repo_path="/repo",
+        branch_name="fix-1",
+        existing_branch=True,
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostCreateWorktreeFrame)
+    assert decoded.existing_branch is True
+    assert decoded == original
+
+
+def test_create_worktree_frame_existing_branch_absent_defaults_false() -> None:
+    """A frame from an older server (no existing_branch key) decodes as False."""
+    import json
+
+    encoded = encode_host_frame(
+        HostCreateWorktreeFrame(request_id="req_wt_4", repo_path="/repo", branch_name="wip")
+    )
+    msg = json.loads(encoded)
+    msg.pop("existing_branch", None)
+    decoded = decode_host_frame(json.dumps(msg))
+    assert isinstance(decoded, HostCreateWorktreeFrame)
+    assert decoded.existing_branch is False
+
+
 def test_create_worktree_result_frame_round_trip() -> None:
     """Verify HostCreateWorktreeResultFrame survives encode → decode.
 
