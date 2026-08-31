@@ -426,4 +426,56 @@ describe("BubbleView dispatch", () => {
       "Compacting conversation…",
     );
   });
+
+  it("calculates elapsed time from createdAtS when provided", () => {
+    // WHY: when a compaction_loading bubble has a createdAtS timestamp, the timer
+    // should calculate elapsed time from that timestamp rather than from component
+    // mount time, so the progress persists across session switches.
+    vi.useFakeTimers();
+    const nowMs = 1_700_000_000_000; // Fixed timestamp
+    vi.setSystemTime(nowMs);
+    const fiveSecondsAgo = Math.floor(nowMs / 1000) - 5;
+
+    render(
+      <BubbleView
+        bubble={{ kind: "compaction_loading", itemId: "cmp_2", createdAtS: fiveSecondsAgo }}
+      />,
+    );
+
+    const indicator = screen.getByTestId("compacting-indicator");
+    expect(indicator.textContent).toContain("(5s)");
+
+    vi.useRealTimers();
+  });
+
+  it("calculates elapsed time from a distant past timestamp", () => {
+    // WHY: if a user switches sessions long after compaction started (e.g., 30s),
+    // the timer should show that elapsed time, not reset to 0s.
+    vi.useFakeTimers();
+    const nowMs = 1_700_000_000_000;
+    vi.setSystemTime(nowMs);
+    const thirtySecondsAgo = Math.floor(nowMs / 1000) - 30;
+
+    render(
+      <BubbleView
+        bubble={{ kind: "compaction_loading", itemId: "cmp_3", createdAtS: thirtySecondsAgo }}
+      />,
+    );
+
+    const indicator = screen.getByTestId("compacting-indicator");
+    expect(indicator.textContent).toContain("(30s)");
+
+    vi.useRealTimers();
+  });
+
+  it("shows 0s initially when no createdAtS is provided", () => {
+    // WHY: when a compaction_loading bubble has no createdAtS (shouldn't happen
+    // in practice, but defensive), the timer falls back to current time and shows
+    // 0s initially.
+    render(<BubbleView bubble={{ kind: "compaction_loading", itemId: "cmp_4" }} />);
+
+    const indicator = screen.getByTestId("compacting-indicator");
+    expect(indicator).toHaveTextContent("Compacting conversation…");
+    expect(indicator).not.toHaveTextContent("(");
+  });
 });
