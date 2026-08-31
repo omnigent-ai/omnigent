@@ -431,6 +431,7 @@ describe("BubbleView dispatch", () => {
     // WHY: when a compaction_loading bubble has a createdAtS timestamp, the timer
     // should calculate elapsed time from that timestamp rather than from component
     // mount time, so the progress persists across session switches.
+
     vi.useFakeTimers();
     const nowMs = 1_700_000_000_000; // Fixed timestamp
     vi.setSystemTime(nowMs);
