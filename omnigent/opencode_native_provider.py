@@ -451,11 +451,14 @@ def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, obj
     server sees both the user's providers (with their custom base URLs) and
     any Omnigent-synthesized providers (e.g. Databricks gateway).
 
-    ``provider`` entries are merged and top-level ``plugin`` entries are
-    preserved (with synthesized plugins taking precedence). The user config's ``model``
-    default is adopted **only when the synthesized config pins none** — the
-    synthesized config still takes precedence for all keys it sets (model, mcp,
-    plugin, permission, etc.). The ``model`` carry-over matters because when
+    ``provider`` entries are merged, and the user's top-level ``plugin``
+    entries are appended after any synthesized ones (synthesized policy
+    plugins stay first; duplicate paths are dropped) so plugin-based
+    provider auth keeps working in native sessions. The user config's
+    ``model`` default is adopted **only when the synthesized config pins
+    none** — for the other keys it sets (model, mcp, permission, etc.) the
+    synthesized config still takes precedence. The ``model`` carry-over
+    matters because when
     neither a gateway nor a spec-supplied ``model_override`` is present, the
     synthesized config has no ``model`` key, and opencode-native would otherwise
     pick its own default over the merged models map (e.g. landing on a served
@@ -512,6 +515,10 @@ def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, obj
         existing = target.get("plugin")
         merged: list[object] = list(existing) if isinstance(existing, list) else []
         for plugin in user_plugins:
+            # Plugin entries are paths/identifiers; skip anything that isn't a
+            # non-empty string so we never emit a config OpenCode would reject.
+            if not isinstance(plugin, str) or not plugin:
+                continue
             if plugin not in merged:
                 merged.append(plugin)
         if merged:

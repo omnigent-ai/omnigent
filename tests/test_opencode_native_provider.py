@@ -446,6 +446,27 @@ def test_merge_user_provider_config_preserves_plugins_and_deduplicates(
     ]
 
 
+def test_merge_user_provider_config_skips_non_string_plugins(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Malformed plugin entries are dropped rather than propagated."""
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.jsonc").write_text(
+        '{"plugin": ["/opt/pulse-agents-harnesses/marshal-opencode", {"bad": "entry"}, "", 42]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    config: dict[str, object] = {"plugin": ["/tmp/omnigent-policy.js"]}
+    result = maybe_merge_user_provider_config(config)
+
+    assert result["plugin"] == [
+        "/tmp/omnigent-policy.js",
+        "/opt/pulse-agents-harnesses/marshal-opencode",
+    ]
+
+
 def test_merge_user_provider_config_merges_alongside_synthesized_providers(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
