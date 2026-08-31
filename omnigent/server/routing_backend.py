@@ -293,7 +293,13 @@ def routing_available(caps: Any) -> bool:  # type: ignore[explicit-any]  # Runti
     that let a deployment configuring only ``routing_backends`` report routing
     off while the server routed anyway.
 
+    A runner reports what its SERVER can answer with: the backends live in the
+    server process, so a runner attached to a remote one carries none itself
+    and reads its availability off ``remote_routing_available`` instead.
+
     :param caps: A ``RuntimeCaps`` (or structural equivalent), or ``None``.
     :returns: ``True`` when at least one router can answer.
     """
+    if caps is not None and getattr(caps, "remote_routing_available", False):
+        return True
     return any(routing_sources(caps).values())

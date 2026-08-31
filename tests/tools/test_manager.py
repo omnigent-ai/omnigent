@@ -583,6 +583,37 @@ def test_advise_models_exposed_when_routing_enabled() -> None:
     assert "sys_advise_models" in names
 
 
+def test_advise_models_exposed_when_only_the_remote_server_routes() -> None:
+    """A runner carries no routing backends, so it reads the server's answer.
+
+    Routing backends are built in the server process. A runner attached to a
+    remote server therefore has none, and gating on its own caps alone hid
+    ``sys_advise_models`` from every session — including those whose server
+    routes and whose ``sys_advise_models`` calls the server intercepts.
+    """
+    caps = SimpleNamespace(
+        routing_client=None,
+        routing_backends=None,
+        remote_routing_available=True,
+    )
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
+    assert "sys_advise_models" in names
+
+
+def test_advise_models_hidden_when_the_remote_server_does_not_route() -> None:
+    """A server that reports no router keeps the tool hidden on the runner."""
+    caps = SimpleNamespace(
+        routing_client=None,
+        routing_backends=None,
+        remote_routing_available=False,
+    )
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
+    assert "sys_list_models" in names
+    assert "sys_advise_models" not in names
+
+
 def test_share_non_public_registers_share_tool_without_public() -> None:
     """
     ``agent_session_sharing: non-public`` alone (no spawn / declared

@@ -307,6 +307,7 @@ from omnigent.server.routes._sessions.helpers import (
     _wait_for_managed_runner_tunnel,
     _wait_for_runner_client,
 )
+from omnigent.server.routing_backend import routing_available
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
@@ -3772,6 +3773,7 @@ async def _ensure_runner_session_initialized(
                     conv,
                     server_version=VERSION,
                     suppress_recovery_turn=suppress_recovery_turn,
+                    smart_routing_available=routing_available(get_caps()),
                 ),
                 timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
             )
