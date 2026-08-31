@@ -3834,7 +3834,7 @@ async def _auto_create_codex_terminal(
 
         # Read staleness BEFORE the fetch — the fetch kicks the background
         # re-probe, which could land between the two reads.
-        _codex_catalog_was_stale = await codex_launch_catalog_is_stale()
+        _codex_catalog_was_stale = await codex_launch_catalog_is_stale(codex_path=_codex_cli_path)
         _codex_catalog = await codex_launch_catalog(codex_path=_codex_cli_path)
         if launch_config.model_override and _codex_catalog:
             if not catalog_contains(_codex_catalog, launch_config.model_override):
@@ -4204,6 +4204,9 @@ async def _auto_create_codex_terminal(
                 socket_path=codex_ws_url,
                 thread_id=launch_config.external_session_id,
                 codex_home=str(codex_home),
+                # The session workspace: without it the executor falls back
+                # to the runner process's own cwd when starting turns.
+                cwd=workspace,
             ),
         )
 
@@ -4303,8 +4306,10 @@ async def _auto_create_codex_terminal(
                 bridge_dir=bridge_dir,
                 codex_ws_url=codex_ws_url,
                 codex_home=codex_home,
+                workspace=workspace,
                 event_client=event_client,
                 routing_summary=_codex_launch.summary,
+                login_required=_codex_launch.login_required,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
             )
@@ -4352,8 +4357,10 @@ async def _codex_discover_thread_and_forward(
     bridge_dir: Path,
     codex_ws_url: str,
     codex_home: Path,
+    workspace: str,
     event_client: CodexAppServerClient,
     routing_summary: str,
+    login_required: bool = False,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
 ) -> None:
@@ -4374,12 +4381,22 @@ async def _codex_discover_thread_and_forward(
         app-server) and re-persisted by the forwarder's thread-rotation
         path so a native ``/clear`` keeps the ws:// transport.
     :param codex_home: Per-session private ``CODEX_HOME`` path.
+    :param workspace: The session workspace directory, persisted as the
+        bridge state's ``cwd`` so web-driven turns run shell tools there
+        instead of the runner process's working directory.
     :param event_client: Connected app-server listener that will observe the
         TUI's ``thread/started``; reused to subscribe the forwarder.
     :param routing_summary: One-line description of the resolved launch
         routing (provider / profile / model, or the login-fallback state),
         threaded into the startup-timeout error so hosted users can diagnose
         without runner-log access (see #2745).
+    :param login_required: ``True`` when the resolved launch defers to
+        Codex's own login with no usable stored credential — the TUI parks
+        on the sign-in screen and cannot start a thread on its own. Chat
+        turns then fail fast with an actionable error (instead of burning
+        the thread-start timeout), while thread discovery keeps listening
+        so an interactive sign-in from the terminal still recovers the
+        session.
     :param subagent_router: Router this terminal launch started, torn down
         in the ``finally``. Passed so a late teardown cannot close the
         endpoint a re-created terminal has since installed.
@@ -4388,6 +4405,7 @@ async def _codex_discover_thread_and_forward(
     """
     from omnigent.codex_native_bridge import (
         CodexNativeBridgeState,
+        clear_bridge_startup_error,
         write_bridge_startup_error,
         write_bridge_state,
     )
@@ -4400,9 +4418,38 @@ async def _codex_discover_thread_and_forward(
         _RunnerDatabricksAuth,
     )
 
+    if login_required:
+        # The launch router already knows this TUI can only render the
+        # sign-in screen: no provider routes the codex harness and Codex
+        # itself holds no usable stored login. Record the cause up front so
+        # a chat turn (headless sub-agent dispatch, web message) fails
+        # immediately with an actionable error instead of hanging through
+        # the thread-start timeout, then keep listening without a deadline
+        # — a user signing in from the attached terminal still starts the
+        # thread, at which point the pre-recorded error is cleared below.
+        _logger.warning(
+            "Codex launch for %s has no usable credential (%s); chat turns will "
+            "fail fast until a sign-in or provider routes the launch",
+            session_id,
+            routing_summary,
+        )
+        write_bridge_startup_error(
+            bridge_dir,
+            "Codex is not signed in and no Omnigent provider routes the codex "
+            "harness, so the Codex TUI is parked on its sign-in screen and "
+            f"cannot run this turn. Launch routing: {routing_summary}. "
+            "Sign in from the session terminal, or configure a provider "
+            "(`omnigent setup`), then send the message again.",
+        )
+
     try:
         try:
-            thread_id = await wait_for_thread_started(event_client)
+            if login_required:
+                # No deadline: the turn-facing failure is already recorded,
+                # so this wait only serves a possible interactive sign-in.
+                thread_id = await wait_for_thread_started(event_client, timeout=None)
+            else:
+                thread_id = await wait_for_thread_started(event_client)
         except (TimeoutError, RuntimeError) as exc:
             # Expected failure modes of wait_for_thread_started: the TUI exited
             # at startup, or the event stream ended before a thread was
@@ -4426,6 +4473,10 @@ async def _codex_discover_thread_and_forward(
             )
             return
 
+        if login_required:
+            # The user signed in (or the TUI otherwise started a thread):
+            # the pre-recorded fail-fast cause no longer applies.
+            clear_bridge_startup_error(bridge_dir)
         write_bridge_state(
             bridge_dir,
             CodexNativeBridgeState(
@@ -4433,6 +4484,9 @@ async def _codex_discover_thread_and_forward(
                 socket_path=codex_ws_url,
                 thread_id=thread_id,
                 codex_home=str(codex_home),
+                # The session workspace: without it the executor falls back
+                # to the runner process's own cwd when starting turns.
+                cwd=workspace,
             ),
         )
 

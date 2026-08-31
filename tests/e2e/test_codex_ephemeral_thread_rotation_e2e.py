@@ -289,3 +289,41 @@ async def test_ephemeral_thread_variants_do_not_rotate(tmp_path: Path, thread_so
 
     assert rotated is False
     assert ap.created_sessions() == []
+
+
+async def test_rotation_preserves_workspace_cwd(tmp_path: Path) -> None:
+    """A thread rotation must carry the bridge state's workspace ``cwd``.
+
+    The rotated bridge state is what the Codex executor reads to build the
+    next turn's ``environments``; dropping ``cwd`` here makes every
+    post-``/clear`` turn fall back to the harness process's own working
+    directory, so shell tools run from the runner service's cwd instead of
+    the session's selected workspace.
+    """
+    ap = _RecordingAP()
+    workspace = str(tmp_path / "selected-workspace")
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id=PARENT_SESSION,
+            socket_path=APP_SERVER_URL,
+            thread_id=PARENT_THREAD,
+            codex_home=str(tmp_path / "codex_home"),
+            cwd=workspace,
+        ),
+    )
+    target = _make_target(ap)
+
+    clear_thread = {
+        "id": "0195dddd-real-clear-thread",
+        "ephemeral": False,
+        "path": "/rollout/0195dddd.jsonl",
+        "threadSource": "user",
+    }
+    rotated = await _rotate(ap, target, tmp_path, _thread_started(clear_thread))
+
+    assert rotated is True
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.thread_id == "0195dddd-real-clear-thread"
+    assert state.cwd == workspace

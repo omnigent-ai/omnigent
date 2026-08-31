@@ -14,6 +14,7 @@ issue-priority = "issue_prioritization.cli:main"
 issue-priority-dashboard-draft = "issue_prioritization.dashboard:main"
 issue-priority-event = "issue_prioritization.event:main"
 issue-priority-job = "issue_prioritization.job:main"
+issue-needs-info-expiry = "issue_prioritization.needs_info:main"
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.12"]

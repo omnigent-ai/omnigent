@@ -23,6 +23,7 @@
           },
           "end_index": {
             "description": "0-based absolute character offset (exclusive) within the file where the anchor range ends.",
+            "format": "int64",
             "title": "End Index",
             "type": "integer"
           },
@@ -33,6 +34,7 @@
           },
           "start_index": {
             "description": "0-based absolute character offset (inclusive) within the file where the anchor range begins.",
+            "format": "int64",
             "title": "Start Index",
             "type": "integer"
           }
@@ -57,6 +59,7 @@
           },
           "created_at": {
             "description": "Unix epoch timestamp of creation.",
+            "format": "int64",
             "title": "Created At",
             "type": "integer"
           },
@@ -141,6 +144,7 @@
           "updated_at": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -153,6 +157,7 @@
           "version": {
             "default": 1,
             "description": "Monotonic version counter. Starts at 1, incremented on each update.",
+            "format": "int64",
             "title": "Version",
             "type": "integer"
           }
@@ -425,6 +430,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -460,6 +466,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -565,6 +572,7 @@
           },
           "created_at": {
             "description": "Unix epoch timestamp of child creation.",
+            "format": "int64",
             "title": "Created At",
             "type": "integer"
           },
@@ -652,6 +660,7 @@
           "pending_elicitations_count": {
             "default": 0,
             "description": "Number of approval / input prompts the child is currently blocked on, read from the server's `omnigent.runtime.pending_elicitations` index. `> 0` means the sub-agent is parked awaiting user input \u2014 the Agents rail renders an \"awaiting input\" badge so a fanned-out sub-agent that needs attention is visible without opening its chat. Mirrors `SessionListItem.pending_elicitations_count`.",
+            "format": "int64",
             "title": "Pending Elicitations Count",
             "type": "integer"
           },
@@ -728,6 +737,7 @@
           },
           "updated_at": {
             "description": "Unix epoch timestamp of the child's most recent update.",
+            "format": "int64",
             "title": "Updated At",
             "type": "integer"
           }
@@ -775,6 +785,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -809,6 +820,7 @@
           "created_at": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -835,6 +847,7 @@
           },
           "time_used_seconds": {
             "description": "Wall-clock seconds spent on this goal, e.g. `60`.",
+            "format": "int64",
             "minimum": 0.0,
             "title": "Time Used Seconds",
             "type": "integer"
@@ -843,6 +856,7 @@
             "anyOf": [
               {
                 "exclusiveMinimum": 0.0,
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -854,6 +868,7 @@
           },
           "tokens_used": {
             "description": "Tokens spent while pursuing this goal, e.g. `1024`.",
+            "format": "int64",
             "minimum": 0.0,
             "title": "Tokens Used",
             "type": "integer"
@@ -861,6 +876,7 @@
           "updated_at": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -924,6 +940,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -962,6 +979,7 @@
           "total_tokens": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -1027,12 +1045,14 @@
           },
           "token_count": {
             "description": "Approximate token count of the summary text, for budget tracking, e.g. `342`.",
+            "format": "int64",
             "title": "Token Count",
             "type": "integer"
           },
           "window_id": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -1056,6 +1076,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -1084,6 +1105,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -1116,6 +1138,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -1171,6 +1194,7 @@
         "properties": {
           "created_at": {
             "description": "Unix epoch timestamp of creation.",
+            "format": "int64",
             "title": "Created At",
             "type": "integer"
           },
@@ -1426,6 +1450,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -1454,6 +1479,7 @@
         "properties": {
           "cost_usd": {
             "default": 0.0,
+            "format": "double",
             "title": "Cost Usd",
             "type": "number"
           },
@@ -1490,6 +1516,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -1648,6 +1675,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -1773,6 +1801,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -1838,6 +1867,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -1873,6 +1903,7 @@
           "completed_at": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -1898,6 +1929,7 @@
           "created_at": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2103,6 +2135,7 @@
         "properties": {
           "level": {
             "description": "Numeric permission level: `1` = read, `2` = edit, `3` = manage.",
+            "format": "int64",
             "maximum": 3.0,
             "minimum": 1.0,
             "title": "Level",
@@ -2140,6 +2173,7 @@
           "last_event_seq": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2153,6 +2187,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2288,6 +2323,7 @@
         "description": "Result of importing or locating one source session.",
         "properties": {
           "item_count": {
+            "format": "int64",
             "title": "Item Count",
             "type": "integer"
           },
@@ -2344,6 +2380,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2392,6 +2429,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2456,6 +2494,7 @@
           },
           "limit": {
             "default": 10,
+            "format": "int64",
             "maximum": 100.0,
             "minimum": 1.0,
             "title": "Limit",
@@ -2494,14 +2533,17 @@
         "description": "Batch result for `POST /v1/imports/local`.",
         "properties": {
           "already_imported": {
+            "format": "int64",
             "title": "Already Imported",
             "type": "integer"
           },
           "failed": {
+            "format": "int64",
             "title": "Failed",
             "type": "integer"
           },
           "imported": {
+            "format": "int64",
             "title": "Imported",
             "type": "integer"
           },
@@ -2686,6 +2728,7 @@
           "cache_creation_input_tokens": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2698,6 +2741,7 @@
           "cache_read_input_tokens": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2710,6 +2754,7 @@
           "input_tokens": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2722,6 +2767,7 @@
           "output_tokens": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2734,6 +2780,7 @@
           "total_cost_usd": {
             "anyOf": [
               {
+                "format": "double",
                 "type": "number"
               },
               {
@@ -2746,6 +2793,7 @@
           "total_tokens": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2904,6 +2952,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2939,6 +2988,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -2986,6 +3036,7 @@
           "index": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -3012,6 +3063,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -3094,6 +3146,7 @@
           },
           "level": {
             "description": "Numeric permission level (1=read, 2=edit, 3=manage).",
+            "format": "int64",
             "title": "Level",
             "type": "integer"
           },
@@ -3134,6 +3187,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -3236,6 +3290,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -3265,6 +3320,7 @@
         "properties": {
           "last_seen": {
             "description": "Wall-clock baseline in seconds, e.g. `1717000000`. Marking seen sets this to \"now\"; marking unread pins it to `updated_at - 1` so the row reads unseen.",
+            "format": "int64",
             "title": "Last Seen",
             "type": "integer"
           },
@@ -3343,6 +3399,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -3376,6 +3433,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -3410,6 +3468,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -3485,6 +3544,7 @@
           "completed_at": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -3509,6 +3569,7 @@
           },
           "created_at": {
             "description": "Unix epoch timestamp of creation.",
+            "format": "int64",
             "title": "Created At",
             "type": "integer"
           },
@@ -3676,11 +3737,13 @@
         "properties": {
           "attempt": {
             "description": "1-based count of the upcoming attempt (i.e. attempt that will run AFTER this delay), e.g. `2` for the first retry.",
+            "format": "int64",
             "title": "Attempt",
             "type": "integer"
           },
           "delay_seconds": {
             "description": "Seconds the producer will sleep before retrying, rounded to two decimals, e.g. `1.5`.",
+            "format": "double",
             "title": "Delay Seconds",
             "type": "number"
           },
@@ -3690,12 +3753,14 @@
           },
           "max_attempts": {
             "description": "Total tries allowed by the retry policy, e.g. `3`. Lets clients render \"attempt 2 of 3\".",
+            "format": "int64",
             "title": "Max Attempts",
             "type": "integer"
           },
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -4291,6 +4356,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -4328,6 +4394,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -4378,6 +4445,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -4419,6 +4487,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -4485,6 +4554,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -4638,6 +4708,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -4683,6 +4754,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -4770,6 +4842,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -4798,6 +4871,7 @@
         "properties": {
           "requested_at": {
             "description": "Unix epoch seconds when the interrupt request reached the server, e.g. `1704067200`.",
+            "format": "int64",
             "title": "Requested At",
             "type": "integer"
           },
@@ -4920,12 +4994,14 @@
           "comments_count": {
             "default": 0,
             "description": "Total number of review comments (any status) on this session. Together with `comments_updated_at` it forms a change fingerprint: an add or edit bumps the timestamp, a delete changes the count, so the web client can invalidate its cached comment list when either field changes in a `WS /v1/sessions/updates` frame. `0` when the session has no comments or the server has no comment store wired.",
+            "format": "int64",
             "title": "Comments Count",
             "type": "integer"
           },
           "comments_updated_at": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -4937,6 +5013,7 @@
           },
           "created_at": {
             "description": "Unix epoch seconds of creation.",
+            "format": "int64",
             "title": "Created At",
             "type": "integer"
           },
@@ -5027,12 +5104,14 @@
           "pending_elicitations_count": {
             "default": 0,
             "description": "Number of approval prompts currently waiting on this session. Powers the sidebar's \"needs attention\" badge so a user with several sessions running can tell which ones are blocked on them without opening each chat. Sourced from the Omnigent server's in-memory `omnigent.runtime.pending_elicitations` index, which mirrors every `response.elicitation_request` event passing through `session_stream` and decrements when a verdict is dispatched. `0` when the session has no outstanding elicitations.",
+            "format": "int64",
             "title": "Pending Elicitations Count",
             "type": "integer"
           },
           "permission_level": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5126,12 +5205,14 @@
           },
           "updated_at": {
             "description": "Unix epoch seconds of last update.",
+            "format": "int64",
             "title": "Updated At",
             "type": "integer"
           },
           "viewer_last_seen": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5181,6 +5262,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5229,6 +5311,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5264,6 +5347,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5303,6 +5387,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5338,6 +5423,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5433,6 +5519,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5468,6 +5555,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5507,6 +5595,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5689,6 +5778,7 @@
           "background_task_count": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5716,6 +5806,7 @@
           "context_window": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5739,6 +5830,7 @@
           },
           "created_at": {
             "description": "Unix epoch seconds of creation.",
+            "format": "int64",
             "title": "Created At",
             "type": "integer"
           },
@@ -5852,6 +5944,7 @@
           "last_total_tokens": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -5940,6 +6033,7 @@
           "permission_level": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6107,6 +6201,7 @@
           "total_cost_usd": {
             "anyOf": [
               {
+                "format": "double",
                 "type": "number"
               },
               {
@@ -6119,6 +6214,7 @@
           "updated_at": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6189,6 +6285,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6237,6 +6334,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6266,6 +6364,7 @@
           "background_task_count": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6338,6 +6437,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6392,6 +6492,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6443,6 +6544,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6493,6 +6595,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6528,6 +6631,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6568,6 +6672,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6618,11 +6723,13 @@
           "cost_usd": {
             "default": 0.0,
             "description": "Authoritative cumulative USD spend for this session's subtree.",
+            "format": "double",
             "title": "Cost Usd",
             "type": "number"
           },
           "created_at": {
             "description": "Unix epoch seconds of creation.",
+            "format": "int64",
             "title": "Created At",
             "type": "integer"
           },
@@ -6655,6 +6762,7 @@
           },
           "models": {
             "additionalProperties": {
+              "format": "double",
               "type": "number"
             },
             "description": "Per-model recorded cost, keyed by the raw harness model id (e.g. `{\"claude-opus-4-8\": 14.03}`). Empty when no per-model cost was recorded. May not sum to `cost_usd` (see above).",
@@ -6689,6 +6797,7 @@
           },
           "updated_at": {
             "description": "Unix epoch seconds of last activity.",
+            "format": "int64",
             "title": "Updated At",
             "type": "integer"
           }
@@ -6707,6 +6816,7 @@
           "context_tokens": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6720,6 +6830,7 @@
           "context_window": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6738,6 +6849,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -6750,6 +6862,7 @@
           "total_cost_usd": {
             "anyOf": [
               {
+                "format": "double",
                 "type": "number"
               },
               {
@@ -6821,6 +6934,7 @@
             "anyOf": [
               {
                 "exclusiveMinimum": 0.0,
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -7099,6 +7213,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -7129,6 +7244,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -7163,6 +7279,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -7203,6 +7320,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -7237,6 +7355,7 @@
           "sequence_number": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -7702,18 +7821,21 @@
           "cache_creation_input_tokens": {
             "default": 0,
             "description": "Prompt tokens written to the provider prompt cache (cache creation), billed at a premium rate. Like `cache_read_input_tokens`, this is separate from `input_tokens`; `0` when not reported.",
+            "format": "int64",
             "title": "Cache Creation Input Tokens",
             "type": "integer"
           },
           "cache_read_input_tokens": {
             "default": 0,
             "description": "Prompt tokens served from a provider prompt cache (cache hit), billed at a reduced rate. Reported by Anthropic-style providers as a count *separate* from `input_tokens` (which carries only the non-cached portion); `0` when the provider does not break out cache usage. Consumed by the cache-aware server-side cost path.",
+            "format": "int64",
             "title": "Cache Read Input Tokens",
             "type": "integer"
           },
           "context_tokens": {
             "anyOf": [
               {
+                "format": "int64",
                 "type": "integer"
               },
               {
@@ -7727,6 +7849,7 @@
           "cost_usd": {
             "anyOf": [
               {
+                "format": "double",
                 "type": "number"
               },
               {
@@ -7740,6 +7863,7 @@
           "input_tokens": {
             "default": 0,
             "description": "Number of input (prompt) tokens consumed.",
+            "format": "int64",
             "title": "Input Tokens",
             "type": "integer"
           },
@@ -7759,6 +7883,7 @@
           "output_tokens": {
             "default": 0,
             "description": "Number of output (completion) tokens generated.",
+            "format": "int64",
             "title": "Output Tokens",
             "type": "integer"
           },
@@ -7769,6 +7894,7 @@
           "total_tokens": {
             "default": 0,
             "description": "Sum of input and output tokens across all LLM sub-calls for this turn (billing total).",
+            "format": "int64",
             "title": "Total Tokens",
             "type": "integer"
           }
@@ -7782,6 +7908,7 @@
           "reasoning_tokens": {
             "default": 0,
             "description": "Number of tokens consumed by chain-of-thought reasoning.",
+            "format": "int64",
             "title": "Reasoning Tokens",
             "type": "integer"
           }
@@ -7795,18 +7922,21 @@
           "cost_last_30d": {
             "default": 0.0,
             "description": "Total spend over the last 30 UTC days (incl. today).",
+            "format": "double",
             "title": "Cost Last 30D",
             "type": "number"
           },
           "cost_last_7d": {
             "default": 0.0,
             "description": "Total spend over the last 7 UTC days (incl. today).",
+            "format": "double",
             "title": "Cost Last 7D",
             "type": "number"
           },
           "cost_today": {
             "default": 0.0,
             "description": "Total spend on the current UTC day.",
+            "format": "double",
             "title": "Cost Today",
             "type": "number"
           },
@@ -7834,6 +7964,7 @@
           "total_cost_usd": {
             "default": 0.0,
             "description": "All-time total spend from the daily rollup.",
+            "format": "double",
             "title": "Total Cost Usd",
             "type": "number"
           }
@@ -7857,6 +7988,7 @@
                   "type": "string"
                 },
                 {
+                  "format": "int64",
                   "type": "integer"
                 }
               ]

@@ -166,7 +166,6 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_status,
     _remove_session_worktree_best_effort,
     _require_external_status_forward,
-    _run_compact_locked,
     _signal_harness_elicitation_resolved_by_id,
     _stop_session_host_runner,
     _stop_session_via_runner,
@@ -1020,20 +1019,14 @@ def register_events_routes(
             # Unified control dispatch (designs/CLAUDE_NATIVE.md
             # "Control events dispatch on the runner"): forward /compact
             # to the bound runner first, regardless of harness. The
-            # runner dispatches by harness — claude-native injects
-            # /compact into the tmux pane so Claude Code compacts its
-            # own context and returns 200; other harnesses 204 no-op.
-            # The Omnigent server stays harness-agnostic: it runs its own
-            # in-process compaction only when the runner did NOT handle
-            # the control (204 / no runner bound). A 4xx/5xx from the
-            # runner (e.g. 503 when the claude-native pane isn't
-            # attached) is surfaced as an error rather than silently
-            # falling through to AP-side compaction, which would be
-            # wrong for a terminal-owned session.
+            # runner dispatches by harness — native harnesses inject
+            # /compact into the vendor TUI and return 200 on success or
+            # 5xx on failure. SDK harnesses return 204 (no-op) because
+            # their context is controlled entirely by the vendor harness.
+            # A 4xx/5xx from the runner is surfaced as an error.
             # TUI budget, not the 5s default: the claude-native handler
             # drives a delivery-verified slash-command inject, and a timeout
-            # here falls through to AP-side compaction on top of the
-            # terminal's own still-running /compact.
+            # here would surface as an error mid-TUI-compact.
             runner_result = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
@@ -1088,13 +1081,10 @@ def register_events_routes(
                     "run /compact again.",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
-            await _run_compact_locked(
-                session_id,
-                conv,
-                agent_store,
-                agent_cache,
+            raise OmnigentError(
+                "/compact is not available for this session type.",
+                code=ErrorCode.INVALID_INPUT,
             )
-            return {"queued": False}
         if body.type == "compaction":
             import uuid as _uuid
 

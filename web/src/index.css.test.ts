@@ -5,15 +5,39 @@ import { readFileSync } from "node:fs";
 // lightningcss is the minifier @tailwindcss/vite runs during `vite build`
 // (resolved from its dependency tree, so we test the version the build uses).
 import { transform } from "lightningcss";
-import { describe, expect, it } from "vitest";
+import { type ComponentProps, createElement } from "react";
+import { cleanup, render } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { TooltipProvider } from "./components/ui/tooltip";
+import type * as UseTerminalsModule from "./hooks/useTerminals";
 import { UI_FONT_SIZE_DEFAULT, UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN } from "./lib/uiFontPreferences";
+import { WorkspacePanel } from "./shell/WorkspacePanel";
+
+// Rendering the real WorkspacePanel below is a layout test: stub its content
+// children and data hooks (each exercised by its own suite) so the rail
+// mounts without Monaco / xterm / query stacks.
+vi.mock("./shell/FileViewer", () => ({ FileViewer: () => null }));
+vi.mock("./shell/FilesPanel", () => ({ FilesPanel: () => null }));
+vi.mock("./shell/SubagentsPanel", () => ({ SubagentsPanel: () => null }));
+vi.mock("./components/BrowserPane/BrowserPane", () => ({ BrowserPane: () => null }));
+vi.mock("./components/blocks/TerminalView", () => ({ TerminalView: () => null }));
+vi.mock("./hooks/useTerminals", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseTerminalsModule>()),
+  useTerminals: () => ({ terminals: [], isLoading: false, error: null }),
+  useCreateTerminal: () => ({ mutate: () => {}, isPending: false, isError: false }),
+}));
+vi.mock("./hooks/useAgents", () => ({ useSessionAgent: () => ({ data: undefined }) }));
 
 // Relative to the vitest root (web/) — import.meta.url is not a file://
 // URL inside vitest's module graph, so it can't locate the file.
 const indexCssSource = readFileSync("src/index.css", "utf8");
 const generatedPaletteCssSource = readFileSync("src/themePalettes.generated.css", "utf8");
 const cssSource = `${generatedPaletteCssSource}\n${indexCssSource}`;
+
+// Innermost `selector { ... }` blocks with their match indices, shared by
+// every rule-extraction below so the block grammar lives in one place.
+const cssBlocks = [...cssSource.matchAll(/[^{}]+\{[^{}]*\}/g)];
 
 /* Regression test for the "transparent dropdown in prod" bug.
  *
@@ -42,16 +66,23 @@ const TARGETS = {
 const UNPREFIXED_DECL = /(?<![-\w])backdrop-filter\s*:/;
 const WEBKIT_DECL = /-webkit-backdrop-filter\s*:/;
 
+/** The selector text of an extracted rule block, minus any leading comment. */
+function selectorOf(rule: string): string {
+  return rule
+    .slice(0, rule.indexOf("{"))
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .trim();
+}
+
 /** Innermost `selector { ... }` blocks that declare backdrop-filter. */
-function extractBackdropFilterRules(css: string): string[] {
-  const blocks = css.match(/[^{}]+\{[^{}]*\}/g) ?? [];
+function extractBackdropFilterRules(): string[] {
   // Require a `:` so blocks that merely mention backdrop-filter in a
   // comment (e.g. the dark-token block) are not treated as glass rules.
-  return blocks.filter((block) => UNPREFIXED_DECL.test(block));
+  return cssBlocks.map(([block]) => block).filter((block) => UNPREFIXED_DECL.test(block));
 }
 
 describe("index.css backdrop-filter glass rules", () => {
-  const rules = extractBackdropFilterRules(cssSource);
+  const rules = extractBackdropFilterRules();
 
   it("has the glass rules this test exists to protect", () => {
     // 2 today: the bg-card frosted surfaces and the popover/menu rule.
@@ -95,12 +126,8 @@ describe("index.css backdrop-filter glass rules", () => {
  */
 describe("index.css bg-card glass rule selector", () => {
   // The selector of the rule declaring the bg-card glass border/blur.
-  const cardRule = extractBackdropFilterRules(cssSource).find((rule) => rule.includes(".bg-card"))!;
-  // Strip comments preceding the selector in the extracted block.
-  const selector = cardRule
-    .slice(0, cardRule.indexOf("{"))
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .trim();
+  const cardRule = extractBackdropFilterRules().find((rule) => rule.includes(".bg-card"))!;
+  const selector = selectorOf(cardRule);
 
   function makeAside(): HTMLElement {
     const dark = document.createElement("div");
@@ -136,14 +163,340 @@ describe("index.css bg-card glass rule selector", () => {
 });
 
 describe("index.css app-shell viewport lock", () => {
-  const rule = (cssSource.match(/[^{}]+\{[^{}]*\}/g) ?? []).find(
-    (block) => block.includes("body:has(.app-shell)") && /overflow\s*:\s*hidden/.test(block),
-  );
+  const rule = cssBlocks
+    .map(([block]) => block)
+    .find((block) => block.includes("body:has(.app-shell)") && /overflow\s*:\s*hidden/.test(block));
 
   it("locks both document roots while the fixed app shell is mounted", () => {
     expect(rule, "the app-shell viewport lock is gone from index.css").toBeDefined();
     expect(rule).toContain("html:has(.app-shell)");
     expect(rule).toContain("body:has(.app-shell)");
+  });
+});
+
+/* The unified native-panel rule: one ungated :is() list covering the
+ * Workspace rail, the conversations sidebar, and every push panel / rail-tab
+ * drawer. The assertions below apply it verbatim — media-stripping a gated
+ * rule would assert padding the md+ layout never applies. */
+// Every block carrying panel testids + the safe-area fold (a single rule
+// today). Matching ALL blocks, not the first, so if the rule is ever split
+// no trailing block's panels silently escape the assertions below.
+const nativePanelBlocks = cssBlocks
+  .filter(([block]) => block.includes('data-testid="') && block.includes("--omnigent-safe-top"))
+  .map((match) => ({ block: match[0], index: match.index! }));
+const nativePanelRule = nativePanelBlocks.map(({ block }) => block).join("\n");
+const rootSafeAreaRule =
+  cssBlocks.find(
+    ([block]) => block.includes(":root") && block.includes("--omnigent-safe-top"),
+  )?.[0] ?? "";
+
+/* Panel testids DERIVED from the index.css rule, so the stub coverage tracks
+ * the rule. Derivation alone can't catch deletion, though: dropping a testid
+ * from the rule shrinks the derived list with it and stays green, so
+ * REQUIRED_PANEL_TEST_IDS anchors the rule to an independent, hand-maintained
+ * expectation. */
+const cssPanelTestIds = [...nativePanelRule.matchAll(/data-testid="([^"]+)"/g)]
+  .map((match) => match[1])
+  .sort();
+
+/* Panels that MUST carry the safe-area fold (sorted). The drift guard below
+ * compares the rule against this list, so deleting a testid from the unified
+ * rule fails even though the derived list shrinks with it. Update it when a
+ * panel deliberately joins or leaves the rule. The rail-tab drawers
+ * (shells / subagents / todos) are covered through the shared
+ * `.mobile-panel-drawer` class rather than per-drawer testids. */
+const REQUIRED_PANEL_TEST_IDS = [
+  "execution-logs-panel",
+  "file-viewer",
+  "files-panel-drawer",
+  "terminals-panel",
+];
+
+/** Runs `assertions` with `css` applied to the document, then removes it. */
+function withStyle(css: string, assertions: () => void): void {
+  const style = document.createElement("style");
+  style.textContent = css;
+  document.head.appendChild(style);
+  try {
+    assertions();
+  } finally {
+    style.remove();
+  }
+}
+
+/** The four safe-area vars must land on the element's padding, edge for edge.
+ * Lateral edges are min()-capped to the surface's published reservation (see
+ * the sliver-rail suite); without the var the cap falls back to the full inset. */
+function expectSafeAreaPadding(element: HTMLElement): void {
+  const computed = getComputedStyle(element);
+  expect(computed.paddingTop).toBe("var(--omnigent-safe-top)");
+  expect(computed.paddingBottom).toBe("var(--omnigent-safe-bottom)");
+  expect(computed.paddingLeft).toBe(
+    "min(var(--omnigent-safe-left), var(--omnigent-lateral-inset-cap))",
+  );
+  expect(computed.paddingRight).toBe(
+    "min(var(--omnigent-safe-right), var(--omnigent-lateral-inset-cap))",
+  );
+}
+
+/** The rule must leave the element alone — all four padding edges stay 0. */
+function expectZeroPadding(element: HTMLElement): void {
+  const computed = getComputedStyle(element);
+  expect(computed.paddingTop).toBe("0");
+  expect(computed.paddingBottom).toBe("0");
+  expect(computed.paddingLeft).toBe("0");
+  expect(computed.paddingRight).toBe("0");
+}
+
+/** Mounts a native-shell root with the unified rule applied, hands it to
+ * `assertions`, then removes both. */
+function withNativeShell(
+  platform: "android" | "ios",
+  assertions: (shell: HTMLElement) => void,
+): void {
+  withStyle(nativePanelRule, () => {
+    const shell = document.createElement("div");
+    shell.setAttribute(`data-${platform}-native`, "");
+    document.body.appendChild(shell);
+    try {
+      assertions(shell);
+    } finally {
+      shell.remove();
+    }
+  });
+}
+
+/* Mounts the rail, the sidebar, and every derived panel testid under a
+ * native-shell root and asserts the four-edge fold on each. */
+function assertNativePanelPadding(platform: "android" | "ios"): void {
+  withNativeShell(platform, (shell) => {
+    const rail = document.createElement("aside");
+    rail.setAttribute("aria-label", "Workspace");
+    shell.appendChild(rail);
+    expectSafeAreaPadding(rail);
+    const sidebar = document.createElement("div");
+    sidebar.className = "conversations-sidebar";
+    shell.appendChild(sidebar);
+    expectSafeAreaPadding(sidebar);
+    for (const testId of cssPanelTestIds) {
+      const panel = document.createElement("div");
+      panel.dataset.testid = testId;
+      shell.appendChild(panel);
+      expectSafeAreaPadding(panel);
+    }
+    // Rail-tab drawers carry no testid in the rule — the shared
+    // MobilePanelDrawer class folds the inset onto all of them.
+    const drawer = document.createElement("div");
+    drawer.className = "mobile-panel-drawer";
+    shell.appendChild(drawer);
+    expectSafeAreaPadding(drawer);
+  });
+}
+
+describe("index.css native safe-area layout", () => {
+  it("folds Android and browser safe areas on both lateral edges", () => {
+    withStyle(rootSafeAreaRule, () => {
+      const computed = getComputedStyle(document.documentElement);
+      expect(computed.getPropertyValue("--omnigent-safe-left")).toContain(
+        "--omnigent-android-safe-area-left",
+      );
+      expect(computed.getPropertyValue("--omnigent-safe-right")).toContain(
+        "--omnigent-android-safe-area-right",
+      );
+    });
+  });
+
+  it("has the unified native panel rule this suite asserts against", () => {
+    expect(nativePanelRule, "the native full-height panel rule is gone").not.toBe("");
+    expect(cssPanelTestIds.length).toBeGreaterThan(0);
+  });
+
+  it("keeps every required panel testid in the index.css rule", () => {
+    // Independent of the Kotlin sheet: deleting a testid from BOTH
+    // stylesheets shrinks the derived lists together, so only this
+    // checked-in expectation still fails on that edit.
+    expect(cssPanelTestIds).toEqual(expect.arrayContaining(REQUIRED_PANEL_TEST_IDS));
+    // The rail-tab drawers ride on the class every MobilePanelDrawer sets.
+    expect(nativePanelRule).toContain(".mobile-panel-drawer");
+  });
+
+  it("keeps the unified rule at stylesheet top level, outside any at-rule", () => {
+    // cssBlocks matches innermost blocks, so re-wrapping the rule in
+    // e.g. @media (width < 48rem) would leave every other assertion here
+    // green while silently dropping the md+ coverage this change exists
+    // for. Brace depth must be 0 where each matching block starts.
+    expect(nativePanelBlocks.length).toBeGreaterThan(0);
+    for (const { index } of nativePanelBlocks) {
+      const before = cssSource.slice(0, index);
+      const opens = (before.match(/\{/g) ?? []).length;
+      const closes = (before.match(/\}/g) ?? []).length;
+      expect(opens - closes, "the unified rule must not sit inside an at-rule").toBe(0);
+    }
+  });
+
+  it.each(["android", "ios"] as const)(
+    "computes four-edge padding on the rail, sidebar, and every panel in the %s shell",
+    assertNativePanelPadding,
+  );
+
+  it("keeps the Workspace aria-label on the rail component", () => {
+    // The stub <aside> in assertNativePanelPadding stands in for
+    // WorkspacePanel; this pins the real component to the label the CSS
+    // selector keys on.
+    const source = readFileSync("src/shell/WorkspacePanel.tsx", "utf8");
+    expect(source).toMatch(/<aside[\s\S]{0,600}?aria-label="Workspace"/);
+  });
+
+  it("leaves a collapsed rail unpadded, so its starved width stays zero", () => {
+    withNativeShell("android", (shell) => {
+      const rail = document.createElement("aside");
+      rail.setAttribute("aria-label", "Workspace");
+      rail.setAttribute("data-collapsed", "true");
+      shell.appendChild(rail);
+      // The width-0 rail carries data-collapsed (pinned above); the rule
+      // must skip it edge for edge or the padding gives it real width.
+      expectZeroPadding(rail);
+    });
+  });
+
+  it("leaves collapsed panels unpadded, so their w-0 width stays zero", () => {
+    withNativeShell("android", (shell) => {
+      const panel = document.createElement("div");
+      panel.dataset.testid = "execution-logs-panel";
+      panel.setAttribute("data-collapsed", "");
+      shell.appendChild(panel);
+      // Closed push panels stay mounted at w-0; with border-box sizing any
+      // padding would give them real width — a cutout-sized gap in the
+      // layout (the e2e layer asserts the layout width itself stays 0).
+      expectZeroPadding(panel);
+    });
+  });
+
+  it("exempts panels nested inside the already-padded rail", () => {
+    withNativeShell("android", (shell) => {
+      const rail = document.createElement("aside");
+      rail.setAttribute("aria-label", "Workspace");
+      const panel = document.createElement("div");
+      panel.dataset.testid = "file-viewer";
+      rail.appendChild(panel);
+      shell.appendChild(rail);
+      // The rail already pads all four edges; padding the nested viewer
+      // again would double the inset.
+      expectZeroPadding(panel);
+    });
+  });
+
+  it("leaves the peeking sidebar unpadded — the card floats clear of every bar", () => {
+    withNativeShell("android", (shell) => {
+      const sidebar = document.createElement("div");
+      sidebar.className = "conversations-sidebar is-peek";
+      shell.appendChild(sidebar);
+      // Peek is a floating card inset 8px off every screen edge (md:absolute
+      // md:inset-2 p-0); it touches neither bar, and effectiveOpen is true
+      // so no data-collapsed saves it — an unguarded rule would override
+      // the card's p-0 with cutout-sized padding.
+      expectZeroPadding(sidebar);
+    });
+  });
+
+  it("keeps the is-peek marker on the sidebar component", () => {
+    // The CSS guard keys on .is-peek; this pins the class the real component
+    // sets while peeking, so a rename can't silently re-pad the card.
+    const source = readFileSync("src/shell/Sidebar.tsx", "utf8");
+    expect(source).toMatch(/peek\s*&&\s*"is-peek /);
+  });
+
+  it("does not double-count app-owned bar footprints", () => {
+    expect(nativePanelRule).not.toMatch(/--omnigent-(?:inset|native)-/);
+  });
+});
+
+/* The stub <aside> suite above proves the CSS side; this suite renders the
+ * real WorkspacePanel (content children stubbed at the top of the file) so
+ * the attributes the unified rule keys on are asserted on the real DOM. */
+describe("index.css native safe-area layout on the rendered WorkspacePanel", () => {
+  const shells: HTMLElement[] = [];
+
+  afterEach(() => {
+    cleanup();
+    for (const shell of shells.splice(0)) shell.remove();
+  });
+
+  /** Renders the rail into a native-shell root, returning its <aside>. */
+  function renderRail(width: number): HTMLElement {
+    const shell = document.createElement("div");
+    shell.setAttribute("data-android-native", "");
+    document.body.appendChild(shell);
+    shells.push(shell);
+    render(
+      createElement(
+        TooltipProvider,
+        // children arrive as the third argument; the cast satisfies
+        // createElement's props typing, which insists they sit in props.
+        { delayDuration: 0 } as ComponentProps<typeof TooltipProvider>,
+        createElement(WorkspacePanel, {
+          conversationId: "conv",
+          width,
+          handleProps: { tabIndex: 0 },
+          rightRailTab: "files",
+          onRightRailTabChange: () => {},
+          showFilesPanel: true,
+          showBrowserTab: false,
+          changedCount: 0,
+          subagentsWorking: 0,
+          agentCount: 1,
+          rootSessionId: null,
+          selectedFilePath: null,
+          openFiles: [],
+          openFileViewer: () => {},
+          onCloseFile: () => {},
+          onShowScopeView: () => {},
+          onCommentsOpenChange: () => {},
+          openTerminalTab: () => {},
+          openTerminals: [],
+          selectedTerminalKey: null,
+          onCloseTerminal: () => {},
+          maximized: false,
+          onToggleMaximized: () => {},
+          permissionLevel: null,
+          filesPanelSort: "recent",
+          onSortChange: () => {},
+          filesPanelShowHidden: false,
+          onShowHiddenChange: () => {},
+        }),
+      ),
+      { container: shell },
+    );
+    const rail = shell.querySelector<HTMLElement>('aside[aria-label="Workspace"]');
+    expect(rail, "the rail <aside> the CSS selector keys on is gone").not.toBeNull();
+    return rail!;
+  }
+
+  it("marks the rail collapsed exactly while its inline width is starved to 0", () => {
+    // useResizableInlinePanel can clamp the rail to width 0 while AppShell
+    // keeps it mounted, and the rail is the only surface in the unified rule
+    // with no other collapsed state — without this marker the rule's
+    // :not([data-collapsed]) keeps padding a zero-width rail, painting a
+    // ghost bg-card strip along the screen edge on native shells.
+    expect(renderRail(0).hasAttribute("data-collapsed")).toBe(true);
+    expect(renderRail(320).hasAttribute("data-collapsed")).toBe(false);
+  });
+
+  it("caps a sliver rail's lateral insets at what its reservation can absorb", () => {
+    withStyle(nativePanelRule, () => {
+      // 40px reserves less than a typical landscape cutout's inset sum; with
+      // uncapped lateral padding the border-box floor would render the rail
+      // wider than the width the layout reserved for it.
+      const rail = renderRail(40);
+      expect(rail.style.width).toBe("40px");
+      expect(rail.style.getPropertyValue("--omnigent-reserved-width")).toBe("40px");
+      const computed = getComputedStyle(rail);
+      // jsdom strips whitespace inside custom-property values; compare bare.
+      expect(computed.getPropertyValue("--omnigent-lateral-inset-cap").replace(/\s/g, "")).toBe(
+        "calc(var(--omnigent-reserved-width,100000px)/2)",
+      );
+      expectSafeAreaPadding(rail);
+    });
   });
 });
 
@@ -157,16 +510,14 @@ describe("index.css app-shell viewport lock", () => {
  * applying to cells only, and never leaks into prose links.
  */
 describe("index.css table link wrapping rule", () => {
-  const rule = (cssSource.match(/[^{}]+\{[^{}]*\}/g) ?? []).find(
-    (block) => block.includes('[data-streamdown="table-cell"]') && /overflow-wrap\s*:/.test(block),
-  );
+  const rule = cssBlocks.find(
+    ([block]) =>
+      block.includes('[data-streamdown="table-cell"]') && /overflow-wrap\s*:/.test(block),
+  )?.[0];
 
   // Derived lazily: a missing rule must fail the assertions below with a
   // readable message, not crash at collection time.
-  const selector = (rule ?? "")
-    .slice(0, rule ? rule.indexOf("{") : 0)
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .trim();
+  const selector = selectorOf(rule ?? "");
 
   it("has the rule this test exists to protect", () => {
     expect(rule, "the table-cell link wrapping rule is gone from index.css").toBeDefined();

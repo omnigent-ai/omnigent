@@ -366,6 +366,18 @@ def register_hooks_routes(
             and result.content
         ):
             decision["updatedInput"] = {**tool_input, "answers": result.content}
+        # ExitPlanMode is a requiresUserInteraction tool: Claude Code coerces a
+        # bare PermissionRequest allow back to an interactive prompt unless the
+        # decision also carries ``updatedInput``. The plan needs no change, so
+        # echo the model's own input verbatim — its presence, not its content,
+        # is what lets a web-UI approval proceed without a TUI keystroke.
+        if (
+            behavior == "allow"
+            and tool_name == "ExitPlanMode"
+            and isinstance(tool_input, dict)
+            and tool_input
+        ):
+            decision["updatedInput"] = tool_input
         # "Accept & allow all edits" — the user approved this edit AND
         # asked to auto-accept future edits. Echo a ``setMode`` permission
         # update so Claude Code switches this session into ``acceptEdits``

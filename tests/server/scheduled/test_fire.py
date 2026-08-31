@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
@@ -40,6 +40,7 @@ class _FakeConversation:
     workspace: str | None = None
     host_id: str | None = None
     git_branch: str | None = None
+    labels: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -47,6 +48,7 @@ class _FakeAgent:
     id: str
     bundle_location: str | None = None
     session_id: str | None = None
+    name: str = "assistant"
 
 
 class FakeAgentStore:
@@ -58,32 +60,36 @@ class FakeAgentStore:
 
 
 class _FakeExecutor:
-    def __init__(self, harness: str) -> None:
+    def __init__(self, harness: str, reasoning_effort: str | None = None) -> None:
         # Mirrors AgentSpec.executor: a canonical harness in ``config['harness']``
         # (falls back to ``type``). The permission-mode injection reads this to
         # confirm a claude-native agent before adding ``--permission-mode``.
         self.type = harness
         self.config = {"harness": harness}
+        self.reasoning_effort = reasoning_effort
 
 
 class _FakeSpec:
-    def __init__(self, harness: str) -> None:
-        self.executor = _FakeExecutor(harness)
+    def __init__(self, harness: str, reasoning_effort: str | None = None) -> None:
+        self.executor = _FakeExecutor(harness, reasoning_effort)
 
 
 class _FakeLoadedAgent:
-    def __init__(self, harness: str) -> None:
-        self.spec = _FakeSpec(harness)
+    def __init__(self, harness: str, reasoning_effort: str | None = None) -> None:
+        self.spec = _FakeSpec(harness, reasoning_effort)
 
 
 class FakeAgentCache:
     """Resolves an agent id to a spec with a fixed harness (for launch gating)."""
 
-    def __init__(self, harness: str = "claude-native") -> None:
+    def __init__(
+        self, harness: str = "claude-native", reasoning_effort: str | None = None
+    ) -> None:
         self._harness = harness
+        self._reasoning_effort = reasoning_effort
 
     def load(self, agent_id: str, bundle_location: str, **_: Any) -> _FakeLoadedAgent:
-        return _FakeLoadedAgent(self._harness)
+        return _FakeLoadedAgent(self._harness, self._reasoning_effort)
 
 
 class FakeScheduledTaskStore:
@@ -139,9 +145,11 @@ class SequencedScheduledTaskStore(FakeScheduledTaskStore):
 class FakeConversationStore:
     def __init__(self, *, fail_create: bool = False) -> None:
         self.created: list[dict[str, Any]] = []
+        self.updated: list[dict[str, Any]] = []
         self.create_workspace_ids: list[int] = []
         self._seq = 0
         self.fail_create = fail_create
+        self.label_writes: dict[str, dict[str, str]] = {}
 
     def create_conversation(self, **kwargs: Any) -> _FakeConversation:
         self.create_workspace_ids.append(current_workspace_id())
@@ -159,7 +167,11 @@ class FakeConversationStore:
         return conv
 
     def update_conversation(self, conversation_id: str, **kwargs: Any) -> _FakeConversation:
+        self.updated.append({"id": conversation_id, **kwargs})
         return _FakeConversation(id=conversation_id, agent_id="")
+
+    def set_labels(self, conversation_id: str, labels: dict[str, str]) -> None:
+        self.label_writes[conversation_id] = dict(labels)
 
     def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
         return _FakeConversation(id=conversation_id, agent_id="ag_1")
@@ -475,6 +487,197 @@ async def test_permission_mode_omitted_for_non_claude_agent() -> None:
 
     assert len(conv_store.created) == 1
     assert conv_store.created[0]["terminal_launch_args"] is None
+
+
+def _effort_agent_deps(
+    store: FakeScheduledTaskStore,
+    conv_store: FakeConversationStore,
+    *,
+    reasoning_effort: str | None,
+) -> FireDeps:
+    """Deps whose agent ``ag_1`` resolves to a spec carrying *reasoning_effort*."""
+    return _deps(
+        store,
+        permission_store=FakePermissionStore(),
+        conversation_store=conv_store,
+        agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/hash")}),
+        agent_cache=FakeAgentCache(harness="claude-native", reasoning_effort=reasoning_effort),
+    )
+
+
+@pytest.mark.asyncio
+async def test_spec_reasoning_effort_seeded_at_fire() -> None:
+    """A task with no explicit effort inherits ``executor.reasoning_effort``."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _effort_agent_deps(store, conv_store, reasoning_effort="high"),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert any(u.get("reasoning_effort") == "high" for u in conv_store.updated)
+
+
+@pytest.mark.asyncio
+async def test_task_reasoning_effort_overrides_spec_at_fire() -> None:
+    """An explicit task effort wins over the spec default."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(reasoning_effort="low")})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _effort_agent_deps(store, conv_store, reasoning_effort="high"),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert any(u.get("reasoning_effort") == "low" for u in conv_store.updated)
+    assert not any(u.get("reasoning_effort") == "high" for u in conv_store.updated)
+
+
+@pytest.mark.asyncio
+async def test_no_reasoning_effort_when_spec_has_none() -> None:
+    """A task and spec both without effort seed nothing (harness default)."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _effort_agent_deps(store, conv_store, reasoning_effort=None),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert not any("reasoning_effort" in u for u in conv_store.updated)
+
+
+@pytest.mark.asyncio
+async def test_native_wrapper_task_stamps_terminal_first_labels() -> None:
+    """A native-CLI (Pi) automation session gets the terminal-first labels.
+
+    Interactive New Chat stamps ``omnigent.ui = terminal`` + the wrapper label
+    so the web UI shows the Chat/Terminal switcher; the fire path must stamp the
+    same labels or the session renders Chat-only with no way to its terminal.
+    """
+    from omnigent.native_coding_agents import PI_NATIVE_AGENT_NAME
+
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        agent_store=FakeAgentStore(
+            {"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/hash", name=PI_NATIVE_AGENT_NAME)}
+        ),
+        agent_cache=FakeAgentCache(harness="pi-native"),
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(deps, launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.label_writes["conv_1"] == {
+        "omnigent.ui": "terminal",
+        "omnigent.wrapper": PI_NATIVE_AGENT_NAME,
+    }
+
+
+@pytest.mark.asyncio
+async def test_non_native_host_bound_task_stamps_repl_terminal_label() -> None:
+    """A non-native SDK automation on a host gets ``omnigent.ui = terminal``.
+
+    Its runner auto-creates the omnigent REPL terminal, so the switcher must be
+    available from creation — mirroring ``_repl_terminal_ui_labels``.
+    """
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/hash")}),
+        agent_cache=FakeAgentCache(harness="claude-sdk"),
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(deps, launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.label_writes["conv_1"] == {"omnigent.ui": "terminal"}
+
+
+@pytest.mark.asyncio
+async def test_non_native_task_without_agent_cache_stamps_no_labels() -> None:
+    """A non-native SDK task without an agent cache stays Chat-only.
+
+    The REPL-terminal branch needs the cache to resolve the harness, so with no
+    cache it can't confirm a terminal — Chat-only, and the fire still succeeds.
+    """
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    # Default _deps leaves agent_cache=None and the default agent is non-native.
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert conv_store.label_writes == {}
+
+
+@pytest.mark.asyncio
+async def test_native_wrapper_labels_resolve_without_agent_cache() -> None:
+    """Native-wrapper labels come from the agent name, so they need no cache.
+
+    Parity with the interactive create path, which resolves these labels with no
+    cache dependency — a deployment with no fire-deps cache must not silently
+    drop the switcher for a Pi/OpenCode/etc. automation.
+    """
+    from omnigent.native_coding_agents import PI_NATIVE_AGENT_NAME
+
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", name=PI_NATIVE_AGENT_NAME)}),
+        # agent_cache left None.
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(deps, launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.label_writes["conv_1"] == {
+        "omnigent.ui": "terminal",
+        "omnigent.wrapper": PI_NATIVE_AGENT_NAME,
+    }
 
 
 @pytest.mark.asyncio
