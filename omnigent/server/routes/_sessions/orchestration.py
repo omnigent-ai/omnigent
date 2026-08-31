@@ -8334,7 +8334,10 @@ async def _create_session_from_existing_agent(
                 host_id=body.host_id,
                 worktree_path=created_worktree_path,
                 branch=git_branch,
-                delete_branch=True,
+                # A recreated worktree checked out a pre-existing branch —
+                # remove the directory but keep the user's branch (and its
+                # unpushed commits).
+                delete_branch=body.git is None or not body.git.existing_branch,
                 request=request,
                 reason="create-rollback",
             )
@@ -8356,7 +8359,9 @@ async def _create_session_from_existing_agent(
                 host_id=body.host_id,
                 worktree_path=created_worktree_path,
                 branch=git_branch,
-                delete_branch=True,
+                # Same branch-preservation rule as the NameAlreadyExists
+                # rollback above: never -D a pre-existing branch.
+                delete_branch=body.git is None or not body.git.existing_branch,
                 request=request,
                 reason="create-rollback",
             )

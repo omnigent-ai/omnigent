@@ -284,7 +284,7 @@ export async function checkHostDirectory(hostId: string, path: string): Promise<
  *
  * The fork dialog uses this to distinguish "the source's worktree directory
  * was deleted — recreatable at the same path/branch" from problems where
- * falling back to worktree creation would be wrong (#5031).
+ * falling back to worktree creation would be wrong.
  */
 export async function hostDirectoryMissing(hostId: string, path: string): Promise<boolean> {
   const baseUrl = buildHostFilesystemUrl(hostId, path);

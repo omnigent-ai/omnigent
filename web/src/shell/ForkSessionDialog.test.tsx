@@ -804,11 +804,13 @@ describe("ForkSessionDialog", () => {
         id: "conv_fork",
       } as unknown as Awaited<ReturnType<typeof forkSession>>);
       launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
-      // The pre-flight fails — the worktree directory is gone — but the
+      // The worktree pre-flight fails — the directory is gone — but the
       // miss is a 404, so the fork recreates the worktree at the same
-      // branch instead of erroring (#5031).
-      checkHostDirectoryMock.mockResolvedValue(
-        "The working directory /Users/a/repo-worktrees/fix-1 doesn't exist on this host (or isn't a directory).",
+      // branch instead of erroring. The repo path itself is intact.
+      checkHostDirectoryMock.mockImplementation(async (_hostId: string, path: string) =>
+        path === "/Users/a/repo"
+          ? null
+          : "The working directory /Users/a/repo-worktrees/fix-1 doesn't exist on this host (or isn't a directory).",
       );
       hostDirectoryMissingMock.mockResolvedValue(true);
       renderDialog(WORKTREE_CODING);
@@ -824,6 +826,26 @@ describe("ForkSessionDialog", () => {
         branchName: "fix-1",
         existingBranch: true,
       });
+      // Both the worktree path and the repo fallback path were pre-flighted.
+      expect(checkHostDirectoryMock).toHaveBeenCalledWith("host_1", "/Users/a/repo");
+    });
+
+    it("still errors when the repo path is also missing (nothing to recreate from)", async () => {
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      // Worktree gone (404 miss) AND the repo itself gone: the recreate
+      // fallback has nothing to launch from, so the fork must abort.
+      checkHostDirectoryMock.mockResolvedValue(
+        "The working directory doesn't exist on this host (or isn't a directory).",
+      );
+      hostDirectoryMissingMock.mockResolvedValue(true);
+      renderDialog(WORKTREE_CODING);
+
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(screen.getByText(/doesn't exist on this host/i)).toBeTruthy());
+      expect(launchRunnerMock).not.toHaveBeenCalled();
     });
 
     it("still errors when the pre-flight fails for a reason other than a missing directory", async () => {

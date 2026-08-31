@@ -981,11 +981,19 @@ export function ForkSessionForm({
           // at the same path/branch instead of erroring — the host's
           // create-worktree handles an already-existing branch (no -b).
           // Only this exact case falls back; every other problem (offline
-          // host, unlistable path, network) still aborts the fork (#5031).
+          // host, unlistable path, network) still aborts the fork.
           if (
             usingSourceWorktree &&
             (await hostDirectoryMissing(selectedHostId, effectiveWorkspace))
           ) {
+            // The recreate launches from the repo path, so pre-flight THAT
+            // path too — a missing repo can't recreate anything, and the
+            // detached launch below swallows its failure.
+            const repoProblem = await checkHostDirectory(selectedHostId, workspaceTrimmed);
+            if (repoProblem !== null) {
+              setError(repoProblem);
+              return;
+            }
             recreateSourceWorktree = true;
           } else {
             setError(problem);

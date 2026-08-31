@@ -4619,6 +4619,12 @@
             "title": "Branch Name",
             "type": "string"
           },
+          "existing_branch": {
+            "default": false,
+            "description": "When `True`, `branch_name` already exists and the host checks it out into a fresh worktree (the deleted-worktree recreate path) instead of creating a new branch. Create mode only; invalid with `existing_worktree` and with `base_branch` (an existing branch has no base to fork).",
+            "title": "Existing Branch",
+            "type": "boolean"
+          },
           "existing_worktree": {
             "default": false,
             "description": "When `True`, bind to the pre-existing worktree at `workspace` instead of creating one (see above).",

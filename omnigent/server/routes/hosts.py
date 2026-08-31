@@ -864,6 +864,11 @@ def create_hosts_router(
             worktree (and no orphan branch) on the host. Never raises —
             a cleanup failure is logged and the original error still
             propagates.
+
+            A recreated worktree (``existing_branch``) checks out a branch
+            that predates this request — the directory is ours to remove,
+            but the branch (and its unpushed commits) is the user's, so it
+            must survive the rollback.
             """
             if worktree is None:
                 return
@@ -878,7 +883,7 @@ def create_hosts_router(
                     host_conn=conn,
                     worktree_path=worktree.worktree_path,
                     branch=worktree.branch,
-                    delete_branch=True,
+                    delete_branch=body.git is None or not body.git.existing_branch,
                 )
             except WorktreeProxyError:
                 _logger.warning(
