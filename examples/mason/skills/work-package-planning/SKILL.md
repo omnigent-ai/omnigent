@@ -47,9 +47,8 @@ Accepted Rollup B is `D-506 + D-703 + D-725`, but it is not a code package:
 author lines on the live `portfolio-manager` template. `git ls-files` confirms
 no template file exists. Route it to a deploy-pass runbook, never a PR.
 
-The seven independent destinations include `apps/rf-app` (three),
-`apps/rf-platform-portal` (two), `apps/query-builder`, `services/rf-explorer-api`
-(two), `packages/workflows`, and live template data. They share no symbol,
+The four independent destinations include `apps/rf-app`, `apps/query-builder`,
+`services/rf-explorer-api`, and `packages/workflows`. They share no symbol,
 file, helper, or test. `D-288` is a second implementation: the fix is in
 `packages/rf-query` and `rf-ui-components`, while `apps/query-builder/queryTransform.ts:109`
 downgrades `joinType === 'full'` to `left` and
@@ -87,7 +86,7 @@ CYCLE. It never becomes a plan change in this pass.
 - Exactly ONE pass. No iterate-until-happy loop.
 - Verdict is one of: ACCEPT / ACCEPT-WITH-EDITS / REJECT, with each objection tied to
   a specific package id.
-- Objections are ranked and capped (top N blocking, top N advisory) so the output
+- Objections are ranked and capped (top 10 blocking, top 10 advisory) so the output
   cannot become an unbounded backlog.
 - NET-SCOPE RULE: a plan revision may reduce, merge, split, or reorder scope. It may
   NOT increase the total set of claim ids under repair. Increasing total scope

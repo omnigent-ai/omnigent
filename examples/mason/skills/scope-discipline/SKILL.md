@@ -12,7 +12,7 @@ an enumerated set; every plan, package, contract, PR, and review cites it.
 Scope may SHRINK freely. Scope may GROW only with explicit human approval.
 Never add a claim, file, or acceptance criterion without a ledger revision.
 Discovery is not a mandate: write out-of-contract problems to
-`<record-dir>/discovered.md` with claim id (if any), file:line, and evidence;
+`~/.mason/<task_id>/discovered.md` with claim id (if any), file:line, and evidence;
 never fix them in the current worktree.
 
 Every contract must contain `files_allowed: [...]` and optional

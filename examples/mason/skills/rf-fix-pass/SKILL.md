@@ -30,7 +30,9 @@ Prior art you MUST read before starting, in this order:
    the original pass was supposed to follow. The richest source of prior art.
 4. `.specify/memory/constitution.md` (1124 lines, 20 principles) — the authority.
 
-Do not re-derive the 25 findings already judged. The gap — roughly 175
+Reuse prior judgements ONLY when the row names evidence AND nothing in the current
+pass contradicts it. Reopen any known-wrong, uncertain, or unnamed-evidence row;
+D-725 demonstrates why. The gap — roughly 175
 unexamined claims — is where unknown failures live.
 
 ## Two rows are NOT defects — never "fix" them
