@@ -1299,6 +1299,30 @@ def _default_artifact_location() -> str:
     return str(_local_data_dir() / "artifacts")
 
 
+def _display_db_uri(db_uri: str) -> str:
+    """Render a DB URI for display with any embedded credential masked.
+
+    The server banner and maintenance reports reach container logs, log
+    shippers, and support bundles, so a password-bearing URL must not be
+    echoed verbatim — even when the operator kept it out of ``ps`` by
+    passing it via the environment.
+
+    :param db_uri: The resolved store DB URI, e.g.
+        ``"postgresql://omnigent:pw@db:5432/omnigent"``.
+    :returns: The URI with the password replaced by ``***``, or the
+        original string when it is not a parseable SQLAlchemy URL.
+    """
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.exc import ArgumentError
+
+    try:
+        return make_url(db_uri).render_as_string(hide_password=True)
+    except ArgumentError:
+        # A malformed URI is surfaced by the engine on connect; display
+        # keeps whatever the operator provided rather than failing here.
+        return db_uri
+
+
 def _ensure_sqlite_parent_dir(db_uri: str) -> None:
     """Create the parent directory of a SQLite DB file if it's missing.
 
@@ -4244,7 +4268,7 @@ def server(
     )
 
     click.echo(f"Starting omnigent server on {host}:{port}")
-    click.echo(f"  database:  {db_uri}")
+    click.echo(f"  database:  {_display_db_uri(db_uri)}")
     click.echo(f"  artifacts: {art_loc}")
     click.echo(f"  log:       {_display_path(server_log_path)}")
 
@@ -10647,7 +10671,7 @@ def debug_migrate_accounts_to_oidc(
 
     mode = "COMMITTED" if report.committed else "DRY RUN (no changes written)"
     click.echo(f"\nIdentity remap — {mode}")
-    click.echo(f"  database: {url}")
+    click.echo(f"  database: {_display_db_uri(url)}")
     click.echo(f"  mappings ({len(report.mapping)}):")
     for old, new in report.mapping.items():
         click.echo(f"    {old}  ->  {new}")
