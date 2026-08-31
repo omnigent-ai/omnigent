@@ -11,6 +11,7 @@ import java.net.URL
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Drives the RFC 8252 login flow for the shell: authenticate in the system
@@ -42,6 +43,11 @@ class OidcLoginManager {
 
     @Volatile private var currentTask: Future<*>? = null
 
+    // Stamped into each flow at start() and bumped by cancel(). The queued
+    // browser launch re-checks it at execution time, so a launch posted before a
+    // cancel/server switch/destroy can never open the obsolete server's URL.
+    private val flowGeneration = AtomicInteger(0)
+
     /**
      * Begin a login against [origin] (the pinned server). Opens the browser and
      * polls in the background; [onSession] is invoked on the main thread with the
@@ -58,6 +64,7 @@ class OidcLoginManager {
     ): Boolean {
         if (!inFlight.compareAndSet(false, true)) return false
         sessionCallback = onSession
+        val generation = flowGeneration.incrementAndGet()
         currentTask =
             io.submit {
                 var token: String? = null
@@ -65,7 +72,19 @@ class OidcLoginManager {
                     val ticket = requestTicket(origin)
                     authLog("cli-login -> ${if (ticket != null) "ticket ok" else "FAILED"}")
                     if (ticket != null) {
-                        main.post { launchTab(activity, origin + ticket.loginUrl) }
+                        main.post {
+                            // Re-check at execution time: the flow may have been
+                            // cancelled/superseded, or the activity torn down,
+                            // while this launch sat in the queue.
+                            if (generation == flowGeneration.get() &&
+                                !activity.isFinishing &&
+                                !activity.isDestroyed
+                            ) {
+                                launchTab(activity, origin + ticket.loginUrl)
+                            } else {
+                                authLog("skipping stale browser launch")
+                            }
+                        }
                         token = pollForToken(origin, ticket.id)
                         authLog(
                             "poll -> ${if (token != null) "token (len=${token.length})" else "no token"}",
@@ -95,6 +114,7 @@ class OidcLoginManager {
      * visible before the lambda can fire.
      */
     fun cancel() {
+        flowGeneration.incrementAndGet() // invalidates any queued browser launch
         sessionCallback = null
         inFlight.set(false)
         currentTask?.cancel(true) // interrupts the polling sleep

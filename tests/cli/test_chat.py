@@ -28,6 +28,7 @@ from omnigent.chat import (
     _is_url,
     _materialize_override_bundle,
     _persisted_turn_text,
+    _pick_agent,
     _prepare_chat_session_via_daemon,
     _query_sessions_once,
     _raise_server_failed,
@@ -1544,6 +1545,56 @@ def test_prepare_chat_session_via_daemon_reports_unreachable_server_as_click_err
     assert expected_hint in message
     # No runner is launched against a server we could not reach.
     assert "launch" not in captured
+
+
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        httpx.ConnectError("[Errno 8] nodename nor servname provided, or not known"),
+        httpx.ConnectTimeout("timed out establishing a connection"),
+        httpx.ProxyError("proxy refused the tunnel"),
+    ],
+    ids=["connect-error", "connect-timeout", "proxy-error"],
+)
+@pytest.mark.parametrize(
+    ("server_url", "expected_hint"),
+    [
+        # A local server that stopped — the user restarts it.
+        ("http://127.0.0.1:6767", "omnigent stop"),
+        # A remote target — the URL, the network, or a proxy is at fault.
+        ("https://example.databricksapps.com", "proxy"),
+    ],
+)
+def test_pick_agent_reports_unreachable_server_as_click_error(
+    server_url: str,
+    expected_hint: str,
+    transport_error: httpx.HTTPError,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreachable server in ``_pick_agent`` is a ``ClickException``.
+
+    ``_pick_agent`` runs the session-listing ``httpx.get`` on the direct
+    server-URL chat path (``omnigent run --server <url>`` and headless
+    prompts). Without a transport-error guard, a stale/unreachable server
+    URL escaped as a raw ``httpx.ConnectError`` all the way to the crash
+    handler — a crash screen and a file-an-issue prompt for what is an
+    environment problem. It must produce the same clean, actionable
+    message as the daemon path.
+    """
+
+    def _refused(*_args: object, **_kwargs: object) -> object:
+        raise transport_error
+
+    monkeypatch.setattr(chat_module.httpx, "get", _refused)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        _pick_agent(server_url)
+
+    message = str(excinfo.value)
+    # The URL identifies which server was unreachable.
+    assert server_url in message
+    # The advice differs for a stopped local server vs a bad remote target.
+    assert expected_hint in message
 
 
 # ── OMNIGENT_MODEL env-var fallback ───────────────────

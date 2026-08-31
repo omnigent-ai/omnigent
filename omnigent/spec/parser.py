@@ -218,6 +218,12 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
             executor.model = llm.model
         if executor.connection is None and llm.connection is not None:
             executor.connection = llm.connection
+        if executor.reasoning_effort is None:
+            llm_effort = llm.extra.get("reasoning_effort")
+            if llm_effort is not None:
+                executor.reasoning_effort = str(llm_effort)
+        elif "reasoning_effort" in llm.extra:
+            llm.extra["reasoning_effort"] = executor.reasoning_effort
     # Ensure spec.llm is populated from executor fields when only the
     # executor: block declares model/connection (the common case for
     # user-authored YAML). Internal consumers (policy builder,

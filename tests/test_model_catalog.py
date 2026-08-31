@@ -1045,9 +1045,42 @@ def test_cursor_listing_failure_is_empty_and_retryable(
     first = list_models_for_worker(_worker_spec("cursor-native"), "cursor-native")
     second = list_models_for_worker(_worker_spec("cursor-native"), "cursor-native")
 
-    assert first.source == second.source == "none"
     assert first.models == second.models == ()
     assert calls == 2
+
+
+def test_cursor_listing_failure_degrades_to_usable_static_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed cursor listing probe must not report the dead-worker shape.
+
+    cursor-agent brings its own stored login, so a listing-probe failure
+    (CLI missing from the probe env, not logged in for listing, transient
+    error) says nothing about dispatchability. The row must degrade to the
+    ``source="static"`` shape the sibling subscription CLIs report — never
+    ``source="none"``, whose note tells orchestrators the worker cannot
+    run here.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    from omnigent import cursor_native
+
+    _isolate_config(monkeypatch, tmp_path, "")
+
+    def fail() -> list[dict[str, object]]:
+        raise OSError("cursor unavailable")
+
+    monkeypatch.setattr(cursor_native, "list_cursor_cli_model_options", fail)
+
+    listing = list_models_for_worker(_worker_spec("cursor-native"), "cursor-native")
+
+    assert listing.source == "static"
+    assert listing.verified is False
+    assert listing.models == ()
+    # The note must say the worker still runs, not the dead-worker signal.
+    assert "can still run" in listing.note
+    assert "cannot run here" not in listing.note
 
 
 def test_none_listing_explains_dead_worker(

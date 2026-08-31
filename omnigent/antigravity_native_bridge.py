@@ -939,9 +939,10 @@ def update_conversation_id(
 # delivery; no shared tmux helper exists, so the small primitives are duplicated
 # per the established per-harness convention.
 
-# tmux probe/command timeout. Short: these are local IPC calls to the runner's
-# own tmux server.
-_TMUX_SEND_TIMEOUT_S = 5.0
+# Per-command tmux budget. These are local IPC calls to the runner's own tmux
+# server, but that server can stall past 5s under parallel worker boots on a
+# large worktree while still healthy — 10s matches every other native bridge.
+_TMUX_SEND_TIMEOUT_S = 10.0
 # Per-readiness-gate wait (tmux.json advertised, then the agy input box mounted).
 _TMUX_READY_TIMEOUT_S = 30.0
 # Poll cadence for the readiness / paste-commit / submit-verify loops.

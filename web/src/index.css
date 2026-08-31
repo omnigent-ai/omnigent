@@ -195,6 +195,14 @@
     env(safe-area-inset-bottom, 0px),
     var(--omnigent-android-safe-area-bottom, 0px)
   );
+  --omnigent-safe-left: max(
+    env(safe-area-inset-left, 0px),
+    var(--omnigent-android-safe-area-left, 0px)
+  );
+  --omnigent-safe-right: max(
+    env(safe-area-inset-right, 0px),
+    var(--omnigent-android-safe-area-right, 0px)
+  );
   --omnigent-native-top-bar: 0px; /* set by native bridge (px) */
   --omnigent-native-bottom-bar: 0px; /* set by native bridge (px) */
   --omnigent-top-bar-visible: 0; /* web-owned 0|1 */
@@ -794,18 +802,29 @@ aside[aria-label="Workspace"][data-maximized] {
     height: var(--omnigent-inset-bottom);
     flex: none;
   }
+}
 
-  :is([data-ios-native], [data-android-native])
-    :is(
-      .conversations-sidebar,
-      [data-testid="file-viewer"],
-      [data-testid="files-panel-drawer"],
-      [data-testid="terminals-panel"],
-      .mobile-panel-drawer
-    ) {
-    padding-top: var(--omnigent-safe-top);
-    padding-bottom: var(--omnigent-safe-bottom);
-  }
+/* Full-height native surfaces touch screen edges at every width. Collapsed
+ * panels must remain zero-width, peeking sidebars are already inset, and
+ * panels inside the padded Workspace rail must not receive the inset twice. */
+:is([data-ios-native], [data-android-native])
+  :is(
+    aside[aria-label="Workspace"],
+    .conversations-sidebar,
+    [data-testid="execution-logs-panel"],
+    [data-testid="file-viewer"],
+    [data-testid="files-panel-drawer"],
+    [data-testid="terminals-panel"],
+    .mobile-panel-drawer
+  ):not(aside[aria-label="Workspace"] *):not([data-collapsed]):not(.is-peek) {
+  /* Border-box floors the box at the padding sum, so each lateral inset is
+   * capped at half the surface's published reservation (the rail's inline
+   * --omnigent-reserved-width) — without the var the full inset holds. */
+  --omnigent-lateral-inset-cap: calc(var(--omnigent-reserved-width, 100000px) / 2);
+  padding-top: var(--omnigent-safe-top);
+  padding-bottom: var(--omnigent-safe-bottom);
+  padding-left: min(var(--omnigent-safe-left), var(--omnigent-lateral-inset-cap));
+  padding-right: min(var(--omnigent-safe-right), var(--omnigent-lateral-inset-cap));
 }
 
 @media (width < 48rem) and (prefers-reduced-motion: reduce) {

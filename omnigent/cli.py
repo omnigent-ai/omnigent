@@ -3333,10 +3333,11 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     today. A non-200 answer that carries the Databricks edge signature
     (302 to the workspace OAuth page, or a DatabricksRealm 401) means
     the run would otherwise die much later with an opaque "non-JSON
-    response (status=302)" traceback from the session-create call. First,
-    it asks the SDK for a fresh workspace token; only then does a TTY run
-    the same flow ``omnigent login`` would, while headless invocations get
-    the exact command to run instead.
+    response (status=302)" traceback from the session-create call. A
+    rejected bearer can hide that signature behind a bare 401/403, so the
+    probe falls back to the saved workspace or an unauthenticated retry.
+    It then asks the SDK for a fresh workspace token before prompting a
+    TTY or giving headless invocations the exact login command.
 
     Non-Databricks postures are deliberately left alone: local accounts
     servers auto-authenticate downstream (magic-link redeem), and
@@ -3356,14 +3357,15 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     import httpx as _httpx
 
     from omnigent.chat import _remote_headers
-    from omnigent.cli_auth import load_databricks_org_id, store_databricks_auth
+    from omnigent.cli_auth import (
+        load_databricks_org_id,
+        load_databricks_workspace_host,
+        store_databricks_auth,
+    )
 
+    headers = _remote_headers(server_url=server, host_id=None)
     try:
-        probe = _httpx.get(
-            f"{server}/v1/me",
-            headers=_remote_headers(server_url=server, host_id=None),
-            timeout=10.0,
-        )
+        probe = _httpx.get(f"{server}/v1/me", headers=headers, timeout=10.0)
     except _httpx.HTTPError:
         # Unreachable / transient: let the connect path raise its own,
         # already-actionable error rather than failing the pre-flight.
@@ -3371,6 +3373,18 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     if probe.status_code == 200:
         return
     workspace_host = _databricks_workspace_login_target(server, probe)
+    credential_rejected = False
+    if workspace_host is None and probe.status_code in (401, 403):
+        # A rejected bearer can hide the edge signature. Prefer the saved
+        # workspace; otherwise re-probe without credentials.
+        workspace_host = load_databricks_workspace_host(server)
+        if workspace_host is None and "Authorization" in headers:
+            try:
+                unauthed_probe = _httpx.get(f"{server}/v1/me", timeout=10.0)
+            except _httpx.HTTPError:
+                return
+            workspace_host = _databricks_workspace_login_target(server, unauthed_probe)
+        credential_rejected = workspace_host is not None and "Authorization" in headers
     if workspace_host is None:
         return
     org_id = load_databricks_org_id(server)
@@ -3389,12 +3403,17 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     # `omnigent login` back to the same API base.
     display = ServerUrl(api_base=server, org_id=org_id).display
     login_cmd = f"omnigent login {display}"
+    state = (
+        f"Your Databricks credential for {display} has expired or was revoked"
+        if credential_rejected
+        else f"Not signed in to {display}"
+    )
     if non_interactive or not sys.stdin.isatty():
         raise click.ClickException(
-            f"Not signed in to {display} (Databricks-fronted; /v1/me answered "
+            f"{state} (Databricks-fronted; /v1/me answered "
             f"HTTP {probe.status_code}). Run `{login_cmd}` and retry."
         )
-    click.echo(f"Not signed in to {display} — running `{login_cmd}` first.")
+    click.echo(f"{state} — running `{login_cmd}` first.")
     # Login selector comes from the URL, not the stored org_id used above: on a
     # single-tenant host a replayed ?o= makes `databricks auth login --host` skip
     # workspace_id resolution, so the grant isn't workspace-bound (matches `login`).
