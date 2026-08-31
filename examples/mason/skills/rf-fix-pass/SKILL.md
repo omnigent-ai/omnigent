@@ -156,12 +156,23 @@ anything. Mason must require it in every rf repair contract.
 
 ## Searching this repo
 
-`grep` runs with `-I` here, and a single NUL byte hides an entire file: seven
-tracked TypeScript files are invisible to it. **Any claim that something does not
-exist must be settled with `git grep` or `awk`, never plain `grep`.**
+`grep` runs with `-I` here, and a single NUL byte hides an entire file. **But
+`git grep` alone is NOT sufficient: it also skips binary files by default.** More
+than 20 tracked files under `.claude/` carry NUL bytes, including every
+`speckit.*` command and several agent definitions — which is why the
+orchestrator's own worker logs were nearly invisible to the first audit, and
+those logs hold decisive evidence.
 
-    git grep -n '<symbol>' -- 'packages/**' 'services/**' 'apps/**'
+**Always pass `-a`. Any claim that something does not exist must be settled with
+`git grep -a` or `awk`, never plain `grep` and never bare `git grep`.**
+
+    git grep -an '<symbol>' -- 'packages/**' 'services/**' 'apps/**'
+    git grep -an '<symbol>' -- '.claude/**'      # the logs: NUL-bearing
     git log --format='%H %s%n%b' ef93d951d..HEAD | awk '/D-[0-9]+/ {print}'
+
+`.claude/orchestrator/logs/` (162 files) is prior art from the original fix pass
+and repeatedly records what a worker could NOT reach. Search it before concluding
+anything is unreachable.
 
 ## Where a user path lives
 
@@ -176,6 +187,40 @@ this repo terminates in one of:
 
 A new symbol that no route, surface or template reaches is unreachable no matter
 how green its unit test is.
+
+## Known errors in FIX-PASS-RECORD.md — the record is evidence, not authority
+
+A second audit found the record wrong in at least one place that would cause a
+WRONG CLOSE. Treat every row as a claim to verify, not a fact.
+
+- **`D-725` — the record mis-states the layer.** It says `contract_event` and
+  `contract_document` have not enabled history. At the SYSTEM-ENTITY layer they
+  HAVE: `CONTRACT_EVENT_TYPE` carries `history: { enabled: true }` at
+  `packages/rf-data/src/system-entities/financial-definitions.ts:625`, and
+  `CONTRACT_DOCUMENT_TYPE` at `:659`. There are TWO `history` flags in TWO
+  layers; the one that is off is the **template** opt-in (see
+  `FIX-PASS-PLAN.md:34-36` on `D-687`, `schemas.ts:3866-3891`). The finding
+  survives, but a repairer sent to `financial-definitions.ts` would find the flag
+  already `true`, conclude the finding is false, and close it wrongly.
+
+When a finding names a flag, a column or a field, **confirm which LAYER it lives
+in** before repairing. This platform has parallel declarations at the
+system-entity layer and the template layer, and they disagree.
+
+## Some findings are NOT code packages
+
+`D-506`, `D-703` and `D-725` all resolve by authoring lines on the LIVE
+`portfolio-manager` template, which is DATABASE content — no template file exists
+in this repository (`.claude/orchestrator/logs/TASK-0153.md:116-118`, confirmed
+via `git ls-files`). The code halves are already merged.
+
+**These cannot be repaired from a git worktree and must not be packaged as a PR.**
+They belong in a deploy-pass runbook. Packaging template-data work as a code PR is
+how you produce a fake green: the PR merges, the gates pass, and the defect is
+exactly as broken as before.
+
+Mason must classify every finding as CODE, TEMPLATE-DATA, or PROCESS before
+planning, and route the non-code ones out of the PR pipeline.
 
 ## The three indeterminate findings
 
