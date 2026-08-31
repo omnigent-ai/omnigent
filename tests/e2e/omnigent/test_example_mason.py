@@ -44,6 +44,17 @@ def test_mason_uses_one_final_pull_request(mason: AgentSpec) -> None:
     assert "single PR is ready for approval and merge" in mason.instructions
 
 
+def test_mason_requires_explicit_plan_approval(mason: AgentSpec) -> None:
+    assert "PLAN APPROVAL GATE (hard stop)" in mason.instructions
+    assert "Then STOP and end the turn" in mason.instructions
+    assert "explicit affirmative approval" in mason.instructions
+    assert "does NOT create" in mason.instructions
+    assert "Human questions, corrections, or requested changes mean revise" in mason.instructions
+    assert "This human-driven plan loop has no bound" in mason.instructions
+    assert "Never infer approval from silence" in mason.instructions
+    assert "only read-only `explore` or `search` workers" in mason.instructions
+
+
 def test_mason_codex_pins_are_load_bearing(mason: AgentSpec) -> None:
     codex = next(agent for agent in mason.sub_agents if agent.name == "codex")
     assert codex.executor.model == "gpt-5.6-luna"
