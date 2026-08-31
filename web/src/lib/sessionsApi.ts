@@ -47,6 +47,7 @@ function getClientSurface(): string {
 export interface ElicitResult {
   action: "accept" | "decline" | "cancel";
   content?: Record<string, unknown>;
+  _meta?: Record<string, unknown>;
 }
 
 /** Response body of `POST /v1/sessions/{id}/events` (202 Accepted). */

@@ -2096,6 +2096,55 @@ async def test_codex_mcp_elicitation_hook_accept_round_trip(
     }
 
 
+async def test_codex_mcp_elicitation_hook_persists_web_session_approval(
+    client: httpx.AsyncClient,
+) -> None:
+    """Web can return a Codex-advertised session persistence choice."""
+    agent = await create_test_agent(client, "test-codex-mcp-persist-session")
+    session_id = await _create_session(client, agent["id"])
+    payload = {
+        "id": 8,
+        "method": "mcpServer/elicitation/request",
+        "params": {
+            "threadId": "thread_123",
+            "turnId": "turn_123",
+            "serverName": "omnigent",
+            "mode": "form",
+            "message": 'Allow the omnigent MCP server to run tool "sys_read_inbox"?',
+            "requestedSchema": {"type": "object", "properties": {}},
+            "_meta": {
+                "codex_approval_kind": "mcp_tool_call",
+                "persist": ["session", "always"],
+            },
+        },
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    assert event["params"]["_meta"] == payload["params"]["_meta"]
+    verdict = await client.post(
+        f"/v1/sessions/{session_id}/elicitations/{event['elicitation_id']}/resolve",
+        json={"action": "accept", "_meta": {"persist": "session"}},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "action": "accept",
+        "content": None,
+        "_meta": {"persist": "session"},
+    }
+
+
 async def test_codex_pending_elicitation_survives_session_snapshot_refresh(
     client: httpx.AsyncClient,
 ) -> None:

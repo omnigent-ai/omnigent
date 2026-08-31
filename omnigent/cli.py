@@ -2143,13 +2143,13 @@ def main() -> None:
     if log_to_stderr:
         os.environ[LOG_TO_STDERR_ENV_VAR] = "1"
 
-    # Bare ``omnigent`` with no args behaves like ``omnigent run`` on an
-    # interactive terminal: ``run`` resolves the configured default agent /
-    # first-run plan and drops into ``setup`` when nothing is configured. In
-    # a non-interactive context (pipe, CI, no TTY) fall back to ``--help`` so
-    # we never launch a REPL that would hang waiting on stdin.
+    # Bare ``omnigent`` with no args behaves like ``omnigent start`` on an
+    # interactive terminal: bring up the local server / host in the background
+    # and return, rather than dropping into an agent REPL. In a non-interactive
+    # context (pipe, CI, no TTY) fall back to ``--help`` so we never block on a
+    # sign-in prompt. Use ``omnigent run`` to launch the default agent.
     if not argv:
-        argv = ["run"] if sys.stdin.isatty() else ["--help"]
+        argv = ["start"] if sys.stdin.isatty() else ["--help"]
 
     # Shorthand: ``omnigent --harness claude [opts]`` →
     # ``run --harness claude [opts]``. Click group-level options are
@@ -5815,9 +5815,9 @@ def polly(run_args: tuple[str, ...]) -> None:
     # :param run_args: Pass-through args for ``run``.
     """Launch polly, the bundled multi-agent coding orchestrator.
 
-    Shorthand for ``omnigent run`` on the packaged polly agent — the same
-    agent a bare ``omnigent`` launches when a Claude credential is
-    configured. All ``run`` options are accepted and forwarded.
+    Shorthand for ``omnigent run`` on the packaged polly agent — the default
+    agent ``omnigent run`` launches when a Claude credential is configured.
+    All ``run`` options are accepted and forwarded.
 
     \b
     Examples:
@@ -11660,9 +11660,9 @@ def _remember_default_server(server: str) -> None:
     """
     Persist *server* as the user-level default after a successful login.
 
-    A bare ``omnigent`` (and ``omnigent host``) fall back to the
-    configured ``server`` key when no ``--server`` is passed (see
-    :func:`run` and :func:`host`). Without this, a user who runs
+    A bare ``omnigent`` (which starts the host) and ``omnigent host`` fall
+    back to the configured ``server`` key when no ``--server`` is passed (see
+    :func:`start` and :func:`host`). Without this, a user who runs
     ``omnigent login <server>`` and then bare ``omnigent`` is still routed
     at whatever default ``setup`` baked in — the confusing "I just logged
     in, yet I'm asked to log in again to a different server" path.

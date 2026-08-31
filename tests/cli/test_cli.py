@@ -5508,9 +5508,9 @@ def test_bare_omnigent_non_tty_shows_help(
 ) -> None:
     """Bare ``omnigent`` in a non-interactive shell (no TTY) shows help.
 
-    On a pipe / CI there is no terminal to drive a REPL, so the bare command
-    falls back to ``--help`` rather than launching ``run`` (which would hang
-    waiting on stdin).
+    On a pipe / CI there is no terminal, so the bare command falls back to
+    ``--help`` rather than launching ``start`` (which would block on a
+    sign-in prompt).
     """
     from omnigent.cli import main
 
@@ -5526,13 +5526,14 @@ def test_bare_omnigent_non_tty_shows_help(
     assert "Commands:" in stdout
 
 
-def test_bare_omnigent_tty_dispatches_to_run(
+def test_bare_omnigent_tty_dispatches_to_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Bare ``omnigent`` on an interactive terminal behaves like ``omnigent run``.
+    """Bare ``omnigent`` on an interactive terminal behaves like ``omnigent start``.
 
-    ``run`` then resolves the configured default / first-run plan. We assert
-    only that the bare invocation is rewritten to ``run`` before dispatch.
+    ``start`` brings up the local server / host in the background rather than
+    dropping into an agent REPL. We assert only that the bare invocation is
+    rewritten to ``start`` before dispatch.
     """
     from omnigent import cli as cli_module
 
@@ -5548,7 +5549,7 @@ def test_bare_omnigent_tty_dispatches_to_run(
 
     cli_module.main()
 
-    assert dispatched["args"] == ["run"]
+    assert dispatched["args"] == ["start"]
 
 
 def test_bare_omnigent_rejects_positional_server_url(
