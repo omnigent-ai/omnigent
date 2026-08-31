@@ -13,6 +13,7 @@ import json
 import math
 import secrets
 import time
+import weakref
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Literal, cast
 
@@ -2171,6 +2172,11 @@ async def _persist_external_codex_subagent_start(
     )
 
 
+_external_item_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
 async def _persist_external_conversation_item(
     session_id: str,
     conv: Conversation,
@@ -2200,6 +2206,38 @@ async def _persist_external_conversation_item(
     :returns: Store-assigned conversation item id.
     """
     item = _parse_external_conversation_item(body)
+    lock = _external_item_locks.setdefault(session_id, asyncio.Lock())
+    async with lock:
+        # Resolve a committed retry before touching pending_inputs. The lock
+        # keeps this lookup, pending reconciliation, and append in one
+        # process-wide serialization boundary for the session.
+        if item.source_id is not None:
+            existing = await asyncio.to_thread(
+                conversation_store.get_item_by_source_id,
+                session_id,
+                item.source_id,
+            )
+            if existing is not None:
+                return existing.id
+        return await _persist_new_external_conversation_item(
+            session_id,
+            conv,
+            item,
+            conversation_store,
+            created_by=created_by,
+            background_title_coordinator=background_title_coordinator,
+        )
+
+
+async def _persist_new_external_conversation_item(
+    session_id: str,
+    conv: Conversation,
+    item: NewConversationItem,
+    conversation_store: ConversationStore,
+    created_by: str | None = None,
+    background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+) -> str:
+    """Reconcile and persist an external item known to be new."""
     # A native user message round-tripping back from the transcript:
     # drain its optimistic pending-input entry (FIFO) and fold the
     # entry's file blocks (image / file) into the item BEFORE persisting.

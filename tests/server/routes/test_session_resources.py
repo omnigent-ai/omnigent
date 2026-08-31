@@ -214,6 +214,10 @@ class _ConversationStore:
             result.append(persisted)
         return result
 
+    def get_item_by_source_id(self, conversation_id: str, source_id: str) -> None:
+        """The route-test fake has no durable external-source index."""
+        del conversation_id, source_id
+
     def list_items(
         self,
         conversation_id: str,

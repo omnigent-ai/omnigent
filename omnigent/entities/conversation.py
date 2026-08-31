@@ -781,12 +781,15 @@ class NewConversationItem(BaseModel):
         item (e.g. ``"alice@example.com"``), or ``None`` for
         agent/tool/system-generated items and single-user mode.
         Mirrors the comment ``created_by`` contract.
+    :param source_id: Optional stable producer identity used to make
+        external transcript retries idempotent within a conversation.
     """
 
     type: str
     response_id: str
     data: ItemData
     created_by: str | None = None
+    source_id: str | None = Field(default=None, min_length=1, max_length=512)
 
     @model_validator(mode="after")
     def check_type_matches_data(self) -> NewConversationItem:

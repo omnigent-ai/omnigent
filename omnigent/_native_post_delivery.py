@@ -3,12 +3,12 @@ event POSTs.
 
 The claude-native, codex-native, and antigravity-native forwarders mirror
 transcript items into AP as ``external_conversation_item`` POSTs. The server
-persists those with a random primary key and does NOT dedupe them — producers
-are responsible for not re-posting items they have already sent. That makes a
-blind retry after a failed POST unsafe: if the server committed the item and
-published ``session.input.consumed`` but the response was lost, a retry appends
-a second copy and the web UI renders a duplicate bubble. The native tmux pane
-is unaffected, which is why the duplicate is web-only.
+can dedupe events that carry a durable ``source_id`` (currently Claude
+transcript items); source-less events still receive a random primary key. The
+shared retry policy therefore remains conservative: if the server committed a
+source-less item but the response was lost, a retry appends a second copy and
+the web UI renders a duplicate bubble. The native tmux pane is unaffected,
+which is why the duplicate is web-only.
 
 :func:`post_may_have_been_delivered` is the shared classifier all forwarders
 use to decide whether a failed POST is safe to retry.

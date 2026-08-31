@@ -1989,6 +1989,25 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         return strip_nul_bytes(extract_search_text(item))
 
+    def get_item_by_source_id(
+        self,
+        conversation_id: str,
+        source_id: str,
+    ) -> ConversationItem | None:
+        """Return the durable item carrying one external producer identity."""
+        with self._conv_session("get_conversation_item_by_source_id") as session:
+            row = session.execute(
+                select(SqlConversationItem).where(
+                    SqlConversationItem.workspace_id == current_workspace_id(),
+                    SqlConversationItem.conversation_id == conversation_id,
+                    SqlConversationItem.source_id == source_id,
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            data_json = self._decode_item_data_batch([row.data])[0]
+            return _to_item(row, data_json)
+
     def append(
         self,
         conversation_id: str,
@@ -1999,7 +2018,9 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         Assigns a globally unique ID, timestamp, and incrementing
         position to each item. Also inserts FTS records for
-        searchability.
+        searchability. Items carrying a ``source_id`` are idempotent
+        within their workspace and conversation: a retry returns the
+        already-persisted item.
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -2017,10 +2038,31 @@ class SqlAlchemyConversationStore(ConversationStore):
             # SQLite the database-level lock already serializes.
             self._lock_conversation(session, conversation_id)
 
-            # Bump updated_at on the conversation.
-            conv_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
-            if conv_row is not None:
-                conv_row.updated_at = now
+            workspace_id = current_workspace_id()
+            conv_row = session.get(SqlConversation, (workspace_id, conversation_id))
+
+            # Resolve durable producer identities while holding the same
+            # conversation lock that serializes inserts. This closes the window
+            # where a native transcript POST commits but its forwarder dies
+            # before advancing local state, then retries the identical source.
+            source_ids = [item.source_id for item in items if item.source_id is not None]
+            persisted_by_source: dict[str, ConversationItem] = {}
+            if source_ids:
+                existing_rows = list(
+                    session.execute(
+                        select(SqlConversationItem).where(
+                            SqlConversationItem.workspace_id == workspace_id,
+                            SqlConversationItem.conversation_id == conversation_id,
+                            SqlConversationItem.source_id.in_(source_ids),
+                        )
+                    ).scalars()
+                )
+                decoded = self._decode_item_data_batch([row.data for row in existing_rows])
+                persisted_by_source = {
+                    row.source_id: _to_item(row, data_json)
+                    for row, data_json in zip(existing_rows, decoded, strict=True)
+                    if row.source_id is not None
+                }
 
             # Allocate item positions from the conversation's maintained
             # next_position counter instead of running a MAX(position) aggregate
@@ -2041,18 +2083,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                 next_pos = (
                     session.execute(
                         select(func.coalesce(func.max(SqlConversationItem.position), -1)).where(
-                            SqlConversationItem.workspace_id == current_workspace_id(),
+                            SqlConversationItem.workspace_id == workspace_id,
                             SqlConversationItem.conversation_id == conversation_id,
                         )
                     ).scalar_one()
                     + 1
                 )
 
-            workspace_id = current_workspace_id()
             completed_status = encode_item_status("completed")  # items are final on append
             fts_rows: list[tuple[str, str, str]] = []
             row_values: list[dict[str, object]] = []
             for item in items:
+                if item.source_id is not None and item.source_id in persisted_by_source:
+                    persisted.append(persisted_by_source[item.source_id])
+                    continue
+
                 position = next_pos
                 next_pos += 1
                 data_dict = item.data.model_dump(exclude_none=True)
@@ -2074,6 +2119,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     "type": encode_item_type(item.type),
                     "data": data,
                     "created_by": item.created_by,
+                    "source_id": item.source_id,
                 }
                 # A backend may omit search_text (see _item_search_text): when it
                 # returns None we drop the column so a schema without it still
@@ -2083,20 +2129,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                     values["search_text"] = search
                     fts_rows.append((item_id, conversation_id, search))
                 row_values.append(values)
-                persisted.append(
-                    ConversationItem(
-                        id=item_id,
-                        # The row stores int codes; the entity carries the
-                        # string names. item.type is the source string and
-                        # the status was just written as "completed".
-                        type=item.type,
-                        status="completed",
-                        response_id=item.response_id,
-                        created_at=now,
-                        data=item.data,
-                        created_by=item.created_by,
-                    )
+                persisted_item = ConversationItem(
+                    id=item_id,
+                    # The row stores int codes; the entity carries the
+                    # string names. item.type is the source string and
+                    # the status was just written as "completed".
+                    type=item.type,
+                    status="completed",
+                    response_id=item.response_id,
+                    created_at=now,
+                    data=item.data,
+                    created_by=item.created_by,
                 )
+                persisted.append(persisted_item)
+                if item.source_id is not None:
+                    persisted_by_source[item.source_id] = persisted_item
             # One executemany for the batch: positions are pre-allocated above so
             # the rows carry no inter-row dependency, and a single round-trip
             # persists all N. A per-row ORM add round-trips per item, which
@@ -2105,9 +2152,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                 session.execute(insert(SqlConversationItem), row_values)
             insert_fts_bulk(session, fts_rows)
 
-            # Persist the advanced counter so the next append reads it instead
-            # of scanning; this also lazily backfills a pre-counter conversation.
-            if conv_row is not None:
+            # Only a genuinely new item advances the conversation. Retried
+            # source ids are a storage no-op.
+            if conv_row is not None and row_values:
+                conv_row.updated_at = now
                 conv_row.next_position = next_pos
 
         return persisted

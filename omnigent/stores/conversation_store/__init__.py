@@ -608,6 +608,21 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def get_item_by_source_id(
+        self,
+        conversation_id: str,
+        source_id: str,
+    ) -> ConversationItem | None:
+        """
+        Return an item by its producer-assigned identity.
+
+        :param conversation_id: Conversation containing the item.
+        :param source_id: Stable external producer identity.
+        :returns: The matching item, or ``None``.
+        """
+        ...
+
+    @abstractmethod
     def append(
         self,
         conversation_id: str,

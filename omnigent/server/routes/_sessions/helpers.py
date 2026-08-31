@@ -3033,11 +3033,15 @@ def _parse_external_conversation_item(
             "external_conversation_item data.response_id must be a non-empty string",
             code=ErrorCode.INVALID_INPUT,
         )
-    # NOTE: external conversation items are persisted with a random
-    # primary key like any other item — there is no server-side dedup.
-    # Producers (the claude-native / codex-native forwarders) are
-    # responsible for not re-posting records they have already sent;
-    # they no longer emit a ``source_id`` dedup key to the server.
+    source_id = body.data.get("source_id")
+    if source_id is not None:
+        if not isinstance(source_id, str) or not source_id.strip() or len(source_id.strip()) > 512:
+            raise OmnigentError(
+                "external_conversation_item data.source_id must be a non-empty string "
+                "of at most 512 characters",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        source_id = source_id.strip()
     # Cap a native tool result so a multi-MB output isn't persisted + broadcast as one frame.
     if item_type == "function_call_output" and isinstance(item_data.get("output"), str):
         item_data = {**item_data, "output": cap_tool_output(item_data["output"])}
@@ -3052,6 +3056,7 @@ def _parse_external_conversation_item(
         type=item_type,
         response_id=response_id.strip(),
         data=data,
+        source_id=source_id,
     )
 
 

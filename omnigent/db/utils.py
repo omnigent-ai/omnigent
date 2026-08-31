@@ -15,7 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Engine, create_engine, event, inspect, text
+import sqlalchemy as sa
+from sqlalchemy import Connection, Engine, create_engine, event, inspect, text
 
 if TYPE_CHECKING:
     from alembic.config import Config
@@ -35,6 +36,14 @@ NamedManagedSessionMaker = Callable[[str], AbstractContextManager[Session]]
 # A zero-argument callable returning a fresh database password (e.g. a
 # short-lived Lakebase OAuth token). Invoked once per *new* DBAPI connection.
 LakebaseTokenProvider = Callable[[], str]
+
+_CONVERSATION_SCHEMA_METADATA = sa.MetaData()
+_CONVERSATION_SCHEMA_MIGRATIONS = sa.Table(
+    "omnigent_conversation_schema_migrations",
+    _CONVERSATION_SCHEMA_METADATA,
+    sa.Column("version", sa.Integer, primary_key=True),
+)
+_CONVERSATION_SCHEMA_SOURCE_ID_VERSION = 1
 
 
 # ── Lakebase token-aware connections ───────────────────
@@ -261,8 +270,16 @@ def _create_engine(db_uri: str) -> Engine:
         def _set_sqlite_pragma(dbapi_conn: sqlite3.Connection, _conn_record: object) -> None:
             cur = dbapi_conn.cursor()
             try:
-                cur.execute("PRAGMA journal_mode=WAL")
                 cur.execute("PRAGMA busy_timeout=20000")  # 20s
+                try:
+                    cur.execute("PRAGMA journal_mode=WAL")
+                except sqlite3.OperationalError as exc:
+                    # A different process may already hold BEGIN EXCLUSIVE
+                    # while upgrading this database. Its connection set WAL
+                    # before taking that lock, so this idempotent write can be
+                    # skipped until a later fresh connection.
+                    if "database is locked" not in str(exc):
+                        raise
                 cur.execute("PRAGMA synchronous=NORMAL")  # WAL-safe + fast
                 cur.execute("PRAGMA foreign_keys=ON")
             finally:
@@ -336,9 +353,10 @@ def get_or_create_conversation_engine(conv_uri: str) -> Engine:
     """
     Return a cached engine for the Agent Platform DB URI.
 
-    Unlike :func:`get_or_create_engine`, this does NOT run Alembic
-    migrations — the AP DB is expected to be a fresh database that
-    gets its tables created via ``ConversationBase.metadata.create_all()``.
+    Unlike :func:`get_or_create_engine`, this does not run the combined
+    Omnigent Alembic lineage, because a split AP database intentionally
+    contains only conversation tables. It does run the split schema's
+    own versioned upgrades after ``ConversationBase.metadata.create_all()``.
     For the common case where AP DB == Omnigent DB, callers should
     use :func:`get_or_create_engine` directly and share the engine.
 
@@ -358,12 +376,180 @@ def get_or_create_conversation_engine(conv_uri: str) -> Engine:
 
 
 def _ensure_conversation_tables(engine: Engine) -> None:
-    """Create AP tables (conversations, conversation_items, conversation_labels) if absent."""
+    """Create and upgrade the split Agent Platform conversation schema."""
     from omnigent.db.db_models import ConversationBase
 
     with query_name_scope("omnigent.database.ensure_conversation_schema"):
-        ConversationBase.metadata.create_all(bind=engine, checkfirst=True)
-        ensure_fts_table(engine)
+        if engine.dialect.name == "sqlite":
+            # BEGIN EXCLUSIVE is SQLite's database-level schema lock. Every
+            # schema read/write below uses this same connection so another
+            # process cannot observe or apply a half-finished upgrade.
+            with engine.connect() as connection:
+                connection.exec_driver_sql("BEGIN EXCLUSIVE")
+                try:
+                    ConversationBase.metadata.create_all(bind=connection, checkfirst=True)
+                    _run_sqlite_conversation_schema_upgrades(connection)
+                    connection.execute(_CREATE_FTS)
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+            return
+
+        with _server_conversation_schema_lock(engine):
+            ConversationBase.metadata.create_all(bind=engine, checkfirst=True)
+            _run_conversation_schema_upgrades(engine)
+            ensure_fts_table(engine)
+
+
+@contextmanager
+def _server_conversation_schema_lock(engine: Engine) -> Iterator[None]:
+    """Hold a backend-native cross-process lock for split schema upgrades."""
+    with engine.connect() as connection:
+        if engine.dialect.name == "postgresql":
+            connection.execute(sa.text("SELECT pg_advisory_lock(5714303826658643542)"))
+            try:
+                yield
+            finally:
+                connection.execute(sa.text("SELECT pg_advisory_unlock(5714303826658643542)"))
+            return
+        if engine.dialect.name == "mysql":
+            acquired = connection.execute(
+                sa.text("SELECT GET_LOCK('omnigent_conversation_schema', 60)")
+            ).scalar()
+            if acquired != 1:
+                raise RuntimeError("Timed out acquiring split conversation schema lock")
+            try:
+                yield
+            finally:
+                connection.execute(sa.text("SELECT RELEASE_LOCK('omnigent_conversation_schema')"))
+            return
+        yield
+
+
+def _run_sqlite_conversation_schema_upgrades(connection: Connection) -> None:
+    """Apply split schema versions while holding SQLite's exclusive lock."""
+    _CONVERSATION_SCHEMA_METADATA.create_all(bind=connection, checkfirst=True)
+    applied = set(
+        connection.execute(sa.select(_CONVERSATION_SCHEMA_MIGRATIONS.c.version)).scalars()
+    )
+    if _CONVERSATION_SCHEMA_SOURCE_ID_VERSION in applied:
+        return
+
+    columns = {column["name"] for column in inspect(connection).get_columns("conversation_items")}
+    if "source_id" not in columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE conversation_items ADD COLUMN source_id VARCHAR(512)"
+        )
+    index_exists, index_current = _split_source_index_status(connection, "sqlite")
+    if not index_current:
+        if index_exists:
+            connection.exec_driver_sql("DROP INDEX ix_conversation_items_source_id")
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_conversation_items_source_id "
+            "ON conversation_items (workspace_id, conversation_id, source_id) "
+            "WHERE source_id IS NOT NULL"
+        )
+    connection.execute(
+        sa.insert(_CONVERSATION_SCHEMA_MIGRATIONS).values(
+            version=_CONVERSATION_SCHEMA_SOURCE_ID_VERSION
+        )
+    )
+
+
+def _split_source_index_status(
+    bind: Engine | Connection,
+    dialect_name: str,
+) -> tuple[bool, bool]:
+    """Return whether the split source index exists with its expected shape."""
+    expected_columns = ("workspace_id", "conversation_id", "source_id")
+    for index in inspect(bind).get_indexes("conversation_items"):
+        if index["name"] != "ix_conversation_items_source_id":
+            continue
+        current = tuple(index.get("column_names") or ()) == expected_columns and not bool(
+            index.get("unique")
+        )
+        if dialect_name == "sqlite":
+            where = (index.get("dialect_options") or {}).get("sqlite_where")
+            predicate = "".join(str(where).lower().split())
+            current = current and predicate in {
+                "source_idisnotnull",
+                "(source_idisnotnull)",
+            }
+        return True, current
+    return False, False
+
+
+def _run_conversation_schema_upgrades(engine: Engine) -> None:
+    """Apply idempotent, split-database-only schema upgrades in version order."""
+    _CONVERSATION_SCHEMA_METADATA.create_all(bind=engine, checkfirst=True)
+    with engine.connect() as connection:
+        applied = set(
+            connection.execute(sa.select(_CONVERSATION_SCHEMA_MIGRATIONS.c.version)).scalars()
+        )
+
+    if _CONVERSATION_SCHEMA_SOURCE_ID_VERSION not in applied:
+        _upgrade_split_conversation_source_id(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                sa.insert(_CONVERSATION_SCHEMA_MIGRATIONS).values(
+                    version=_CONVERSATION_SCHEMA_SOURCE_ID_VERSION
+                )
+            )
+
+
+def _upgrade_split_conversation_source_id(engine: Engine) -> None:
+    """Add the external-source identity column and lookup index when absent."""
+    columns = {column["name"] for column in inspect(engine).get_columns("conversation_items")}
+    if "source_id" not in columns:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "ALTER TABLE conversation_items ADD COLUMN source_id VARCHAR(512)"
+            )
+
+    index_exists, index_current = _split_source_index_status(engine, engine.dialect.name)
+    columns_sql = "(workspace_id, conversation_id, source_id)"
+    if engine.dialect.name == "postgresql":
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+            row = (
+                connection.execute(
+                    sa.text(
+                        "SELECT i.indisvalid, pg_get_indexdef(i.indexrelid) AS definition "
+                        "FROM pg_index i WHERE i.indexrelid = to_regclass(:name)"
+                    ),
+                    {"name": "ix_conversation_items_source_id"},
+                )
+                .mappings()
+                .first()
+            )
+            if row is not None:
+                definition = str(row["definition"])
+                expected_shape = (
+                    "(workspace_id, conversation_id, source_id)" in definition
+                    and "WHERE (source_id IS NOT NULL)" in definition
+                    and not definition.startswith("CREATE UNIQUE INDEX")
+                )
+                if row["indisvalid"] and expected_shape:
+                    return
+                connection.exec_driver_sql(
+                    "DROP INDEX CONCURRENTLY IF EXISTS ix_conversation_items_source_id"
+                )
+            connection.exec_driver_sql(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+                f"ix_conversation_items_source_id ON conversation_items {columns_sql} "
+                "WHERE source_id IS NOT NULL"
+            )
+        return
+    where = " WHERE source_id IS NOT NULL" if engine.dialect.name == "sqlite" else ""
+    with engine.begin() as connection:
+        if index_current:
+            return
+        if index_exists:
+            connection.exec_driver_sql("DROP INDEX ix_conversation_items_source_id")
+        connection.exec_driver_sql(
+            f"CREATE INDEX ix_conversation_items_source_id "
+            f"ON conversation_items {columns_sql}{where}"
+        )
 
 
 def _set_alembic_database_url(config: Config, db_uri: str) -> None:

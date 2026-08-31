@@ -354,13 +354,13 @@ class PreparedClaudeTerminal:
         transcript end in this case — when ``--resume <claude_sid>``
         is injected into the launch args, Claude reopens the prior
         JSONL transcript, and re-reading it from offset 0 would
-        re-post every prior turn to AP. There is no server-side dedup:
-        seeking to the end (plus the forwarder's persisted byte offset
-        on subsequent ticks) is the only thing keeping old turns from
-        being re-posted as new messages. ``cold_resumed`` is
-        *independent* of ``reattached``: cold resume creates a new
-        terminal (we own teardown) but the forwarder still needs the
-        skip-existing behavior.
+        re-post every prior turn to AP. Seeking to the end (plus the
+        forwarder's persisted byte offset on subsequent ticks) avoids
+        unnecessary retries; the transcript source ids provide the durable
+        server-side backstop against duplicate items. ``cold_resumed`` is
+        *independent* of ``reattached``: cold resume creates a new terminal
+        (we own teardown) but the forwarder still needs the skip-existing
+        behavior.
     :param tmux_socket: Runner tmux server socket path when the
         terminal exposed one and it is reachable from this process,
         e.g. ``Path("/tmp/omnigent-501/.../tmux.sock")``. ``None``

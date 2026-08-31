@@ -877,6 +877,8 @@ class SqlConversationItem(ConversationBase):
     :param created_by: Identity of the human actor who authored the
         item, or ``None`` for agent/tool/system items and single-user
         mode. Mirrors :class:`SqlComment.created_by`.
+    :param source_id: Stable producer identity for idempotent external
+        transcript appends. ``None`` for ordinary AP-created items.
     """
 
     __tablename__ = "conversation_items"
@@ -913,6 +915,7 @@ class SqlConversationItem(ConversationBase):
     data: Mapped[str] = mapped_column(Text)
     search_text: Mapped[str] = mapped_column(Text)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    source_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
 
     __table_args__ = (
         # Backs the per-conversation position-ordered scan (the dominant read).
@@ -935,6 +938,17 @@ class SqlConversationItem(ConversationBase):
             "conversation_id",
             "response_id",
             "id",
+        ),
+        # External transcript retries resolve by stable producer source id.
+        # The conversation row lock in ConversationStore.append serializes the
+        # lookup + insert; this index makes the lookup a narrow prefix seek.
+        Index(
+            "ix_conversation_items_source_id",
+            "workspace_id",
+            "conversation_id",
+            "source_id",
+            sqlite_where=text("source_id IS NOT NULL"),
+            postgresql_where=text("source_id IS NOT NULL"),
         ),
         # Latest-message previews scan one type per conversation ordered by
         # position DESC (list_latest_message_items_for_conversations). Ordering

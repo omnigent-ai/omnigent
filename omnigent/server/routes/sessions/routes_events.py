@@ -380,6 +380,12 @@ def register_events_routes(
         return isinstance(runner_id, str) and token_bound_runner_id(token) == runner_id
 
     @router.post(
+        "/sessions/{session_id}/events/source-id-v1",
+        include_in_schema=False,
+        status_code=202,
+        response_model=None,
+    )
+    @router.post(
         "/sessions/{session_id}/events",
         # Internal event ingestion — hidden from the public API reference.
         include_in_schema=False,
@@ -476,6 +482,15 @@ def register_events_routes(
             control and internal transient events.
         :raises OmnigentError: 404 if no session exists.
         """
+        if request.url.path.endswith("/events/source-id-v1") and (
+            body.type != _EXTERNAL_CONVERSATION_ITEM_TYPE
+            or not isinstance(body.data.get("source_id"), str)
+            or not body.data["source_id"].strip()
+        ):
+            raise OmnigentError(
+                "source-id-v1 requires external_conversation_item with source_id",
+                code=ErrorCode.INVALID_INPUT,
+            )
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_EDIT, permission_store, conversation_store

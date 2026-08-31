@@ -41,7 +41,7 @@ from omnigent.db.utils import (
 # Revision one step before ``za2b3c4d5e6f`` (which adds ``task_summary``).
 _REVISION_BEFORE_TASK_SUMMARY = "d5e9f1a2b3c4"
 # Current head at the time this bug was filed; asserted as the reachable target.
-_EXPECTED_HEAD = "e5d9bc8ac650"
+_EXPECTED_HEAD = "f3c7a1d9e2b4"
 
 _METADATA_TABLE = "omnigent_conversation_metadata"
 
