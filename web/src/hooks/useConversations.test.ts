@@ -1375,7 +1375,7 @@ describe("useBulkArchiveConversations", () => {
     return { queryClient, invalidateSpy, rendered };
   }
 
-  it("PATCHes each session and invalidates the list on success", async () => {
+  it("PATCHes each session and refreshes projects (not conversations) on success", async () => {
     fetchMock
       .mockResolvedValueOnce(
         mockResponse({
@@ -1407,7 +1407,11 @@ describe("useBulkArchiveConversations", () => {
       expect(init.method).toBe("PATCH");
       expect(JSON.parse(init.body as string)).toEqual({ archived: true });
     }
-    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
+    // Rows leave the sidebar via the optimistic overlay, so success refreshes
+    // only the DB-direct project caches — refetching ["conversations"] here
+    // would race the search-index reindex and bounce the rows back.
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
+    expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
   });
 
   it("throws with failed ids when some archives fail", async () => {
@@ -2064,7 +2068,7 @@ describe("useMoveToProject", () => {
 });
 
 describe("useArchiveConversation", () => {
-  it("PATCHes archived and invalidates both the conversations and projects queries", async () => {
+  it("PATCHes archived, overlays the flag optimistically, and doesn't race the reindex", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({
         id: "conv_a",
@@ -2076,22 +2080,56 @@ describe("useArchiveConversation", () => {
       }),
     );
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    // Seed the sidebar list (include-archived variant) holding the live row.
+    queryClient.setQueryData(["conversations", "", true], {
+      pages: [
+        {
+          data: [
+            {
+              id: "conv_a",
+              object: "conversation",
+              title: "A",
+              created_at: 0,
+              updated_at: 0,
+              labels: {},
+              permission_level: null,
+              status: "idle",
+              archived: false,
+            },
+          ],
+          first_id: "conv_a",
+          last_id: "conv_a",
+          has_more: false,
+        },
+      ],
+      pageParams: [undefined],
+    });
     const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
     const { result } = renderHook(() => useArchiveConversation(), { wrapper });
 
     result.current.mutate({ id: "conv_a", archived: true });
+
+    // Optimistic: the cached flag flips before the PATCH resolves (the sidebar
+    // filters archived rows out client-side, so the row disappears now).
+    await waitFor(() => {
+      const d = queryClient.getQueryData(["conversations", "", true]) as {
+        pages: { data: { archived?: boolean }[] }[];
+      };
+      expect(d.pages[0].data[0].archived).toBe(true);
+    });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_a");
     expect(init.method).toBe("PATCH");
     expect(JSON.parse(init.body as string)).toEqual({ archived: true });
-    // Projects must refresh too: archiving the last live member of a project
-    // removes its folder; unarchiving restores it.
-    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
+    // Projects refresh (DB-direct, no lag). Conversations is NOT refetched on
+    // success — that would race the search-index reindex and bounce the row
+    // back into the sidebar until the index caught up.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
+    expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
   });
 });
 

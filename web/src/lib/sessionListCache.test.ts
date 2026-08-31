@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { QueryClient } from "@tanstack/react-query";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import {
   type ConversationsInfiniteData,
@@ -7,6 +8,7 @@ import {
   filtersFromConversationQueryKey,
   mergeItemsIntoPages,
   nullsToUndefined,
+  overlayArchivedIntoCaches,
   removeIdsFromPages,
 } from "./sessionListCache";
 
@@ -419,5 +421,23 @@ describe("collectConversationIds", () => {
     // query) contributes nothing rather than throwing.
     expect(new Set(ids)).toEqual(new Set(["a", "b", "c"]));
     expect(ids.length).toBe(3);
+  });
+});
+
+describe("overlayArchivedIntoCaches", () => {
+  it("flips the flag in an include-archived list and drops the row from a folder", () => {
+    const qc = new QueryClient();
+    // Sidebar/archived-view cache keeps archived rows (client filters them).
+    qc.setQueryData(["conversations", "", true], data([conv("a"), conv("b")]));
+    // Project folder is non-archived — an archived row no longer belongs.
+    qc.setQueryData(["project-sessions", "proj"], data([conv("a")]));
+
+    overlayArchivedIntoCaches(qc, "a", true);
+
+    const list = qc.getQueryData<ConversationsInfiniteData>(["conversations", "", true])!;
+    expect(list.pages[0].data.find((c) => c.id === "a")!.archived).toBe(true);
+
+    const folder = qc.getQueryData<ConversationsInfiniteData>(["project-sessions", "proj"])!;
+    expect(folder.pages[0].data.map((c) => c.id)).toEqual([]);
   });
 });

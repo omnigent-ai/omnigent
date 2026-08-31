@@ -29,6 +29,7 @@ import { startTimedInteraction } from "@/lib/analyticsEmit";
 import {
   filtersFromConversationQueryKey,
   mergeItemsIntoPages,
+  overlayArchivedIntoCaches,
   overlayTitleIntoCaches,
   PINNED_LABEL_KEY,
   PROJECT_FOLDER_FILTERS,
@@ -619,23 +620,43 @@ export function useRenameConversation() {
 /**
  * Archive / unarchive a conversation via `PATCH /v1/sessions/{id}`.
  *
- * Invalidates the conversations list on success so the row moves
- * into (or out of) the sidebar's "Archived" section. Mirrors the
- * rename hook's `markConversationSeen` anchoring: the PATCH bumps
- * server `updated_at`, and without this the unseen tracker would
- * flag the user's own archive action as new activity.
+ * Optimistic: `onMutate` overlays the new `archived` flag into every cached
+ * list (see `overlayArchivedIntoCaches`), so the sidebar — which filters
+ * archived rows out client-side — repaints on the next frame instead of after
+ * the PATCH round-trips. `onError` reconciles the flag from the server (the
+ * row returns to its old section) and toasts. `onSuccess` anchors the unseen
+ * tracker (the PATCH bumps server `updated_at`, which would otherwise flag the
+ * user's own archive as new activity) and refreshes the project caches, which
+ * read the DB directly (no search-index lag).
  */
 export function useArchiveConversation() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: ({ id, archived }: { id: string; archived: boolean }) =>
       archiveConversation(id, archived),
+    onMutate: async ({ id, archived }) => {
+      // Cancel any in-flight list refetch so it can't resolve after this
+      // overlay and clobber the flag with the stale search-indexed state.
+      await queryClient.cancelQueries({ queryKey: ["conversations"] });
+      overlayArchivedIntoCaches(queryClient, id, archived);
+    },
+    onError: (_err, { archived }) => {
+      // The PATCH failed — reconcile the optimistic flag from the server (the
+      // row snaps back to its old section on the refetch).
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      showToast(
+        archived
+          ? "Couldn't archive the session — it's back in the sidebar."
+          : "Couldn't unarchive the session.",
+      );
+    },
     onSuccess: (updated) => {
       markConversationSeen(updated.id, updated.updated_at);
-      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       // Archiving/unarchiving the last (or first) non-archived member of a
       // project removes/restores it from the server's project list, and adds
-      // or drops it from that project folder's own paginated list.
+      // or drops it from that project folder's own paginated list. These read
+      // the DB directly, so refetching them can't resurrect the archived row.
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
       // Archive membership just changed, so the archived-view picker's option
@@ -899,10 +920,11 @@ export function useStopSession() {
 /**
  * Archive multiple conversations in parallel via `PATCH /v1/sessions/{id}`.
  *
- * Each session is archived independently — individual failures don't
- * block the rest. The conversations list is invalidated once on
- * completion so the sidebar refreshes. Returns an array of session IDs
- * that failed.
+ * Optimistic like the single-session archive: `onMutate` overlays the new flag
+ * onto every selected row so the sidebar repaints immediately. Each session is
+ * archived independently — individual failures don't block the rest — and
+ * `onError` reconciles the whole selection from the server (rows whose PATCH
+ * failed snap back). Returns the session IDs that failed.
  */
 export function useBulkArchiveConversations() {
   const queryClient = useQueryClient();
@@ -925,8 +947,18 @@ export function useBulkArchiveConversations() {
         .filter((r): r is PromiseFulfilledResult<Conversation> => r.status === "fulfilled")
         .map((r) => r.value);
     },
-    onSettled: () => {
+    onMutate: async ({ ids, archived }) => {
+      await queryClient.cancelQueries({ queryKey: ["conversations"] });
+      for (const id of ids) overlayArchivedIntoCaches(queryClient, id, archived);
+    },
+    onError: () => {
+      // Some or all failed — reconcile every row's flag from the server.
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+    },
+    onSettled: () => {
+      // Project caches read the DB directly (no search-index lag), so unlike
+      // ["conversations"] they can be refreshed on every settle without
+      // racing the reindex and resurrecting an archived row.
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });

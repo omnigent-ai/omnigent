@@ -391,3 +391,51 @@ export function overlayTitleIntoCaches(
   );
   queryClient.setQueryData<Session>(["session", id], (old) => (old ? { ...old, title } : old));
 }
+
+/**
+ * Overlay an archived-flag change onto every cached list that holds the row,
+ * so archiving repaints the sidebar on the next frame instead of after the
+ * PATCH round-trips (which is what made archive feel slower than delete).
+ * Mirrors {@link overlayTitleIntoCaches}: the merge keeps the row in an
+ * include-archived list (marked archived, which the sidebar filters out
+ * client-side) and drops it from a non-archived project folder via
+ * `violatesKnownMembership`.
+ *
+ * Patched in place rather than invalidated, for the same reason rename/delete
+ * are: GET /v1/sessions may be served from a search index that lags the PATCH,
+ * so an immediate refetch races the reindex and bounces the row back. The
+ * server-confirmed state converges via the WS stream and the reconcile poll.
+ *
+ * ponytail: a reconcile poll firing inside the reindex-lag window (before the
+ * index reflects the archive) can briefly bounce the row back; it self-heals on
+ * the next poll. Add a fetch-time flag override (like `withoutDeletingSessions`)
+ * if metrics show the bounce.
+ */
+export function overlayArchivedIntoCaches(
+  queryClient: QueryClient,
+  id: string,
+  archived: boolean,
+): void {
+  const itemsById = new Map<string, SessionListWireItem>([[id, { id, archived }]]);
+  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+    queryKey: ["conversations"],
+  })) {
+    const { data: next } = mergeItemsIntoPages(
+      data,
+      itemsById,
+      filtersFromConversationQueryKey(key),
+      undefined,
+    );
+    if (next !== data) queryClient.setQueryData(key, next);
+  }
+  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+    queryKey: ["project-sessions"],
+  })) {
+    const { data: next } = mergeItemsIntoPages(data, itemsById, PROJECT_FOLDER_FILTERS, undefined);
+    if (next !== data) queryClient.setQueryData(key, next);
+  }
+  queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
+    old ? { ...old, archived } : old,
+  );
+}
+
