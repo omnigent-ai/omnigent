@@ -401,3 +401,46 @@ def test_shell_command_does_not_see_omnigent_project_root(
     out = result.get("stdout", "")
     assert project_entry in out
     assert str(_project_root()) not in out
+
+
+# ---------------------------------------------------------------------------
+# _HelperProcessClient — Windows config delivery without an active sandbox
+# ---------------------------------------------------------------------------
+
+
+def test_helper_windows_config_delivery_without_active_sandbox(tmp_path: Path) -> None:
+    """The Windows config-file branch must start the helper with NO sandbox.
+
+    Native Windows never has an active sandbox, but only an active sandbox
+    creates the private scratch tmpdir the ``--config-file`` fallback writes
+    into. The branch must create that tmpdir itself instead of asserting a
+    precondition the platform can never meet (which left every OS tool call
+    returning a bare error payload).
+    """
+    from unittest import mock
+
+    from omnigent.inner import os_env as os_env_mod
+    from omnigent.inner.sandbox import resolve_sandbox
+
+    spec = OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none"))
+    sandbox = resolve_sandbox(spec, tmp_path)
+    assert not sandbox.active
+
+    client = os_env_mod._HelperProcessClient(
+        cwd=tmp_path,
+        shell_path=shutil.which("sh") or "/bin/sh",
+        sandbox=sandbox,
+    )
+    try:
+        with mock.patch.object(os_env_mod, "IS_WINDOWS", True):
+            result = client.request({"op": "shell", "command": "echo tmpdir-ok", "timeout": 30})
+        assert not result.get("error"), result
+        assert "tmpdir-ok" in result.get("stdout", "")
+        # The branch created its own scratch tmpdir for the config file.
+        created = client._tmpdir
+        assert created is not None and created.exists()
+    finally:
+        client.close()
+    # close() releases the scratch dir it created.
+    assert client._tmpdir is None
+    assert not created.exists()

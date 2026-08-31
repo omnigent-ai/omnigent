@@ -136,3 +136,40 @@ def test_runner_env_preserves_claude_tool_search_flags() -> None:
 
     # Then
     assert {name: env.get(name) for name in _CLAUDE_TOOL_SEARCH_ENV} == _CLAUDE_TOOL_SEARCH_ENV
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_host_daemon_env_defaults_pythonutf8_on(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """Both daemon modes force UTF-8 mode so status glyphs can't kill stdio.
+
+    The daemon logs to a file, where Python picks the locale encoding
+    (cp1252 on Windows); a non-Latin-1 status glyph then raises
+    ``UnicodeEncodeError`` inside the serve loop and flaps the tunnel.
+    """
+    # Given: the user set nothing (a stock Windows shell).
+    monkeypatch.delenv("PYTHONUTF8", raising=False)
+
+    # When
+    env = _build_host_daemon_env(server_url=server_url)
+
+    # Then
+    assert env.get("PYTHONUTF8") == "1"
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_host_daemon_env_keeps_explicit_pythonutf8(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """An explicit user PYTHONUTF8 value stays authoritative over the default."""
+    # Given
+    monkeypatch.setenv("PYTHONUTF8", "0")
+
+    # When
+    env = _build_host_daemon_env(server_url=server_url)
+
+    # Then
+    assert env.get("PYTHONUTF8") == "0"

@@ -3289,6 +3289,11 @@ def _build_host_daemon_env(
             or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
             or key.startswith(daemon_env_prefixes)
         }
+    # The daemon's stdio is a log file, so Python picks the locale encoding
+    # (cp1252 on Windows) and the first non-Latin-1 status glyph crashes the
+    # serve loop into a reconnect flap. Force UTF-8 mode; an explicit user
+    # value (allowlisted above) stays authoritative.
+    env.setdefault("PYTHONUTF8", "1")
     return env
 
 
