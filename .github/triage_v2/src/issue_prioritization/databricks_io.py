@@ -37,10 +37,10 @@ class SparkIssueSource:
 
     def load_open_issues(self) -> list[BronzeIssue]:
         frame = self.spark.table(self.table)
-        rows = frame.where("state = 'open'").collect()
+        rows = frame.where("state = 'open'").drop("state").collect()
         issues = []
         for row in rows:
-            value = row.asDict(recursive=True)
+            value = {**row.asDict(recursive=True), "state": "open"}
             if value.get("repo") != self.repo:
                 continue
             issue = BronzeIssue.from_mapping(value)
