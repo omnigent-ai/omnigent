@@ -289,6 +289,81 @@ def test_resolve_write_paths_dot_makes_cwd_writable() -> None:
     assert policy.write_roots == [Path.cwd().resolve(strict=False)]
 
 
+def _resolve_with_linux_gates(
+    backend: BwrapSandboxBackend, spec: OSEnvSpec, cwd: Path
+) -> SandboxPolicy:
+    """
+    Run ``resolve`` with the Linux/bwrap host gates satisfied.
+
+    The resolver otherwise hard-errors off Linux, which keeps production
+    honest but would keep these resolver-behavior tests from running on
+    macOS dev machines; only the host gates are patched, not any of the
+    behavior under test.
+    """
+    with (
+        patch("omnigent.inner.bwrap_sandbox.sys.platform", "linux"),
+        patch("omnigent.inner.bwrap_sandbox.shutil.which", return_value="/usr/bin/bwrap"),
+    ):
+        return backend.resolve(spec, cwd)
+
+
+def test_resolve_creates_missing_write_paths_root(tmp_path: Path) -> None:
+    """
+    ``write_paths`` entry whose directory does not exist yet is created
+    by the resolver. The argv builder emits write roots as
+    ``--bind-try``, which is a no-op for a missing source — without
+    creation the grant is silently dropped and the agent's first write
+    fails with ``EROFS`` on the read-only cwd bind.
+    """
+    backend = _make_backend()
+    spec = OSEnvSpec(
+        type="caller_process",
+        sandbox=OSEnvSandboxSpec(type="linux_bwrap", write_paths=["docs/specs"]),
+    )
+    policy = _resolve_with_linux_gates(backend, spec, tmp_path)
+    root = tmp_path / "docs" / "specs"
+    assert policy.write_roots == [root.resolve(strict=False)]
+    assert root.is_dir(), (
+        "resolve() must create a missing write_paths root before the "
+        "namespace is assembled; otherwise --bind-try drops the grant."
+    )
+
+
+def test_resolve_creates_nested_missing_write_paths_roots(tmp_path: Path) -> None:
+    """
+    Multiple missing roots, at different depths, are all created. A
+    spec granting ``reports/`` and ``docs/specs`` at once must not leave
+    the shallower one working while the deeper one is dropped.
+    """
+    backend = _make_backend()
+    spec = OSEnvSpec(
+        type="caller_process",
+        sandbox=OSEnvSandboxSpec(type="linux_bwrap", write_paths=["reports", "docs/specs"]),
+    )
+    _resolve_with_linux_gates(backend, spec, tmp_path)
+    assert (tmp_path / "reports").is_dir()
+    assert (tmp_path / "docs" / "specs").is_dir()
+
+
+def test_resolve_keeps_existing_write_paths_root_untouched(tmp_path: Path) -> None:
+    """
+    A root that already exists (with content) survives resolve.
+    Creation is ``mkdir -p`` semantics: idempotent, and never truncates
+    or replaces a populated grant directory.
+    """
+    backend = _make_backend()
+    root = tmp_path / "out"
+    root.mkdir()
+    existing = root / "keep.txt"
+    existing.write_text("keep")
+    spec = OSEnvSpec(
+        type="caller_process",
+        sandbox=OSEnvSandboxSpec(type="linux_bwrap", write_paths=["out"]),
+    )
+    _resolve_with_linux_gates(backend, spec, tmp_path)
+    assert existing.read_text() == "keep"
+
+
 def test_resolve_default_cwd_allow_hidden_is_dot_venv() -> None:
     """
     ``cwd_allow_hidden=None`` in the spec resolves to the documented

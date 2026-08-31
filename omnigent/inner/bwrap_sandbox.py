@@ -289,6 +289,9 @@ class BwrapSandboxBackend(SandboxBackend):
 
         - ``write_paths`` defaults to **empty** — cwd is read-only
           unless the spec sets ``write_paths: ["."]`` explicitly.
+        - Each ``write_paths`` root that does not exist yet is created
+          (``mkdir -p`` semantics) before the namespace is assembled, so
+          the ``--bind-try`` emission cannot silently drop the grant.
         - ``cwd_allow_hidden`` falls back to
           :data:`_DEFAULT_CWD_ALLOW_HIDDEN` when the spec doesn't
           declare one.
@@ -334,6 +337,14 @@ class BwrapSandboxBackend(SandboxBackend):
             sandbox_spec.write_paths if sandbox_spec.write_paths is not None else []
         )
         write_roots = [_resolve_root(cwd, root) for root in write_paths_config]
+
+        # ``--bind-try`` skips a missing source, so a grant on a directory
+        # that does not exist yet would never take effect — the agent's
+        # first write hits the read-only cwd bind instead. The operator
+        # already granted write access to these paths; creating them on
+        # the host is within that grant.
+        for root in write_roots:
+            root.mkdir(parents=True, exist_ok=True)
 
         write_files: list[Path] = []
         if sandbox_spec.write_files is not None:
