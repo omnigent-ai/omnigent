@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
-import { isAcpHarnessAgent, partitionAgentsByKind } from "@/lib/agentGrouping";
+import {
+  isAcpHarnessAgent,
+  partitionAgentsByKind,
+  selectableSessionAgents,
+} from "@/lib/agentGrouping";
 
 function agent(overrides: Partial<AvailableAgent> & Pick<AvailableAgent, "name">): AvailableAgent {
   return {
@@ -13,6 +17,20 @@ function agent(overrides: Partial<AvailableAgent> & Pick<AvailableAgent, "name">
     ...overrides,
   };
 }
+
+describe("selectableSessionAgents", () => {
+  it("drops the hidden agents every session-creation surface must exclude", () => {
+    // Shared by the composer picker AND project settings — filter parity is
+    // what stops a project from pinning a default the composer can't show.
+    const result = selectableSessionAgents([
+      agent({ name: "hello" }),
+      agent({ name: "nessie" }),
+      agent({ name: "kimi" }),
+      agent({ name: "kimi-code" }),
+    ]);
+    expect(result.map((a) => a.name)).toEqual(["hello"]);
+  });
+});
 
 describe("partitionAgentsByKind", () => {
   it("groups a server-marked built-in with harnesses even when its name isn't in the static allowlist", () => {

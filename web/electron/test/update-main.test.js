@@ -22,6 +22,7 @@ function loadMainHarness({
 
   const ipcHandlers = new Map();
   const appEvents = new Map();
+  const mainImmediates = [];
   const calls = {
     appQuit: 0,
     appExit: 0,
@@ -194,6 +195,9 @@ function loadMainHarness({
       if (specifier in localRequires) return localRequires[specifier];
       return mainRequire(specifier);
     },
+    setImmediate: (callback, ...args) => {
+      mainImmediates.push(() => callback(...args));
+    },
     setInterval,
     setTimeout,
   };
@@ -216,7 +220,12 @@ function loadMainHarness({
       unpinned: { sender, senderFrame: { url: "https://evil.example/app" } },
     },
     ipcHandlers,
+    pendingMainImmediates: () => mainImmediates.length,
     readSettings: () => JSON.parse(fs.readFileSync(path.join(userData, "settings.json"), "utf8")),
+    runMainImmediates: () => {
+      const pending = mainImmediates.splice(0);
+      for (const run of pending) run();
+    },
   };
 }
 
@@ -243,15 +252,19 @@ function hasDebugMenu(menu) {
   return menu.template.some((item) => item.label === "Debug");
 }
 
-describe("new session menu action", () => {
-  it("routes Cmd/Ctrl+N to the current window without replacing the New Window action", (t) => {
+describe("in-app navigation menu actions", () => {
+  it("routes Settings and New Session through the focused connected window", (t) => {
     const harness = loadMainHarness();
     t.after(harness.cleanup);
 
     harness.api.buildMenu();
     const menu = harness.calls.setApplicationMenu.at(-1);
+    const settingsItem = findMenuItem(menu, "open_settings");
     const newSessionItem = findMenuItem(menu, "new_session");
     const newWindowItem = findMenuItem(menu, "new_window");
+
+    settingsItem.click();
+    assert.deepEqual(harness.calls.sent, [{ channel: "omnigent:open-path", payload: "/settings" }]);
 
     assert.equal(newSessionItem.label, "New Session");
     assert.equal(newSessionItem.accelerator, "CmdOrCtrl+N");
@@ -259,7 +272,10 @@ describe("new session menu action", () => {
 
     newSessionItem.click();
 
-    assert.deepEqual(harness.calls.sent, [{ channel: "omnigent:open-path", payload: "/" }]);
+    assert.deepEqual(harness.calls.sent.at(-1), {
+      channel: "omnigent:open-path",
+      payload: "/",
+    });
   });
 });
 
@@ -501,6 +517,10 @@ describe("auto-update main-process wiring", () => {
     await flushPromises();
 
     assert.equal(prevented, 1);
+    assert.deepEqual(harness.calls.quitAndInstall, []);
+    assert.equal(harness.pendingMainImmediates(), 1);
+
+    harness.runMainImmediates();
     assert.deepEqual(harness.calls.quitAndInstall, [[false, true]]);
     assert.equal(harness.calls.appQuit, 1);
   });
@@ -529,6 +549,11 @@ describe("auto-update main-process wiring", () => {
     harness.api.setQuitTimeouts({ installFallback: 10 });
     harness.appEvents.get("before-quit")({ preventDefault: () => {} });
     await flushPromises();
+    assert.deepEqual(harness.calls.quitAndInstall, []);
+    assert.equal(harness.pendingMainImmediates(), 1);
+
+    harness.runMainImmediates();
+    assert.deepEqual(harness.calls.quitAndInstall, [[false, true]]);
     assert.equal(harness.calls.appQuit, 1); // still no re-issued quit
     assert.equal(harness.calls.appExit, 0); // fallback not fired yet
 
@@ -537,6 +562,45 @@ describe("auto-update main-process wiring", () => {
     });
     assert.equal(harness.calls.appExit, 1); // fallback forced the exit
     assert.equal(harness.calls.appQuit, 1); // never re-issued
+  });
+
+  it("force-exits if the re-issued normal quit does not terminate", async (t) => {
+    const harness = loadMainHarness({ settings: { update_mode: "manual" } });
+    t.after(harness.cleanup);
+    harness.api.setQuitTimeouts({ cleanup: 10 });
+
+    harness.appEvents.get("before-quit")({ preventDefault: () => {} });
+    await flushPromises();
+    assert.equal(harness.calls.appQuit, 0);
+    assert.equal(harness.pendingMainImmediates(), 1);
+
+    harness.runMainImmediates();
+    assert.equal(harness.calls.appQuit, 1);
+    assert.equal(harness.calls.appExit, 0);
+
+    await new Promise((resolve) => {
+      setTimeout(resolve, 30);
+    });
+    assert.equal(harness.calls.appExit, 1);
+  });
+
+  it("cancels the normal quit fallback once quit is reached", async (t) => {
+    const harness = loadMainHarness({ settings: { update_mode: "manual" } });
+    t.after(harness.cleanup);
+    harness.api.setQuitTimeouts({ cleanup: 10 });
+
+    harness.appEvents.get("before-quit")({ preventDefault: () => {} });
+    await flushPromises();
+    assert.equal(harness.calls.appQuit, 0);
+    assert.equal(harness.pendingMainImmediates(), 1);
+
+    harness.runMainImmediates();
+    assert.equal(harness.calls.appQuit, 1);
+    harness.appEvents.get("quit")();
+    await new Promise((resolve) => {
+      setTimeout(resolve, 30);
+    });
+    assert.equal(harness.calls.appExit, 0);
   });
 
   it("force-exits if before-quit cleanup hangs past the safety cap", async (t) => {
@@ -558,6 +622,7 @@ describe("auto-update main-process wiring", () => {
     harness.appEvents.get("before-quit")({ preventDefault: () => {} });
     await flushPromises();
     assert.equal(harness.calls.appQuit, 0); // shutdown hung, no re-issued quit
+    assert.equal(harness.pendingMainImmediates(), 0);
     assert.equal(harness.calls.appExit, 0); // cap not fired yet
 
     await new Promise((resolve) => {
@@ -565,6 +630,27 @@ describe("auto-update main-process wiring", () => {
     });
     assert.equal(harness.calls.appExit, 1); // cap forced the exit
     assert.equal(harness.calls.appQuit, 0); // never re-issued
+  });
+
+  it("shows Restart to Update only while an update is ready to install", (t) => {
+    const harness = loadMainHarness({
+      forceDevUpdateConfig: true,
+      settings: { update_mode: "manual" },
+    });
+    t.after(harness.cleanup);
+    harness.api.updater.init();
+
+    harness.api.buildMenu();
+    let restartItem = findMenuItem(harness.calls.setApplicationMenu.at(-1), "restart_to_update");
+    assert.equal(restartItem.visible, false);
+
+    harness.autoUpdater.emit("update-downloaded", { version: "0.4.0" });
+    restartItem = findMenuItem(harness.calls.setApplicationMenu.at(-1), "restart_to_update");
+    assert.equal(restartItem.visible, true);
+
+    harness.autoUpdater.emit("update-not-available");
+    restartItem = findMenuItem(harness.calls.setApplicationMenu.at(-1), "restart_to_update");
+    assert.equal(restartItem.visible, false);
   });
 
   it("does not start the install path when no update is downloaded", async (t) => {
@@ -587,6 +673,7 @@ describe("auto-update main-process wiring", () => {
     harness.api.buildMenu();
     const restartItem = findMenuItem(harness.calls.setApplicationMenu.at(-1), "restart_to_update");
     assert.ok(restartItem);
+    assert.equal(restartItem.visible, false);
     restartItem.click();
     assert.equal(harness.api.updater.installPending, false);
     assert.equal(harness.calls.appQuit, 0);

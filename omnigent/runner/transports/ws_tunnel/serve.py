@@ -26,6 +26,8 @@ from urllib.parse import quote, urlsplit, urlunsplit
 from starlette.types import ASGIApp, Message, Scope
 from websockets.exceptions import ConnectionClosedOK, InvalidURI, WebSocketException
 
+from omnigent.cli_invocation import cli_invocation
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.runner.identity import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
     RUNNER_SLICE_KEY_ENV_VAR,
@@ -374,7 +376,10 @@ async def serve_tunnel(
             try:
                 await on_reconnect()
             except Exception:
-                _logger.exception("on_reconnect callback failed")
+                _logger.exception(
+                    "on_reconnect callback failed",
+                    extra={"session_id": runner_primary_session_id()},
+                )
         retry_reason = "connection closed cleanly"
         recycle = False
         try:
@@ -425,13 +430,18 @@ async def serve_tunnel(
                 # fresh token each attempt, so the session survives
                 # once credentials become valid again.
                 if not ever_connected and login_redirect_streak >= _LOGIN_REDIRECT_FATAL_ATTEMPTS:
+                    # Show the display form (workspace /omnigent URL, ?o=
+                    # when known), not the internal API mount; it round-trips
+                    # through `omnigent login` to the same server.
+                    from omnigent.server_url import display_server_url
+
                     raise RuntimeError(
                         f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
                         f"(redirect to non-WebSocket URL {redirect_url} "
                         f"persisted across {login_redirect_streak} attempts); "
                         "the server likely requires auth — "
-                        f"run `omnigent login {server_url}` or "
-                        "`omnigent setup` to configure credentials"
+                        f"run `{cli_invocation()} login {display_server_url(server_url)}` or "
+                        f"`{cli_invocation()} setup` to configure credentials"
                     ) from exc
                 retry_reason = (
                     f"login-page redirect during upgrade ({redirect_url}); "
@@ -445,11 +455,20 @@ async def serve_tunnel(
                         not ever_connected
                         and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
                     ):
-                        login_hint = (
-                            f"run `databricks auth login --host {server_url}` to re-authenticate"
-                            if server_url
-                            else "check remote server authentication"
-                        )
+                        if server_url:
+                            # `omnigent login` detects the fronting workspace
+                            # itself — unlike a raw `databricks auth login
+                            # --host`, which would need the workspace host,
+                            # not the server URL (for workspace-hosted
+                            # servers the API mount is the wrong --host).
+                            from omnigent.server_url import display_server_url
+
+                            login_hint = (
+                                f"run `omnigent login {display_server_url(server_url)}` "
+                                "to re-authenticate"
+                            )
+                        else:
+                            login_hint = "check remote server authentication"
                         raise RuntimeError(
                             f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
                             f"(HTTP {http_status} persisted across "
@@ -471,9 +490,14 @@ async def serve_tunnel(
                             "HTTP %d after a successful upgrade; retrying — "
                             "check VPN/network connectivity",
                             http_status,
+                            extra={"session_id": runner_primary_session_id()},
                         )
                     else:
-                        _logger.info("HTTP %d; invalidated auth token, retrying", http_status)
+                        _logger.info(
+                            "HTTP %d; invalidated auth token, retrying",
+                            http_status,
+                            extra={"session_id": runner_primary_session_id()},
+                        )
                         delay_s = _INITIAL_RECONNECT_DELAY_S
                 else:
                     close_code = _websocket_close_code(exc)
@@ -519,6 +543,7 @@ async def serve_tunnel(
             retry_reason,
             jittered,
             delay_s,
+            extra={"session_id": runner_primary_session_id()},
         )
         await asyncio.sleep(jittered)
         # Match the host tunnel (connect.py): escalate the backoff only on
@@ -568,6 +593,7 @@ async def _refresh_auth_token(
         _logger.warning(
             "auth token refresh failed; falling back to previous token",
             exc_info=True,
+            extra={"session_id": runner_primary_session_id()},
         )
     return current_token
 
@@ -599,6 +625,7 @@ async def _handle_refreshable_auth_failure(
                 _logger.info(
                     "auth token refreshed after HTTP %d; retrying",
                     http_status,
+                    extra={"session_id": runner_primary_session_id()},
                 )
                 return fresh
         except (ValueError, OSError, ImportError):
@@ -606,6 +633,7 @@ async def _handle_refreshable_auth_failure(
                 "auth token refresh failed after HTTP %d",
                 http_status,
                 exc_info=True,
+                extra={"session_id": runner_primary_session_id()},
             )
     raise RuntimeError(
         f"{RUNNER_TUNNEL_REJECTION_PREFIX}(HTTP {http_status}); check remote server authentication"
@@ -766,7 +794,12 @@ async def _serve_tunnel_once(
             direct_attach_port=direct_attach_port,
             direct_attach_token=direct_attach_token,
         )
-        _logger.info("runner %s connected to %s", runner_id, tunnel_url)
+        _logger.info(
+            "runner %s connected to %s",
+            runner_id,
+            tunnel_url,
+            extra={"session_id": runner_primary_session_id()},
+        )
 
         def _on_resume_from_suspend(gap_s: float) -> None:
             # Wake from system suspend: this socket is now half-open (the server
@@ -781,6 +814,7 @@ async def _serve_tunnel_once(
                 "runner %s resumed from suspend (~%.0fs); dropping tunnel to reconnect",
                 runner_id,
                 gap_s,
+                extra={"session_id": runner_primary_session_id()},
             )
             if on_resume_note is not None:
                 on_resume_note()
@@ -843,6 +877,7 @@ async def _serve_tunnel_once(
                                     "during graceful shutdown of runner %s",
                                     runner_id,
                                     exc_info=True,
+                                    extra={"session_id": runner_primary_session_id()},
                                 )
                             await _graceful_drain(
                                 dispatch_tasks,
@@ -912,7 +947,10 @@ async def _graceful_drain(
             on_graceful_shutdown()
         except Exception:
             # A drain-hook error must not abort shutdown.
-            _logger.exception("on_graceful_shutdown callback failed")
+            _logger.exception(
+                "on_graceful_shutdown callback failed",
+                extra={"session_id": runner_primary_session_id()},
+            )
     if dispatch_tasks:
         # Wait for the streams to drain the sentinel and emit their end frames.
         # Bounded: a stream that never finishes must not wedge shutdown — the
@@ -926,6 +964,7 @@ async def _graceful_drain(
                 "graceful shutdown: %d dispatch task(s) did not drain in %.1fs; closing anyway",
                 len(pending),
                 _GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_S,
+                extra={"session_id": runner_primary_session_id()},
             )
 
 
@@ -1009,7 +1048,11 @@ async def _handle_tunnel_frame(
         text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
         frame = decode_frame(text)
     except ValueError as exc:
-        _logger.warning("runner received malformed tunnel frame; dropping: %s", exc)
+        _logger.warning(
+            "runner received malformed tunnel frame; dropping: %s",
+            exc,
+            extra={"session_id": runner_primary_session_id()},
+        )
         return
     if isinstance(frame, PingFrame):
         await send_text(encode_frame(PongFrame(ts=frame.ts)))
@@ -1043,7 +1086,11 @@ async def _handle_tunnel_frame(
             on_activity()
         active_channel = ws_channels.get(frame.ch_id)
         if active_channel is None:
-            _logger.debug("runner: dropping ws.frame for unknown ch_id %r", frame.ch_id)
+            _logger.debug(
+                "runner: dropping ws.frame for unknown ch_id %r",
+                frame.ch_id,
+                extra={"session_id": runner_primary_session_id()},
+            )
             return
         if frame.encoding == "utf-8":
             active_channel.inbound.put_nowait(("text", frame.data))
@@ -1054,11 +1101,16 @@ async def _handle_tunnel_frame(
                 _logger.warning(
                     "runner: dropping ws.frame with malformed base64 on ch_id %r",
                     frame.ch_id,
+                    extra={"session_id": runner_primary_session_id()},
                 )
                 return
             active_channel.inbound.put_nowait(("bytes", decoded))
         else:
-            _logger.warning("runner: dropping ws.frame with unknown encoding %r", frame.encoding)
+            _logger.warning(
+                "runner: dropping ws.frame with unknown encoding %r",
+                frame.encoding,
+                extra={"session_id": runner_primary_session_id()},
+            )
     elif isinstance(frame, WSCloseFrame):
         if on_activity is not None:
             on_activity()
@@ -1211,7 +1263,12 @@ async def _dispatch_ws_via_asgi(
             )
         raise
     except Exception as exc:  # noqa: BLE001 -- log + surface as close
-        _logger.warning("runner ws-attach dispatch %s failed: %r", channel.ch_id, exc)
+        _logger.warning(
+            "runner ws-attach dispatch %s failed: %r",
+            channel.ch_id,
+            exc,
+            extra={"session_id": runner_primary_session_id()},
+        )
         with contextlib.suppress(Exception):
             await channel.send_text(
                 encode_frame(
@@ -1245,7 +1302,12 @@ def _forget_ws_channel(
             return
         exc = task.exception()
         if exc is not None:
-            _logger.warning("runner ws-attach dispatch %s failed: %r", ch_id, exc)
+            _logger.warning(
+                "runner ws-attach dispatch %s failed: %r",
+                ch_id,
+                exc,
+                extra={"session_id": runner_primary_session_id()},
+            )
 
     return _callback
 
@@ -1274,7 +1336,12 @@ def _forget_dispatch_task(
             return
         exc = task.exception()
         if exc is not None:
-            _logger.warning("runner tunnel dispatch %s failed: %s", req_id, exc)
+            _logger.warning(
+                "runner tunnel dispatch %s failed: %s",
+                req_id,
+                exc,
+                extra={"session_id": runner_primary_session_id()},
+            )
 
     return _callback
 

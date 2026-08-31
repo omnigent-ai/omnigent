@@ -8,6 +8,9 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
+import { clearSessionDrafts, hasSessionDraft } from "@/lib/sessionDrafts";
+import { setOmnigentHostConfig } from "@/lib/host";
+import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
@@ -103,6 +106,23 @@ function textarea() {
   return screen.getByLabelText("Message the agent") as HTMLTextAreaElement;
 }
 
+function forceDesktopCoarsePointer(): () => void {
+  const original = window.matchMedia;
+  window.matchMedia = ((query: string) => ({
+    matches: query.includes("pointer: coarse"),
+    media: query,
+    onchange: null,
+    addListener: () => {},
+    removeListener: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    dispatchEvent: () => false,
+  })) as typeof window.matchMedia;
+  return () => {
+    window.matchMedia = original;
+  };
+}
+
 /** The currently highlighted menu row, or null when none is highlighted. */
 function activeRow(): HTMLElement | null {
   return document.querySelector('[data-active="true"]');
@@ -111,6 +131,34 @@ function activeRow(): HTMLElement | null {
 function renderWithTooltips(ui: ReactElement) {
   return render(<TooltipProvider>{ui}</TooltipProvider>);
 }
+
+function tooltipKeys(tooltip: HTMLElement): string[] {
+  return Array.from(tooltip.querySelectorAll('[data-slot="kbd"]')).map(
+    (key) => key.textContent ?? "",
+  );
+}
+
+describe("Composer session drafts", () => {
+  beforeEach(() => {
+    clearSessionDrafts();
+    useChatStore.setState({ conversationId: "conv_draft" });
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+  });
+
+  it("publishes unfinished text for the sidebar and clears it after send", async () => {
+    render(<Composer {...composerProps()} />);
+
+    fireEvent.change(textarea(), { target: { value: "unfinished message" } });
+    await waitFor(() => expect(hasSessionDraft("conv_draft")).toBe(true));
+
+    fireEvent.submit(textarea().closest("form")!);
+    await waitFor(() => expect(hasSessionDraft("conv_draft")).toBe(false));
+  });
+});
 
 describe("Composer growth layout", () => {
   afterEach(() => {
@@ -145,6 +193,106 @@ describe("Composer growth layout", () => {
 
     expect(ta.style.height).toBe("200px");
     expect(form?.style.marginTop).toBe("");
+  });
+
+  it("keeps long drafts scrollable without showing a native scrollbar", () => {
+    render(<Composer {...composerProps()} />);
+
+    const ta = textarea();
+    expect(ta).toHaveClass(
+      "overflow-y-auto",
+      "[scrollbar-width:none]",
+      "[&::-webkit-scrollbar]:hidden",
+    );
+    expect(ta.parentElement).toHaveClass("overflow-hidden");
+  });
+});
+
+describe("Composer send shortcut", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    clearSessionDrafts();
+    useChatStore.setState({
+      conversationId: "conv_shortcut",
+      skills: [{ name: "deslop", description: "Remove AI slop" }],
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    clearSessionDrafts();
+  });
+
+  it("keeps Enter and the legacy Mod+Enter alias in default mode", () => {
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    fireEvent.change(textarea(), { target: { value: "legacy alias" } });
+    fireEvent.keyDown(textarea(), { key: "Enter", metaKey: true });
+    expect(onSend).toHaveBeenCalledWith("legacy alias", undefined);
+
+    fireEvent.change(textarea(), { target: { value: "default shortcut" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(onSend).toHaveBeenLastCalledWith("default shortcut", undefined);
+  });
+
+  it("uses Mod+Enter after the alternate preference is restored", () => {
+    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    fireEvent.change(textarea(), { target: { value: "alternate shortcut" } });
+
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(textarea(), { key: "Enter", metaKey: true });
+    expect(onSend.mock.calls[0]?.[0]).toBe("alternate shortcut");
+  });
+
+  it("shows the alternate Send shortcut in the button tooltip", async () => {
+    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "ready to send" } });
+
+    fireEvent.pointerMove(screen.getByRole("button", { name: "Send" }), {
+      pointerType: "mouse",
+    });
+    const tooltip = await screen.findByRole("tooltip");
+
+    expect(within(tooltip).getByText("Send")).toBeInTheDocument();
+    expect(tooltipKeys(tooltip)).toEqual(["Ctrl", "↵"]);
+  });
+
+  it("keeps Enter native and hides its hint on a desktop-width coarse pointer", () => {
+    const restorePointer = forceDesktopCoarsePointer();
+    const onSend = vi.fn();
+    try {
+      render(<Composer {...composerProps({ onSend })} />);
+      fireEvent.change(textarea(), { target: { value: "/des" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(textarea().value).toBe("/des");
+      expect(onSend).not.toHaveBeenCalled();
+
+      fireEvent.focus(screen.getByRole("button", { name: "Send" }));
+      expect(screen.queryByRole("tooltip")).toBeNull();
+    } finally {
+      restorePointer();
+    }
+  });
+
+  it("keeps plain Enter completion while Mod+Enter bypasses an open slash menu", () => {
+    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    fireEvent.change(textarea(), { target: { value: "/des" } });
+
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(textarea().value).toBe("/deslop ");
+    expect(onSend).not.toHaveBeenCalled();
+
+    fireEvent.change(textarea(), { target: { value: "/des" } });
+    fireEvent.keyDown(textarea(), { key: "Enter", ctrlKey: true });
+    expect(onSend.mock.calls[0]?.[0]).toBe("/des");
   });
 });
 
@@ -211,6 +359,7 @@ describe("Composer slash-command menu", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+    setOmnigentHostConfig({});
   });
 
   it("highlights the first match as soon as the menu opens", () => {
@@ -276,14 +425,35 @@ describe("Composer slash-command menu", () => {
     expect(activeRow()).toBeNull();
   });
 
-  it("Enter sends a normal (non-slash) message", () => {
+  it("Enter sends a normal (non-slash) message and reports the send to analytics", () => {
     const onSend = vi.fn();
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
     render(<Composer {...composerProps({ onSend })} />);
     const ta = textarea();
     fireEvent.change(ta, { target: { value: "hello there" } });
 
     fireEvent.keyDown(ta, { key: "Enter" });
     expect(onSend).toHaveBeenCalledWith("hello there", undefined);
+    // Enter-key sends must emit the same telemetry as clicking Send.
+    expect(analytics).toHaveBeenCalledWith({
+      type: "click",
+      componentId: "chat.composer.send",
+      componentKind: "button",
+    });
+  });
+
+  it("Enter on an empty composer neither sends nor reports a send", () => {
+    const onSend = vi.fn();
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    render(<Composer {...composerProps({ onSend })} />);
+
+    // Empty draft: the Send button is disabled, so a click can't fire the
+    // event — the guarded Enter path must not fire it either.
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
+    expect(analytics).not.toHaveBeenCalled();
   });
 
   it("does not send when Enter confirms active IME composition", () => {
@@ -1147,6 +1317,58 @@ describe("Composer Codex Plan-mode control", () => {
   });
 });
 
+describe("Composer claude-native permission mode", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    useChatStore.setState({ claudePermissionMode: "" });
+  });
+
+  it("shows the Permissions row inside the gear modal", async () => {
+    useChatStore.setState({ conversationId: "conv_test", claudePermissionMode: "auto" });
+
+    renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
+    fireEvent.click(screen.getByTestId("composer-config-gear"));
+
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+    const row = screen.getByTestId("composer-config-permission-mode");
+    // Trigger shows the label only — the description belongs to the open list.
+    expect(row).toHaveTextContent("Auto");
+    expect(row).not.toHaveTextContent("classifier");
+  });
+
+  it("omits the Permissions row when the mode could not be determined", async () => {
+    // Claude only renders its mode footer in some pane states (a todo list
+    // displaces it), so an unknown mode must not be shown as a guess.
+    useChatStore.setState({ conversationId: "conv_test", claudePermissionMode: "" });
+
+    renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
+    fireEvent.click(screen.getByTestId("composer-config-gear"));
+
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+    expect(screen.queryByTestId("composer-config-permission-mode")).toBeNull();
+  });
+
+  it("keeps the gear reachable when the mode is the only config row", () => {
+    // A Claude session with no model/effort/routing knobs must still open the
+    // gear, since the permission mode lives behind it.
+    useChatStore.setState({ conversationId: "conv_test", claudePermissionMode: "auto" });
+
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showClaudePermissionMode: true,
+          showModels: false,
+          showEffort: false,
+          costRoutingEligible: false,
+        })}
+      />,
+    );
+
+    expect(screen.getByTestId("composer-config-gear")).toBeInTheDocument();
+  });
+});
+
 describe("slashCommandMatches", () => {
   it("matches the leaf segment after a namespace prefix", () => {
     expect(slashCommandMatches("/superpowers:using-superpowers", "using-superpowers")).toBe(true);
@@ -1332,7 +1554,7 @@ describe("Composer placeholder", () => {
 
   it("shows the normal placeholder when the runner is live", () => {
     render(<Composer {...composerProps({})} />);
-    expect(textarea().placeholder).toMatch(/ask the agent anything/i);
+    expect(textarea().placeholder).toMatch(/send a message/i);
   });
 
   it("a structural read-only reason wins over the normal placeholder", () => {
@@ -1342,17 +1564,8 @@ describe("Composer placeholder", () => {
     expect(textarea().placeholder).toBe("Mirrored transcript");
   });
 
-  it("runner_asleep (reconnectHint): enabled composer nudges the user to send", () => {
-    // Host online but runner offline — sending relaunches the runner, so the
-    // composer stays writable and the placeholder is the affordance.
-    render(<Composer {...composerProps({ reconnectHint: true })} />);
-    expect(textarea().placeholder).toBe("Send a message to reconnect this session");
-    expect(textarea().disabled).toBe(false);
-  });
-
-  it("streaming wins over the reconnect hint", () => {
-    // A queued follow-up message takes precedence over the asleep nudge.
-    render(<Composer {...composerProps({ reconnectHint: true, status: "streaming" })} />);
+  it("streaming shows the queued follow-up placeholder", () => {
+    render(<Composer {...composerProps({ status: "streaming" })} />);
     expect(textarea().placeholder).toMatch(/send a follow-up/i);
   });
 
@@ -1360,12 +1573,6 @@ describe("Composer placeholder", () => {
     // A message can't wake it, so the textarea is disabled and the banner
     // below is the only affordance.
     render(<Composer {...composerProps({ unreachable: true })} />);
-    expect(textarea().disabled).toBe(true);
-    expect(textarea().placeholder).toMatch(/reconnect below/i);
-  });
-
-  it("unreachable wins over the reconnect hint (both set defensively)", () => {
-    render(<Composer {...composerProps({ unreachable: true, reconnectHint: true })} />);
     expect(textarea().disabled).toBe(true);
     expect(textarea().placeholder).toMatch(/reconnect below/i);
   });
@@ -1656,12 +1863,18 @@ describe("Composer — queued-message flush gating", () => {
     });
 
     // Idle + a waiting head, but unreachable → the effect must not flush.
-    const { rerender } = render(<Composer {...composerProps({ unreachable: true })} />);
+    // Wrapped in TooltipProvider since the queued-message strip renders the
+    // steer button's tooltip.
+    const { rerender } = renderWithTooltips(<Composer {...composerProps({ unreachable: true })} />);
     await waitFor(() => expect(sendSpy).not.toHaveBeenCalled());
     expect(useChatStore.getState().queuedMessages).toHaveLength(1);
 
     // Becomes reachable → the effect re-fires and drains the head.
-    rerender(<Composer {...composerProps({ unreachable: false })} />);
+    rerender(
+      <TooltipProvider>
+        <Composer {...composerProps({ unreachable: false })} />
+      </TooltipProvider>,
+    );
     await waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(1));
     expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["held", "agent_xyz"]);
     expect(useChatStore.getState().queuedMessages).toHaveLength(0);
@@ -2017,6 +2230,76 @@ describe("Composer config gear", () => {
     resolveModel();
     await waitFor(() => expect(setEffort).toHaveBeenCalledWith("low"));
     expect(calls).toEqual(["model", "effort"]);
+  });
+
+  it("recomputes the Codex effort ladder for the drafted model and drops an unsupported level", async () => {
+    // Codex advertises a per-model effort ladder. Drafting a lower-ceiling
+    // model (Luna, no "ultra") must refresh the dropdown to that model's levels
+    // and drop a picked level it can't run — else Save would send Sol's "ultra"
+    // to Luna, and the dropdown would show a rung Luna rejects.
+    const codexOptions = [
+      {
+        id: "gpt-5.6-sol",
+        model: "gpt-5.6-sol",
+        displayName: "GPT-5.6-Sol",
+        isDefault: true,
+        supportedReasoningEfforts: [
+          { reasoningEffort: "low" },
+          { reasoningEffort: "medium" },
+          { reasoningEffort: "high" },
+          { reasoningEffort: "xhigh" },
+          { reasoningEffort: "max" },
+          { reasoningEffort: "ultra" },
+        ],
+      },
+      {
+        id: "gpt-5.6-luna",
+        model: "gpt-5.6-luna",
+        displayName: "GPT-5.6-Luna",
+        supportedReasoningEfforts: [
+          { reasoningEffort: "low" },
+          { reasoningEffort: "medium" },
+          { reasoningEffort: "high" },
+          { reasoningEffort: "xhigh" },
+          { reasoningEffort: "max" },
+        ],
+      },
+    ] as never;
+    useChatStore.setState({
+      setModel: vi.fn().mockResolvedValue(undefined),
+      setEffort: vi.fn().mockResolvedValue(undefined),
+      selectedEffort: "ultra",
+      llmModel: "gpt-5.6-sol",
+      codexModelOptions: codexOptions,
+      refreshSessionOverrides: vi.fn().mockResolvedValue(undefined),
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          showEffort: true,
+          modelPickerKind: "codex",
+          effortLevels: ["low", "medium", "high", "xhigh", "max", "ultra"],
+          codexModelOptions: codexOptions,
+        })}
+      />,
+    );
+    fireEvent.click(gear()!);
+    await screen.findByTestId("composer-config-modal");
+
+    // Sol starts on ultra.
+    expect(screen.getByTestId("composer-config-effort")).toHaveTextContent("ultra");
+
+    // Draft a switch to Luna, whose ceiling is "max".
+    fireEvent.click(document.querySelector('[data-testid="composer-config-model"]') as Element);
+    fireEvent.click(document.querySelector('[data-model-id="gpt-5.6-luna"]') as Element);
+
+    // The picked ultra is dropped (back to Default) and no longer offered,
+    // while Luna's own max stays.
+    expect(screen.getByTestId("composer-config-effort")).toHaveTextContent("Default");
+    fireEvent.click(document.querySelector('[data-testid="composer-config-effort"]') as Element);
+    expect(document.querySelector('[data-effort-level="ultra"]')).toBeNull();
+    expect(document.querySelector('[data-effort-level="max"]')).not.toBeNull();
   });
 
   it("skips unchanged knobs on Save (no spurious slash-command injection)", async () => {
@@ -2613,5 +2896,18 @@ describe("shouldQueueSend", () => {
 
   it("ignores queued messages belonging to a different conversation", () => {
     expect(shouldQueueSend("conv_a", "idle", "idle", [q("conv_b")])).toBe(false);
+  });
+
+  it("sends directly while busy when alwaysSteer is on", () => {
+    // The whole point of the preference: a mid-turn follow-up is POSTed now
+    // (steered) instead of parking in the queue strip.
+    expect(shouldQueueSend("conv_a", "streaming", "idle", [], true)).toBe(false);
+    expect(shouldQueueSend("conv_a", "idle", "running", [], true)).toBe(false);
+  });
+
+  it("still queues under alwaysSteer when this conversation has a queued message", () => {
+    // The ordering guard outranks always-steer: draining must stay in order, so
+    // a direct send can't overtake a still-queued earlier one.
+    expect(shouldQueueSend("conv_a", "streaming", "running", [q("conv_a")], true)).toBe(true);
   });
 });

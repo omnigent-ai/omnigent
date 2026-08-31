@@ -44,10 +44,12 @@ never ``gemini``.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.env_credentials import (
     _ENV_REF_RE,
     env_names_with_omnigent_prefix,
@@ -58,6 +60,8 @@ from omnigent.env_credentials import (
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.spec.parser import check_unresolved_env_vars
+
+_logger = logging.getLogger(__name__)
 
 # Family keys. ``anthropic`` is the Messages-API surface (Claude SDK,
 # native Claude); ``openai`` is the Responses/Chat surface (Codex,
@@ -92,10 +96,11 @@ _PI_FALLBACK_FAMILIES = (ANTHROPIC_FAMILY, OPENAI_FAMILY)
 # too (a Databricks AI Gateway is pi-consumable — Pi speaks its Anthropic
 # surface), with the actual gateway capability validated at resolution time.
 # A ``subscription`` (CLI login, unusable outside its own CLI) and ``bedrock``
-# (native-``omnigent claude`` only) can never drive pi. Resolution: an
-# explicit pi default wins; otherwise pi falls back to the anthropic then
-# openai family default, skipping the non-pi kinds (see
-# :func:`default_provider_for_harness`).
+# (native-``omnigent claude`` only) can never drive pi — EXCEPT for a pi
+# subscription (``kind="subscription", cli="pi"``), which explicitly opts into
+# Pi's own native auth and may default the pi surface. Resolution: an explicit
+# pi default wins; otherwise pi falls back to the anthropic then openai family
+# default, skipping the non-pi kinds (see :func:`default_provider_for_harness`).
 PI_SURFACE = "pi"
 
 # Accepted ``wire_api`` values. ``responses`` is the OpenAI Responses API;
@@ -124,6 +129,14 @@ LOCAL_KIND = "local"
 DATABRICKS_KIND: Literal["databricks"] = "databricks"
 CLI_CONFIG_KIND = "cli-config"
 BEDROCK_KIND = "bedrock"
+
+# The CLIs whose own config file this build knows how to drive for a
+# ``cli-config`` provider. A ``cli-config`` entry naming any other CLI is a
+# shape from a newer build (or a stale entry a newer build wrote, e.g. a
+# ``cli: claude`` gateway): :func:`load_providers` SKIPS it with a warning
+# rather than raising, so one such entry cannot crash every turn's config
+# parse — the forward-compatibility gap that broke released runners.
+_CLI_CONFIG_RECOGNIZED_CLIS = frozenset({"codex"})
 _VALID_KINDS = (
     KEY_KIND,
     SUBSCRIPTION_KIND,
@@ -169,6 +182,7 @@ _HARNESS_FAMILY: dict[str, str] = {
     # Antigravity is Gemini-native but routes generic-provider traffic over
     # the OpenAI-compatible wire, so it consumes the ``openai`` family.
     "antigravity": OPENAI_FAMILY,
+    "agy": OPENAI_FAMILY,
     # NB: ``kimi`` is intentionally absent. Upstream Kimi Code CLI has no
     # per-spawn provider override flag, so Omnigent cannot thread a generic
     # provider through. Provider routing for kimi lives in ``~/.kimi/config.toml``
@@ -182,9 +196,11 @@ _HARNESS_FAMILY: dict[str, str] = {
     # (file-based, checked in :mod:`omnigent.onboarding.gemini_auth`) and the
     # detected GEMINI_API_KEY is adopted as a ``gemini``-family key, so the
     # native harness consumes the ``gemini`` family for onboarding / readiness.
-    # Both spellings are accepted, mirroring claude-native / native-claude.
+    # All spellings and aliases are accepted, mirroring claude-native / native-claude.
     "antigravity-native": GEMINI_FAMILY,
     "native-antigravity": GEMINI_FAMILY,
+    "agy-native": GEMINI_FAMILY,
+    "native-agy": GEMINI_FAMILY,
 }
 
 # Executor-type spellings that ``AgentSpec.harness_kind`` returns for SDK
@@ -223,6 +239,51 @@ def provider_family_for_harness(harness: str | None) -> str | None:
 
 
 @dataclass(frozen=True)
+class ModelPricingConfig:
+    """Custom per-million-token pricing for self-hosted models.
+
+    Allows users to specify pricing in their provider config when the
+    model isn't in the MLflow catalog (e.g., Ollama, vLLM, custom gateways).
+    Prices are specified per million tokens and later converted to per-token
+    rates for cost computation.
+
+    All price values must be >= 0. When cache pricing is omitted, the cost
+    computation will derive it from the input rate using standard fallback
+    ratios (cache read ≈ 0.10×, cache write ≈ 1.25×).
+
+    :param input_per_million: Input price per million tokens (USD), e.g.
+        ``0.25`` for $0.25 per 1M input tokens.
+    :param output_per_million: Output price per million tokens (USD), e.g.
+        ``1.0`` for $1.00 per 1M output tokens.
+    :param cache_read_per_million: Optional cache-read (cache-hit) price per
+        million tokens (USD). Typically ~0.1× the input rate.
+    :param cache_write_per_million: Optional cache-write (cache-creation)
+        price per million tokens (USD). Typically ~1.25× the input rate.
+    :raises ValueError: If any price value is negative.
+    """
+
+    input_per_million: float
+    output_per_million: float
+    cache_read_per_million: float | None = None
+    cache_write_per_million: float | None = None
+
+    def __post_init__(self) -> None:
+        """Validate that all pricing values are non-negative."""
+        if self.input_per_million < 0:
+            raise ValueError(f"input_per_million must be >= 0, got {self.input_per_million}")
+        if self.output_per_million < 0:
+            raise ValueError(f"output_per_million must be >= 0, got {self.output_per_million}")
+        if self.cache_read_per_million is not None and self.cache_read_per_million < 0:
+            raise ValueError(
+                f"cache_read_per_million must be >= 0, got {self.cache_read_per_million}"
+            )
+        if self.cache_write_per_million is not None and self.cache_write_per_million < 0:
+            raise ValueError(
+                f"cache_write_per_million must be >= 0, got {self.cache_write_per_million}"
+            )
+
+
+@dataclass(frozen=True)
 class FamilyConfig:
     """One provider family (``anthropic`` or ``openai``) for a harness surface.
 
@@ -257,6 +318,19 @@ class FamilyConfig:
     :param models: Map of role/tier to model id, with an optional
         ``default`` key consulted when the spec declares no model, e.g.
         ``{"default": "gpt-4o", "opus": "claude-opus-4"}``.
+    :param pricing: Optional custom per-million-token pricing for
+        self-hosted models and gateways (e.g., Ollama, vLLM, custom endpoints).
+        When configured, this pricing takes precedence over catalog lookup,
+        allowing self-hosted providers serving catalog-known model IDs to use
+        their own rates. ``None`` (the default) means no custom pricing — falls
+        back to catalog. See :class:`ModelPricingConfig`.
+    :param context_window: Optional context window size in tokens for the
+        default model (e.g. ``1048576`` for a 1M-context gateway model).
+        When set, pi-native sessions advertise this limit in ``models.json``
+        so Pi does not fall back to its own 128k default.
+    :param max_output_tokens: Optional maximum output token count for the
+        default model (e.g. ``65536``). When set, pi-native sessions
+        advertise this limit in ``models.json`` instead of Pi's 16k default.
     """
 
     base_url: str
@@ -265,6 +339,9 @@ class FamilyConfig:
     auth_command: str | None = None
     wire_api: str | None = None
     models: dict[str, str] = field(default_factory=dict)
+    pricing: ModelPricingConfig | None = None
+    context_window: int | None = None
+    max_output_tokens: int | None = None
 
     @property
     def default_model(self) -> str | None:
@@ -454,7 +531,7 @@ def resolve_secret(ref: str) -> str:
         if value is None:
             raise OmnigentError(
                 f"no stored secret named {name!r}; run "
-                "`omnigent setup --no-internal-beta` to set it.",
+                f"`{cli_invocation()} setup --no-internal-beta` to set it.",
                 code=ErrorCode.INVALID_INPUT,
             )
         return value
@@ -651,6 +728,66 @@ def _parse_family(provider_name: str, family_name: str, raw: dict[str, object]) 
     models = (
         {str(k): str(v) for k, v in models_raw.items()} if isinstance(models_raw, dict) else {}
     )
+
+    # Parse optional custom pricing for self-hosted models
+    pricing_raw = raw.get("pricing")
+    pricing: ModelPricingConfig | None = None
+    if pricing_raw is not None:
+        if not isinstance(pricing_raw, dict):
+            raise OmnigentError(
+                f"{prefix}.pricing must be a mapping, got {type(pricing_raw).__name__}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        input_price = pricing_raw.get("input_per_million")
+        output_price = pricing_raw.get("output_per_million")
+        if input_price is None or output_price is None:
+            raise OmnigentError(
+                f"{prefix}.pricing requires both 'input_per_million' and "
+                "'output_per_million' fields.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        try:
+            pricing = ModelPricingConfig(
+                input_per_million=float(input_price),
+                output_per_million=float(output_price),
+                cache_read_per_million=(
+                    float(pricing_raw["cache_read_per_million"])
+                    if "cache_read_per_million" in pricing_raw
+                    else None
+                ),
+                cache_write_per_million=(
+                    float(pricing_raw["cache_write_per_million"])
+                    if "cache_write_per_million" in pricing_raw
+                    else None
+                ),
+            )
+        except ValueError as exc:
+            raise OmnigentError(
+                f"{prefix}.pricing: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+
+    context_window_raw = raw.get("context_window")
+    context_window: int | None = None
+    if context_window_raw is not None:
+        if not isinstance(context_window_raw, int) or context_window_raw <= 0:
+            raise OmnigentError(
+                f"{prefix}.context_window must be a positive integer, got {context_window_raw!r}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        context_window = context_window_raw
+
+    max_output_tokens_raw = raw.get("max_output_tokens")
+    max_output_tokens: int | None = None
+    if max_output_tokens_raw is not None:
+        if not isinstance(max_output_tokens_raw, int) or max_output_tokens_raw <= 0:
+            raise OmnigentError(
+                f"{prefix}.max_output_tokens must be a positive integer, "
+                f"got {max_output_tokens_raw!r}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        max_output_tokens = max_output_tokens_raw
+
     return FamilyConfig(
         base_url=base_url_raw,
         api_key=api_key,
@@ -658,6 +795,9 @@ def _parse_family(provider_name: str, family_name: str, raw: dict[str, object]) 
         auth_command=auth_command,
         wire_api=wire_api,
         models=models,
+        pricing=pricing,
+        context_window=context_window,
+        max_output_tokens=max_output_tokens,
     )
 
 
@@ -717,7 +857,7 @@ def _parse_default_families(
     # ``provider_families`` and rejects a hand-edited ``default: ["gemini",
     # "pi"]`` at parse time (parity with how a subscription's pi scope is
     # rejected), rather than failing loudly only at pi launch.
-    pi_ok = pi_capable and bool(served & frozenset(_PI_FALLBACK_FAMILIES))
+    pi_ok = pi_capable and (bool(served & frozenset(_PI_FALLBACK_FAMILIES)) or not served)
     allowed = served | {PI_SURFACE} if pi_ok else served
     invalid = requested - allowed
     if invalid:
@@ -798,19 +938,24 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
                 code=ErrorCode.INVALID_INPUT,
             )
         # A subscription serves the family its CLI implies (claude→anthropic,
-        # codex→openai); an unknown CLI serves nothing.
+        # codex→openai); a pi subscription serves no model family directly —
+        # it is pi-capable so it can claim the pi scope explicitly, signalling
+        # "use Pi's own native auth"; an unknown CLI serves nothing.
         served = (
             {ANTHROPIC_FAMILY}
             if cli_raw == "claude"
             else ({OPENAI_FAMILY} if cli_raw == "codex" else set())
         )
+        # claude/codex subscriptions are locked to their own CLIs and cannot
+        # drive pi. A pi subscription explicitly opts into Pi's own native auth
+        # and may default the pi surface (pi_capable=True, served={}).
         return ProviderEntry(
             name=name,
             kind=kind,
             cli=cli_raw,
-            # A subscription is locked to its own CLI, so it can never drive
-            # pi — naming "pi" in its default scope is a config error.
-            default_families=_parse_default_families(name, default_raw, served, pi_capable=False),
+            default_families=_parse_default_families(
+                name, default_raw, served, pi_capable=(cli_raw == "pi")
+            ),
         )
 
     if kind == CLI_CONFIG_KIND:
@@ -953,6 +1098,24 @@ def load_providers(config: dict[str, object]) -> dict[str, ProviderEntry]:
                 f"provider {str(name)!r} must be a mapping.",
                 code=ErrorCode.INVALID_INPUT,
             )
+        # Forward compatibility: a ``cli-config`` entry naming a CLI this build
+        # doesn't drive (e.g. a ``cli: claude`` gateway written by a newer
+        # build) is SKIPPED, not fatal. Raising here would propagate out of the
+        # whole parse and fail turn setup on every harness — the version-skew
+        # break that took down released runners. One unknown provider is
+        # ignored; the rest of the config still loads.
+        if (
+            raw.get("kind") == CLI_CONFIG_KIND
+            and raw.get("cli") not in _CLI_CONFIG_RECOGNIZED_CLIS
+        ):
+            _logger.warning(
+                "provider %r: ignoring cli-config entry for unrecognized cli %r "
+                "(a newer build may understand it; this build drives %s).",
+                str(name),
+                raw.get("cli"),
+                sorted(_CLI_CONFIG_RECOGNIZED_CLIS),
+            )
+            continue
         result[str(name)] = _parse_provider(str(name), raw)
     return result
 
@@ -1056,8 +1219,8 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
       plus the :data:`PI_SURFACE` scope (pi consumes either family).
     - ``subscription`` / ``cli-config``: derived from the CLI — ``claude``
       serves the ``anthropic`` surface, ``codex`` serves the ``openai``
-      surface. Never pi: a CLI login (or a provider pinned in the CLI's
-      own config file) is unusable outside its own CLI.
+      surface, ``pi`` serves only the :data:`PI_SURFACE` scope (signals
+      "use Pi's own native auth"). Other CLIs serve nothing.
     - ``databricks``: both families plus pi — ucode routes the Claude,
       Codex, and pi surfaces.
 
@@ -1097,6 +1260,10 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
     if entry.kind in (SUBSCRIPTION_KIND, CLI_CONFIG_KIND):
         if entry.cli == "claude":
             return frozenset({ANTHROPIC_FAMILY})
+        if entry.cli == "pi":
+            # A pi subscription signals "use Pi's own native auth" — it serves
+            # only the pi scope (no model family directly).
+            return frozenset({PI_SURFACE})
         if entry.cli == "codex":
             # A codex *cli-config* provider may ALSO serve pi: a Databricks AI
             # Gateway exposes an Anthropic Messages surface Pi speaks natively

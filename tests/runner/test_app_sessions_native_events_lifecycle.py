@@ -250,6 +250,198 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
 
 
 @pytest.mark.asyncio
+async def test_events_codex_native_plan_mode_change_preserves_developer_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A plan-mode toggle must not silently wipe ``developer_instructions``.
+
+    Without the current-value read, the plan-mode collaboration-mode
+    settings send always carried
+    ``developer_instructions: null``, clearing whatever
+    ``build_codex_native_server`` had persisted into the bridge's private
+    ``config.toml`` the moment a user toggled Plan mode. This drives the
+    real HTTP path end-to-end and asserts the current value is read back
+    and threaded through to ``thread/settings/update``.
+    """
+    from omnigent import codex_native_app_server
+    from omnigent.codex_native_bridge import codex_home_for_bridge_dir
+
+    conv_id = "6f2f8f7f6a3b4c5d9e0f1a2b3c4d5e6f"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_home = codex_home_for_bridge_dir(bridge_dir)
+    codex_home.mkdir(parents=True)
+    (codex_home / "config.toml").write_text(
+        'developer_instructions = "Be a concise coding assistant."\n'
+    )
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43210",
+            thread_id="thread_codex",
+            codex_home=str(codex_home),
+            active_turn_id=None,
+        ),
+    )
+
+    fake_client = _RecordingCodexAppServerClient(
+        transport="ws://127.0.0.1:43210",
+        client_name="omnigent-codex-native-runner",
+    )
+
+    def _fake_client_for_transport(
+        transport: str, *, client_name: str = "omnigent"
+    ) -> _RecordingCodexAppServerClient:
+        assert transport == fake_client.transport
+        assert client_name == fake_client.client_name
+        return fake_client
+
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", _fake_client_for_transport
+    )
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "codex-native", "model": "gpt-5.4"},
+        ),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return codex_native_spec
+
+    async def _no_op_auto_create(*args: Any, **kwargs: Any) -> None:
+        # Stands in for the auto-create-terminal path, which needs a real
+        # terminal registry and otherwise overwrites the bridge state written
+        # above during session creation.
+        del args, kwargs
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal", _no_op_auto_create
+    )
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "plan_mode_change", "enabled": True},
+        )
+
+    assert resp.status_code == 204, resp.text
+    assert fake_client.requests == [
+        (
+            "thread/settings/update",
+            {
+                "threadId": "thread_codex",
+                "collaborationMode": {
+                    "mode": "plan",
+                    "settings": {
+                        "model": "gpt-5.4",
+                        "reasoning_effort": None,
+                        "developer_instructions": "Be a concise coding assistant.",
+                    },
+                },
+            },
+        ),
+    ], fake_client.requests
+
+
+@pytest.mark.asyncio
+async def test_events_codex_native_plan_mode_change_503s_when_config_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A plan-mode toggle must fail loudly (503), not guess, when the private
+    ``config.toml`` holding ``developer_instructions`` can't be read.
+
+    Regression guard: collapsing "unreadable" into "genuinely absent" would
+    send ``developer_instructions: null`` on a transient read glitch,
+    silently wiping live state — the same class of bug this whole codex
+    plan-mode preservation feature exists to prevent. The tri-state read
+    must refuse to guess instead.
+    """
+    from omnigent.codex_native_bridge import codex_home_for_bridge_dir
+
+    conv_id = "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_home = codex_home_for_bridge_dir(bridge_dir)
+    codex_home.mkdir(parents=True)
+    (codex_home / "config.toml").write_bytes(b"\xff\xfe not valid utf-8")
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43210",
+            thread_id="thread_codex",
+            codex_home=str(codex_home),
+            active_turn_id=None,
+        ),
+    )
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "codex-native", "model": "gpt-5.4"},
+        ),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return codex_native_spec
+
+    async def _no_op_auto_create(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal", _no_op_auto_create
+    )
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "plan_mode_change", "enabled": True},
+        )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"] == "codex_native_settings_update_failed"
+
+
+@pytest.mark.asyncio
 async def test_events_codex_native_model_change_without_bridge_fails_loud(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2919,6 +3111,58 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
     assert parent_inbox.empty()
     # The harness subprocess is still released — the terminal is gone.
     assert pm.released == [conv_id]
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_codex_tui_exit_preserves_app_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Losing the streamable TUI does not cancel Codex's active control plane."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.resource_registry import TerminalExitEvent, TerminalLifecycle
+
+    conv_id = uuid.uuid4().hex
+    teardown_calls: list[str] = []
+
+    async def _record_teardown(session_id: str) -> None:
+        teardown_calls.append(session_id)
+
+    monkeypatch.setattr(
+        runner_app._native_runtime,
+        "teardown_codex_native_app_server",
+        _record_teardown,
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    publish_exit = app.state.session_resource_registry._terminal_exit_publisher
+    assert callable(publish_exit)
+
+    try:
+        publish_exit(
+            TerminalExitEvent(
+                session_id=conv_id,
+                terminal_id="terminal_codex_main",
+                terminal_name="codex",
+                session_key="main",
+                lifecycle=TerminalLifecycle.AUXILIARY,
+            )
+        )
+        await asyncio.sleep(0)
+        events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+
+    assert teardown_calls == []
+    assert {
+        "type": "session.resource.deleted",
+        "resource_id": "terminal_codex_main",
+        "resource_type": "terminal",
+        "session_id": conv_id,
+    } in events
+    assert not [event for event in events if event.get("type") == "session.status"]
 
 
 @pytest.mark.parametrize("terminal_name", ["qwen", "antigravity"])

@@ -72,11 +72,10 @@ interface NativeShellApi {
    */
   onNotificationActivated?: (callback: (path: string) => void) => () => void;
   /**
-   * Subscribe to deep-link navigations from the desktop shell. When the user
-   * clicks an `omnigent://.../c/<id>` link for a server this window is already
-   * on, the main process sends the in-app path here so the SPA routes to it
-   * in-place (no reload). Same path shape as onNotificationActivated. Absent
-   * on older shells / outside Electron; returns an unsubscribe.
+   * Subscribe to in-app navigation from the desktop shell. Native menu actions
+   * and same-server deep links send a basename-less path so the SPA can route
+   * in place without reloading. Absent on older shells / outside Electron;
+   * returns an unsubscribe.
    */
   onOpenPath?: (callback: (path: string) => void) => () => void;
   /**
@@ -156,9 +155,9 @@ interface ElectronDesktopApi extends NativeShellApi {
    * idle, so the web never shows a (duplicate) banner. Absent on older shells.
    */
   updates?: ElectronUpdateBridge;
-  /** Current server origin + recent servers, or null on a foreign page. */
+  /** Current server origin + managed/recent choices, or null on a foreign page. */
   getServerPicker?: () => Promise<ServerPickerInfo | null>;
-  /** Re-point this window to a previously-connected server URL. */
+  /** Re-point this window to a server URL returned by the picker. */
   switchServer?: (url: string) => Promise<void>;
   /** Return this window to the shell's "connect to server" setup page. */
   openServerSetup?: () => void;
@@ -278,12 +277,21 @@ export interface ElectronUpdateBridge {
   installNow: () => Promise<void>;
   setConfig: (patch: Partial<UpdateConfig>) => Promise<UpdateConfig>;
   onStatus: (callback: (status: UpdateStatus) => void) => () => void;
+  /** Shell-owned update card height; optional on older desktop builds. */
+  getOverlayHeight?: () => Promise<number>;
+  /** Subscribe to shell-owned update card height changes. */
+  onOverlayHeight?: (callback: (height: number) => void) => () => void;
 }
 
 /** Data backing the title-bar server picker, from the Electron shell. */
 export interface ServerPickerInfo {
   /** Origin this window is connected to, e.g. `"http://localhost:8000"`. */
   currentOrigin: string;
+  /**
+   * Server URLs supplied through macOS Managed Preferences. Optional because a
+   * newer server-served SPA can run inside a desktop shell that predates MDM.
+   */
+  managedServers?: string[];
   /** Recently-connected server URLs, most recent first. */
   recentServers: string[];
   /**
@@ -503,16 +511,14 @@ export function onNativeNotificationActivated(callback: (path: string) => void):
 }
 
 /**
- * Subscribe to deep-link navigations from the desktop shell. When the user
- * clicks an `omnigent://.../c/<id>` link for a server this window is already
- * on, the main process sends the in-app path here so the SPA can route to it
- * in-place (no reload) — reusing the same router `navigate` a notification
- * click uses. The path is basename-less (`/c/<id>`); the embedded build's
- * `basenamedRouting` rebases it under the mount.
+ * Subscribe to in-app navigation from the desktop shell. Native menu actions
+ * and same-server deep links send basename-less paths such as `/settings` and
+ * `/c/<id>` so the SPA can route in place without reloading. The embedded
+ * build's `basenamedRouting` rebases them under the mount.
  *
  * Returns an unsubscribe function. A no-op (returning a no-op unsubscribe)
- * outside the Electron shell or under a shell too old to support deep-link
- * routing, so callers can register it unconditionally.
+ * outside the Electron shell or under a shell too old to support in-app
+ * navigation, so callers can register it unconditionally.
  */
 export function onOpenPath(callback: (path: string) => void): () => void {
   const native = nativeApi();
@@ -670,8 +676,8 @@ export function onNativeInsets(callback: (insets: NativeInsets) => void): () => 
 }
 
 /**
- * Fetch the title-bar server picker data from the Electron shell: the
- * window's current server origin plus the recently-connected server list.
+ * Fetch server picker data from the Electron shell: the current origin plus
+ * organization-provided and recently-connected server lists.
  *
  * Resolves `null` outside the Electron shell, under a shell too old to
  * support the picker, or on a page the shell doesn't recognize as a
@@ -689,9 +695,9 @@ export async function getServerPicker(): Promise<ServerPickerInfo | null> {
 }
 
 /**
- * Ask the Electron shell to re-point this window to another
- * previously-connected server URL (one of `ServerPickerInfo.recentServers`).
- * The shell navigates the whole window, so on success this page unloads.
+ * Ask the Electron shell to re-point this window to another URL returned in
+ * `ServerPickerInfo.managedServers` or `recentServers`. The shell navigates the
+ * whole window, so on success this page unloads.
  */
 export async function switchServer(url: string): Promise<void> {
   const electron = electronApi();

@@ -25,6 +25,7 @@ import {
   type QueryClient,
 } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import { startTimedInteraction } from "@/lib/analyticsEmit";
 import {
   filtersFromConversationQueryKey,
   mergeItemsIntoPages,
@@ -404,6 +405,13 @@ async function fetchConversationsPage({
  * distinct four-element key that refetches when the picker changes. Used by
  * the Archived settings view's project filter.
  */
+// Latch so the list_sessions CUJ times only the first full-list fetch per app
+// load. `useConversations` is observed by several components sharing one query
+// cache, and it also refetches on a background poll / WS reconcile / pagination —
+// none of which are the user "open the list" action. A module-scoped flag times
+// exactly one fetch regardless of observer count, then stays latched.
+let initialListLoadTimed = false;
+
 export function useConversations(
   searchQuery = "",
   includeArchived = false,
@@ -426,13 +434,29 @@ export function useConversations(
     queryKey: project
       ? ["conversations", searchQuery, includeArchived, project]
       : ["conversations", searchQuery, includeArchived],
-    queryFn: ({ pageParam }) =>
-      fetchConversationsPage({
-        after: pageParam as string | undefined,
-        searchQuery,
-        includeArchived,
-        project,
-      }),
+    queryFn: async ({ pageParam }) => {
+      const fetchPage = () =>
+        fetchConversationsPage({
+          after: pageParam as string | undefined,
+          searchQuery,
+          includeArchived,
+          project,
+        });
+      // Time the first full-list load per app session; skip pagination
+      // (pageParam set) and every later fetch (poll / reconcile / invalidation).
+      if (initialListLoadTimed || pageParam !== undefined) return fetchPage();
+      initialListLoadTimed = true;
+      const interaction = startTimedInteraction("list_sessions");
+      try {
+        const page = await fetchPage();
+        interaction.complete();
+        return page;
+      } catch (error) {
+        interaction.fail();
+        throw error;
+      }
+    },
+
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) =>
       lastPage.has_more ? (lastPage.last_id ?? undefined) : undefined,
@@ -1802,7 +1826,8 @@ export function useDeleteProject() {
 export function useCreateProject() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (name: string) => apiCreateProject(name),
+    mutationFn: ({ name, icon }: { name: string; icon?: string }) =>
+      apiCreateProject(name, icon ? { icon } : undefined),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
     },
@@ -1863,6 +1888,10 @@ export function useRenameProject() {
           if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
         }),
       );
+      // Return the resolved id so a caller promoting a label-only folder can
+      // target the just-created row for a follow-up write instead of passing
+      // the stale `null` and re-creating it (which 409s on the duplicate name).
+      return projectId;
     },
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });

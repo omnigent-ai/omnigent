@@ -20,6 +20,7 @@ from omnigent.db.utils import (
     _initialize_or_verify_schema,
     _install_lakebase_token_refresh,
     _resolve_lakebase_token_provider,
+    _run_migrations,
     _shared_read_sessions,
     build_search_snippet,
     builtin_agent_id,
@@ -302,6 +303,29 @@ def test_create_engine_wires_token_refresh_and_short_recycle(
         engine.dispose()
 
 
+def test_build_alembic_config_preserves_percent_encoded_database_url() -> None:
+    """Alembic accepts URL-encoded credentials without changing the URL."""
+    uri = "postgresql+psycopg://user:p%40ss%25word@db.example.com:5432/app"
+
+    config = _build_alembic_config(uri)
+
+    assert config.get_main_option("sqlalchemy.url") == uri
+
+
+def test_alembic_env_override_preserves_percent_encoded_database_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The environment override survives Alembic's ConfigParser boundary."""
+    uri = f"sqlite:///{tmp_path / 'override%25.db'}"
+    config = _build_alembic_config("sqlite:///:memory:")
+    monkeypatch.setenv("OMNIGENT_DB_URL", uri)
+
+    command.upgrade(config, "head")
+
+    assert config.get_main_option("sqlalchemy.url") == uri
+
+
 # ── _initialize_or_verify_schema ────────────────────────
 
 
@@ -324,6 +348,24 @@ def _make_db_at_revision(db_path: Path, revision: str) -> str:
         with engine.begin() as conn:
             config.attributes["connection"] = conn
             command.upgrade(config, revision)
+    finally:
+        engine.dispose()
+    return uri
+
+
+def _make_db_at_unknown_revision(db_path: Path, revision: str) -> str:
+    """Build a SQLite database stamped beyond this build's migration map."""
+    uri = f"sqlite:///{db_path}"
+    engine = create_engine(uri)
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
+            )
+            conn.exec_driver_sql(
+                "INSERT INTO alembic_version (version_num) VALUES (?)",
+                (revision,),
+            )
     finally:
         engine.dispose()
     return uri
@@ -460,6 +502,63 @@ def test_initialize_or_verify_schema_reports_manual_retry_when_auto_migration_fa
         f"Error message must include the database URL so the "
         f"command is copy-pastable. Got: {msg!r}"
     )
+
+
+def test_initialize_or_verify_schema_reports_database_from_newer_build(
+    tmp_path: Path,
+) -> None:
+    """An unknown DB revision means this build is too old, not that the DB is stale."""
+    future_revision = "deadbeef1234"
+    uri = _make_db_at_unknown_revision(tmp_path / "newer.db", future_revision)
+    head = _get_head_db_revision(uri)
+
+    engine = create_engine(uri)
+    try:
+        with pytest.raises(RuntimeError, match="newer") as exc_info:
+            _initialize_or_verify_schema(engine, uri)
+    finally:
+        engine.dispose()
+
+    msg = str(exc_info.value)
+    assert future_revision in msg
+    assert head in msg
+    assert "out of date" not in msg.lower()
+    assert "db-upgrade" not in msg
+
+
+def test_initialize_or_verify_schema_does_not_migrate_database_from_newer_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup must leave a database from a newer build untouched."""
+    uri = _make_db_at_unknown_revision(tmp_path / "newer.db", "deadbeef1234")
+    run_migrations = MagicMock()
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", run_migrations)
+
+    engine = create_engine(uri)
+    try:
+        with pytest.raises(RuntimeError, match="newer"):
+            _initialize_or_verify_schema(engine, uri)
+    finally:
+        engine.dispose()
+
+    run_migrations.assert_not_called()
+
+
+def test_run_migrations_reports_database_from_newer_build(tmp_path: Path) -> None:
+    """The manual db-upgrade path must replace Alembic's CommandError."""
+    future_revision = "deadbeef1234"
+    uri = _make_db_at_unknown_revision(tmp_path / "newer.db", future_revision)
+
+    engine = create_engine(uri)
+    try:
+        with pytest.raises(RuntimeError, match="newer") as exc_info:
+            _run_migrations(engine, uri)
+        assert _get_current_db_revision(engine) == future_revision
+    finally:
+        engine.dispose()
+
+    assert "Can't locate revision" not in str(exc_info.value)
 
 
 # ── slash_command persistence path ────────────────────

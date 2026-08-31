@@ -27,6 +27,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from omnigent._platform import resolve_repo_symlink
 from omnigent.db.db_models import InvalidUuidError
+from omnigent.debug_logging import set_current_user_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import (
     NativeHarnessProvider,
@@ -43,7 +44,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.server import session_live_state
+from omnigent.server import session_live_state, shutdown_state
 from omnigent.server.auth import AuthProvider, SharingMode
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -209,6 +210,21 @@ _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
 _SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
+
+
+def _session_id_from_request(request: Request) -> str | None:
+    """Best-effort session id parsed from a ``/v1/sessions/<id>/…`` request path.
+
+    Threaded into exception-handler logs (``extra={"session_id": …}``) so a 500
+    on a session route carries its conversation id in the debug-logs table. Read
+    from the request explicitly per-invocation — no ambient/request-scoped
+    session ContextVar exists on the server, deliberately, to avoid
+    cross-request mis-attribution.
+    """
+    match = _SESSION_PATH_RE.search(request.url.path)
+    return match.group(1) if match else None
+
+
 # polly's and debby's multi-file bundles are packaged under
 # omnigent.resources.examples (see pyproject package-data), so they resolve
 # in both a repo checkout and an installed wheel. The presence check in each
@@ -442,8 +458,10 @@ def _ensure_builtin_agent(
       update the row in place (keeps the ``agent_id`` stable so task
       history isn't cascade-deleted; bumps ``version`` so the runner's
       version-keyed spec cache re-fetches), then warm-swap the cache.
-    - **Row exists, content hash matches** → evict the local cache so
-      the next load re-fetches from ``bundle_location``, then return.
+    - **Row exists, content hash matches** → re-``put`` the bundle if
+      the artifact store is missing the blob (self-heals a lost
+      bundle), evict the local cache so the next load re-fetches from
+      ``bundle_location``, then return.
 
     The evict on the matching-hash path matters because
     :meth:`AgentCache.load` is keyed by ``agent_id`` and trusts its
@@ -474,7 +492,13 @@ def _ensure_builtin_agent(
         # Sha-segment compare: legacy rows keep an ``ag_``-prefixed left
         # segment (physical artifact key); only the sha encodes content.
         if existing.bundle_location.rsplit("/", 1)[-1] == bundle_hash:
-            # Row current; evict so a lagging replica's stale cache reloads the bundle.
+            # Blob can vanish while the row survives (pruned artifacts, DB
+            # restored without the store); re-put so boot self-heals. Keyed on
+            # the row's location, not ``new_loc``: this path never rewrites the
+            # row, so a legacy ``ag_``-prefixed value is what the loader reads.
+            if not artifact_store.exists(existing.bundle_location):
+                artifact_store.put(existing.bundle_location, bundle_bytes)
+            # Evict so a lagging replica's stale cache reloads the bundle.
             agent_cache.evict(existing.id)
             return
         artifact_store.put(new_loc, bundle_bytes)
@@ -1030,6 +1054,9 @@ def create_app(
         falsy — ``0``/``false``/``no``/``off``), failing open to enabled
         when unset. Reported by ``GET /v1/info`` as
         ``public_sharing_enabled``.
+    :param server_config: Resolved non-secret server settings. The optional
+        ``session_title_instructions`` string augments the isolated automatic
+        title prompt. ``None`` loads the standard server config.
     :returns: A fully configured :class:`FastAPI` application.
     :raises ValueError: If ``permission_store`` is provided
         without an ``auth_provider``.
@@ -1037,9 +1064,15 @@ def create_app(
     if permission_store is not None and auth_provider is None:
         raise ValueError("auth_provider is required when permission_store is provided")
 
-    from omnigent.server.server_config import load_branding_snapshot
+    from omnigent.server.server_config import (
+        load_branding_snapshot,
+        load_server_config,
+        session_title_instructions,
+    )
 
-    branding_snapshot = load_branding_snapshot(server_config)
+    resolved_server_config = load_server_config() if server_config is None else server_config
+    branding_snapshot = load_branding_snapshot(resolved_server_config)
+    title_instructions = session_title_instructions(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
 
     # First-boot admin bootstrap for the accounts auth provider.
@@ -1098,6 +1131,7 @@ def create_app(
     background_title_coordinator = BackgroundSessionTitleCoordinator(
         conversation_store,
         RunnerBackgroundTitleGenerator(runner_router),
+        additional_instructions=title_instructions,
     )
     # Shared between the host tunnel (which records ``host.runner_exited``
     # reports from daemons) and the runner status endpoint (which surfaces
@@ -1268,6 +1302,7 @@ def create_app(
                 agent_store=agent_store,
                 conversation_store=conversation_store,
                 permission_store=permission_store,
+                policy_store=policy_store,
                 host_store=host_store,
                 host_registry=host_registry,
                 agent_cache=agent_cache,
@@ -1485,6 +1520,18 @@ def create_app(
         set_request_session_id_for_access_log(
             session_match.group(1) if session_match else None,
         )
+        # Bind the request's authenticated user so debug-log records emitted
+        # while handling it are attributed. Request-scoped: each request runs in
+        # its own task/context, so concurrent users never see each other's id.
+        # Best-effort — attribution must never fail a request. The raw identity
+        # (incl. the "local" single-user sentinel) is kept; it is a meaningful
+        # queryable value in the debug table.
+        try:
+            set_current_user_id(
+                auth_provider.get_user_id(request) if auth_provider is not None else None
+            )
+        except Exception:  # noqa: BLE001 — attribution is best-effort
+            set_current_user_id(None)
 
         failed = False
         status_code: int | None = None
@@ -1529,15 +1576,24 @@ def create_app(
         """
         Convert application errors to structured JSON responses.
 
-        :param request: The incoming request (unused — FastAPI signature requirement).
+        :param request: The incoming request; its path supplies the session id
+            threaded into the error log.
         :param exc: The application error.
         :returns: A JSON response with the error code and message.
         """
         if exc.http_status >= 500:
-            _logger.error("Internal error: %s", exc.message, exc_info=exc)
+            _logger.error(
+                "Internal error: %s",
+                exc.message,
+                exc_info=exc,
+                extra={"session_id": _session_id_from_request(request)},
+            )
         elif exc.http_status == 400 and request.url.path.endswith("/policies/evaluate"):
             _logger.warning(
-                "Policy evaluate rejected 400 on %s: %s", request.url.path, exc.message
+                "Policy evaluate rejected 400 on %s: %s",
+                request.url.path,
+                exc.message,
+                extra={"session_id": _session_id_from_request(request)},
             )
         return JSONResponse(
             status_code=exc.http_status,
@@ -1546,7 +1602,7 @@ def create_app(
 
     @app.exception_handler(StatementError)
     async def _handle_statement_error(
-        request: Request,  # noqa: ARG001 — FastAPI exception-handler signature requires (request, exc); we only use exc
+        request: Request,
         exc: StatementError,
     ) -> JSONResponse:
         """
@@ -1559,7 +1615,8 @@ def create_app(
         not-found instead of an internal error. Any other statement error (real
         DB failure) falls through to the standard 500 shape.
 
-        :param request: The incoming request (unused — FastAPI signature requirement).
+        :param request: The incoming request; its path supplies the session id
+            threaded into the error log.
         :param exc: The SQLAlchemy statement error.
         :returns: 404 for a malformed id, otherwise a 500 JSON response.
         """
@@ -1572,7 +1629,12 @@ def create_app(
                 status_code=404,
                 content={"error": {"code": ErrorCode.NOT_FOUND, "message": "Not found."}},
             )
-        _logger.error("Database error: %s", exc, exc_info=exc)
+        _logger.error(
+            "Database error: %s",
+            exc,
+            exc_info=exc,
+            extra={"session_id": _session_id_from_request(request)},
+        )
         return JSONResponse(
             status_code=500,
             content={
@@ -1585,7 +1647,7 @@ def create_app(
 
     @app.exception_handler(Exception)
     async def _handle_unhandled_exception(
-        request: Request,  # noqa: ARG001 — FastAPI exception-handler signature requires (request, exc); we only use exc
+        request: Request,
         exc: Exception,
     ) -> JSONResponse:
         """
@@ -1593,11 +1655,17 @@ def create_app(
         OperationalError). Returns the standard JSON error schema
         so clients always get a consistent response format.
 
-        :param request: The incoming request (unused — FastAPI signature requirement).
+        :param request: The incoming request; its path supplies the session id
+            threaded into the error log.
         :param exc: The unhandled exception.
         :returns: A 500 JSON response with ``internal_error`` code.
         """
-        _logger.error("Unhandled exception: %s", exc, exc_info=exc)
+        _logger.error(
+            "Unhandled exception: %s",
+            exc,
+            exc_info=exc,
+            extra={"session_id": _session_id_from_request(request)},
+        )
         return JSONResponse(
             status_code=500,
             content={
@@ -2223,6 +2291,8 @@ def create_app(
             agent_store,
             auth_provider=auth_provider,
             permission_store=permission_store,
+            host_registry=host_registry,
+            host_store=host_store,
         ),
         prefix="/v1",
         tags=["imports"],
@@ -2382,6 +2452,11 @@ def create_app(
         :func:`_mark_runner_sessions_offline`, which fails only the
         interrupted turns and stamps the disconnect cause.
 
+        A server that is itself shutting down skips the marking too: it
+        closed the tunnel, and the runner cannot re-register with a
+        process that stopped listening — the replacement server re-adopts
+        it on reconnect (:mod:`omnigent.server.shutdown_state`).
+
         :param runner_id: The disconnected runner's id.
         """
         from omnigent.server.routes.sessions import (
@@ -2391,6 +2466,12 @@ def create_app(
         from omnigent.server.schemas import ErrorDetail
 
         await asyncio.sleep(RUNNER_DISCONNECT_GRACE_S)
+        if shutdown_state.server_shutting_down():
+            _logger.info(
+                "Runner %s dropped because this server is shutting down; skipping offline-marking",
+                runner_id,
+            )
+            return
         if tunnel_registry.get(runner_id) is not None:
             _logger.info(
                 "Runner %s reconnected within the disconnect grace; skipping offline-marking",
@@ -2751,6 +2832,7 @@ def create_app(
                     account_store,
                     admin_list,
                     permission_store,
+                    device_grant_store,
                 ),
                 prefix="/auth",
                 tags=["auth"],

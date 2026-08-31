@@ -367,7 +367,11 @@ export function useMarkConversationSeen(
   useEffect(() => {
     if (!conversationId || updatedAt === undefined) return;
     const markIfFocused = () => {
-      if (windowHasFocus()) markConversationSeen(conversationId);
+      // Anchor at or above the updated_at being viewed: a server clock that
+      // leads the client must not leave a just-read turn reading as unseen
+      // (updated_at > client wall clock). Wall clock still wins when it's
+      // ahead, capturing an update the poll hasn't picked up yet.
+      if (windowHasFocus()) markConversationSeen(conversationId, Math.max(nowSeconds(), updatedAt));
     };
     markIfFocused();
     window.addEventListener("focus", markIfFocused);

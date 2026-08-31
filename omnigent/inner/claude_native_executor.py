@@ -126,9 +126,12 @@ class ClaudeNativeExecutor(Executor):
         :param tools: Tool schemas from Omnigent. Ignored here;
             Claude-native output/tool activity is terminal-originated
             and mirrored from Claude's transcript.
-        :param system_prompt: System prompt from the agent spec. The
-            native Claude Code terminal controls its own prompt/settings,
-            so this is ignored.
+        :param system_prompt: Per-turn composed system prompt. Ignored here:
+            claude-native delivers raw author instructions once, at terminal
+            launch, via ``--append-system-prompt`` (see
+            ``omnigent.runner.native.orchestration`` and
+            ``omnigent.claude_native``) — not per-turn through this
+            parameter.
         :param config: Per-turn executor config. Only ``config.model``
             is used: when intelligent routing picks a model for this turn,
             it arrives here (adapter maps ``request.model_override`` →
@@ -196,6 +199,10 @@ class ClaudeNativeExecutor(Executor):
                         content=text,
                     )
         except ClaudePromptTimeout as exc:
+            _logger.exception(
+                "claude-native: prompt delivery to harness timed out",
+                extra={"session_id": self._request_session_id},
+            )
             cleanup_error = self._reap_failed_turn()
             message = describe_exception(exc)
             if cleanup_error is not None:
@@ -203,6 +210,10 @@ class ClaudeNativeExecutor(Executor):
             yield ExecutorError(message=message)
             return
         except RuntimeError as exc:
+            _logger.exception(
+                "claude-native: failed to deliver message to harness",
+                extra={"session_id": self._request_session_id},
+            )
             yield ExecutorError(message=describe_exception(exc))
             return
         yield TurnComplete(response=None)
@@ -212,9 +223,16 @@ class ClaudeNativeExecutor(Executor):
         try:
             kill_session(self._bridge_dir, timeout_s=1.0)
         except TmuxSessionNotAdvertised:
-            _logger.debug("claude-native: timed-out session already disappeared")
+            _logger.debug(
+                "claude-native: timed-out session already disappeared",
+                extra={"session_id": self._request_session_id},
+            )
         except RuntimeError as exc:
-            _logger.warning("claude-native: failed to reap timed-out session", exc_info=True)
+            _logger.warning(
+                "claude-native: failed to reap timed-out session",
+                exc_info=True,
+                extra={"session_id": self._request_session_id},
+            )
             return describe_exception(exc)
         return None
 
@@ -238,12 +256,16 @@ class ClaudeNativeExecutor(Executor):
             should be typed.
         """
         if wanted_model is None:
-            _logger.info("claude-native: turn carries no routed model; not typing /model")
+            _logger.info(
+                "claude-native: turn carries no routed model; not typing /model",
+                extra={"session_id": self._request_session_id},
+            )
             return None
         if not self._should_switch_model(wanted_model):
             _logger.info(
                 "claude-native: skipping /model — pane is already on %s",
                 wanted_model,
+                extra={"session_id": self._request_session_id},
             )
             return None
         env = read_model_env(self._bridge_dir) or None
@@ -254,6 +276,7 @@ class ClaudeNativeExecutor(Executor):
                 "session accepts (pins=%s); sending the turn on the current model",
                 wanted_model,
                 sorted(env or ()),
+                extra={"session_id": self._request_session_id},
             )
             return None
         if (
@@ -266,12 +289,14 @@ class ClaudeNativeExecutor(Executor):
                 "claude-native: skipping /model — %r resolves to %r, already applied",
                 wanted_model,
                 wanted_arg,
+                extra={"session_id": self._request_session_id},
             )
             return None
         _logger.info(
             "claude-native: typing /model %s for routed model %s",
             wanted_arg,
             wanted_model,
+            extra={"session_id": self._request_session_id},
         )
         return wanted_arg
 

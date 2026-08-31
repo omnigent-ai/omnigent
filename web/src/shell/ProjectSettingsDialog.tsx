@@ -35,9 +35,10 @@ import { Switch } from "@/components/ui/switch";
 import { useProjectConfig, useUpdateProjectConfig } from "@/hooks/useConversations";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
-import { sortAgentsForDisplay } from "@/lib/agentGrouping";
+import { selectableSessionAgents } from "@/lib/agentGrouping";
 import { sandboxOptionLabel } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
 import { isNativeCodingAgent } from "@/lib/nativeCodingAgents";
 import type { ProjectConfig } from "@/lib/projectsApi";
@@ -102,7 +103,12 @@ export function ProjectSettingsDialog({
   const loadFailed = projectId !== null && isError;
   const updateConfig = useUpdateProjectConfig();
   const hosts = useHosts();
-  const { data: agents } = useAvailableAgents();
+  // Pin the stored default agent into discovery so an already-configured
+  // session-scoped agent (archived / paginated out of the scan) still
+  // resolves here — matching what the composer's prefill will see.
+  const { data: agents } = useAvailableAgents({
+    pinnedAgentIds: stored?.agent_id != null ? [stored.agent_id] : [],
+  });
   const info = useServerInfo();
   // Sandbox is only a real default when the server can provision managed
   // sandbox hosts — mirror the composer's gate so we don't offer a target that
@@ -114,9 +120,11 @@ export function ProjectSettingsDialog({
   // the fetched config arrives); local until saved.
   const [hostId, setHostId] = useState<string>(NONE);
   const [workspace, setWorkspace] = useState("");
-  // Worktrees are opt-in: the toggle starts OFF and only an explicit ON is
-  // stored (as use_worktree:true), which the composer honors by creating a
-  // fresh worktree for new sessions in the project.
+  // Worktree default for the project. The toggle seeds from the project's
+  // stored value when set, else from the user-global "always use a worktree"
+  // default (Settings › Git). On save it stays "inherit" (stores nothing) while
+  // it matches the global default, and stores an explicit true/false only to
+  // override it — so a project can force a worktree on or opt out of a global on.
   const [useWorktree, setUseWorktree] = useState(false);
   // Base branch a new worktree forks from; blank stores no default (falls
   // through to the user-global default in Settings › Git). Only meaningful
@@ -165,7 +173,7 @@ export function ProjectSettingsDialog({
     const c: ProjectConfig = stored ?? {};
     setHostId(c.host_id ?? NONE);
     setWorkspace(c.workspace ?? "");
-    setUseWorktree(c.use_worktree ?? false);
+    setUseWorktree(c.use_worktree ?? readAlwaysUseWorktree());
     setBaseBranch(c.base_branch ?? "");
     setAgentId(c.agent_id ?? null);
     setWorkspaceOpen(false);
@@ -188,9 +196,10 @@ export function ProjectSettingsDialog({
       hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE ? trimOrUndef(workspace) : undefined;
     if (ws) config.workspace = ws;
     if (agentId) config.agent_id = agentId;
-    // Worktrees are opt-in: only an explicit ON is stored (as use_worktree:true);
-    // leaving it OFF stores nothing, so an all-default dialog still clears to {}.
-    if (useWorktree) config.use_worktree = true;
+    // Store the worktree choice only when it overrides the user-global default;
+    // while it matches, leave the key unset so the project keeps inheriting
+    // (and an all-default dialog still clears to {}).
+    if (useWorktree !== readAlwaysUseWorktree()) config.use_worktree = useWorktree;
     // A base branch only forks a worktree, so it's only meaningful when the
     // worktree default is on — drop it otherwise so it can't linger as a stale,
     // invisible default after the toggle is turned off.
@@ -220,7 +229,10 @@ export function ProjectSettingsDialog({
 
   // Agent picker groups, mirroring the composer's split (native harness CLIs vs
   // SDK / bundle agents). The picker takes both lists and a selection.
-  const agentList = useMemo(() => sortAgentsForDisplay(agents ?? []), [agents]);
+  // Same resolver as the composer's picker (selectableSessionAgents): the two
+  // surfaces must offer the SAME set, or a project could pin a default the
+  // composer refuses to show — and then silently substitutes another for.
+  const agentList = useMemo(() => selectableSessionAgents(agents ?? []), [agents]);
   const harnessEntries = useMemo(() => agentList.filter(isNativeCodingAgent), [agentList]);
   const agentEntries = useMemo(() => agentList.filter((a) => !isNativeCodingAgent(a)), [agentList]);
   const selectedAgent = agentList.find((a) => a.id === agentId) ?? null;
@@ -339,7 +351,7 @@ export function ProjectSettingsDialog({
                       className="fixed inset-0 z-10 cursor-default"
                       onClick={() => setWorkspaceOpen(false)}
                     />
-                    <div className="absolute top-full right-0 left-0 z-20 mt-1 rounded-[12px] border border-border bg-popover p-2 shadow-menu [&>[data-testid=workspace-picker]]:border-0">
+                    <div className="absolute top-full right-0 left-0 z-20 mt-1 rounded-[12px] border border-border bg-popover p-2 shadow-menu dark:border-white/10 dark:backdrop-blur-xl dark:backdrop-saturate-150 [&>[data-testid=workspace-picker]]:border-0">
                       <WorkspacePicker
                         hostId={browsableHostId}
                         initialPath={isNavigablePath(workspace) ? workspace : undefined}
@@ -366,7 +378,7 @@ export function ProjectSettingsDialog({
 
           <Field
             label="Random worktree"
-            hint="Start each new session in a fresh randomly-named git worktree (vs. directly in the workspace)"
+            hint="Start each new session in a fresh randomly-named git worktree (vs. directly in the workspace). Overrides the global default in Settings › Git."
           >
             <div className="flex sm:justify-end">
               <Switch

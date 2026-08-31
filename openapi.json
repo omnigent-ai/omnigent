@@ -170,7 +170,7 @@
         "description": "Request body for the current-agent automatic rename endpoint.",
         "properties": {
           "title": {
-            "maxLength": 60,
+            "maxLength": 100,
             "minLength": 2,
             "title": "Title",
             "type": "string"
@@ -221,6 +221,73 @@
           "renamed"
         ],
         "title": "AutomaticSessionRenameResponse",
+        "type": "object"
+      },
+      "BackgroundTaskInfo": {
+        "description": "One still-running background shell from the claude-native `Stop` hook.\n\nClaude Code leaves finished shells in the hook's `background_tasks`\narray, so the list surfaced here is filtered to the non-terminal ones \u2014\nits length matches the `background_task_count` tally. Every field is\nbest-effort: the hook shape is external, so an entry missing one field\nstill yields a usable row (e.g. a `description` with no `command`).",
+        "properties": {
+          "command": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Command the shell is running, e.g. `\"sleep 120\"`.",
+            "title": "Command"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Human-readable label, e.g. `\"Wait for CI\"`.",
+            "title": "Description"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opaque per-shell identifier, e.g. `\"abc123\"`.",
+            "title": "Id"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-task status, e.g. `\"running\"`.",
+            "title": "Status"
+          },
+          "type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Task kind, e.g. `\"shell\"`.",
+            "title": "Type"
+          }
+        },
+        "title": "BackgroundTaskInfo",
         "type": "object"
       },
       "Body_update_session_agent_v1_sessions__session_id__agent_put": {
@@ -1555,6 +1622,24 @@
       "ElicitationResolvedEvent": {
         "description": "Signal that a previously-published elicitation is no longer\noutstanding, even though no UI `approval` verdict was\ndelivered through `POST /v1/sessions/{id}/events`.\n\nEmitted by the runner when its own `_pending_approvals`\nFuture is popped without a verdict (the runner's wait timed\nout, the turn was cancelled, the harness exited) so the AP\nserver's `omnigent.runtime.pending_elicitations`\nindex can decrement the sidebar badge in lockstep with the\nunderlying awaiter's lifecycle. Without this signal, the AP\nserver has no way to learn that the prompt is dead and the\nbadge stays stuck.\n\nIdempotent on the consumer side: the Omnigent server's index\ndecrement is a no-op when the id isn't tracked, so the\nrunner can fire-and-forget on every Future cleanup.",
         "properties": {
+          "action": {
+            "anyOf": [
+              {
+                "enum": [
+                  "accept",
+                  "decline",
+                  "cancel"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional MCP verdict recorded when the resolution carried a human decision (`\"accept\"` / `\"decline\"` / `\"cancel\"`). `None` for resolutions without a verdict \u2014 timeout, severed wait, or a runner that predates verdict carriage \u2014 so consumers can say \"no verdict was recorded\" rather than guessing one.",
+            "title": "Action"
+          },
           "elicitation_id": {
             "description": "Correlation id of the elicitation being cleared, e.g. `\"elicit_abc123\"`. Must match the id of a prior `ElicitationRequestEvent`.",
             "title": "Elicitation Id",
@@ -1736,11 +1821,19 @@
         "type": "object"
       },
       "FailedEvent": {
-        "description": "Terminal event for a turn that ended with an error.\n\nCarries the final\n`omnigent.server.schemas.ResponseObject` whose\n`error` field describes the failure.",
+        "description": "Terminal event for a turn that ended with an error.\n\nCarries a `omnigent.server.schemas.FailedResponseObject`\nwhose `error` field describes the failure. Response metadata may\nbe absent when the failure occurs before response allocation.",
         "properties": {
           "response": {
-            "$ref": "#/components/schemas/ResponseObject",
-            "description": "The final response object with `status=\"failed\"` and `error` populated."
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ResponseObject"
+              },
+              {
+                "$ref": "#/components/schemas/FailedResponseObject"
+              }
+            ],
+            "description": "The failure response object with `status=\"failed\"` and `error` populated.",
+            "title": "Response"
           },
           "sequence_number": {
             "anyOf": [
@@ -1766,6 +1859,190 @@
           "response"
         ],
         "title": "FailedEvent",
+        "type": "object"
+      },
+      "FailedResponseObject": {
+        "description": "Response payload for failures raised before response allocation.\n\nTransport and setup failures can terminate a turn before the harness has\nassigned the metadata required by `ResponseObject`. The remaining\nfields mirror that model so fully allocated failures retain their complete\nwire representation.",
+        "properties": {
+          "background": {
+            "default": false,
+            "description": "Whether the response was created as a background task.",
+            "title": "Background",
+            "type": "boolean"
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Unix epoch timestamp of completion, or `None`.",
+            "title": "Completed At"
+          },
+          "conversation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConversationRef"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Reference to the owning conversation, or `None`."
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Unix epoch timestamp of creation, or `None` when the response failed before creation.",
+            "title": "Created At"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ErrorDetail"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Error details describing the failure, or `None`."
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Unique response identifier, e.g. `\"resp_abc123\"`, or `None` when allocation did not complete.",
+            "title": "Id"
+          },
+          "incomplete_details": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IncompleteDetails"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Incomplete-response details, or `None`."
+          },
+          "instructions": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Per-request instructions override, or `None`.",
+            "title": "Instructions"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Agent name that produced the response, e.g. `\"research-agent\"`, or `None` when resolution did not complete.",
+            "title": "Model"
+          },
+          "object": {
+            "default": "response",
+            "description": "Fixed resource type, always `\"response\"`.",
+            "title": "Object",
+            "type": "string"
+          },
+          "output": {
+            "description": "Heterogeneous serialized output items accumulated before failure.",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Output",
+            "type": "array"
+          },
+          "previous_response_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "ID of the prior response, or `None`.",
+            "title": "Previous Response Id"
+          },
+          "reasoning": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Reasoning configuration, or `None`.",
+            "title": "Reasoning"
+          },
+          "status": {
+            "description": "Lifecycle status, normally `\"failed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "store": {
+            "default": true,
+            "description": "Whether the response is persisted.",
+            "title": "Store",
+            "type": "boolean"
+          },
+          "usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Usage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Token usage statistics, or `None` when unavailable."
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "FailedResponseObject",
         "type": "object"
       },
       "FunctionCallData": {
@@ -1974,6 +2251,18 @@
             "title": "Source",
             "type": "string"
           },
+          "title": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
           "workspace": {
             "anyOf": [
               {
@@ -2018,6 +2307,31 @@
           "item_count"
         ],
         "title": "ImportSessionResponse",
+        "type": "object"
+      },
+      "ImportedSessionRef": {
+        "description": "One freshly imported session: its new id plus display title.\n\n`title` is `None` when the session has no native title and no first user\nmessage to synthesize from; the UI falls back to a placeholder.",
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "ImportedSessionRef",
         "type": "object"
       },
       "InProgressEvent": {
@@ -2131,6 +2445,81 @@
           "workspace"
         ],
         "title": "LaunchRunnerRequest",
+        "type": "object"
+      },
+      "LocalImportRequest": {
+        "description": "Request to import the caller's recent local harness sessions from a host.\n\nUnlike `/imports` (the CLI posts already-normalized items), the server\nasks the chosen host to read + normalize its own transcripts over the\ntunnel \u2014 the transcripts live on the caller's machine, not the server.",
+        "properties": {
+          "host_id": {
+            "title": "Host Id",
+            "type": "string"
+          },
+          "limit": {
+            "default": 10,
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "enum": [
+                  "claude",
+                  "codex",
+                  "kimi",
+                  "kiro",
+                  "opencode",
+                  "pi",
+                  "qwen"
+                ],
+                "type": "string"
+              },
+              {
+                "const": "all",
+                "type": "string"
+              }
+            ],
+            "title": "Source"
+          }
+        },
+        "required": [
+          "host_id",
+          "source"
+        ],
+        "title": "LocalImportRequest",
+        "type": "object"
+      },
+      "LocalImportResponse": {
+        "description": "Batch result for `POST /v1/imports/local`.",
+        "properties": {
+          "already_imported": {
+            "title": "Already Imported",
+            "type": "integer"
+          },
+          "failed": {
+            "title": "Failed",
+            "type": "integer"
+          },
+          "imported": {
+            "title": "Imported",
+            "type": "integer"
+          },
+          "sessions": {
+            "items": {
+              "$ref": "#/components/schemas/ImportedSessionRef"
+            },
+            "title": "Sessions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "imported",
+          "already_imported",
+          "failed",
+          "sessions"
+        ],
+        "title": "LocalImportResponse",
         "type": "object"
       },
       "MCPServerSummary": {
@@ -3162,7 +3551,7 @@
               }
             ],
             "default": null,
-            "description": "Per-request system instructions override, or `None`.",
+            "description": "Per-request system instructions composed additively with the agent's own, or `None`.",
             "title": "Instructions"
           },
           "model": {
@@ -3695,6 +4084,7 @@
             "session.mcp_startup": "#/components/schemas/SessionMcpStartupEvent",
             "session.model": "#/components/schemas/SessionModelEvent",
             "session.model_options": "#/components/schemas/SessionModelOptionsEvent",
+            "session.permission_mode": "#/components/schemas/SessionPermissionModeEvent",
             "session.presence": "#/components/schemas/SessionPresenceEvent",
             "session.reasoning_effort": "#/components/schemas/SessionReasoningEffortEvent",
             "session.resource.created": "#/components/schemas/SessionResourceCreatedEvent",
@@ -3733,6 +4123,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionCollaborationModeEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionPermissionModeEvent"
           },
           {
             "$ref": "#/components/schemas/SessionAgentChangedEvent"
@@ -4132,9 +4525,55 @@
             "description": "Built-in agent to bind the fork to, switching it away from the source's agent/harness (e.g. fork a Claude session into a Codex one, or a Claude-SDK session into Claude Code). When `None`, the fork keeps the source's agent. Must be a built-in agent (one listed by `GET /v1/agents`).",
             "title": "Agent Id"
           },
+          "codex_bypass_sandbox": {
+            "default": false,
+            "description": "Opt-in for the DANGEROUS codex-native full-bypass (`--dangerously-bypass-approvals-and-sandbox`) on the fork. The source's bypass label is ALWAYS dropped on a fork (a bypass-armed source can never silently re-arm its clone), so this is the only way a fork enables it \u2014 an explicit, banner-gated opt-in from the dialog, mirroring the new-session approval selector. `True` stamps `omnigent.codex_native.bypass_sandbox` on the fork; `False` / omitted leaves the fork in Codex's normal approval/sandbox stance. Only meaningful for a codex-native target; ignored otherwise.",
+            "title": "Codex Bypass Sandbox",
+            "type": "boolean"
+          },
+          "model_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-session LLM model override to apply to the fork, e.g. `\"claude-opus-4-7\"`. **Omitting** the field inherits the source's model (same as today, within the same provider family); an explicit value overrides it, and a clear alias (`\"default\"`, `\"off\"`, `\"reset\"`) resets the fork to the bound agent's default. Validated against a conservative model-id charset. Set by the web fork dialog's model picker.",
+            "title": "Model Override"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-session reasoning-effort override to apply to the fork, e.g. `\"high\"`. **Omitting** the field inherits the source's effort; an explicit value overrides it, and a clear alias (`\"default\"`, `\"off\"`, `\"reset\"`) resets it. Validated against the shared effort vocabulary; provider support is enforced at launch. Set by the web fork dialog's effort picker.",
+            "title": "Reasoning Effort"
+          },
+          "terminal_launch_args": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-session native-terminal pass-through args to apply to the fork, e.g. `[\"--permission-mode\", \"auto\"]` (the fork dialog's permission-/approval-mode selector). **Omitting** the field keeps today's behavior \u2014 the source's args are carried on a same-agent fork and dropped on an agent switch. A list (including `[]`, which clears them) replaces them wholesale. Bounds (count / length) are validated server-side.",
+            "title": "Terminal Launch Args"
+          },
           "title": {
             "anyOf": [
               {
+                "maxLength": 200,
                 "type": "string"
               },
               {
@@ -4848,6 +5287,46 @@
         "title": "SessionModelOptionsEvent",
         "type": "object"
       },
+      "SessionPermissionModeEvent": {
+        "description": "Active permission-mode update from a claude-native session.\n\nEmitted after the web UI switches the mode, and after the Claude forwarder\nobserves a different mode in the pane footer \u2014 a shift+tab pressed inside\nthe TUI, which Omnigent has no other way to see. Lets the composer's mode\npicker track the pane without a reload.",
+        "properties": {
+          "conversation_id": {
+            "description": "Session identifier, e.g. `\"conv_abc123\"`.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "permission_mode": {
+            "description": "The active mode, e.g. `\"auto\"` or `\"plan\"`. Category: **transient** (SSE-only). The server also writes `omnigent.claude_native.permission_mode` on the conversation labels, so reconnecting clients restore the same state from the session snapshot.",
+            "title": "Permission Mode",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.permission_mode",
+            "description": "Always `\"session.permission_mode\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "permission_mode"
+        ],
+        "title": "SessionPermissionModeEvent",
+        "type": "object"
+      },
       "SessionPresenceEvent": {
         "description": "The session's viewer list changed \u2014 full state, not a delta.\n\nEmitted on `GET /v1/sessions/{id}/stream` whenever a user\njoins, leaves (after the server-side grace window absorbs\nreconnect churn), or flips their idle aggregate, and once to\neach newly-connected stream as a snapshot-on-connect. Every\nevent carries the COMPLETE viewer list so clients replace their\nstate wholesale \u2014 missed events self-heal on the next event or\nreconnect. Viewers are scoped to the session *tree* (the root\nconversation and every sub-agent conversation under it), so a\nuser on a sub-agent page and a user on the root page appear in\neach other's lists. See `omnigent/server/presence.py` and\n`designs/UI/PRESENCE.md`.",
         "properties": {
@@ -5218,6 +5697,21 @@
             ],
             "description": "Background shells (claude-native) still running as of the last status edge, so a reload re-shows \"N shells still running\" even though the session has settled to `\"idle\"`. `None` (the default / omitted) when no shells are tracked.",
             "title": "Background Task Count"
+          },
+          "background_tasks": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BackgroundTaskInfo"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-shell detail for the running tally above, so a reload can restore each shell's description/command. `None` when none are tracked (or when an older runner reported only the count).",
+            "title": "Background Tasks"
           },
           "context_window": {
             "anyOf": [
@@ -5779,7 +6273,24 @@
               }
             ],
             "default": null,
+            "description": "Background shells still running at this edge (claude-native `Stop` hook). `None` when the edge carries no information (leave the sticky tally untouched); `0` clears it.",
             "title": "Background Task Count"
+          },
+          "background_tasks": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BackgroundTaskInfo"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Per-shell detail backing that tally, so the UI can name each running shell. `None` when the edge reports no detail (an older runner may send only the count).",
+            "title": "Background Tasks"
           },
           "blocked_on": {
             "anyOf": [
@@ -7005,6 +7516,18 @@
             "description": "Per-session LLM model override, e.g. `\"claude-opus-4-7\"`. The value is forwarded as-is to the executor at turn start; the server does not enumerate valid models. Clear aliases such as `\"default\"`, `\"off\"`, or `\"reset\"` remove the override (matching the REPL's `/model` semantics). `None` leaves unchanged.",
             "title": "Model Override"
           },
+          "permission_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Claude-native permission mode to switch a running session to, e.g. `\"auto\"`. Only the modes Claude Code's shift+tab cycle can reach are accepted (`default`, `acceptEdits`, `plan`, `auto`) \u2014 `dontAsk` and `bypassPermissions` are launch-only. Only valid for sessions stamped with the claude-native wrapper label. Unlike the other fields here the switch is applied by the live TUI, so a failure to reach the mode is surfaced as an error rather than persisted. Omitted leaves unchanged.",
+            "title": "Permission Mode"
+          },
           "project_id": {
             "anyOf": [
               {
@@ -7077,6 +7600,7 @@
           "title": {
             "anyOf": [
               {
+                "maxLength": 200,
                 "type": "string"
               },
               {
@@ -8383,6 +8907,48 @@
           }
         },
         "summary": "Import Session",
+        "tags": [
+          "imports"
+        ]
+      }
+    },
+    "/v1/imports/local": {
+      "post": {
+        "description": "Import the caller's recent local transcripts from a chosen host.\n\nThe transcripts live on the caller's machine, so the read happens on\nthe connected host over its tunnel \u2014 the server can't see them. The\nhost enumerates + normalizes the most recent sessions; the server\nimports those not already imported. Drives the web \"Import sessions\"\nbutton.\n\nNot atomic: each session is persisted as its frame arrives. If the host\ndrops mid-stream this raises after the sessions read so far are already\ncommitted; a retry is idempotent (they come back as already-imported).",
+        "operationId": "import_local_sessions_v1_imports_local_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LocalImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LocalImportResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Local Sessions",
         "tags": [
           "imports"
         ]
@@ -12798,7 +13364,7 @@
     },
     "/v1/sessions/{source_id}/fork": {
       "post": {
-        "description": "Fork an existing session into a new session.\n\nDeep-copies the source session's conversation items and\nclones the agent into a new session. When `body.agent_id`\nis set, the fork binds that built-in agent instead of the\nsource's \u2014 switching harness (e.g. Claude-SDK \u2192 Claude Code,\nor Claude \u2192 Codex). The source's model settings carry over\nonly within the same provider family; a same-family native\ntarget also carries conversation history (the runner rebuilds\nits transcript). The REPL/CLI binds the fork to its runner via\n`PATCH /v1/sessions/{id}` after creation.\n\nWhen `body.up_to_response_id` is set, only history up to and\nincluding that response is copied into the fork (a \"fork from\nthis response\"); a native target then rebuilds its transcript\nfrom the truncated items instead of resuming the source's full\nnative transcript.\n\nA sub-agent source is allowed, which is how a sub-agent is\npromoted to a session of its own: the fork is always a fresh\ntop-level conversation (no parent, its own spawn-tree root, its\nown owner grant), so it appears in the sidebar and outlives the\nparent. The source keeps running under its parent untouched,\nand the fork does not adopt the source's own children.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionForkRequest`.\n\n**Returns:** A `SessionResponse` describing the newly created fork (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if *source_id* does not exist or `body.agent_id` is not a bindable built-in agent; 403 if the caller lacks read access; 400 if the source has no agent binding, or `body.up_to_response_id` names no response in the source session.",
+        "description": "Fork an existing session into a new session.\n\nDeep-copies the source session's conversation items and\nclones the agent into a new session. When `body.agent_id`\nis set, the fork binds that built-in agent instead of the\nsource's \u2014 switching harness (e.g. Claude-SDK \u2192 Claude Code,\nor Claude \u2192 Codex). The source's model settings carry over\nonly within the same provider family; a same-family native\ntarget also carries conversation history (the runner rebuilds\nits transcript). The REPL/CLI binds the fork to its runner via\n`PATCH /v1/sessions/{id}` after creation.\n\nWhen `body.up_to_response_id` is set, only history up to and\nincluding that response is copied into the fork (a \"fork from\nthis response\"); a native target then rebuilds its transcript\nfrom the truncated items instead of resuming the source's full\nnative transcript.\n\nThe dialog's run-config picks (`body.model_override`,\n`body.reasoning_effort`, `body.terminal_launch_args` \u2014 the\npermission-/approval-mode selector) override what the fork would\notherwise inherit. Each is opt-in: a field omitted from the request\nkeeps the inherited value (model/effort within the same provider\nfamily; launch args on a same-agent fork), while a field present\nwins \u2014 a clear alias (`\"default\"`) resets to the bound agent's\ndefault, and an explicit launch-args list also drops the source's\ncopied permission-mode / codex-bypass labels so they can't shadow\nthe freshly chosen mode.\n\nA sub-agent source is allowed, which is how a sub-agent is\npromoted to a session of its own: the fork is always a fresh\ntop-level conversation (no parent, its own spawn-tree root, its\nown owner grant), so it appears in the sidebar and outlives the\nparent. The source keeps running under its parent untouched,\nand the fork does not adopt the source's own children.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionForkRequest`.\n\n**Returns:** A `SessionResponse` describing the newly created fork (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if *source_id* does not exist or `body.agent_id` is not a bindable built-in agent; 403 if the caller lacks read access; 400 if the source has no agent binding, or `body.up_to_response_id` names no response in the source session.",
         "operationId": "fork_session_v1_sessions__source_id__fork_post",
         "parameters": [
           {

@@ -10,7 +10,7 @@ Selectors:
   - copy button: accessible name "Copy" (MessageAction sr-only label/tooltip)
   - copied state: lucide check icon (``svg.lucide-check``) replaces the copy
     icon (``svg.lucide-copy``) for ~2s after a successful write
-  - composer: placeholder "Ask the agent anything…"
+  - composer: placeholder "Send a message…"
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import uuid
 
 from playwright.sync_api import Browser, Page, expect
 
-_COMPOSER_PLACEHOLDER = "Ask the agent anything…"
+_COMPOSER_PLACEHOLDER = "Send a message…"
 _USER_BUBBLE = '[data-testid="message-bubble"][data-role="user"]'
 
 

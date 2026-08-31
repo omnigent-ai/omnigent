@@ -51,6 +51,7 @@ def _point_codex_auth_check_at(
     *,
     binary_present: bool,
     launch: Any | None = None,
+    config_toml: str | None = None,
 ) -> None:
     """Redirect Codex availability checks away from the real machine state.
 
@@ -59,6 +60,9 @@ def _point_codex_auth_check_at(
     set → resolves to ``"openai"``), which is exactly the case where
     ``auth.json`` is the credential that decides availability. Provider-routed
     tests pass an explicit launch.
+
+    ``config_toml`` writes Codex's config next to ``auth.json``; omitted
+    means only ``auth.json`` can carry a credential.
     """
     if launch is None:
         launch = codex_native_app_server.NativeCodexLaunch(
@@ -67,11 +71,15 @@ def _point_codex_auth_check_at(
     # Isolate the shared codex config.toml the config-default launch reads, so a
     # defer-to-login test doesn't pick up the real machine's provider default.
     monkeypatch.setenv("CODEX_HOME", str(auth_path.parent))
+    config_path = auth_path.parent / "config.toml"
+    if config_toml is not None:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(config_toml, encoding="utf-8")
     monkeypatch.setattr(codex_native, "resolve_native_codex_launch", lambda model=None: launch)
     monkeypatch.setattr(
         codex_native,
         "_resolve_codex_auth_source",
-        lambda: codex_native._CodexAuthSource(auth_path=auth_path),
+        lambda: codex_native._CodexAuthSource(auth_path=auth_path, config_path=config_path),
     )
     monkeypatch.setattr(
         codex_native,
@@ -261,6 +269,253 @@ def test_codex_auth_unavailable_reason_explicit_openai_needs_auth(
     assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
 
 
+@pytest.mark.parametrize(
+    ("launch", "expected"),
+    [
+        (
+            codex_native_app_server.NativeCodexLaunch([], None, None),
+            False,
+        ),
+        (
+            codex_native_app_server.NativeCodexLaunch([], None, "profile"),
+            True,
+        ),
+        (
+            codex_native_app_server.NativeCodexLaunch(['model_provider="openai"'], None, None),
+            True,
+        ),
+    ],
+)
+def test_native_codex_launch_pins_model_provider(
+    launch: codex_native_app_server.NativeCodexLaunch, expected: bool
+) -> None:
+    """Provider-pin detection is owned beside the override parser."""
+    assert codex_native_app_server.native_codex_launch_pins_model_provider(launch) is expected
+
+
+#: A Codex ``config.toml`` selecting a custom gateway provider that
+#: authenticates from an environment variable, the shape reported in the
+#: "needs-auth with an authenticated custom provider" bug. The variable is
+#: ``OPENAI_``-prefixed so the native launch's env filter passes it through.
+_ENV_KEY_CONFIG_TOML = """\
+model_provider = "aigateway"
+
+[model_providers.aigateway]
+name = "AI Gateway"
+base_url = "https://gateway.example.com/openai/v1"
+env_key = "OPENAI_EXAMPLE_GATEWAY_TOKEN"
+wire_api = "responses"
+"""
+
+
+def test_codex_auth_unavailable_reason_config_env_key_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A config-selected provider with a populated ``env_key`` is available.
+
+    The reported bug: the launch leaves Codex's own provider selection alone, so
+    Codex routes through the custom ``[model_providers.X]`` table and never reads
+    ``auth.json`` — gating on the (legitimately absent) ``auth.json`` reported
+    ``needs-auth`` and told the user to run ``codex login``, which would add a
+    second credential that bypasses the gateway.
+    """
+    auth_path = tmp_path / "codex-home" / "auth.json"  # never created
+    _point_codex_auth_check_at(
+        monkeypatch, auth_path, binary_present=True, config_toml=_ENV_KEY_CONFIG_TOML
+    )
+    monkeypatch.setenv("OPENAI_EXAMPLE_GATEWAY_TOKEN", "gw-token")
+
+    assert codex_native._codex_auth_unavailable_reason() is None
+
+
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_codex_auth_unavailable_reason_config_env_key_unset_needs_auth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: str | None
+) -> None:
+    """A config-selected provider whose ``env_key`` is unset/empty needs auth.
+
+    The credential the config names is not there, and no ``auth.json`` backs it
+    up, so Codex would fail to authenticate — the warning is correct here.
+    """
+    auth_path = tmp_path / "codex-home" / "auth.json"  # never created
+    _point_codex_auth_check_at(
+        monkeypatch, auth_path, binary_present=True, config_toml=_ENV_KEY_CONFIG_TOML
+    )
+    if value is None:
+        monkeypatch.delenv("OPENAI_EXAMPLE_GATEWAY_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("OPENAI_EXAMPLE_GATEWAY_TOKEN", value)
+
+    assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
+
+
+def test_codex_auth_unavailable_reason_missing_provider_env_ignores_auth_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A custom provider's missing env key is not masked by a Codex login.
+
+    Codex selects the custom provider before considering ``auth.json``. Its
+    declared env credential is therefore the gate even when a valid login file
+    also exists.
+    """
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(
+        monkeypatch, auth_path, binary_present=True, config_toml=_ENV_KEY_CONFIG_TOML
+    )
+    monkeypatch.delenv("OPENAI_EXAMPLE_GATEWAY_TOKEN", raising=False)
+    _write_codex_auth(auth_path, {"OPENAI_API_KEY": "sk-unused"})
+
+    assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
+
+
+def test_codex_auth_unavailable_reason_config_env_key_scrubbed_needs_auth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An ``env_key`` the launch env scrubs is not reported as available.
+
+    Readiness resolves the variable in the same filtered env the launch hands
+    the CLI, so a variable outside Codex's allowed env families (here a bare
+    ``EXAMPLE_GATEWAY_TOKEN``) cannot mark the harness ready and then 401 on the
+    first turn.
+    """
+    auth_path = tmp_path / "codex-home" / "auth.json"  # never created
+    _point_codex_auth_check_at(
+        monkeypatch,
+        auth_path,
+        binary_present=True,
+        config_toml=_ENV_KEY_CONFIG_TOML.replace(
+            'env_key = "OPENAI_EXAMPLE_GATEWAY_TOKEN"', 'env_key = "EXAMPLE_GATEWAY_TOKEN"'
+        ),
+    )
+    monkeypatch.setenv("EXAMPLE_GATEWAY_TOKEN", "gw-token")
+
+    assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
+
+
+def test_codex_auth_unavailable_reason_config_auth_command_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A config-selected provider with a token-printing auth command is available.
+
+    Same generic rule as the ``env_key`` case, a different credential shape: the
+    config names the credential, so no vendor is special-cased.
+    """
+    auth_path = tmp_path / "codex-home" / "auth.json"  # never created
+    _point_codex_auth_check_at(
+        monkeypatch,
+        auth_path,
+        binary_present=True,
+        config_toml=(
+            'model_provider = "gw"\n'
+            "[model_providers.gw]\n"
+            'base_url = "https://gateway.example.com/openai/v1"\n'
+            "[model_providers.gw.auth]\n"
+            'command = "print-token"\n'
+        ),
+    )
+
+    assert codex_native._codex_auth_unavailable_reason() is None
+
+
+def test_codex_auth_unavailable_reason_config_local_provider_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A local provider needs no ``auth.json`` credential."""
+    auth_path = tmp_path / "codex-home" / "auth.json"  # never created
+    _point_codex_auth_check_at(
+        monkeypatch,
+        auth_path,
+        binary_present=True,
+        config_toml='model_provider = "ollama"\n',
+    )
+
+    assert codex_native._codex_auth_unavailable_reason() is None
+
+
+def test_codex_auth_unavailable_reason_config_builtin_provider_needs_auth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A config selecting the built-in provider still gates on ``auth.json``.
+
+    ``model_provider = "openai"`` is Codex's own login, so an absent
+    ``auth.json`` is a real ``needs-auth`` — the config check must not fail open
+    for every config file that happens to exist.
+    """
+    auth_path = tmp_path / "codex-home" / "auth.json"  # never created
+    _point_codex_auth_check_at(
+        monkeypatch,
+        auth_path,
+        binary_present=True,
+        config_toml='model_provider = "openai"\nmodel = "gpt-5.4"\n',
+    )
+
+    assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
+
+
+def test_codex_auth_unavailable_reason_dismissed_config_provider_needs_auth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A launch pinning the built-in provider ignores the config's credential.
+
+    When the user removed (dismissed) the detected config provider, the launch
+    pins ``model_provider="openai"``, so the config table is not what Codex
+    routes through and its ``env_key`` cannot make the harness available.
+    """
+    auth_path = tmp_path / "codex-home" / "auth.json"  # never created
+    launch = codex_native_app_server.NativeCodexLaunch(
+        config_overrides=['model_provider="openai"'], model=None, profile=None
+    )
+    _point_codex_auth_check_at(
+        monkeypatch,
+        auth_path,
+        binary_present=True,
+        launch=launch,
+        config_toml=_ENV_KEY_CONFIG_TOML,
+    )
+    monkeypatch.setenv("OPENAI_EXAMPLE_GATEWAY_TOKEN", "gw-token")
+
+    assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
+
+
+def test_codex_auth_unavailable_reason_missing_provider_table_ignores_auth_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A broken custom-provider selection is not masked by a Codex login."""
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(
+        monkeypatch,
+        auth_path,
+        binary_present=True,
+        config_toml='model_provider = "missing-table"\n',
+    )
+    _write_codex_auth(auth_path, {"OPENAI_API_KEY": "sk-unused"})
+
+    assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
+
+
+def test_codex_auth_unavailable_reason_local_auth_failure_needs_auth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Unexpected local-auth errors never escape the readiness refresh."""
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(
+        monkeypatch,
+        auth_path,
+        binary_present=True,
+        config_toml=_ENV_KEY_CONFIG_TOML,
+    )
+
+    def _boom(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("broken local auth check")
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.codex_auth_readiness.codex_config_effective_auth",
+        _boom,
+    )
+
+    assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
+
+
 def test_codex_auth_unavailable_reason_resolver_failure_falls_back_to_auth_json(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -274,6 +529,27 @@ def test_codex_auth_unavailable_reason_resolver_failure_falls_back_to_auth_json(
     monkeypatch.setattr(codex_native, "resolve_native_codex_launch", _boom)
 
     # No auth.json → falls through to needs-auth rather than propagating.
+    assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
+
+
+def test_codex_auth_unavailable_reason_resolver_failure_skips_config_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed launch resolution cannot assume the config provider is active."""
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(
+        monkeypatch,
+        auth_path,
+        binary_present=True,
+        config_toml=_ENV_KEY_CONFIG_TOML,
+    )
+    monkeypatch.setenv("OPENAI_EXAMPLE_GATEWAY_TOKEN", "gw-token")
+
+    def _boom(model: object = None) -> object:
+        raise RuntimeError("corrupt config")
+
+    monkeypatch.setattr(codex_native, "resolve_native_codex_launch", _boom)
+
     assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
 
 
@@ -2286,6 +2562,72 @@ def test_forwarder_tracks_active_turn_across_terminal_event_sequences(
     ] == expected_statuses
 
 
+def test_terminal_turn_clears_control_state_before_blocked_delta_flush(tmp_path: Path) -> None:
+    """A slow output flush cannot leave a completed Codex turn steerable."""
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_123",
+        ),
+    )
+    posted: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Capture posts that must remain ordered after the output flush."""
+        posted.append(json.loads(request.content))
+        return httpx.Response(202, json={"queued": False})
+
+    async def run() -> None:
+        """Block output delivery and inspect bridge control state mid-boundary."""
+        flush_entered = asyncio.Event()
+        release_flush = asyncio.Event()
+
+        class _BlockingDeltaCoalescer:
+            """Delta coalescer that parks the terminal handler in ``flush``."""
+
+            async def flush(self) -> None:
+                """Signal entry and wait until the assertion releases delivery."""
+                flush_entered.set()
+                await release_flush.wait()
+
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            task = asyncio.create_task(
+                codex_native_forwarder._handle_event(
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    usage_coalescer=_usage_coalescer(client),
+                    elicitation_tracker=_elicitation_tracker(),
+                    event=_completed_event("turn_123"),
+                    delta_coalescer=_BlockingDeltaCoalescer(),  # type: ignore[arg-type]
+                )
+            )
+            await asyncio.wait_for(flush_entered.wait(), timeout=5.0)
+
+            state = read_bridge_state(tmp_path)
+            assert state is not None
+            assert state.active_turn_id is None
+            assert posted == [], "terminal status must still follow pending output delivery"
+
+            release_flush.set()
+            await asyncio.wait_for(task, timeout=5.0)
+
+    asyncio.run(run())
+
+    assert [
+        payload["data"]["status"]
+        for payload in posted
+        if payload["type"] == "external_session_status"
+    ] == ["idle"]
+
+
 def test_forwarder_posts_agent_item_after_stale_terminal_event(tmp_path: Path) -> None:
     """
     Stale turn completion does not block newer Codex response mirroring.
@@ -4249,7 +4591,15 @@ def test_forwarder_starts_default_turn_from_plan_implementation_prompt(
         ),
     )
     fake_client = _FakeCodexAppServerClient()
-    forwarder_state = codex_native_forwarder._CodexForwarderState(model="mock-model")
+    forwarder_state = codex_native_forwarder._CodexForwarderState(
+        model="mock-model",
+        # A confirmed (config-read or live-notification) ABSENT read, the
+        # way a real forwarder session would have it by the time a plan
+        # prompt is answered — distinct from the never-yet-confirmed default,
+        # which now makes _default_collaboration_mode refuse to build a
+        # payload at all.
+        developer_instructions_known=True,
+    )
 
     async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
         """
@@ -4359,7 +4709,12 @@ def test_forwarder_starts_fresh_thread_from_clear_context_plan_prompt(
         ),
     )
     fake_client = _FakeCodexAppServerClient()
-    forwarder_state = codex_native_forwarder._CodexForwarderState(model="mock-model")
+    forwarder_state = codex_native_forwarder._CodexForwarderState(
+        model="mock-model",
+        # See the sibling default-turn test above: a confirmed read is a
+        # precondition for _default_collaboration_mode to build a payload.
+        developer_instructions_known=True,
+    )
 
     async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
         """
@@ -4449,6 +4804,107 @@ def test_forwarder_starts_fresh_thread_from_clear_context_plan_prompt(
     assert state is not None
     assert state.thread_id == "thread_fresh"
     assert state.active_turn_id == "turn_fresh"
+
+
+def test_clear_context_plan_implementation_refuses_before_creating_thread_when_unconfirmed(
+    tmp_path: Path,
+) -> None:
+    """
+    The clear-context plan-implementation flow must validate the
+    model/developer_instructions gate BEFORE creating (and switching to) a
+    new Codex thread — not after.
+
+    Regression: the old code only checked ``forwarder_state.model`` up
+    front, then unconditionally created a fresh thread and recorded it as
+    the bridge's active thread, and only THEN (inside
+    ``_start_plan_implementation_turn``) checked
+    ``developer_instructions_known`` and bailed. With never-confirmed
+    developer_instructions (``developer_instructions_known=False``, e.g.
+    every config.toml read so far has been UNREADABLE), that ordering let
+    a bare ``thread/start`` through, switched the bridge to the new (now
+    orphaned) empty thread, and silently never started the implementation
+    turn — the user's "clear context and implement" choice would appear
+    accepted but do nothing. Asserts NO ``thread/start`` (or any
+    other) request reaches Codex, and the bridge state's thread_id is
+    unchanged.
+    """
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_123",
+        ),
+    )
+    fake_client = _FakeCodexAppServerClient()
+    # developer_instructions_known defaults to False — never confirmed.
+    forwarder_state = codex_native_forwarder._CodexForwarderState(model="mock-model")
+
+    async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        fake_client.requests.append((method, params))
+        if method == "thread/start":
+            return {"result": {"thread": {"id": "thread_fresh"}}}
+        return {"result": {"turn": {"id": "turn_fresh"}}}
+
+    fake_client.request = fake_request  # type: ignore[method-assign]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/events"):
+            return httpx.Response(202, json={"queued": False})
+        return httpx.Response(
+            200,
+            json={
+                "answers": {
+                    "plan_implementation": {"answers": ["Yes, clear context and implement"]}
+                }
+            },
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            for event in [
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "item": {
+                            "type": "plan",
+                            "id": "item_plan",
+                            "text": "- do the work",
+                        },
+                    },
+                },
+                _completed_event("turn_123"),
+            ]:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    usage_coalescer=_usage_coalescer(client),
+                    elicitation_tracker=_elicitation_tracker(),
+                    event=event,
+                    codex_client=fake_client,  # type: ignore[arg-type]
+                    forwarder_state=forwarder_state,
+                )
+
+    asyncio.run(run())
+
+    assert fake_client.requests == [], (
+        f"No Codex app-server request should have been issued when "
+        f"developer_instructions_known is False; got {fake_client.requests!r}."
+    )
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.thread_id == "thread_123", (
+        "Bridge state's active thread must be unchanged — no orphaned "
+        "empty thread switch on a refused gate."
+    )
 
 
 def test_forwarder_sends_codex_command_approval_response_to_app_server(
@@ -7348,6 +7804,216 @@ def test_run_with_local_server_records_fresh_session_before_attach(
     )
 
     assert order == ["prepare", "record:conv_fresh", "attach"]
+
+
+def test_wrapper_spec_raw_instructions_resolves_prompt(tmp_path: Path) -> None:
+    """The ``omnigent codex`` wrapper's own materialized spec is resolvable.
+
+    Its ``prompt`` field is real ``AgentSpec.instructions`` content, not
+    framework-composed text, so it must reach ``developer_instructions``
+    like any other codex-native author instructions.
+    """
+    spec_path = codex_native._materialize_codex_agent_spec(tmp_path, model=None)
+    result = codex_native._wrapper_spec_raw_instructions(spec_path)
+    assert result is not None
+    assert "Codex is running in the session terminal" in result
+
+
+def test_wrapper_spec_raw_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
+    """A malformed wrapper spec must not block the terminal launch."""
+    bad_spec = tmp_path / "bad.yaml"
+    bad_spec.write_text("not: [valid, agent, spec")
+    assert codex_native._wrapper_spec_raw_instructions(bad_spec) is None
+
+
+@pytest.mark.asyncio
+async def test_prepare_codex_terminal_fresh_session_passes_developer_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Direct-wrapper fresh launch passes raw author instructions through to
+    ``build_codex_native_server`` as ``developer_instructions``.
+
+    The direct-wrapper call site in ``_prepare_codex_terminal``
+    (``codex_native.py``), where the CLI-launched path can discard the value
+    while the managed-host path still receives it.
+    """
+    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "codex-bridge")
+
+    async def _fake_create_session(_client: object, _bundle: bytes, *, bridge_id: str) -> str:
+        del _client, _bundle, bridge_id
+        return "conv_fresh_di"
+
+    captured: dict[str, Any] = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    def _fake_build_codex_native_server(**kwargs: object) -> object:
+        captured.update(kwargs)
+        raise _Sentinel
+
+    monkeypatch.setattr(codex_native, "_create_codex_session", _fake_create_session)
+    monkeypatch.setattr(codex_native, "build_codex_native_server", _fake_build_codex_native_server)
+
+    with pytest.raises(_Sentinel):
+        await codex_native._prepare_codex_terminal(
+            base_url="http://test",
+            headers={},
+            session_id=None,
+            runner_id=None,
+            session_bundle=b"fake-bundle",
+            codex_args=(),
+            command="codex",
+            model=None,
+            developer_instructions="Be a concise, careful coding assistant.",
+        )
+
+    assert captured.get("developer_instructions") == "Be a concise, careful coding assistant."
+
+
+def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fresh(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    The real outer call site (``_run_with_local_server``) threads the
+    wrapper spec's raw instructions all the way into ``_prepare_codex_terminal``
+    on a FRESH session — with ``_prepare_codex_terminal`` itself REAL, not
+    faked. Only ``build_codex_native_server`` — one level further in — is
+    faked (and made to raise immediately after capturing its kwargs), to
+    observe what the real ``_prepare_codex_terminal`` call actually
+    forwards, without needing to fake the rest of the app-server lifecycle.
+    """
+    spec_path = codex_native._materialize_codex_agent_spec(tmp_path, model=None)
+
+    class _Proc:
+        def poll(self) -> None:
+            return None
+
+    def fake_start_server(*args: object, **kwargs: object) -> Any:
+        del args, kwargs
+        return SimpleNamespace(proc=_Proc(), runner_id="runner_local", log_path=None)
+
+    async def _fake_create_session(_client: object, _bundle: bytes, *, bridge_id: str) -> str:
+        del _client, _bundle, bridge_id
+        return "conv_fresh_wiring"
+
+    captured: dict[str, Any] = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    def _fake_build_codex_native_server(**kwargs: object) -> object:
+        captured.update(kwargs)
+        raise _Sentinel
+
+    monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 12401)
+    monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
+    monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
+    monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.chat._bundle_agent", lambda path: b"bundle")
+    monkeypatch.setattr(codex_native, "_resolve_session_id_for_resume", lambda **kwargs: None)
+    monkeypatch.setattr(codex_native, "_create_codex_session", _fake_create_session)
+    monkeypatch.setattr(codex_native, "build_codex_native_server", _fake_build_codex_native_server)
+
+    with pytest.raises(_Sentinel):
+        codex_native._run_with_local_server(
+            spec_path,
+            session_id=None,
+            resume_picker=False,
+            codex_args=(),
+            command="codex",
+            model=None,
+            prompt=None,
+            auto_open_conversation=False,
+        )
+
+    assert captured.get("developer_instructions") is not None
+    assert "Codex is running in the session terminal" in captured["developer_instructions"]
+
+
+def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resume(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Same as the fresh-session sibling, but for an existing session id
+    (``resolved_session_id is not None`` — the RESUME branch of
+    ``_prepare_codex_terminal``, e.g. cold-resume with no live terminal).
+    """
+    spec_path = codex_native._materialize_codex_agent_spec(tmp_path, model=None)
+
+    class _Proc:
+        def poll(self) -> None:
+            return None
+
+    def fake_start_server(*args: object, **kwargs: object) -> Any:
+        del args, kwargs
+        return SimpleNamespace(proc=_Proc(), runner_id="runner_local", log_path=None)
+
+    async def _fake_fetch_codex_session(_client: object, _session_id: str) -> dict[str, Any]:
+        del _client, _session_id
+        return {
+            "labels": {codex_native._WRAPPER_LABEL_KEY: codex_native._WRAPPER_LABEL_VALUE},
+            "external_session_id": "019e96aa-0be2-7343-8d3b-6f914d60936b",
+        }
+
+    async def _fake_find_running_codex_terminal(_client: object, _session_id: str) -> None:
+        del _client, _session_id
+        return
+
+    async def _fake_ensure_local_codex_resume_rollout(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        return tmp_path / "rollout.jsonl"
+
+    captured: dict[str, Any] = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    def _fake_build_codex_native_server(**kwargs: object) -> object:
+        captured.update(kwargs)
+        raise _Sentinel
+
+    monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 12402)
+    monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
+    monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
+    monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
+    monkeypatch.setattr(
+        codex_native,
+        "_resolve_session_id_for_resume",
+        lambda **kwargs: "conv_resume_wiring",
+    )
+    monkeypatch.setattr(
+        codex_native, "_align_working_directory_with_session", lambda session_id: None
+    )
+    monkeypatch.setattr(codex_native, "_fetch_codex_session", _fake_fetch_codex_session)
+    monkeypatch.setattr(
+        codex_native, "_find_running_codex_terminal", _fake_find_running_codex_terminal
+    )
+    monkeypatch.setattr(
+        codex_native,
+        "_ensure_local_codex_resume_rollout",
+        _fake_ensure_local_codex_resume_rollout,
+    )
+    monkeypatch.setattr(codex_native, "build_codex_native_server", _fake_build_codex_native_server)
+
+    with pytest.raises(_Sentinel):
+        codex_native._run_with_local_server(
+            spec_path,
+            session_id="conv_resume_wiring",
+            resume_picker=False,
+            codex_args=(),
+            command="codex",
+            model=None,
+            prompt=None,
+            auto_open_conversation=False,
+        )
+
+    assert captured.get("developer_instructions") is not None
+    assert "Codex is running in the session terminal" in captured["developer_instructions"]
 
 
 @pytest.mark.asyncio

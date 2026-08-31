@@ -53,7 +53,7 @@ from typing import Any
 import filelock
 import httpx
 import pytest
-from playwright.sync_api import Locator, Page, expect
+from playwright.sync_api import APIResponse, Error, Locator, Page, Route, expect
 
 from tests._helpers.compat import apply_server_env, compat_server_cwd, server_executable
 from tests.codex_parity.helpers import ev_assistant_message, ev_completed, ev_response_created
@@ -68,6 +68,32 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ALLOW_DEV_BASE_URL_ENV = "OMNIGENT_E2E_ALLOW_DEV_BASE_URL"
 _CODEX_GOAL_MIN_VERSION = (0, 139, 0)
 _PUBLIC_LOOPBACK_HOST = "omnigent-e2e-public.test"
+
+
+# A pooled connection the server closes as the replay goes out surfaces as one
+# of these; the request itself is fine on a retry.
+_TRANSIENT_FETCH_ERRORS = ("ECONNRESET", "socket hang up")
+
+
+def fetch_with_retry(route: Route, *, attempts: int = 3) -> APIResponse:
+    """Replay *route*'s request upstream, retrying a dropped connection.
+
+    Intercepting a request opts out of the browser's own connection handling,
+    which retries an idempotent GET when the server closes a pooled keep-alive
+    connection. Replaying by hand does not, so a reset fails the test on
+    something it never meant to assert.
+
+    :param route: Route whose request to replay upstream.
+    :param attempts: Total tries before the error surfaces.
+    :returns: The upstream response.
+    """
+    for _ in range(attempts - 1):
+        try:
+            return route.fetch()
+        except Error as exc:
+            if not any(marker in str(exc) for marker in _TRANSIENT_FETCH_ERRORS):
+                raise
+    return route.fetch()
 
 
 def open_right_rail(page: Page) -> None:
@@ -542,7 +568,10 @@ def configure_mock_llm(
     :param mock_url: Mock server base URL.
     :param responses: List of response configs. Keys:
         ``text``, ``tool_calls``, ``block``, ``stream``,
-        ``error``, ``status_code``.
+        ``error``, ``status_code``, ``delay``, ``truncate_after``
+        (emit only N SSE events then end the stream, dropping the
+        completion event — a mid-stream fault for exercising the SPA's
+        stream error/recovery UI).
     :param key: Queue key — typically the model name baked into the
         agent spec. Defaults to ``"default"`` (matches any model
         not assigned to a more specific queue).
@@ -727,63 +756,6 @@ def _write_codex_unknown_version_shim(directory: Path, codex_path: str) -> Path:
     return shim
 
 
-def _assert_service_worker_tombstone(build_output: Path) -> None:
-    """Fail if the built SPA ships anything but the tombstone service worker.
-
-    The PWA is retired: ``sw.js`` exists only to unregister workers still
-    installed in browsers, and the manifest/version sentinel must be gone. The
-    dangerous direction matters most — a worker that intercepted requests could
-    serve a stale shell and white-screen users after a deploy, and an unscoped
-    cache purge could delete Cache Storage belonging to a future feature.
-
-    Delete this guard together with ``sw-src/sw.js`` in 0.11.0.
-    """
-    if not (build_output / "index.html").is_file():
-        pytest.fail(f"SPA build is missing index.html at {build_output}")
-    if not (build_output / "sw.js").is_file():
-        pytest.fail(
-            f"SPA build is missing the tombstone sw.js at {build_output} — without it, "
-            "service workers already registered in browsers are never unregistered"
-        )
-    for name in ("manifest.webmanifest", "version.json"):
-        if (build_output / name).is_file():
-            pytest.fail(f"SPA build still emits the retired PWA asset {name}")
-    # Strip line comments first so prose that mentions these tokens can neither
-    # fake nor mask a regression.
-    sw = (build_output / "sw.js").read_text(encoding="utf-8")
-    sw_code = re.sub(r"//[^\n]*", "", sw)
-    if "registration.unregister" not in sw_code:
-        pytest.fail(
-            "sw.js does not call registration.unregister() — it must remove itself, "
-            "or the retired worker stays registered in users' browsers"
-        )
-    if "__BUILD_VERSION__" in sw:
-        pytest.fail(
-            "sw.js still carries the __BUILD_VERSION__ token but nothing substitutes "
-            "it any more; the tombstone is byte-stable and needs no fingerprint"
-        )
-    responders = sw_code.count("respondWith")
-    if responders:
-        pytest.fail(
-            f"sw.js has {responders} respondWith() call(s); the tombstone must intercept "
-            "nothing — any responder risks serving a stale shell after a deploy"
-        )
-    # The purge must match the retired worker's exact cache-name shape
-    # (`omnigent-pwa-<8 lowercase hex>`), not a bare prefix: a tombstone lingering
-    # in some browser must not be able to delete a future feature's Cache Storage
-    # even if that feature reuses the prefix. Checked by marker rather than
-    # structurally — the pattern is held in a const, so a same-line regex would
-    # only be asserting the current formatting.
-    if "caches.delete" in sw_code and not (
-        r"/^omnigent-pwa-[0-9a-f]{8}$/" in sw_code and ".filter(" in sw_code
-    ):
-        pytest.fail(
-            "sw.js deletes caches without filtering on the retired cache-name shape "
-            "/^omnigent-pwa-[0-9a-f]{8}$/ — the purge must not touch caches it does "
-            "not own, and a bare prefix match is too broad"
-        )
-
-
 @pytest.fixture(scope="session")
 def built_spa(request: pytest.FixtureRequest) -> None:
     """
@@ -803,7 +775,6 @@ def built_spa(request: pytest.FixtureRequest) -> None:
     if request.config.getoption("--ui-base-url"):
         return
     if request.config.getoption("--ui-skip-build"):
-        _assert_service_worker_tombstone(_BUILD_OUTPUT)
         return
 
     lock_path = _WEB_DIR / ".build.lock"
@@ -829,8 +800,6 @@ def built_spa(request: pytest.FixtureRequest) -> None:
             stdin=subprocess.DEVNULL,
             env=env,
         )
-
-    _assert_service_worker_tombstone(_BUILD_OUTPUT)
 
 
 def _spawn_runner_against_external_server(
@@ -2201,6 +2170,47 @@ def _ui_defaults() -> None:
     for streaming-text assertions without masking real hangs.
     """
     expect.set_options(timeout=15_000)
+
+
+@pytest.fixture(autouse=True)
+def _record_video(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[None]:
+    """Capture a screen recording of the journey when recording is requested.
+
+    Most e2e_ui tests drive Playwright through ``async_playwright()`` directly
+    (``browser.new_page()`` / ``browser.new_context()``), not the
+    pytest-playwright ``page`` fixture, so ``pytest --video`` records nothing for
+    them. When ``OMNIGENT_E2E_RECORD_DIR`` is set, patch the async ``Browser``
+    methods to inject ``record_video_dir`` into every page/context they open, so
+    the rendered journey lands as a ``.webm`` regardless of how the test opened
+    the browser. A caller that already passes ``record_video_dir`` is left alone.
+    Playwright writes the file (a random hash name) when the context closes;
+    callers/harnesses pick it up from the directory. No-op when the env var is
+    unset, so ordinary runs are unaffected.
+    """
+    record_dir = os.environ.get("OMNIGENT_E2E_RECORD_DIR")
+    if not record_dir:
+        yield
+        return
+
+    from playwright.async_api import Browser as _AsyncBrowser
+
+    Path(record_dir).mkdir(parents=True, exist_ok=True)
+    _orig_new_page = _AsyncBrowser.new_page
+    _orig_new_context = _AsyncBrowser.new_context
+
+    async def _new_page(self: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("record_video_dir", record_dir)
+        return await _orig_new_page(self, *args, **kwargs)
+
+    async def _new_context(self: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("record_video_dir", record_dir)
+        return await _orig_new_context(self, *args, **kwargs)
+
+    monkeypatch.setattr(_AsyncBrowser, "new_page", _new_page)
+    monkeypatch.setattr(_AsyncBrowser, "new_context", _new_context)
+    yield
 
 
 @pytest.fixture

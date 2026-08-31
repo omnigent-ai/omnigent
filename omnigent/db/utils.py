@@ -354,6 +354,11 @@ def _ensure_conversation_tables(engine: Engine) -> None:
         ensure_fts_table(engine)
 
 
+def _set_alembic_database_url(config: Config, db_uri: str) -> None:
+    """Store a database URL safely in Alembic's ConfigParser-backed config."""
+    config.set_main_option("sqlalchemy.url", db_uri.replace("%", "%%"))
+
+
 def _build_alembic_config(db_uri: str) -> Config:
     """
     Build an Alembic ``Config`` pointed at our migrations directory.
@@ -373,7 +378,7 @@ def _build_alembic_config(db_uri: str) -> Config:
 
     alembic_ini = Path(__file__).parent / "alembic.ini"
     config = Config(str(alembic_ini))
-    config.set_main_option("sqlalchemy.url", db_uri)
+    _set_alembic_database_url(config, db_uri)
     config.set_main_option("script_location", str(Path(__file__).parent / "migrations"))
     return config
 
@@ -398,10 +403,16 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
     :param db_uri: Database connection string forwarded to
         Alembic's ``sqlalchemy.url`` config option, e.g.
         ``"sqlite:///mydb.db"``.
+    :raises RuntimeError: If the database revision is newer than
+        the revisions known to this build.
     """
     from alembic import command
 
     from omnigent.db.db_models import ConversationBase, OmnigentBase
+
+    current = _get_current_db_revision(engine)
+    head = _get_head_db_revision(db_uri)
+    _verify_db_revision_is_supported(db_uri, current, head)
 
     _logger.info("Running database migrations...")
     config = _build_alembic_config(db_uri)
@@ -476,11 +487,34 @@ def _get_head_db_revision(db_uri: str) -> str:
     return head
 
 
+def _verify_db_revision_is_supported(
+    db_uri: str,
+    current: str | None,
+    head: str,
+) -> None:
+    """Reject a database revision that is unknown to this build."""
+    if current is None or current == head:
+        return
+
+    from alembic.script import ScriptDirectory
+    from alembic.util import CommandError
+
+    script = ScriptDirectory.from_config(_build_alembic_config(db_uri))
+    try:
+        script.get_revision(current)
+    except CommandError as exc:
+        raise RuntimeError(
+            "Omnigent database schema is newer than this version of Omnigent "
+            f"(found revision {current!r}, latest supported revision {head!r}). "
+            "Upgrade Omnigent before using this database."
+        ) from exc
+
+
 def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
     """
     Bring a fresh or stale database to head before the server starts.
 
-    Three cases:
+    Four cases:
 
     - **Fresh DB** (no ``alembic_version`` table) — run migrations to
       head. This covers brand-new SQLite files and freshly created
@@ -491,6 +525,8 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
       If the migration fails, re-raise with context so the server
       still terminates with an actionable error instead of continuing
       against an incompatible schema.
+    - **Newer than this build** — stop without attempting a migration
+      and tell the operator to upgrade Omnigent.
 
     :param engine: SQLAlchemy engine bound to the target database.
     :param db_uri: Database URL, used both for Alembic config and in
@@ -500,6 +536,7 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
     """
     head = _get_head_db_revision(db_uri)
     current = _get_current_db_revision(engine)
+    _verify_db_revision_is_supported(db_uri, current, head)
 
     if current is None:
         _run_migrations(engine, db_uri)

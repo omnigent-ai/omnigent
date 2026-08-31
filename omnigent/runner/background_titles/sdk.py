@@ -7,12 +7,13 @@ import json
 import logging
 import uuid
 
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.runner.background_titles.service import (
     BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS,
-    BACKGROUND_TITLE_INSTRUCTIONS,
-    BACKGROUND_TITLE_MAX_OUTPUT_TOKENS,
     BackgroundTitleContext,
     BackgroundTitleHarnessError,
+    background_title_max_output_tokens,
+    build_background_title_instructions,
 )
 
 _logger = logging.getLogger("omnigent.runner.background_titles.sdk")
@@ -44,9 +45,9 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         "content": f"<user_message>\n{context.prompt}\n</user_message>",
         "model": "session-title",
         "tools": [],
-        "instructions": BACKGROUND_TITLE_INSTRUCTIONS,
+        "instructions": build_background_title_instructions(context.additional_instructions),
         "reasoning": {"effort": "low"},
-        "max_output_tokens": BACKGROUND_TITLE_MAX_OUTPUT_TOKENS,
+        "max_output_tokens": background_title_max_output_tokens(context.additional_instructions),
     }
     try:
         client = await context.process_manager.get_client(
@@ -119,6 +120,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
                             "background title harness failed process=%s detail=%s",
                             process_key,
                             detail,
+                            extra={"session_id": runner_primary_session_id()},
                         )
                         raise BackgroundTitleHarnessError(detail)
                     elif event_type == "response.completed":

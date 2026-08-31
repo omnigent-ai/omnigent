@@ -12,11 +12,23 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import type * as NativeBridge from "@/lib/nativeBridge";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 
-afterEach(cleanup);
+const nativeShell = vi.hoisted(() => ({ electron: false }));
+
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof NativeBridge>()),
+  isElectronShell: () => nativeShell.electron,
+}));
+
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+  nativeShell.electron = false;
+});
 
 const WORKSPACE = "/home/u/ws";
 
@@ -54,6 +66,8 @@ describe("markdown links to workspace files", () => {
     const link = screen.getByRole("button", { name: "proposal.md" });
     // No href at all: the parked fragment must not survive as clickable.
     expect(link).not.toHaveAttribute("href");
+    expect(link).not.toHaveAttribute("target");
+    expect(link).not.toHaveAttribute("rel");
 
     fireEvent.click(link);
     expect(openFile).toHaveBeenCalledWith("docs/proposal.md");
@@ -75,11 +89,57 @@ describe("markdown links to workspace files", () => {
     expect(openFile).toHaveBeenCalledWith("docs/notes.md");
   });
 
-  it("leaves an external link as a real anchor", () => {
+  it("leaves an external web link as a real current-tab anchor", () => {
     renderMarkdown("[docs](https://example.com/page)");
 
     const link = screen.getByRole("link", { name: "docs" });
     expect(link).toHaveAttribute("href", "https://example.com/page");
+    expect(link).toHaveAttribute("target", "_self");
+    expect(link).toHaveAttribute("rel", "noreferrer");
+  });
+
+  it("keeps Electron external links on the desktop popup-policy path", () => {
+    nativeShell.electron = true;
+    renderMarkdown("[docs](https://example.com/page)");
+
+    const link = screen.getByRole("link", { name: "docs" });
+    expect(link).toHaveAttribute("href", "https://example.com/page");
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noopener noreferrer");
+  });
+
+  it("leaves primary-click current-tab navigation to the browser", () => {
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+    renderMarkdown("[docs](https://example.com/page)");
+
+    const link = screen.getByRole("link", { name: "docs" });
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 });
+    link.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(openSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["ctrl-click", "click", { button: 0, ctrlKey: true }],
+    ["meta-click", "click", { button: 0, metaKey: true }],
+    ["shift-click", "click", { button: 0, shiftKey: true }],
+    ["middle-click", "auxclick", { button: 1 }],
+  ])("leaves %s to the browser", (_label, type, init) => {
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+    renderMarkdown("[docs](https://example.com/page)");
+
+    const event = new MouseEvent(type, { bubbles: true, cancelable: true, ...init });
+    screen.getByRole("link", { name: "docs" }).dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(openSpy).not.toHaveBeenCalled();
+  });
+
+  it("keeps dangerous link targets blocked", () => {
+    renderMarkdown("[unsafe](javascript:alert(1))");
+
+    expect(screen.queryByRole("link", { name: "unsafe" })).toBeNull();
   });
 
   // Overriding the `a` slot replaces Streamdown's link component, so its

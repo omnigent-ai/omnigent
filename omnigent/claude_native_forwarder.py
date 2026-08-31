@@ -36,6 +36,7 @@ from omnigent.claude_native_bridge import (
     read_hook_events_from_offset,
     read_hook_events_since_with_position,
     read_message_deltas_from_offset,
+    read_permission_mode,
     read_transcript_items_from_offset,
     read_transcript_items_since_with_position,
     read_transcript_path,
@@ -82,6 +83,11 @@ _SUBAGENT_IDLE_QUIESCENCE_S = 5.0
 # ``agent-<id>.jsonl`` transcript.
 _SUBAGENT_META_GLOB = "agent-*.meta.json"
 _DEFAULT_POLL_INTERVAL_S = 0.25
+# Minimum spacing between permission-mode pane reads. Unlike the model mirror
+# (which reads a JSON file), this spawns a ``tmux capture-pane`` subprocess, so
+# it runs well below the poll interval; a mode switch is a human action and 2s
+# of lag is imperceptible.
+_PERMISSION_MODE_POLL_INTERVAL_S = 2.0
 # Hard ceiling on one poll iteration of the forward loop. A silently stalled
 # await anywhere in the pipeline used to stop mirroring, status and the busy
 # signal forever; the deadline cancels the stall (the traceback names it) and
@@ -95,6 +101,15 @@ _FORK_COMMAND_NAMES = frozenset({"/branch", "/fork"})
 _HTTP_POST_MAX_PERMANENT_FAILURES = 3
 _HTTP_POST_RETRY_BASE_DELAY_S = 1.0
 _HTTP_POST_RETRY_MAX_DELAY_S = 30.0
+# Ceiling for the backoff exponent. Transient failures retry with no give-up
+# budget (by design — see _PostRetryTracker), so ``attempts`` is unbounded, and
+# ``min()`` evaluates both operands: without this clamp ``2 ** attempts`` is
+# computed in full before the delay cap can apply, and overflows float once
+# attempts passes ~1025 (OverflowError out of record_failure). Any exponent past
+# the cap is dead weight anyway — with the defaults the cap is already reached at
+# attempt 6 — so 32 leaves the schedule identical while staying far inside float
+# range for any realistic max_delay_s / base_delay_s ratio.
+_HTTP_POST_RETRY_MAX_BACKOFF_EXPONENT = 32
 _HTTP_TRANSIENT_STATUS_CODES = {408, 409, 425, 429}
 # A 503 ``subagent_delivery_not_confirmed`` means the runner could not deliver a
 # terminal sub-agent result to the parent inbox. It is retried (the work entry can
@@ -542,6 +557,13 @@ class _ForwardDedupeState:
     # sub-agent spend so the gate can block mid-turn. Separate baseline
     # because it can advance while ``posted_cost`` (S) is frozen.
     posted_policy_cost: float | None = None
+    # Last permission mode POSTed as ``external_permission_mode_change`` —
+    # mirrors the launch mode and any in-pane shift+tab switch, neither of
+    # which the web UI can observe on its own.
+    posted_permission_mode: str | None = None
+    # Monotonic deadline before which the next pane read is skipped, so the
+    # subprocess spawn runs at _PERMISSION_MODE_POLL_INTERVAL_S, not every poll.
+    permission_mode_next_read: float = 0.0
     # Turn-settle latch driving the scheduled-wake boundary. The Stop edge
     # records the ended turn's id as PENDING; it activates (moves to
     # ``settled_response_id``) only once a fully-consumed transcript batch
@@ -709,8 +731,9 @@ class _PostRetryTracker:
                 exhausted=True,
                 permanent=permanent,
             )
+        exponent = min(max(0, entry.attempts - 1), _HTTP_POST_RETRY_MAX_BACKOFF_EXPONENT)
         delay_s = min(
-            self._base_delay_s * (2 ** max(0, entry.attempts - 1)),
+            self._base_delay_s * (2**exponent),
             self._max_delay_s,
         )
         entry.next_attempt_at = time.monotonic() + delay_s
@@ -1011,6 +1034,14 @@ async def forward_claude_transcript_to_session(
                             bridge_dir=bridge_dir,
                             dedupe=dedupe,
                         )
+                        # Same rationale for the permission mode: a shift+tab in
+                        # the pane emits no event, so poll the footer.
+                        await _forward_permission_mode_from_pane(
+                            client=client,
+                            session_id=current_session_id,
+                            bridge_dir=bridge_dir,
+                            dedupe=dedupe,
+                        )
             except asyncio.CancelledError:
                 raise
             except TimeoutError:
@@ -1025,12 +1056,14 @@ async def forward_claude_transcript_to_session(
                     session_id,
                     bridge_dir,
                     exc_info=True,
+                    extra={"session_id": session_id},
                 )
             except Exception:
                 _logger.exception(
                     "Claude transcript forwarder loop failed; session=%s bridge_dir=%s",
                     session_id,
                     bridge_dir,
+                    extra={"session_id": session_id},
                 )
             await asyncio.sleep(poll_interval_s)
 
@@ -1358,6 +1391,7 @@ async def _forward_available_subagents(
                     subagent_id,
                     decision.attempts,
                     _http_status_for_log(exc),
+                    extra={"session_id": parent_session_id},
                 )
                 # Dead-letter the dropped payload for recovery (#1120; replay #1579).
                 append_dead_letter(
@@ -1402,6 +1436,7 @@ async def _forward_available_subagents(
                 decision.delay_s,
                 _http_status_for_log(exc),
                 exc_info=True,
+                extra={"session_id": parent_session_id},
             )
             continue
         start_retry_tracker.clear(retry_key)
@@ -1896,6 +1931,7 @@ async def _forward_session_cost(
             _http_status_for_log(exc),
             delay,
             exc_info=True,
+            extra={"session_id": session_id},
         )
         return
     dedupe.cost_retry_failures = 0
@@ -2016,6 +2052,7 @@ async def supervise_forwarder(
                 "session=%s bridge_dir=%s",
                 session_id,
                 bridge_dir,
+                extra={"session_id": session_id},
             )
         except asyncio.CancelledError:
             raise
@@ -2034,6 +2071,7 @@ async def supervise_forwarder(
                 session_id,
                 bridge_dir,
                 exc_info=crash_exc,
+                extra={"session_id": session_id},
             )
         await _supervisor_sleep(backoff_s)
         backoff_s = min(backoff_s * 2.0, _SUPERVISOR_MAX_BACKOFF_S)
@@ -2102,6 +2140,7 @@ async def _maybe_rotate_session_on_clear(
             "Claude /clear rotation failed; consuming the clear hook to avoid a "
             "re-rotation loop. old_session=%s",
             session_id,
+            extra={"session_id": session_id},
         )
     await _write_hook_state_async(bridge_dir, durable)
     reset_transcript_forward_state(bridge_dir, reset_hooks=False)
@@ -2229,6 +2268,7 @@ async def _create_clear_replacement_session(
             new_session_id,
             clear_resp.status_code,
             clear_resp.text,
+            extra={"session_id": old_session_id},
         )
     return new_session_id
 
@@ -2292,6 +2332,7 @@ async def _maybe_rotate_session_on_fork(
             "Claude /fork rotation failed; consuming the fork hook to avoid a "
             "re-rotation loop. old_session=%s",
             session_id,
+            extra={"session_id": session_id},
         )
     await _write_hook_state_async(bridge_dir, durable)
     await _seed_fork_transcript_forward_state(
@@ -2363,6 +2404,7 @@ async def _create_fork_replacement_session(
             new_session_id,
             clear_resp.status_code,
             clear_resp.text,
+            extra={"session_id": old_session_id},
         )
     return new_session_id
 
@@ -2493,12 +2535,14 @@ async def _maybe_mirror_external_session_id(
                 exc.response.status_code,
                 session_id,
                 claude_sid,
+                extra={"session_id": session_id},
             )
             return True
         _logger.warning(
             "Transient Omnigent error PATCHing external_session_id (%s); session=%s — will retry",
             exc.response.status_code,
             session_id,
+            extra={"session_id": session_id},
         )
         return False
     except httpx.HTTPError:
@@ -2506,6 +2550,7 @@ async def _maybe_mirror_external_session_id(
             "Transient transport error PATCHing external_session_id; session=%s — will retry",
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
         return False
     return True
@@ -2691,6 +2736,7 @@ async def _forward_available_status_events(
                 record.event_name,
                 status,
                 record.transcript_path,
+                extra={"session_id": session_id},
             )
             durable = next_durable
             await _write_hook_state_async(bridge_dir, durable)
@@ -2717,6 +2763,7 @@ async def _forward_available_status_events(
                         record.event_cursor,
                         compaction_status,
                         exc_info=True,
+                        extra={"session_id": session_id},
                     )
                 if compaction_status == "in_progress":
                     # ``PreCompact`` mints a durable pending token that the
@@ -2812,6 +2859,7 @@ async def _forward_available_status_events(
                                         seq,
                                         decision.attempts,
                                         _http_status_for_log(exc),
+                                        extra={"session_id": session_id},
                                     )
                                     # Fall through to advance the cursor.
                                 else:
@@ -2827,6 +2875,7 @@ async def _forward_available_status_events(
                                         decision.delay_s,
                                         _http_status_for_log(exc),
                                         exc_info=True,
+                                        extra={"session_id": session_id},
                                     )
                                     return durable
                         except Exception:  # noqa: BLE001
@@ -2903,6 +2952,7 @@ async def _forward_available_status_events(
                         session_id,
                         record.event_cursor,
                         exc_info=True,
+                        extra={"session_id": session_id},
                     )
             durable = next_durable
             await _write_hook_state_async(bridge_dir, durable)
@@ -2925,6 +2975,10 @@ async def _forward_available_status_events(
                 background_task_count=(
                     None if status == "failed" else record.background_task_count
                 ),
+                # Detail rides alongside the count on the same ``Stop`` edge so
+                # the UI can name the shells. Dropped on ``failed`` for the same
+                # reason as the count (the server clears the tally there).
+                background_tasks=(None if status == "failed" else record.background_tasks),
             )
         except httpx.HTTPError as exc:
             decision = retry_tracker.record_failure(retry_key, exc)
@@ -2939,6 +2993,7 @@ async def _forward_available_status_events(
                     status,
                     decision.attempts,
                     _http_status_for_log(exc),
+                    extra={"session_id": session_id},
                 )
                 if status != "failed":
                     await _post_forwarder_failed_status(
@@ -2964,6 +3019,7 @@ async def _forward_available_status_events(
                 decision.delay_s,
                 _http_status_for_log(exc),
                 exc_info=True,
+                extra={"session_id": session_id},
             )
             return durable
         retry_tracker.clear(retry_key)
@@ -3185,6 +3241,7 @@ async def _handle_compact_summary_item(
                 session_id,
                 bridge_dir,
                 _compaction_skip_stats.precompact_miss,
+                extra={"session_id": session_id},
             )
         else:
             _compaction_skip_stats.expected_skip += 1
@@ -3194,6 +3251,7 @@ async def _handle_compact_summary_item(
                 session_id,
                 bridge_dir,
                 _compaction_skip_stats.expected_skip,
+                extra={"session_id": session_id},
             )
         await _note_transcript_summary_without_token(bridge_dir)
         return True
@@ -3233,6 +3291,7 @@ async def _handle_compact_summary_item(
             decision.delay_s,
             _http_status_for_log(exc),
             exc_info=True,
+            extra={"session_id": session_id},
         )
         return False
     except Exception:  # noqa: BLE001
@@ -3388,6 +3447,7 @@ async def _forward_available_items(
                     item.item_type,
                     decision.attempts,
                     _http_status_for_log(exc),
+                    extra={"session_id": session_id},
                 )
                 # Dead-letter the dropped item for recovery (#1120; replay #1579).
                 append_dead_letter(
@@ -3442,6 +3502,7 @@ async def _forward_available_items(
                     item.item_type,
                     _http_status_for_log(exc),
                     exc_info=True,
+                    extra={"session_id": session_id},
                 )
                 retry_tracker.clear(retry_key)
                 seen.add(item.source_id)
@@ -3471,6 +3532,7 @@ async def _forward_available_items(
                 decision.delay_s,
                 _http_status_for_log(exc),
                 exc_info=True,
+                extra={"session_id": session_id},
             )
             return updated
         retry_tracker.clear(retry_key)
@@ -3570,6 +3632,7 @@ async def _forward_available_items(
                 bridge_dir,
                 _http_status_for_log(exc),
                 exc_info=True,
+                extra={"session_id": session_id},
             )
     # Report the transcript's model verbatim. This transcript-derived
     # observation only fires when a turn produces a fresh
@@ -3693,6 +3756,7 @@ def _validated_hook_state(
             session_id,
             bridge_dir,
             state.byte_offset,
+            extra={"session_id": session_id},
         )
     elif state.cursor_fingerprint is None:
         _logger.warning(
@@ -3701,6 +3765,7 @@ def _validated_hook_state(
             session_id,
             bridge_dir,
             state.byte_offset,
+            extra={"session_id": session_id},
         )
     elif current_fingerprint == state.cursor_fingerprint:
         return state
@@ -3711,6 +3776,7 @@ def _validated_hook_state(
             session_id,
             bridge_dir,
             state.byte_offset,
+            extra={"session_id": session_id},
         )
     return HookForwardState(
         event_cursor=0,
@@ -3785,6 +3851,7 @@ def _validated_transcript_state(
             bridge_dir,
             state.transcript_path,
             state.byte_offset,
+            extra={"session_id": session_id},
         )
     elif state.cursor_fingerprint is None:
         if state.byte_offset == 0 and state.line_cursor == 0:
@@ -3809,6 +3876,7 @@ def _validated_transcript_state(
             bridge_dir,
             state.transcript_path,
             state.byte_offset,
+            extra={"session_id": session_id},
         )
     elif current_fingerprint == state.cursor_fingerprint:
         return state
@@ -3820,6 +3888,7 @@ def _validated_transcript_state(
             bridge_dir,
             state.transcript_path,
             state.byte_offset,
+            extra={"session_id": session_id},
         )
     end_offset = _transcript_end_offset(state.transcript_path)
     return TranscriptForwardState(
@@ -3887,6 +3956,7 @@ async def _post_clear_supersession(
             old_session_id,
             new_session_id,
             exc_info=True,
+            extra={"session_id": old_session_id},
         )
     notice = (
         "This conversation was ended by `/clear`. "
@@ -3915,6 +3985,7 @@ async def _post_clear_supersession(
             old_session_id,
             new_session_id,
             exc_info=True,
+            extra={"session_id": old_session_id},
         )
     try:
         event_resp = await client.post(
@@ -3931,6 +4002,7 @@ async def _post_clear_supersession(
             old_session_id,
             new_session_id,
             exc_info=True,
+            extra={"session_id": old_session_id},
         )
 
 
@@ -4076,6 +4148,7 @@ async def _forward_available_deltas(
                 delta.message_id,
                 delta.index,
                 _http_status_for_log(exc),
+                extra={"session_id": session_id},
             )
     updated = DeltaForwardState(byte_offset=result.byte_offset)
     await _write_delta_forward_state_async(bridge_dir, updated)
@@ -4173,6 +4246,84 @@ def _gen_ai_usage_tokens(usage: Mapping[str, float | str] | None) -> dict[str, i
     if "input_tokens" not in tokens and "output_tokens" not in tokens:
         return None
     return tokens
+
+
+async def _post_external_permission_mode_change(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    mode: str,
+) -> None:
+    """
+    Post one ``external_permission_mode_change`` event to the Sessions API.
+
+    Lets the web mode picker reflect a shift+tab switch made inside the Claude
+    Code terminal, which Omnigent has no other way to observe.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
+    :param mode: Permission mode the pane now shows, e.g. ``"auto"``.
+    :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
+    """
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_permission_mode_change", "data": {"permission_mode": mode}},
+    )
+    resp.raise_for_status()
+
+
+async def _forward_permission_mode_from_pane(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    dedupe: _ForwardDedupeState,
+) -> None:
+    """
+    Mirror the pane's permission-mode footer to the session label each poll.
+
+    A shift+tab pressed inside the TUI produces no event Omnigent can see, so
+    without this the web picker shows a stale mode until the next UI-driven
+    switch. Polling the footer is the only signal available: Claude Code emits
+    nothing on a mode change, and hook payloads only arrive on tool use.
+
+    The launch mode is posted too, not just later switches: a session started
+    in manual mode carries no ``--permission-mode`` arg and no mode label, so
+    with nothing posted the web picker has no mode to render and hides itself.
+    Best-effort and idempotent — the server ignores a mode equal to the stored
+    label, an unchanged mode or unreadable pane is a no-op, and a failed POST
+    is retried next poll.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param bridge_dir: Native Claude bridge directory.
+    :param dedupe: Shared per-session dedupe state; mutated in place.
+    """
+    # Throttled: this spawns a tmux subprocess, unlike the file-backed model
+    # mirror that shares this poll loop.
+    now = time.monotonic()
+    if now < dedupe.permission_mode_next_read:
+        return
+    dedupe.permission_mode_next_read = now + _PERMISSION_MODE_POLL_INTERVAL_S
+    mode = await asyncio.to_thread(read_permission_mode, bridge_dir)
+    if mode is None or mode == dedupe.posted_permission_mode:
+        return
+    try:
+        await _post_external_permission_mode_change(
+            client,
+            session_id=session_id,
+            mode=mode,
+        )
+    except httpx.HTTPError:
+        _logger.debug(
+            "external_permission_mode_change post failed; session=%s mode=%s",
+            session_id,
+            mode,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return
+    dedupe.posted_permission_mode = mode
 
 
 async def _post_external_model_change(
@@ -4279,6 +4430,7 @@ async def _post_title_change_if_new(
             "list may show a stale title until the next poll",
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
 
 
@@ -4331,6 +4483,7 @@ async def _post_model_change_if_new(
             "cost-budget gate may lag until the next poll",
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
 
 
@@ -4569,6 +4722,7 @@ async def _maybe_sync_effort_from_slash_command(
             level,
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
 
 
@@ -4610,6 +4764,7 @@ async def _post_forwarder_failed_status(
             bridge_dir,
             reason,
             exc_info=True,
+            extra={"session_id": session_id},
         )
 
 

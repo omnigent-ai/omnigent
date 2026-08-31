@@ -105,10 +105,11 @@ from omnigent.claude_native_state import (
     redirect_launch_state,
     write_launch_state,
 )
+from omnigent.cli_invocation import cli_invocation
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.host.daemon_launch import (
-    DAEMON_POLL_INTERVAL_S,
+    daemon_poll_intervals,
     error_text,
     launch_or_reuse_daemon_runner,
     open_daemon_client,
@@ -134,7 +135,8 @@ from omnigent.native_terminal import (
 from omnigent.native_terminal import (
     terminal_attach_url as _attach_url,
 )
-from omnigent.terminals.ws_bridge import (
+from omnigent.process_logging import log_info_once
+from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
 )
@@ -254,11 +256,24 @@ _SESSION_LABELS = {
     _WRAPPER_LABEL_KEY: _WRAPPER_LABEL_VALUE,
 }
 _CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
-_CLAUDE_CODE_MANAGED_SETTINGS_PATHS: tuple[Path, ...] = (
-    Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
-    Path("/etc/claude-code/managed-settings.json"),
-    Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "ClaudeCode" / "managed-settings.json",
-)
+# Test override for the managed-settings chain. ``None`` means "use the ambient
+# detector's chain" — the single canonical definition (``ambient`` owns both the
+# path list and the parser). Binding a *copy* here would create a second source
+# of host state that a test fixture could neutralize independently of the other,
+# so both readers below resolve through ``_managed_settings_paths`` at call time.
+_CLAUDE_CODE_MANAGED_SETTINGS_PATHS: tuple[Path, ...] | None = None
+
+
+def _managed_settings_paths() -> tuple[Path, ...]:
+    """The Claude Code managed-settings chain to read (ambient's, or a test override)."""
+    override = _CLAUDE_CODE_MANAGED_SETTINGS_PATHS
+    if override is not None:
+        return override
+    from omnigent.onboarding.ambient import CLAUDE_CODE_MANAGED_SETTINGS_PATHS
+
+    return CLAUDE_CODE_MANAGED_SETTINGS_PATHS
+
+
 _CLAUDE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _RESUME_ACTION_SWITCH = "switch"
 _RESUME_ACTION_MOVE = "move"
@@ -352,7 +367,7 @@ class PreparedClaudeTerminal:
         when the runner did not advertise a socket. Drives the
         same-machine direct ``tmux attach`` fast path; a remote
         runner's socket won't exist locally, so the attach falls back
-        to the WebSocket PTY bridge.
+        to the WebSocket terminal bridge.
     :param tmux_target: tmux ``-t`` target for the terminal pane,
         e.g. ``"main"``. ``None`` when unavailable. Paired with
         ``tmux_socket`` for the direct attach.
@@ -413,6 +428,57 @@ def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> b
         return True
     host = (urlparse(base_url).hostname or "").lower()
     return host == "anthropic.com" or host.endswith(".anthropic.com")
+
+
+def _claude_family(token: str) -> str | None:
+    """
+    The family alias a model id or alias folds onto, bracket markers dropped.
+
+    :param token: A picker id or model id, e.g. ``"opus[1m]"``,
+        ``"claude-opus-4-8"``.
+    :returns: The family alias, e.g. ``"opus"``, or ``None`` for none.
+    """
+    from omnigent.claude_model_vocabulary import claude_model_alias
+
+    alias = claude_model_alias(token, {})
+    return alias.partition("[")[0] if alias else None
+
+
+def claude_catalog_serves_model(
+    rows: list[dict[str, object]],
+    model: str,
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> bool:
+    """
+    Whether a launch of *model* is backed by this config's catalog.
+
+    An exact row — a picker id or its wire model — always serves. A canonical
+    Anthropic id no row spells exactly still launches when the endpoint takes
+    canonical spellings (``--model`` passes any string through, and a pane's
+    ``/model`` persists exactly this id) and the catalog lists the id's
+    family: the same family fold ``/model`` applies to an unpinned canonical
+    id. A gateway that routes only its own ids, and a family the catalog
+    does not list, refuse — a genuinely stale pick still fails fast.
+
+    :param rows: Catalog rows, e.g.
+        ``[{"id": "opus", "model": "claude-opus-5"}]``.
+    :param model: A picker id or model id, e.g. ``"claude-opus-4-8"``.
+    :param claude_config: The resolved launch config, or ``None`` (Claude's
+        own login).
+    :returns: ``True`` when the launch can run *model* against this catalog.
+    """
+    from omnigent.model_catalog_store import catalog_contains
+
+    if catalog_contains(rows, model):
+        return True
+    if claude_config is not None and not _serves_canonical_anthropic_ids(claude_config):
+        return False
+    if not model.lower().startswith("claude-"):
+        return False
+    family = _claude_family(model)
+    return family is not None and any(
+        _claude_family(str(row.get("id") or row.get("model") or "")) == family for row in rows
+    )
 
 
 def resolve_claude_native_model_selection(
@@ -582,7 +648,7 @@ def _managed_claude_model_config() -> ClaudeNativeUcodeConfig | None:
         _ANTHROPIC_CUSTOM_MODEL_OPTION_ENV,
         _ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV,
     }
-    for path in _CLAUDE_CODE_MANAGED_SETTINGS_PATHS:
+    for path in _managed_settings_paths():
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -615,25 +681,9 @@ def managed_claude_gateway_signal() -> tuple[str | None, bool]:
     :returns: ``(base_url, has_credential)`` from the first readable managed
         settings file, or ``(None, False)`` when none is present or parseable.
     """
-    for path in _CLAUDE_CODE_MANAGED_SETTINGS_PATHS:
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        raw_env = payload.get("env")
-        env = raw_env if isinstance(raw_env, dict) else {}
-        raw_base_url = env.get("ANTHROPIC_BASE_URL")
-        base_url = raw_base_url.strip() if isinstance(raw_base_url, str) else None
-        has_helper = bool(payload.get("apiKeyHelper"))
-        use_gateway = str(env.get("CLAUDE_CODE_USE_GATEWAY", "")).strip().lower() not in (
-            "",
-            "0",
-            "false",
-        )
-        return base_url or None, has_helper or use_gateway
-    return None, False
+    from omnigent.onboarding.ambient import claude_managed_gateway
+
+    return claude_managed_gateway(_managed_settings_paths())
 
 
 def claude_native_model_options(
@@ -1152,6 +1202,20 @@ async def claude_launch_catalog(
     fingerprint = claude_catalog_fingerprint(claude_config)
     return await model_catalog_store.ensure_catalog(
         "claude-native", fingerprint, lambda: claude_model_catalog(claude_config)
+    )
+
+
+def claude_launch_catalog_is_stale(claude_config: ClaudeNativeUcodeConfig | None) -> bool:
+    """
+    Whether this config's stored catalog is past the freshness TTL.
+
+    :param claude_config: The resolved launch config, or ``None``.
+    :returns: ``True`` when the store holds only a stale entry.
+    """
+    from omnigent import model_catalog_store
+
+    return model_catalog_store.catalog_is_stale(
+        "claude-native", claude_catalog_fingerprint(claude_config)
     )
 
 
@@ -1987,6 +2051,7 @@ def _fetch_external_session_id_for_redirect(
             "failed to fetch external Claude session id for redirect; session=%s",
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
         return None
     external_session_id = payload.get("external_session_id") if isinstance(payload, dict) else None
@@ -2447,7 +2512,7 @@ def _ucode_config_for_profile(
     if agent_state is None:
         raise click.ClickException(
             f"ucode state for profile {profile!r} does not include a Claude agent entry. "
-            "Run `omnigent setup --internal-beta` to refresh ucode configuration."
+            f"Run `{cli_invocation()} setup --internal-beta` to refresh ucode configuration."
         )
 
     base_url = agent_state.env.get(_UCODE_CLAUDE_BASE_URL_ENV) or agent_state.base_url
@@ -2457,12 +2522,12 @@ def _ucode_config_for_profile(
         raise click.ClickException(
             f"ucode state for profile {profile!r} is missing Claude base URL "
             f"({_UCODE_CLAUDE_BASE_URL_ENV} / base_url). "
-            "Run `omnigent setup --internal-beta` to refresh ucode configuration."
+            f"Run `{cli_invocation()} setup --internal-beta` to refresh ucode configuration."
         )
     if not agent_state.auth_command:
         raise click.ClickException(
             f"ucode state for profile {profile!r} is missing Claude auth_command. "
-            "Run `omnigent setup --internal-beta` to refresh ucode configuration."
+            f"Run `{cli_invocation()} setup --internal-beta` to refresh ucode configuration."
         )
 
     refresh_interval_ms = (
@@ -2667,7 +2732,8 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
             entry.name,
         )
         return None
-    _logger.info(
+    log_info_once(
+        _logger,
         "native-claude routing: provider %r (base_url=%s, model=%s)",
         entry.name,
         family.base_url,
@@ -2796,7 +2862,8 @@ def _bedrock_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcode
             "Bedrock account. Set models.default to a Bedrock inference-profile id.",
             entry.name,
         )
-    _logger.info(
+    log_info_once(
+        _logger,
         "native-claude routing: bedrock provider %r (base_url=%s, model=%s)",
         entry.name,
         family.base_url,
@@ -2853,9 +2920,11 @@ def _native_claude_config_from_entry(
     if entry.kind == BEDROCK_KIND:
         return _bedrock_config_for_native_claude(entry)
     if entry.kind == DATABRICKS_KIND:
-        _logger.info("native-claude routing: Databricks ucode profile %r", entry.profile)
+        log_info_once(_logger, "native-claude routing: Databricks ucode profile %r", entry.profile)
         return _ucode_config_for_profile(entry.profile, refresh_models=refresh_models)
-    _logger.info("native-claude routing: Claude CLI login (subscription provider %r)", entry.name)
+    log_info_once(
+        _logger, "native-claude routing: Claude CLI login (subscription provider %r)", entry.name
+    )
     return None
 
 
@@ -2927,10 +2996,11 @@ def resolve_native_claude_config(
     entry = default_provider_for_harness(effective_config_with_detected(explicit), "claude-sdk")
     if entry is not None:
         return _native_claude_config_from_entry(entry, refresh_models=refresh_models)
-    _logger.info(
+    log_info_once(
+        _logger,
         "native-claude routing: Claude CLI login (no provider configured for the Claude "
         "harness, no Databricks profile). Run `omnigent setup --no-internal-beta` to route "
-        "through a provider."
+        "through a provider.",
     )
     return None
 
@@ -2984,6 +3054,37 @@ def _materialize_claude_agent_spec(tmpdir: Path) -> Path:
     }
     yaml_path.write_text(yaml.safe_dump(raw, sort_keys=False))
     return yaml_path
+
+
+def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
+    """Resolve raw author instructions from the wrapper's agent spec.
+
+    Reuses :func:`omnigent.spec.load` (the same loader
+    :func:`~omnigent.cli._bundle` and the server use for both an agent-image
+    directory and a standalone single-file YAML) so the value matches exactly
+    what ``AgentSpec.instructions`` resolves to — including the
+    ``instructions:`` file precedence over ``prompt:`` — rather than
+    re-reading the raw YAML ad hoc.
+
+    :param spec_path: The generated/current wrapper agent spec (a
+        standalone YAML file or an agent-image directory).
+    :returns: The verbatim instructions text, or ``None`` if unresolvable
+        or absent/whitespace-only. Best-effort: a malformed spec must not
+        block the terminal launch, so load failures degrade to ``None``.
+    """
+    from omnigent.runtime.prompt import raw_author_instructions
+    from omnigent.spec import load as load_agent_spec
+
+    try:
+        spec = load_agent_spec(spec_path, expand_env=False)
+    except Exception:  # noqa: BLE001 — best-effort; never block the launch
+        _logger.warning(
+            "Could not resolve raw instructions from wrapper spec %s",
+            spec_path,
+            exc_info=True,
+        )
+        return None
+    return raw_author_instructions(spec)
 
 
 def _run_with_local_server(
@@ -3085,6 +3186,7 @@ def _run_with_local_server(
                     claude_config=claude_config,
                     startup_profiler=startup_profiler,
                     startup_progress=progress,
+                    append_system_prompt=_wrapper_spec_raw_instructions(spec_path),
                 )
             )
             _mark_startup_step(
@@ -3176,7 +3278,7 @@ def _can_attach_direct_tmux(prepared: PreparedClaudeTerminal) -> bool:
     socket exists on this host (so the runner shares this machine), and
     ``tmux`` is on PATH. This is the same-machine fast path: it wires the
     local TTY straight to the runner's tmux pane instead of relaying
-    every keystroke over the WebSocket PTY bridge. A remote runner's
+    every keystroke over the WebSocket terminal bridge. A remote runner's
     socket won't exist locally, so this returns ``False`` and the caller
     falls back to the WebSocket attach. Mirrors the Codex wrapper's
     :func:`omnigent.codex_native._can_attach_direct_tmux`.
@@ -3219,7 +3321,7 @@ async def _attach_direct_tmux(
         outlives the attach (user detached), else
         :attr:`_AttachOutcome.EXITED`.
     """
-    from omnigent.terminals.ws_bridge import _check_pane_dead_definitive, _tmux_session_alive
+    from omnigent.terminals.ws_common import _check_pane_dead_definitive, _tmux_session_alive
 
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
     env = dict(os.environ)
@@ -3601,8 +3703,8 @@ async def _is_terminal_resource_gone(
     a clean tmux exit because Claude quit (the wrapper should stop).
     The runner's terminal-attach route emits close code ``4404`` when
     the resource is already marked stopped before attach, but a
-    teardown that races attach can produce a code-``1000`` close from
-    the PTY bridge instead. This GET disambiguates the two states.
+    teardown that races attach can produce a code-``1000`` bridge close.
+    This GET disambiguates the two states.
 
     HTTP / connection errors are treated as "not gone" so a server
     that's still bouncing (probe also fails) keeps the wrapper in the
@@ -3694,10 +3796,9 @@ def _is_terminal_detached_close(exc: ConnectionClosed) -> bool:
     """
     Return whether *exc* indicates the user detached from tmux.
 
-    The runner's PTY bridge closes the attach WebSocket with code
-    ``WS_CLOSE_TERMINAL_DETACHED`` (``4405``) when the ``tmux attach``
-    child exits but ``has-session`` confirms the session is still
-    alive — i.e. the user pressed the tmux detach key. Unlike a 4404
+    The runner's terminal bridge closes the attach WebSocket with code
+    ``WS_CLOSE_TERMINAL_DETACHED`` (``4405``) when the control client exits but
+    the tmux pane remains alive. Unlike a 4404
     (terminal gone), this must NOT end the session: the runner keeps
     running so the web UI stays connected.
 
@@ -3773,11 +3874,12 @@ async def _wait_for_claude_terminal_ready(
     :raises click.ClickException: If no terminal appears in time.
     """
     deadline = asyncio.get_event_loop().time() + timeout_s
+    intervals = daemon_poll_intervals()
     while asyncio.get_event_loop().time() < deadline:
         terminal_id = await _find_running_claude_terminal(client, session_id)
         if terminal_id is not None:
             return terminal_id
-        await asyncio.sleep(DAEMON_POLL_INTERVAL_S)
+        await asyncio.sleep(next(intervals))
     raise click.ClickException(
         f"The runner did not create the Claude terminal for {session_id!r} "
         f"within {timeout_s:.0f}s."
@@ -4079,7 +4181,7 @@ def _run_with_remote_server(
     creates/resolves the session, persists the pass-through args, waits
     for the daemon-spawned runner + its auto-created terminal, and
     attaches (directly to the runner's tmux when it is local, else over
-    the WebSocket PTY bridge). See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
+    the WebSocket terminal bridge). See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
 
     :param base_url: Remote Omnigent server base URL without a trailing
         slash, e.g. ``"https://example.databricks.com"``.
@@ -4291,6 +4393,7 @@ async def _prepare_claude_terminal(
     claude_config: ClaudeNativeUcodeConfig | None = None,
     startup_profiler: StartupProfiler | None = None,
     startup_progress: RunnerStartupProgress | None = None,
+    append_system_prompt: str | None = None,
 ) -> PreparedClaudeTerminal:
     """
     Create/bind a session and launch its Claude terminal resource.
@@ -4308,6 +4411,10 @@ async def _prepare_claude_terminal(
         marks. ``None`` disables output.
     :param startup_progress: Optional user-visible progress renderer,
         e.g. a handle from :func:`runner_startup_progress`.
+    :param append_system_prompt: Raw author instructions for
+        ``--append-system-prompt``, applied on fresh launch and cold
+        resume only — the hot-reattach fast path below returns before
+        this is used, so it never relaunches or duplicates the flag.
     :returns: Prepared terminal details.
     :raises click.ClickException: If any server operation fails.
     """
@@ -4448,6 +4555,7 @@ async def _prepare_claude_terminal(
             command=command,
             bridge_dir=bridge_dir,
             claude_config=claude_config,
+            append_system_prompt=append_system_prompt,
         )
         _mark_startup_step(
             startup_profiler,
@@ -4491,7 +4599,7 @@ async def _fetch_claude_session_labels(
     if resp.status_code == 404:
         raise click.ClickException(
             f"Conversation {session_id!r} not found on the server. "
-            "Run `omnigent claude` (no --resume) to start a new session.",
+            f"Run `{cli_invocation()} claude` (no --resume) to start a new session.",
         )
     if resp.status_code >= 400:
         raise click.ClickException(
@@ -4535,7 +4643,7 @@ async def _resolve_cold_resume_args(
     if resp.status_code == 404:
         raise click.ClickException(
             f"Conversation {session_id!r} not found on the server. "
-            "Run `omnigent claude` (no --resume) to start a new session.",
+            f"Run `{cli_invocation()} claude` (no --resume) to start a new session.",
         )
     if resp.status_code >= 400:
         raise click.ClickException(
@@ -4553,7 +4661,7 @@ async def _resolve_cold_resume_args(
     if wrapper != _WRAPPER_LABEL_VALUE:
         raise click.ClickException(
             f"Conversation {session_id!r} is not a claude-native session "
-            f"(wrapper={wrapper!r}). Use `omnigent run --resume "
+            f"(wrapper={wrapper!r}). Use `{cli_invocation()} run --resume "
             f"{session_id}` to resume it through the right runtime.",
         )
     external_session_id = payload.get("external_session_id")
@@ -5373,8 +5481,9 @@ async def _launch_claude_terminal(
     :param bridge_dir: Bridge directory shared with Claude's MCP
         MCP server and the web-chat harness.
     :param claude_config: Optional ucode-derived Claude Code config.
-    :param append_system_prompt: Optional framework-owned instructions for
-        this fresh native session.
+    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
+        (author-supplied, not framework-composed) for this fresh native
+        session.
     :param allowed_tools: Optional narrowly scoped Claude tools preapproved
         for this native session.
     :returns: Terminal resource id.
@@ -5481,7 +5590,7 @@ async def _read_claude_terminal_tmux(
 
     Lets the caller decide whether to attach to the runner's tmux
     directly (same machine, low latency) instead of relaying over the
-    WebSocket PTY bridge. Best-effort: any lookup failure, non-200, or
+    WebSocket terminal bridge. Best-effort: any lookup failure, non-200, or
     missing metadata yields ``(None, None)``, which callers treat as
     "not locally attachable" and fall back to the WebSocket path.
 
@@ -5536,8 +5645,9 @@ def _claude_terminal_request(
     :param ap_auth_headers: Auth headers for the
         ``PermissionRequest`` command hook.
     :param claude_config: Optional ucode-derived Claude Code config.
-    :param append_system_prompt: Optional framework-owned instructions to
-        append to Claude Code's system prompt.
+    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
+        (author-supplied, not framework-composed) to append to Claude
+        Code's system prompt.
     :param allowed_tools: Optional narrowly scoped Claude tools preapproved
         for this native session.
     :returns: JSON body for ``POST /resources/terminals``.

@@ -34,16 +34,17 @@ import {
   LaptopIcon,
   Loader2Icon,
   MailIcon,
+  MessageCircleDashedIcon,
   Maximize2Icon,
   Minimize2Icon,
   MoreHorizontalIcon,
   PencilIcon,
   PinIcon,
   PinOffIcon,
+  PlusIcon,
   SearchIcon,
   Settings2Icon,
   ShareIcon,
-  SmileIcon,
   SmilePlusIcon,
   SquareIcon,
   SquareCheckIcon,
@@ -68,7 +69,7 @@ import {
 } from "@dnd-kit/core";
 import { useQueryClient } from "@tanstack/react-query";
 import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
-import { SidebarHeaderActions } from "./SidebarHeaderActions";
+import { SidebarHeaderActions, SidebarSettingsButton } from "./SidebarHeaderActions";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
 import {
@@ -103,6 +104,7 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   type Conversation,
   type PinnedConversationsResult,
@@ -134,6 +136,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
 import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
+import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showToast } from "@/components/ui/toast";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
@@ -146,6 +149,7 @@ import { sumPendingApprovals } from "@/lib/inbox";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { useHasSessionDraft } from "@/lib/sessionDrafts";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
 import { useChatStore } from "@/store/chatStore";
 import {
@@ -155,6 +159,7 @@ import {
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
 import { cn } from "@/lib/utils";
+import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
@@ -185,11 +190,23 @@ import {
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 
-// Positioning for a row's trailing session-state badge. On desktop it shares
-// the controls' right-1 edge and fades on hover so the pin + kebab take its
-// place; on mobile it sits left of the always-visible controls.
+// Positioning for a row's trailing session-state badge. Anchored at the row's
+// right-1 edge in every viewport: on desktop it fades on hover so the pin +
+// kebab take its place; on mobile those controls are gone, so the badge simply
+// holds the right edge.
 const SESSION_STATE_SLOT_CLASS =
-  "-translate-y-1/2 pointer-events-none absolute top-1/2 right-[4.5rem] flex h-5 items-center transition-opacity md:right-1 md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
+  "-translate-y-1/2 pointer-events-none absolute top-1/2 right-1 flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
+
+// Small markers (running/starting/unseen dot, or the draft pencil when there's
+// no session state) get a fixed size-6 centered box so their glyph lands 16px
+// from the right edge — lining up vertically with the desktop kebab and the
+// size-6 section-header icons above (the marker column) in every viewport. The
+// "awaiting" pill keeps its natural width — a fixed box would clip its "Needs
+// response" label.
+function isDotMarker(state: SessionState | null): boolean {
+  return state === null || state.kind !== "awaiting";
+}
+const SESSION_STATE_DOT_SLOT_CLASS = "w-6 justify-center";
 
 // Match the Settings sidebar's ghost-button hover treatment across every home
 // sidebar row.
@@ -692,253 +709,254 @@ export function Sidebar({
   useEffect(() => cancelPeekClose, [cancelPeekClose]);
 
   return (
-    <aside
-      aria-label="Conversations"
-      onPointerEnter={cancelPeekClose}
-      onPointerLeave={() => {
-        if (!peek) return;
-        cancelPeekClose();
-        // Defer closing if any context menu is open
-        const tryClose = () => {
-          if (document.querySelector('[role="menu"][data-state="open"]')) {
-            peekCloseTimer.current = setTimeout(tryClose, 200);
-            return;
-          }
-          onClose();
-        };
-        peekCloseTimer.current = setTimeout(tryClose, 200);
-      }}
-      className={cn(
-        // Base: bg + flex column. No transition — expand/collapse snaps
-        // instantly (animating the width also lagged drag-to-resize).
-        // conversations-sidebar only matters under the macOS Electron
-        // shell, where it pushes the card below the traffic lights
-        // (see the [data-electron-mac] rules in index.css).
-        "conversations-sidebar flex flex-col bg-card md:select-none",
-        // Mobile (default): fixed full-screen overlay, slide via
-        // translate-x. Stays edge-to-edge — the floating-card
-        // treatment below is desktop-only.
-        // bg-card-solid (opaque): the overlay sits on top of the chat, and
-        // WebKit drops the glass rule's backdrop-filter once a Radix popper
-        // opens (and never repaints it), letting the chat bleed through the
-        // 60%-alpha glass --card. Desktop keeps the translucent bg-card —
-        // there the sidebar pushes content aside, so nothing sits behind it.
-        "max-md:bg-card-solid",
-        "fixed inset-0 z-50",
-        // Mobile only: animate the slide so the iOS edge-swipe settles
-        // smoothly on release. Suppressed inline while a drag is live (the
-        // overlay must track the finger 1:1). Scoped to transform so it can't
-        // re-introduce the width-animation lag the base comment warns about,
-        // and gated to mobile so the desktop floating card is unaffected.
-        "max-md:transition-transform max-md:duration-200 max-md:ease-out",
-        effectiveOpen ? "translate-x-0" : "-translate-x-full",
-        // Desktop: a full-height panel flush to the window edge, carrying
-        // the brand gradient canvas (see html:not(.dark) .conversations-sidebar
-        // in index.css) and separated from the white content by a right
-        // divider — no outer margin or rounding. Width (the user-resizable
-        // variable) animates →0 to push main; when closed the border
-        // collapses too so nothing lingers.
-        "md:translate-x-0 md:overflow-hidden",
-        // Normal desktop flow: relative panel that pushes main. Suppressed while
-        // peeking so its `md:inset-auto`/`md:relative` don't override the
-        // floating-card positioning below (same `md:` layer, source order wins).
-        !peek && "md:relative md:inset-auto",
-        open || peek ? "md:m-0 md:w-[var(--sidebar-width)] " : "md:m-0 md:w-0 md:border-0",
-        // Peek: float as a card 4px off the viewport edge (capped at 300px wide),
-        // ringed and shadowed, sliding+fading in from the left so it reads as an
-        // overlay rather than a push.
-        peek &&
-          "is-peek md:absolute md:inset-2 p-0 md:max-w-[400px] ring-1 ring-border rounded-xl md:shadow-xl animate-in fade-in slide-in-from-left-4 duration-200 ease-out",
+    <>
+      {/* Mobile: the drawer stops short of the right edge, leaving a strip of
+      the chat visible; this scrim covers that strip so tapping it dismisses the
+      drawer — the gesture that replaced the collapse icon. Full-bleed and
+      behind the drawer (z-45 vs z-50), so only the strip is actually reachable.
+      Tracks the finger during an edge-swipe drag.
+
+      A labeled <button>, not a bare div: with the collapse toggle gone on
+      mobile this is the drawer's only non-navigational way out, so it has to be
+      reachable by keyboard and announced by a screen reader, not just findable
+      by sighted users with a pointer. Parked, it leaves the tab order and the
+      a11y tree via tabIndex/aria-hidden rather than the `inert` the drawer
+      uses: React 18 doesn't know `inert` as a boolean attribute and drops it,
+      so a focusable control relying on it would stay tabbable while closed.
+
+      z-45, not z-40: chat chrome also sits at z-40 (ChatPage's jump-to-top
+      pill) and renders after the sidebar, so a same-z peer that ever takes
+      pointer events would win the tie inside the exposed strip and swallow the
+      dismiss. Strictly between chat chrome and the drawer's z-50. */}
+      {!inSettings && (
+        <button
+          type="button"
+          data-testid="sidebar-scrim"
+          aria-label="Close sidebar"
+          onClick={onClose}
+          tabIndex={effectiveOpen ? 0 : -1}
+          aria-hidden={!effectiveOpen}
+          className={cn(
+            "fixed inset-0 z-[45] bg-black/25 transition-opacity duration-200 ease-out md:hidden",
+            effectiveOpen ? "opacity-100" : "pointer-events-none opacity-0",
+          )}
+          style={dragging ? { opacity: dragProgress, transition: "none" } : undefined}
+        />
       )}
-      style={
-        {
-          "--sidebar-width": `${sidebarWidth}px`,
-          // Track the finger: map the 0→1 open fraction to translateX
-          // -100%→0% and kill the transition so it follows the drag exactly.
-          ...(dragging
-            ? { transform: `translateX(${(dragProgress - 1) * 100}%)`, transition: "none" }
-            : null),
-        } as CSSProperties
-      }
-      // Hide from the accessibility tree when closed so screen readers
-      // don't see the empty-state contents while focus is elsewhere.
-      aria-hidden={!effectiveOpen}
-      data-collapsed={!effectiveOpen || undefined}
-      // Match the keyboard-focus story: when closed, the sidebar's
-      // children shouldn't receive tabs.
-      inert={!effectiveOpen}
-    >
-      {/* Right-edge resize handle (desktop only), mirroring the right rail's
+      <aside
+        aria-label="Conversations"
+        onPointerEnter={cancelPeekClose}
+        onPointerLeave={() => {
+          if (!peek) return;
+          cancelPeekClose();
+          // Defer closing if any context menu is open
+          const tryClose = () => {
+            if (document.querySelector('[role="menu"][data-state="open"]')) {
+              peekCloseTimer.current = setTimeout(tryClose, 200);
+              return;
+            }
+            onClose();
+          };
+          peekCloseTimer.current = setTimeout(tryClose, 200);
+        }}
+        className={cn(
+          // Base: bg + flex column. No transition — expand/collapse snaps
+          // instantly (animating the width also lagged drag-to-resize).
+          // conversations-sidebar only matters under the macOS Electron
+          // shell, where it pushes the card below the traffic lights
+          // (see the [data-electron-mac] rules in index.css).
+          "conversations-sidebar flex flex-col bg-card md:select-none",
+          // Mobile (default): a fixed drawer that slides in via translate-x
+          // and stops short of the right edge, leaving a tappable strip of the
+          // chat behind it. The floating-card treatment below is desktop-only.
+          // bg-card-solid (opaque): the overlay sits on top of the chat, and
+          // WebKit drops the glass rule's backdrop-filter once a Radix popper
+          // opens (and never repaints it), letting the chat bleed through the
+          // 60%-alpha glass --card. Desktop keeps the translucent bg-card —
+          // there the sidebar pushes content aside, so nothing sits behind it.
+          "max-md:bg-card-solid",
+          // `max-md:right-14` is the ChatGPT-style peek strip: the drawer covers
+          // most of the phone but stops short of the right edge so the chat stays
+          // visible (and tappable through the scrim) behind it.
+          "fixed inset-0 z-50",
+          // The settings nav takes the sidebar over and its "Back" row is the
+          // only way out, so there the drawer stays full-bleed (and gets no
+          // dismiss scrim) rather than offering a tap that strands the user.
+          !inSettings && "max-md:right-14",
+          // Mobile only: animate the slide so the iOS edge-swipe settles
+          // smoothly on release. Suppressed inline while a drag is live (the
+          // overlay must track the finger 1:1). Scoped to transform so it can't
+          // re-introduce the width-animation lag the base comment warns about,
+          // and gated to mobile so the desktop floating card is unaffected.
+          "max-md:transition-transform max-md:duration-200 max-md:ease-out",
+          effectiveOpen ? "translate-x-0" : "-translate-x-full",
+          // Desktop: a full-height panel flush to the window edge, carrying
+          // the brand gradient canvas (see html:not(.dark) .conversations-sidebar
+          // in index.css) and separated from the white content by a right
+          // divider — no outer margin or rounding. Width (the user-resizable
+          // variable) animates →0 to push main; when closed the border
+          // collapses too so nothing lingers.
+          "md:translate-x-0 md:overflow-hidden",
+          // Normal desktop flow: relative panel that pushes main. Suppressed while
+          // peeking so its `md:inset-auto`/`md:relative` don't override the
+          // floating-card positioning below (same `md:` layer, source order wins).
+          !peek && "md:relative md:inset-auto",
+          open || peek ? "md:m-0 md:w-[var(--sidebar-width)] " : "md:m-0 md:w-0 md:border-0",
+          // Peek: float as a card 4px off the viewport edge (capped at 300px wide),
+          // ringed and shadowed, sliding+fading in from the left so it reads as an
+          // overlay rather than a push.
+          peek &&
+            "is-peek md:absolute md:inset-2 p-0 md:max-w-[400px] ring-1 ring-border rounded-xl md:shadow-xl animate-in fade-in slide-in-from-left-4 duration-200 ease-out",
+        )}
+        style={
+          {
+            "--sidebar-width": `${sidebarWidth}px`,
+            // Track the finger: map the 0→1 open fraction to translateX
+            // -100%→0% and kill the transition so it follows the drag exactly.
+            ...(dragging
+              ? { transform: `translateX(${(dragProgress - 1) * 100}%)`, transition: "none" }
+              : null),
+          } as CSSProperties
+        }
+        // Hide from the accessibility tree when closed so screen readers
+        // don't see the empty-state contents while focus is elsewhere.
+        aria-hidden={!effectiveOpen}
+        data-collapsed={!effectiveOpen || undefined}
+        // Match the keyboard-focus story: when closed, the sidebar's
+        // children shouldn't receive tabs.
+        inert={!effectiveOpen}
+      >
+        {/* Right-edge resize handle (desktop only), mirroring the right rail's
           left-edge handle. Hidden on mobile, where the sidebar is a
           full-screen overlay with no resize affordance; the parent's ``inert``
           when closed also keeps it from being draggable while collapsed.
           Hidden while peeking too — the peek card is a fixed-width flyout, not
           a resizable panel. */}
-      {!peek && (
-        <div
-          {...resizeHandleProps}
-          className="absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
-        />
-      )}
-      {inSettings ? (
-        <SettingsSidebarBody onNavClick={onNavClick} />
-      ) : (
-        <>
-          {/* sidebar-header-row is the hook for the macOS Electron shell, where
+        {!peek && (
+          <div
+            {...resizeHandleProps}
+            className="absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
+          />
+        )}
+        {inSettings ? (
+          <SettingsSidebarBody onNavClick={onNavClick} />
+        ) : (
+          <>
+            {/* sidebar-header-row is the hook for the macOS Electron shell, where
           this row shares the window's top strip with the traffic lights: the
           brand mark is dropped and the actions slide left to sit beside the
           window controls (see the [data-electron-mac] rules in index.css).
           Inert in a browser and on other platforms, which keep the row below. */}
-          <div className="sidebar-header-row flex h-12 shrink-0 items-center justify-between pr-3 pl-4">
-            {/* Brand mark doubles as the "home" affordance: clicking it
+            <div className="sidebar-header-row flex h-12 shrink-0 items-center justify-between pr-3 pl-4">
+              {/* Brand mark doubles as the "home" affordance: clicking it
             returns to `/`, the new-session composer. Without this there
             is no way back to the landing composer once you're inside a
             session. Reuses onNavClick so a plain primary click closes
             the sidebar on mobile (where it's a full-screen overlay) but
             modifier/middle clicks still open `/` in a new tab. */}
-            <Link
-              to="/"
-              onClick={onNavClick}
-              data-testid="sidebar-brand"
-              className="sidebar-brand rounded-none transition-opacity duration-200 ease-[var(--ease-otto)] hover:opacity-70"
-            >
-              {branding.app_name ? (
-                <span className="text-[15px] font-semibold tracking-tight">
-                  {branding.app_name}
-                </span>
-              ) : (
-                <img
-                  src={omnigentWordmark}
-                  alt="Omnigent"
-                  data-testid="sidebar-wordmark"
-                  className="h-[15px] w-auto shrink-0 translate-y-px dark:invert"
-                />
-              )}
-            </Link>
-            {/* On the macOS shell this copy is hidden and an identical cluster
+              <Link
+                to="/"
+                onClick={onNavClick}
+                data-testid="sidebar-brand"
+                componentId="sidebar.home"
+                className="sidebar-brand rounded-none transition-opacity duration-200 ease-[var(--ease-otto)] hover:opacity-70"
+              >
+                {branding.app_name ? (
+                  <span className="text-[15px] font-semibold tracking-tight">
+                    {branding.app_name}
+                  </span>
+                ) : (
+                  <img
+                    src={omnigentWordmark}
+                    alt="Omnigent"
+                    data-testid="sidebar-wordmark"
+                    className="h-[15px] w-auto shrink-0 translate-y-px dark:invert"
+                  />
+                )}
+              </Link>
+              {/* On the macOS shell this copy is hidden and an identical cluster
             renders in the title-bar strip instead (see AppShell), so the icons
             keep their place when the sidebar collapses or peeks. Everywhere
             else this is the only copy. */}
-            <SidebarHeaderActions
-              expanded={!peek}
-              // onOpen is optional (the sidebar renders standalone in tests), so
-              // fall back to a no-op rather than widening the child's contract.
-              onToggle={peek ? () => onOpen?.() : onClose}
-              onOpenSearch={onOpenSearch}
-            />
-          </div>
+              <SidebarHeaderActions
+                expanded={!peek}
+                // onOpen is optional (the sidebar renders standalone in tests), so
+                // fall back to a no-op rather than widening the child's contract.
+                onToggle={peek ? () => onOpen?.() : onClose}
+                onOpenSearch={onOpenSearch}
+              />
+            </div>
 
-          <div className="flex flex-col gap-0 px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
-            {/* "New session" routes to the home composer ("/"), which now owns
+            <div className="flex flex-col gap-0 px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
+              {/* "New session" routes to the home composer ("/"), which now owns
             session creation end-to-end (host/workspace/worktree chips +
             send). Rendered as a Link so cmd/middle-click opens it in a new
             tab; onNavClick still closes the sidebar on a plain mobile tap. */}
-            <Button
-              asChild
-              className={cn(
-                // px-2 + gap-2 puts the icon on the sidebar's left (red) column
-                // and the label on the label (blue) column — matching section
-                // headers and project folders. border-0 drops the Button base's
-                // transparent 1px border so the icon lands exactly on that
-                // column, flush with the Inbox row and folder rows.
-                SIDEBAR_ROW,
-                "w-full justify-start border-0 font-normal",
-                SIDEBAR_HOVER_HIGHLIGHT,
-                isNewChatPage && SIDEBAR_ACTIVE_HIGHLIGHT,
-              )}
-              variant="ghost"
-              data-testid="new-chat-button"
-            >
-              {/* New session always creates a session the viewer owns, which
+              <Button
+                asChild
+                className={cn(
+                  // px-2 + gap-2 puts the icon on the sidebar's left (red) column
+                  // and the label on the label (blue) column — matching section
+                  // headers and project folders. border-0 drops the Button base's
+                  // transparent 1px border so the icon lands exactly on that
+                  // column, flush with the Inbox row and folder rows.
+                  SIDEBAR_ROW,
+                  "w-full justify-start border-0 font-normal",
+                  SIDEBAR_HOVER_HIGHLIGHT,
+                  isNewChatPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                )}
+                variant="ghost"
+                data-testid="new-chat-button"
+              >
+                {/* New session always creates a session the viewer owns, which
               lands under "My sessions" — so snap the tab back there on click
               (the button stays visible on both tabs). */}
-              <Link
-                to="/"
-                onClick={(e) => {
-                  switchTab("mine");
-                  onNavClick(e);
-                }}
-              >
-                <SquarePenIcon
-                  className={cn(
-                    "ui-icon",
-                    isNewChatPage
-                      ? "text-[var(--sidebar-active-foreground)]"
-                      : "text-muted-foreground",
-                  )}
-                />
-                New session
-              </Link>
-            </Button>
-            {/* Keep Scheduled in the primary nav group with the same row treatment as New session. */}
-            <Button
-              asChild
-              className={cn(
-                // Same shared nav-row construct as "New session" / "Inbox" so
-                // the active-pill, hover, insets, icon column, and text weight
-                // all match post-refactor.
-                SIDEBAR_ROW,
-                "w-full justify-start border-0 font-normal",
-                SIDEBAR_HOVER_HIGHLIGHT,
-                isTasksPage && SIDEBAR_ACTIVE_HIGHLIGHT,
-              )}
-              variant="ghost"
-              data-testid="scheduled-tasks-nav"
-            >
-              <Link to="/tasks" onClick={onNavClick}>
-                <ClockIcon
-                  className={cn(
-                    "ui-icon",
-                    isTasksPage
-                      ? "text-[var(--sidebar-active-foreground)]"
-                      : "text-muted-foreground",
-                  )}
-                />
-                Automations
-              </Link>
-            </Button>
-            <Button
-              asChild
-              variant="ghost"
-              className={cn(
-                SIDEBAR_ROW,
-                "w-full justify-start border-0 font-normal",
-                SIDEBAR_HOVER_HIGHLIGHT,
-                isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
-              )}
-              data-testid="inbox-button"
-            >
-              <Link to="/inbox" onClick={onNavClick}>
-                <InboxIcon
-                  className={cn(
-                    "ui-icon",
-                    isInboxPage
-                      ? "text-[var(--sidebar-active-foreground)]"
-                      : "text-muted-foreground",
-                  )}
-                />
-                Inbox
-                {inboxCount > 0 && (
-                  <span
-                    aria-label={
-                      inboxCount === 1
-                        ? "1 inbox item waiting"
-                        : `${inboxCount} inbox items waiting`
-                    }
+                <Link
+                  to="/"
+                  componentId="sidebar.new_chat"
+                  onClick={(e) => {
+                    switchTab("mine");
+                    onNavClick(e);
+                  }}
+                >
+                  <SquarePenIcon
                     className={cn(
-                      "ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-10 font-medium text-[var(--sidebar-active-foreground)] tabular-nums",
-                      // The active Inbox row already paints the translucent
-                      // --sidebar-active wash; repainting it on the nested
-                      // badge would double-composite to a darker fill.
-                      isInboxPage ? "bg-transparent" : "bg-[var(--sidebar-active)]",
+                      "ui-icon",
+                      isNewChatPage
+                        ? "text-[var(--sidebar-active-foreground)]"
+                        : "text-muted-foreground",
                     )}
-                  >
-                    {inboxCount}
-                  </span>
+                  />
+                  New session
+                </Link>
+              </Button>
+              {/* Keep Scheduled in the primary nav group with the same row treatment as New session. */}
+              <Button
+                asChild
+                className={cn(
+                  // Same shared nav-row construct as "New session" / "Inbox" so
+                  // the active-pill, hover, insets, icon column, and text weight
+                  // all match post-refactor.
+                  SIDEBAR_ROW,
+                  "w-full justify-start border-0 font-normal",
+                  SIDEBAR_HOVER_HIGHLIGHT,
+                  isTasksPage && SIDEBAR_ACTIVE_HIGHLIGHT,
                 )}
-              </Link>
-            </Button>
-            {usagePageEnabled && (
+                variant="ghost"
+                data-testid="scheduled-tasks-nav"
+              >
+                <Link to="/tasks" onClick={onNavClick} componentId="sidebar.tasks">
+                  <ClockIcon
+                    className={cn(
+                      "ui-icon",
+                      isTasksPage
+                        ? "text-[var(--sidebar-active-foreground)]"
+                        : "text-muted-foreground",
+                    )}
+                  />
+                  Automations
+                </Link>
+              </Button>
               <Button
                 asChild
                 variant="ghost"
@@ -946,62 +964,121 @@ export function Sidebar({
                   SIDEBAR_ROW,
                   "w-full justify-start border-0 font-normal",
                   SIDEBAR_HOVER_HIGHLIGHT,
-                  isUsagePage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                  isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
                 )}
-                data-testid="usage-nav"
+                data-testid="inbox-button"
               >
-                <Link to="/usage" onClick={onNavClick}>
-                  <WalletIcon
+                <Link to="/inbox" onClick={onNavClick} componentId="sidebar.inbox">
+                  <InboxIcon
                     className={cn(
                       "ui-icon",
-                      isUsagePage
+                      isInboxPage
                         ? "text-[var(--sidebar-active-foreground)]"
                         : "text-muted-foreground",
                     )}
                   />
-                  Usage
+                  Inbox
+                  {inboxCount > 0 && (
+                    <span
+                      aria-label={
+                        inboxCount === 1
+                          ? "1 inbox item waiting"
+                          : `${inboxCount} inbox items waiting`
+                      }
+                      className={cn(
+                        "ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-10 font-medium text-[var(--sidebar-active-foreground)] tabular-nums",
+                        // The active Inbox row already paints the translucent
+                        // --sidebar-active wash; repainting it on the nested
+                        // badge would double-composite to a darker fill.
+                        isInboxPage ? "bg-transparent" : "bg-[var(--sidebar-active)]",
+                      )}
+                    >
+                      {inboxCount}
+                    </span>
+                  )}
                 </Link>
               </Button>
-            )}
-          </div>
+              {usagePageEnabled && (
+                <Button
+                  asChild
+                  variant="ghost"
+                  className={cn(
+                    SIDEBAR_ROW,
+                    "w-full justify-start border-0 font-normal",
+                    SIDEBAR_HOVER_HIGHLIGHT,
+                    isUsagePage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                  )}
+                  data-testid="usage-nav"
+                >
+                  <Link to="/usage" onClick={onNavClick} componentId="sidebar.usage">
+                    <WalletIcon
+                      className={cn(
+                        "ui-icon",
+                        isUsagePage
+                          ? "text-[var(--sidebar-active-foreground)]"
+                          : "text-muted-foreground",
+                      )}
+                    />
+                    Usage
+                  </Link>
+                </Button>
+              )}
+            </div>
 
-          <nav
-            ref={scrollContainerRef}
-            // Keep wheel/touch scrolling without letting classic-scrollbar
-            // platforms reserve a wide, permanently visible Sidebar gutter.
-            className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
-          >
-            <ConversationList
-              conversationsQuery={conversationsQuery}
-              scrollContainerRef={scrollContainerRef}
-              onRowClick={onNavClick}
-              searchQuery=""
-              newSessionProjectName={newSessionProjectName}
-              activeTab={activeTab}
-              onActiveTabChange={switchTab}
-              multiUser={multiUser}
-              pinnedConversationIds={pinnedConversationIds}
-              pinnedConversations={pinnedConversations}
-              onTogglePinned={togglePinnedConversation}
-              onEnterSelectionMode={enterSelectionMode}
-              selectionMode={selectionMode}
-              selectionScope={selectionScope}
-              selectedIds={selectedIds}
-              onToggleSelected={toggleSelected}
-              onDeselectAll={deselectAll}
-              onExitSelectionMode={exitSelectionMode}
-              getVisibleIdsRef={getVisibleIdsRef}
-            />
-          </nav>
+            {/* Wrapper (not the `aside`) anchors the floating Settings button:
+          absolute-positioning inside the aside would place it in the native
+          safe-area padding, under the home indicator. */}
+            <div className="relative flex min-h-0 flex-1 flex-col">
+              <nav
+                ref={scrollContainerRef}
+                // Keep wheel/touch scrolling without letting classic-scrollbar
+                // platforms reserve a wide, permanently visible Sidebar gutter.
+                // max-md:pb-14 is the floating Settings chip's clearance: the
+                // chip is a non-scrolling sibling pinned bottom-right, so
+                // without a gutter the last row's always-visible kebab parks
+                // underneath it and can't be tapped.
+                className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] max-md:pb-14 [&::-webkit-scrollbar]:hidden"
+              >
+                <ConversationList
+                  conversationsQuery={conversationsQuery}
+                  scrollContainerRef={scrollContainerRef}
+                  onRowClick={onNavClick}
+                  searchQuery=""
+                  newSessionProjectName={newSessionProjectName}
+                  activeTab={activeTab}
+                  onActiveTabChange={switchTab}
+                  multiUser={multiUser}
+                  pinnedConversationIds={pinnedConversationIds}
+                  pinnedConversations={pinnedConversations}
+                  onTogglePinned={togglePinnedConversation}
+                  onEnterSelectionMode={enterSelectionMode}
+                  selectionMode={selectionMode}
+                  selectionScope={selectionScope}
+                  selectedIds={selectedIds}
+                  onToggleSelected={toggleSelected}
+                  onDeselectAll={deselectAll}
+                  onExitSelectionMode={exitSelectionMode}
+                  getVisibleIdsRef={getVisibleIdsRef}
+                />
+              </nav>
+              {/* Mobile: Settings floats over the bottom of the session list, with
+          Search floating at the top of the header row — the two icons the
+          drawer keeps once the collapse toggle is gone. */}
+              <SidebarSettingsButton
+                testId="sidebar-settings-float"
+                className="absolute right-3 bottom-3 md:hidden"
+              />
+            </div>
 
-          {/* Desktop server picker, pinned below the scrolling session list.
+            {/* Desktop server picker, pinned below the scrolling session list.
           Self-hiding: renders nothing outside the Electron shell (see
           SidebarServerPicker), so browsers keep an unchanged sidebar that ends
           with the list. */}
-          <SidebarServerPicker />
-        </>
-      )}
-    </aside>
+            <SidebarServerPicker />
+          </>
+        )}
+      </aside>
+    </>
   );
 }
 
@@ -2275,13 +2352,28 @@ function SectionHeader({
         {collapsed && marker && (
           <span
             className={cn(
-              "ml-auto flex shrink-0 items-center transition-opacity",
+              // Match the session rows' badge slot so the marker lines up
+              // vertically with the dots on the rows above. The header button's
+              // right padding differs by kind (icon folders use px-2, plain
+              // headers use pr-0), so offset each to the same right-1 edge:
+              // -mr-1 trims the folder's 8px padding to 4px; mr-1 pushes the
+              // padless header out to 4px.
+              "ml-auto flex shrink-0 items-center justify-center transition-opacity",
+              icon ? "-mr-1" : "mr-1",
+              // Dot/spinner markers get the fixed size-6 centered box (center
+              // lands 16px from the edge, matching the rows). The "awaiting"
+              // pill keeps its natural width so its label isn't clipped.
+              isDotMarker(marker) && "w-6",
               // When the header also carries a hover-revealed kebab, keep the
               // marker clear of it the same way a row's time/marker slot does:
               // reserve space on mobile (kebab always shown) and fade out on
               // desktop hover so the kebab takes its place.
               hasAction &&
-                "mr-14 md:mr-0 md:group-hover/section:opacity-0 md:group-focus-within/section:opacity-0",
+                cn(
+                  "mr-14",
+                  icon ? "md:-mr-1" : "md:mr-1",
+                  "md:group-hover/section:opacity-0 md:group-focus-within/section:opacity-0",
+                ),
             )}
           >
             <SessionStateBadge state={marker} />
@@ -2442,7 +2534,8 @@ function SectionGroup({
   collapsed: boolean;
   onToggleCollapsed: () => void;
   /** Optional control overlaid at the group header's right edge (e.g. the
-      "collapse all projects" toggle). Hover/focus-revealed on desktop. */
+      "collapse all projects" toggle). Always shown without hover support and
+      hover/focus-revealed on hover-capable desktop displays. */
   headerAction?: ReactNode;
   /** Optional content rendered directly under the header, above the children
       (and shown even when collapsed) — e.g. the bulk-selection action bar. */
@@ -2459,14 +2552,15 @@ function SectionGroup({
           onToggleCollapsed={onToggleCollapsed}
         />
         {headerAction && (
-          // Desktop-only, hover/keyboard-focus-revealed: a group-level bulk
-          // control (e.g. "expand all projects") is a pointer convenience, so it
-          // stays hidden until the header is hovered and never floats on touch
-          // viewports where there's no hover. Reveal on :focus-visible (keyboard)
-          // — NOT :focus-within — so clicking the button with the mouse doesn't
-          // leave it stuck visible: React reuses the same node when it swaps
+          // Always visible without hover support (no hover on phones or touch
+          // tablets, and the "New project" control lives here — the only way to
+          // create a project). On hover-capable desktop displays it's
+          // hover/keyboard-focus-revealed: a group-level control is a pointer
+          // convenience there. Reveal on :focus-visible (keyboard) — NOT
+          // :focus-within — so clicking the button with the mouse doesn't leave
+          // it stuck visible: React reuses the same node when it swaps
           // expand↔revert, so the clicked button keeps focus afterward.
-          <div className="-translate-y-1/2 absolute top-1/2 right-1 hidden items-center transition-opacity md:flex md:opacity-0 md:has-[:focus-visible]:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:group-hover/header:opacity-100">
+          <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity [@media(hover:hover)]:md:opacity-0 [@media(hover:hover)]:md:has-[:focus-visible]:opacity-100 [@media(hover:hover)]:md:group-has-[[data-state=open]]/header:opacity-100 [@media(hover:hover)]:md:group-hover/header:opacity-100">
             {headerAction}
           </div>
         )}
@@ -2722,6 +2816,7 @@ function ConversationMenuItems({
   // to the side. `view` swaps between the main actions and that sub-view;
   // desktop always renders the native side-flyout submenu regardless.
   const isMobile = useIsMobileViewport();
+  const { trackClick } = useOmnigentAnalytics();
   const [view, setView] = useState<"main" | "projects">("main");
 
   // The project pick / create / remove flow — shared verbatim by the desktop
@@ -2815,7 +2910,13 @@ function ConversationMenuItems({
           </Tooltip>
         ))}
       {isOwner ? (
-        <C.Item data-testid="rename-conversation" onSelect={() => setIsEditing(true)}>
+        <C.Item
+          data-testid="rename-conversation"
+          onSelect={() => {
+            trackClick("sidebar.conversation.rename", "button");
+            setIsEditing(true);
+          }}
+        >
           <PencilIcon className="size-3.5" />
           Rename
         </C.Item>
@@ -3186,6 +3287,7 @@ function ConversationRow({
   }, [conversation.title, pendingTitle, rename.isSuccess, rename.isError]);
 
   const label = pendingTitle ?? conversationDisplayLabel(conversation);
+  const hasDraft = useHasSessionDraft(conversation.id);
   // Recompute unseen state the moment the last-seen map changes (e.g. the
   // user picks "Mark as unread" on this row) rather than waiting for the
   // next conversations poll.
@@ -3223,6 +3325,11 @@ function ConversationRow({
       : hasUnseenMessages
         ? { kind: "unseen" as const }
         : (derivedState ?? (isStartingUp ? { kind: "starting" as const } : null));
+  // Drafts share the row's trailing indicator slot, but the active session's
+  // composer already makes its draft visible. Live session state wins while
+  // present; otherwise only an inactive row needs the draft marker.
+  const showDraftIndicator = hasDraft && !isActive;
+  const hasTrailingIndicator = sessionState !== null || showDraftIndicator;
 
   // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
   // owner-only, like the Move-to-project kebab item), outside selection /
@@ -3425,12 +3532,11 @@ function ConversationRow({
         // Full width (not 100%+1rem) so the highlight stays inset from the
         // right edge, aligning with the project/folder rows above.
         "w-full",
+        // Mobile drops the pin + kebab (see the trailing controls below), so it
+        // reserves only what the badge needs — the same width desktop uses at
+        // rest, before hover reveals the controls.
         !selectionMode &&
-          (sessionState?.kind === "awaiting"
-            ? "pr-48 md:pr-29"
-            : sessionState !== null
-              ? "pr-28 md:pr-8"
-              : "pr-28 md:pr-2"),
+          (sessionState?.kind === "awaiting" ? "pr-29" : hasTrailingIndicator ? "pr-8" : "pr-2"),
         // The narrowed reserve must track exactly when the trailing controls
         // appear and the state marker fades — both keyed on `:focus-visible`.
         // `focus-within` also fires for a plain click, which shrank the reserve
@@ -3475,10 +3581,8 @@ function ConversationRow({
       }}
       title={isMobile ? (conversation.title ?? conversation.id) : undefined}
     >
-      {/* Row 1: the session name. Status markers (working, needs-approval,
-          unseen) render in the trailing session-state slot below, not inline
-          here. Leading icons (agent type, pin, shared) were removed to keep
-          rows text-clean; pinned rows still group under "Pinned". */}
+      {/* Row 1: the session name. Working, needs-approval, unseen, and draft
+          markers render in the shared trailing indicator slot below. */}
       <div className="flex w-full items-center gap-1.5">
         <span className="relative min-w-0 truncate">
           {label}
@@ -3581,9 +3685,28 @@ function ConversationRow({
             <SquareIcon className="size-4 text-muted-foreground" />
           )}
         </span>
-      ) : sessionState !== null ? (
-        <span className={SESSION_STATE_SLOT_CLASS}>
-          <SessionStateBadge state={sessionState} />
+      ) : hasTrailingIndicator ? (
+        <span
+          className={cn(
+            SESSION_STATE_SLOT_CLASS,
+            // The wide "awaiting" pill keeps its natural width; every other
+            // marker (running/starting/unseen dot, or the draft pencil) sits in
+            // the fixed centered box so it lines up under the kebab.
+            isDotMarker(sessionState) && SESSION_STATE_DOT_SLOT_CLASS,
+          )}
+        >
+          {sessionState !== null ? (
+            <SessionStateBadge state={sessionState} />
+          ) : (
+            <span
+              role="img"
+              aria-label="Draft"
+              data-testid="conversation-draft-indicator"
+              className="inline-flex h-5 shrink-0 items-center justify-center text-muted-foreground"
+            >
+              <MessageCircleDashedIcon aria-hidden className="size-3.5" />
+            </span>
+          )}
         </span>
       ) : null}
       {/* Trailing controls (pin + kebab) share one absolutely-positioned flex
@@ -3644,12 +3767,14 @@ function ConversationRow({
                 size="icon-xs"
                 aria-label="Conversation actions"
                 data-testid="conversation-actions"
-                // On mobile (no hover state) it's always visible. On desktop it
-                // stays hidden until hover / keyboard focus, with `aria-expanded`
-                // keeping it surfaced while the menu is open so the trigger
-                // doesn't vanish under the cursor.
+                // Desktop-only: the chat page's own header menu covers these
+                // per-session actions on mobile, so the row kebab is dropped
+                // there. From `md` up it stays hidden until hover / keyboard
+                // focus, with `aria-expanded` keeping it surfaced while the menu
+                // is open so the trigger doesn't vanish under the cursor.
                 className={cn(
                   "text-muted-foreground transition-opacity",
+                  "hidden md:inline-flex",
                   "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
                   "md:aria-expanded:opacity-100",
                 )}
@@ -3734,6 +3859,7 @@ function ConversationRow({
               variant="destructive"
               onClick={confirmDelete}
               disabled={del.isPending}
+              componentId="sidebar.conversation.delete"
             >
               Delete
             </Button>
@@ -3769,6 +3895,7 @@ function ConversationRow({
               data-testid="confirm-leave-conversation"
               onClick={confirmLeave}
               disabled={leave.isPending}
+              componentId="sidebar.conversation.leave"
             >
               Leave
             </Button>
@@ -3816,6 +3943,7 @@ function ConversationRow({
                 stopSession.mutate(conversation.id, { onSuccess: () => setStopOpen(false) })
               }
               loading={stopSession.isPending}
+              componentId="sidebar.conversation.stop"
             >
               Stop session
             </Button>
@@ -3988,43 +4116,33 @@ function ProjectFolderMenu({
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [iconOpen, setIconOpen] = useState(false);
+  const [emojiOpen, setEmojiOpen] = useState(false);
   const [renameValue, setRenameValue] = useState(projectName);
+  // The icon staged in the rename modal, committed only on Confirm:
+  //   undefined = untouched (show the saved icon), string = a picked emoji,
+  //   null = staged removal. Reset to `undefined` each time the modal opens.
+  const [pendingIcon, setPendingIcon] = useState<string | null | undefined>(undefined);
   const deleteProject = useDeleteProject();
   const renameProject = useRenameProject();
   const updateConfig = useUpdateProjectConfig();
-  // Fetch the full config only while the menu or picker is open, so we can
+  // Fetch the full config only while the menu or rename modal is open, so we can
   // merge the icon onto the other stored defaults (host / workspace / agent)
   // without a per-folder request on every sidebar render — and without wiping
-  // those defaults on set/remove.
-  const { data: iconConfig, isLoading: iconConfigLoading } = useProjectConfig(
-    menuOpen || iconOpen ? projectId : null,
+  // those defaults on save.
+  const { data: iconConfig, isError: iconConfigError } = useProjectConfig(
+    menuOpen || renameOpen ? projectId : null,
   );
-  // The config PATCH replaces the whole blob, so a set/remove must merge onto a
+  // The config PATCH replaces the whole blob, so an ICON save must merge onto a
   // fully-loaded config or it silently wipes the other defaults. "Ready" means
   // the config actually resolved (`!== undefined` — `isLoading` alone is false
   // on a query *error* too, leaving no data to merge onto) — except a
   // label-only folder (`projectId === null`), whose base is legitimately `{}`.
+  // This gates only the icon path; renaming the name never needs the config.
   const configReady = projectId === null || iconConfig !== undefined;
-  const setIcon = (native: string) => {
-    if (!configReady) return;
-    updateConfig.mutate(
-      { id: projectId, name: projectName, config: { ...(iconConfig ?? {}), icon: native } },
-      {
-        onSuccess: () => {
-          setIconOpen(false);
-          setMenuOpen(false);
-        },
-      },
-    );
-  };
-  const removeIcon = () => {
-    if (!configReady) return;
-    const next = { ...(iconConfig ?? {}) };
-    delete next.icon;
-    updateConfig.mutate({ id: projectId, name: projectName, config: next });
-    setMenuOpen(false);
-  };
+  const savedIcon = iconConfig !== undefined ? iconConfig?.icon : icon;
+  // What the modal's tile shows: the staged pick when touched, else the saved
+  // icon. `null` (staged removal) renders as the empty folder.
+  const displayIcon = pendingIcon !== undefined ? pendingIcon : savedIcon;
 
   return (
     <>
@@ -4062,6 +4180,7 @@ function ProjectFolderMenu({
             data-testid="rename-project"
             onSelect={() => {
               setRenameValue(projectName);
+              setPendingIcon(undefined);
               setRenameOpen(true);
             }}
           >
@@ -4072,20 +4191,6 @@ function ProjectFolderMenu({
             <Settings2Icon className="size-3.5" />
             Project settings
           </DropdownMenuItem>
-          <DropdownMenuItem data-testid="change-project-icon" onSelect={() => setIconOpen(true)}>
-            <SmilePlusIcon className="size-3.5" />
-            Change icon…
-          </DropdownMenuItem>
-          {icon ? (
-            <DropdownMenuItem
-              data-testid="remove-project-icon"
-              disabled={!configReady}
-              onSelect={removeIcon}
-            >
-              <SmileIcon className="size-3.5" />
-              Remove icon
-            </DropdownMenuItem>
-          ) : null}
           <DropdownMenuItem
             data-testid="delete-project"
             variant="destructive"
@@ -4097,7 +4202,23 @@ function ProjectFolderMenu({
         </DropdownMenuContent>
       </DropdownMenu>
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
-        <DialogContent onClick={(e) => e.stopPropagation()}>
+        <DialogContent
+          onClick={(e) => e.stopPropagation()}
+          // emoji-mart preventDefaults the pointer event, so Radix's own
+          // outside-dismissal never fires for clicks elsewhere in the modal.
+          // Catch them in the capture phase and close the picker ourselves,
+          // unless the pointer is inside the picker or on its trigger tile.
+          onPointerDownCapture={(e) => {
+            if (!emojiOpen) return;
+            const target = e.target as Element;
+            if (
+              target.closest('[data-slot="popover-content"]') ||
+              target.closest('[data-testid="rename-project-icon"]')
+            )
+              return;
+            setEmojiOpen(false);
+          }}
+        >
           <DialogHeader>
             <DialogTitle>Rename project</DialogTitle>
           </DialogHeader>
@@ -4105,34 +4226,137 @@ function ProjectFolderMenu({
               doesn't wrap children in one) instead of relying on a manual
               key handler + button lookup. */}
           <form
-            onSubmit={(e) => {
+            onSubmit={async (e) => {
               e.preventDefault();
               const newName = renameValue.trim();
-              if (newName === "" || newName === projectName) {
-                setRenameOpen(false);
-                setMenuOpen(false);
+              const nameChanged = newName !== "" && newName !== projectName;
+              const iconChanged = pendingIcon !== undefined && pendingIcon !== (savedIcon ?? null);
+              // Only the icon write needs a loaded config to merge onto; a
+              // name-only rename must proceed even if the config fetch failed.
+              if (iconChanged && !configReady) return;
+              try {
+                // Name first: it promotes a label-only folder (creating the
+                // first-class row) and reconciles members. Capture the resolved
+                // id so the icon write below targets that row — passing the
+                // stale render-time `null` would make the config write try to
+                // create the project a second time and 409 on the duplicate.
+                let targetId = projectId;
+                if (nameChanged) {
+                  targetId = await renameProject.mutateAsync({
+                    id: projectId,
+                    oldName: projectName,
+                    newName,
+                  });
+                }
+                if (iconChanged) {
+                  const next = { ...(iconConfig ?? {}) };
+                  if (pendingIcon === null) delete next.icon;
+                  else next.icon = pendingIcon;
+                  await updateConfig.mutateAsync({
+                    id: targetId,
+                    name: nameChanged ? newName : projectName,
+                    config: next,
+                  });
+                }
+              } catch {
+                // Errors surface via the mutation state below. A rename that
+                // lands before a failed icon write is already persisted; only
+                // the icon needs retrying.
                 return;
               }
-              renameProject.mutate(
-                { id: projectId, oldName: projectName, newName },
-                {
-                  onSuccess: () => {
-                    setRenameOpen(false);
-                    setMenuOpen(false);
-                  },
-                },
-              );
+              setRenameOpen(false);
+              setMenuOpen(false);
             }}
           >
-            <input
-              autoFocus
-              className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none"
-              value={renameValue}
-              onChange={(e) => setRenameValue(e.target.value)}
-            />
-            {renameProject.isError && (
+            {/* One combined control: emoji tile (left) + name (right) share a
+                single border, so it reads as a single input. The tile opens a
+                picker popover; the pick is staged and committed on Confirm. */}
+            <div className="flex items-stretch overflow-hidden rounded-lg border border-input">
+              <Popover open={emojiOpen} onOpenChange={setEmojiOpen}>
+                <PopoverTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="Change project icon"
+                    data-testid="rename-project-icon"
+                    disabled={!configReady}
+                    className={cn(
+                      "flex size-[38px] shrink-0 cursor-pointer items-center justify-center outline-none transition-colors disabled:cursor-default disabled:opacity-50",
+                      displayIcon ? "bg-muted" : "bg-tag-pink",
+                    )}
+                  >
+                    {displayIcon ? (
+                      <span className="text-xl leading-none">{displayIcon}</span>
+                    ) : (
+                      <SmilePlusIcon className="size-4 text-brand-accent" />
+                    )}
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent
+                  align="start"
+                  // Publish the collision-aware available viewport height (Radix
+                  // exposes it as a CSS var), less the optional "Remove icon"
+                  // header and capped at the picker's natural size, so the
+                  // .emoji-picker-popover rule in index.css shrinks emoji-mart to
+                  // fit — it then scrolls its grid internally (nav + search
+                  // pinned) instead of clipping on short screens.
+                  collisionPadding={8}
+                  style={
+                    {
+                      "--emoji-picker-height": `min(420px, calc(var(--radix-popover-content-available-height) - ${displayIcon ? "38px" : "0px"}))`,
+                    } as CSSProperties
+                  }
+                  className="emoji-picker-popover flex max-h-[var(--radix-popover-content-available-height)] w-auto flex-col overflow-hidden p-0"
+                  // The rename Dialog's scroll lock (react-remove-scroll)
+                  // preventDefaults wheel events over the picker — it can't see
+                  // emoji-mart's scroll region inside shadow DOM. Stop the wheel
+                  // from reaching the document-level lock so the grid scrolls.
+                  onWheel={(e) => e.stopPropagation()}
+                  // Nested in the rename Dialog, emoji-mart's own focus handling
+                  // swallows Radix's default outside-pointer dismissal, so a
+                  // click elsewhere in the modal wouldn't close the picker.
+                  // Close it explicitly on any outside interaction.
+                >
+                  {displayIcon ? (
+                    <div className="shrink-0 border-b p-1">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="w-full justify-start"
+                        data-testid="rename-project-remove-icon"
+                        onClick={() => {
+                          setPendingIcon(null);
+                          setEmojiOpen(false);
+                        }}
+                      >
+                        <Trash2Icon className="size-3.5" />
+                        Remove icon
+                      </Button>
+                    </div>
+                  ) : null}
+                  <EmojiPicker
+                    onSelect={(native) => {
+                      setPendingIcon(native);
+                      setEmojiOpen(false);
+                    }}
+                  />
+                </PopoverContent>
+              </Popover>
+              <input
+                className="w-full bg-transparent px-3 py-2 text-ui outline-none"
+                value={renameValue}
+                onChange={(e) => setRenameValue(e.target.value)}
+              />
+            </div>
+            {iconConfigError && (
               <p className="text-ui text-destructive" role="alert">
-                {(renameProject.error as Error).message}
+                Couldn&apos;t load this project&apos;s icon settings. You can still rename it;
+                changing the icon is unavailable until this loads.
+              </p>
+            )}
+            {(renameProject.isError || updateConfig.isError) && (
+              <p className="text-ui text-destructive" role="alert">
+                {((renameProject.error ?? updateConfig.error) as Error).message}
               </p>
             )}
             <DialogFooter className="border-t-0 bg-transparent">
@@ -4140,17 +4364,18 @@ function ProjectFolderMenu({
                 type="button"
                 variant="ghost"
                 onClick={() => setRenameOpen(false)}
-                disabled={renameProject.isPending}
+                disabled={renameProject.isPending || updateConfig.isPending}
               >
                 Cancel
               </Button>
               <Button
                 type="submit"
                 data-testid="rename-project-confirm"
-                loading={renameProject.isPending}
+                loading={renameProject.isPending || updateConfig.isPending}
                 disabled={renameValue.trim() === ""}
+                componentId="sidebar.project.rename"
               >
-                Rename
+                Confirm
               </Button>
             </DialogFooter>
           </form>
@@ -4165,33 +4390,6 @@ function ProjectFolderMenu({
         projectId={projectId}
         projectName={projectName}
       />
-      <Dialog
-        open={iconOpen}
-        onOpenChange={(o) => {
-          setIconOpen(o);
-          if (!o) setMenuOpen(false);
-        }}
-      >
-        <DialogContent
-          onClick={(e) => e.stopPropagation()}
-          className="w-auto items-center gap-3 p-4"
-        >
-          <DialogHeader>
-            <DialogTitle>Choose an icon</DialogTitle>
-          </DialogHeader>
-          {configReady ? (
-            <EmojiPicker onSelect={setIcon} />
-          ) : iconConfigLoading ? (
-            <div className="flex h-[420px] w-[352px] items-center justify-center">
-              <Loader2Icon className="size-5 animate-spin text-muted-foreground" />
-            </div>
-          ) : (
-            <div className="flex h-[420px] w-[352px] items-center justify-center px-6 text-center text-ui text-muted-foreground">
-              Couldn&apos;t load this project&apos;s settings. Close and try again.
-            </div>
-          )}
-        </DialogContent>
-      </Dialog>
       <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
         <DialogContent onClick={(e) => e.stopPropagation()}>
           <DialogHeader>
@@ -4266,9 +4464,13 @@ function ProjectPickerMenu({
   const { data: projects = [] } = useProjects();
   const [search, setSearch] = useState("");
 
-  const filtered = search
-    ? projects.filter((p) => p.name.toLowerCase().includes(search.toLowerCase()))
+  const trimmed = search.trim();
+  const filtered = trimmed
+    ? projects.filter((p) => p.name.toLowerCase().includes(trimmed.toLowerCase()))
     : projects;
+  // Offer create only when the typed name isn't already an exact project.
+  const canCreate =
+    trimmed.length > 0 && !projects.some((p) => p.name.toLowerCase() === trimmed.toLowerCase());
 
   // Keep keystrokes inside the inputs from reaching the menu's typeahead /
   // navigation handlers (which would otherwise steal letters and arrows).
@@ -4282,7 +4484,7 @@ function ProjectPickerMenu({
         <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
         <input
           className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
-          placeholder="Search projects"
+          placeholder="Search or create project"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           onKeyDown={swallowKeys}
@@ -4297,10 +4499,21 @@ function ProjectPickerMenu({
             )}
           </C.Item>
         ))}
-        {filtered.length === 0 && (
+        {filtered.length === 0 && !canCreate && (
           <p className="px-2 py-1.5 text-sm text-muted-foreground">No projects yet.</p>
         )}
       </div>
+      {canCreate && (
+        <div className="border-t pt-1">
+          <C.Item className="px-2 py-1" onSelect={() => onSelect(trimmed)}>
+            <PlusIcon className="size-3.5 shrink-0 text-muted-foreground" />
+            Create{" "}
+            <span className="truncate rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
+              {trimmed}
+            </span>
+          </C.Item>
+        </div>
+      )}
       {currentProject && (
         <div className="border-t pt-1">
           <C.Item className="px-2 py-1" onSelect={() => onSelect("")}>
@@ -4375,6 +4588,7 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
       <input
         ref={inputRef}
         type="text"
+        maxLength={USER_SESSION_TITLE_MAX_CHARS}
         value={value}
         onChange={(e) => setValue(e.target.value)}
         onCompositionStart={() => {

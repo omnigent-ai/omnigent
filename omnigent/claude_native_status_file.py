@@ -306,10 +306,15 @@ class SessionStatusPoller:
         pane_pid_getter: Callable[[], int | None],
         session_id_getter: Callable[[], str | None],
         config_dir: Path | None = None,
+        omnigent_session_id: str | None = None,
     ) -> None:
         self._on_status = on_status
         self._pane_pid_getter = pane_pid_getter
+        # Claude's own session uuid, resolved lazily from the bridge.
         self._session_id_getter = session_id_getter
+        # The Omnigent conversation id this poller watches — for debug-log
+        # attribution only (distinct from Claude's session uuid above).
+        self._omnigent_session_id = omnigent_session_id
         self._config_dir = config_dir
         self._path: Path | None = None
         self._attempts = 0
@@ -361,6 +366,7 @@ class SessionStatusPoller:
                 path,
                 self._attempts,
                 pane_pid,
+                extra={"session_id": self._omnigent_session_id},
             )
             self._path = path
             return
@@ -370,6 +376,7 @@ class SessionStatusPoller:
                 "(pane_pid=%s); session status falls back to the pane watcher",
                 self._attempts,
                 pane_pid,
+                extra={"session_id": self._omnigent_session_id},
             )
             self._exhausted = True
 
@@ -381,7 +388,11 @@ class SessionStatusPoller:
         the file owns the session's status while it is readable, a dead pane
         must retire it or that final value would pin the session forever.
         """
-        _logger.info("claude status file retired: path=%s", self._path)
+        _logger.info(
+            "claude status file retired: path=%s",
+            self._path,
+            extra={"session_id": self._omnigent_session_id},
+        )
         self._exhausted = True
 
     def resync(self) -> None:
@@ -398,7 +409,11 @@ class SessionStatusPoller:
         Keeps the resolved path and the attempt count — this re-asserts a
         working poller, it does not restart resolution.
         """
-        _logger.info("claude status file resync: path=%s", self._path)
+        _logger.info(
+            "claude status file resync: path=%s",
+            self._path,
+            extra={"session_id": self._omnigent_session_id},
+        )
         self._last_mtime = None
         self._last_edge = None
 

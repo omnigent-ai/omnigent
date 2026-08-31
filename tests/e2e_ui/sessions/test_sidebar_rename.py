@@ -20,6 +20,8 @@ import uuid
 import httpx
 from playwright.sync_api import Locator, Page, expect
 
+from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
+
 
 def _row(page: Page, session_id: str) -> Locator:
     """Locate the sidebar row (``<li>``) for *session_id* by its href."""
@@ -104,6 +106,34 @@ def test_rename_session_is_preserved(
     assert snap.json().get("title") == new_title, (
         f"server should persist the renamed title {new_title!r}, got {snap.json().get('title')!r}"
     )
+
+
+def test_rename_session_enforces_user_title_limit(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The browser accepts 200 title characters and blocks the 201st."""
+    base_url, session_id = seeded_session
+    title = "x" * USER_SESSION_TITLE_MAX_CHARS
+
+    page.goto(f"{base_url}/c/{session_id}")
+    row = _row(page, session_id)
+    expect(row).to_be_visible()
+    row.hover()
+    row.get_by_test_id("conversation-actions").click()
+    page.get_by_test_id("rename-conversation").click()
+
+    edit = page.get_by_test_id("rename-conversation-input")
+    expect(edit).to_have_attribute("maxlength", str(USER_SESSION_TITLE_MAX_CHARS))
+    edit.fill(title)
+    edit.press("End")
+    edit.type("y")
+    expect(edit).to_have_value(title)
+    edit.press("Enter")
+
+    snap = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+    snap.raise_for_status()
+    assert snap.json().get("title") == title
 
 
 def test_rename_row_never_repaints_the_old_title(

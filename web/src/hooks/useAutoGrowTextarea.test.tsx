@@ -110,19 +110,23 @@ describe("useAutoGrowTextarea", () => {
     // scrollHeight is read while the textarea is collapsed, so it's the one
     // moment that sees the layout the rest of the page would have seen.
     let wrapperHeightWhileCollapsed: string | null = null;
+    let wrapperOverflowWhileCollapsed: string | null = null;
     Object.defineProperty(ta, "scrollHeight", {
       configurable: true,
       get: () => {
         wrapperHeightWhileCollapsed = wrapper.style.height;
+        wrapperOverflowWhileCollapsed = wrapper.style.overflow;
         return 40;
       },
     });
     roCallback?.([], {} as ResizeObserver);
 
     expect(wrapperHeightWhileCollapsed).toBe("100px");
+    expect(wrapperOverflowWhileCollapsed).toBe("hidden");
     // Released again once the real height is on, so the wrapper goes back to
     // tracking its content instead of freezing at the pinned value.
     expect(wrapper.style.height).toBe("");
+    expect(wrapper.style.overflow).toBe("");
     expect(ta.style.height).toBe("40px");
   });
 

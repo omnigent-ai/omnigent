@@ -22,7 +22,7 @@ export function ViewModeToggle() {
   const ctx = useTerminalFirst();
   if (!ctx || !ctx.isTerminalFirst || ctx.isShellView || isIOSShell()) return null;
 
-  const { view, setView, terminalsAvailable, terminalStartingUp } = ctx;
+  const { view, setView, terminalStartingUp } = ctx;
   const terminalLabel = terminalStartingUp ? "Terminal is starting up…" : "Terminal view";
 
   return (
@@ -30,6 +30,9 @@ export function ViewModeToggle() {
       role="group"
       aria-label="Switch between chat and terminal"
       data-testid="view-mode-toggle"
+      // Lets the mobile header pill inset itself only when this segmented
+      // track is present — see MOBILE_GLASS_PILL.
+      data-slot="view-mode-toggle"
       // Inset track: p-0.5 around two size-6 segments lands the control at
       // 32px tall, matching the header's other controls.
       className="flex items-center gap-0.5 rounded-[var(--radius-lg)] bg-muted/60 p-0.5"
@@ -39,17 +42,16 @@ export function ViewModeToggle() {
         active={view === "chat"}
         onClick={() => setView("chat")}
         testId="view-mode-chat"
+        componentId="chat.header.view_chat"
       >
         <MessagesSquareIcon className="size-3.5" />
       </ViewModeSegment>
-      {/* Terminal stays disabled until a PTY is reachable; the spinner while
-          it's coming up reads as "loading" rather than a dead segment. */}
       <ViewModeSegment
         label={terminalLabel}
         active={view === "terminal"}
-        disabled={!terminalsAvailable}
         onClick={() => setView("terminal")}
         testId="view-mode-terminal"
+        componentId="chat.header.view_terminal"
       >
         {terminalStartingUp ? (
           <Loader2Icon className="size-3.5 animate-spin" aria-hidden />
@@ -70,23 +72,20 @@ export function ViewModeToggle() {
 function ViewModeSegment({
   label,
   active,
-  disabled = false,
   onClick,
   testId,
+  componentId,
   children,
 }: {
   label: string;
   active: boolean;
-  disabled?: boolean;
   onClick: () => void;
   testId: string;
+  componentId: string;
   children: React.ReactNode;
 }) {
   return (
     <Tooltip>
-      {/* Wrapper span owns hover/focus: a disabled button gets no pointer
-          events, so the tooltip explaining *why* it's disabled would never
-          open if it anchored to the button itself. */}
       <TooltipTrigger asChild>
         <span className="inline-flex">
           <Button
@@ -95,9 +94,9 @@ function ViewModeSegment({
             size="icon-xs"
             aria-label={label}
             aria-pressed={active}
-            disabled={disabled}
             onClick={onClick}
             data-testid={testId}
+            componentId={componentId}
             className={cn(
               "border-none",
               active

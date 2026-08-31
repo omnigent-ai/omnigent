@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 from playwright.sync_api import Page, Route, expect
 
 from omnigent.claude_native import ClaudeNativeUcodeConfig, claude_native_model_options
-from tests.e2e_ui.conftest import seed_committed_turn
+from tests.e2e_ui.conftest import fetch_with_retry, seed_committed_turn
 
 _EXPECTED_ROWS = [
     ("opus", "Opus 4.10"),
@@ -48,6 +48,7 @@ def _patch_session_as_claude_native(
     model_options: list[dict] | None = None,
     llm_model: str = "system.ai.claude-sonnet-5",
     host_asleep: bool = False,
+    permission_mode: str | None = None,
 ) -> list[dict]:
     """Patch the browser's session snapshot into a claude-native response.
 
@@ -66,10 +67,14 @@ def _patch_session_as_claude_native(
     :param host_asleep: Shape the snapshot like a dormant resumable managed
         host (host-bound, resumable, aged past the startup grace); pair with
         :func:`_force_asleep_liveness` to drive the ``host_asleep`` state.
+    :param permission_mode: Initial ``omnigent.claude_native.permission_mode``
+        label value; required for the permission-mode picker to appear.
     :returns: Captured PATCH request bodies.
     """
     latest_payload: dict | None = None
     patch_bodies: list[dict] = []
+    # Mutable so the PATCH handler can update it without rebinding the name.
+    cur_permission_mode: list[str | None] = [permission_mode]
 
     def _handle(route: Route) -> None:
         nonlocal latest_payload
@@ -81,7 +86,7 @@ def _patch_session_as_claude_native(
 
         headers = {"content-type": "application/json"}
         if request.method == "GET":
-            response = route.fetch()
+            response = fetch_with_retry(route)
             payload = response.json()
             headers = {**response.headers, **headers}
         elif request.method == "PATCH":
@@ -90,13 +95,19 @@ def _patch_session_as_claude_native(
             payload = dict(latest_payload or {})
             if "model_override" in request_body:
                 payload["model_override"] = request_body["model_override"]
+            if "permission_mode" in request_body:
+                cur_permission_mode[0] = request_body["permission_mode"]
         else:
             route.continue_()
             return
 
+        extra_labels: dict[str, str] = {}
+        if cur_permission_mode[0] is not None:
+            extra_labels["omnigent.claude_native.permission_mode"] = cur_permission_mode[0]
         payload["labels"] = {
             **payload.get("labels", {}),
             "omnigent.wrapper": "claude-code-native-ui",
+            **extra_labels,
         }
         payload["harness"] = "claude"
         payload["llm_model"] = llm_model
@@ -298,7 +309,7 @@ def _force_asleep_liveness(page: Page, session_id: str) -> None:
         if request.method != "GET" or urlparse(request.url).path != "/health":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         offline = {"runner_online": False, "host_online": False}
         if isinstance(payload.get("sessions"), dict):
@@ -316,7 +327,7 @@ def _force_asleep_liveness(page: Page, session_id: str) -> None:
         if request.method != "GET" or urlparse(request.url).path != "/v1/sessions":
             route.continue_()
             return
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         rows = payload.get("data") if isinstance(payload, dict) else None
         if isinstance(rows, list):
@@ -354,15 +365,15 @@ def test_claude_native_picker_saves_model_while_host_asleep(
     _force_asleep_liveness(page, session_id)
     patch_bodies = _patch_session_as_claude_native(page, session_id, host_asleep=True)
 
-    page.goto(f"{base_url}/c/{session_id}")
-
-    # Wait for liveness to resolve to host_asleep (the composer's resume
-    # placeholder) so the gear assertions exercise the asleep state, not the
-    # initial not-yet-polled window.
-    composer = page.get_by_label("Message the agent")
-    expect(composer).to_have_attribute(
-        "placeholder", re.compile("resume the sandbox host"), timeout=15_000
-    )
+    # Wait for the /health poll that resolves liveness to host_asleep to land
+    # before the gear assertions, so they exercise the settled asleep state and
+    # not the initial not-yet-polled window. (The composer placeholder is no
+    # longer state-specific, so it can't be the signal.)
+    with page.expect_response(
+        lambda r: urlparse(r.url).path == "/health" and r.status == 200,
+        timeout=15_000,
+    ):
+        page.goto(f"{base_url}/c/{session_id}")
 
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_have_attribute("aria-disabled", "false")
@@ -527,7 +538,7 @@ def _patch_native_session_pair(page: Page, codex_session_id: str, claude_session
             route.continue_()
             return
 
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         if path == f"/v1/sessions/{codex_session_id}":
             wrapper, harness = "codex-native-ui", "codex"
@@ -818,3 +829,51 @@ def test_claude_native_picker_highlights_the_reported_model(
     expect(page.locator('[role="option"][data-model-id="haiku"]')).not_to_have_attribute(
         "data-active", "true"
     )
+
+
+def test_claude_native_permission_mode_switch_persists(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Picking a permission mode in the gear modal PATCHes the server.
+
+    Selecting "Auto" sends ``{"permission_mode": "auto"}`` to
+    ``PATCH /v1/sessions/{id}``, exercising the new in-chat permission-mode
+    control introduced by the claude-web-auto-mode feature.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` for a real server-backed
+        session; the browser snapshot is patched to a claude-native session
+        already in ``default`` (Manual) mode.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    patch_bodies = _patch_session_as_claude_native(page, session_id, permission_mode="default")
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    gear = page.get_by_test_id("composer-config-gear")
+    expect(gear).to_be_visible(timeout=15_000)
+    gear.click()
+
+    # The permission-mode picker is visible for claude-native sessions whose
+    # current mode is known (non-empty label).
+    perm = page.get_by_test_id("composer-config-permission-mode")
+    expect(perm).to_be_visible()
+    perm.click()
+
+    # Located by data attribute, not accessible name: each option renders its
+    # label and description together, so the name is never the bare label.
+    page.locator('[role="option"][data-permission-mode="auto"]').click()
+
+    # Save commits the draft and fires the PATCH.
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and urlparse(response.url).path == f"/v1/sessions/{session_id}"
+            and response.status == 200
+        )
+    ):
+        page.get_by_test_id("composer-config-save").click()
+
+    assert patch_bodies[-1] == {"permission_mode": "auto"}

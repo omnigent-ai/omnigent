@@ -9,6 +9,7 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -34,10 +35,12 @@ class OidcLoginManager {
     private val main = Handler(Looper.getMainLooper())
     private val inFlight = AtomicBoolean(false)
 
-    // Held only for the duration of a login; nulled by [shutdown] so a poll that
-    // finishes after the host is destroyed can neither invoke into a dead
-    // Activity nor pin it (and its View tree) for the poll's lifetime.
+    // Held only for the duration of a login; nulled by [cancel]/[shutdown] so a
+    // poll that finishes after a server switch or host destroy can neither inject
+    // a stale token nor invoke into a dead Activity.
     @Volatile private var sessionCallback: ((String) -> Unit)? = null
+
+    @Volatile private var currentTask: Future<*>? = null
 
     /**
      * Begin a login against [origin] (the pinned server). Opens the browser and
@@ -55,37 +58,53 @@ class OidcLoginManager {
     ): Boolean {
         if (!inFlight.compareAndSet(false, true)) return false
         sessionCallback = onSession
-        io.execute {
-            var token: String? = null
-            try {
-                val ticket = requestTicket(origin)
-                authLog("cli-login -> ${if (ticket != null) "ticket ok" else "FAILED"}")
-                if (ticket != null) {
-                    main.post { launchTab(activity, origin + ticket.loginUrl) }
-                    token = pollForToken(origin, ticket.id)
-                    authLog(
-                        "poll -> ${if (token != null) "token (len=${token.length})" else "no token"}",
-                    )
+        currentTask =
+            io.submit {
+                var token: String? = null
+                try {
+                    val ticket = requestTicket(origin)
+                    authLog("cli-login -> ${if (ticket != null) "ticket ok" else "FAILED"}")
+                    if (ticket != null) {
+                        main.post { launchTab(activity, origin + ticket.loginUrl) }
+                        token = pollForToken(origin, ticket.id)
+                        authLog(
+                            "poll -> ${if (token != null) "token (len=${token.length})" else "no token"}",
+                        )
+                    }
+                } catch (_: InterruptedException) {
+                    // shutdown() interrupted the poll — the host is going away; drop.
+                } catch (t: Throwable) {
+                    authLog("login flow error: ${t.javaClass.simpleName}")
+                } finally {
+                    inFlight.set(false)
                 }
-            } catch (_: InterruptedException) {
-                // shutdown() interrupted the poll — the host is going away; drop.
-            } catch (t: Throwable) {
-                authLog("login flow error: ${t.javaClass.simpleName}")
-            } finally {
-                inFlight.set(false)
+                val result = token
+                // sessionCallback is null once shutdown() ran — never invoke into a
+                // destroyed host.
+                if (result != null) main.post { sessionCallback?.invoke(result) }
             }
-            val result = token
-            // sessionCallback is null once shutdown() ran — never invoke into a
-            // destroyed host.
-            if (result != null) main.post { sessionCallback?.invoke(result) }
-        }
         return true
     }
 
-    /** Cancel an in-flight login and release the host. Call from onDestroy. */
-    fun shutdown() {
+    /**
+     * Cancel an in-flight login without tearing down the executor. Safe to call
+     * when switching servers: nulls the callback (so a late-arriving token is
+     * never injected), resets [inFlight] (so a new login can start immediately),
+     * and interrupts the polling thread (stops wasted network I/O). Both this and
+     * the token-delivery lambda run on the main thread, so the null is always
+     * visible before the lambda can fire.
+     */
+    fun cancel() {
         sessionCallback = null
-        io.shutdownNow() // interrupts the polling sleep so the task exits promptly
+        inFlight.set(false)
+        currentTask?.cancel(true) // interrupts the polling sleep
+        currentTask = null
+    }
+
+    /** Cancel any in-flight login and release the executor. Call from onDestroy. */
+    fun shutdown() {
+        cancel()
+        io.shutdownNow()
     }
 
     private data class Ticket(

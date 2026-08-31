@@ -25,6 +25,7 @@ import httpx
 from fastapi import FastAPI
 
 from omnigent._platform import IS_WINDOWS
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.inner import _proc
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
 from omnigent.version import VERSION
@@ -245,6 +246,7 @@ async def _run_inactivity_monitor(
             _logger.info(
                 "runner idle timeout reached after %.1fs with no active work; shutting down",
                 elapsed_s,
+                extra={"session_id": runner_primary_session_id()},
             )
             request_shutdown()
             return
@@ -434,7 +436,8 @@ class _InitialAuthTokenFactory:
                 self._no_credential_logged = True
                 _logger.error(
                     "host bootstrap bearer expired and no SDK/OIDC credential is available "
-                    "to renew it; run `databricks auth login` to re-authenticate"
+                    "to renew it; run `databricks auth login` to re-authenticate",
+                    extra={"session_id": runner_primary_session_id()},
                 )
             return token
 
@@ -451,7 +454,10 @@ class _InitialAuthTokenFactory:
             if self._initial_token is None:
                 return False
             self._initial_token = None
-            _logger.info("host bootstrap bearer rejected; resolving runner-local auth")
+            _logger.info(
+                "host bootstrap bearer rejected; resolving runner-local auth",
+                extra={"session_id": runner_primary_session_id()},
+            )
             return True
 
 
@@ -530,7 +536,10 @@ def _make_auth_token_factory(
         else ""
     )
     if initial_token and resolved_server_url:
-        _logger.info("using host-provided bearer for runner bootstrap")
+        _logger.info(
+            "using host-provided bearer for runner bootstrap",
+            extra={"session_id": runner_primary_session_id()},
+        )
         return _InitialAuthTokenFactory(initial_token, resolved_server_url)
 
     from omnigent.inner.databricks_executor import (
@@ -1035,6 +1044,7 @@ def _run_parent_death_killer(
         "runner exiting: parent process died and graceful shutdown did not "
         "complete within %.1fs; forcing hard exit",
         grace_s,
+        extra={"session_id": runner_primary_session_id()},
     )
     # os._exit skips buffer flushing, so flush logs first for diagnosability.
     with contextlib.suppress(Exception):
@@ -1138,6 +1148,7 @@ async def _resolve_agent_spec_from_server(
         _logger.info(
             "spec_resolver: GET %s returned 404 for missing agent",
             path,
+            extra={"session_id": session_id},
         )
         return None
     if resp.status_code != 200:
@@ -1318,6 +1329,7 @@ def create_app(
         _logger.info(
             "Reaped %d orphaned terminal tmux server(s) from prior runs",
             _reaped_terminals,
+            extra={"session_id": runner_primary_session_id()},
         )
 
     # Reuse the tunnel binding token for runner-side request auth.
@@ -1355,9 +1367,14 @@ def create_app(
                     "runner MCP prewarm registered for %s (servers=%d)",
                     prewarm_path,
                     len(prewarm_spec.mcp_servers or []),
+                    extra={"session_id": runner_primary_session_id()},
                 )
             except Exception:
-                _logger.exception("runner MCP prewarm failed for %s", prewarm_path)
+                _logger.exception(
+                    "runner MCP prewarm failed for %s",
+                    prewarm_path,
+                    extra={"session_id": runner_primary_session_id()},
+                )
         # Native-pane idle reaper (#1349): reclaims idle native CLI panes.
         _pane_reaper = getattr(app.state, "native_pane_reaper", None)
         if _pane_reaper is not None:
@@ -1460,7 +1477,11 @@ async def _run_tunnel_from_env() -> None:
 
         telemetry.init("omni-runner")
     except Exception:  # noqa: BLE001 — best-effort; tracing failure must not crash the runner
-        _logger.debug("telemetry init failed in runner", exc_info=True)
+        _logger.debug(
+            "telemetry init failed in runner",
+            exc_info=True,
+            extra={"session_id": runner_primary_session_id()},
+        )
 
     # Reuse the tunnel's token factory for the app's httpx client so the
     # runner resolves Databricks auth once at boot, not twice.
@@ -1475,6 +1496,30 @@ async def _run_tunnel_from_env() -> None:
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     last_activity_at = loop.time()
+
+    # asyncio funnels unretrieved task exceptions and callback errors through
+    # the loop's exception handler. Those are not our own _logger callsites
+    # (e.g. a discarded ``ws.recv()`` task on a normal tunnel close), so this is
+    # the one place we can attribute them to the runner's session and keep them
+    # out of asyncio's default, untagged "Task exception was never retrieved".
+    from websockets.exceptions import ConnectionClosedOK
+
+    def _handle_loop_exception(
+        loop: asyncio.AbstractEventLoop,  # noqa: ARG001 — signature mandated by asyncio
+        context: dict[str, object],
+    ) -> None:
+        exc = context.get("exception")
+        message = context.get("message") or "unhandled asyncio exception"
+        extra = {"session_id": runner_primary_session_id()}
+        if isinstance(exc, asyncio.CancelledError | ConnectionClosedOK):
+            # Benign teardown — keep it quiet but still attributed.
+            _logger.debug("asyncio: %s", message, exc_info=exc, extra=extra)
+        elif isinstance(exc, BaseException):
+            _logger.error("asyncio: %s", message, exc_info=exc, extra=extra)
+        else:
+            _logger.error("asyncio: %s (context=%r)", message, context, extra=extra)
+
+    loop.set_exception_handler(_handle_loop_exception)
 
     def _mark_activity() -> None:
         """Record real runner work for the inactivity watchdog.
@@ -1558,7 +1603,11 @@ async def _run_tunnel_from_env() -> None:
                     )
                 )
         except Exception:  # noqa: BLE001 — optimization only; never block the tunnel
-            _logger.warning("direct-attach listener setup failed", exc_info=True)
+            _logger.warning(
+                "direct-attach listener setup failed",
+                exc_info=True,
+                extra={"session_id": runner_primary_session_id()},
+            )
             direct_attach_listener = None
     tunnel_task = asyncio.create_task(
         serve_tunnel(
@@ -1661,7 +1710,11 @@ async def _run_tunnel_from_env() -> None:
         # A crash unwinding through here is attributed by sys.excepthook with
         # its traceback, so only record the reason for an orderly shutdown.
         if sys.exc_info()[0] is None:
-            _logger.info("runner exiting: %s", exit_reason or "shutdown requested")
+            _logger.info(
+                "runner exiting: %s",
+                exit_reason or "shutdown requested",
+                extra={"session_id": runner_primary_session_id()},
+            )
         for task in wait_tasks:
             task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -1736,6 +1789,7 @@ def _install_signal_handlers(
                 "Signal handler registration failed; continuing without "
                 "graceful-shutdown signal handling",
                 exc_info=True,
+                extra={"session_id": runner_primary_session_id()},
             )
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -1785,6 +1839,7 @@ def _install_crash_logging() -> None:
                 exc_type.__name__,
                 exc,
                 exc_info=(exc_type, exc, traceback),
+                extra={"session_id": runner_primary_session_id()},
             )
         previous_hook(exc_type, exc, traceback)
 
@@ -1839,7 +1894,7 @@ def main() -> None:
             raise
         # A fatal server rejection is an expected, actionable exit — log the
         # reason but keep stderr to the concise message (no traceback).
-        _logger.error("runner exiting: %s", exc)
+        _logger.error("runner exiting: %s", exc, extra={"session_id": runner_primary_session_id()})
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
 

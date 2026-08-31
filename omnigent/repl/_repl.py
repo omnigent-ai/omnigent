@@ -68,6 +68,7 @@ from rich.console import RenderableType
 from rich.markup import escape
 from rich.text import Text
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.spec.types import SkillSpec
 
 if TYPE_CHECKING:
@@ -493,9 +494,8 @@ def _render_startup_banner_ansi(
         ``None`` for the minimal banner.
     :returns: ANSI-styled string ready to be written to stdout.
     """
-    from omnigent.cli_auth import is_workspace_hosted_url
-    from omnigent.conversation_browser import display_server_url
     from omnigent.inner.banner import BannerLine, startup_banner_strings
+    from omnigent.server_url import display_server_url, is_workspace_hosted_url
 
     remote = _is_remote_server_url(server_url)
     # User-facing form of the URL: a Databricks workspace-hosted server is
@@ -1891,12 +1891,12 @@ class _SessionsChatReplAdapter:
                     # online runners at create time and found none.
                     raise RuntimeError(
                         "This server has no online runner to run the turn. Start one "
-                        "against it with `omnigent host --server <url>` (or run the "
-                        "agent locally with `omnigent run <agent.yaml>`), then retry."
+                        f"against it with `{cli_invocation()} host --server <url>` (or run the "
+                        f"agent locally with `{cli_invocation()} run <agent.yaml>`), then retry."
                     )
                 raise RuntimeError(
                     "Sessions API dispatch requires a registered runner id. "
-                    "Start through `omnigent run <agent>` or pass --server so the CLI "
+                    f"Start through `{cli_invocation()} run <agent>` or pass --server so the CLI "
                     "can launch and bind a runner."
                 )
             if self._bound_runner_id == self._runner_id:
@@ -4513,7 +4513,7 @@ async def run_repl(
         #   - the server is a Databricks workspace mount — a workspace build
         #     reports no meaningful version string (its /api/version returns a
         #     placeholder like "source"), so showing it is noise.
-        from omnigent.cli_auth import is_workspace_hosted_url
+        from omnigent.server_url import is_workspace_hosted_url
 
         _show_version = _header is not None and not (
             server_url is not None and is_workspace_hosted_url(server_url)
@@ -4814,7 +4814,7 @@ async def _cmd_theme(
     host.output(_build_preview(selected.name))
 
 
-_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 _EFFORT_CLEAR_ALIASES = {"default", "off", "reset"}
 
 
@@ -4880,7 +4880,8 @@ async def _cmd_effort(
         host.output(
             Text.from_markup(
                 "  [bold red]Invalid effort: "
-                f"{value} · expected none, minimal, low, medium, high, xhigh, max, or default[/]"
+                f"{value} · expected none, minimal, low, medium, high, "
+                "xhigh, max, ultra, or default[/]"
             )
         )
         return
@@ -5024,7 +5025,8 @@ def _build_model_readout_lines(
         else:
             lines.append("Active:  None  ·  None")
             lines.append(
-                "no model configured — run `omnigent setup --no-internal-beta` to add one"
+                f"no model configured — run `{cli_invocation()} setup --no-internal-beta` "
+                "to add one"
             )
         lines.append("usage: /model <name> · /model default | off | reset to clear")
         return lines
@@ -5266,7 +5268,7 @@ async def _cmd_model(
         host.output(
             Text.from_markup(
                 f"  [{fmt.muted}]Active provider: {active_label}. To use {target_label}, run "
-                f"`omnigent setup --no-internal-beta` and select it as the "
+                f"`{cli_invocation()} setup --no-internal-beta` and select it as the "
                 f"default, then restart. "
                 f"(You can still change the model within {active_label}: /model <model-name>.)"
                 f"[/{fmt.muted}]"

@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Literal
 
 from cachetools import TTLCache
 
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
@@ -209,7 +210,10 @@ def _terminal_exit_diagnostics(
         try:
             raw_last_output = read_last_output()
         except Exception:
-            _logger.exception("Failed to read terminal pane diagnostics")
+            _logger.exception(
+                "Failed to read terminal pane diagnostics",
+                extra={"session_id": runner_primary_session_id()},
+            )
         else:
             if isinstance(raw_last_output, str):
                 last_output = _trim_terminal_exit_output(raw_last_output)
@@ -220,7 +224,10 @@ def _terminal_exit_diagnostics(
         try:
             raw_exit_status = read_exit_status()
         except Exception:
-            _logger.exception("Failed to read terminal exit status")
+            _logger.exception(
+                "Failed to read terminal exit status",
+                extra={"session_id": runner_primary_session_id()},
+            )
         else:
             if isinstance(raw_exit_status, int):
                 exit_status = raw_exit_status
@@ -527,6 +534,7 @@ class SessionResourceRegistry:
                 len(sessions),
                 len(pollers),
                 sessions,
+                extra={"session_id": runner_primary_session_id()},
             )
 
     def note_session_turn_started(self, session_id: str) -> None:
@@ -1065,7 +1073,10 @@ class SessionResourceRegistry:
         if self._terminal_registry is None:
             raise RuntimeError("Terminal registry not configured")
         if not getattr(instance, "running", False) or not await instance.is_alive():
-            await self._terminal_registry.close(session_id, terminal_name, session_key)
+            # Close by instance, not key — a successor may hold the key now.
+            await self._terminal_registry.close(
+                session_id, terminal_name, session_key, expected=instance
+            )
             raise RuntimeError(
                 f"terminal {terminal_name}:{session_key} is not running for session {session_id}"
             )
@@ -1393,6 +1404,7 @@ class SessionResourceRegistry:
             on_status=on_status,
             pane_pid_getter=instance.pane_pid_sync,
             session_id_getter=_session_id_getter,
+            omnigent_session_id=session_id,
         )
 
     async def _handle_terminal_exit(
@@ -1428,9 +1440,12 @@ class SessionResourceRegistry:
         # or never observed → boot failure) stays a failure.
         session_was_idle = self._take_session_status_memo(session_id) == "idle"
 
+        superseded_by: TerminalInstance | None = None
         if self._terminal_registry is not None:
             try:
-                await self._terminal_registry.close(session_id, terminal_name, session_key)
+                await self._terminal_registry.close(
+                    session_id, terminal_name, session_key, expected=instance
+                )
             except Exception:
                 _logger.exception(
                     "Error evicting exited terminal: session=%s terminal=%s:%s",
@@ -1438,9 +1453,20 @@ class SessionResourceRegistry:
                     terminal_name,
                     session_key,
                 )
+            else:
+                current = self._terminal_registry.get(session_id, terminal_name, session_key)
+                if current is not None and instance is not None and current is not instance:
+                    superseded_by = current
 
         publisher = self._terminal_exit_publisher
-        if publisher is not None:
+        if superseded_by is not None:
+            _logger.info(
+                "Skipping exit event for superseded terminal: session=%s terminal=%s:%s",
+                session_id,
+                terminal_name,
+                session_key,
+            )
+        elif publisher is not None:
             publisher(
                 TerminalExitEvent(
                     session_id=session_id,

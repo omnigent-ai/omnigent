@@ -7,6 +7,7 @@ from sqlalchemy import event, text
 
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import (
+    CompactionData,
     ErrorData,
     FunctionCallData,
     FunctionCallOutputData,
@@ -3471,6 +3472,54 @@ def test_fork_conversation_copies_items(
         assert fork_item.data == src_item.data
 
 
+def test_fork_remaps_compaction_boundary_to_copied_item(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A fork's compaction cursor must not keep an item ID from its source."""
+    source = conversation_store.create_conversation()
+    [boundary] = conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_001",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "old"}]),
+            )
+        ],
+    )
+    conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="compaction",
+                response_id="compact_001",
+                data=CompactionData(
+                    summary="The user said old.",
+                    last_item_id=boundary.id,
+                    token_count=6,
+                ),
+            )
+        ],
+    )
+    conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_002",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "recent"}]),
+            )
+        ],
+    )
+
+    fork = conversation_store.fork_conversation(source.id)
+    fork_items = conversation_store.list_items(fork.id).data
+    fork_compaction = next(item for item in fork_items if item.type == "compaction")
+    assert isinstance(fork_compaction.data, CompactionData)
+    assert fork_compaction.data.last_item_id != boundary.id
+    assert fork_compaction.data.last_item_id == fork_items[0].id
+
+
 def test_fork_of_sub_agent_is_top_level(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,
@@ -3559,6 +3608,72 @@ def test_fork_copies_terminal_launch_args_by_default(
     fetched = conversation_store.get_conversation(fork.id)
     assert fetched is not None
     assert fetched.terminal_launch_args == ["--permission-mode", "auto"]
+
+
+def test_fork_override_terminal_launch_args_supersedes_copy(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """An explicit launch-args override replaces the copied source args.
+
+    The fork dialog's permission-mode picker sends its own
+    ``terminal_launch_args``; the override must win over the same-agent copy,
+    and an empty list must clear the source's flags entirely.
+    """
+    source = conversation_store.create_conversation(
+        terminal_launch_args=["--permission-mode", "auto"],
+    )
+    picked = conversation_store.fork_conversation(
+        source.id,
+        override_terminal_launch_args=["--permission-mode", "plan"],
+        override_terminal_launch_args_set=True,
+    )
+    fetched = conversation_store.get_conversation(picked.id)
+    assert fetched is not None
+    assert fetched.terminal_launch_args == ["--permission-mode", "plan"]
+
+    cleared = conversation_store.fork_conversation(
+        source.id,
+        override_terminal_launch_args=[],
+        override_terminal_launch_args_set=True,
+    )
+    fetched_cleared = conversation_store.get_conversation(cleared.id)
+    assert fetched_cleared is not None
+    assert fetched_cleared.terminal_launch_args == []
+
+
+def test_fork_override_model_and_effort_supersede_inherit(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """An explicit model/effort override wins over the source's copied values,
+    and a cleared override (set-flag on, value None) resets to the agent
+    default even on a same-agent fork that would otherwise copy them."""
+    source = conversation_store.create_conversation()
+    conversation_store.update_conversation(
+        source.id, model_override="sonnet", reasoning_effort="low"
+    )
+
+    overridden = conversation_store.fork_conversation(
+        source.id,
+        override_model_override="opus",
+        override_model_override_set=True,
+        override_reasoning_effort="high",
+        override_reasoning_effort_set=True,
+    )
+    fetched = conversation_store.get_conversation(overridden.id)
+    assert fetched is not None
+    assert fetched.model_override == "opus"
+    assert fetched.reasoning_effort == "high"
+
+    cleared = conversation_store.fork_conversation(
+        source.id,
+        override_model_override=None,
+        override_model_override_set=True,
+    )
+    fetched_cleared = conversation_store.get_conversation(cleared.id)
+    assert fetched_cleared is not None
+    assert fetched_cleared.model_override is None
+    # Effort NOT overridden ⇒ same-agent fork still copies the source's value.
+    assert fetched_cleared.reasoning_effort == "low"
 
 
 def test_fork_drops_terminal_launch_args_when_switching_agent(
@@ -3742,6 +3857,40 @@ def test_fork_conversation_drops_instance_scoped_labels(
     # usage.
     assert fork.labels == {"omnigent.wrapper": "claude-code-native-ui"}, (
         f"Fork must drop instance-scoped labels, kept {fork.labels!r}"
+    )
+
+
+def test_fork_extra_labels_rearm_bypass_over_the_always_drop(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """``extra_labels`` stamps AFTER the drop, so a deliberate opt-in wins.
+
+    The source's own bypass label is always dropped (instance-scoped), so a
+    bypass-armed source can't silently re-arm its clone. But when the fork
+    dialog explicitly re-arms bypass, the route passes it via ``extra_labels``,
+    which the store applies last — the fork ends up armed even though the
+    source's identical label was dropped on the same fork.
+    """
+    agent_store.create(
+        agent_id="c1a2b3c4d5e6f7081920314253647586",
+        name="fork-bypass",
+        bundle_location="c1a2b3c4d5e6f7081920314253647586/fakehash",
+    )
+    source = conversation_store.create_conversation(agent_id="c1a2b3c4d5e6f7081920314253647586")
+    conversation_store.set_labels(source.id, {"omnigent.codex_native.bypass_sandbox": "1"})
+
+    # Same-agent fork WITHOUT the opt-in: the source's label is dropped.
+    plain = conversation_store.fork_conversation(source.id)
+    assert "omnigent.codex_native.bypass_sandbox" not in plain.labels
+
+    # WITH the opt-in via extra_labels: armed on the fork despite the drop.
+    armed = conversation_store.fork_conversation(
+        source.id,
+        extra_labels={"omnigent.codex_native.bypass_sandbox": "1"},
+    )
+    assert armed.labels.get("omnigent.codex_native.bypass_sandbox") == "1", (
+        f"extra_labels must re-arm bypass over the always-drop, got {armed.labels!r}"
     )
 
 
@@ -4882,6 +5031,37 @@ def test_append_reads_counter_not_max_scan(
     # Position 100 (counter), not 2 (max + 1) — proves the scan path is unused.
     assert _stored_positions(conversation_store, conv.id) == [0, 1, 100]
     assert _stored_next_position(conversation_store, conv.id) == 101
+
+
+def test_append_persists_batch_in_single_insert(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A multi-item append writes every item in one bulk INSERT, not one
+    statement per row — a per-row round-trip dominates import latency against a
+    remote managed Postgres, so guard against a regression to it."""
+    import re
+
+    conv = conversation_store.create_conversation()
+
+    statements: list[str] = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):  # type: ignore[no-untyped-def]
+        statements.append(statement)
+
+    # Attach after create_conversation so only the append's SQL is captured.
+    event.listen(conversation_store._conv_engine, "before_cursor_execute", _record)
+    try:
+        conversation_store.append(conv.id, [_user_message(f"m{i}") for i in range(10)])
+    finally:
+        event.remove(conversation_store._conv_engine, "before_cursor_execute", _record)
+
+    # The FTS mirror is a separate table (conversation_items_fts); the regex
+    # keeps it out by requiring the base table name to be followed by "(".
+    item_inserts = [
+        s for s in statements if re.search(r"insert into conversation_items\s*\(", s, re.I)
+    ]
+    assert len(item_inserts) == 1, item_inserts
+    assert _stored_positions(conversation_store, conv.id) == list(range(10))
 
 
 @pytest.mark.parametrize("preexisting", [0, 1, 3])

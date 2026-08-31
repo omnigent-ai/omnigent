@@ -16,7 +16,9 @@ import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import { setSessionHost } from "./sessionHost";
+import { parseBackgroundTasks } from "./sse";
 import type {
+  BackgroundTaskInfo,
   ModelUsage,
   NativeModelOption,
   NestedSessionItem,
@@ -128,6 +130,11 @@ interface SessionResponseWire {
    * has settled to ``"idle"``. Absent/0 when none are tracked.
    */
   background_task_count?: number | null;
+  /**
+   * Per-shell detail behind `background_task_count`, so a reload can restore
+   * it. Absent when none are tracked.
+   */
+  background_tasks?: BackgroundTaskInfo[] | null;
   created_at: number;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
@@ -138,6 +145,12 @@ interface SessionResponseWire {
   labels?: Record<string, string>;
   /** Canonical working directory; ``null`` when unbound. */
   workspace?: string | null;
+  /**
+   * Native-terminal CLI args the session launched with, e.g.
+   * ``["--permission-mode", "plan"]``. Records only the LAUNCH flags —
+   * a later mode switch is reflected in `labels`, not here.
+   */
+  terminal_launch_args?: string[] | null;
   /** Worktree branch; ``null`` when the session uses no worktree. */
   git_branch?: string | null;
   items?: SessionItem[];
@@ -301,10 +314,12 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     hostResumable: wire.host_resumable ?? false,
     status: wire.status,
     backgroundTaskCount: wire.background_task_count ?? undefined,
+    backgroundTasks: parseBackgroundTasks(wire.background_tasks),
     createdAt: wire.created_at,
     title: wire.title ?? null,
     labels: wire.labels,
     workspace: wire.workspace ?? null,
+    terminalLaunchArgs: wire.terminal_launch_args ?? null,
     gitBranch: wire.git_branch ?? null,
     items: wire.items ?? [],
     queuedItems: wire.queued_items,
@@ -478,6 +493,57 @@ export async function createSession(
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }
 
+/** Local coding harnesses whose transcripts can be imported. */
+export type ImportSource = "claude" | "codex" | "kimi" | "kiro" | "opencode" | "pi" | "qwen";
+
+/** A specific harness, or "all" to import from every supported harness at once. */
+export type ImportSourceSelector = ImportSource | "all";
+
+/** One freshly imported session, for linking to it in the UI. */
+export interface ImportedSessionRef {
+  id: string;
+  /** null when the session had no native title and nothing to synthesize from. */
+  title: string | null;
+}
+
+/** Result of a batch local import (`POST /v1/imports/local`). */
+export interface LocalImportResult {
+  imported: number;
+  alreadyImported: number;
+  failed: number;
+  sessions: ImportedSessionRef[];
+}
+
+/**
+ * Import the caller's most recent local transcripts via `POST /v1/imports/local`.
+ * The chosen host reads + normalizes its own transcripts over the tunnel (the
+ * transcripts live on that machine, not the server); already-imported sessions
+ * are skipped. `source` is a specific harness or "all" for every harness at once.
+ */
+export async function importLocalSessions(
+  hostId: string,
+  source: ImportSourceSelector,
+  limit: number,
+): Promise<LocalImportResult> {
+  const res = await authenticatedFetch("/v1/imports/local", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    body: JSON.stringify({ host_id: hostId, source, limit }),
+  });
+  const wire = await readJsonOrThrow<{
+    imported: number;
+    already_imported: number;
+    failed: number;
+    sessions: { session_id: string; title: string | null }[];
+  }>(res);
+  return {
+    imported: wire.imported,
+    alreadyImported: wire.already_imported,
+    failed: wire.failed,
+    sessions: wire.sessions.map((s) => ({ id: s.session_id, title: s.title })),
+  };
+}
+
 /**
  * Create a session with an inline agent bundle via multipart
  * `POST /v1/sessions`.
@@ -542,14 +608,36 @@ export async function createBundledSession(
  * @param upToResponseId - Optional truncation point, e.g. "resp_abc". When
  *   set, the fork copies history only up to and including that response
  *   ("fork from here"); omitted, the full history is copied.
+ * @param config - Optional run-config overrides from the fork dialog's
+ *   model / effort / permission-mode pickers. Each field is opt-in: a field
+ *   left `undefined` inherits the source (model settings carry within the
+ *   same provider family), while a sent field overrides it. The
+ *   permission-/approval-mode selector rides `terminalLaunchArgs` (e.g.
+ *   `["--permission-mode", "auto"]`); `[]` clears the source's launch args.
+ *   `codexBypassSandbox: true` (Codex only) arms the dangerous full-bypass on
+ *   the fork — sent only on an explicit, banner-gated pick.
  */
 export async function forkSession(
   sourceId: string,
   title?: string,
   agentId?: string,
   upToResponseId?: string,
+  config?: {
+    modelOverride?: string;
+    reasoningEffort?: string;
+    terminalLaunchArgs?: string[];
+    codexBypassSandbox?: boolean;
+  },
 ): Promise<Session> {
-  const body: { title?: string; agent_id?: string; up_to_response_id?: string } = {};
+  const body: {
+    title?: string;
+    agent_id?: string;
+    up_to_response_id?: string;
+    model_override?: string;
+    reasoning_effort?: string;
+    terminal_launch_args?: string[];
+    codex_bypass_sandbox?: boolean;
+  } = {};
   if (title !== undefined) {
     body.title = title;
   }
@@ -558,6 +646,20 @@ export async function forkSession(
   }
   if (upToResponseId !== undefined) {
     body.up_to_response_id = upToResponseId;
+  }
+  if (config?.modelOverride !== undefined) {
+    body.model_override = config.modelOverride;
+  }
+  if (config?.reasoningEffort !== undefined) {
+    body.reasoning_effort = config.reasoningEffort;
+  }
+  if (config?.terminalLaunchArgs !== undefined) {
+    body.terminal_launch_args = config.terminalLaunchArgs;
+  }
+  // Only send the dangerous bypass opt-in when explicitly true; omitting it
+  // otherwise keeps the request minimal and the server default (no bypass).
+  if (config?.codexBypassSandbox) {
+    body.codex_bypass_sandbox = true;
   }
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sourceId)}/fork`, {
     method: "POST",
@@ -683,6 +785,14 @@ export async function updateSession(
     reasoningEffort?: string | null;
     modelOverride?: string | null;
     codexPlanMode?: boolean;
+    /**
+     * Claude-native permission mode to switch a RUNNING session to, e.g.
+     * `"auto"`. Rejected by the server unless it's shift+tab-reachable
+     * (see `CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES`), and the PATCH
+     * fails if the live TUI didn't actually land on it — so a resolved
+     * promise means the mode really changed.
+     */
+    claudePermissionMode?: string;
     costControlModeOverride?: "on" | "off" | null;
     subagentRoutingOverride?: "on" | "off" | null;
     runnerId?: string;
@@ -699,6 +809,9 @@ export async function updateSession(
   }
   if (updates.codexPlanMode !== undefined) {
     body.collaboration_mode = updates.codexPlanMode ? "plan" : "default";
+  }
+  if (updates.claudePermissionMode !== undefined) {
+    body.permission_mode = updates.claudePermissionMode;
   }
   if ("costControlModeOverride" in updates) {
     body.cost_control_mode_override = updates.costControlModeOverride ?? null;

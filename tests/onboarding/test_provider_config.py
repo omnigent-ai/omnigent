@@ -44,6 +44,14 @@ from omnigent.onboarding.provider_config import (
         ("qwen", OPENAI_FAMILY),
         ("qwen-native", OPENAI_FAMILY),
         ("native-qwen", OPENAI_FAMILY),
+        # Antigravity SDK harness and aliases consume OpenAI family.
+        ("antigravity", OPENAI_FAMILY),
+        ("agy", OPENAI_FAMILY),
+        # Antigravity native CLI harness and aliases consume Gemini family.
+        ("antigravity-native", GEMINI_FAMILY),
+        ("native-antigravity", GEMINI_FAMILY),
+        ("agy-native", GEMINI_FAMILY),
+        ("native-agy", GEMINI_FAMILY),
         # An unknown harness has no family (caller falls back / shows nothing).
         ("some-unknown-harness", None),
     ],
@@ -504,11 +512,11 @@ def test_key_with_gemini_block_still_serves_gemini() -> None:
 
 
 def test_subscription_cannot_claim_pi_scope() -> None:
-    """Naming ``"pi"`` in a subscription's default scope fails loud.
+    """A claude/codex subscription cannot claim the pi scope.
 
     Both at parse time (a hand-edited config) and via set_default_provider
-    (the menu path) — a subscription can never drive pi, so persisting the
-    scope would wedge pi on an unusable credential.
+    (the menu path) — a claude/codex subscription can never drive pi, so
+    persisting the scope would wedge pi on an unusable credential.
     """
     raw = {"kind": "subscription", "cli": "claude", "default": ["pi"]}
     with pytest.raises(OmnigentError):
@@ -516,6 +524,33 @@ def test_subscription_cannot_claim_pi_scope() -> None:
     block = {"claude-subscription": {"kind": "subscription", "cli": "claude"}}
     with pytest.raises(OmnigentError):
         set_default_provider(block, "claude-subscription", PI_SURFACE)
+
+
+def test_pi_subscription_claims_pi_scope() -> None:
+    """A pi subscription (cli: pi) can default the pi surface.
+
+    ``kind="subscription", cli="pi"`` signals "use Pi's own native auth". It
+    may claim the pi scope, be set as the pi-surface default via
+    ``set_default_provider``, and be returned by ``default_provider_for_harness``.
+    """
+    raw = {"kind": "subscription", "cli": "pi", "default": "pi"}
+    providers = load_providers({"providers": {"pi-subscription": raw}})
+    entry = providers["pi-subscription"]
+    assert entry.kind == "subscription"
+    assert entry.cli == "pi"
+    assert PI_SURFACE in entry.default_families
+    # A pi subscription serves no model family directly.
+    assert ANTHROPIC_FAMILY not in entry.default_families
+    assert OPENAI_FAMILY not in entry.default_families
+    # default_provider_for_harness picks it up as the explicit pi default.
+    config = {"providers": {"pi-subscription": raw}}
+    assert default_provider_for_harness(config, "pi").name == "pi-subscription"
+    # set_default_provider accepts the pi scope (this was the bug:
+    # provider_families returned {} so the scope check rejected it).
+    block: dict[str, object] = {"pi-subscription": {"kind": "subscription", "cli": "pi"}}
+    result = set_default_provider(block, "pi-subscription", PI_SURFACE)
+    reparsed = load_providers({"providers": result})
+    assert PI_SURFACE in reparsed["pi-subscription"].default_families
 
 
 def test_set_default_provider_pi_scope_round_trips_and_moves() -> None:
@@ -577,19 +612,21 @@ def test_set_default_provider_pi_scope_round_trips_and_moves() -> None:
             },
             True,
         ),
-        # A CLI login is unusable outside its own CLI — never pi-capable.
+        # A claude/codex CLI login is unusable outside its own CLI — never pi-capable.
         ({"kind": "subscription", "cli": "claude"}, False),
+        # A pi subscription explicitly opts into Pi's own native auth — pi-capable.
+        ({"kind": "subscription", "cli": "pi"}, True),
     ],
 )
 def test_provider_families_pi_capability(raw: dict[str, object], expect_pi: bool) -> None:
     """``provider_families`` reports the pi scope only for pi-capable providers.
 
     pi-capable = an inline key/gateway/local declaring an anthropic or openai
-    family, or a databricks profile. A gemini-only key (Gemini surface only)
-    and a subscription (CLI-bound) are NOT pi-capable. This drives both the Pi
-    page's credential list (which rows appear) and set-default validation — a
-    regression in either direction lets the menu offer a credential pi can't
-    use, or hides one it can.
+    family, a databricks profile, or a pi subscription. A gemini-only key
+    (Gemini surface only) and a claude/codex subscription (CLI-bound) are NOT
+    pi-capable. This drives both the Pi page's credential list (which rows
+    appear) and set-default validation — a regression in either direction lets
+    the menu offer a credential pi can't use, or hides one it can.
     """
     entry = load_providers({"providers": {"p": raw}})["p"]
     assert (PI_SURFACE in provider_families(entry)) is expect_pi
@@ -671,13 +708,12 @@ def test_parse_cli_config_entry() -> None:
 @pytest.mark.parametrize(
     "body,message_fragment",
     [
-        # Only codex has config-file model providers; a claude analog would
-        # be a deliberate extension, not a silently-accepted value.
-        (
-            {"kind": "cli-config", "cli": "claude", "model_provider": "X"},
-            "requires cli: 'codex'",
-        ),
-        # The pin target is the entry's whole point — fail loud without it.
+        # A `cli: codex` cli-config is recognized, so a missing model_provider
+        # (its whole point) is a real error and must fail loud. (An unrecognized
+        # cli like `claude` is instead SKIPPED by load_providers for forward
+        # compatibility — see
+        # test_load_providers_skips_unrecognized_cli_config_cli_without_raising —
+        # so it is intentionally NOT in this "fails loud" list.)
         ({"kind": "cli-config", "cli": "codex"}, "'model_provider'"),
     ],
 )
@@ -889,3 +925,93 @@ def test_provider_credential_env_vars_empty_for_keychain_and_auth_command() -> N
         }
     }
     assert provider_credential_env_vars(config) == frozenset()
+
+
+def test_load_providers_skips_unrecognized_cli_config_cli_without_raising() -> None:
+    """A `cli-config` entry naming an unknown CLI is skipped, not fatal.
+
+    This is the version-skew guard: the first attempt persisted a
+    `cli: claude` cli-config entry that OLDER runners' parser rejected, and
+    because `load_providers` had no per-entry isolation, that single entry
+    raised and crashed turn setup for EVERY harness. Now such an entry is
+    dropped with a warning and the rest of the config still loads.
+    """
+    from omnigent.onboarding.provider_config import load_providers
+
+    config = {
+        "providers": {
+            # The poison pill a newer build might write / that the reverted
+            # build left in the field.
+            "claude-databricks": {
+                "kind": "cli-config",
+                "cli": "claude",
+                "display_name": "Databricks AI Gateway",
+                "default": True,
+            },
+            "openai": {
+                "kind": "key",
+                "openai": {"api_key": "sk-x", "base_url": "https://api.openai.com/v1"},
+            },
+        }
+    }
+    parsed = load_providers(config)  # must NOT raise
+    assert set(parsed) == {"openai"}
+    assert "claude-databricks" not in parsed
+
+
+def test_load_providers_still_accepts_codex_cli_config() -> None:
+    """The recognized `cli: codex` cli-config still parses (no over-broad skip)."""
+    from omnigent.onboarding.provider_config import load_providers
+
+    parsed = load_providers(
+        {
+            "providers": {
+                "codex-databricks": {
+                    "kind": "cli-config",
+                    "cli": "codex",
+                    "model_provider": "Databricks",
+                }
+            }
+        }
+    )
+    assert parsed["codex-databricks"].cli == "codex"
+    assert parsed["codex-databricks"].model_provider == "Databricks"
+
+
+def test_load_providers_still_raises_on_malformed_known_shape() -> None:
+    """Resilience is targeted: a malformed KNOWN shape still fails loud.
+
+    Skipping is only for an unrecognized cli-config CLI (a newer-build shape).
+    A recognized shape with a real error (a `key` provider configuring no
+    family) must still raise so user typos aren't silently dropped.
+    """
+    from omnigent.errors import OmnigentError
+    from omnigent.onboarding.provider_config import load_providers
+
+    with pytest.raises(OmnigentError):
+        load_providers({"providers": {"bad": {"kind": "key"}}})
+
+
+def test_claude_sdk_resolution_survives_stray_cli_config_claude_entry() -> None:
+    """The EXACT reverted failure: claude-sdk resolution over a poisoned config.
+
+    The revert stack was `_build_claude_sdk_spawn_env` →
+    `_resolve_provider_for_build` → `default_provider_for_harness("claude-sdk")`
+    → `load_providers` → raise. With resilience the stray entry is skipped, so
+    resolution returns the next usable anthropic default (or None) instead of
+    crashing every claude-sdk turn.
+    """
+    from omnigent.onboarding.provider_config import default_provider_for_harness
+
+    config = {
+        "providers": {
+            "claude-databricks": {"kind": "cli-config", "cli": "claude", "default": True},
+            "vendor-anthropic": {
+                "kind": "key",
+                "default": "anthropic",
+                "anthropic": {"api_key": "sk-x", "base_url": "https://api.anthropic.com"},
+            },
+        }
+    }
+    entry = default_provider_for_harness(config, "claude-sdk")  # must NOT raise
+    assert entry is not None and entry.name == "vendor-anthropic"

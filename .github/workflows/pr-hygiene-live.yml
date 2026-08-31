@@ -50,6 +50,9 @@ jobs:
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           ENFORCE: "true"
+          # Keep in step with the sweep in demo-check.yml: the two paths run the
+          # same script and must never reach different verdicts.
+          CLOSE_ENFORCE: "false"
           # One PR per run, so the sweep's LIMIT (which bounds a batch) does not apply.
           PR_NUMBER: ${{ github.event.pull_request.number }}
         with:

@@ -8,10 +8,11 @@ import logging
 import tempfile
 from pathlib import Path
 
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.runner.background_titles.service import (
     BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS,
-    BACKGROUND_TITLE_INSTRUCTIONS,
     BackgroundTitleContext,
+    build_background_title_instructions,
 )
 
 _logger = logging.getLogger("omnigent.runner.background_titles.codex_native")
@@ -88,9 +89,9 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             args.extend(("--config", override))
         if launch.model:
             args.extend(("--model", launch.model))
+        instructions = build_background_title_instructions(context.additional_instructions)
         args.append(
-            f"{BACKGROUND_TITLE_INSTRUCTIONS} Do not use tools.\n"
-            f"<user_message>\n{context.prompt}\n</user_message>"
+            f"{instructions} Do not use tools.\n<user_message>\n{context.prompt}\n</user_message>"
         )
         env = {**native_server.env, "CODEX_HOME": str(codex_home)}
         process = await asyncio.create_subprocess_exec(
@@ -119,6 +120,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
                 "background native Codex title failed returncode=%s detail=%s",
                 process.returncode,
                 detail[-1000:],
+                extra={"session_id": runner_primary_session_id()},
             )
             return None
         if not output_path.is_file():

@@ -200,6 +200,38 @@
     return url.toString();
   }
 
+  const WORKSPACE_API_PATHS = new Set([
+    "/api/2.0/omnigent",
+    // Databricks keeps this plural route for older clients.
+    "/api/2.0/omnigents",
+  ]);
+
+  /**
+   * Map a saved Databricks API URL to the browser-facing workspace mount.
+   *
+   * The CLI records the API mount, but Electron must load the SPA mount.
+   * Query and fragment state survive so workspace selectors and deep-link
+   * state are not lost. Non-workspace hosts and existing UI paths stay exact.
+   *
+   * @param {string} rawUrl A saved server URL (may be undefined/empty/garbage).
+   * @returns {string} The browser-facing URL, or the input unchanged.
+   */
+  function normalizeSavedServerUrl(rawUrl) {
+    if (typeof rawUrl !== "string" || rawUrl === "") return rawUrl;
+    let url;
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      return rawUrl;
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") return rawUrl;
+    if (!isDatabricksWorkspaceHost(url.hostname)) return rawUrl;
+    const pathWithoutTrailingSlash = url.pathname.replace(/\/+$/, "");
+    if (!WORKSPACE_API_PATHS.has(pathWithoutTrailingSlash)) return rawUrl;
+    url.pathname = WORKSPACE_UI_PATH;
+    return url.toString();
+  }
+
   /**
    * Probe timeout for Databricks workspace detection. Deliberately short: a
    * slow or unreachable host must not stall the connect flow — on timeout we
@@ -363,6 +395,7 @@
     normalizeRecentServers,
     serverDisplayLabel,
     isPlainHttpRemote,
+    normalizeSavedServerUrl,
     WORKSPACE_UI_PATH,
     WORKSPACE_PROBE_TIMEOUT_MS,
     databricksWorkspaceUiUrl,

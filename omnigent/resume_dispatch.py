@@ -31,6 +31,7 @@ import httpx
 from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY,
 )
+from omnigent.cli_invocation import cli_invocation
 from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.native_dispatch import resolve_hook_for_key
 
@@ -75,8 +76,8 @@ def run_resume(
     if target is None:
         if server is None:
             raise click.UsageError(
-                "`omnigent resume` (no id) requires `--server <url>`. "
-                "Pass a conversation id (`omnigent resume conv_...`) "
+                f"`{cli_invocation()} resume` (no id) requires `--server <url>`. "
+                f"Pass a conversation id (`{cli_invocation()} resume conv_...`) "
                 "to use the persistent local store.",
             )
         target = _pick_conversation_for_resume(server=server)
@@ -221,17 +222,20 @@ def _dispatch_by_runtime(
     """
     from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 
-    # Resolve the id the argument contains, then canonicalize to bare hex
-    # before any lookup: a paste drags punctuation along (trailing period,
-    # wrapping quotes or backticks), and none of it can ever be part of a
-    # valid id — so strip it and resume rather than erroring. A malformed
-    # id would otherwise surface as a raw StatementError traceback from
-    # the local store's Uuid16 bind, and downstream consumers key
-    # sessions on the bare spelling.
-    try:
-        target = uuid_to_bytes(target.strip(_PASTE_PUNCTUATION)).hex()
-    except InvalidUuidError as exc:
-        raise click.ClickException("Invalid session id.") from exc
+    # Paste punctuation (trailing period, wrapping quotes/backticks) is never
+    # part of an id, so strip it. Only the local path binds the id to the sqlite
+    # store's Uuid16 column, so it must be a real uuid — reject a malformed one
+    # loudly rather than surfacing a raw StatementError. The remote server owns
+    # its id space (a managed deployment keys sessions on non-uuid ids) and
+    # validates the id itself, so forward it untouched, like the runner and SDK.
+    stripped = target.strip(_PASTE_PUNCTUATION)
+    if server is None:
+        try:
+            target = uuid_to_bytes(stripped).hex()
+        except InvalidUuidError as exc:
+            raise click.ClickException("Invalid session id.") from exc
+    else:
+        target = stripped
 
     if server is not None:
         wrapper = _read_wrapper_label_remote(server=server, conv_id=target)
@@ -244,7 +248,7 @@ def _dispatch_by_runtime(
         raise click.ClickException(
             f"Conversation {target!r} is not a terminal-native session "
             f"(wrapper={wrapper!r}). To resume it, run "
-            f"`omnigent run --resume {target} <agent.yaml> --server "
+            f"`{cli_invocation()} run --resume {target} <agent.yaml> --server "
             f"{server}`. The agentless form is tracked separately.",
         )
 
@@ -258,7 +262,7 @@ def _dispatch_by_runtime(
     raise click.ClickException(
         f"Conversation {target!r} is not a terminal-native session "
         f"(wrapper={wrapper!r}). To resume it, run "
-        f"`omnigent run --resume {target} <agent.yaml>`. "
+        f"`{cli_invocation()} run --resume {target} <agent.yaml>`. "
         "The agentless form is tracked separately.",
     )
 

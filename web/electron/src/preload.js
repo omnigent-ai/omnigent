@@ -70,11 +70,9 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     return () => ipcRenderer.removeListener("omnigent:notification-activated", listener);
   },
   /**
-   * Subscribe to deep-link navigations. When the user clicks an
-   * `omnigent://.../c/<id>` link for a server this window is already on, the
-   * main process sends the in-app path here so the SPA routes to it in-place
-   * (no reload) — same path shape as onNotificationActivated. Returns an
-   * unsubscribe function.
+   * Subscribe to in-app navigation from the main process. Native menu actions
+   * and same-server deep links send a basename-less path so the SPA can route
+   * in place without reloading. Returns an unsubscribe function.
    * @param {(path: string) => void} callback
    * @returns {() => void}
    */
@@ -89,14 +87,13 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     return () => ipcRenderer.removeListener("omnigent:open-path", listener);
   },
   /**
-   * Title-bar server picker data: the window's current server origin and the
-   * recently-connected server URLs (most recent first). Resolves null on
-   * pages that aren't a connected server.
+   * Server picker data: the current origin plus organization-provided and
+   * recently-connected server URLs. Resolves null off a connected server.
    */
   getServerPicker: () => ipcRenderer.invoke("omnigent:get-server-picker"),
   /**
-   * Re-point this window to a previously-connected server URL (must come
-   * from getServerPicker's recentServers list; anything else rejects).
+   * Re-point this window to a URL returned by getServerPicker (anything else
+   * rejects in the main process).
    */
   switchServer: (url) => ipcRenderer.invoke("omnigent:switch-server", url),
   /** Return this window to the bundled "connect to server" setup page. */
@@ -161,6 +158,17 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
       const listener = (_event, status) => callback(bannerSafe(status));
       ipcRenderer.on("omnigent:update-status", listener);
       return () => ipcRenderer.removeListener("omnigent:update-status", listener);
+    },
+    /** Current shell-owned update-overlay card height in CSS pixels. */
+    getOverlayHeight: () => ipcRenderer.invoke("omnigent:get-update-overlay-height"),
+    /** Subscribe to overlay height changes; returns an unsubscribe function. */
+    onOverlayHeight: (callback) => {
+      const listener = (_event, height) => {
+        const normalized = Math.max(0, Math.round(Number(height) || 0));
+        callback(normalized);
+      };
+      ipcRenderer.on("omnigent:update-overlay-height", listener);
+      return () => ipcRenderer.removeListener("omnigent:update-overlay-height", listener);
     },
   },
   /**
@@ -411,6 +419,8 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
    * @param {string} url
    */
   setServerUrl: (url) => ipcRenderer.invoke("omnigent:set-server-url", url),
+  /** Organization-provided server URLs from macOS Managed Preferences. */
+  getManagedServers: () => ipcRenderer.invoke("omnigent:get-managed-servers"),
   /** Recently-connected server URLs, most recent first. */
   getRecentServers: () => ipcRenderer.invoke("omnigent:get-recent-servers"),
   /** Copy text from the bundled setup page to the native clipboard. */

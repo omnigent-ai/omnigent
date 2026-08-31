@@ -177,6 +177,7 @@ export function ReconnectSessionDialog({
           <Tabs
             defaultValue={showCommand ? "reconnect" : "clone"}
             className="flex min-h-0 flex-1 flex-col gap-4"
+            componentId="reconnect.tabs"
           >
             <TabsList className="w-full">
               <TabsTrigger value="reconnect" data-testid="reconnect-session-tab-reconnect">

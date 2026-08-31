@@ -37,6 +37,7 @@ from omnigent.harness_plugins import (
 from omnigent.runner.routing import RunnerRouter
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.schemas import (
+    BackgroundTaskInfo,
     McpServerStartup,
     SandboxStatus,
     ServerStreamEvent,
@@ -129,6 +130,9 @@ _EXTERNAL_SESSION_USAGE_TYPE: str = "external_session_usage"
 _EXTERNAL_MODEL_CHANGE_TYPE: str = "external_model_change"
 
 
+_EXTERNAL_PERMISSION_MODE_CHANGE_TYPE: str = "external_permission_mode_change"
+
+
 _EXTERNAL_SESSION_TITLE_TYPE: str = "external_session_title"
 
 
@@ -139,6 +143,21 @@ _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE: str = "external_reasoning_effort_change"
 
 
 _EXTERNAL_SUBAGENT_START_TYPE: str = "external_subagent_start"
+
+
+_EXTERNAL_ACP_SUBAGENT_START_TYPE: str = "external_acp_subagent_start"
+
+
+# Stable id an ACP agent gave the sub-agent it spawned (Devin's ``agentId``);
+# the idempotency key for the child row. Unlike the native families there is no
+# ``omnigent.wrapper`` value: an ACP sub-agent runs the SAME harness as its
+# parent, so leaving the wrapper unset lets the child's harness resolve to the
+# parent's (e.g. ``devin``) and the UI label it accordingly, instead of
+# mislabeling it as another vendor.
+_ACP_SUBAGENT_ID_LABEL_KEY = "omnigent.acp.subagent_id"
+
+
+_ACP_SUBAGENT_DESCRIPTION_LABEL_KEY = "omnigent.acp.subagent_description"
 
 
 _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE = "claude-code-native-ui-subagent"
@@ -187,6 +206,21 @@ _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE: str = "external_codex_approval_mode_c
 
 
 _CODEX_NATIVE_COLLABORATION_MODES: frozenset[str] = frozenset({"default", "plan"})
+
+
+# Current permission mode of a live claude-native session.
+# ``terminal_launch_args`` records only the launch mode, so this label is what
+# the web UI reads back after a reload.
+_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY = "omnigent.claude_native.permission_mode"
+
+
+# Permission modes switchable on a running session — the ones Claude
+# Code's shift+tab cycle can reach. Mirrors
+# ``claude_native_bridge.CYCLEABLE_PERMISSION_MODES``; ``dontAsk`` and
+# ``bypassPermissions`` are launch-only and rejected on PATCH.
+_CLAUDE_NATIVE_PERMISSION_MODES: frozenset[str] = frozenset(
+    {"default", "acceptEdits", "plan", "auto"}
+)
 
 
 _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
@@ -419,10 +453,12 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_MCP_STARTUP_TYPE,
     _EXTERNAL_MODEL_CHANGE_TYPE,
     _EXTERNAL_MODEL_OPTIONS_TYPE,
+    _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
     _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
     _EXTERNAL_SESSION_TITLE_TYPE,
     _EXTERNAL_SESSION_TODOS_TYPE,
     _EXTERNAL_SUBAGENT_START_TYPE,
+    _EXTERNAL_ACP_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
     _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
@@ -443,6 +479,12 @@ _session_active_response_cache: dict[str, str] = {}
 
 
 _session_background_task_count_cache: dict[str, int] = {}
+
+
+# Per-shell detail behind the tally above, kept sticky in lockstep with it (see
+# ``_publish_status``) so a reload/reconnect can restore it. Absent when the
+# count cache is absent, or when a runner reported only the count with no detail.
+_session_background_tasks_cache: dict[str, list[BackgroundTaskInfo]] = {}
 
 
 _read_last_seen: dict[str, dict[str, int]] = {}
@@ -500,6 +542,12 @@ _session_mcp_startup_cache: dict[str, dict[str, McpServerStartup]] = {}
 
 
 _runner_skills_cache: dict[str, list[SkillSummary]] = {}
+
+
+# Sessions whose cached skills need a re-fetch but should keep serving until it
+# lands. A browser reload asks for one, and dropping the entry outright would
+# empty the composer's slash-command menu for the reload that requested it.
+_runner_skills_stale: set[str] = set()
 
 
 _runner_skills_inflight: dict[str, asyncio.Task[None]] = {}
@@ -797,6 +845,8 @@ __all__ = [
     "_CLAUDE_NATIVE_MESSAGE_TIMEOUT_S",
     "_CLAUDE_NATIVE_MODEL",
     "_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S",
+    "_CLAUDE_NATIVE_PERMISSION_MODES",
+    "_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY",
     "_CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS",
     "_CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY",
     "_CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",
@@ -842,6 +892,7 @@ __all__ = [
     "_EXTERNAL_MODEL_OPTIONS_TYPE",
     "_EXTERNAL_OUTPUT_REASONING_DELTA_TYPE",
     "_EXTERNAL_OUTPUT_TEXT_DELTA_TYPE",
+    "_EXTERNAL_PERMISSION_MODE_CHANGE_TYPE",
     "_EXTERNAL_REASONING_EFFORT_CHANGE_TYPE",
     "_EXTERNAL_SESSION_INTERRUPTED_TYPE",
     "_EXTERNAL_SESSION_STATUS_TYPE",
@@ -934,10 +985,12 @@ __all__ = [
     "_runner_relay_tasks",
     "_runner_skills_cache",
     "_runner_skills_inflight",
+    "_runner_skills_stale",
     "_server_host_registry",
     "_server_runner_router",
     "_session_active_response_cache",
     "_session_background_task_count_cache",
+    "_session_background_tasks_cache",
     "_session_mcp_startup_cache",
     "_session_sandbox_status_cache",
     "_session_status_cache",

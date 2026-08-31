@@ -196,6 +196,29 @@ def enqueue_compact(bridge_dir: Path, custom_instructions: str | None = None) ->
     return compact_id
 
 
+def enqueue_thinking_level_change(bridge_dir: Path, level: str) -> str:
+    """Queue a UI-originated thinking-level switch for the resident Pi extension.
+
+    The extension consumes this inbox payload and calls Pi's
+    ``setThinkingLevel``, taking effect immediately without a restart.
+
+    :param bridge_dir: Native Pi bridge directory.
+    :param level: Pi thinking level, e.g. ``"high"`` or ``"off"``. Must be in
+        Pi vocabulary — translate canonical ``"none"`` to ``"off"`` and
+        ``"ultra"`` to ``"max"`` before calling.
+    :returns: Opaque change id.
+    """
+    change_id = f"thinking_level_change_{uuid.uuid4().hex}"
+    payload: _JsonObject = {
+        "id": change_id,
+        "type": "thinking_level_change",
+        "thinkingLevel": level,
+        "created_at": time.time(),
+    }
+    _enqueue_payload(bridge_dir, change_id, payload)
+    return change_id
+
+
 def enqueue_model_change(bridge_dir: Path, model: str) -> str:
     """
     Queue a UI-originated model switch for the resident Pi extension.

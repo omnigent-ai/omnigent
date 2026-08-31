@@ -774,7 +774,8 @@ class CopilotExecutor(Executor):
             final_event = send_task.result()
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 — the SDK turn failed mid-stream
+        except Exception as exc:
+            logger.exception("copilot-sdk turn failed mid-stream")
             await self.close_session(session_key)
             yield ExecutorError(message=f"copilot-sdk turn failed: {exc}", retryable=True)
             return

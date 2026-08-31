@@ -50,6 +50,8 @@ class ScheduledTaskStore(ABC):
         *,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
+        permission_mode: str | None = None,
+        max_cost_usd: float | None = None,
         workspace: str | None = None,
         host_id: str | None = None,
         state: str = "active",
@@ -68,6 +70,9 @@ class ScheduledTaskStore(ABC):
         :param timezone: IANA timezone the trigger is evaluated in.
         :param model_override: Optional LLM model override.
         :param reasoning_effort: Optional reasoning-effort hint.
+        :param permission_mode: Optional native-harness permission mode
+            (Claude Code), e.g. ``"acceptEdits"``.
+        :param max_cost_usd: Optional per-firing cost budget in USD.
         :param workspace: Runner start path (source repo / working dir).
         :param host_id: The connected host to pin the run to.
         :param state: Lifecycle state — ``active``/``paused``/``deleted``.
@@ -128,9 +133,12 @@ class ScheduledTaskStore(ABC):
         name: str | None = None,
         prompt: str | None = None,
         rrule: str | None = None,
+        agent_id: str | None = None,
         timezone: str | None = None,
-        model_override: str | None = None,
-        reasoning_effort: str | None = None,
+        model_override: str | None = _UNSET,
+        reasoning_effort: str | None = _UNSET,
+        permission_mode: str | None = _UNSET,
+        max_cost_usd: float | None = _UNSET,
         workspace: str | None = None,
         host_id: str | None = _UNSET,
         state: str | None = None,
@@ -140,14 +148,22 @@ class ScheduledTaskStore(ABC):
         """
         Update mutable fields of a task.
 
-        Most parameters use ``None`` to mean "leave unchanged". For ``host_id``
-        and ``last_run_conversation_id``, the sentinel default means "not
-        provided / leave unchanged"; passing ``None`` explicitly sets the column
-        to NULL (e.g. to clear a host binding or to null out the last-run
-        conversation after it is deleted).
+        Most parameters use ``None`` to mean "leave unchanged". For the per-task
+        overrides (``model_override``, ``reasoning_effort``,
+        ``permission_mode``), ``host_id``, ``max_cost_usd``, and
+        ``last_run_conversation_id``, the sentinel default means "not provided /
+        leave unchanged"; passing ``None`` explicitly sets the column to NULL —
+        so resetting an override to the agent default actually clears it (e.g.
+        turning a set ``bypassPermissions`` back off), and clearing a host
+        binding or nulling out a deleted last-run conversation.
 
         Passing ``rrule`` updates the recurring trigger; ``None``
         leaves it unchanged.
+
+        Passing ``agent_id`` rebinds the task to a different agent, which
+        switches the harness its future firings run. The fire path reads
+        ``agent_id`` fresh on every firing and each firing owns its own
+        conversation, so past runs keep the agent they actually ran.
 
         Returns ``None`` if the task does not exist.
 
