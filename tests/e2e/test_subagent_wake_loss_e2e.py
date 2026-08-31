@@ -211,6 +211,10 @@ class _WakeLossStack:
                 ):
                     return
             except httpx.HTTPError:
+                # Expected while the stack is still booting or mid-restart;
+                # fall through to the paced poll below and retry until the
+                # deadline. NOT `continue`: that would skip the sleep and
+                # busy-spin against the half-up server.
                 pass
             time.sleep(0.25)
         server_tail = self.server_log.read_text()[-3000:] if self.server_log.exists() else ""
