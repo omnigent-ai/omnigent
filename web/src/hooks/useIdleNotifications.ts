@@ -8,10 +8,8 @@
 //   * a new elicitation — `pending_elicitations_count` increased (the agent
 //     is asking the user for input)
 //
-// Neither cue fires for an archived session, nor counts toward the badge (see
-// idleTransitions). A "needs response" cue fires once per session until the
-// user views it: the reported pending count dips to 0 whenever the runner
-// reads offline, so one outstanding prompt would re-notify on every dip.
+// Neither cue fires for an archived session, nor counts toward the badge
+// (see idleTransitions) — archiving means "stop showing me this".
 //
 // A turn-end is DEFERRED by a short settle window. Agents that work in steps
 // emit a `running` -> `idle` edge per step and then resume, so each step would
@@ -156,9 +154,6 @@ export function useIdleNotifications(activeConversationId?: string): void {
   // then reporting back) into one beep. Cleared when the user views the session
   // or it drops off the list, so a later finish can notify again.
   const notifiedSessions = useRef<Set<string>>(new Set());
-  // Sessions with an outstanding "needs response" cue the user hasn't viewed.
-  // Cleared alongside `notifiedSessions`, so a flapping count stays quiet.
-  const notifiedElicitations = useRef<Set<string>>(new Set());
 
   useLazyPermissionRequest();
 
@@ -315,17 +310,14 @@ export function useIdleNotifications(activeConversationId?: string): void {
       }
     }
 
-    // Clear the "already notified" marks for a session the user is now viewing
+    // Clear the "already beeped" mark for a session the user is now viewing
     // (they've dealt with it) or that dropped off the list, so a later finish
-    // or prompt is allowed to notify again.
+    // is allowed to beep again.
     const presentIds = new Set(conversations.map((c) => c.id));
-    const dealtWith = (id: string) =>
-      !presentIds.has(id) || (windowFocused && id === activeConversationId);
     for (const id of notifiedSessions.current) {
-      if (dealtWith(id)) notifiedSessions.current.delete(id);
-    }
-    for (const id of notifiedElicitations.current) {
-      if (dealtWith(id)) notifiedElicitations.current.delete(id);
+      if (!presentIds.has(id) || (windowFocused && id === activeConversationId)) {
+        notifiedSessions.current.delete(id);
+      }
     }
 
     // A session is "actively viewed" — and thus suppressed — only when the
@@ -372,8 +364,6 @@ export function useIdleNotifications(activeConversationId?: string): void {
         // Same offline-runner guard: a prompt on a dead-runner session can't be
         // acted on and is almost always stale reconciliation.
         if (conversation.runner_online === false) continue;
-        // A re-reported count is the same prompt flapping, not a new question.
-        if (notifiedElicitations.current.has(conversation.id)) continue;
         // "Needs response" is surfaced immediately. Drop any deferred turn-end
         // cue for this session — it's awaiting input, not quietly finishing.
         const pending = timers.get(conversation.id);
@@ -381,7 +371,6 @@ export function useIdleNotifications(activeConversationId?: string): void {
           clearTimeout(pending);
           timers.delete(conversation.id);
         }
-        notifiedElicitations.current.add(conversation.id);
         notify(conversation, ELICITATION_BODY, navigate);
       }
     }

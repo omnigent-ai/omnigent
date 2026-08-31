@@ -435,68 +435,6 @@ describe("useIdleNotifications archived sessions", () => {
   });
 });
 
-describe("useIdleNotifications elicitation re-notification dedup", () => {
-  it("does not re-notify when a pending count flaps back up on the same prompt", () => {
-    // The runner going offline zeroes the pending count and coming back
-    // restores it, so one approval looks like a fresh 0 -> 1 every flap.
-    setConversations([{ ...conv("a", "running", 0), runner_online: true }]);
-    const { rerender } = renderHook(() => useIdleNotifications());
-
-    setConversations([{ ...conv("a", "running", 1), runner_online: true }]);
-    rerender();
-    expect(showMock).toHaveBeenCalledOnce();
-    showMock.mockClear();
-
-    // Runner drops (count zeroed), then returns with the prompt still parked.
-    setConversations([{ ...conv("a", "running", 0), runner_online: false }]);
-    rerender();
-    setConversations([{ ...conv("a", "running", 1), runner_online: true }]);
-    rerender();
-    expect(showMock).not.toHaveBeenCalled();
-  });
-
-  it("does not re-notify when a resolved prompt is briefly re-reported", () => {
-    // The persisted cross-replica count mirror can lag a resolve.
-    setConversations([{ ...conv("a", "running", 0), runner_online: true }]);
-    const { rerender } = renderHook(() => useIdleNotifications());
-
-    setConversations([{ ...conv("a", "running", 1), runner_online: true }]);
-    rerender();
-    showMock.mockClear();
-
-    // Approved (count 0), then the stale mirror reads 1 again.
-    setConversations([{ ...conv("a", "running", 0), runner_online: true }]);
-    rerender();
-    setConversations([{ ...conv("a", "running", 1), runner_online: true }]);
-    rerender();
-    expect(showMock).not.toHaveBeenCalled();
-  });
-
-  it("notifies a new prompt after the user has viewed the session", () => {
-    setConversations([conv("a", "running", 0)]);
-    const { rerender } = renderHook(() => useIdleNotifications("a"));
-    setConversations([conv("a", "running", 1)]);
-    rerender();
-    expect(showMock).toHaveBeenCalledOnce();
-    showMock.mockClear();
-
-    // User views 'a' (focused + active) and answers -> mark cleared.
-    act(() => {
-      window.dispatchEvent(new Event("focus"));
-    });
-    setConversations([conv("a", "running", 0)]);
-    rerender();
-
-    // They step away; the agent raises a genuinely new prompt -> notify again.
-    act(() => {
-      window.dispatchEvent(new Event("blur"));
-    });
-    setConversations([conv("a", "running", 1)]);
-    rerender();
-    expect(showMock).toHaveBeenCalledOnce();
-  });
-});
-
 describe("useIdleNotifications active-view suppression", () => {
   it("does NOT notify a turn end for the conversation actively viewed (focused + active)", () => {
     setWindowFocused(true);
