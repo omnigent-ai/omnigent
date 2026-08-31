@@ -72,11 +72,10 @@ interface NativeShellApi {
    */
   onNotificationActivated?: (callback: (path: string) => void) => () => void;
   /**
-   * Subscribe to deep-link navigations from the desktop shell. When the user
-   * clicks an `omnigent://.../c/<id>` link for a server this window is already
-   * on, the main process sends the in-app path here so the SPA routes to it
-   * in-place (no reload). Same path shape as onNotificationActivated. Absent
-   * on older shells / outside Electron; returns an unsubscribe.
+   * Subscribe to in-app navigation from the desktop shell. Native menu actions
+   * and same-server deep links send a basename-less path so the SPA can route
+   * in place without reloading. Absent on older shells / outside Electron;
+   * returns an unsubscribe.
    */
   onOpenPath?: (callback: (path: string) => void) => () => void;
   /**
@@ -512,16 +511,14 @@ export function onNativeNotificationActivated(callback: (path: string) => void):
 }
 
 /**
- * Subscribe to deep-link navigations from the desktop shell. When the user
- * clicks an `omnigent://.../c/<id>` link for a server this window is already
- * on, the main process sends the in-app path here so the SPA can route to it
- * in-place (no reload) — reusing the same router `navigate` a notification
- * click uses. The path is basename-less (`/c/<id>`); the embedded build's
- * `basenamedRouting` rebases it under the mount.
+ * Subscribe to in-app navigation from the desktop shell. Native menu actions
+ * and same-server deep links send basename-less paths such as `/settings` and
+ * `/c/<id>` so the SPA can route in place without reloading. The embedded
+ * build's `basenamedRouting` rebases them under the mount.
  *
  * Returns an unsubscribe function. A no-op (returning a no-op unsubscribe)
- * outside the Electron shell or under a shell too old to support deep-link
- * routing, so callers can register it unconditionally.
+ * outside the Electron shell or under a shell too old to support in-app
+ * navigation, so callers can register it unconditionally.
  */
 export function onOpenPath(callback: (path: string) => void): () => void {
   const native = nativeApi();

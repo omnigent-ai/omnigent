@@ -161,8 +161,11 @@ function App({ basename }: AppProps = {}) {
               sidebar stays put — entering settings only swaps the card's
               content (the section nav) and the main area. The active section
               is carried in the URL (/settings/<section>); bare /settings
-              defaults to Appearance. */}
-          <Route path={`${prefix}/settings`} element={<SettingsPage />} />
+              redirects to the canonical General section. */}
+          <Route
+            path={`${prefix}/settings`}
+            element={<Navigate to={`${prefix}/settings/general`} replace />}
+          />
           <Route path={`${prefix}/settings/:section`} element={<SettingsPage />} />
           {/* Members / Policies are now settings sub-categories
               (/settings/members, /settings/policies) so entering them

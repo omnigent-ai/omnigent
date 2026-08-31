@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -155,10 +156,39 @@ def _coerce_int(value: object) -> int:
     return int(cast(str | bytes | bytearray | SupportsInt | SupportsIndex, value))
 
 
-# Binary appearance is cheap to probe, so new CLI installs surface quickly.
+# Quick-probe cadence. Binary appearance itself is not cheap to probe on
+# every wakeup: a shutil.which miss walks the whole PATH, and on hosts where
+# each stat is expensive (long PATH, endpoint-security filter drivers) a 5s
+# cadence over several uninstalled harnesses burns a sustained CPU core while
+# the daemon is idle — hence the TTL verdict cache below.
 HARNESS_READINESS_REFRESH_INTERVAL_S = 5.0
 # Auth changes and removals need the full, potentially expensive readiness map.
 HARNESS_READINESS_FULL_REFRESH_INTERVAL_S = 60.0
+# How long a quick-probe verdict stays cached. New-CLI installs surface within
+# this window (a minute of badge staleness is invisible); the quick probe's
+# 5s cadence re-uses the cached verdict for free. Matches the full-refresh
+# cadence so quick-probe staleness never exceeds a full-refresh window.
+HARNESS_READINESS_QUICK_PROBE_CACHE_TTL_S = 60.0
+_quick_probe_cache: dict[str, float] = {}
+_quick_probe_cached: dict[str, bool] = {}
+
+
+def _invalidate_quick_probe_cache() -> None:
+    """Drop cached quick-probe verdicts (tests; installs refilled within TTL)."""
+    _quick_probe_cache.clear()
+    _quick_probe_cached.clear()
+
+
+def _harness_now_configured(harness: str) -> bool:
+    """harness_is_configured through the quick-probe TTL cache."""
+    now = time.monotonic()
+    stamp = _quick_probe_cache.get(harness)
+    if stamp is not None and now - stamp < HARNESS_READINESS_QUICK_PROBE_CACHE_TTL_S:
+        return _quick_probe_cached[harness]
+    verdict = harness_is_configured(harness)
+    _quick_probe_cache[harness] = now
+    _quick_probe_cached[harness] = verdict
+    return verdict
 
 
 def _unavailable_harness_became_ready(
@@ -167,7 +197,7 @@ def _unavailable_harness_became_ready(
     """Detect newly available binaries; auth changes wait for the full refresh."""
     return any(
         (availability is False or availability == HARNESS_BINARY_MISSING)
-        and harness_is_configured(harness)
+        and _harness_now_configured(harness)
         for harness, availability in previous.items()
     )
 
@@ -639,6 +669,12 @@ _RETRYABLE_UPGRADE_STATUSES: frozenset[int] = frozenset({408, 429})
 # HAS connected keeps retrying indefinitely, so a deploy restart never
 # kills a live host with running sessions.
 _LOGIN_REDIRECT_FATAL_ATTEMPTS = 3
+
+# Max chars of a rejected-upgrade response body surfaced in the operator-facing
+# error. The server's own refusals (_refuse_upgrade) are short plain text, but
+# an edge/proxy can answer with a multi-KB HTML error page; cap it so a legit
+# refusal reason stays readable and a stray HTML blob can't flood the terminal.
+_UPGRADE_BODY_MAX_CHARS = 300
 
 
 class HostConnectError(Exception):
@@ -1337,13 +1373,29 @@ class HostProcess:
                     flush=True,
                 )
             return None
-        return self._classify_http_status(exc.response.status_code)
+        # Carry the upgrade response's body through so a refusal that names its
+        # own cause (the server sends one via _refuse_upgrade — e.g. a malformed
+        # host id, or an edge/proxy 400) surfaces that text verbatim instead of a
+        # guessed, status-only message. Best-effort decode; a bare close has none.
+        raw_body = getattr(exc.response, "body", b"") or b""
+        # Collapse whitespace to one line and cap the length: the body is
+        # interpolated verbatim into the operator-facing error, and an edge/proxy
+        # refusal can be a multi-KB HTML page rather than the server's short
+        # plain-text reason.
+        body = " ".join(raw_body.decode("utf-8", "replace").split())
+        if len(body) > _UPGRADE_BODY_MAX_CHARS:
+            body = body[:_UPGRADE_BODY_MAX_CHARS] + "…"
+        return self._classify_http_status(exc.response.status_code, body)
 
-    def _classify_http_status(self, status: int) -> HostConnectError | None:
+    def _classify_http_status(self, status: int, body: str = "") -> HostConnectError | None:
         """Map a rejected-upgrade HTTP status to a fatal error, or ``None``.
 
         :param status: HTTP status on the failed WS upgrade response, e.g.
             ``403``.
+        :param body: The response body the server sent with the refusal, if any
+            (decoded, stripped). When present it is the authoritative,
+            reason-specific explanation, so it is surfaced verbatim for statuses
+            without their own client-actionable guidance.
         :returns: A :class:`HostConnectError` for a permanent 4xx, or
             ``None`` for a transient status (retryable 4xx in
             :data:`_RETRYABLE_UPGRADE_STATUSES`, or any non-4xx such as a
@@ -1434,6 +1486,12 @@ class HostProcess:
                 "the existing host registration, or reset this machine's host "
                 "id, then retry. " + self._login_fix_hint()
             )
+        # Any other permanent 4xx (e.g. a 400 for a malformed host id, or an
+        # edge/proxy rejection): the server's own body is the authoritative
+        # reason, so surface it verbatim rather than guessing. Fall back to a
+        # generic message only when the refusal carried no body.
+        if body:
+            return HostConnectError(f"Connection refused (HTTP {status}): {body}")
         return HostConnectError(
             f"Connection refused (HTTP {status}): the server rejected the host "
             "tunnel request. This is a permanent error; retrying will not help. "
@@ -3819,7 +3877,15 @@ def run_host_process(
     from omnigent.host.identity import CONFIG_PATH
 
     path = config_path or CONFIG_PATH
-    identity = load_or_create_host_identity(path)
+    try:
+        identity = load_or_create_host_identity(path)
+    except ValueError as exc:
+        print(
+            f"\n✗ Could not start host.\n{exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(HOST_FATAL_EXIT_CODE) from None
     if not path.exists():
         print(f"Auto-generated {path} ({identity.host_id}, name: {identity.name})")
     # User-facing: the display form (workspace /omnigent URL with ?o= when

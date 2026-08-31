@@ -126,7 +126,10 @@ export function TranscriptScrollbar({
         onPointerUp={endDrag}
         onPointerCancel={endDrag}
         className={cn(
-          "pointer-events-auto absolute right-0.5 w-1.5 cursor-default rounded-full",
+          // touch-none: the drag is pointer-event driven, so the browser's
+          // native touch-pan arbitration must not steal the gesture (it fires
+          // pointercancel right after pointerdown and the drag dies).
+          "pointer-events-auto absolute right-0.5 w-1.5 cursor-default touch-none rounded-full",
           "bg-foreground/20 transition-[width,background-color] duration-150",
           "hover:w-2.5 hover:bg-foreground/40",
           dragging && "w-2.5 bg-foreground/50",

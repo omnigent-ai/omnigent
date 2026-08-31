@@ -354,6 +354,11 @@ def _ensure_conversation_tables(engine: Engine) -> None:
         ensure_fts_table(engine)
 
 
+def _set_alembic_database_url(config: Config, db_uri: str) -> None:
+    """Store a database URL safely in Alembic's ConfigParser-backed config."""
+    config.set_main_option("sqlalchemy.url", db_uri.replace("%", "%%"))
+
+
 def _build_alembic_config(db_uri: str) -> Config:
     """
     Build an Alembic ``Config`` pointed at our migrations directory.
@@ -373,7 +378,7 @@ def _build_alembic_config(db_uri: str) -> Config:
 
     alembic_ini = Path(__file__).parent / "alembic.ini"
     config = Config(str(alembic_ini))
-    config.set_main_option("sqlalchemy.url", db_uri)
+    _set_alembic_database_url(config, db_uri)
     config.set_main_option("script_location", str(Path(__file__).parent / "migrations"))
     return config
 

@@ -32,6 +32,10 @@ import {
 } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  composerSendShortcutKeys,
+  KeyboardShortcutTooltipContent,
+} from "@/components/KeyboardShortcut";
 import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
 import { useNavigate, useParams } from "@/lib/routing";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
@@ -120,6 +124,8 @@ import {
   nativeCodingAgentForSubagentWrapper,
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
+import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import { isComposerSendKey, readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
   buildMentionPreamble,
   detectMentionAt,
@@ -220,6 +226,7 @@ import { SessionImage } from "@/components/SessionImage";
 import { GoalControl, GoalStatusPill, useGoalState, type Goal } from "@/components/goal";
 import { copyText } from "@/lib/clipboard";
 import { showToast } from "@/components/ui/toast";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import {
   ConnectionIndicator,
@@ -643,16 +650,24 @@ export function shouldShowAuthorBadge(
  * turn immediately instead of stalling behind that background work. (The
  * "Working…" spinner and sidebar dot still treat ``waiting`` as active — those
  * reflect background activity, which is a separate concern from send gating.)
+ *
+ * ``alwaysSteer`` (a per-device preference) drops the busy gate entirely: a
+ * follow-up sent mid-turn is POSTed now — steered into the running turn —
+ * instead of parking in the queue strip. The ``hasQueued`` guard still holds:
+ * once this conversation has a queued message it must drain in order, or a
+ * direct send could overtake a still-queued earlier one on an idle flicker.
  */
 export function shouldQueueSend(
   conversationId: string | null,
   status: "idle" | "streaming",
   sessionStatus: SessionStatus,
   queuedMessages: QueuedMessage[],
+  alwaysSteer = false,
 ): boolean {
   if (conversationId === null) return false;
-  const isBusy = status === "streaming" || sessionStatus === "running";
   const hasQueued = queuedMessages.some((m) => m.conversationId === conversationId);
+  if (alwaysSteer) return hasQueued;
+  const isBusy = status === "streaming" || sessionStatus === "running";
   return isBusy || hasQueued;
 }
 
@@ -1238,10 +1253,18 @@ export function ChatPage() {
       return;
     }
     // Queue instead of POSTing now (see shouldQueueSend). enqueueMessage flushes
-    // FIFO immediately when genuinely idle, so nothing stalls.
+    // FIFO immediately when genuinely idle, so nothing stalls. With the
+    // always-steer preference on, a mid-turn follow-up skips the queue and is
+    // POSTed now instead.
     const chat = useChatStore.getState();
     if (
-      shouldQueueSend(chat.conversationId, chat.status, chat.sessionStatus, chat.queuedMessages)
+      shouldQueueSend(
+        chat.conversationId,
+        chat.status,
+        chat.sessionStatus,
+        chat.queuedMessages,
+        readAlwaysSteer(),
+      )
     ) {
       chat.enqueueMessage(text, files);
       return;
@@ -4284,6 +4307,7 @@ export function Composer({
   wrapperLabel = null,
 }: ComposerProps) {
   const [value, setValue] = useState("");
+  const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   const [files, setFiles] = useState<File[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
@@ -4436,17 +4460,11 @@ export function Composer({
   // On mobile, programmatic focus immediately summons the software keyboard.
   // Keep desktop's fast-type affordance, but let mobile users explicitly tap
   // the composer when switching back from Terminal or changing sessions.
-  const [isMobile, setIsMobile] = useState(
-    () => typeof window !== "undefined" && window.matchMedia("(max-width: 767px)").matches,
-  );
+  const isMobile = useIsMobileViewport();
+  const isCoarsePointer = useIsCoarsePointer();
+  const preventsKeyboardSubmit = isMobile || isCoarsePointer;
   const isMobileRef = useRef(isMobile);
   isMobileRef.current = isMobile;
-  useEffect(() => {
-    const mq = window.matchMedia("(max-width: 767px)");
-    const handler = (e: MediaQueryListEvent) => setIsMobile(e.matches);
-    mq.addEventListener("change", handler);
-    return () => mq.removeEventListener("change", handler);
-  }, []);
 
   useEffect(() => {
     const restored = conversationId ? getSessionDraft(conversationId) : undefined;
@@ -5017,10 +5035,32 @@ export function Composer({
       return;
     }
 
+    // Touch-primary newline behavior outranks autocomplete and desktop submit
+    // preferences. Leave the event untouched so the textarea inserts it.
+    if (preventsKeyboardSubmit && e.key === "Enter") {
+      return;
+    }
+
+    const shouldSubmitFromKeyboard = isComposerSendKey(
+      {
+        key: e.key,
+        shiftKey: e.shiftKey,
+        metaKey: e.metaKey,
+        ctrlKey: e.ctrlKey,
+        altKey: e.altKey,
+        isComposing: e.nativeEvent.isComposing,
+      },
+      submitWithModEnter,
+      preventsKeyboardSubmit,
+    );
+    // Plain Enter still completes an open suggestion. In Mod+Enter mode, the
+    // explicit send chord bypasses suggestions so the modifier has one meaning.
+    const shouldPreferSendOverCompletion = submitWithModEnter && shouldSubmitFromKeyboard;
+
     // "@"-mention menu navigation (shared useMentionBrowser) — mutually
     // exclusive with the slash menu below (a mention token can't also read as a
     // "/"-command). Takes priority over history recall and submission.
-    if (handleMentionKeyDown(e)) return;
+    if (!shouldPreferSendOverCompletion && handleMentionKeyDown(e)) return;
 
     // When the suggestions menu is open, ArrowUp/Down navigate it and
     // Enter/Tab complete the highlighted item. These take priority over
@@ -5036,7 +5076,11 @@ export function Composer({
         setMenuIndex((i) => (i <= 0 ? menuMatches.length - 1 : i - 1));
         return;
       }
-      if ((e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !isMobile)) && menuIndex >= 0) {
+      if (
+        !shouldPreferSendOverCompletion &&
+        (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !isMobile)) &&
+        menuIndex >= 0
+      ) {
         e.preventDefault();
         applyMenuSelection(menuMatches[menuIndex]!);
         return;
@@ -5050,9 +5094,9 @@ export function Composer({
       }
     }
 
-    // Enter sends; Shift+Enter inserts a newline. On mobile, Enter inserts a
-    // newline (no Shift available on-screen) and Send must be tapped instead.
-    if (e.key === "Enter" && !e.shiftKey && !isMobile && !e.nativeEvent.isComposing) {
+    // Mobile Enter behavior takes precedence over this desktop preference:
+    // software-keyboard Enter inserts a newline and Send remains an explicit tap.
+    if (shouldSubmitFromKeyboard) {
       e.preventDefault();
       // The mention menu is briefly closed while its listing loads (see
       // ``mentionListingPending``); swallow Enter so the in-progress "@dir/"
@@ -5545,35 +5589,47 @@ export function Composer({
                 openNonce={pickerOpenNonce}
               />
             </div>
-            <Button
-              type="submit"
-              size="icon"
-              variant={showInterruptButton ? "destructive" : "default"}
-              // Send button fades more decisively when there's no draft —
-              // overrides the base 50% disabled-opacity so the affordance
-              // reads as "waiting for input", not "almost active".
-              className={cn(
-                "size-9 shrink-0 rounded-lg md:size-8",
-                !showInterruptButton &&
-                  "hover:bg-primary/90 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
-              )}
-              // Interrupt stays live during a pending elicitation —
-              // cancelling the turn is the other legitimate way out.
-              disabled={
-                showInterruptButton
-                  ? isReadOnly
-                  : !hasDraft || disabled || isReadOnly || hasPendingElicitation
-              }
-              title={showInterruptButton ? "Interrupt" : "Send"}
-              aria-label={showInterruptButton ? "Interrupt" : "Send"}
-            >
-              {showInterruptButton ? (
-                <SquareIcon className="size-4 fill-current" />
-              ) : (
-                <ArrowUpIcon className="size-4" viewBox="4 4 16 16" />
-              )}
-              <span className="sr-only">{showInterruptButton ? "Interrupt" : "Send"}</span>
-            </Button>
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="submit"
+                    size="icon"
+                    variant={showInterruptButton ? "destructive" : "default"}
+                    // Send button fades more decisively when there's no draft —
+                    // overrides the base 50% disabled-opacity so the affordance
+                    // reads as "waiting for input", not "almost active".
+                    className={cn(
+                      "size-9 shrink-0 rounded-lg md:size-8",
+                      !showInterruptButton &&
+                        "hover:bg-primary/90 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
+                    )}
+                    // Interrupt stays live during a pending elicitation —
+                    // cancelling the turn is the other legitimate way out.
+                    disabled={
+                      showInterruptButton
+                        ? isReadOnly
+                        : !hasDraft || disabled || isReadOnly || hasPendingElicitation
+                    }
+                    title={showInterruptButton ? "Interrupt" : undefined}
+                    aria-label={showInterruptButton ? "Interrupt" : "Send"}
+                  >
+                    {showInterruptButton ? (
+                      <SquareIcon className="size-4 fill-current" />
+                    ) : (
+                      <ArrowUpIcon className="size-4" viewBox="4 4 16 16" />
+                    )}
+                    <span className="sr-only">{showInterruptButton ? "Interrupt" : "Send"}</span>
+                  </Button>
+                </TooltipTrigger>
+                {!showInterruptButton && !preventsKeyboardSubmit && (
+                  <KeyboardShortcutTooltipContent
+                    label="Send"
+                    keys={composerSendShortcutKeys(submitWithModEnter)}
+                  />
+                )}
+              </Tooltip>
+            </TooltipProvider>
           </div>
         </div>
       </div>

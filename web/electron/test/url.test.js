@@ -12,6 +12,7 @@ const {
   normalizeRecentServers,
   serverDisplayLabel,
   isPlainHttpRemote,
+  normalizeSavedServerUrl,
   databricksWorkspaceUiUrl,
   expandDatabricksWorkspaceUrl,
   WORKSPACE_UI_PATH,
@@ -165,6 +166,59 @@ describe("isPlainHttpRemote", () => {
     assert.equal(isPlainHttpRemote("https://example.databricks.com"), false);
     assert.equal(isPlainHttpRemote(""), false);
     assert.equal(isPlainHttpRemote("ht tp://nope"), false);
+  });
+});
+
+describe("normalizeSavedServerUrl", () => {
+  it("maps the current Databricks API mount to the UI mount", () => {
+    assert.equal(
+      normalizeSavedServerUrl("https://ws.cloud.databricks.com/api/2.0/omnigent"),
+      "https://ws.cloud.databricks.com/omnigent",
+    );
+  });
+
+  it("maps the legacy plural API mount to the current UI mount", () => {
+    assert.equal(
+      normalizeSavedServerUrl("https://ws.azuredatabricks.net/api/2.0/omnigents"),
+      "https://ws.azuredatabricks.net/omnigent",
+    );
+  });
+
+  it("handles trailing slashes while preserving port, query, and fragment", () => {
+    assert.equal(
+      normalizeSavedServerUrl(
+        "https://ws.cloud.databricks.com:8443/api/2.0/omnigent/?o=123#conversation",
+      ),
+      "https://ws.cloud.databricks.com:8443/omnigent?o=123#conversation",
+    );
+  });
+
+  it("leaves workspace roots and current or legacy UI mounts exact", () => {
+    for (const url of [
+      "https://ws.cloud.databricks.com",
+      "https://ws.cloud.databricks.com/",
+      "https://ws.cloud.databricks.com/omnigent?o=123#state",
+      "https://ws.cloud.databricks.com/ml/omnigents",
+    ]) {
+      assert.equal(normalizeSavedServerUrl(url), url);
+    }
+  });
+
+  it("does not rewrite matching paths on non-workspace hosts or nested paths", () => {
+    for (const url of [
+      "https://example.com/api/2.0/omnigent",
+      "https://databricks.com.example.org/api/2.0/omnigent",
+      "https://ws.cloud.databricks.com/prefix/api/2.0/omnigent",
+      "ftp://ws.cloud.databricks.com/api/2.0/omnigent",
+    ]) {
+      assert.equal(normalizeSavedServerUrl(url), url);
+    }
+  });
+
+  it("returns empty/undefined/invalid input unchanged", () => {
+    assert.equal(normalizeSavedServerUrl(""), "");
+    assert.equal(normalizeSavedServerUrl(undefined), undefined);
+    assert.equal(normalizeSavedServerUrl("not a url"), "not a url");
   });
 });
 

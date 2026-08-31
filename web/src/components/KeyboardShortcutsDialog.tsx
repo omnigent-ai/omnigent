@@ -9,8 +9,16 @@
 // (a window keydown for ⌘/Ctrl+/, plus a custom event so a menu entry can open
 // it without prop-drilling). Mount it once near the app shell.
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState } from "react";
 
+import {
+  ALT_KEY,
+  composerNewLineShortcutKeys,
+  composerSendShortcutKeys,
+  ENTER_KEY,
+  Kbd,
+  MOD_KEY,
+} from "@/components/KeyboardShortcut";
 import {
   Dialog,
   DialogContent,
@@ -18,6 +26,9 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { isNativeShell } from "@/lib/nativeBridge";
 
 // Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
@@ -30,19 +41,7 @@ export function openKeyboardShortcuts(): void {
   window.dispatchEvent(new Event(KEYBOARD_SHORTCUTS_EVENT));
 }
 
-// Platform-aware modifier glyphs. macOS shows ⌘/⌥; elsewhere Ctrl/Alt — the
-// same split the underlying handlers use (`metaKey || ctrlKey`).
-const IS_MAC =
-  typeof navigator !== "undefined" &&
-  /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent || "");
-
-/** Modifier label shown in menu hints (⌘ on macOS, Ctrl elsewhere). */
-export const MOD_KEY = IS_MAC ? "⌘" : "Ctrl";
-
 // Glyphs match the in-app tooltips (e.g. UserMessageNav's "⌘⌥↑").
-const ENTER = "↵";
-const SHIFT = "⇧";
-const ALT = IS_MAC ? "⌥" : "Alt";
 const UP = "↑";
 const DOWN = "↓";
 
@@ -74,12 +73,10 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
     title: "In chats",
     items: [
-      { label: "Send message", keys: [ENTER] },
-      { label: "New line in message", keys: [SHIFT, ENTER] },
       { label: "Recall previous prompt", keys: [UP] },
       { label: "Recall next prompt", keys: [DOWN] },
-      { label: "Accept approval prompt", keys: [MOD_KEY, ENTER] },
-      { label: "Toggle voice dictation", keys: [MOD_KEY, ALT, "V"] },
+      { label: "Accept approval prompt", keys: [MOD_KEY, ENTER_KEY] },
+      { label: "Toggle voice dictation", keys: [MOD_KEY, ALT_KEY, "V"] },
       { label: "Stop response", keys: ["Esc"] },
     ],
   },
@@ -93,8 +90,8 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
     title: "View",
     items: [
-      { label: "Toggle conversations sidebar", keys: [MOD_KEY, ALT, "["] },
-      { label: "Toggle workspace sidebar", keys: [MOD_KEY, ALT, "]"] },
+      { label: "Toggle conversations sidebar", keys: [MOD_KEY, ALT_KEY, "["] },
+      { label: "Toggle workspace sidebar", keys: [MOD_KEY, ALT_KEY, "]"] },
     ],
   },
   {
@@ -115,25 +112,35 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
 function pinnedSessionShortcut(native: boolean): Shortcut {
   return {
     label: "Jump to pinned session (1–10)",
-    keys: native ? [MOD_KEY, "1…0"] : [MOD_KEY, ALT, "1…0"],
+    keys: native ? [MOD_KEY, "1…0"] : [MOD_KEY, ALT_KEY, "1…0"],
   };
 }
 
-/** Shortcut groups for the current runtime — the pinned-jump chord differs by shell. */
-function shortcutGroupsFor(native: boolean): ShortcutGroup[] {
-  return SHORTCUT_GROUPS.map((group) =>
-    group.title === "Navigation"
-      ? { ...group, items: [...group.items, pinnedSessionShortcut(native)] }
-      : group,
-  );
-}
-
-function Kbd({ children }: { children: ReactNode }) {
-  return (
-    <kbd className="inline-flex h-6 min-w-6 items-center justify-center rounded-md border border-border bg-muted px-1.5 font-sans text-sm font-medium text-muted-foreground">
-      {children}
-    </kbd>
-  );
+/** Shortcut groups for the current runtime and composer preference. */
+function shortcutGroupsFor(
+  native: boolean,
+  submitWithModEnter: boolean,
+  preventsKeyboardSubmit: boolean,
+): ShortcutGroup[] {
+  return SHORTCUT_GROUPS.map((group) => {
+    if (group.title === "In chats" && !preventsKeyboardSubmit) {
+      return {
+        ...group,
+        items: [
+          { label: "Send message", keys: composerSendShortcutKeys(submitWithModEnter) },
+          {
+            label: "New line in message",
+            keys: composerNewLineShortcutKeys(submitWithModEnter),
+          },
+          ...group.items,
+        ],
+      };
+    }
+    if (group.title === "Navigation") {
+      return { ...group, items: [...group.items, pinnedSessionShortcut(native)] };
+    }
+    return group;
+  });
 }
 
 /**
@@ -143,7 +150,14 @@ function Kbd({ children }: { children: ReactNode }) {
  */
 export function KeyboardShortcutsList() {
   // Feature-based, stable per session; computed at render so tests can vary it.
-  const groups = shortcutGroupsFor(isNativeShell());
+  const isMobileViewport = useIsMobileViewport();
+  const isCoarsePointer = useIsCoarsePointer();
+  const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
+  const groups = shortcutGroupsFor(
+    isNativeShell(),
+    readSubmitWithModEnter(),
+    preventsKeyboardSubmit,
+  );
   return (
     <>
       {groups.map((group) => (

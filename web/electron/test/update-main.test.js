@@ -252,15 +252,19 @@ function hasDebugMenu(menu) {
   return menu.template.some((item) => item.label === "Debug");
 }
 
-describe("new session menu action", () => {
-  it("routes Cmd/Ctrl+N to the current window without replacing the New Window action", (t) => {
+describe("in-app navigation menu actions", () => {
+  it("routes Settings and New Session through the focused connected window", (t) => {
     const harness = loadMainHarness();
     t.after(harness.cleanup);
 
     harness.api.buildMenu();
     const menu = harness.calls.setApplicationMenu.at(-1);
+    const settingsItem = findMenuItem(menu, "open_settings");
     const newSessionItem = findMenuItem(menu, "new_session");
     const newWindowItem = findMenuItem(menu, "new_window");
+
+    settingsItem.click();
+    assert.deepEqual(harness.calls.sent, [{ channel: "omnigent:open-path", payload: "/settings" }]);
 
     assert.equal(newSessionItem.label, "New Session");
     assert.equal(newSessionItem.accelerator, "CmdOrCtrl+N");
@@ -268,7 +272,10 @@ describe("new session menu action", () => {
 
     newSessionItem.click();
 
-    assert.deepEqual(harness.calls.sent, [{ channel: "omnigent:open-path", payload: "/" }]);
+    assert.deepEqual(harness.calls.sent.at(-1), {
+      channel: "omnigent:open-path",
+      payload: "/",
+    });
   });
 });
 

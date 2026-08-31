@@ -47,8 +47,10 @@ adds native niceties:
   the badge.
 - **The standard native menu** (App / Edit / View / Window / Help) built from
   Electron's menu roles, so the usual text-editing shortcuts — Cmd/Ctrl-A,
-  C, V, X, Z — work inside the webview's text fields. Our custom actions —
-  **New Window**, **New Window on Different Server…**, and
+  C, V, X, Z — work inside the webview's text fields. **Settings…** uses the
+  native `Cmd+,` accelerator on macOS (`Ctrl+,` elsewhere) and routes the
+  focused connected window through the SPA without reloading it. Our other
+  custom actions — **New Window**, **New Window on Different Server…**, and
   **Change Server…** — live in a dedicated **Server** submenu. On macOS a
   **Notifications** submenu turns the notification sound on/off (**Play
   Notification Sound**, **off by default** — the user opts in) and picks which
