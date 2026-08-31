@@ -36,6 +36,9 @@ const DEFAULT_CAP = 10;
  * server — two windows connected to different servers could carry the same
  * conversationId and would otherwise share a cookie jar.
  *
+ * `conversationId` is interpolated raw and assumed to be the server's opaque
+ * `conv_*` token; encode it (or switch delimiters) if that ever loosens.
+ *
  * @param {string} scope Registry-unique namespace (one per shell window).
  * @param {string} conversationId
  * @returns {string}
@@ -44,8 +47,9 @@ function agentPartition(scope, conversationId) {
   return `omnigent-agent-${scope}-${conversationId}`;
 }
 
-// Monotonic fallback so two registries created in the same millisecond still
-// get distinct default scopes.
+// Monotonic per-process counter: each registry (shell window) gets a distinct
+// default partition scope. In-memory partitions never outlive the process, so
+// no cross-run uniqueness is needed.
 let registrySeq = 0;
 
 function createBrowserViewRegistry({
@@ -59,7 +63,7 @@ function createBrowserViewRegistry({
   cap = DEFAULT_CAP,
   // Partition namespace for this registry's views — see agentPartition.
   // Injectable so tests can pin it; defaults to a per-instance unique value.
-  partitionScope = `w${++registrySeq}-${Date.now().toString(36)}`,
+  partitionScope = `w${++registrySeq}`,
 } = {}) {
   const entries = new Map(); // conversationId -> BrowserViewEntry
   let activeConversationId = null;
