@@ -5281,7 +5281,13 @@ def create_runner_app(
         registry = resource_registry.terminal_registry
         instance = registry.get(conv_id, "codex", "main") if registry is not None else None
         if instance is None or not instance.running:
-            return Response(status_code=204)
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_compact_failed",
+                    "detail": "Codex terminal is not running; reconnect first.",
+                },
+            )
 
         socket_path = str(instance.socket_path)
         target = instance.tmux_target
@@ -5305,7 +5311,13 @@ def create_runner_app(
         server = _AUTO_OPENCODE_SERVERS.get(conv_id)
         state = read_bridge_state(bridge_dir_for_bridge_id(conv_id))
         if server is None or state is None or not state.opencode_session_id:
-            return Response(status_code=204)
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "opencode_native_compact_failed",
+                    "detail": "OpenCode session is not active; reconnect first.",
+                },
+            )
         client = server.client()
         try:
             session = await client.get_session(state.opencode_session_id)
@@ -5314,7 +5326,13 @@ def create_runner_app(
                 session, messages, state.model_override
             )
             if not provider_id or not model_id:
-                return Response(status_code=204)
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "opencode_native_compact_failed",
+                        "detail": "Could not resolve a compaction model; try switching the model.",
+                    },
+                )
             await client.summarize(
                 state.opencode_session_id, provider_id=provider_id, model_id=model_id
             )
@@ -6436,8 +6454,8 @@ def create_runner_app(
         try:
             await _run_turn_bg_setup_and_stream(msg_body, conv)
         except _ContextWindowOverflow:
-            # The streaming phase handles reactive compaction itself; re-raise so
-            # its handler is never shadowed by the generic except below.
+            # Re-raise so the streaming-phase handler (which publishes the
+            # error event) is never shadowed by the generic except below.
             raise
         except asyncio.CancelledError as exc:
             _logger.error(
