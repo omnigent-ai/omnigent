@@ -374,6 +374,7 @@ class ConversationStore(ABC):
         git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
         conversation_id: str | None = None,
+        project_id: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation. Generates a unique
