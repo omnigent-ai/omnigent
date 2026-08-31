@@ -32,6 +32,10 @@ import {
 } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  composerSendShortcutKeys,
+  KeyboardShortcutTooltipContent,
+} from "@/components/KeyboardShortcut";
 import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
 import { useNavigate, useParams } from "@/lib/routing";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
@@ -121,6 +125,7 @@ import {
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import { isComposerSendKey, readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
   buildMentionPreamble,
   detectMentionAt,
@@ -221,6 +226,7 @@ import { SessionImage } from "@/components/SessionImage";
 import { GoalControl, GoalStatusPill, useGoalState, type Goal } from "@/components/goal";
 import { copyText } from "@/lib/clipboard";
 import { showToast } from "@/components/ui/toast";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import {
   ConnectionIndicator,
@@ -4301,6 +4307,7 @@ export function Composer({
   wrapperLabel = null,
 }: ComposerProps) {
   const [value, setValue] = useState("");
+  const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   const [files, setFiles] = useState<File[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
@@ -4453,17 +4460,11 @@ export function Composer({
   // On mobile, programmatic focus immediately summons the software keyboard.
   // Keep desktop's fast-type affordance, but let mobile users explicitly tap
   // the composer when switching back from Terminal or changing sessions.
-  const [isMobile, setIsMobile] = useState(
-    () => typeof window !== "undefined" && window.matchMedia("(max-width: 767px)").matches,
-  );
+  const isMobile = useIsMobileViewport();
+  const isCoarsePointer = useIsCoarsePointer();
+  const preventsKeyboardSubmit = isMobile || isCoarsePointer;
   const isMobileRef = useRef(isMobile);
   isMobileRef.current = isMobile;
-  useEffect(() => {
-    const mq = window.matchMedia("(max-width: 767px)");
-    const handler = (e: MediaQueryListEvent) => setIsMobile(e.matches);
-    mq.addEventListener("change", handler);
-    return () => mq.removeEventListener("change", handler);
-  }, []);
 
   useEffect(() => {
     const restored = conversationId ? getSessionDraft(conversationId) : undefined;
@@ -5034,10 +5035,32 @@ export function Composer({
       return;
     }
 
+    // Touch-primary newline behavior outranks autocomplete and desktop submit
+    // preferences. Leave the event untouched so the textarea inserts it.
+    if (preventsKeyboardSubmit && e.key === "Enter") {
+      return;
+    }
+
+    const shouldSubmitFromKeyboard = isComposerSendKey(
+      {
+        key: e.key,
+        shiftKey: e.shiftKey,
+        metaKey: e.metaKey,
+        ctrlKey: e.ctrlKey,
+        altKey: e.altKey,
+        isComposing: e.nativeEvent.isComposing,
+      },
+      submitWithModEnter,
+      preventsKeyboardSubmit,
+    );
+    // Plain Enter still completes an open suggestion. In Mod+Enter mode, the
+    // explicit send chord bypasses suggestions so the modifier has one meaning.
+    const shouldPreferSendOverCompletion = submitWithModEnter && shouldSubmitFromKeyboard;
+
     // "@"-mention menu navigation (shared useMentionBrowser) — mutually
     // exclusive with the slash menu below (a mention token can't also read as a
     // "/"-command). Takes priority over history recall and submission.
-    if (handleMentionKeyDown(e)) return;
+    if (!shouldPreferSendOverCompletion && handleMentionKeyDown(e)) return;
 
     // When the suggestions menu is open, ArrowUp/Down navigate it and
     // Enter/Tab complete the highlighted item. These take priority over
@@ -5053,7 +5076,11 @@ export function Composer({
         setMenuIndex((i) => (i <= 0 ? menuMatches.length - 1 : i - 1));
         return;
       }
-      if ((e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !isMobile)) && menuIndex >= 0) {
+      if (
+        !shouldPreferSendOverCompletion &&
+        (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !isMobile)) &&
+        menuIndex >= 0
+      ) {
         e.preventDefault();
         applyMenuSelection(menuMatches[menuIndex]!);
         return;
@@ -5067,9 +5094,9 @@ export function Composer({
       }
     }
 
-    // Enter sends; Shift+Enter inserts a newline. On mobile, Enter inserts a
-    // newline (no Shift available on-screen) and Send must be tapped instead.
-    if (e.key === "Enter" && !e.shiftKey && !isMobile && !e.nativeEvent.isComposing) {
+    // Mobile Enter behavior takes precedence over this desktop preference:
+    // software-keyboard Enter inserts a newline and Send remains an explicit tap.
+    if (shouldSubmitFromKeyboard) {
       e.preventDefault();
       // The mention menu is briefly closed while its listing loads (see
       // ``mentionListingPending``); swallow Enter so the in-progress "@dir/"
@@ -5562,35 +5589,47 @@ export function Composer({
                 openNonce={pickerOpenNonce}
               />
             </div>
-            <Button
-              type="submit"
-              size="icon"
-              variant={showInterruptButton ? "destructive" : "default"}
-              // Send button fades more decisively when there's no draft —
-              // overrides the base 50% disabled-opacity so the affordance
-              // reads as "waiting for input", not "almost active".
-              className={cn(
-                "size-9 shrink-0 rounded-lg md:size-8",
-                !showInterruptButton &&
-                  "hover:bg-primary/90 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
-              )}
-              // Interrupt stays live during a pending elicitation —
-              // cancelling the turn is the other legitimate way out.
-              disabled={
-                showInterruptButton
-                  ? isReadOnly
-                  : !hasDraft || disabled || isReadOnly || hasPendingElicitation
-              }
-              title={showInterruptButton ? "Interrupt" : "Send"}
-              aria-label={showInterruptButton ? "Interrupt" : "Send"}
-            >
-              {showInterruptButton ? (
-                <SquareIcon className="size-4 fill-current" />
-              ) : (
-                <ArrowUpIcon className="size-4" viewBox="4 4 16 16" />
-              )}
-              <span className="sr-only">{showInterruptButton ? "Interrupt" : "Send"}</span>
-            </Button>
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="submit"
+                    size="icon"
+                    variant={showInterruptButton ? "destructive" : "default"}
+                    // Send button fades more decisively when there's no draft —
+                    // overrides the base 50% disabled-opacity so the affordance
+                    // reads as "waiting for input", not "almost active".
+                    className={cn(
+                      "size-9 shrink-0 rounded-lg md:size-8",
+                      !showInterruptButton &&
+                        "hover:bg-primary/90 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
+                    )}
+                    // Interrupt stays live during a pending elicitation —
+                    // cancelling the turn is the other legitimate way out.
+                    disabled={
+                      showInterruptButton
+                        ? isReadOnly
+                        : !hasDraft || disabled || isReadOnly || hasPendingElicitation
+                    }
+                    title={showInterruptButton ? "Interrupt" : undefined}
+                    aria-label={showInterruptButton ? "Interrupt" : "Send"}
+                  >
+                    {showInterruptButton ? (
+                      <SquareIcon className="size-4 fill-current" />
+                    ) : (
+                      <ArrowUpIcon className="size-4" viewBox="4 4 16 16" />
+                    )}
+                    <span className="sr-only">{showInterruptButton ? "Interrupt" : "Send"}</span>
+                  </Button>
+                </TooltipTrigger>
+                {!showInterruptButton && !preventsKeyboardSubmit && (
+                  <KeyboardShortcutTooltipContent
+                    label="Send"
+                    keys={composerSendShortcutKeys(submitWithModEnter)}
+                  />
+                )}
+              </Tooltip>
+            </TooltipProvider>
           </div>
         </div>
       </div>

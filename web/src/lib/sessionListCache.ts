@@ -273,6 +273,48 @@ export function mergeItemsIntoPages(
 }
 
 /**
+ * Prepend brand-new rows (a create here or elsewhere, a share) to page 0 so the
+ * sidebar shows them the instant the push lands, instead of after the debounced
+ * refetch (which lags the search index). A new row sorts newest-first, so page 0
+ * is its home. Skips: search lists (membership unknown), archived/wrong-project
+ * rows, sub-agent children (`parent_session_id` — they live off the sidebar),
+ * and ids the caller excludes via `skip` (e.g. an optimistic delete in flight).
+ * `candidates` should already exclude rows the list holds.
+ */
+export function insertNewRowsIntoPages(
+  data: ConversationsInfiniteData | undefined,
+  candidates: Map<string, SessionListWireItem>,
+  filters: ConversationListFilters,
+  skip?: (id: string) => boolean,
+): { data: ConversationsInfiniteData | undefined; inserted: Set<string> } {
+  const inserted = new Set<string>();
+  if (!data || candidates.size === 0 || filters.searchQuery) return { data, inserted };
+  const present = new Set<string>();
+  for (const page of data.pages) for (const c of page.data) present.add(c.id);
+  const rows: Conversation[] = [];
+  for (const [id, wire] of candidates) {
+    if (present.has(id) || skip?.(id)) continue;
+    const conv: Conversation = {
+      object: "conversation",
+      title: null,
+      created_at: 0,
+      updated_at: 0,
+      labels: {},
+      permission_level: null,
+      ...nullsToUndefined(wire),
+      id,
+    };
+    if (conv.parent_session_id != null || violatesKnownMembership(conv, filters)) continue;
+    rows.push(conv);
+    inserted.add(id);
+  }
+  if (rows.length === 0) return { data, inserted };
+  const [first, ...rest] = data.pages;
+  const nextFirst = { ...first, data: [...rows, ...first.data], first_id: rows[0].id };
+  return { data: { ...data, pages: [nextFirst, ...rest] }, inserted };
+}
+
+/**
  * Drop rows with the given ids from one infinite query's cached pages.
  *
  * Page cursors are recomputed from the surviving rows: `last_id` of the
@@ -390,4 +432,51 @@ export function overlayTitleIntoCaches(
     old ? { ...old, title, ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}) } : old,
   );
   queryClient.setQueryData<Session>(["session", id], (old) => (old ? { ...old, title } : old));
+}
+
+/**
+ * Overlay an archived-flag change onto every cached list that holds the row,
+ * so archiving repaints the sidebar on the next frame instead of after the
+ * PATCH round-trips (which is what made archive feel slower than delete).
+ * Mirrors {@link overlayTitleIntoCaches}: the merge keeps the row in an
+ * include-archived list (marked archived, which the sidebar filters out
+ * client-side) and drops it from a non-archived project folder via
+ * `violatesKnownMembership`.
+ *
+ * Patched in place rather than invalidated, for the same reason rename/delete
+ * are: GET /v1/sessions may be served from a search index that lags the PATCH,
+ * so an immediate refetch races the reindex and bounces the row back. The
+ * server-confirmed state converges via the WS stream and the reconcile poll.
+ *
+ * ponytail: a reconcile poll firing inside the reindex-lag window (before the
+ * index reflects the archive) can briefly bounce the row back; it self-heals on
+ * the next poll. Add a fetch-time flag override (like `withoutDeletingSessions`)
+ * if metrics show the bounce.
+ */
+export function overlayArchivedIntoCaches(
+  queryClient: QueryClient,
+  id: string,
+  archived: boolean,
+): void {
+  const itemsById = new Map<string, SessionListWireItem>([[id, { id, archived }]]);
+  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+    queryKey: ["conversations"],
+  })) {
+    const { data: next } = mergeItemsIntoPages(
+      data,
+      itemsById,
+      filtersFromConversationQueryKey(key),
+      undefined,
+    );
+    if (next !== data) queryClient.setQueryData(key, next);
+  }
+  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+    queryKey: ["project-sessions"],
+  })) {
+    const { data: next } = mergeItemsIntoPages(data, itemsById, PROJECT_FOLDER_FILTERS, undefined);
+    if (next !== data) queryClient.setQueryData(key, next);
+  }
+  queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
+    old ? { ...old, archived } : old,
+  );
 }

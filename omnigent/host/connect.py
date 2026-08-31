@@ -670,6 +670,12 @@ _RETRYABLE_UPGRADE_STATUSES: frozenset[int] = frozenset({408, 429})
 # kills a live host with running sessions.
 _LOGIN_REDIRECT_FATAL_ATTEMPTS = 3
 
+# Max chars of a rejected-upgrade response body surfaced in the operator-facing
+# error. The server's own refusals (_refuse_upgrade) are short plain text, but
+# an edge/proxy can answer with a multi-KB HTML error page; cap it so a legit
+# refusal reason stays readable and a stray HTML blob can't flood the terminal.
+_UPGRADE_BODY_MAX_CHARS = 300
+
 
 class HostConnectError(Exception):
     """A non-retryable failure while opening the host tunnel.
@@ -1367,13 +1373,29 @@ class HostProcess:
                     flush=True,
                 )
             return None
-        return self._classify_http_status(exc.response.status_code)
+        # Carry the upgrade response's body through so a refusal that names its
+        # own cause (the server sends one via _refuse_upgrade — e.g. a malformed
+        # host id, or an edge/proxy 400) surfaces that text verbatim instead of a
+        # guessed, status-only message. Best-effort decode; a bare close has none.
+        raw_body = getattr(exc.response, "body", b"") or b""
+        # Collapse whitespace to one line and cap the length: the body is
+        # interpolated verbatim into the operator-facing error, and an edge/proxy
+        # refusal can be a multi-KB HTML page rather than the server's short
+        # plain-text reason.
+        body = " ".join(raw_body.decode("utf-8", "replace").split())
+        if len(body) > _UPGRADE_BODY_MAX_CHARS:
+            body = body[:_UPGRADE_BODY_MAX_CHARS] + "…"
+        return self._classify_http_status(exc.response.status_code, body)
 
-    def _classify_http_status(self, status: int) -> HostConnectError | None:
+    def _classify_http_status(self, status: int, body: str = "") -> HostConnectError | None:
         """Map a rejected-upgrade HTTP status to a fatal error, or ``None``.
 
         :param status: HTTP status on the failed WS upgrade response, e.g.
             ``403``.
+        :param body: The response body the server sent with the refusal, if any
+            (decoded, stripped). When present it is the authoritative,
+            reason-specific explanation, so it is surfaced verbatim for statuses
+            without their own client-actionable guidance.
         :returns: A :class:`HostConnectError` for a permanent 4xx, or
             ``None`` for a transient status (retryable 4xx in
             :data:`_RETRYABLE_UPGRADE_STATUSES`, or any non-4xx such as a
@@ -1464,6 +1486,12 @@ class HostProcess:
                 "the existing host registration, or reset this machine's host "
                 "id, then retry. " + self._login_fix_hint()
             )
+        # Any other permanent 4xx (e.g. a 400 for a malformed host id, or an
+        # edge/proxy rejection): the server's own body is the authoritative
+        # reason, so surface it verbatim rather than guessing. Fall back to a
+        # generic message only when the refusal carried no body.
+        if body:
+            return HostConnectError(f"Connection refused (HTTP {status}): {body}")
         return HostConnectError(
             f"Connection refused (HTTP {status}): the server rejected the host "
             "tunnel request. This is a permanent error; retrying will not help. "
@@ -3849,7 +3877,15 @@ def run_host_process(
     from omnigent.host.identity import CONFIG_PATH
 
     path = config_path or CONFIG_PATH
-    identity = load_or_create_host_identity(path)
+    try:
+        identity = load_or_create_host_identity(path)
+    except ValueError as exc:
+        print(
+            f"\n✗ Could not start host.\n{exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(HOST_FATAL_EXIT_CODE) from None
     if not path.exists():
         print(f"Auto-generated {path} ({identity.host_id}, name: {identity.name})")
     # User-facing: the display form (workspace /omnigent URL with ?o= when

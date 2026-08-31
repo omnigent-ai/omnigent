@@ -160,7 +160,6 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY,
     _CODEX_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY,
     _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
-    _COMPACT_LOCKS,
     _CURSOR_FORK_HISTORY_HARNESSES,
     _CURSOR_NATIVE_HARNESS,
     _DENY_SENTINEL_PREFIX,
@@ -7164,124 +7163,6 @@ async def _flush_relay_text(
     session_stream.publish(session_id, done_event.model_dump())
 
 
-def _compact_lock(session_id: str) -> asyncio.Lock:
-    """
-    Return the lock serializing explicit compaction for one session.
-
-    Call-time proxy to the facade so a test's ``monkeypatch.setattr`` of
-    this name on ``sessions`` is honored by sibling impl callers.
-    """
-    from omnigent.server.routes import sessions as _facade
-
-    return _facade._compact_lock(session_id)
-
-
-def _compact_lock_impl(session_id: str) -> asyncio.Lock:
-    """
-    Return the lock serializing explicit compaction for one session.
-
-    Concurrent ``/compact`` events for the same session must not overlap;
-    different sessions get distinct locks so they may compact concurrently.
-    Get-or-create is race-free because there is no ``await`` between the
-    lookup and the insert (single event loop).
-
-    :param session_id: Session/conversation id being compacted.
-    :returns: A process-wide :class:`asyncio.Lock` shared by every concurrent
-        caller for the same ``session_id``.
-    """
-    lock = _COMPACT_LOCKS.get(session_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _COMPACT_LOCKS[session_id] = lock
-    return lock
-
-
-async def _run_compact_locked(
-    session_id: str,
-    conv: Conversation,
-    agent_store: AgentStore,
-    agent_cache: AgentCache | None,
-) -> None:
-    """
-    Run explicit compaction while holding the per-session compact lock.
-
-    :param session_id: Session/conversation identifier.
-    :param conv: Conversation row.
-    :param agent_store: Agent store for spec lookup.
-    :param agent_cache: Agent cache for bundle loading.
-    """
-    lock = _compact_lock(session_id)
-    async with lock:
-        if conv.agent_id is None:
-            raise OmnigentError("Session has no agent binding", code=ErrorCode.INTERNAL_ERROR)
-        if agent_cache is None:
-            raise OmnigentError(
-                "Compaction is unavailable: agent cache is not configured",
-                code=ErrorCode.INTERNAL_ERROR,
-            )
-        # Recheck after acquiring — a turn may have started while waiting.
-        if _session_status_cache.get(session_id) in ("running", "waiting"):
-            raise OmnigentError(
-                "Cannot compact while a turn is running; cancel or wait for it to finish first",
-                code=ErrorCode.CONFLICT,
-            )
-        agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
-        if agent is None or agent.bundle_location is None:
-            raise OmnigentError(
-                f"Agent not found: {conv.agent_id!r}",
-                code=ErrorCode.NOT_FOUND,
-            )
-        loaded = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
-        )
-        spec = loaded.spec
-        if spec.llm is not None:
-            llm_config = spec.llm
-        elif spec.executor.model is not None:
-            from omnigent.spec.types import LLMConfig
-
-            llm_config = LLMConfig(model=spec.executor.model, connection=spec.executor.connection)
-        else:
-            harness = spec.executor.harness_kind
-            raise OmnigentError(
-                f"/compact is unavailable for this {harness} session because the agent "
-                "does not declare an LLM model for server-side compaction. Configure "
-                "`llm.model` or `executor.model`, or use a harness-native compaction "
-                "control when one is available.",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        task_id = f"compact_{int(time.time() * 1000)}"
-        # compact() publishes its own in_progress / completed SSE events when
-        # conversation_id is set, and the web UI's compaction bubble owns the
-        # busy state from those. Deliberately no ``session.status`` bracket:
-        # compaction is not an agent turn, so reporting running→idle would
-        # invent one — and its idle would land mid-turn on a session that is
-        # genuinely working, which clients then had to second-guess.
-        from omnigent.runtime.workflow import compact_conversation_now
-
-        try:
-            await compact_conversation_now(
-                task_id=task_id,
-                conversation_id=session_id,
-                spec=spec,
-                llm_config=llm_config,
-                tool_schemas=[],
-                preserve_recent_window=1,
-            )
-        except Exception as exc:
-            _logger.exception(
-                "Explicit session compaction failed for %s",
-                session_id,
-                extra={"session_id": session_id},
-            )
-            detail = str(exc) or repr(exc)
-            _publish_compaction_failed(session_id)
-            raise OmnigentError(
-                f"Compaction failed while generating a summary: {detail}",
-                code=ErrorCode.INTERNAL_ERROR,
-            ) from exc
-
-
 def _agent_provider_family(agent: Agent) -> str | None:
     """Return the provider family of an agent's harness, or ``None``.
 
@@ -10167,7 +10048,6 @@ __all__ = [
     "_codex_subagent_labels_from_body",
     "_coerce_cumulative_field",
     "_collect_descendant_conversation_ids",
-    "_compact_lock",
     "_consume_pre_resolved_harness_elicitation",
     "_create_and_publish_antigravity_child",
     "_create_and_publish_codex_child",
@@ -10313,7 +10193,6 @@ __all__ = [
     "_resolve_subagent_spec",
     "_resource_event_item_from_sse",
     "_routing_decision_item_from_sse",
-    "_run_compact_locked",
     "_same_provider_family",
     "_same_provider_family_impl",
     "_seed_missing_title",

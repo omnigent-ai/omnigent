@@ -611,6 +611,17 @@ Once the set is genuinely green:
    diff). Follow the repo's commit conventions. You likely committed already in
    2B.6 to produce the review diff; if the cross-vendor review led to further
    changes, amend or add a follow-up commit so the branch reflects the final fix.
+   **Never commit workspace artifacts.** The commit must contain only the fix and
+   its reproduction test — nothing else. In particular, **never** stage or commit
+   the `recordings/` clips or any `.omnigent/` handoff files (e.g.
+   `.omnigent/repro-handoff.json`): recordings are workspace artifacts that ride
+   in the PR's Demo section / CI artifact bundle, not in the diff (see
+   [`dev/recording-lanes.md`](../recording-lanes.md)). Do **not** use a blanket
+   `git add -A` / `git add .` that sweeps them in — stage the fix and test paths
+   explicitly, and run `git status` / `git diff --cached --stat` before committing
+   to confirm the staged set is only the fix + test. If a recording or handoff
+   file already landed in an earlier commit on this branch, remove it (e.g.
+   `git rm --cached`) so it never reaches the PR.
 2. **If the input has `skip_push: true`, stop here** — the fix is committed
    locally; do **not** push and do **not** open a PR. Report the branch name in
    your output (`pushed_branch`) so a human can inspect, push, and PR it. (The

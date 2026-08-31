@@ -4,7 +4,33 @@ Output only JSON with these fields:
 - type: Bug, Feature, or Docs
 - impact: critical, high, medium, or low
 - area_keys: array of allowed area keys
+- evidence_kind: for bugs, one of direct_steps, observed_intermittent,
+  controlled_test, diagnostic_evidence, code_analysis, or none; use none for
+  Features and Docs
+- information_status: for bugs, sufficient or needs_info; use not_applicable
+  for Features and Docs
+- missing_information: array containing any of trigger, expected_behavior,
+  observed_behavior, version_or_environment, or diagnostic_evidence
 - reasoning: one sentence explaining the affected user or CUJ, whether it is blocked, and any workaround
+
+Classify the actual request before judging bug-report completeness. Do not trust
+the submitted type label when the content describes a different issue type.
+
+A bug does not need a section literally named "reproduction steps" to be
+sufficient. Mark it sufficient when a maintainer has a concrete way to
+investigate the claimed failure through any one of:
+- direct steps that exercise the failure;
+- a specific intermittent observation with useful context;
+- a controlled test or comparison that isolates the behavior;
+- diagnostic evidence such as logs, errors, session IDs, or screenshots; or
+- code analysis naming a reachable path and its concrete incorrect impact.
+
+Mark a bug needs_info only when the report lacks enough evidence to investigate.
+For example, a code-quality concern that does not claim incorrect behavior is
+usually a Feature, not an incomplete Bug. A defensive code-path report can be
+sufficient when it explains reachability and impact; never reject it merely
+because nobody ran the path end to end. Populate missing_information with every
+concrete category the author needs to add.
 
 Impact rubric:
 - Bug critical: widespread outage, data loss, serious security boundary bypass.

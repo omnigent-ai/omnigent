@@ -630,6 +630,86 @@ async def _permission_mode_launch_args(deps: FireDeps, task: ScheduledTask) -> l
     return ["--permission-mode", task.permission_mode]
 
 
+async def _spec_reasoning_effort(deps: FireDeps, task: ScheduledTask) -> str | None:
+    """Read ``executor.reasoning_effort`` from the task's agent spec.
+
+    Fail-safe like :func:`_permission_mode_launch_args`: a task with no explicit
+    effort inherits the spec default, and any load failure yields ``None`` (the
+    harness default) rather than breaking the fire. The spec value is validated
+    at spec load, so it needs no re-validation here.
+    """
+    if deps.agent_cache is None:
+        return None
+    try:
+        agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
+        if agent is None or getattr(agent, "bundle_location", None) is None:
+            return None
+        loaded = await asyncio.to_thread(deps.agent_cache.load, agent.id, agent.bundle_location)
+        executor = getattr(loaded.spec, "executor", None)
+        return getattr(executor, "reasoning_effort", None) if executor else None
+    except Exception:
+        _logger.exception(
+            "scheduled fire: could not resolve reasoning_effort for task %s; "
+            "using harness default",
+            task.id,
+        )
+        return None
+
+
+async def _presentation_labels(deps: FireDeps, task: ScheduledTask) -> dict[str, str]:
+    """Resolve the terminal-first presentation labels for a fired session.
+
+    The interactive New Chat path stamps ``omnigent.ui = "terminal"`` (plus the
+    matching ``omnigent.wrapper`` for native CLIs) at create time so the web
+    UI's Chat/Terminal switcher is available; the fire path bypasses that path
+    and must stamp the same labels itself, or an automation-created session on a
+    terminal harness renders Chat-only with no way to reach its live terminal.
+
+    Two harness shapes get a terminal:
+
+    * A native-CLI wrapper agent (``pi-native-ui`` etc.) — the terminal IS the
+      main view. Resolved from the bound agent's name, mirroring
+      ``native_coding_agent_for_agent_name`` in the interactive create path.
+    * A non-native SDK agent whose runner auto-creates the ``omnigent`` REPL
+      terminal — host-bound only (an in-process session has no runner to host
+      a terminal), mirroring ``_repl_terminal_ui_labels``.
+
+    Fail-safe: any resolution error omits the labels rather than guessing, so
+    the session falls back to Chat-only rather than breaking the fire.
+    """
+    from omnigent.native_coding_agents import native_coding_agent_for_agent_name
+    from omnigent.server.routes.sessions import _repl_terminal_ui_labels
+
+    try:
+        agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
+        if agent is None:
+            return {}
+        # Native-wrapper labels come solely from the agent name, so they resolve
+        # without the cache — matching the interactive path, which has no cache
+        # dependency for this branch.
+        native_agent = native_coding_agent_for_agent_name(agent.name)
+        if native_agent is not None:
+            return dict(native_agent.presentation_labels)
+        # Non-native SDK session: it only gets a REPL terminal when a runner
+        # hosts it, so a task with no resolved host stays Chat-only. Resolving
+        # the harness for that branch needs the cache.
+        if task.host_id is None or deps.agent_cache is None:
+            return {}
+        return await asyncio.to_thread(
+            _repl_terminal_ui_labels,
+            agent=agent,
+            agent_cache=deps.agent_cache,
+            harness_override=None,
+        )
+    except Exception:
+        _logger.exception(
+            "scheduled fire: could not resolve presentation labels for task %s; "
+            "session will render Chat-only",
+            task.id,
+        )
+        return {}
+
+
 async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
     """Create a conversation bound to the task's agent, carrying the stored spec."""
     # Connected-host, existing-workspace runs create the conversation directly.
@@ -643,15 +723,27 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
         workspace=task.workspace,
         terminal_launch_args=await _permission_mode_launch_args(deps, task),
     )
-    if task.model_override is not None or task.reasoning_effort is not None:
+    reasoning_effort = task.reasoning_effort
+    if reasoning_effort is None:
+        reasoning_effort = await _spec_reasoning_effort(deps, task)
+    if task.model_override is not None or reasoning_effort is not None:
         updated: Conversation | None = await asyncio.to_thread(
             deps.conversation_store.update_conversation,
             conv.id,
             model_override=task.model_override,
-            reasoning_effort=task.reasoning_effort,
+            reasoning_effort=reasoning_effort,
         )
         if updated is not None:
             conv = updated
+    # Stamp terminal-first presentation labels the interactive create path would
+    # have set, so a fired session on a terminal harness exposes the
+    # Chat/Terminal switcher instead of rendering Chat-only. Stamped last (after
+    # the override reload above) so the labels land on the conversation returned
+    # to the launch/dispatch caller, not a stale pre-label reload of it.
+    labels = await _presentation_labels(deps, task)
+    if labels:
+        await asyncio.to_thread(deps.conversation_store.set_labels, conv.id, labels)
+        conv.labels.update(labels)
     return conv
 
 

@@ -3,28 +3,25 @@
 The web-UI ``/compact`` command and compact button POST
 ``{"type": "compact"}`` to ``POST /v1/sessions/{id}/events``. Per
 ``designs/CLAUDE_NATIVE.md`` ("Control events dispatch on the runner"),
-the Omnigent server stays harness-agnostic: it forwards the control to the
-bound runner and only runs its own in-process compaction
-(``_run_compact_locked`` → ``compact_conversation_now``) when the
-runner did NOT handle it.
+the Omnigent server forwards the control to the bound runner and lets the
+runner's harness-specific handler own the operation.
 
 The runner's dispatch contract (verified in
 ``tests/runner/test_app_sessions_native.py``):
 
-* claude-native injects ``/compact`` into the tmux pane and returns
-  **200** — Claude Code compacts its own context.
-* other harnesses **204** no-op — the Omnigent server owns the operation.
-* a failed injection (pane not attached) returns **503**.
+* Native harnesses inject ``/compact`` into the vendor TUI and return
+  **200** on success or **5xx** on failure.
+* SDK harnesses return **204** (no-op) because their context is controlled
+  entirely by the vendor harness; the server surfaces a 400 error.
+* A failed injection (pane not attached) returns **503**.
 
 These tests pin the Omnigent side of that contract by stubbing the runner's
-HTTP response and asserting whether the AP-side compaction ran.
+HTTP response and asserting the correct server behaviour.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
-from collections import defaultdict
 from typing import Any
 
 import httpx
@@ -62,9 +59,8 @@ def _fake_runner_returning(compact_status: int) -> tuple[httpx.AsyncClient, list
     runner POST so unrelated session traffic passes through).
 
     :param compact_status: HTTP status the fake runner returns for a
-        ``compact`` ``/events`` POST, e.g. ``200`` (claude-native
-        handled), ``204`` (in-process no-op), or ``503`` (pane not
-        attached).
+        ``compact`` ``/events`` POST, e.g. ``200`` (native handled),
+        ``204`` (SDK no-op), or ``503`` (pane not attached).
     :returns: The mock ``httpx.AsyncClient`` and the list that captures
         forwarded compact bodies.
     """
@@ -100,10 +96,8 @@ async def test_compact_skips_omnigent_compaction_when_runner_handles_it(
     A 200 from the runner (claude-native injected ``/compact``) makes
     the Omnigent server skip its own compaction.
 
-    This is the fix for the original bug: claude-native sessions bind
-    to an LLM-less pseudo-agent, so ``_run_compact_locked`` would 400.
-    When the runner reports it handled the control (200), the Omnigent server
-    must NOT run ``compact_conversation_now`` at all.
+    When the runner reports it handled the control (200), the Omnigent
+    server must NOT run ``compact_conversation_now`` at all.
     """
     from omnigent.runtime import set_runner_client
 
@@ -138,39 +132,31 @@ async def test_compact_skips_omnigent_compaction_when_runner_handles_it(
     # compaction.
     assert resp.status_code == 202, resp.text
     assert resp.json() == {"queued": False}, resp.text
-    # Exactly one compact control was forwarded to the runner. 0 = the
-    # Omnigent server never forwarded (it would have run _run_compact_locked
-    # directly — the pre-fix behavior); 2+ = duplicate forward.
+    # Exactly one compact control was forwarded to the runner.
     assert captured == [{"type": "compact"}], (
         f"AP server must forward exactly one compact control to the runner; got {captured!r}."
     )
 
 
-async def test_compact_runs_omnigent_compaction_when_runner_noops(
+async def test_compact_returns_error_when_runner_noops(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A 204 from the runner (in-process harness) makes the Omnigent server run
-    its own ``compact_conversation_now``.
+    A 204 from the runner (SDK harness) surfaces a clear 400 error.
 
-    In-process harnesses have no terminal to inject into — explicit
-    compaction is an AP-side LLM summarisation. The 204 no-op tells the
-    Omnigent server it owns the operation, so it must still forward the
-    control (harness-agnostic) AND then run the compaction.
+    SDK harnesses own their own context; the server cannot compact on their
+    behalf. The 204 no-op signals "not handled here" and the server must
+    reject the request rather than attempting AP-side compaction.
     """
     from omnigent.runtime import set_runner_client
 
-    calls: list[dict[str, Any]] = []
-
-    async def _record(**kwargs: Any) -> CompactionResult:
-        """Record that AP-side compaction ran; return a real result."""
-        calls.append(kwargs)
-        return CompactionResult(messages=[], summary_metadata=None, total_tokens=1234)
+    async def _must_not_run(**_: Any) -> CompactionResult:
+        raise AssertionError("compact_conversation_now must not run when the runner returned 204")
 
     monkeypatch.setattr(
         "omnigent.runtime.workflow.compact_conversation_now",
-        _record,
+        _must_not_run,
     )
 
     runner, captured = _fake_runner_returning(204)
@@ -186,39 +172,25 @@ async def test_compact_runs_omnigent_compaction_when_runner_noops(
         await runner.aclose()
         set_runner_client(None)
 
-    assert resp.status_code == 202, resp.text
-    assert resp.json() == {"queued": False}, resp.text
-    # Control was still forwarded even though the runner no-ops — the
-    # Omnigent server is harness-agnostic and forwards for every harness.
+    assert resp.status_code == 400, resp.text
+    assert "/compact is not available" in resp.text
+    # Control was still forwarded before the error.
     assert captured == [{"type": "compact"}], (
-        f"AP server must forward compact to the runner even on the "
-        f"in-process path; got {captured!r}."
-    )
-    # AP-side compaction ran exactly once for the session it was asked
-    # to compact. 0 = the 204 path skipped compaction (the in-process
-    # /compact silently does nothing); 2+ = double compaction.
-    assert len(calls) == 1, (
-        f"Expected exactly one compact_conversation_now call on the 204 path; got {len(calls)}."
-    )
-    assert calls[0]["conversation_id"] == sid, (
-        f"AP-side compaction ran for the wrong session; got "
-        f"{calls[0].get('conversation_id')!r}, expected {sid!r}."
+        f"AP server must forward compact to the runner before returning the error; "
+        f"got {captured!r}."
     )
 
 
-async def test_compact_model_less_sdk_harness_returns_clear_unavailable_message(
+async def test_compact_sdk_harness_no_runner_returns_not_available(
     client: httpx.AsyncClient,
 ) -> None:
     """
-    A model-less SDK-style harness should not expose the raw server-side
-    compaction model requirement.
+    A compact request for an SDK-harness session with no runner returns a
+    clear 400 "not available for this session type" error.
     """
     agent = await create_test_agent(
         client,
-        name="model-less-sdk",
-        # Explicit harness: build_agent_bundle defaults config.harness to
-        # "claude-sdk", which harness_kind would echo instead of the real
-        # model-less SDK harness under test.
+        name="sdk-no-runner-compact",
         executor={"type": "omnigent", "config": {"harness": "openai-agents"}},
         include_llm=False,
     )
@@ -230,161 +202,7 @@ async def test_compact_model_less_sdk_harness_returns_clear_unavailable_message(
     )
 
     assert resp.status_code == 400, resp.text
-    assert "/compact is unavailable" in resp.text
-    assert "openai-agents" in resp.text
-    assert "llm.model" in resp.text
-    assert "executor.model" in resp.text
-
-
-async def test_compact_single_flight_per_session(
-    client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Explicit compaction is single-flight per session, not globally.
-
-    Two ``/compact`` POSTs for one session must never overlap inside
-    ``compact_conversation_now``. Different sessions may overlap. A
-    failed compaction must release the lock so a later request can run.
-    """
-    from omnigent.runtime import set_runner_client
-    from omnigent.server.routes import sessions as sessions_routes
-
-    active: dict[str, int] = defaultdict(int)
-    max_active: dict[str, int] = defaultdict(int)
-    simultaneous_sessions = 0
-    entered: dict[str, asyncio.Event] = {}
-    release: dict[str, asyncio.Event] = {}
-    fail_once: set[str] = set()
-    calls: list[str] = []
-    lock_requests: dict[str, int] = defaultdict(int)
-    second_lock_requested: dict[str, asyncio.Event] = {}
-
-    real_compact_lock = sessions_routes._compact_lock
-
-    def _instrumented_compact_lock(session_id: str) -> asyncio.Lock:
-        lock_requests[session_id] += 1
-        if lock_requests[session_id] == 2:
-            second_lock_requested.setdefault(session_id, asyncio.Event()).set()
-        return real_compact_lock(session_id)
-
-    monkeypatch.setattr(sessions_routes, "_compact_lock", _instrumented_compact_lock)
-
-    async def _gated(**kwargs: Any) -> CompactionResult:
-        """Hold inside compaction until the test releases this session."""
-        nonlocal simultaneous_sessions
-        cid = kwargs["conversation_id"]
-        assert isinstance(cid, str)
-        calls.append(cid)
-        active[cid] += 1
-        max_active[cid] = max(max_active[cid], active[cid])
-        simultaneous_sessions = max(
-            simultaneous_sessions,
-            sum(1 for count in active.values() if count > 0),
-        )
-        entered.setdefault(cid, asyncio.Event()).set()
-        try:
-            if cid in fail_once:
-                fail_once.discard(cid)
-                raise RuntimeError("injected compact failure")
-            await release.setdefault(cid, asyncio.Event()).wait()
-            return CompactionResult(messages=[], summary_metadata=None, total_tokens=1)
-        finally:
-            active[cid] -= 1
-
-    monkeypatch.setattr(
-        "omnigent.runtime.workflow.compact_conversation_now",
-        _gated,
-    )
-
-    runner, _captured = _fake_runner_returning(204)
-    set_runner_client(runner)
-    try:
-        agent = await create_test_agent(client)
-        sid_a = await _create_session(client, agent["id"])
-        sid_b = await _create_session(client, agent["id"])
-        release[sid_a] = asyncio.Event()
-        release[sid_b] = asyncio.Event()
-        entered[sid_a] = asyncio.Event()
-        entered[sid_b] = asyncio.Event()
-        second_lock_requested[sid_a] = asyncio.Event()
-
-        # Same session: second request must wait outside compact_conversation_now
-        # until the first releases — never overlap.
-        first_a = asyncio.create_task(
-            client.post(f"/v1/sessions/{sid_a}/events", json={"type": "compact", "data": {}})
-        )
-        await asyncio.wait_for(entered[sid_a].wait(), timeout=5.0)
-        entered[sid_a].clear()
-        second_a = asyncio.create_task(
-            client.post(f"/v1/sessions/{sid_a}/events", json={"type": "compact", "data": {}})
-        )
-        await asyncio.wait_for(second_lock_requested[sid_a].wait(), timeout=5.0)
-        assert active[sid_a] == 1, (
-            f"Same-session compact overlapped inside compact_conversation_now; "
-            f"active={active[sid_a]}."
-        )
-        assert not entered[sid_a].is_set(), (
-            "Second same-session compact entered before the first released."
-        )
-        release[sid_a].set()
-        resp_a1, resp_a2 = await asyncio.wait_for(
-            asyncio.gather(first_a, second_a),
-            timeout=5.0,
-        )
-        assert resp_a1.status_code == 202, resp_a1.text
-        assert resp_a2.status_code == 202, resp_a2.text
-        assert max_active[sid_a] == 1, (
-            f"Same-session compact overlapped; max_active={max_active[sid_a]}."
-        )
-
-        # Different sessions may hold compact_conversation_now concurrently.
-        release[sid_a].clear()
-        release[sid_b].clear()
-        entered[sid_a].clear()
-        entered[sid_b].clear()
-        task_a = asyncio.create_task(
-            client.post(f"/v1/sessions/{sid_a}/events", json={"type": "compact", "data": {}})
-        )
-        task_b = asyncio.create_task(
-            client.post(f"/v1/sessions/{sid_b}/events", json={"type": "compact", "data": {}})
-        )
-        await asyncio.wait_for(
-            asyncio.gather(entered[sid_a].wait(), entered[sid_b].wait()),
-            timeout=5.0,
-        )
-        assert simultaneous_sessions >= 2, (
-            "Different sessions failed to overlap inside compact_conversation_now; "
-            f"simultaneous_sessions={simultaneous_sessions}."
-        )
-        release[sid_a].set()
-        release[sid_b].set()
-        resp_cross_a, resp_cross_b = await asyncio.wait_for(
-            asyncio.gather(task_a, task_b),
-            timeout=5.0,
-        )
-        assert resp_cross_a.status_code == 202, resp_cross_a.text
-        assert resp_cross_b.status_code == 202, resp_cross_b.text
-
-        # Failure must release the lock so a later compact can run.
-        fail_once.add(sid_a)
-        release[sid_a].set()
-        fail_resp = await client.post(
-            f"/v1/sessions/{sid_a}/events",
-            json={"type": "compact", "data": {}},
-        )
-        assert fail_resp.status_code == 500, fail_resp.text
-        retry_resp = await client.post(
-            f"/v1/sessions/{sid_a}/events",
-            json={"type": "compact", "data": {}},
-        )
-        assert retry_resp.status_code == 202, retry_resp.text
-        assert calls.count(sid_a) >= 4, (
-            f"Expected failed compact plus successful retry for {sid_a}; calls={calls!r}."
-        )
-    finally:
-        await runner.aclose()
-        set_runner_client(None)
+    assert "/compact is not available" in resp.text
 
 
 async def test_compact_errors_when_runner_injection_fails(
@@ -403,11 +221,8 @@ async def test_compact_errors_when_runner_injection_fails(
     from omnigent.runtime import set_runner_client
 
     async def _must_not_run(**_: Any) -> CompactionResult:
-        """Fail loudly if AP-side compaction is reached on the error path."""
         raise AssertionError(
-            "compact_conversation_now must not run when the runner "
-            "returned a non-200/204 status — Omnigent fell through to its "
-            "own compaction instead of surfacing the runner failure."
+            "compact_conversation_now must not run when the runner returned a 5xx"
         )
 
     monkeypatch.setattr(
@@ -428,9 +243,6 @@ async def test_compact_errors_when_runner_injection_fails(
         await runner.aclose()
         set_runner_client(None)
 
-    # 500 = INTERNAL_ERROR raised from the compact branch on a runner
-    # 5xx. A 200 here would mean the error was swallowed; a 400 would
-    # mean it fell through to _run_compact_locked's LLM-config check.
     assert resp.status_code == 500, resp.text
     # The control was forwarded before the failure was detected.
     assert captured == [{"type": "compact"}], (
@@ -445,22 +257,16 @@ async def test_compact_native_session_no_runner_returns_reconnect_error(
 ) -> None:
     """
     A native-terminal /compact with no reachable runner surfaces a clear
-    "reconnect first" error, not the confusing no-LLM-model message.
+    "reconnect first" 503, not a generic error.
 
-    A native session compacts only in its vendor TUI, so when no runner is
-    bound (disconnected session) the compact branch must NOT fall through to
-    server-side ``_run_compact_locked`` — which would 400 with the opaque
-    "does not declare an LLM model" text. Instead it should try to wake the
-    runner; an un-host-bound native session can't be woken, so it returns a
-    503 RUNNER_UNAVAILABLE the user can act on.
+    Native sessions compact only in their vendor TUI, so when no runner is
+    bound the compact branch must try to wake the runner and, when it can't
+    (un-host-bound session), return a RUNNER_UNAVAILABLE the user can act on.
     """
 
     async def _must_not_run(**_: Any) -> CompactionResult:
-        """Fail loudly if AP-side compaction is reached on the native path."""
         raise AssertionError(
-            "compact_conversation_now must not run for a native-terminal "
-            "session with no runner — the compact branch fell through to "
-            "in-process compaction instead of the reconnect error."
+            "compact_conversation_now must not run for a native session with no runner"
         )
 
     monkeypatch.setattr(
@@ -481,8 +287,6 @@ async def test_compact_native_session_no_runner_returns_reconnect_error(
         json={"type": "compact", "data": {}},
     )
 
-    # 503 = RUNNER_UNAVAILABLE (reconnect-first). A 400 would mean it fell
-    # through to the no-LLM-model check (the original confusing bug).
     assert resp.status_code == 503, resp.text
     assert "Reconnect the session" in resp.text
     assert "llm.model" not in resp.text

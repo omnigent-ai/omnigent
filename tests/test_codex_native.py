@@ -11160,3 +11160,112 @@ def test_codex_discover_thread_and_forward_writes_routing_summary_on_timeout(
     assert err is not None
     assert "Launch routing: Codex CLI login (no provider configured) -- SENTINEL" in err
     assert "startup timed out" in err
+
+
+# --- headless login-fallback fail-fast: no credential can start the TUI thread ---
+
+
+def test_codex_discover_thread_login_required_records_error_before_waiting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A login-doomed launch records the failure up front, before any wait.
+
+    When routing resolved to Codex's own login with no usable credential, the
+    TUI can only render the sign-in screen. The turn-facing error must exist
+    *before* thread discovery starts waiting, so a headless chat turn fails
+    immediately with an actionable message instead of burning the 30s
+    thread-start timeout (the "Codex TUI never started a thread" hang).
+    """
+    from omnigent import codex_native_forwarder as _fwd
+    from omnigent.codex_native_bridge import read_bridge_startup_error
+    from omnigent.runner.native import orchestration as native_orch
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    error_at_wait_time: list[str | None] = []
+
+    async def _wait(_client: object, *, timeout: float | None = 30.0) -> str:
+        # The fail-fast contract: the turn-facing error is already on disk
+        # when the (now unbounded) wait begins.
+        error_at_wait_time.append(read_bridge_startup_error(bridge_dir))
+        assert timeout is None, "login-gated discovery must wait without a deadline"
+        raise RuntimeError("stream ended")
+
+    monkeypatch.setattr(_fwd, "wait_for_thread_started", _wait)
+
+    class _FakeClient:
+        async def close(self) -> None:
+            return None
+
+    asyncio.run(
+        native_orch._codex_discover_thread_and_forward(
+            session_id="conv_test",
+            bridge_dir=bridge_dir,
+            codex_ws_url="ws://127.0.0.1:9999",
+            codex_home=tmp_path / "codex-home",
+            event_client=_FakeClient(),
+            routing_summary="Codex CLI login (no provider configured) -- SENTINEL",
+            login_required=True,
+        )
+    )
+
+    assert error_at_wait_time and error_at_wait_time[0] is not None
+    recorded = error_at_wait_time[0]
+    assert "not signed in" in recorded
+    assert "Launch routing: Codex CLI login (no provider configured) -- SENTINEL" in recorded
+    # The pre-recorded error must not carry the timeout markers: the whole
+    # point is a clear, non-timeout failure.
+    assert "startup timed out" not in recorded
+    assert "never started a thread" not in recorded
+
+
+def test_codex_discover_thread_login_required_clears_error_on_thread_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An interactive sign-in that starts the thread clears the pre-recorded error.
+
+    The login-gated launch stays recoverable: a user signing in from the
+    attached terminal starts the thread, and the stale fail-fast cause must
+    not shadow the now-working bridge state.
+    """
+    from omnigent import codex_native_forwarder as _fwd
+    from omnigent.codex_native_bridge import (
+        read_bridge_startup_error,
+        read_bridge_state,
+    )
+    from omnigent.runner.native import orchestration as native_orch
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    async def _wait(_client: object, *, timeout: float | None = 30.0) -> str:
+        return "thread_after_signin"
+
+    async def _forward(**_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(_fwd, "wait_for_thread_started", _wait)
+    monkeypatch.setattr(_fwd, "supervise_forwarder", _forward)
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:1")
+
+    class _FakeClient:
+        async def close(self) -> None:
+            return None
+
+    asyncio.run(
+        native_orch._codex_discover_thread_and_forward(
+            session_id="conv_test",
+            bridge_dir=bridge_dir,
+            codex_ws_url="ws://127.0.0.1:9999",
+            codex_home=tmp_path / "codex-home",
+            event_client=_FakeClient(),
+            routing_summary="Codex CLI login (no provider configured)",
+            login_required=True,
+        )
+    )
+
+    assert read_bridge_startup_error(bridge_dir) is None
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.thread_id == "thread_after_signin"

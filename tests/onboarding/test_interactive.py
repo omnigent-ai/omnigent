@@ -1,15 +1,15 @@
 """Tests for the shared onboarding interactive selectors.
 
 :mod:`omnigent.onboarding.interactive` provides the theme-picker-styled
-``select`` arrow-key menu and the ``prompt_text`` text input. The
-raw-termios TTY path cannot be exercised in a headless test runner (no
-controlling terminal), so these tests cover the **non-TTY numbered
-fallback** — the path pipes, CI, and the CLI test suite actually hit.
-
-Each test forces a non-TTY by monkeypatching ``sys.stdin.isatty`` to
-``False`` and feeds input via ``click``'s isolated input stream, then
-asserts on the returned index / string so a regression in the fallback
+``select`` arrow-key menu and the ``prompt_text`` text input. Most tests
+here cover the **non-TTY numbered fallback** — the path pipes, CI, and the
+CLI test suite actually hit — by monkeypatching ``sys.stdin.isatty`` to
+``False`` and feeding input via ``click``'s isolated input stream, then
+asserting on the returned index / string so a regression in the fallback
 parsing surfaces here.
+
+The raw-termios TTY path has no controlling terminal in a headless runner,
+so the tests that need one stand up a pty (see :func:`_select_over_pty`).
 """
 
 from __future__ import annotations
@@ -519,3 +519,76 @@ def test_count_terminal_lines_matches_naive_for_short_content() -> None:
 
 def test_count_terminal_lines_empty_string() -> None:
     assert interactive._count_terminal_lines("", width=80) == 0
+
+
+def _select_over_pty(monkeypatch: pytest.MonkeyPatch, keys: bytes) -> int:
+    """Run :func:`select` against a real pty, feeding it *keys*.
+
+    ``openpty`` gives the raw-termios path the controlling terminal a
+    headless runner otherwise lacks, so the ↑/↓ escape-sequence parsing
+    can be exercised directly. ``setcbreak`` flushes pending input, so the
+    keys are written from a helper thread only once the menu has switched
+    the pty into cbreak mode.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param keys: Raw bytes to deliver as keystrokes, e.g. ``b"\\x1b[B\\r"``.
+    :returns: The index :func:`select` returned.
+    """
+    import os
+    import pty
+    import threading
+    import tty
+
+    ready = threading.Event()
+    real_setcbreak = tty.setcbreak
+
+    def _setcbreak_then_signal(fd: int, when: int = tty.TCSAFLUSH) -> None:
+        real_setcbreak(fd, when)
+        ready.set()
+
+    monkeypatch.setattr(tty, "setcbreak", _setcbreak_then_signal)
+
+    controller, follower = pty.openpty()
+
+    def _send() -> None:
+        ready.wait(timeout=10)
+        os.write(controller, keys)
+
+    writer = threading.Thread(target=_send, daemon=True)
+    try:
+        stdin = os.fdopen(follower, "rb", buffering=0)
+        monkeypatch.setattr(sys, "stdin", stdin)
+        monkeypatch.setattr(sys, "stdout", io.StringIO())
+        writer.start()
+        return interactive.select("Pick", ["Claude", "Codex", "Quit"])
+    finally:
+        writer.join(timeout=10)
+        os.close(controller)
+
+
+@pytest.mark.parametrize(
+    ("introducer", "label"),
+    [(b"[", "normal cursor mode"), (b"O", "application cursor mode")],
+)
+def test_select_arrow_keys_work_in_both_cursor_modes(
+    monkeypatch: pytest.MonkeyPatch,
+    introducer: bytes,
+    label: str,
+) -> None:
+    """↑/↓ move the cursor whether the terminal sends ``ESC [ A`` or ``ESC O A``.
+
+    A terminal left in application cursor mode (DECCKM, what the ``smkx``
+    terminfo capability turns on) sends ``ESC O A``/``ESC O B`` for the
+    arrows. Dropping that form leaves the menu looking frozen — Esc and
+    Enter still respond, but the selection never moves.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param introducer: The escape-sequence introducer under test.
+    :param label: The cursor mode *introducer* corresponds to.
+    :returns: None.
+    """
+    # Down, down, up → lands on index 1; Enter confirms.
+    keys = b"\x1b" + introducer + b"B" + b"\x1b" + introducer + b"B"
+    keys += b"\x1b" + introducer + b"A" + b"\r"
+
+    assert _select_over_pty(monkeypatch, keys) == 1, label

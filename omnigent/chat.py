@@ -1414,15 +1414,21 @@ def _pick_agent(base_url: str, *, quiet: bool = False) -> str:
     :param quiet: When ``True``, suppress interactive prompts and
         auto-select the first available agent.
     :returns: The chosen agent name.
-    :raises click.ClickException: If no sessions exist or no
-        agent name can be discovered.
+    :raises click.ClickException: If the server is unreachable, no
+        sessions exist, or no agent name can be discovered.
     """
-    resp = httpx.get(
-        f"{base_url}/v1/sessions",
-        headers=_remote_headers(server_url=base_url, host_id=None),
-        params={"limit": 100},
-        timeout=10.0,
-    )
+    try:
+        resp = httpx.get(
+            f"{base_url}/v1/sessions",
+            headers=_remote_headers(server_url=base_url, host_id=None),
+            params={"limit": 100},
+            timeout=10.0,
+        )
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError) as exc:
+        # No connection was ever established — a stale/unreachable server
+        # URL is an environment problem, not a crash. Same guard as the
+        # daemon path (_prepare_chat_session_via_daemon).
+        raise click.ClickException(_unreachable_server_message(base_url)) from exc
     resp.raise_for_status()
     sessions = resp.json()["data"]
 

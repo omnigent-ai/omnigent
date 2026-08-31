@@ -75,6 +75,11 @@ def test_spark_source_filters_repository_and_pull_requests() -> None:
         "raw_json": json.dumps({"html_url": "https://github.com/issues/42"}),
     }
 
+    def without_state(**overrides):
+        value = {**base, **overrides}
+        value.pop("state")
+        return value
+
     class Row:
         def __init__(self, value):
             self.value = value
@@ -83,25 +88,32 @@ def test_spark_source_filters_repository_and_pull_requests() -> None:
             return self.value
 
     class Frame:
+        state_dropped = False
+
         def where(self, expression):
             assert expression == "state = 'open'"
             return self
 
+        def drop(self, column):
+            assert column == "state"
+            self.state_dropped = True
+            return self
+
         def collect(self):
+            assert self.state_dropped
             return [
-                Row(base),
-                Row({**base, "issue_number": 43, "repo": "other/repo"}),
+                Row(without_state()),
+                Row(without_state(issue_number=43, repo="other/repo")),
                 Row(
-                    {
-                        **base,
-                        "issue_number": 44,
-                        "raw_json": json.dumps(
+                    without_state(
+                        issue_number=44,
+                        raw_json=json.dumps(
                             {
                                 "html_url": "https://github.com/pull/44",
                                 "pull_request": {"url": "https://api.github.com/pulls/44"},
                             }
                         ),
-                    }
+                    )
                 ),
             ]
 

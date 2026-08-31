@@ -3157,7 +3157,7 @@ class _ConnectSpy:
         return _HandshakeFailingConnect(exc)
 
 
-def _invalid_status(status_code: int) -> InvalidStatus:
+def _invalid_status(status_code: int, body: bytes = b"") -> InvalidStatus:
     """Build a real :class:`InvalidStatus` for a rejected WS upgrade.
 
     Matches what ``websockets`` raises when the server answers the
@@ -3165,10 +3165,13 @@ def _invalid_status(status_code: int) -> InvalidStatus:
 
     :param status_code: HTTP status on the upgrade response, e.g.
         ``403``.
+    :param body: Optional response body the server sent with the refusal
+        (what ``_refuse_upgrade`` emits), so a test can assert it is
+        surfaced to the operator.
     :returns: An ``InvalidStatus`` whose ``response.status_code`` is
         *status_code*.
     """
-    return InvalidStatus(Response(status_code, "", Headers()))
+    return InvalidStatus(Response(status_code, "", Headers(), body))
 
 
 def _patch_connect(monkeypatch: pytest.MonkeyPatch, spy: _ConnectSpy) -> None:
@@ -3855,6 +3858,26 @@ def test_run_host_process_exits_nonzero_on_fatal(
     # The actionable message reached stderr (banner + the 403 cause).
     assert "Could not connect" in err
     assert "HTTP 403" in err
+
+
+async def test_run_host_process_invalid_host_id_exits_actionably(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A malformed configured identity is a user error, not a CLI crash."""
+    monkeypatch.setenv("OMNIGENT_HOST_ID", "not-a-uuid")
+    monkeypatch.setenv("OMNIGENT_HOST_NAME", "managed-test")
+
+    with pytest.raises(SystemExit) as excinfo:
+        run_host_process(
+            server_url="https://app.example.databricks.com",
+            config_path=tmp_path / "config.yaml",
+        )
+
+    assert excinfo.value.code == HOST_FATAL_EXIT_CODE
+    err = capsys.readouterr().err
+    assert "Could not start host" in err
+    assert "OMNIGENT_HOST_ID" in err
+    assert "not-a-uuid" in err
 
 
 def test_run_host_process_announces_session_log_dir_on_start(
@@ -4801,6 +4824,33 @@ def test_post_connect_auth_rejection_escalates_without_going_fatal(
     assert "omnigent login http://localhost:8000" in escalated
     assert "no longer a transient network blip" in escalated
     assert host._auth_retry_streak == _AUTH_REJECT_ESCALATE_ATTEMPTS
+
+
+async def test_fatal_upgrade_error_surfaces_server_refusal_body() -> None:
+    """A refusal that carries a body (what ``_refuse_upgrade`` sends, e.g. the
+    server's malformed-host-id 400) is surfaced verbatim — the client passes the
+    server's own reason through instead of guessing from the status code.
+    """
+    host = _make_host_process()
+    server_reason = (
+        "Invalid host id 'superagent-databricks-host': host ids must be UUIDs. "
+        "Set OMNIGENT_HOST_ID to a UUID (or unset it to have one generated) and reconnect."
+    )
+    err = host._fatal_upgrade_error(_invalid_status(400, server_reason.encode()))
+    assert err is not None  # 400 is a permanent refusal, not retried
+    assert server_reason in str(err)
+    assert "HTTP 400" in str(err)
+
+
+async def test_fatal_upgrade_error_bodyless_4xx_falls_back_to_generic() -> None:
+    """A permanent 4xx with no body (a bare pre-accept close carries none) still
+    yields an actionable, generic message rather than an empty one.
+    """
+    host = _make_host_process()
+    err = host._fatal_upgrade_error(_invalid_status(400))
+    assert err is not None
+    assert "HTTP 400" in str(err)
+    assert "the server rejected the host tunnel request" in str(err)
 
 
 async def test_handle_launch_supersedes_previous_runner_for_same_session(

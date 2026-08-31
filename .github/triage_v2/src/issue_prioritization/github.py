@@ -8,7 +8,11 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from issue_prioritization.bronze import BronzeIssue
-from issue_prioritization.comments import COMMENT_MARKER, build_triage_comment
+from issue_prioritization.comments import (
+    COMMENT_MARKER,
+    build_triage_comment,
+    preserve_needs_info_deadline,
+)
 from issue_prioritization.labels import LabelManifest
 from issue_prioritization.mutations import (
     BotState,
@@ -68,21 +72,97 @@ class GitHubClient:
             )
 
     def issue_labels(self, issue_number: int) -> tuple[str, ...]:
-        value = self.transport("GET", f"/issues/{issue_number}", None)
-        if not isinstance(value, dict):
-            raise ValueError("GitHub issue response must be an object")
+        value = self.issue_data(issue_number)
         labels = value.get("labels", [])
         return tuple(
             str(label["name"]) for label in labels if isinstance(label, dict) and label.get("name")
         )
 
-    def open_issue(self, issue_number: int) -> BronzeIssue | None:
+    def issue_data(self, issue_number: int) -> dict[str, object]:
         value = self.transport("GET", f"/issues/{issue_number}", None)
         if not isinstance(value, dict):
             raise ValueError("GitHub issue response must be an object")
+        return value
+
+    def open_issues_with_label(self, label: str) -> tuple[dict[str, object], ...]:
+        issues = []
+        page = 1
+        while True:
+            path = f"/issues?state=open&labels={quote(label, safe='')}&per_page=100&page={page}"
+            value = self.transport("GET", path, None)
+            if not isinstance(value, list):
+                raise ValueError("GitHub issues response must be an array")
+            issues.extend(
+                issue for issue in value if isinstance(issue, dict) and "pull_request" not in issue
+            )
+            if len(value) < 100:
+                return tuple(issues)
+            page += 1
+
+    def issue_comments(self, issue_number: int) -> tuple[dict[str, object], ...]:
+        comments = []
+        page = 1
+        while True:
+            value = self.transport(
+                "GET", f"/issues/{issue_number}/comments?per_page=100&page={page}", None
+            )
+            if not isinstance(value, list):
+                raise ValueError("GitHub issue comments response must be an array")
+            comments.extend(comment for comment in value if isinstance(comment, dict))
+            if len(value) < 100:
+                return tuple(comments)
+            page += 1
+
+    def comment_on_issue(self, issue_number: int, body: str) -> None:
+        self.transport("POST", f"/issues/{issue_number}/comments", {"body": body})
+
+    def close_issue(self, issue_number: int) -> None:
+        self.transport(
+            "PATCH",
+            f"/issues/{issue_number}",
+            {"state": "closed", "state_reason": "not_planned"},
+        )
+
+    def open_issue(self, issue_number: int) -> BronzeIssue | None:
+        value = self.issue_data(issue_number)
         if value.get("state") != "open" or "pull_request" in value:
             return None
+        author = value.get("user")
+        author_login = str(author.get("login", "")) if isinstance(author, dict) else ""
+        comments = self._author_comments(issue_number, author_login)
+        if comments:
+            original_body = str(value.get("body") or "")
+            value = {
+                **value,
+                "body": "Author follow-up comments (newest first):\n\n"
+                + "\n\n---\n\n".join(reversed(comments))
+                + "\n\nOriginal issue body:\n\n"
+                + original_body,
+            }
         return BronzeIssue.from_mapping(value)
+
+    def _author_comments(self, issue_number: int, author_login: str) -> tuple[str, ...]:
+        if not author_login:
+            return ()
+        comments = []
+        page = 1
+        while True:
+            value = self.transport(
+                "GET", f"/issues/{issue_number}/comments?per_page=100&page={page}", None
+            )
+            if not isinstance(value, list):
+                raise ValueError("GitHub issue comments response must be an array")
+            for comment in value:
+                if not isinstance(comment, dict):
+                    continue
+                user = comment.get("user")
+                login = str(user.get("login", "")) if isinstance(user, dict) else ""
+                body = str(comment.get("body") or "").strip()
+                if login.casefold() == author_login.casefold() and body:
+                    comments.append(body[:4000])
+            if len(value) < 100:
+                return tuple(comments[-5:])
+            page += 1
 
     def apply_labels(
         self,
@@ -115,7 +195,9 @@ class GitHubClient:
                 ):
                     continue
                 comment_id = int(comment["id"])
-                if comment.get("body") != body:
+                existing_body = str(comment.get("body", ""))
+                body = preserve_needs_info_deadline(body, existing_body)
+                if existing_body != body:
                     self.transport("PATCH", f"/issues/comments/{comment_id}", {"body": body})
                 return comment_id
             if len(value) < 100:
@@ -261,7 +343,7 @@ class GitHubMutationSink:
                 if item := ranked.get(issue_number):
                     self.client.upsert_issue_comment(
                         issue_number,
-                        build_triage_comment(item, plan, labels_after),
+                        build_triage_comment(item, plan, labels_after, run.scored_at),
                     )
         finally:
             self.states.upsert(updated)
