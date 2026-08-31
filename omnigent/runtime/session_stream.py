@@ -227,11 +227,13 @@ def publish(conversation_id: str, event: dict[str, Any]) -> int:
         the Omnigent route layer validates each emitted dict against
         the union before serializing, so an unmodelled event
         fails loud at the SSE boundary.
-    :returns: The number of subscriber queues the event was handed to
-        (``0`` when nothing was listening or the event was suppressed).
-        Callers that need a live listener — e.g. the browser action
-        bridge — use this to fail fast instead of awaiting a response
-        that can never arrive; most callers ignore it.
+    :returns: The number of subscriber slots the event was dispatched
+        toward (``0`` when nothing was listening or the event was
+        suppressed). A slow subscriber's queue may still overflow after
+        dispatch, so a positive count is presence, not delivery. Callers
+        that need a live listener — e.g. the browser action bridge — use
+        this to fail fast instead of awaiting a response that can never
+        arrive; most callers ignore it.
     """
     # Mirror the emitted event to the debug-log table (best-effort, table-only,
     # no-op unless the sink is enabled). Done first so it captures every event
