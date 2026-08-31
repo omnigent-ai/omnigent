@@ -34,6 +34,7 @@ import os
 import time
 import uuid
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -197,33 +198,16 @@ def _gate_pending(mock_url: str) -> bool:
     return bool(resp.json().get("pending"))
 
 
-def test_subagent_result_reaches_parent_chat_after_server_blip(
-    wake_loss_stack: _WakeLossStack,
+def _run_browser_journey(
+    stack: _WakeLossStack,
+    session_id: str,
     mock_llm_server_url: str,
-) -> None:
-    """The parent chat must eventually show the sub-agent's result, unprompted.
-
-    Journey (all in the browser): send the dispatch message → see the
-    dispatch ack → server restarts while the researcher finishes → wait on
-    the parent chat with NO further input → the inbox wake and drain must
-    surface in the transcript. On a buggy build nothing arrives; the test
-    then demonstrates the manual bump revealing the stranded result, and
-    fails.
-    """
-    stack = wake_loss_stack
-    reset_mock_llm(mock_llm_server_url)
-
-    uid = uuid.uuid4().hex[:6]
-    parent_model = f"mock-wlui-parent-{uid}"
-    child_model = f"mock-wlui-child-{uid}"
-    mock_base = f"{mock_llm_server_url}/v1"
-    _configure_queues(mock_llm_server_url, parent_model, child_model)
-    session_id = _register_parent_with_researcher(stack, parent_model, child_model, mock_base)
-
+) -> bool:
+    """Drive the synchronous Playwright journey outside pytest's asyncio loop."""
     record_dir = os.environ.get("OMNIGENT_E2E_RECORD_DIR")
     auto_woken = False
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
         context_kwargs: dict[str, object] = {"viewport": {"width": 1280, "height": 720}}
         if record_dir:
             Path(record_dir).mkdir(parents=True, exist_ok=True)
@@ -287,6 +271,39 @@ def test_subagent_result_reaches_parent_chat_after_server_blip(
         finally:
             context.close()
             browser.close()
+    return auto_woken
+
+
+def test_subagent_result_reaches_parent_chat_after_server_blip(
+    wake_loss_stack: _WakeLossStack,
+    mock_llm_server_url: str,
+) -> None:
+    """The parent chat must eventually show the sub-agent's result, unprompted.
+
+    Journey (all in the browser): send the dispatch message → see the
+    dispatch ack → server restarts while the researcher finishes → wait on
+    the parent chat with NO further input → the inbox wake and drain must
+    surface in the transcript. On a buggy build nothing arrives; the test
+    then demonstrates the manual bump revealing the stranded result, and
+    fails.
+    """
+    stack = wake_loss_stack
+    reset_mock_llm(mock_llm_server_url)
+
+    uid = uuid.uuid4().hex[:6]
+    parent_model = f"mock-wlui-parent-{uid}"
+    child_model = f"mock-wlui-child-{uid}"
+    mock_base = f"{mock_llm_server_url}/v1"
+    _configure_queues(mock_llm_server_url, parent_model, child_model)
+    session_id = _register_parent_with_researcher(stack, parent_model, child_model, mock_base)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        auto_woken = executor.submit(
+            _run_browser_journey,
+            stack,
+            session_id,
+            mock_llm_server_url,
+        ).result()
 
     assert auto_woken, (
         f"Sub-agent completion was stranded: after the server came back and the "
