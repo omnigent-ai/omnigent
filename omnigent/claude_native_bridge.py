@@ -4990,18 +4990,26 @@ class _McpProgressHeartbeat:
             self._thread = None
 
     def _run(self) -> None:
-        while not self._stop_event.wait(self._interval_s):
+        # Emit an immediate first tick so the client learns the call is alive
+        # right away, then keep ticking every interval. MCP requires
+        # ``progress`` to increase on every notification; a constant value may
+        # be ignored (or rejected) by conforming clients.
+        tick = 0
+        while True:
+            tick += 1
             notification: _JsonObject = {
                 "jsonrpc": "2.0",
                 "method": "notifications/progress",
                 "params": {
                     "progressToken": self._progress_token,
-                    "progress": 0,
+                    "progress": tick,
                 },
             }
             try:
                 _write_jsonrpc(notification, self._stdout_lock, framed=self._framed)
             except Exception:  # noqa: BLE001 - progress failure must not interrupt execution
+                break
+            if self._stop_event.wait(self._interval_s):
                 break
 
     def __enter__(self) -> _McpProgressHeartbeat:
