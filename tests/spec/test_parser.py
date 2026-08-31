@@ -90,6 +90,7 @@ def test_parse_full_config(tmp_path: Path) -> None:
     assert spec.llm.model == "openai/gpt-5.4"
     # executor.model is the canonical source — verify consolidation
     assert spec.executor.model == "openai/gpt-5.4"
+    assert spec.executor.reasoning_effort == "medium"
     assert spec.llm.extra == {
         "max_completion_tokens": 4096,
         "reasoning_effort": "medium",
@@ -99,6 +100,44 @@ def test_parse_full_config(tmp_path: Path) -> None:
     assert spec.interaction.modalities.output == ["text"]
     assert spec.tools.agents == ["researcher", "critic"]
     assert spec.params == {"max_results": 10, "prefer_recent": True}
+
+
+def test_parse_llm_reasoning_effort_lifted_to_executor(tmp_path: Path) -> None:
+    """The deprecated ``llm.reasoning_effort`` lifts to the canonical field.
+
+    Mirrors the model/connection consolidation: ``executor.reasoning_effort``
+    is the source of truth, populated from the ``llm:`` block for back-compat.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "eff-llm",
+        "llm": {"model": "openai/gpt-5.4", "reasoning_effort": "xhigh"},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.executor.reasoning_effort == "xhigh"
+    assert spec.llm is not None
+    assert spec.llm.extra.get("reasoning_effort") == "xhigh"
+
+
+def test_parse_executor_reasoning_effort_supersedes_llm(tmp_path: Path) -> None:
+    """When both are set, executor.reasoning_effort wins and llm is synced to it."""
+    config = {
+        "spec_version": 1,
+        "name": "eff-both",
+        "executor": {
+            "type": "omnigent",
+            "config": {"harness": "claude-sdk"},
+            "model": "openai/gpt-5.4",
+            "reasoning_effort": "high",
+        },
+        "llm": {"model": "openai/gpt-5.4", "reasoning_effort": "low"},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.executor.reasoning_effort == "high"
+    assert spec.llm is not None
+    assert spec.llm.extra.get("reasoning_effort") == "high"
 
 
 def test_parse_llm_missing_model(tmp_path: Path) -> None:

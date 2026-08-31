@@ -58,32 +58,36 @@ class FakeAgentStore:
 
 
 class _FakeExecutor:
-    def __init__(self, harness: str) -> None:
+    def __init__(self, harness: str, reasoning_effort: str | None = None) -> None:
         # Mirrors AgentSpec.executor: a canonical harness in ``config['harness']``
         # (falls back to ``type``). The permission-mode injection reads this to
         # confirm a claude-native agent before adding ``--permission-mode``.
         self.type = harness
         self.config = {"harness": harness}
+        self.reasoning_effort = reasoning_effort
 
 
 class _FakeSpec:
-    def __init__(self, harness: str) -> None:
-        self.executor = _FakeExecutor(harness)
+    def __init__(self, harness: str, reasoning_effort: str | None = None) -> None:
+        self.executor = _FakeExecutor(harness, reasoning_effort)
 
 
 class _FakeLoadedAgent:
-    def __init__(self, harness: str) -> None:
-        self.spec = _FakeSpec(harness)
+    def __init__(self, harness: str, reasoning_effort: str | None = None) -> None:
+        self.spec = _FakeSpec(harness, reasoning_effort)
 
 
 class FakeAgentCache:
     """Resolves an agent id to a spec with a fixed harness (for launch gating)."""
 
-    def __init__(self, harness: str = "claude-native") -> None:
+    def __init__(
+        self, harness: str = "claude-native", reasoning_effort: str | None = None
+    ) -> None:
         self._harness = harness
+        self._reasoning_effort = reasoning_effort
 
     def load(self, agent_id: str, bundle_location: str, **_: Any) -> _FakeLoadedAgent:
-        return _FakeLoadedAgent(self._harness)
+        return _FakeLoadedAgent(self._harness, self._reasoning_effort)
 
 
 class FakeScheduledTaskStore:
@@ -139,6 +143,7 @@ class SequencedScheduledTaskStore(FakeScheduledTaskStore):
 class FakeConversationStore:
     def __init__(self, *, fail_create: bool = False) -> None:
         self.created: list[dict[str, Any]] = []
+        self.updated: list[dict[str, Any]] = []
         self.create_workspace_ids: list[int] = []
         self._seq = 0
         self.fail_create = fail_create
@@ -159,6 +164,7 @@ class FakeConversationStore:
         return conv
 
     def update_conversation(self, conversation_id: str, **kwargs: Any) -> _FakeConversation:
+        self.updated.append({"id": conversation_id, **kwargs})
         return _FakeConversation(id=conversation_id, agent_id="")
 
     def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
@@ -475,6 +481,80 @@ async def test_permission_mode_omitted_for_non_claude_agent() -> None:
 
     assert len(conv_store.created) == 1
     assert conv_store.created[0]["terminal_launch_args"] is None
+
+
+def _effort_agent_deps(
+    store: FakeScheduledTaskStore,
+    conv_store: FakeConversationStore,
+    *,
+    reasoning_effort: str | None,
+) -> FireDeps:
+    """Deps whose agent ``ag_1`` resolves to a spec carrying *reasoning_effort*."""
+    return _deps(
+        store,
+        permission_store=FakePermissionStore(),
+        conversation_store=conv_store,
+        agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/hash")}),
+        agent_cache=FakeAgentCache(harness="claude-native", reasoning_effort=reasoning_effort),
+    )
+
+
+@pytest.mark.asyncio
+async def test_spec_reasoning_effort_seeded_at_fire() -> None:
+    """A task with no explicit effort inherits ``executor.reasoning_effort``."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _effort_agent_deps(store, conv_store, reasoning_effort="high"),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert any(u.get("reasoning_effort") == "high" for u in conv_store.updated)
+
+
+@pytest.mark.asyncio
+async def test_task_reasoning_effort_overrides_spec_at_fire() -> None:
+    """An explicit task effort wins over the spec default."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(reasoning_effort="low")})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _effort_agent_deps(store, conv_store, reasoning_effort="high"),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert any(u.get("reasoning_effort") == "low" for u in conv_store.updated)
+    assert not any(u.get("reasoning_effort") == "high" for u in conv_store.updated)
+
+
+@pytest.mark.asyncio
+async def test_no_reasoning_effort_when_spec_has_none() -> None:
+    """A task and spec both without effort seed nothing (harness default)."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _effort_agent_deps(store, conv_store, reasoning_effort=None),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert not any("reasoning_effort" in u for u in conv_store.updated)
 
 
 @pytest.mark.asyncio

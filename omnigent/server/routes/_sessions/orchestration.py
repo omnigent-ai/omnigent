@@ -8286,6 +8286,31 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
+    if reasoning_effort is None:
+        effort_spec: AgentSpec | None = sub_spec
+        if effort_spec is None and agent_cache is not None and agent.bundle_location is not None:
+            try:
+                effort_loaded = await asyncio.to_thread(
+                    agent_cache.load,
+                    agent.id,
+                    agent.bundle_location,
+                    expand_env=agent.session_id is None,
+                )
+                effort_spec = effort_loaded.spec if effort_loaded is not None else None
+            except (OSError, ValueError, RuntimeError, KeyError, AttributeError, ImportError):
+                _logger.warning(
+                    "create: spec load for reasoning_effort default failed "
+                    "(agent=%s); session starts with no spec-level effort",
+                    agent.id,
+                    exc_info=True,
+                )
+        spec_effort = effort_spec.executor.reasoning_effort if effort_spec is not None else None
+        if spec_effort is not None:
+            _, reasoning_effort = validate_session_model_metadata(
+                model_override=None,
+                reasoning_effort=spec_effort,
+            )
+
     try:
         conv = conversation_store.create_conversation(
             agent_id=agent.id,
@@ -8659,6 +8684,13 @@ def _create_session_from_bundle(
         enforce_handler_allowlist=not local_single_user_enabled(),
     )
     assert spec.name is not None
+
+    if metadata.reasoning_effort is None and spec.executor.reasoning_effort is not None:
+        _, seeded_effort = validate_session_model_metadata(
+            model_override=None,
+            reasoning_effort=spec.executor.reasoning_effort,
+        )
+        metadata = metadata.model_copy(update={"reasoning_effort": seeded_effort})
 
     agent_id = generate_agent_id()
     agent_bundle_location = bundle_location(agent_id, bundle_bytes)
