@@ -48,6 +48,10 @@ prompt: |
   (file:line) and how you verified it; for REVIEW / EXPLORE, your findings.
   Note anything that did not fit the task.
 
+  If you discover a problem outside your contract, DO NOT FIX IT. Record it in
+  your final report under "DISCOVERED — OUT OF SCOPE" with file:line and
+  evidence, and continue with your assigned work.
+
 os_env:
   type: caller_process
   cwd: .

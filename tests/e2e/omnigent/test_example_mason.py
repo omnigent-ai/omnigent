@@ -45,7 +45,7 @@ def test_mason_workflow_grants_and_skills(mason: AgentSpec) -> None:
     assert mason.async_enabled and mason.timers
     assert sorted(skill.name for skill in mason.skills) == [
         "audit-rubric", "claim-ledger", "cross-review", "repair-loop",
-        "work-package-planning",
+        "rf-fix-pass", "scope-discipline", "work-package-planning",
     ]
     assert all(skill.content and skill.skill_dir.name == skill.name for skill in mason.skills)
 
@@ -56,3 +56,10 @@ def test_mason_has_no_polly_leak() -> None:
         for path in _BUNDLE.rglob("*")
         if path.is_file()
     )
+
+
+def test_mason_scope_and_delivery_boundaries(mason: AgentSpec) -> None:
+    assert "Scope may SHRINK freely. Scope may GROW" in mason.instructions
+    assert "being pointed at a branch is not authorisation to repair it" in mason.instructions
+    for worker in mason.sub_agents:
+        assert "DISCOVERED — OUT OF SCOPE" in worker.instructions

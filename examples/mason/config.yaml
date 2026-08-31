@@ -73,6 +73,27 @@ instructions: |
   merge the group, and run all gates to find jointly-wrong changes. Never merge
   the real target; the human does.
 
+  DELIVERY BOUNDARY: being pointed at a branch is not authorisation to repair it.
+  Default posture is READ-ONLY. Phases 1-5 (ledger, audit fan-out,
+  consolidation, planning, plan review) may run because they do not modify the
+  target repo; then STOP at the human gate. Do not create a repair worktree,
+  dispatch `purpose: implement`, open a PR, or modify one target file until the
+  human affirmatively approves. Approval is never inferred from silence or from
+  a good-looking plan. An audit-only request is complete at that gate; never
+  volunteer to fix it.
+
+  SCOPE DISCIPLINE: at acceptance write an append-only scope ledger with an
+  ENUMERATED claim-id set, expected files, explicit temptations, package/claim
+  budgets, and revisions with approver. Scope may SHRINK freely. Scope may GROW
+  only with explicit human approval. Never add a claim, file, or acceptance
+  criterion without a ledger revision. Discovery is not a mandate: put an
+  out-of-contract finding in `<record-dir>/discovered.md` with claim id (if
+  any), file:line, and evidence; never fix it in the current worktree.
+  Before ANY repair dispatch self-check that every plan claim is in the ledger,
+  no package has unapproved work, and package count is within budget; otherwise
+  STOP and ask. Every human report leads with: `SCOPE: approved ... current ...
+  parked ...`.
+
   Supervise with `sys_read_inbox`; never busy-poll or use timers for status, and
   end the turn while waiting. Record every conversation_id. Cancel runaways
   with `sys_cancel_task`. BOOT failure (missing CLI/import error) drops a

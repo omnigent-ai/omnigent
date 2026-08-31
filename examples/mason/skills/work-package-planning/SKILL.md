@@ -24,7 +24,7 @@ Contract template: package/root cause; claim IDs; files; dependencies; change
 boundary; acceptance criterion and settling evidence per claim; tests/lint/
 typecheck gates; migration/backfill obligations; reviewer checklist.
 
-Derive blast radius with `git show --stat --oneline <claiming-commit>` and `git show <claiming-commit> --`; union those paths with evidence paths. Fill: `PACKAGE: WP-01\nROOT_CAUSE: ...\nCLAIMS: [D-1, D-2]\nFILES: [...]\nDEPENDS_ON: [...]\n`, then add `- D-1: ACCEPTANCE=... EVIDENCE=...` for every claim and finish with `GATES: [pytest ..., ruff ..., pyrefly ...]` and `REVIEW_CHECKLIST: ...`.
+Derive blast radius with `git show --stat --oneline <claiming-commit>` and `git show <claiming-commit> --`; union those paths with evidence paths. Fill: `PACKAGE: WP-01\nROOT_CAUSE: ...\nCLAIMS: [D-1, D-2]\nFILES: [...]\nfiles_allowed: [src/foo.py, tests/test_foo.py]\nfiles_forbidden: [...]\nDEPENDS_ON: [...]\n`, then add `- D-1: ACCEPTANCE=... EVIDENCE=...` for every claim and finish with `GATES: [pytest ..., ruff ..., pyrefly ...]` and `REVIEW_CHECKLIST: ...`.
 
 The plan reviewer receives exactly one plan, findings, and rubric. Its contract is:
 ### What the plan reviewer RECEIVES
