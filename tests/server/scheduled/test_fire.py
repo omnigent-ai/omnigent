@@ -150,7 +150,6 @@ class FakeConversationStore:
         self._seq = 0
         self.fail_create = fail_create
         self.label_writes: dict[str, dict[str, str]] = {}
-        self._by_id: dict[str, _FakeConversation] = {}
 
     def create_conversation(self, **kwargs: Any) -> _FakeConversation:
         self.create_workspace_ids.append(current_workspace_id())
@@ -165,7 +164,6 @@ class FakeConversationStore:
             git_branch=kwargs.get("git_branch"),
         )
         self.created.append(kwargs)
-        self._by_id[conv.id] = conv
         return conv
 
     def update_conversation(self, conversation_id: str, **kwargs: Any) -> _FakeConversation:
@@ -626,15 +624,19 @@ async def test_non_native_host_bound_task_stamps_repl_terminal_label() -> None:
 
 
 @pytest.mark.asyncio
-async def test_task_without_agent_cache_stamps_no_labels() -> None:
-    """No agent cache → no label resolution → Chat-only, fire still succeeds."""
+async def test_non_native_task_without_agent_cache_stamps_no_labels() -> None:
+    """A non-native SDK task without an agent cache stays Chat-only.
+
+    The REPL-terminal branch needs the cache to resolve the harness, so with no
+    cache it can't confirm a terminal — Chat-only, and the fire still succeeds.
+    """
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task()})
 
     async def _launch(conv: Any, task: Any) -> None:
         return None
 
-    # Default _deps leaves agent_cache=None.
+    # Default _deps leaves agent_cache=None and the default agent is non-native.
     on_fire = build_on_fire(
         _deps(store, conversation_store=conv_store),
         launch_dispatch=_launch,
@@ -644,6 +646,38 @@ async def test_task_without_agent_cache_stamps_no_labels() -> None:
 
     assert len(conv_store.created) == 1
     assert conv_store.label_writes == {}
+
+
+@pytest.mark.asyncio
+async def test_native_wrapper_labels_resolve_without_agent_cache() -> None:
+    """Native-wrapper labels come from the agent name, so they need no cache.
+
+    Parity with the interactive create path, which resolves these labels with no
+    cache dependency — a deployment with no fire-deps cache must not silently
+    drop the switcher for a Pi/OpenCode/etc. automation.
+    """
+    from omnigent.native_coding_agents import PI_NATIVE_AGENT_NAME
+
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", name=PI_NATIVE_AGENT_NAME)}),
+        # agent_cache left None.
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(deps, launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.label_writes["conv_1"] == {
+        "omnigent.ui": "terminal",
+        "omnigent.wrapper": PI_NATIVE_AGENT_NAME,
+    }
 
 
 @pytest.mark.asyncio

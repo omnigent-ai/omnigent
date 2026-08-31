@@ -677,8 +677,6 @@ async def _presentation_labels(deps: FireDeps, task: ScheduledTask) -> dict[str,
     Fail-safe: any resolution error omits the labels rather than guessing, so
     the session falls back to Chat-only rather than breaking the fire.
     """
-    if deps.agent_cache is None:
-        return {}
     from omnigent.native_coding_agents import native_coding_agent_for_agent_name
     from omnigent.server.routes.sessions import _repl_terminal_ui_labels
 
@@ -686,12 +684,16 @@ async def _presentation_labels(deps: FireDeps, task: ScheduledTask) -> dict[str,
         agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
         if agent is None:
             return {}
+        # Native-wrapper labels come solely from the agent name, so they resolve
+        # without the cache — matching the interactive path, which has no cache
+        # dependency for this branch.
         native_agent = native_coding_agent_for_agent_name(agent.name)
         if native_agent is not None:
             return dict(native_agent.presentation_labels)
         # Non-native SDK session: it only gets a REPL terminal when a runner
-        # hosts it, so a task with no resolved host stays Chat-only.
-        if task.host_id is None:
+        # hosts it, so a task with no resolved host stays Chat-only. Resolving
+        # the harness for that branch needs the cache.
+        if task.host_id is None or deps.agent_cache is None:
             return {}
         return await asyncio.to_thread(
             _repl_terminal_ui_labels,
