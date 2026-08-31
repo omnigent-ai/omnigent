@@ -239,8 +239,66 @@ def test_handle_mcp_request_emits_progress_notifications(
         "in flight; opencode's resetTimeoutOnProgress cannot extend the 60 s "
         "client deadline without them"
     )
-    # Each notification must carry the progressToken the client sent.
+    # Each notification must carry the progressToken the client sent, and
+    # ``progress`` must strictly increase (MCP requires it; a constant value
+    # may be ignored by conforming clients).
     for notif in notifications_emitted:
         assert notif.get("params", {}).get("progressToken") == "tok-keepalive", (
             f"progress notification is missing or has wrong progressToken: {notif!r}"
         )
+    progresses = [n["params"]["progress"] for n in notifications_emitted]
+    assert progresses == sorted(set(progresses)), (
+        f"progress values must strictly increase, got {progresses!r}"
+    )
+
+
+def test_handle_mcp_request_no_heartbeat_for_local_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hung LOCAL (non-relay) tool must stay killable by the client's static
+    timeout: the bridge must NOT emit keep-alive progress for it, or a wedged
+    local tool would reset opencode's deadline forever.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    notifications_emitted: list[dict] = []
+
+    def _capturing_write(payload: dict, lock: threading.Lock, **kwargs: object) -> None:
+        if payload.get("method") == "notifications/progress":
+            notifications_emitted.append(payload)
+
+    monkeypatch.setattr(claude_native_bridge, "_write_jsonrpc", _capturing_write)
+    # No relay advertises this tool — it is a local tool.
+    monkeypatch.setattr(claude_native_bridge, "_read_relay_tool_names", lambda _path: set())
+
+    # Slow handler: a wrongly-started heartbeat would emit its immediate first
+    # tick during this window, making the assertion below deterministic.
+    def _slow_handle(method: str, params: object, tools: dict, bridge_dir: Path) -> dict:
+        time.sleep(0.3)
+        return {"content": [{"type": "text", "text": "done"}]}
+
+    monkeypatch.setattr(claude_native_bridge, "_handle_mcp_request", _slow_handle)
+
+    request_slots = threading.BoundedSemaphore(4)
+    request_slots.acquire()
+    claude_native_bridge._handle_and_write_mcp_request(
+        7,
+        "tools/call",
+        {
+            "name": "local_tool",
+            "arguments": {},
+            "_meta": {"progressToken": "tok-local"},
+        },
+        {},
+        bridge_dir,
+        threading.Lock(),
+        False,
+        request_slots,
+    )
+
+    assert notifications_emitted == [], (
+        "the bridge emitted keep-alive progress for a non-relay tool call; a hung "
+        f"local tool could never be timed out by the client: {notifications_emitted!r}"
+    )
