@@ -406,35 +406,6 @@ describe("useIdleNotifications re-notification dedup (one beep until viewed)", (
   });
 });
 
-describe("useIdleNotifications archived sessions", () => {
-  it("does NOT notify a new elicitation on an archived session", () => {
-    // The report: it kept notifying after the session was archived.
-    setConversations([conv("a", "running", 0)]);
-    const { rerender } = renderHook(() => useIdleNotifications());
-
-    setConversations([{ ...conv("a", "running", 1), archived: true }]);
-    rerender();
-    expect(showMock).not.toHaveBeenCalled();
-  });
-
-  it("does NOT notify a turn end on an archived session", async () => {
-    setConversations([conv("a", "running")]);
-    const { rerender } = renderHook(() => useIdleNotifications());
-
-    setConversations([{ ...conv("a", "idle"), archived: true }]);
-    rerender();
-    await settle();
-    expect(showMock).not.toHaveBeenCalled();
-  });
-
-  it("keeps an archived awaiting session out of the badge count", () => {
-    isNativeMock.mockReturnValue(true);
-    setConversations([{ ...conv("a", "idle", 1), archived: true }]);
-    renderHook(() => useIdleNotifications());
-    expect(setBadgeMock).toHaveBeenLastCalledWith(0);
-  });
-});
-
 describe("useIdleNotifications active-view suppression", () => {
   it("does NOT notify a turn end for the conversation actively viewed (focused + active)", () => {
     setWindowFocused(true);

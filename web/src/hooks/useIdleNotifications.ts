@@ -8,9 +8,6 @@
 //   * a new elicitation — `pending_elicitations_count` increased (the agent
 //     is asking the user for input)
 //
-// Neither cue fires for an archived session, nor counts toward the badge
-// (see idleTransitions) — archiving means "stop showing me this".
-//
 // A turn-end is DEFERRED by a short settle window. Agents that work in steps
 // emit a `running` -> `idle` edge per step and then resume, so each step would
 // otherwise look like "finished." We wait `IDLE_SETTLE_MS` and only notify if
