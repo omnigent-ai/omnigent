@@ -996,6 +996,12 @@ async def forward_claude_transcript_to_session(
                             # (the user-message reset only fires on the next turn).
                             response_id=state.current_response_id,
                         )
+                        # Re-seed from disk (written per record): a poll the
+                        # stall deadline cancels never returns its advanced
+                        # state, so re-read to resume instead of re-uploading.
+                        subagent_state = await asyncio.to_thread(
+                            _read_subagent_forward_state, bridge_dir
+                        )
                         subagent_state = await _forward_available_subagents(
                             client=client,
                             parent_session_id=current_session_id,
@@ -1331,7 +1337,11 @@ async def _forward_available_subagents(
     offset for every sub-agent already seen. Sub-agents whose
     ``.meta.json`` appears for the first time are registered with AP
     via ``external_subagent_start``; sub-agents already in ``state``
-    just have their ``.jsonl`` tailed forward.
+    just have their ``.jsonl`` tailed forward. The tail cursor advances
+    one record at a time (see ``record_byte_offset``), so a drain the
+    stall deadline cancels resumes at the last fully-posted record on the
+    next poll instead of re-reading — and a sub-agent already forwarded
+    by a prior run resumes at its persisted end offset, not offset 0.
 
     :param client: Omnigent HTTP client.
     :param parent_session_id: Parent (claude-native) conversation id.
@@ -1481,7 +1491,36 @@ async def _forward_available_subagents(
         items_failed = False
         seen_source_ids = list(entry.seen_source_ids)
         seen = set(seen_source_ids)
+        # Durable cursor advances one record at a time: ``committed_offset`` is
+        # the end offset of the last record whose items all posted (or were
+        # skipped), so a drain cut short by the stall deadline or a transient
+        # failure resumes at a record boundary rather than re-reading from the
+        # start. One record can expand to several items, so a record is only
+        # committed once we cross into the next one.
+        committed_offset = entry.byte_offset
+        current_record_offset: int | None = None
         for item in result.items:
+            # Crossing into a new record means every item of the previous one
+            # was handled without breaking — persist its end offset so the
+            # progress survives a later cancel/failure at this boundary.
+            if (
+                current_record_offset is not None
+                and item.record_byte_offset != current_record_offset
+            ):
+                committed_offset = current_record_offset
+                new_entry = SubagentEntry(
+                    subagent_id=entry.subagent_id,
+                    child_conversation_id=entry.child_conversation_id,
+                    byte_offset=committed_offset,
+                    seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
+                    last_activity_ts=now if had_item else entry.last_activity_ts,
+                    last_status=new_entry.last_status,
+                )
+                updated = SubagentForwardState(
+                    subagents={**updated.subagents, subagent_id: new_entry}
+                )
+                await _write_subagent_forward_state_async(bridge_dir, updated)
+            current_record_offset = item.record_byte_offset
             if item.source_id in seen:
                 continue
             retry_key = f"subagent_item:{entry.child_conversation_id}:{item.source_id}"
@@ -1534,7 +1573,7 @@ async def _forward_available_subagents(
                     new_entry = SubagentEntry(
                         subagent_id=entry.subagent_id,
                         child_conversation_id=entry.child_conversation_id,
-                        byte_offset=entry.byte_offset,
+                        byte_offset=committed_offset,
                         seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
                         last_activity_ts=new_entry.last_activity_ts,
                         last_status=new_entry.last_status,
@@ -1563,7 +1602,7 @@ async def _forward_available_subagents(
                     new_entry = SubagentEntry(
                         subagent_id=entry.subagent_id,
                         child_conversation_id=entry.child_conversation_id,
-                        byte_offset=entry.byte_offset,
+                        byte_offset=committed_offset,
                         seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
                         last_activity_ts=new_entry.last_activity_ts,
                         last_status=new_entry.last_status,
@@ -1599,37 +1638,27 @@ async def _forward_available_subagents(
             new_entry = SubagentEntry(
                 subagent_id=entry.subagent_id,
                 child_conversation_id=entry.child_conversation_id,
-                byte_offset=entry.byte_offset,
+                byte_offset=committed_offset,
                 seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
                 last_activity_ts=now,
                 last_status=new_entry.last_status,
             )
             updated = SubagentForwardState(subagents={**updated.subagents, subagent_id: new_entry})
             await _write_subagent_forward_state_async(bridge_dir, updated)
-        # Only advance the cursor when every item this tick was
-        # posted successfully (or there were no items at all).
-        # Advancing past a failed item permanently skips it.
-        if not items_failed and (result.byte_offset != entry.byte_offset or had_item):
+        # A clean pass (no transient failure) consumed every record the reader
+        # returned, so advance to its end offset — this also covers trailing
+        # records that produced no items. A cut-short pass leaves ``new_entry``
+        # at ``committed_offset`` (the last fully-posted record) from the loop
+        # above, so the next poll resumes there and re-reads only the failed
+        # record; advancing past a failed item would permanently skip it.
+        if not items_failed and (result.byte_offset != new_entry.byte_offset or had_item):
             new_entry = SubagentEntry(
                 subagent_id=entry.subagent_id,
                 child_conversation_id=entry.child_conversation_id,
                 byte_offset=result.byte_offset,
                 seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
                 last_activity_ts=now if had_item else entry.last_activity_ts,
-                last_status=entry.last_status,
-            )
-        elif had_item:
-            # Items DID flow but a later post failed — still record
-            # the activity timestamp so the status badge advances,
-            # but leave byte_offset at the previous tick's value so
-            # the failed items get retried.
-            new_entry = SubagentEntry(
-                subagent_id=entry.subagent_id,
-                child_conversation_id=entry.child_conversation_id,
-                byte_offset=entry.byte_offset,
-                seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
-                last_activity_ts=now,
-                last_status=entry.last_status,
+                last_status=new_entry.last_status,
             )
 
         # Quiescence-based status. Sub-agent transcripts don't carry

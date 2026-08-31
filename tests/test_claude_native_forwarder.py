@@ -5171,6 +5171,130 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
         server.server_close()
 
 
+async def test_subagent_watcher_advances_cursor_per_record_on_partial_drain(
+    tmp_path: Path,
+) -> None:
+    """
+    A drain cut short by a failed post commits the cursor to the last
+    fully-posted record, so the retry resumes there instead of re-reading
+    (and re-posting) the whole transcript from offset 0.
+
+    Three records; the third's post fails transiently once. The first pass
+    must leave ``byte_offset`` at the boundary after the second record — not
+    at 0 (the old behaviour) and not at EOF — and the retry must post only
+    the third record.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    subagent_jsonl = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="rec1",
+        agent_type="Explore",
+        description="per-record cursor",
+        tool_use_id="toolu_rec",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "user",
+                "uuid": "sa-user",
+                "message": {"role": "user", "content": "go"},
+            },
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "sa-one",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "one"}]},
+            },
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "sa-two",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "two"}]},
+            },
+        ],
+    )
+    # Byte offset immediately after the second record — the boundary the
+    # cut-short drain must commit to. Robust to serialization: the position
+    # right after the second newline.
+    data = subagent_jsonl.read_bytes()
+    newlines = [i for i, byte in enumerate(data) if byte == 0x0A]
+    boundary_after_second = newlines[1] + 1
+
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "rec1": forwarder.SubagentEntry(
+                subagent_id="rec1",
+                child_conversation_id="conv_child_rec",
+            )
+        }
+    )
+    posted_items: list[str] = []
+    fail_two_once = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """
+        Fail the third record's item once; accept everything else.
+
+        :param request: Request issued by the forwarder.
+        :returns: Canned Omnigent response.
+        """
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") != "external_conversation_item":
+            return httpx.Response(202, json={})
+        text = body["data"]["item_data"]["content"][0]["text"]
+        posted_items.append(text)
+        if text == "two" and fail_two_once["count"] == 0:
+            fail_two_once["count"] += 1
+            return httpx.Response(503, json={"error": "try again"})
+        return httpx.Response(202, json={})
+
+    item_retry_tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        first = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=item_retry_tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+        # First two records posted; the third failed. The cursor sits at the
+        # boundary after the second record — durable progress, not 0, not EOF.
+        assert posted_items == ["go", "one", "two"]
+        assert first.subagents["rec1"].byte_offset == boundary_after_second
+        assert 0 < boundary_after_second < subagent_jsonl.stat().st_size
+
+        second = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=first,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=item_retry_tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    # The retry resumed at the boundary and re-posted only the third record
+    # ("go"/"one" were not re-read), then advanced to EOF.
+    assert posted_items == ["go", "one", "two", "two"]
+    assert second.subagents["rec1"].byte_offset == subagent_jsonl.stat().st_size
+    assert set(second.subagents["rec1"].seen_source_ids) == {
+        "sa-user:0:message",
+        "sa-one:0:message",
+        "sa-two:0:message",
+    }
+
+
 async def test_subagent_watcher_retry_skips_previously_posted_items(
     tmp_path: Path,
 ) -> None:

@@ -44,7 +44,7 @@ import threading
 import time
 import urllib.parse
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -436,6 +436,14 @@ class ClaudeTranscriptItem:
         :func:`omnigent.claude_native_forwarder._forward_available_items`)
         instead of rendering the summary as a user bubble. Defaults to
         ``False`` for every ordinary transcript item.
+    :param record_byte_offset: Byte offset immediately after the JSONL
+        record this item was parsed from, e.g. ``4096`` — the cursor
+        position that has fully consumed the item's record. Populated only
+        by :func:`read_transcript_items_from_offset`; the sub-agent
+        forwarder advances its durable cursor to this value once every item
+        sharing the record has been posted, so a cut-short drain resumes at
+        a record boundary rather than re-reading from the start. Defaults to
+        ``0`` for items produced by other readers.
     """
 
     source_id: str
@@ -443,6 +451,7 @@ class ClaudeTranscriptItem:
     data: _JsonObject
     response_id: str
     is_compact_summary: bool = False
+    record_byte_offset: int = 0
 
 
 @dataclass(frozen=True)
@@ -2478,6 +2487,10 @@ def read_transcript_items_from_offset(
             settled_response_id=active_settled_id,
             include_sidechains=include_sidechains,
         )
+        # Tag each item with the byte offset immediately after its source
+        # record, so a consumer can advance a durable cursor one record at a
+        # time (the sub-agent forwarder commits progress per record).
+        parsed = [replace(item, record_byte_offset=record.next_byte_offset) for item in parsed]
         items.extend(parsed)
         # Post-compaction output continues the SAME turn: a batch holding
         # the compact summary AND the resumed output must not parse the
