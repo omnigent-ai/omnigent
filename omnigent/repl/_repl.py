@@ -6059,6 +6059,19 @@ async def _cmd_compact(
     """Request proactive context compaction for the current conversation."""
     from rich.text import Text
 
+    from omnigent.harness_aliases import is_native_harness
+
+    _harness = getattr(session, "harness", None)
+    if not is_native_harness(_harness):
+        host.output(
+            Text.from_markup(
+                f"  [{fmt.muted}]/compact is only available for native-TUI sessions "
+                f"(claude, codex, cursor, …). This session uses the "
+                f"{_harness or 'unknown'} harness, which manages its own "
+                f"context window.[/{fmt.muted}]"
+            )
+        )
+        return
     if session.is_streaming:
         host.output(
             Text.from_markup(
