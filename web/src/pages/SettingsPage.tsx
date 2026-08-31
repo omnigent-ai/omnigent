@@ -176,7 +176,11 @@ import {
   writeSubmitWithModEnter,
 } from "@/lib/composerSendShortcutPreferences";
 import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
-import { readRetentionDays, writeRetentionDays } from "@/lib/retentionPreferences";
+import {
+  archivedAtSeconds,
+  readRetentionDays,
+  writeRetentionDays,
+} from "@/lib/retentionPreferences";
 import {
   DEFAULT_HIDE_UNCONFIGURED_HARNESSES,
   readHideUnconfiguredHarnesses,
@@ -2114,15 +2118,25 @@ function ImportSection() {
 }
 
 function ArchivedSection() {
+  // `undefined` = all projects; a name scopes the list to that project.
   const [project, setProject] = useState<string | undefined>(undefined);
   const [retentionDays, setRetentionDays] = useState<number | null>(() => readRetentionDays());
   const [deleteExpiredOpen, setDeleteExpiredOpen] = useState(false);
   const bulkDelete = useBulkDeleteConversations();
   const viewerId = useViewerId();
 
+  // Picker options: every project that has an archived session. Sourced from a
+  // dedicated hook that pages through ALL archived sessions server-side —
+  // `useProjects()` omits all-archived projects, and deriving options from only
+  // the visible list's loaded first page would hide archived-only projects
+  // whose sessions sit on later pages.
   const namesQuery = useArchivedProjectNames();
   const projectNames = useMemo(() => namesQuery.data ?? [], [namesQuery.data]);
 
+  // A picked project can vanish from the option set for good (its last
+  // archived session deleted or restored, possibly by another client). Once
+  // the scan settles without it, fall back to "All projects" rather than
+  // pinning a defunct filter with a project-scoped empty state.
   useEffect(() => {
     if (
       project !== undefined &&
@@ -2134,6 +2148,7 @@ function ArchivedSection() {
     }
   }, [project, projectNames, namesQuery.isSuccess, namesQuery.isFetching]);
 
+  // The visible list, filtered server-side via ?project= when one is picked.
   const listQuery = useConversations("", true, undefined, project);
   const archived = useMemo(
     () => (listQuery.data?.pages ?? []).flatMap((p) => p.data).filter((c) => c.archived === true),
@@ -2147,10 +2162,7 @@ function ArchivedSection() {
 
   const expiredSessions = useMemo(() => {
     if (cutoff === null) return [];
-    return archived.filter((c) => {
-      const archivedAt = c.archived_at ?? c.updated_at;
-      return archivedAt < cutoff;
-    });
+    return archived.filter((c) => archivedAtSeconds(c) < cutoff);
   }, [archived, cutoff]);
 
   // Filter expired sessions to only owned ones (same pattern as ArchivedBulkActionBar)
@@ -2176,6 +2188,9 @@ function ArchivedSection() {
     return groups;
   }, [archived]);
 
+  // Keep a picked project listed even if it drops out of the option set (its
+  // last archived session was just unarchived) so the trigger never shows a
+  // blank, orphaned value while the refetch settles.
   const items =
     project && !projectNames.includes(project) ? [project, ...projectNames] : projectNames;
 
@@ -2372,6 +2387,8 @@ function ArchivedSection() {
       {listQuery.isLoading ? (
         <p className="text-ui text-muted-foreground">Loading…</p>
       ) : archived.length === 0 && !listQuery.hasNextPage ? (
+        // Definitive empty only when there are no archived rows AND no further
+        // pages to fetch.
         <p className="text-ui text-muted-foreground">
           {project ? "No archived sessions in this project." : "No archived sessions."}
         </p>
@@ -2401,12 +2418,19 @@ function ArchivedSection() {
             </div>
           )}
           {archived.length === 0 && (
+            // The list fetches a mixed page (active + archived rows) and filters
+            // to archived client-side; archived sessions are older and can sort
+            // onto later pages, so a page with none isn't the end. Offer to page
+            // forward instead of dead-ending on the definitive empty state.
             <p className="text-ui text-muted-foreground">
               {project
                 ? "No archived sessions in this project on this page."
                 : "No archived sessions on this page."}
             </p>
           )}
+          {/* Keep the pager visible whenever more pages exist, independent of the
+              current page's archived count — otherwise a first page of only
+              active rows would hide the archived rows on later pages. */}
           {listQuery.hasNextPage && (
             <div className="mt-3">
               <Button
@@ -2601,8 +2625,7 @@ function ArchivedRow({
   isSelected: boolean;
   onToggleSelected: (id: string) => void;
 }) {
-  const isExpired =
-    cutoff !== null && (conversation.archived_at ?? conversation.updated_at) < cutoff;
+  const isExpired = cutoff !== null && archivedAtSeconds(conversation) < cutoff;
   const navigate = useNavigate();
   const archive = useArchiveConversation();
   const del = useStopAndDeleteConversation();

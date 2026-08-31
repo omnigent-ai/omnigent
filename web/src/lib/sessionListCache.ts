@@ -38,6 +38,16 @@ export const PROJECT_LABEL_KEY = "omni_project";
  */
 export const PINNED_LABEL_KEY = "omnigent.pinned";
 
+/**
+ * The reserved `conversation_labels` key holding the epoch-SECONDS time a
+ * session was archived. Written by the server on the archive transition and
+ * deleted on unarchive, so its absence is normal for sessions archived before
+ * this shipped (readers fall back to `updated_at`). Seconds, not the pin key's
+ * epoch-ms, to match that fallback's unit. Mirrors the server's
+ * `ARCHIVED_AT_LABEL_KEY`.
+ */
+export const ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at";
+
 /** Filter dimensions encoded by a `["conversations", ...]` query key. */
 export interface ConversationListFilters {
   searchQuery: string;

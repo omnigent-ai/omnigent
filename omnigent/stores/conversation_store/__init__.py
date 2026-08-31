@@ -141,6 +141,14 @@ def pinned_label_key(user_id: str | None) -> str:
     return f"{PINNED_LABEL_KEY}.{suffix}"
 
 
+# Epoch-SECONDS time a session was archived, written on archive and deleted on
+# unarchive. A label rather than a ``conversations`` column, so ageing out old
+# archived sessions needs no schema migration; readers fall back to
+# ``updated_at`` when it is absent. Seconds, not the pin key's epoch-ms, to
+# match that fallback's unit.
+ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at"
+
+
 # Labels that must NOT cross into a new session context — deliberately
 # dropped both when forking (not copied to the clone) and on an in-place
 # agent switch (deleted from the switched session). Two distinct reasons

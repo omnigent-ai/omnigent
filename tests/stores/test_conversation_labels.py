@@ -17,6 +17,7 @@ from omnigent.entities import (
     MessageData,
     NewConversationItem,
 )
+from omnigent.stores.conversation_store import ARCHIVED_AT_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -435,3 +436,38 @@ def test_upsert_refreshes_timestamp_on_overwrite(
     # `value` and `updated_at`. If this reads first_stamp,
     # the `set_` clause forgot `updated_at`.
     assert stamp == second_stamp
+
+
+def test_archive_stamps_archived_at_once_and_clears_on_unarchive(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Archiving records the archive time under
+    ``ARCHIVED_AT_LABEL_KEY``; a redundant re-archive must NOT
+    rewrite it (that would restart the retention clock, so an
+    expired session could never age out), and unarchiving deletes
+    it so a later re-archive starts a fresh clock."""
+    conv = conversation_store.create_conversation()
+    fresh = conversation_store.get_conversation(conv.id)
+    assert fresh is not None
+    assert ARCHIVED_AT_LABEL_KEY not in fresh.labels
+
+    conversation_store.update_conversation(conv.id, archived=True)
+    archived = conversation_store.get_conversation(conv.id)
+    assert archived is not None
+    assert int(archived.labels[ARCHIVED_AT_LABEL_KEY]) > 0
+
+    # Rewind the stamp to a known old value, then re-archive an
+    # already-archived session: the stamp must survive untouched.
+    # Asserting against a planted value rather than comparing two
+    # real timestamps, which share a second and would match even
+    # if the code did overwrite.
+    conversation_store.set_labels(conv.id, {ARCHIVED_AT_LABEL_KEY: "1000"})
+    conversation_store.update_conversation(conv.id, archived=True)
+    again = conversation_store.get_conversation(conv.id)
+    assert again is not None
+    assert again.labels[ARCHIVED_AT_LABEL_KEY] == "1000"
+
+    conversation_store.update_conversation(conv.id, archived=False)
+    restored = conversation_store.get_conversation(conv.id)
+    assert restored is not None
+    assert ARCHIVED_AT_LABEL_KEY not in restored.labels
