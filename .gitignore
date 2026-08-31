@@ -6,6 +6,12 @@ node_modules/
 .pnpm-debug.log*
 reviews/
 
+# repro/resolve-agent workspace artifacts — bug-repro recordings and the
+# machine-readable handoff. Ride in the PR Demo section / CI artifact bundle,
+# never in the diff. Gitignored so a stray `git add` can't sweep them into a PR.
+recordings/
+.omnigent/
+
 # Generated artifact; never committed.
 .pytest_cache/
 __pycache__/
