@@ -639,12 +639,22 @@ export function useArchiveConversation() {
       // overlay and clobber the flag with the stale search-indexed state.
       await queryClient.cancelQueries({ queryKey: ["conversations"] });
       overlayArchivedIntoCaches(queryClient, id, archived);
+      // A pinned session outside the paginated window lives only in the pinned
+      // backfill cache, which the overlay above doesn't reach; drop it from
+      // there too so an archived pin vanishes eagerly (mirrors delete).
+      if (archived) {
+        queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
+          old ? { ...old, conversations: old.conversations.filter((c) => c.id !== id) } : old,
+        );
+      }
     },
     onError: (_err, { archived }) => {
       // The PATCH failed — reconcile the optimistic flag from the server (the
-      // row snaps back to its old section on the refetch).
+      // row snaps back to its old section on the refetch, and a dropped pin
+      // returns to the pinned backfill).
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: PINNED_CONVERSATIONS_KEY });
       showToast(
         archived
           ? "Couldn't archive the session — it's back in the sidebar."

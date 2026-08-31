@@ -16,7 +16,7 @@
 // file exercises the archive path from a row's kebab.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -145,12 +145,10 @@ describe("archive flow", () => {
     clickArchive();
 
     expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
-    expect(mocks.archive.mutate).toHaveBeenCalledWith(
-      { id: "conv_1", archived: true },
-      // The optimistic overlay + error reconcile live in the hook; the only
-      // call-site callback is the success toast.
-      expect.objectContaining({ onSuccess: expect.any(Function) }),
-    );
+    // Just the flag — the optimistic overlay + error reconcile live in the
+    // hook, and the toast fires synchronously (not in a mutate callback, which
+    // wouldn't fire once the optimistic overlay unmounts the row).
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({ id: "conv_1", archived: true });
     // The server owns the stop. A client stop here would race it against
     // the same runner and put its timeouts in front of the flag flip.
     expect(mocks.stop.mutate).not.toHaveBeenCalled();
@@ -169,15 +167,13 @@ describe("archive flow", () => {
     expect(screen.getByRole("link", { name: /My Session/ })).toBeInTheDocument();
   });
 
-  it("toasts a pointer to Settings once the archive succeeds", async () => {
+  it("toasts a pointer to Settings on archive", async () => {
     mockConversations([CONV]);
     renderSidebar();
     clickArchive();
 
-    // Drive the archive to its success callback.
-    const archiveArgs = mocks.archive.mutate.mock.calls[0];
-    act(() => (archiveArgs[1] as { onSuccess: () => void }).onSuccess());
-
+    // The toast fires synchronously on click (the row is about to unmount, so
+    // it can't wait for a mutate callback) — no need to drive onSuccess.
     const toast = await screen.findByTestId("toast");
     expect(within(toast).getByText(/View archived sessions in/)).toBeInTheDocument();
     expect(within(toast).getByRole("link", { name: "Settings" })).toHaveAttribute(

@@ -3426,11 +3426,12 @@ function ConversationRow({
     // later with a stale `isActive`, which used to jump the user off whatever
     // session they'd switched to meanwhile. Mirrors confirmDelete.
     if (nextArchived && isActive) navigate("/", { replace: true });
-    archive.mutate(
-      { id: conversation.id, archived: nextArchived },
-      // Point the user at where the session went once the archive confirms.
-      { onSuccess: nextArchived ? showArchivedToast : undefined },
-    );
+    archive.mutate({ id: conversation.id, archived: nextArchived });
+    // Point the user at where the session went — fire NOW, not in a mutate
+    // onSuccess: the optimistic overlay unmounts this row on the next frame,
+    // and per-call mutate callbacks don't fire once their observer unmounts.
+    // A failed archive reconciles the row back with its own error toast.
+    if (nextArchived) showArchivedToast();
   }
 
   function confirmLeave() {

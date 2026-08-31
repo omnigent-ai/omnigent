@@ -179,7 +179,10 @@ export function HeaderConversationMenu({
     // confirmDelete — rather than in an onSuccess callback that fires a
     // round-trip later with a stale active session.
     navigate("/", { replace: true });
-    archive.mutate({ id: conversation.id, archived: true }, { onSuccess: showArchivedToast });
+    archive.mutate({ id: conversation.id, archived: true });
+    // Fire NOW, not in a mutate onSuccess: navigating away unmounts this menu,
+    // and per-call mutate callbacks don't fire once their observer unmounts.
+    showArchivedToast();
   };
 
   const mainItems = (

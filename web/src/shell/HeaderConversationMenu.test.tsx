@@ -165,10 +165,10 @@ describe("HeaderConversationMenu", () => {
 
     openMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
-    expect(mocks.archive).toHaveBeenCalledWith(
-      { id: "conv-1", archived: true },
-      expect.objectContaining({ onSuccess: expect.any(Function) }),
-    );
+    // Just the flag: the optimistic overlay lives in the hook, and the
+    // "view archived" toast fires synchronously (navigating away unmounts this
+    // menu, so a mutate onSuccess callback wouldn't fire).
+    expect(mocks.archive).toHaveBeenCalledWith({ id: "conv-1", archived: true });
 
     view.unmount();
     renderMenu();
