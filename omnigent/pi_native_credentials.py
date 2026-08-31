@@ -920,7 +920,13 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         provider_id=_PI_PROVIDER_ID,
         base_url=_gateway_anthropic_base_url(transport.base_url),
         api="anthropic-messages",
-        model=model or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
+        # DATABRICKS-PATCH(pi-live-model-discovery): prefer what the workspace
+        # actually serves (fetched above) over the bundled catalog, which is
+        # workspace-agnostic — resolving from it alone can select, and register
+        # in models.json, a model this workspace does not serve.
+        model=model
+        or _default_claude_model_from(claude_models)
+        or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
         # Pi resolves a "!command" apiKey at request time, so the gateway
         # bearer token (the codex auth command prints it) is refreshed per
         # request — matching codex-native's refresh semantics.

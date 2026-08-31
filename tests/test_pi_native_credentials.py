@@ -654,6 +654,72 @@ def test_cli_config_databricks_respects_model_override(
     )
 
 
+def _stub_cli_config_workspace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the cli-config path reach live discovery.
+
+    It only lists models when the real workspace URL resolves and the auth
+    command yields a token; both need the SDK, which tests don't have.
+    """
+    from omnigent.runtime.credentials import databricks as db_creds_mod
+
+    monkeypatch.setattr(
+        creds,
+        "resolve_databricks_workspace",
+        lambda profile: db_creds_mod.WorkspaceCreds(
+            host="https://wkspc.example.com", token="sdk-tok"
+        ),
+    )
+    monkeypatch.setattr(creds, "_run_auth_command", lambda *_: "cmd-tok")
+
+
+def test_cli_config_databricks_prefers_live_models_over_catalog(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The cli-config branch selects a live workspace model, not a catalog one.
+
+    The bundled catalog is workspace-agnostic, so resolving the launch model
+    from it can name an endpoint this workspace does not serve — and
+    ``to_models_config`` then registers that unservable id in models.json
+    alongside the live ones. The databricks-kind branch already preferred live
+    discovery; this branch did not.
+    """
+    _write_codex_config(tmp_path, _DATABRICKS_CODEX_CONFIG)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _stub_cli_config_workspace(monkeypatch)
+    live_claude = [
+        {"id": "system.ai.claude-sonnet-5", "input": ["text", "image"]},
+        {"id": "system.ai.claude-opus-5", "input": ["text", "image"]},
+    ]
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", lambda *_: (live_claude, [], [], []))
+
+    provider = creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_config)
+
+    assert provider is not None
+    # Newest opus from the live listing — not "catalog-databricks-claude-default".
+    assert provider.model == "system.ai.claude-opus-5"
+    # And no extra id is registered beyond what the workspace actually serves.
+    cfg = provider.to_models_config()
+    assert [m["id"] for m in cfg["providers"]["omnigent"]["models"]] == [
+        "system.ai.claude-sonnet-5",
+        "system.ai.claude-opus-5",
+    ]
+
+
+def test_cli_config_databricks_falls_back_to_catalog_without_live_models(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An empty live listing still falls back to the catalog default."""
+    _write_codex_config(tmp_path, _DATABRICKS_CODEX_CONFIG)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _stub_cli_config_workspace(monkeypatch)
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", lambda *_: ([], [], [], []))
+
+    provider = creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_config)
+
+    assert provider is not None
+    assert provider.model == "catalog-databricks-claude-default"
+
+
 def test_cli_config_missing_codex_table_returns_none(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
