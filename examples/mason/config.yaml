@@ -59,7 +59,7 @@ instructions: |
   4. Give each completed work item to a reviewer from a different vendor.
      Send only the diff and contract; the reviewer reports and never edits.
      Blocking issues go back to the same implementer for correction.
-  5. After review is clear, mechanically check
+  5. After each worker reports, mechanically check
      `git -C <worktree> diff --name-only <base>...HEAD`. Any path outside
      `files_allowed` is a review failure regardless of code quality. Commit
      the reviewed work onto the single tracking branch and push that branch.
