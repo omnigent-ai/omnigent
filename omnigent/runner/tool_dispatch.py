@@ -483,6 +483,31 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
 )
 
 
+def strip_browser_tool_schemas(schemas: list[_JsonObject]) -> list[_JsonObject]:
+    """Drop the ``browser_*`` tool schemas from a tool-schema list.
+
+    Used when the turn's dispatch says no renderer is subscribed to the
+    session stream: a browser tool advertised then can only stall for the
+    full server-side await and fail, so a headless turn must not offer it
+    to the model at all. Handles both the nested OpenAI shape
+    (``{"function": {"name": ...}}``) and the flat relay shape
+    (``{"name": ...}``).
+
+    :param schemas: Tool schemas in either supported shape.
+    :returns: The same list minus any ``browser_*`` entries.
+    """
+    kept: list[_JsonObject] = []
+    for schema in schemas:
+        name: object = schema.get("name")
+        if not isinstance(name, str):
+            function = _string_object_dict(schema.get("function"))
+            name = function.get("name") if function is not None else None
+        if isinstance(name, str) and name in _BROWSER_TOOLS:
+            continue
+        kept.append(schema)
+    return kept
+
+
 def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]:
     """Build the flat Omnigent tool surface for native harness bridges.
 

@@ -424,9 +424,11 @@ async def test_timeout_returns_clean_json_and_cleans_registry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    With no renderer result, the await elapses and the route returns the
-    clean timeout JSON — and the registry, owner, and claim entries are
-    all removed in the ``finally`` (no leak).
+    A subscribed renderer that never answers: the await elapses and the
+    route returns the clean timeout JSON — and the registry, owner, and
+    claim entries are all removed in the ``finally`` (no leak). The
+    subscriber is required: with none at all the route fails fast before
+    parking anything.
     """
     # Shrink the await so the test doesn't wait 30s.
     monkeypatch.setattr(sessions_routes, "_BROWSER_ACTION_AWAIT_S", 0.2)
@@ -434,16 +436,60 @@ async def test_timeout_returns_clean_json_and_cleans_registry(
     agent = await create_test_agent(client, "test-browser-timeout")
     session_id = await _create_session(client, agent["id"])
 
-    resp = await client.post(
-        f"/v1/sessions/{session_id}/browser/action_request",
-        json={"action": "snapshot", "args": {}},
-    )
+    # Subscribe a renderer that observes the request but never resolves it.
+    subscribed = asyncio.Event()
+    drain = asyncio.create_task(_drain_until_action_request(session_id, subscribed=subscribed))
+    await subscribed.wait()
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/browser/action_request",
+            json={"action": "snapshot", "args": {}},
+        )
+        await drain  # the event was published before the await elapsed
+    finally:
+        drain.cancel()
+        await asyncio.gather(drain, return_exceptions=True)
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert "timed out" in body["error"]
     assert "Omnigent desktop app" in body["error"]
 
     # Registry fully cleaned — no leaked Future / owner / claim.
+    assert sessions_routes._browser_action_registry == {}
+    assert sessions_routes._browser_action_owners == {}
+    assert sessions_routes._browser_action_claims == {}
+
+
+async def test_request_without_subscriber_fails_fast(client: httpx.AsyncClient) -> None:
+    """
+    With NO subscriber on the session stream, the request route returns
+    the timeout-error JSON immediately — it must not hold the runner's
+    POST for the full ``_BROWSER_ACTION_AWAIT_S`` budget. A headless or
+    scheduled session pays ~0 s per browser call, not 30 s.
+    """
+    import time
+
+    agent = await create_test_agent(client, "test-browser-fail-fast")
+    session_id = await _create_session(client, agent["id"])
+
+    # NOTE: the full 30 s await budget is deliberately NOT shrunk here —
+    # a regression that re-awaits with no subscriber makes this test take
+    # 30 s and fail the elapsed assertion, not hang.
+    start = time.monotonic()
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/browser/action_request",
+        json={"action": "navigate", "args": {"url": "https://example.com"}},
+    )
+    elapsed = time.monotonic() - start
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "timed out" in body["error"]
+    assert elapsed < 2.0, (
+        f"action_request took {elapsed:.1f}s with no subscriber — the route "
+        "must fail fast instead of awaiting a renderer that can never answer"
+    )
+    # Nothing was parked: registries stay clean.
     assert sessions_routes._browser_action_registry == {}
     assert sessions_routes._browser_action_owners == {}
     assert sessions_routes._browser_action_claims == {}

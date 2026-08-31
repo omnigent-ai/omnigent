@@ -113,7 +113,16 @@ def register_browser_routes(
             )
             from omnigent.server.routes import sessions as _sessions_facade
 
-            _sessions_facade.session_stream.publish(session_id, event.model_dump())
+            delivered = _sessions_facade.session_stream.publish(session_id, event.model_dump())
+            if delivered == 0:
+                # Fail fast: the stream has no buffer or replay, so a
+                # request delivered to zero subscribers can never be
+                # answered — return the timeout result immediately
+                # instead of holding the runner's POST for the full
+                # await budget. Checked on the publish return (not a
+                # separate pre-check) so a subscriber disconnecting
+                # between check and publish can't reintroduce the wait.
+                return _BROWSER_ACTION_TIMEOUT_RESULT
             done, _pending = await asyncio.wait(
                 {future},
                 timeout=_sessions_facade._BROWSER_ACTION_AWAIT_S,

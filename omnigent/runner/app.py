@@ -6970,6 +6970,14 @@ def create_runner_app(
                     )
 
         _spec_tools = _session_tool_schemas.get(conv) or []
+        # Headless sessions must not advertise browser tools: with no
+        # renderer subscribed to the session stream, every ``browser_*``
+        # call can only stall and fail. The server stamps the hint on the
+        # forwarded turn; absent (older server) keeps them advertised.
+        if msg_body.get("browser_renderer_available") is False:
+            from omnigent.runner.tool_dispatch import strip_browser_tool_schemas
+
+            _spec_tools = strip_browser_tool_schemas(_spec_tools)
         _client_tools = cast(list[_JsonObject], msg_body.get("tools") or [])
         merged_tools = _merge_request_client_tools(_spec_tools, _client_tools)
         if merged_tools:
