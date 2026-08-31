@@ -344,7 +344,8 @@ request enforces this, so unsigned commits will block merging.
 - Sign off your commits with `git commit -s` (see
   [Developer Certificate of Origin](#developer-certificate-of-origin) above).
 - **Reference an issue** (see below).
-- Fill in the PR template. For **UI / frontend changes**, check the
+- Fill in the PR template. Bug fixes and features should include reproducible
+  evidence in the Demo or Test Plan. For **UI / frontend changes**, check the
   "UI / frontend change" box and attach a **video or images** in the `Demo`
   section showing the new behaviour, so reviewers can see it without checking
   out the branch.

@@ -5,7 +5,7 @@ const MS_PER_HOUR = 60 * 60 * 1000;
 const HOURS_TO_SCAN = 24;
 const NEEDS_DEMO_LABEL = "needs-demo";
 const DEMO_COMMENT_MARKER = "<!-- needs-demo-comment -->";
-const DEMO_COMMENT_TEXT =
+const LEGACY_DEMO_COMMENT_TEXT =
   "This PR is a **Bug fix**, **Feature**, or **UI / frontend change** but the **Demo** section is missing";
 
 const MAINTAINER_ASSOCIATIONS = ["MEMBER", "OWNER", "COLLABORATOR"];
@@ -42,15 +42,10 @@ const QUERY = `
   }
 `;
 
-// Returns true when any change type that requires a demo is checked:
-// Bug fix, Feature, or UI / frontend change.
+// Visual media is required only when UI / frontend change is checked.
 function requiresDemo(body) {
   const text = body ?? "";
-  return (
-    /- \[[xX]\] Bug fix/.test(text) ||
-    /- \[[xX]\] Feature/.test(text) ||
-    /- \[[xX]\] UI \/ frontend change/.test(text)
-  );
+  return /- \[[xX]\] UI \/ frontend change/.test(text);
 }
 
 // Extracts the text content of the Demo section (between ## Demo and the next
@@ -79,16 +74,20 @@ function hasDemoContent(body) {
   return DEMO_MEDIA_PATTERNS.some((re) => re.test(content));
 }
 
+function bodyNeedsDemo(body) {
+  return requiresDemo(body) && !hasDemoContent(body);
+}
+
 const demoRequiredMessage = (author) =>
   `${DEMO_COMMENT_MARKER}
-@${author} This PR is a **Bug fix**, **Feature**, or **UI / frontend change** but the **Demo** section is missing or only contains a placeholder.
+@${author} This PR checks **UI / frontend change**, but the **Demo** section has no screenshot or recording.
 
-These change types require a screenshot or screen recording so reviewers can see the new behaviour without checking out the branch. Please update the **Demo** section with:
+UI / frontend changes require visual evidence so reviewers can see the new behaviour without checking out the branch. Please update the **Demo** section with:
 
 - A screenshot or screen recording of the change, or
 - A link to a hosted video or GIF showing the new behaviour.
 
-_Use \`N/A\` only when the change has no user-visible effect whatsoever (e.g. a pure refactor or test-only change). If that's the case, uncheck the relevant type box and check **Refactor / chore** or **Test / CI** instead._`;
+_If this PR has no visual surface, uncheck **UI / frontend change** and provide non-visual evidence in the **Test Plan**._`;
 
 const demoResolvedMessage = `${DEMO_COMMENT_MARKER}
 ✅ This PR no longer requires demo follow-up.`;
@@ -124,7 +123,7 @@ module.exports = async ({ context, github, core }) => {
         repo,
         name: NEEDS_DEMO_LABEL,
         color: "e4e669",
-        description: "PR needs a demo screenshot or recording",
+        description: "UI PR needs a demo screenshot or recording",
       });
     } catch (err) {
       // 422 = already exists; anything else is unexpected.
@@ -143,7 +142,8 @@ module.exports = async ({ context, github, core }) => {
       return comments.find(
         (comment) =>
           comment.user?.type === "Bot" &&
-          (comment.body?.includes(DEMO_COMMENT_MARKER) || comment.body?.includes(DEMO_COMMENT_TEXT))
+          (comment.body?.includes(DEMO_COMMENT_MARKER) ||
+            comment.body?.includes(LEGACY_DEMO_COMMENT_TEXT))
       );
     };
 
@@ -210,8 +210,7 @@ module.exports = async ({ context, github, core }) => {
         pr.state === "OPEN" &&
         !pr.isDraft &&
         !isMaintainer &&
-        requiresDemo(pr.body) &&
-        !hasDemoContent(pr.body);
+        bodyNeedsDemo(pr.body);
 
       if (!needsDemo && isLabeled) {
         try {
@@ -291,3 +290,5 @@ module.exports = async ({ context, github, core }) => {
     throw error;
   }
 };
+
+module.exports.bodyNeedsDemo = bodyNeedsDemo;
