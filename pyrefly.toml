@@ -45,6 +45,8 @@ ignore-missing-imports = [
     "numpy",
     "numpy.*",
     "omnigent.onboarding.internal_beta",
+    "opensandbox",
+    "opensandbox.*",
     "openshell",
     "openshell.*",
 ]
