@@ -50,7 +50,6 @@ from tests.e2e.conftest import (
     send_user_message_to_session,
 )
 
-
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 
@@ -136,9 +135,7 @@ def test_browser_action_request_times_out_without_renderer(
         model=model,
         profile="",
         prompt="You are a browser-capable agent.",
-        mock_llm_base_url=(
-            f"{mock_llm_server_url}/v1" if mock_llm_server_url else None
-        ),
+        mock_llm_base_url=(f"{mock_llm_server_url}/v1" if mock_llm_server_url else None),
     )
     session_id = create_runner_bound_session(
         http_client,
@@ -159,8 +156,7 @@ def test_browser_action_request_times_out_without_renderer(
     # Must return HTTP 200 (not 4xx/5xx), because the runner dispatch expects
     # a 200 with an error body rather than an HTTP error.
     assert resp.status_code == 200, (
-        f"Expected HTTP 200 from browser/action_request, got {resp.status_code}: "
-        f"{resp.text[:300]}"
+        f"Expected HTTP 200 from browser/action_request, got {resp.status_code}: {resp.text[:300]}"
     )
 
     body = resp.json()
@@ -171,8 +167,7 @@ def test_browser_action_request_times_out_without_renderer(
         f"renderer is subscribed, got: {body}"
     )
     assert "browser action timed out" in body["error"], (
-        "Expected 'browser action timed out' in the error message, got: "
-        f"{body['error']!r}"
+        f"Expected 'browser action timed out' in the error message, got: {body['error']!r}"
     )
 
     # After the fix: the call should return fast (< 2 s) because the server
@@ -261,8 +256,7 @@ def test_browser_tools_not_advertised_without_renderer(
         timeout=120,
     )
     assert body["status"] == "completed", (
-        f"turn did not complete: status={body.get('status')!r}, "
-        f"error={body.get('error')!r}"
+        f"turn did not complete: status={body.get('status')!r}, error={body.get('error')!r}"
     )
 
     reqs = get_mock_requests(mock_llm_server_url, key=model)
