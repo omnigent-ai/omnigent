@@ -6,13 +6,9 @@
 // global. The hook owns the previous-snapshot ref; this module only
 // diffs two snapshots.
 //
-// Archived sessions are excluded from every "needs your attention" output
-// here — notifications and the dock badge alike. Archiving is the user
-// saying "stop showing me this", and the sidebar, the Inbox page and the
-// Inbox badge already hide archived rows; without this the notification
-// path was the one surface archiving couldn't quiet. The snapshot builders
-// still record archived rows, so unarchiving diffs against real prior
-// state instead of firing a phantom transition.
+// Archived sessions are excluded from every output here — archiving means
+// "stop showing me this". The snapshot builders still record them, so
+// unarchiving diffs against real prior state, not a phantom transition.
 
 import type { Conversation } from "@/hooks/useConversations";
 

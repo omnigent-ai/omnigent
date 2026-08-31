@@ -74,8 +74,6 @@ describe("detectIdleTransitions", () => {
   });
 
   it("ignores an archived conversation that just finished", () => {
-    // Archiving is "stop showing me this" — a finish on an archived row must
-    // not notify, the one surface where archiving used to have no effect.
     const prev = statusMap({ a: "running" });
     expect(detectIdleTransitions(prev, [{ ...conv("a", "idle"), archived: true }])).toEqual([]);
   });
@@ -126,7 +124,6 @@ describe("detectNewElicitations", () => {
   });
 
   it("ignores a new prompt on an archived conversation", () => {
-    // The reported bug: the session was archived and kept notifying anyway.
     const prev = new Map([["a", 0]]);
     expect(detectNewElicitations(prev, [{ ...convE("a", 1), archived: true }])).toEqual([]);
   });
@@ -271,9 +268,7 @@ describe("computeUnreadBadgeIds", () => {
   });
 
   it("excludes an archived session, even one awaiting input", () => {
-    // Matches the Inbox page and the sidebar Inbox badge, which both hide
-    // archived rows: an archived prompt must not keep the dock badge lit
-    // (on Android the badge itself renders as a notification).
+    // Matches the Inbox page and Inbox badge, which both hide archived rows.
     const next = computeUnreadBadgeIds(
       [{ ...convB("a", { pending: 1 }), archived: true }, convB("b", { pending: 1 })],
       undefined,

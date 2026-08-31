@@ -408,8 +408,7 @@ describe("useIdleNotifications re-notification dedup (one beep until viewed)", (
 
 describe("useIdleNotifications archived sessions", () => {
   it("does NOT notify a new elicitation on an archived session", () => {
-    // The report: "I keep getting this notification over and over even though
-    // I already archived the session." Archiving must silence it.
+    // The report: it kept notifying after the session was archived.
     setConversations([conv("a", "running", 0)]);
     const { rerender } = renderHook(() => useIdleNotifications());
 
@@ -438,9 +437,8 @@ describe("useIdleNotifications archived sessions", () => {
 
 describe("useIdleNotifications elicitation re-notification dedup", () => {
   it("does not re-notify when a pending count flaps back up on the same prompt", () => {
-    // The runner going offline zeroes the reported pending count and coming
-    // back restores it, so one unresolved approval looks like a fresh 0 -> 1
-    // every flap. It must notify once, not once per flap.
+    // The runner going offline zeroes the pending count and coming back
+    // restores it, so one approval looks like a fresh 0 -> 1 every flap.
     setConversations([{ ...conv("a", "running", 0), runner_online: true }]);
     const { rerender } = renderHook(() => useIdleNotifications());
 
@@ -458,8 +456,7 @@ describe("useIdleNotifications elicitation re-notification dedup", () => {
   });
 
   it("does not re-notify when a resolved prompt is briefly re-reported", () => {
-    // "I already clicked approve but it kept notifying me": the persisted
-    // cross-replica count mirror can lag a resolve and re-report the prompt.
+    // The persisted cross-replica count mirror can lag a resolve.
     setConversations([{ ...conv("a", "running", 0), runner_online: true }]);
     const { rerender } = renderHook(() => useIdleNotifications());
 
