@@ -186,7 +186,7 @@ async def test_compact_sdk_harness_no_runner_returns_not_available(
 ) -> None:
     """
     A compact request for an SDK-harness session with no runner returns a
-    clear 400, not the internal ``_run_compact_locked`` model-requirement error.
+    clear 400 "not available for this session type" error.
     """
     agent = await create_test_agent(
         client,

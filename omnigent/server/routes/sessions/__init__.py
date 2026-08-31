@@ -505,7 +505,6 @@ from omnigent.server.routes._sessions.helpers import (
     _resolve_subagent_spec as _resolve_subagent_spec,
     _resource_event_item_from_sse as _resource_event_item_from_sse,
     _routing_decision_item_from_sse as _routing_decision_item_from_sse,
-    _run_compact_locked as _run_compact_locked,
     _same_provider_family_impl as _same_provider_family_impl,
     _seed_missing_title as _seed_missing_title,
     _seed_missing_title_from_user_message as _seed_missing_title_from_user_message,
