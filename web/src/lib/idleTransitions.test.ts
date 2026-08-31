@@ -73,6 +73,13 @@ describe("detectIdleTransitions", () => {
     expect(detectIdleTransitions(prev, [conv("a")])).toEqual([]);
   });
 
+  it("ignores an archived conversation that just finished", () => {
+    // Archiving is "stop showing me this" — a finish on an archived row must
+    // not notify, the one surface where archiving used to have no effect.
+    const prev = statusMap({ a: "running" });
+    expect(detectIdleTransitions(prev, [{ ...conv("a", "idle"), archived: true }])).toEqual([]);
+  });
+
   it("returns only the newly-finished conversations from a mixed list", () => {
     const prev = statusMap({ a: "running", b: "running", c: "idle" });
     const result = detectIdleTransitions(prev, [
@@ -116,6 +123,12 @@ describe("detectNewElicitations", () => {
     // No previous entry -> a page load with already-pending prompts must not
     // fire, mirroring the idle fresh-load behavior.
     expect(detectNewElicitations(new Map(), [convE("a", 2)])).toEqual([]);
+  });
+
+  it("ignores a new prompt on an archived conversation", () => {
+    // The reported bug: the session was archived and kept notifying anyway.
+    const prev = new Map([["a", 0]]);
+    expect(detectNewElicitations(prev, [{ ...convE("a", 1), archived: true }])).toEqual([]);
   });
 
   it("ignores a steady elicitation count", () => {
@@ -255,6 +268,19 @@ describe("computeUnreadBadgeIds", () => {
       },
     );
     expect(calls).toEqual([{ id: "a", updatedAt: 42, status: "failed" }]);
+  });
+
+  it("excludes an archived session, even one awaiting input", () => {
+    // Matches the Inbox page and the sidebar Inbox badge, which both hide
+    // archived rows: an archived prompt must not keep the dock badge lit
+    // (on Android the badge itself renders as a notification).
+    const next = computeUnreadBadgeIds(
+      [{ ...convB("a", { pending: 1 }), archived: true }, convB("b", { pending: 1 })],
+      undefined,
+      true,
+      unseenIds("a", "b"),
+    );
+    expect([...next]).toEqual(["b"]);
   });
 
   it("returns an empty set for an empty list", () => {

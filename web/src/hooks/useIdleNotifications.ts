@@ -8,6 +8,20 @@
 //   * a new elicitation — `pending_elicitations_count` increased (the agent
 //     is asking the user for input)
 //
+// Neither cue fires for an ARCHIVED session, and archived sessions don't
+// count toward the badge (see idleTransitions): archiving is the user saying
+// "stop showing me this", and it's the only lever they have over a session
+// whose prompt they can no longer resolve.
+//
+// A "needs response" cue fires ONCE per session until the user views it —
+// the same rule the turn-end cue follows. The pending count a list row
+// reports is not monotonic while a prompt is outstanding: the server zeroes
+// it whenever the runner reads offline (a dead runner's parked prompts can't
+// be answered) and restores it when the runner returns, and the persisted
+// cross-replica mirror can re-report a resolved prompt for a beat. Each of
+// those dips makes the next tick look like a brand-new elicitation, so
+// without this guard one unresolved approval re-notified on every flap.
+//
 // A turn-end is DEFERRED by a short settle window. Agents that work in steps
 // emit a `running` -> `idle` edge per step and then resume, so each step would
 // otherwise look like "finished." We wait `IDLE_SETTLE_MS` and only notify if
@@ -151,6 +165,12 @@ export function useIdleNotifications(activeConversationId?: string): void {
   // then reporting back) into one beep. Cleared when the user views the session
   // or it drops off the list, so a later finish can notify again.
   const notifiedSessions = useRef<Set<string>>(new Set());
+  // Sessions we've already surfaced a "needs response" cue for and the user
+  // hasn't viewed since. Cleared alongside `notifiedSessions` — when the user
+  // views the session or it drops off the list — so a later prompt on a
+  // session they've dealt with notifies again, while a flapping pending count
+  // on the SAME outstanding prompt stays quiet.
+  const notifiedElicitations = useRef<Set<string>>(new Set());
 
   useLazyPermissionRequest();
 
@@ -307,14 +327,17 @@ export function useIdleNotifications(activeConversationId?: string): void {
       }
     }
 
-    // Clear the "already beeped" mark for a session the user is now viewing
+    // Clear the "already notified" marks for a session the user is now viewing
     // (they've dealt with it) or that dropped off the list, so a later finish
-    // is allowed to beep again.
+    // or prompt is allowed to notify again.
     const presentIds = new Set(conversations.map((c) => c.id));
+    const dealtWith = (id: string) =>
+      !presentIds.has(id) || (windowFocused && id === activeConversationId);
     for (const id of notifiedSessions.current) {
-      if (!presentIds.has(id) || (windowFocused && id === activeConversationId)) {
-        notifiedSessions.current.delete(id);
-      }
+      if (dealtWith(id)) notifiedSessions.current.delete(id);
+    }
+    for (const id of notifiedElicitations.current) {
+      if (dealtWith(id)) notifiedElicitations.current.delete(id);
     }
 
     // A session is "actively viewed" — and thus suppressed — only when the
@@ -361,6 +384,10 @@ export function useIdleNotifications(activeConversationId?: string): void {
         // Same offline-runner guard: a prompt on a dead-runner session can't be
         // acted on and is almost always stale reconciliation.
         if (conversation.runner_online === false) continue;
+        // Already surfaced a prompt for this session and the user hasn't
+        // viewed it since — a re-reported count is the same outstanding
+        // approval flapping, not a new question.
+        if (notifiedElicitations.current.has(conversation.id)) continue;
         // "Needs response" is surfaced immediately. Drop any deferred turn-end
         // cue for this session — it's awaiting input, not quietly finishing.
         const pending = timers.get(conversation.id);
@@ -368,6 +395,7 @@ export function useIdleNotifications(activeConversationId?: string): void {
           clearTimeout(pending);
           timers.delete(conversation.id);
         }
+        notifiedElicitations.current.add(conversation.id);
         notify(conversation, ELICITATION_BODY, navigate);
       }
     }
