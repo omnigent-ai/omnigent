@@ -1,0 +1,74 @@
+name: VIP activity alert
+
+# This workflow handles untrusted contributor events, so it checks out only the
+# default branch and never executes code from a pull request.
+on:
+  issues:
+    types: [opened, edited, deleted, closed, reopened, assigned, unassigned, labeled, unlabeled, locked, unlocked, milestoned, demilestoned]
+  issue_comment:
+    types: [created, edited, deleted]
+  pull_request_target:
+    types: [opened, edited, closed, reopened, synchronize, converted_to_draft, ready_for_review, locked, unlocked]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  pull_request_review_comment:
+    types: [created, edited, deleted]
+  discussion:
+    types: [created, edited, deleted, answered, unanswered, labeled, unlabeled, locked, unlocked]
+  discussion_comment:
+    types: [created, edited, deleted]
+  workflow_dispatch:
+    inputs:
+      vip_login:
+        description: "VIP GitHub login to use for an end-to-end test"
+        required: true
+        type: string
+        default: terrytangyuan
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vip-activity-${{ github.event_name }}-${{ github.event.sender.login || inputs.vip_login }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # pull_request_target exposes secrets for fork PRs. Pinning the checkout to
+      # the default branch ensures contributor-controlled code never sees them.
+      - name: Check out trusted notifier
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Mint token for the private VIP mapping
+        id: vip-map-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: omnigent-internal
+
+      - name: Read private VIP mapping
+        env:
+          GH_TOKEN: ${{ steps.vip-map-token.outputs.token }}
+        run: |
+          gh api repos/omnigent-ai/omnigent-internal/contents/agents/issue-sync/mapping.yaml \
+            --jq .content | base64 --decode > "$RUNNER_TEMP/vip-mapping.yaml"
+
+      - name: Notify private Slack channel
+        env:
+          ALERT_ACTOR: ${{ github.event_name == 'workflow_dispatch' && inputs.vip_login || github.event.sender.login }}
+          SLACK_WEBHOOK_URL: ${{ secrets.VIP_ACTIVITY_SLACK_WEBHOOK_URL }}
+        run: |
+          python .github/scripts/vip_activity_alert.py \
+            --mapping "$RUNNER_TEMP/vip-mapping.yaml" \
+            --event "$GITHUB_EVENT_PATH" \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --actor "$ALERT_ACTOR" \
+            --slack-webhook "$SLACK_WEBHOOK_URL"
