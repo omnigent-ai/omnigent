@@ -53,12 +53,127 @@ export interface BlockContext {
   clientCreatedAtS?: number;
 }
 
+/**
+ * An image attached to a user message.
+ *
+ * Uploads carry a `file_id` addressing stored session bytes. A session
+ * imported from another harness carries the bytes inline as an `image_url`
+ * data URI instead and has no `file_id` at all, and a truncated transcript can
+ * carry neither — so both fields are optional and every reader narrows with
+ * {@link imagePreview}.
+ */
+export interface ImageContentBlock {
+  type: "input_image";
+  file_id?: string;
+  image_url?: string;
+  filename?: string;
+}
+
 /** Per-message-item content blocks. Both user input and assistant output. */
 export type MessageContentBlock =
   | { type: "input_text"; text: string }
-  | { type: "input_image"; file_id: string; filename?: string }
-  | { type: "input_file"; file_id: string; filename?: string }
+  | ImageContentBlock
+  | { type: "input_file"; file_id?: string; filename?: string }
   | { type: "output_text"; text: string };
+
+/** Marks an attachment whose upload has not returned a file id yet. Shared so
+ * the writer that mints the sentinel and the readers that strip it can't drift. */
+export const PENDING_FILE_PREFIX = "pending:";
+
+/**
+ * Only inline image bytes may become an `<img src>`. A remote URL from an
+ * imported transcript would make every viewer's browser fetch attacker-chosen
+ * content on load, so it renders as a placeholder instead.
+ */
+const RENDERABLE_IMAGE_URL = /^data:image\//i;
+
+/** How an {@link ImageContentBlock} should be rendered. */
+export type ImagePreview =
+  | { kind: "pending"; label: string }
+  | { kind: "uploaded"; fileId: string; alt: string }
+  | { kind: "inline"; src: string; alt: string }
+  | { kind: "unavailable"; label: string };
+
+/**
+ * A transcript field is only usable when it really holds a string. An imported
+ * or third-party-written rollout is copied verbatim, so any type can land here.
+ */
+function asText(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+/**
+ * Resolve how one image block renders, tolerating every shape the transcript
+ * can hold.
+ *
+ * :param block: The `input_image` block to render.
+ * :returns: The preview variant for it, never throwing on a partial block.
+ */
+export function imagePreview(block: ImageContentBlock): ImagePreview {
+  const fileId = asText(block.file_id);
+  const imageUrl = asText(block.image_url);
+  const filename = asText(block.filename);
+  if (fileId?.startsWith(PENDING_FILE_PREFIX)) {
+    return { kind: "pending", label: filename ?? fileId.slice(PENDING_FILE_PREFIX.length) };
+  }
+  if (fileId) return { kind: "uploaded", fileId, alt: filename ?? fileId };
+  if (imageUrl && RENDERABLE_IMAGE_URL.test(imageUrl)) {
+    return { kind: "inline", src: imageUrl, alt: filename ?? "Attached image" };
+  }
+  return { kind: "unavailable", label: filename ?? "Unavailable image" };
+}
+
+/**
+ * True for a text block that really carries text. An imported transcript's
+ * `text` can hold any type; such a block contributes no text at all rather
+ * than "[object Object]".
+ */
+export function isTextBlock(
+  block: MessageContentBlock,
+): block is Extract<MessageContentBlock, { type: "input_text" }> {
+  return block.type === "input_text" && typeof block.text === "string";
+}
+
+/**
+ * Label for an attachment chip, tolerating every shape the transcript can
+ * hold — a field that isn't a string carries no label and falls through.
+ *
+ * :param block: The attachment block to label.
+ * :returns: A string safe to render, never a raw transcript value.
+ */
+export function attachmentLabel(block: { file_id?: string; filename?: string }): string {
+  return asText(block.filename) ?? asText(block.file_id) ?? "Attachment";
+}
+
+/**
+ * Pair each attachment with a stable render key.
+ *
+ * Every field on an attachment block is optional and the same file can be
+ * attached twice, so neither the block nor its identity alone is unique. The
+ * key is that identity — bounded, because an inline image's data URI runs to
+ * megabytes — plus an occurrence counter.
+ *
+ * :param items: Attachments in the order they render.
+ * :param identify: Identity of one attachment, if it carries any.
+ * :returns: The attachments, each paired with a key unique within the list.
+ */
+export function keyedAttachments<T>(
+  items: T[],
+  identify: (item: T) => string | undefined,
+): { key: string; item: T }[] {
+  const seen = new Map<string, number>();
+  return items.map((item) => {
+    // A block field that isn't a string carries no usable identity; the
+    // occurrence counter still keys such attachments apart.
+    const identity = (asText(identify(item)) ?? "attachment").slice(0, MAX_KEY_LENGTH);
+    const occurrence = seen.get(identity) ?? 0;
+    seen.set(identity, occurrence + 1);
+    return { key: occurrence === 0 ? identity : `${identity}#${occurrence}`, item };
+  });
+}
+
+/** Cap on the identity a render key is built from. */
+const MAX_KEY_LENGTH = 96;
 
 /** A single tool call paired with its result. Mirrors `ToolExecution`. */
 export interface ToolExecution {

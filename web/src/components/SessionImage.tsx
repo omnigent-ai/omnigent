@@ -37,10 +37,30 @@ const PREVIEW_IMAGE = "max-h-64 max-w-full";
 const PREVIEW_PLACEHOLDER_BOX = "flex h-64 w-40 shrink-0 items-center justify-center";
 
 /**
+ * Fallback for an image that can't be shown: a compact labelled chip, so an
+ * unusable attachment costs a line rather than a tall box of broken glyph.
+ */
+function UnavailableImage({ alt, className }: { alt: string; className?: string }) {
+  return (
+    <div
+      role="img"
+      aria-label={alt}
+      className={cn(
+        "flex items-center gap-1.5 rounded-md border border-border bg-muted px-2 py-1.5 text-sm text-muted-foreground",
+        className,
+      )}
+    >
+      <ImageIcon className="size-3.5 shrink-0" />
+      <span className="truncate">{alt}</span>
+    </div>
+  );
+}
+
+/**
  * Inline preview for an uploaded image stored as a session file resource.
  *
- * Standalone the file path is same-origin, so a plain `<img src>` works and we
- * keep it as-is (native streaming + HTTP caching). Embedded, the host proxies
+ * Standalone the file path is same-origin, so a plain `<img src>` works (native
+ * streaming + HTTP caching) and {@link InlineImage} renders it. Embedded, the host proxies
  * the API behind a path prefix and cookie+CSRF auth that a browser `<img>` GET
  * can't satisfy (no way to send the prefix or the CSRF header), so we pull the
  * bytes through the host fetcher — which handles both — and render an object
@@ -50,21 +70,58 @@ export function SessionImage({ path, alt, className }: SessionImageProps) {
   // Host config is installed once at embed startup and never changes, so it's
   // safe to branch on it before any hooks. Hooks live in the embedded child.
   if (!getOmnigentHostConfig().fetcher) {
-    return (
-      <div className={PREVIEW_BOX}>
-        <ZoomableImage
-          src={path}
-          alt={alt}
-          className={cn(PREVIEW_IMAGE, className)}
-          // Offscreen history images cost nothing until scrolled to, and
-          // decoding off the main thread keeps the swap from blocking paint.
-          loading="lazy"
-          decoding="async"
-        />
-      </div>
-    );
+    // Same reserved box and failure chip as a transcript-carried image; only the
+    // source differs, so the two must not drift apart.
+    return <InlineImage src={path} alt={alt} className={className} />;
   }
   return <EmbeddedSessionImage path={path} alt={alt} className={className} />;
+}
+
+/**
+ * Preview for an image the browser can load straight from `src`: a `data:` URI
+ * the transcript carries, or a same-origin session file path.
+ *
+ * Owns the reserved box and the failure chip for both, so a sizing or loading
+ * fix lands on every direct-`<img>` preview at once. `src` may be undefined
+ * while a session is still resolving; the box holds its place until it lands.
+ */
+export function InlineImage({
+  src,
+  alt,
+  className,
+}: {
+  src?: string;
+  alt: string;
+  className?: string;
+}) {
+  // Tracked by source rather than as a bare flag, so a later block swapping in a
+  // different `src` on the same slot retries instead of staying stuck failed.
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
+
+  // A truncated or corrupt `data:` URI decodes to nothing; showing the chip
+  // keeps it out of the reserved box and off the lightbox.
+  if (src !== undefined && failedSrc === src) {
+    return <UnavailableImage alt={alt} className={className} />;
+  }
+
+  return (
+    <div className={PREVIEW_BOX}>
+      <ZoomableImage
+        src={src}
+        alt={alt}
+        className={cn(PREVIEW_IMAGE, className)}
+        // Offscreen history images cost nothing until scrolled to, and decoding
+        // off the main thread keeps the swap from blocking paint.
+        loading="lazy"
+        decoding="async"
+        // An absent src never resolved, so nothing has failed yet — latching
+        // here would strand the slot on a chip once the path arrives.
+        onError={() => {
+          if (src !== undefined) setFailedSrc(src);
+        }}
+      />
+    </div>
+  );
 }
 
 type LoadState = "loading" | "loaded" | "error";
@@ -163,19 +220,7 @@ function EmbeddedSessionImage({ path, alt, className }: SessionImageProps) {
   }, [path]);
 
   if (state === "error") {
-    return (
-      <div
-        role="img"
-        aria-label={alt}
-        className={cn(
-          "flex items-center gap-1.5 rounded-md border border-border bg-muted px-2 py-1.5 text-sm text-muted-foreground",
-          className,
-        )}
-      >
-        <ImageIcon className="size-3.5 shrink-0" />
-        <span className="truncate">{alt}</span>
-      </div>
-    );
+    return <UnavailableImage alt={alt} className={className} />;
   }
 
   if (state === "loading" || !blobUrl) {

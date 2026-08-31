@@ -54,7 +54,7 @@ import type {
   UserMessageBlock,
 } from "@/lib/blocks";
 import { userInputElicitationKey } from "@/lib/askUserQuestion";
-import { LIVE_ITEM_PREFIX, structuredErrorFields } from "@/lib/blocks";
+import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
@@ -1596,9 +1596,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const tempId = `pend_${pendingSeq}`;
     const pendingFileBlocks: MessageContentBlock[] = (files ?? []).map((file) => {
       const filename = file.name || "image.png";
+      const fileId = `${PENDING_FILE_PREFIX}${filename}`;
       return file.type.startsWith("image/")
-        ? { type: "input_image" as const, file_id: `pending:${filename}`, filename }
-        : { type: "input_file" as const, file_id: `pending:${filename}`, filename };
+        ? { type: "input_image" as const, file_id: fileId, filename }
+        : { type: "input_file" as const, file_id: fileId, filename };
     });
     const content: MessageContentBlock[] = [
       ...pendingFileBlocks,

@@ -20,6 +20,9 @@ const MIN_ZOOM = 1;
 const MAX_ZOOM = 8;
 const ZOOM_STEP = 0.25;
 
+/** Pointer travel that separates a pan from a click, in CSS pixels. */
+const DRAG_SLOP_PX = 4;
+
 function clampZoom(z: number) {
   return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, z));
 }
@@ -80,14 +83,23 @@ export function ZoomableImage({ src, alt, className, ...imgProps }: ZoomableImag
  * Zoom: scroll wheel (anchored at the cursor), the +/- toolbar buttons, or
  * double-click to toggle between fit and 2x. Pan: drag while zoomed in. The
  * image is `object-contain` within a fixed-size viewport that clips overflow,
- * so the zoomed image never escapes the card.
+ * so the zoomed image never escapes the card. A click on the empty stage
+ * around the image dismisses the preview.
  */
-function ZoomViewer({ image }: { image: LightboxImage }) {
+function ZoomViewer({ image, onClose }: { image: LightboxImage; onClose: () => void }) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const [zoom, setZoom] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   // Active pointer drag (panning); null when not dragging.
-  const dragRef = useRef<{ pointerId: number; startX: number; startY: number } | null>(null);
+  const dragRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+  } | null>(null);
+  // Whether the current gesture panned, so its closing click isn't a dismiss.
+  const pannedRef = useRef(false);
 
   const resetView = useCallback(() => {
     setZoom(1);
@@ -116,21 +128,36 @@ function ZoomViewer({ image }: { image: LightboxImage }) {
   }, [zoom]);
 
   const onPointerDown = (e: React.PointerEvent) => {
+    pannedRef.current = false;
     if (zoom <= MIN_ZOOM) return;
     dragRef.current = {
       pointerId: e.pointerId,
       startX: e.clientX - offset.x,
       startY: e.clientY - offset.y,
+      originX: e.clientX,
+      originY: e.clientY,
     };
     e.currentTarget.setPointerCapture(e.pointerId);
   };
   const onPointerMove = (e: React.PointerEvent) => {
     const drag = dragRef.current;
     if (!drag) return;
+    if (Math.hypot(e.clientX - drag.originX, e.clientY - drag.originY) > DRAG_SLOP_PX) {
+      pannedRef.current = true;
+    }
     setOffset({ x: e.clientX - drag.startX, y: e.clientY - drag.startY });
   };
   const endDrag = (e: React.PointerEvent) => {
     if (dragRef.current?.pointerId === e.pointerId) dragRef.current = null;
+  };
+
+  // A click on the stage dismisses, but only a real one: a click whose target
+  // is the image (or the toolbar) is not "outside", and the click a pan leaves
+  // behind when the pointer is released would otherwise close the preview
+  // every time someone repositions a zoomed image.
+  const onStageClick = (e: React.MouseEvent) => {
+    if (e.target !== e.currentTarget || pannedRef.current) return;
+    onClose();
   };
 
   const zoomed = zoom > MIN_ZOOM;
@@ -140,6 +167,7 @@ function ZoomViewer({ image }: { image: LightboxImage }) {
       <div
         ref={viewportRef}
         className="absolute inset-0 flex items-center justify-center overflow-hidden"
+        onClick={onStageClick}
         onDoubleClick={() => applyZoom(zoomed ? MIN_ZOOM : 2)}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
@@ -196,14 +224,15 @@ function ZoomViewer({ image }: { image: LightboxImage }) {
 /**
  * Provides a single shared full-screen image viewer for the whole app. Any
  * image wired with {@link useImageZoomProps} opens here. Built on the Radix
- * Dialog primitive, so Escape closes it for free; an explicit "x" button gives
- * the second close affordance. The content fills the viewport, so a click never
- * lands "outside" — closing is Escape or the x only, by design.
+ * Dialog primitive, so Escape closes it for free; an explicit "x" button and a
+ * click on the empty stage around the image give the other two close
+ * affordances.
  */
 export function ImageLightboxProvider({ children }: { children: React.ReactNode }) {
   const [image, setImage] = useState<LightboxImage | null>(null);
 
   const open = useCallback((img: LightboxImage) => setImage(img), []);
+  const close = useCallback(() => setImage(null), []);
   const value = useMemo(() => ({ open }), [open]);
 
   return (
@@ -235,15 +264,17 @@ export function ImageLightboxProvider({ children }: { children: React.ReactNode 
             )}
             // The image carries its own description; the title is for a11y only.
             aria-describedby={undefined}
-            // Close is Escape or the "x" only — keep clicks on the backdrop
-            // (and elsewhere) from dismissing the preview.
+            // The stage fills the viewport, so no click is ever "outside" it
+            // as far as Radix is concerned; dismissing on a click around the
+            // image is the stage's own handler, which can tell a click on the
+            // image or a finished pan from a real one.
             onInteractOutside={(e) => e.preventDefault()}
           >
             <DialogPrimitive.Title className="sr-only">
               {image?.alt || "Image preview"}
             </DialogPrimitive.Title>
             {/* key by src so zoom/pan state resets when a new image opens. */}
-            {image && <ZoomViewer key={image.src} image={image} />}
+            {image && <ZoomViewer key={image.src} image={image} onClose={close} />}
             <DialogPrimitive.Close asChild>
               <Button
                 variant="ghost"

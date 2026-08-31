@@ -117,11 +117,10 @@ export interface Response {
 // ── Content blocks ───────────────────────────────────────
 
 /**
- * A typed content block for user messages.
- *
- * Used when sending messages via `POST /v1/sessions/{id}/events`.
- * Mirrors the `content` array that `content_resolver.py` and the
- * sessions schema accept on the server side.
+ * The content blocks the composer sends via
+ * `POST /v1/sessions/{id}/events` — a send-path subset, not the full
+ * server schema. Blocks read back from a session are wider (e.g.
+ * `input_image` without `file_id`); parse those with `blocks.ts`.
  */
 export type ContentBlock =
   | { type: "input_text"; text: string }

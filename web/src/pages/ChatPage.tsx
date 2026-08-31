@@ -30,6 +30,7 @@ import {
   SquareTerminalIcon,
   XIcon,
 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
@@ -90,8 +91,14 @@ import type { NativeModelOption, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
-import type { MessageContentBlock } from "@/lib/blocks";
-import { ELICITATION_RESPONSE_PREFIX } from "@/lib/blocks";
+import type { ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
+import {
+  attachmentLabel,
+  ELICITATION_RESPONSE_PREFIX,
+  imagePreview,
+  isTextBlock,
+  keyedAttachments,
+} from "@/lib/blocks";
 import {
   derivePermissionLevel,
   isOwnerLevel,
@@ -222,7 +229,7 @@ import {
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
 import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
-import { SessionImage } from "@/components/SessionImage";
+import { InlineImage, SessionImage } from "@/components/SessionImage";
 import { GoalControl, GoalStatusPill, useGoalState, type Goal } from "@/components/goal";
 import { copyText } from "@/lib/clipboard";
 import { showToast } from "@/components/ui/toast";
@@ -301,9 +308,7 @@ export function isSubagentRoutingEligible(
 
 function extractUserText(content: MessageContentBlock[]): string {
   return content
-    .filter(
-      (c): c is Extract<MessageContentBlock, { type: "input_text" }> => c.type === "input_text",
-    )
+    .filter(isTextBlock)
     .map((c) => c.text)
     .join("")
     .replace(ATTACHED_RE, "")
@@ -336,9 +341,7 @@ function isAbsolutePath(p: string): boolean {
 
 function extractAttachedPaths(content: MessageContentBlock[]): MentionItem[] {
   const text = content
-    .filter(
-      (c): c is Extract<MessageContentBlock, { type: "input_text" }> => c.type === "input_text",
-    )
+    .filter(isTextBlock)
     .map((c) => c.text)
     .join("");
   const out: MentionItem[] = [];
@@ -3285,20 +3288,29 @@ function useCopyMessage(getText: () => string): {
   return { isCopied, handleCopy };
 }
 
+/** Pill for an attachment with no preview of its own: a non-image file, an
+ *  upload still in flight, or an image block carrying nothing renderable. */
+function AttachmentChip({ icon: Icon, label }: { icon: LucideIcon; label: string }) {
+  return (
+    <span className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground">
+      <Icon className="size-3 shrink-0" />
+      <span className="max-w-[180px] truncate">{label}</span>
+    </span>
+  );
+}
+
 function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const sessionId = useChatStore((s) => s.conversationId);
   // Author labels only matter once the session is shared with someone else.
   const isSessionShared = useContext(SessionSharedContext);
   // Plain-text path is the common case.
-  // - input_image: render inline <img> when the file is uploaded (file_id
-  //   doesn't start with "pending:"); show a chip while the upload is
-  //   in-flight.
+  // - input_image: `imagePreview` picks the variant — an uploaded file, an
+  //   imported inline data URI, an in-flight upload chip, or a placeholder
+  //   for a block carrying neither.
   // - input_file: always render as a chip (non-image files can't be
   //   previewed inline).
   const text = extractUserText(bubble.content);
-  const images = bubble.content.filter(
-    (c): c is Extract<MessageContentBlock, { type: "input_image" }> => c.type === "input_image",
-  );
+  const images = bubble.content.filter((c): c is ImageContentBlock => c.type === "input_image");
   const fileChips = bubble.content.filter(
     (c): c is Extract<MessageContentBlock, { type: "input_file" }> => c.type === "input_file",
   );
@@ -3371,48 +3383,50 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                 the row exactly one preview tall no matter what lands. */}
             {images.length > 0 && (
               <div className="mb-1.5 flex gap-2 overflow-x-auto">
-                {images.map((img) =>
-                  img.file_id.startsWith("pending:") ? (
-                    // Upload in-flight — show a chip placeholder
-                    <span
-                      key={img.file_id}
-                      className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                    >
-                      <ImageIcon className="size-3 shrink-0" />
-                      <span className="max-w-[180px] truncate">
-                        {img.filename ?? img.file_id.replace("pending:", "")}
-                      </span>
-                    </span>
-                  ) : (
-                    // Uploaded — render the actual image
-                    <SessionImage
-                      key={img.file_id}
-                      path={
-                        sessionId
-                          ? `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(img.file_id)}/content`
-                          : undefined
-                      }
-                      alt={img.filename ?? img.file_id}
-                      // Sizing lives in SessionImage, which reserves a matching
-                      // box so the bubble's height is settled before bytes land.
-                      className="rounded-md object-contain"
-                    />
-                  ),
-                )}
+                {keyedAttachments(
+                  images,
+                  (img) => img.file_id ?? img.image_url ?? img.filename,
+                ).map(({ key, item: img }) => {
+                  const preview = imagePreview(img);
+                  if (preview.kind === "uploaded") {
+                    return (
+                      <SessionImage
+                        key={key}
+                        path={
+                          sessionId
+                            ? `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(preview.fileId)}/content`
+                            : undefined
+                        }
+                        alt={preview.alt}
+                        // Sizing lives in SessionImage, which reserves a matching
+                        // box so the bubble's height is settled before bytes land.
+                        className="rounded-md object-contain"
+                      />
+                    );
+                  }
+                  if (preview.kind === "inline") {
+                    return (
+                      <InlineImage
+                        key={key}
+                        src={preview.src}
+                        alt={preview.alt}
+                        className="rounded-md object-contain"
+                      />
+                    );
+                  }
+                  // In-flight upload, or a block with nothing renderable on it.
+                  return <AttachmentChip key={key} icon={ImageIcon} label={preview.label} />;
+                })}
               </div>
             )}
             {/* Non-image file chips */}
             {fileChips.length > 0 && (
               <div className="mb-1.5 flex flex-wrap gap-1.5">
-                {fileChips.map((att) => (
-                  <span
-                    key={att.file_id}
-                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                  >
-                    <FileTextIcon className="size-3 shrink-0" />
-                    <span className="max-w-[180px] truncate">{att.filename ?? att.file_id}</span>
-                  </span>
-                ))}
+                {keyedAttachments(fileChips, (att) => att.file_id ?? att.filename).map(
+                  ({ key, item: att }) => (
+                    <AttachmentChip key={key} icon={FileTextIcon} label={attachmentLabel(att)} />
+                  ),
+                )}
               </div>
             )}
             {/* "@"-mentioned workspace files/folders (delivered as text markers) */}
