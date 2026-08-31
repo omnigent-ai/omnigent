@@ -69,7 +69,7 @@ def test_usage_page_route_and_navigation_are_available_when_feature_is_on(
     def handle_usage(route: Route) -> None:
         route.fulfill(status=200, content_type="application/json", body=report)
 
-    page.route("**/v1/usage", handle_usage)
+    page.route("**/v1/usage*", handle_usage)
     page.goto(f"{live_server}/usage")
 
     expect(page.get_by_test_id("usage-nav")).to_be_visible(timeout=30_000)
@@ -117,7 +117,7 @@ def test_session_table_shows_other_harnesses_badge(
     def handle_usage(route: Route) -> None:
         route.fulfill(status=200, content_type="application/json", body=report)
 
-    page.route("**/v1/usage", handle_usage)
+    page.route("**/v1/usage*", handle_usage)
     page.goto(f"{live_server}/usage")
 
     expect(page.get_by_test_id("usage-nav")).to_be_visible(timeout=30_000)
@@ -152,7 +152,7 @@ def _setup_usage_page(page: Page, live_server: str) -> None:
     def handle_usage(route: Route) -> None:
         route.fulfill(status=200, content_type="application/json", body=report)
 
-    page.route("**/v1/usage", handle_usage)
+    page.route("**/v1/usage*", handle_usage)
     page.goto(f"{live_server}/usage")
     expect(page.get_by_role("heading", name="Usage", exact=True)).to_be_visible(timeout=30_000)
 
