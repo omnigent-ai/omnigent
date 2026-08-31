@@ -785,7 +785,21 @@ def built_spa(request: pytest.FixtureRequest) -> None:
         # COREPACK_ENABLE_DOWNLOAD_PROMPT=0 keeps a corepack `pnpm` shim
         # from blocking on its download confirmation under captured
         # pytest output, which reads as a hung test run.
-        env = {**os.environ, "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"}
+        # Build the SPA against the SSE event-stream transport. Production
+        # defaults to the event WebSocket (it dodges the ~6-per-origin
+        # HTTP/1.1 connection cap), but much of this suite drives the SSE
+        # transport directly — intercepting `GET /stream` to inject 404s or
+        # monkeypatching `window.fetch` to hand back a controllable
+        # ReadableStream — and Playwright's `extra_http_headers` do not apply
+        # to a WebSocket handshake, so header-auth'd multi-viewer tests
+        # cannot identify themselves over WS. SSE keeps that coverage
+        # meaningful; the WebSocket transport has its own e2e coverage that
+        # opts back in via this env var.
+        env = {
+            **os.environ,
+            "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0",
+            "VITE_EVENT_STREAM_TRANSPORT": "sse",
+        }
         subprocess.run(
             ["pnpm", "install", "--frozen-lockfile", "--filter", "web"],
             cwd=_REPO_ROOT,

@@ -405,6 +405,7 @@ from omnigent.server.routes._sessions.helpers import (
     _invalidate_runner_backed_snapshot_state as _invalidate_runner_backed_snapshot_state,
     _is_codex_native_subagent as _is_codex_native_subagent,
     _is_kiro_native_session as _is_kiro_native_session,
+    _iter_session_events as _iter_session_events,
     _last_task_error_from_labels as _last_task_error_from_labels,
     _latest_assistant_text_from_store as _latest_assistant_text_from_store,
     _latest_message_preview as _latest_message_preview,
