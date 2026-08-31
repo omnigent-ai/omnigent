@@ -2081,6 +2081,18 @@ wheels = [
 ]
 
 [[package]]
+name = "hvac"
+version = "2.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e2/57/b46c397fb3842cfb02a44609aa834c887f38dd75f290c2fc5a34da4b2fee/hvac-2.4.0.tar.gz", hash = "sha256:e0056ad9064e7923e874e6769015b032580b639e29246f5ab1044f7959c1c7e0", size = 332543, upload-time = "2025-10-30T12:57:47.512Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/55/33/71e45a6bd6875f44a26f99da31c63b6840123e88bedf2c0b1ce429b8be12/hvac-2.4.0-py3-none-any.whl", hash = "sha256:008db5efd8c2f77bd37d2368ea5f713edceae1c65f11fd608393179478649e0f", size = 155921, upload-time = "2025-10-30T12:57:46.253Z" },
+]
+
+[[package]]
 name = "hyperframe"
 version = "6.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3218,6 +3230,10 @@ hindsight = [
 islo = [
     { name = "islo" },
 ]
+kms = [
+    { name = "boto3" },
+    { name = "botocore" },
+]
 kubernetes = [
     { name = "kubernetes" },
 ]
@@ -3247,6 +3263,9 @@ tracing = [
     { name = "opentelemetry-instrumentation-httpx" },
     { name = "opentelemetry-instrumentation-sqlalchemy" },
     { name = "opentelemetry-sdk" },
+]
+vault = [
+    { name = "hvac" },
 ]
 vertex = [
     { name = "google-auth" },
@@ -3307,8 +3326,10 @@ requires-dist = [
     { name = "argon2-cffi", specifier = ">=23.1,<24" },
     { name = "blaxel", marker = "extra == 'blaxel'", specifier = ">=0.4.1,<0.5" },
     { name = "boto3", marker = "extra == 'bedrock'", specifier = ">=1.30,<2" },
+    { name = "boto3", marker = "extra == 'kms'", specifier = ">=1.30,<2" },
     { name = "boto3", marker = "extra == 's3'", specifier = ">=1.30,<2" },
     { name = "botocore", marker = "extra == 'bedrock'", specifier = ">=1.30,<2" },
+    { name = "botocore", marker = "extra == 'kms'", specifier = ">=1.30,<2" },
     { name = "botocore", marker = "extra == 's3'", specifier = ">=1.30,<2" },
     { name = "boxlite", marker = "extra == 'boxlite'", specifier = ">=0.9.5,<1" },
     { name = "cachetools", specifier = ">=5.0,<7" },
@@ -3331,6 +3352,7 @@ requires-dist = [
     { name = "google-auth", marker = "extra == 'vertex'", specifier = ">=2.0,<3" },
     { name = "hindsight-client", marker = "extra == 'hindsight'", specifier = ">=0.4.0" },
     { name = "httpx", specifier = ">=0.27,<1" },
+    { name = "hvac", marker = "extra == 'vault'", specifier = ">=2,<3" },
     { name = "islo", marker = "extra == 'islo'", specifier = ">=0.3.5,<0.4" },
     { name = "json5", specifier = ">=0.10,<1" },
     { name = "keyring", specifier = ">=24,<26" },
@@ -3388,7 +3410,7 @@ requires-dist = [
     { name = "websockets", specifier = ">=10.4,<15" },
     { name = "zstandard", specifier = ">=0.22,<1" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "vertex", "modal", "daytona", "blaxel", "boxlite", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "tracing", "agents-sdk", "antigravity", "copilot", "dictation", "cursor", "hindsight", "nimble", "slack", "databricks", "loadtest"]
+provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "kms", "s3", "vertex", "modal", "daytona", "blaxel", "boxlite", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "vault", "tracing", "agents-sdk", "antigravity", "copilot", "dictation", "cursor", "hindsight", "nimble", "slack", "databricks", "loadtest"]
 
 [package.metadata.requires-dev]
 dev = [

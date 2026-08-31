@@ -206,12 +206,22 @@ launch tokens. So "stops vending when the session ends" must remain a
 server-side check on the broker path, independent of KMS; KMS is defence in
 depth on the storage, not the session boundary.
 
-## Dependency
+## Dependencies
 
-The KMS cipher needs boto3, declared as the `credentials` extra
-(`omnigent[credentials]`). It is imported lazily and only when a KMS key is
-configured, so a deployment that doesn't enable the integration credential store
-neither needs boto3 nor talks to AWS.
+The credential store is backend-agnostic; each `SecretCipher` backend declares its
+own extra, both imported lazily:
+
+- **AWS KMS** (`KmsSecretCipher`) needs boto3 — `omnigent[kms]`.
+- **HashiCorp Vault** (`VaultSecretCipher`, Transit) needs hvac — `omnigent[vault]`.
+
+boto3 / hvac load only when the matching backend is selected
+(`OMNIGENT_CREDENTIAL_KMS_KEY_ID` / `OMNIGENT_CREDENTIAL_VAULT_KEY`), so a deployment
+that doesn't enable the credential store — or uses the other backend — needs neither.
+
+`OMNIGENT_CREDENTIAL_CIPHER` (`kms` | `vault`) selects the backend explicitly per
+server; the chosen backend's key env var is then required. Leave it unset to
+auto-detect the single configured backend — configuring more than one without the
+selector is an error (no silent precedence), and configuring none disables the store.
 
 ## MCP auth & roadmap
 

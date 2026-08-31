@@ -151,10 +151,11 @@ all = [
 ]
 # From omnigent.
 bedrock = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
-# The credential-store KMS cipher (omnigent/stores/credential_store/secret_cipher.py)
-# imports boto3 lazily, only when OMNIGENT_CREDENTIAL_KMS_KEY_ID is set. boto3 is
-# already provided by the bedrock / s3 / all extras, so deployments that enable the
-# Connect features install one of those (no dedicated extra needed).
+# The credential store's AWS KMS backend (omnigent/stores/credential_store/secret_cipher.py)
+# imports boto3 lazily, only when OMNIGENT_CREDENTIAL_KMS_KEY_ID is set. Its own extra, so a
+# KMS deployment installs `omnigent[kms]`; the Vault backend uses `vault` (hvac) instead, and
+# the backend-agnostic base store needs neither.
+kms = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
 # S3-compatible artifact store (AWS S3, Cloudflare R2, MinIO, …). Selected
 # with ``OMNIGENT_ARTIFACT_URI=s3://bucket/prefix``; the store imports boto3
 # lazily, so only users of this backend need the extra.
@@ -198,6 +199,11 @@ openshell = ["openshell>=0.0.88,<1"]
 # package and imports the official client lazily, so only users of the
 # provider need this extra.
 kubernetes = ["kubernetes>=36,<37"]
+# Vault Transit backend for the credential store's SecretCipher — the
+# non-AWS alternative to the built-in KMS cipher (selected by
+# OMNIGENT_CREDENTIAL_VAULT_KEY). hvac is imported lazily, like boto3, so
+# only deployments that pick the Vault backend need this extra.
+vault = ["hvac>=2,<3"]
 # OpenTelemetry tracing is opt-in so the exporters and automatic
 # instrumentors do not inflate the default install.
 tracing = [

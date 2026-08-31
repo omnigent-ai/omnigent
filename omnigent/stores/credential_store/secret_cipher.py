@@ -20,7 +20,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any, Protocol, runtime_checkable
 
 _logger = logging.getLogger(__name__)
@@ -33,6 +33,12 @@ SecretContext = Mapping[str, str]
 #: secrets. Owned by the credential store, not any one provider, so every
 #: "Connect …" integration shares it. Unset ⇒ the store is disabled.
 CREDENTIAL_KMS_KEY_ENV_VAR = "OMNIGENT_CREDENTIAL_KMS_KEY_ID"
+
+#: Optional explicit backend selector for the credential store's cipher
+#: (``kms`` | ``vault``). Set it to pick a backend per server; its key env var is
+#: then required. Unset ⇒ the single configured backend is auto-detected, and
+#: configuring more than one without this selector is an error.
+CREDENTIAL_CIPHER_ENV_VAR = "OMNIGENT_CREDENTIAL_CIPHER"
 
 #: KMS error codes that mean "this ciphertext can't be read under this identity"
 #: — a wrong/rotated key, a mismatched encryption context, or a corrupt blob.
@@ -64,19 +70,63 @@ class SecretCipher(Protocol):
         ...
 
 
-def build_secret_cipher() -> SecretCipher | None:
-    """Construct the credential store's cipher from deployment config.
+def build_kms_secret_cipher() -> KmsSecretCipher | None:
+    """Build the AWS KMS cipher from ``OMNIGENT_CREDENTIAL_KMS_KEY_ID``, or ``None``.
 
-    Single seam where a deployment selects the secret backend. Reads
-    ``OMNIGENT_CREDENTIAL_KMS_KEY_ID`` and returns a :class:`KmsSecretCipher`;
-    returns ``None`` when it is unset — the credential store, and every
-    integration built on it, is then disabled (the caller decides how to surface
-    that). See ``designs/CREDENTIAL_STORE.md``.
+    ``None`` when the key is unset — the KMS backend is simply not configured.
+    boto3 stays lazy: this only reads env and constructs (no SDK import and no AWS
+    call until the first encrypt/decrypt).
     """
     key_id = os.environ.get(CREDENTIAL_KMS_KEY_ENV_VAR, "").strip()
-    if not key_id:
-        return None
-    return KmsSecretCipher(key_id)
+    return KmsSecretCipher(key_id) if key_id else None
+
+
+def build_secret_cipher() -> SecretCipher | None:
+    """Construct the credential store's cipher from deployment config, or ``None``.
+
+    The backend is configurable per server. Set ``OMNIGENT_CREDENTIAL_CIPHER`` to
+    choose one explicitly (``kms`` or ``vault``); its key env var
+    (``OMNIGENT_CREDENTIAL_KMS_KEY_ID`` / ``OMNIGENT_CREDENTIAL_VAULT_KEY``) is then
+    required, and a mismatch raises rather than silently disabling the store. When
+    the selector is unset, the single configured backend is auto-detected as a
+    zero-config convenience; configuring more than one without a selector is an
+    error (no silent precedence), and configuring none disables the store
+    (``None`` — the caller decides how to surface that). Adding a backend is a new
+    registry entry, not a new branch. See ``designs/CREDENTIAL_STORE.md``.
+    """
+    # hvac / boto3 stay optional: each builder only reads env and constructs, so
+    # importing and calling them here pulls no SDK and makes no network call.
+    from omnigent.stores.credential_store.vault_cipher import build_vault_secret_cipher
+
+    builders: dict[str, Callable[[], SecretCipher | None]] = {
+        "kms": build_kms_secret_cipher,
+        "vault": build_vault_secret_cipher,
+    }
+
+    selected = os.environ.get(CREDENTIAL_CIPHER_ENV_VAR, "").strip().lower()
+    if selected:
+        builder = builders.get(selected)
+        if builder is None:
+            raise ValueError(
+                f"{CREDENTIAL_CIPHER_ENV_VAR}={selected!r} is not a known credential "
+                f"backend; expected one of {sorted(builders)}."
+            )
+        cipher = builder()
+        if cipher is None:
+            raise ValueError(
+                f"{CREDENTIAL_CIPHER_ENV_VAR}={selected!r} but its key is unset — "
+                "set the backend's key env var."
+            )
+        return cipher
+
+    # No explicit selector: use the single configured backend, or None if none.
+    configured = {name: c for name, build in builders.items() if (c := build()) is not None}
+    if len(configured) > 1:
+        raise ValueError(
+            f"multiple credential backends are configured ({sorted(configured)}); "
+            f"set {CREDENTIAL_CIPHER_ENV_VAR} to choose one."
+        )
+    return next(iter(configured.values()), None)
 
 
 def _kms_context(context: SecretContext) -> dict[str, str]:
@@ -112,7 +162,13 @@ class KmsSecretCipher:
     @property
     def _kms(self) -> Any:
         if self._client is None:
-            import boto3
+            try:
+                import boto3
+            except ImportError as exc:  # pragma: no cover - import guard
+                raise ImportError(
+                    "The AWS KMS credential backend needs boto3. Install it with "
+                    "`pip install 'omnigent[kms]'`."
+                ) from exc
 
             self._client = boto3.client("kms")
         return self._client
