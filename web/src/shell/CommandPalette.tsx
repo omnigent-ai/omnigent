@@ -26,11 +26,13 @@ import {
   PanelRightIcon,
   SettingsIcon,
   SquarePenIcon,
+  TerminalIcon,
   XIcon,
 } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
 import { useConversations } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { canToggleTerminalFirstView } from "@/hooks/useViewModeToggleHotkey";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
@@ -43,6 +45,7 @@ import {
   CommandList,
 } from "@/components/ui/command";
 import { conversationDisplayLabel, getConversationAgentType } from "./sidebarNav";
+import { useTerminalFirst } from "./TerminalFirstContext";
 
 export interface CommandPaletteProps {
   open: boolean;
@@ -106,6 +109,7 @@ export function CommandPalette({
 }: CommandPaletteProps) {
   const navigate = useNavigate();
   const isMobile = useIsMobileViewport();
+  const terminalFirst = useTerminalFirst();
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
 
@@ -168,8 +172,19 @@ export function CommandPalette({
         keywords: ["panel", "right", "files", "terminal"],
         run: onToggleRightSidebar,
       },
+      ...(canToggleTerminalFirstView(terminalFirst)
+        ? [
+            {
+              id: "toggle-view-mode",
+              label: "Toggle chat / terminal view",
+              icon: TerminalIcon,
+              keywords: ["terminal", "chat", "view", "shell", "pty"],
+              run: () => terminalFirst.setView(terminalFirst.view === "chat" ? "terminal" : "chat"),
+            },
+          ]
+        : []),
     ],
-    [navigate, onToggleLeftSidebar, onToggleRightSidebar],
+    [navigate, onToggleLeftSidebar, onToggleRightSidebar, terminalFirst],
   );
 
   const filteredActions = useMemo(() => {
