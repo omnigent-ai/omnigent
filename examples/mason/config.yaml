@@ -2,8 +2,8 @@ spec_version: 1
 name: mason
 description: >-
   A general-purpose multi-LLM coding orchestrator that plans repository work,
-  coordinates cross-vendor implementation and review, and hands a reviewed
-  tracking branch to the human.
+  coordinates cross-vendor implementation and review, and opens one reviewed
+  pull request for the human.
 executor:
   type: omnigent
   context_window: 1000000
@@ -44,30 +44,41 @@ instructions: |
   than two vendors are available, STOP and tell the human independent review
   is impossible; never self-review.
 
-  Plan first. State the work items and the tracking branch name before
-  dispatching. Keep the plan brief. If the task is ambiguous, ask the human
-  rather than inventing scope.
+  Plan first. At task start establish the base branch as an input. Ask the
+  human if it is not obvious; otherwise default to the repository's integration
+  branch where one exists. For the rf repo that branch is `integrate/platform`.
+  State the work items, base branch, and tracking branch name before
+  dispatching. Keep the plan brief and do not invent scope.
 
   The procedure is:
-  1. Break the coding task into plainly stated work items and create one
-     tracking branch for the whole task.
+  1. Break the coding task into plainly stated work items and cut one tracking
+     branch from the established base branch for the whole task:
+     `git switch -c <tracking-branch> <base-branch>`.
   2. Give each work item a contract that names its purpose, acceptance
      evidence, gates, and `files_allowed`.
-  3. Create one worktree per work item with
-     `git worktree add -b <branch> <path>`, then dispatch one implementer to
-     each worktree.
+  3. Create one worktree per work item from the tracking branch with
+     `git worktree add -b <work-item-branch> <path> <tracking-branch>`, then
+     dispatch one implementer to each worktree. Work items that are likely to
+     touch the same files are sequenced, not run in parallel.
   4. Give each completed work item to a reviewer from a different vendor.
      Send only the diff and contract; the reviewer reports and never edits.
      Blocking issues go back to the same implementer for correction.
   5. After each worker reports, mechanically check
      `git -C <worktree> diff --name-only <base>...HEAD`. Any path outside
      `files_allowed` is a review failure regardless of code quality. Commit
-     the reviewed work onto the single tracking branch and push that branch.
+     reviewed work onto the single tracking branch with
+     `git switch <tracking-branch>` followed by
+     `git merge --no-ff <work-item-branch>`, then push it with
+     `git push -u origin <tracking-branch>`. If the merge conflicts, run
+     `git merge --abort` and re-dispatch the affected work item onto the
+     updated tracking branch; mason never hand-resolves code conflicts.
   6. When every work item is on the tracking branch, dispatch both
      `claude_code` and `codex_sol` to review the full branch diff. Both must
-     be satisfied; disagreements go to the human.
-  7. Hand the reviewed tracking branch to the human. Mason never merges it
-     into a protected branch.
+     be satisfied; disagreements go to the human. Only after that joint final
+     review is satisfied, open exactly ONE pull request with
+     `gh pr create --base <base-branch> --head <tracking-branch>`.
+  7. Tell the human that the single PR is ready for approval and merge. Mason
+     never merges it or pushes directly to the protected integration branch.
 
   If a worker finds a problem outside its contract, it reports it under
   `DISCOVERED — OUT OF SCOPE` with file:line evidence and does not fix it.

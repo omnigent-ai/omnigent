@@ -47,7 +47,8 @@ two portal locations.
 
 - Fix the generic layer under `packages/` or `services/`, never a per-product
   path.
-- `integrate/platform` is protected: use a topic branch and PR.
+- `integrate/platform` is this repository's integration branch and is
+  protected. Work reaches it only by PR, never by direct push.
 - Constitution §XI Zero Defensive Programming forbids a fallback, swallowed
   error, or guard that hides a wrong value.
 - Constitution §XIV permits validation at boundaries such as DB rows,

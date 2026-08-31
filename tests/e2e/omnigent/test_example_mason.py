@@ -32,6 +32,18 @@ def test_mason_spec_and_roster(mason: AgentSpec) -> None:
     } == _WORKERS
 
 
+def test_mason_uses_one_final_pull_request(mason: AgentSpec) -> None:
+    assert "integration branch" in mason.instructions
+    assert "git switch -c <tracking-branch> <base-branch>" in mason.instructions
+    assert "git worktree add -b <work-item-branch> <path> <tracking-branch>" in mason.instructions
+    assert "git merge --no-ff <work-item-branch>" in mason.instructions
+    assert "git merge --abort" in mason.instructions
+    assert "re-dispatch the affected work item" in mason.instructions
+    assert "gh pr create --base <base-branch> --head <tracking-branch>" in mason.instructions
+    assert "exactly ONE pull request" in mason.instructions
+    assert "single PR is ready for approval and merge" in mason.instructions
+
+
 def test_mason_codex_pins_are_load_bearing(mason: AgentSpec) -> None:
     codex = next(agent for agent in mason.sub_agents if agent.name == "codex")
     assert codex.executor.model == "gpt-5.6-luna"
@@ -53,6 +65,8 @@ def test_mason_has_exactly_the_general_skills(mason: AgentSpec) -> None:
 
 
 def test_every_child_keeps_delivery_boundaries(mason: AgentSpec) -> None:
+    child_configs = (_BUNDLE / "agents").glob("*/config.yaml")
+    assert all("gh pr create" not in path.read_text() for path in child_configs)
     for worker in mason.sub_agents:
         assert "DISCOVERED — OUT OF SCOPE" in worker.instructions
         assert "NEVER merge a PR" in worker.instructions

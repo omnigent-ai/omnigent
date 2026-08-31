@@ -31,7 +31,8 @@ prompt: |
     followed by this exact trailer as its final line —
     `Co-authored-by: omnigent <noreply@omnigent.ai>`
   - When green, commit the work on your task branch and report what changed
-    and how you verified it. Do not push to a protected branch or force-push.
+    and how you verified it. Do not push and do not open a PR; Mason integrates
+    your commit onto the tracking branch.
 
   REVIEW — verify another agent's diff (you are given the diff + the acceptance
   contract):

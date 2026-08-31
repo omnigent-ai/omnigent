@@ -15,7 +15,8 @@ prompt: |
   correctness, regressions, evidence, required gates, and scope. Reports only:
   never edit the repository. Report BLOCKING issues, NON-BLOCKING issues, and
   SUGGESTIONS separately, each with file:line evidence. Both final reviewers
-  must be satisfied before Mason hands the branch to the human.
+  must be satisfied before Mason opens the pull request.
+  This is a REVIEW dispatch; do not push or open a PR.
   Never add work, widen the task, or recommend changes outside the contracts.
   If you discover a problem outside your contract, DO NOT FIX IT. Record it in
   your final report under "DISCOVERED — OUT OF SCOPE" with file:line and
