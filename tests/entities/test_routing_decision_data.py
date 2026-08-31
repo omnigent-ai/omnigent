@@ -30,6 +30,8 @@ def test_legacy_row_deserializes_with_defaults() -> None:
     assert data.raw_model is None
     assert data.attempted_override is None
     assert data.router_source is None
+    assert data.reasoning_effort is None
+    assert data.display_label is None
 
 
 @pytest.mark.parametrize(
@@ -49,6 +51,8 @@ def test_legacy_row_deserializes_with_defaults() -> None:
                 "raw_model": "gpt-5-6-sol",
                 "attempted_override": "databricks-gpt-5-5",
                 "router_source": "databricks-aigw",
+                "reasoning_effort": "medium",
+                "display_label": "codex-subscription-gpt-5.6-terra-medium",
             },
             {
                 "harness": "codex",
@@ -56,6 +60,8 @@ def test_legacy_row_deserializes_with_defaults() -> None:
                 "decision_id": "dec_abc123",
                 "raw_model": "gpt-5-6-sol",
                 "router_source": "databricks-aigw",
+                "reasoning_effort": "medium",
+                "display_label": "codex-subscription-gpt-5.6-terra-medium",
             },
         ),
         # An unapplied advisory decision: the unset optional stays null in the
@@ -75,6 +81,8 @@ def test_legacy_row_deserializes_with_defaults() -> None:
                 "decision_id": "dec_1",
                 "raw_model": None,
                 "router_source": None,
+                "reasoning_effort": None,
+                "display_label": None,
             },
         ),
     ],

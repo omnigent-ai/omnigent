@@ -495,6 +495,51 @@ describe("ErrorBanner", () => {
 });
 
 describe("RoutingDecisionCard — session-level auto-routing", () => {
+  it("labels automatic Codex subscription picks with model and effort", () => {
+    render(
+      <RoutingDecisionCard
+        model="gpt-5-6-luna"
+        applied
+        rationale="Routine task."
+        routing={{ routerSource: "codex-subscription", reasoningEffort: "low" }}
+      />,
+    );
+    expect(screen.getByTestId("routing-decision-card")).toHaveTextContent(
+      "codex-subscription-gpt-5.6-luna-light",
+    );
+  });
+
+  it("prefers the server's canonical automatic-route label", () => {
+    render(
+      <RoutingDecisionCard
+        model="gpt-5-6-luna"
+        applied
+        rationale="Routine task."
+        routing={{
+          routerSource: "codex-subscription",
+          reasoningEffort: "low",
+          displayLabel: "server-provided-label",
+        }}
+      />,
+    );
+    expect(screen.getByTestId("routing-decision-card")).toHaveTextContent("server-provided-label");
+  });
+
+  it("does not add an effort label when a Codex effort is explicitly pinned", () => {
+    render(
+      <RoutingDecisionCard
+        model="gpt-5-6-luna"
+        applied
+        rationale="Pinned effort."
+        routing={{ routerSource: "codex-subscription" }}
+      />,
+    );
+    expect(screen.getByTestId("routing-decision-card")).toHaveTextContent("luna");
+    expect(screen.getByTestId("routing-decision-card")).not.toHaveTextContent(
+      "codex-subscription-gpt-5.6-luna",
+    );
+  });
+
   it("applied verdict: shows model pill with tier and rationale", () => {
     render(
       <RoutingDecisionCard

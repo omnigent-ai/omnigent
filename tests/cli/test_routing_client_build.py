@@ -16,6 +16,7 @@ import pytest
 
 from omnigent.cli import _build_routing_backends
 from omnigent.server.smart_routing import (
+    CodexSubscriptionRoutingClient,
     ExternalRoutingClient,
     LLMRoutingClient,
     RoutingSettings,
@@ -122,3 +123,30 @@ def test_an_unusable_config_leaves_routing_off() -> None:
             {"routing": {"provider": "judge"}}, None, RoutingSettings()
         )
     assert (backends.external, backends.local) == (None, None)
+
+
+def test_codex_subscription_provider_uses_the_local_subscription_router() -> None:
+    with patch("omnigent.cli._build_codex_subscription_routing_client") as build:
+        build.return_value = CodexSubscriptionRoutingClient()
+        backends = _build_routing_backends(
+            {"routing": {"provider": "codex-subscription"}},
+            None,
+            RoutingSettings(),
+        )
+    assert backends.external is None
+    assert isinstance(backends.local, CodexSubscriptionRoutingClient)
+
+
+def test_codex_subscription_setup_failure_retains_the_local_judge() -> None:
+    """A broken subscription setup must not silently disable existing local routing."""
+    judge = LLMRoutingClient(MagicMock())
+    with (
+        patch("omnigent.cli._build_local_llm_routing_client", return_value=judge),
+        patch("omnigent.cli._build_codex_subscription_routing_client", return_value=None),
+    ):
+        backends = _build_routing_backends(
+            {"routing": {"provider": "codex-subscription"}},
+            _server_llm(),
+            RoutingSettings(),
+        )
+    assert backends.local is judge

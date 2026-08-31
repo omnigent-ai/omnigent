@@ -1767,6 +1767,22 @@ def register_core_routes(
             body.subagent_routing_override
         )
 
+        # Kimi eligibility is an explicit, opt-in session preference.  Keep it
+        # in a server-owned label so old rows remain safely off without a DB
+        # migration; callers cannot make a missing provider usable by toggling.
+        if "gpt_5_6_sol_routing_enabled" in body.model_fields_set:
+            labels_to_set["omnigent.routing.gpt_5_6_sol"] = (
+                "on" if body.gpt_5_6_sol_routing_enabled else "off"
+            )
+        if "databricks_kimi_routing_enabled" in body.model_fields_set:
+            labels_to_set["omnigent.routing.databricks_kimi"] = (
+                "on" if body.databricks_kimi_routing_enabled else "off"
+            )
+        if "codex_subscription_routing_enabled" in body.model_fields_set:
+            labels_to_set["omnigent.routing.codex_subscription"] = (
+                "on" if body.codex_subscription_routing_enabled else "off"
+            )
+
         # Native-terminal pass-through args: ``None`` leaves them
         # unchanged; a provided list (including ``[]``) replaces the
         # stored value wholesale (resume is last-write-wins, never an

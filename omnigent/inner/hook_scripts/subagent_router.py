@@ -396,9 +396,13 @@ def build_route_request(
                 break
     requested = tool_input.get("model")
     requested = requested if isinstance(requested, str) and requested else None
+    requested_effort = tool_input.get("reasoning_effort")
+    requested_effort = (
+        requested_effort if isinstance(requested_effort, str) and requested_effort else None
+    )
     if requested is not None and requested_model_resolver is not None:
         requested = requested_model_resolver(requested)
-    return {
+    body = {
         "harness": harness,
         "task_name": spawn_task_name(tool_input, task_keys),
         "prompt": prompt,
@@ -408,6 +412,9 @@ def build_route_request(
         # as the recorded ``attempted_override``.
         "requested_model": requested,
     }
+    if requested_effort is not None:
+        body["requested_effort"] = requested_effort
+    return body
 
 
 def request_decision(
@@ -450,11 +457,17 @@ def _allow_with_model(
     tool_input: dict[str, Any],  # type: ignore[explicit-any]
     model: str,
     reason: str,
+    *,
+    reasoning_effort: str | None = None,
 ) -> dict[str, Any]:  # type: ignore[explicit-any]
     output: dict[str, Any] = {  # type: ignore[explicit-any]
         "hookEventName": "PreToolUse",
         "permissionDecision": "allow",
-        "updatedInput": {**tool_input, "model": model},
+        "updatedInput": {
+            **tool_input,
+            "model": model,
+            **({"reasoning_effort": reasoning_effort} if reasoning_effort is not None else {}),
+        },
     }
     if reason:
         output["permissionDecisionReason"] = reason
@@ -735,15 +748,17 @@ def decision_to_hook_output(
     model = decision.get("model")
     rationale = decision.get("rationale")
     rationale = rationale if isinstance(rationale, str) else ""
+    effort = decision.get("reasoning_effort")
+    effort = effort if isinstance(effort, str) and effort else None
     if action == "rewrite" and isinstance(model, str) and model:
         if model_translator is None:
-            return _allow_with_model(tool_input, model, rationale)
+            return _allow_with_model(tool_input, model, rationale, reasoning_effort=effort)
         translated = model_translator(model)
         if translated is None:
             return None
         if translated != model:
             rationale = f"{rationale} (applied as {translated!r})".strip()
-        return _allow_with_model(tool_input, translated, rationale)
+        return _allow_with_model(tool_input, translated, rationale, reasoning_effort=effort)
     if action == "redirect":
         harness = decision.get("harness")
         if isinstance(harness, str) and harness and isinstance(model, str) and model:

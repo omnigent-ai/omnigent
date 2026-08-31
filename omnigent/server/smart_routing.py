@@ -15,12 +15,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 import time
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
 
 from omnigent.model_fallbacks import (
+    CODEX_DEFAULT_MODEL,
+    DATABRICKS_ROUTING_DEFAULT_MODELS,
     SMART_ROUTING_CLAUDE_LADDER,
     SMART_ROUTING_CURRENT_GENERATION_GPT,
     SMART_ROUTING_FAMILY_FALLBACKS,
@@ -29,8 +33,10 @@ from omnigent.model_fallbacks import (
     SMART_ROUTING_PI_LADDER,
     SMART_ROUTING_TASK_V1_CLAUDE_ARMS,
     SMART_ROUTING_TASK_V1_CODEX_ARMS,
+    static_model_fallback,
 )
 from omnigent.model_metadata import ModelCostTier, ModelIntent, ModelWireAPI
+from omnigent.onboarding.provider_config import SUBSCRIPTION_KIND
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -236,6 +242,7 @@ class RoutingResult:
     rationale: str
     harness: str | None = None
     raw_model: str | None = None
+    reasoning_effort: str | None = None
 
 
 class RoutingClient(Protocol):
@@ -262,6 +269,294 @@ class RoutingClient(Protocol):
         :returns: A :class:`RoutingResult`, or ``None`` to skip routing.
         """
         ...
+
+
+class CodexSubscriptionRoutingClient:
+    """Route a Codex CLI subscription without calling a separate judge model.
+
+    A ChatGPT subscription can run Codex, but it does not expose an API
+    credential for the server-level LLM judge. Keeping the choice local lets a
+    user opt into Smart Routing without sending a request to another provider.
+
+    The host's Codex model picker (or the release-curated subscription fallback)
+    defines eligibility. A declarative task profile chooses one model tier and
+    effort together; tier fallback is explicit, never based on catalog order.
+    """
+
+    router_source = "codex-subscription"
+    _fallback = static_model_fallback(SUBSCRIPTION_KIND, "codex")
+    fallback_models = _fallback.model_ids if _fallback is not None else (CODEX_DEFAULT_MODEL,)
+
+    # Automatic subscription routing intentionally uses only the three effort
+    # choices exposed in the Codex UI.  ``xhigh`` (Extra High) and ``ultra``
+    # remain valid explicit pins, but are never router-selected.
+    _AUTOMATIC_EFFORTS = frozenset({"low", "medium", "high"})
+    _AUTOMATIC_EFFORT_LABELS = MappingProxyType(
+        {"low": "light", "medium": "medium", "high": "high"}
+    )
+
+    _TASK_PROFILES = (
+        (
+            "difficult work",
+            "sol",
+            "high",
+            ("architecture", "root cause", "system-wide", "difficult", "ambiguity"),
+        ),
+        (
+            "investigation",
+            "terra",
+            "high",
+            ("investigate", "investigation", "security", "performance", "migration"),
+        ),
+        (
+            "debugging or review",
+            "terra",
+            "medium",
+            ("debug", "bug", "review", "multi-file", "multiple files", "refactor", "test"),
+        ),
+        ("trivial work", "luna", "low", ("trivial", "typo", "one line", "one-line", "format")),
+        (
+            "quick work",
+            "luna",
+            "low",
+            ("quick", "small", "simple", "tiny", "rename", "explain", "summarize"),
+        ),
+        ("routine edit", "luna", "low", ("edit", "update", "add", "change")),
+    )
+    _DEFAULT_PROFILE = ("routine work", "luna", "low")
+    _TIER_FALLBACKS = MappingProxyType(
+        {
+            "luna": ("luna", "terra", "sol"),
+            "terra": ("terra", "luna", "sol"),
+            "sol": ("sol", "terra", "luna"),
+        }
+    )
+
+    # Kimi is deliberately restricted to work whose failure can safely fall
+    # through to the established Codex tiers.  It is never an automatic choice
+    # for investigation, debugging, or architecture work.
+    _KIMI_TASK_PROFILES = frozenset({"trivial work", "quick work", "routine edit", "routine work"})
+
+    def __init__(self) -> None:
+        self.last_error: str | None = None
+
+    @classmethod
+    def _task_profile(cls, message: str) -> tuple[str, str, str]:
+        """Resolve the first matching declarative task profile."""
+        text = message.lower()
+        for name, tier, effort, signals in cls._TASK_PROFILES:
+            if any(signal in text for signal in signals):
+                return name, tier, effort
+        return cls._DEFAULT_PROFILE
+
+    @classmethod
+    def _effort_for_model(cls, effort: str, model: str) -> str:
+        """Clamp an automatic effort to the selected eligible model."""
+        from omnigent.reasoning_effort import clamp_effort_for_model
+
+        # Model caps still win when they keep us in the automatic vocabulary.
+        # A deployment must not be able to promote an automatic choice to
+        # Extra High/Ultra through a cap fallback.
+        clamped = clamp_effort_for_model(effort, model)
+        if clamped is not None and clamped in cls._AUTOMATIC_EFFORTS:
+            return clamped
+        return effort if effort in cls._AUTOMATIC_EFFORTS else "high"
+
+    @staticmethod
+    def _tier_model(candidates: list[str], tier: str) -> str | None:
+        """Return an eligible tier model without using candidate position."""
+        needle = f"-{tier}"
+        return next((model for model in candidates if needle in model.lower()), None)
+
+    @classmethod
+    def _model_for_profile(
+        cls, candidates: list[str], preferred_tier: str
+    ) -> tuple[str, str] | None:
+        """Select a preferred tier, then use its explicit degradation order."""
+        for tier in cls._TIER_FALLBACKS[preferred_tier]:
+            if model := cls._tier_model(candidates, tier):
+                return model, tier
+        return None
+
+    @classmethod
+    def _databricks_model_for_profile(cls, candidates: list[str], profile: str) -> str | None:
+        """Pick a configured Databricks endpoint using task-appropriate name cues."""
+        preferred_tokens = {
+            "trivial work": ("kimi", "nano", "mini", "haiku", "flash", "luna"),
+            "quick work": ("kimi", "nano", "mini", "haiku", "flash", "luna"),
+            "routine edit": ("kimi", "mini", "haiku", "flash", "luna", "terra"),
+            "routine work": ("mini", "haiku", "flash", "luna", "terra", "kimi"),
+            "debugging": ("terra", "sonnet", "glm", "gpt", "kimi"),
+            "investigation": ("sol", "opus", "large", "terra", "sonnet", "glm"),
+        }
+        for token in preferred_tokens.get(profile, ()):
+            if model := next((item for item in candidates if token in item.lower()), None):
+                return model
+        return candidates[0] if candidates else None
+
+    async def route(
+        self,
+        message: str,
+        available_models: dict[str, list[str]],
+    ) -> RoutingResult | None:
+        self.last_error = None
+        all_candidates = _flatten_models(available_models)
+        candidates = [model for model in all_candidates if _model_family(model) == "gpt"]
+        profile, preferred_tier, requested_effort = self._task_profile(message)
+        databricks_candidates = [
+            model for model in all_candidates if _is_databricks_routing_model(model)
+        ]
+        if databricks_candidates and len(databricks_candidates) == len(all_candidates):
+            model = self._databricks_model_for_profile(databricks_candidates, profile)
+            if model is None:
+                self.last_error = "no configured Databricks routing candidates were available"
+                return None
+            harness = next(
+                (name for name, models in available_models.items() if model in models), None
+            )
+            return RoutingResult(
+                model=model,
+                rationale=f"Selected configured Databricks endpoint for {profile}.",
+                harness=harness,
+                reasoning_effort=(
+                    self._effort_for_model(requested_effort, model)
+                    if _model_family(model) == "gpt"
+                    else None
+                ),
+            )
+        if not candidates:
+            self.last_error = "no Codex subscription candidates were available"
+            return None
+
+        kimi = next((model for model in all_candidates if _is_databricks_kimi_model(model)), None)
+        if kimi is not None and profile in self._KIMI_TASK_PROFILES:
+            harness = next(
+                (name for name, models in available_models.items() if kimi in models), None
+            )
+            return RoutingResult(
+                model=kimi,
+                rationale=f"Selected configured Databricks Kimi for cheap {profile}.",
+                harness=harness,
+            )
+        selected = self._model_for_profile(candidates, preferred_tier)
+        if selected is None:
+            self.last_error = "no tiered Codex subscription candidates were available"
+            return None
+        model, actual_tier = selected
+        harness = next(
+            (name for name, models in available_models.items() if model in models),
+            None,
+        )
+        effort = self._effort_for_model(requested_effort, model)
+        fallback = "" if actual_tier == preferred_tier else f"; fell back to {actual_tier}"
+        rationale = f"Selected Codex {actual_tier}/{effort} for {profile}{fallback}."
+        return RoutingResult(
+            model=model,
+            rationale=rationale,
+            harness=harness,
+            reasoning_effort=effort,
+        )
+
+
+def _is_databricks_kimi_model(model: str) -> bool:
+    """Whether *model* is a Databricks-served Kimi endpoint spelling."""
+    normalized = model.lower().replace("_", "-")
+    return "kimi" in normalized and normalized.startswith(("databricks-", "system.ai." + "kimi"))
+
+
+def _is_databricks_routing_model(model: str) -> bool:
+    """Whether *model* is a Databricks gateway or model-service endpoint."""
+    return model.lower().startswith(("databricks-", "system.ai."))
+
+
+_DATABRICKS_ROUTING_PROFILE_ENV = "OMNIGENT_DATABRICKS_ROUTING_PROFILE"
+_DATABRICKS_ROUTING_MODELS_ENV = "OMNIGENT_DATABRICKS_ROUTING_MODELS"
+_DEFAULT_DATABRICKS_ROUTING_PROFILE = "produ2m"
+_DEFAULT_DATABRICKS_ROUTING_MODELS = DATABRICKS_ROUTING_DEFAULT_MODELS
+
+
+def _configured_databricks_routing_model_ids() -> tuple[str, tuple[str, ...]]:
+    """Read profile and allowlist, with safe local defaults for each setting."""
+    profile = (
+        os.environ.get(
+            _DATABRICKS_ROUTING_PROFILE_ENV, _DEFAULT_DATABRICKS_ROUTING_PROFILE
+        ).strip()
+        or _DEFAULT_DATABRICKS_ROUTING_PROFILE
+    )
+    raw_models = os.environ.get(
+        _DATABRICKS_ROUTING_MODELS_ENV, ",".join(_DEFAULT_DATABRICKS_ROUTING_MODELS)
+    )
+    models = tuple(dict.fromkeys(item.strip() for item in raw_models.split(",") if item.strip()))
+    if not models:
+        models = _DEFAULT_DATABRICKS_ROUTING_MODELS
+    return profile, models
+
+
+def databricks_routing_profile() -> str:
+    """Return the explicit profile used for Smart Routing Databricks arms."""
+    return _configured_databricks_routing_model_ids()[0]
+
+
+def is_configured_databricks_routing_model(model: str) -> bool:
+    """Whether *model* is in the local Smart Routing Databricks allowlist."""
+    return model in _configured_databricks_routing_model_ids()[1]
+
+
+async def configured_databricks_routing_models(
+    models: Sequence[str] | None = None,
+) -> tuple[list[str], str | None]:
+    """Return allowlisted, live Databricks endpoints available to this task.
+
+    The profile and allowlist are explicit environment settings. The live
+    workspace listing verifies that the profile can authenticate and that each
+    selected endpoint still exists. When *models* is supplied it is intersected
+    as an additional caller restriction. Omitting it deliberately exposes the
+    configured Databricks source independently of a Codex subscription's
+    local model catalog; the runner dispatches a selected endpoint through the
+    configured Databricks profile.
+    """
+    profile, configured = _configured_databricks_routing_model_ids()
+    try:
+        from omnigent.model_catalog import list_databricks_profile_models
+
+        listing = await asyncio.to_thread(list_databricks_profile_models, profile)
+    except (OSError, ValueError, ImportError):
+        return [], f"Databricks routing is unavailable: profile {profile!r} could not be resolved."
+    except Exception:  # noqa: BLE001 — endpoint discovery must not block a task
+        _logger.warning("smart_routing: Databricks endpoint discovery failed", exc_info=True)
+        return [], (
+            f"Databricks routing is unavailable: profile {profile!r} endpoint discovery failed."
+        )
+    live = {entry.id for entry in listing.models}
+    catalog = set(models) if models is not None else None
+    allowed = [
+        model for model in configured if model in live and (catalog is None or model in catalog)
+    ]
+    if not allowed:
+        return [], (
+            "Databricks routing is unavailable: none of the allowlisted endpoints "
+            "are available to this task."
+        )
+    return allowed, None
+
+
+def codex_subscription_display_label(
+    model: str,
+    router_source: str | None,
+    reasoning_effort: str | None,
+) -> str | None:
+    """Return the readable label for one automatic subscription decision."""
+    if router_source != CodexSubscriptionRoutingClient.router_source:
+        return None
+    if _is_databricks_kimi_model(model):
+        return f"databricks-{model.removeprefix('databricks-')}"
+    if not reasoning_effort:
+        return None
+    effort_label = CodexSubscriptionRoutingClient._AUTOMATIC_EFFORT_LABELS.get(reasoning_effort)
+    if effort_label is None:
+        return None
+    readable_model = re.sub(r"^gpt-(\d+)-(\d+)(?=-|$)", r"gpt-\1.\2", model)
+    return f"codex-subscription-{readable_model}-{effort_label}"
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -654,6 +949,73 @@ class LLMRoutingClient:
             )
 
         return RoutingResult(model=model, rationale=str(rationale), harness=chosen_harness)
+
+
+_ROUTING_JUDGE_ENV = "OMNIGENT_SMART_ROUTING_JUDGE"
+_OLLAMA_ROUTING_MODEL_ENV = "OMNIGENT_OLLAMA_ROUTING_MODEL"
+_OLLAMA_ROUTING_BASE_URL_ENV = "OMNIGENT_OLLAMA_ROUTING_BASE_URL"
+
+
+def configured_routing_judge() -> str:
+    """Return the explicitly requested judge, defaulting to existing behavior."""
+    judge = os.environ.get(_ROUTING_JUDGE_ENV, "auto").strip().lower()
+    return judge if judge in {"auto", "databricks", "ollama"} else "auto"
+
+
+class OllamaRoutingClient:
+    """Small local OpenAI-compatible judge for strict Smart Routing menus."""
+
+    router_source = "ollama"
+
+    def __init__(self, *, base_url: str, model: str) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._model = model
+        self.last_error: str | None = None
+
+    async def route(
+        self, message: str, available_models: dict[str, list[str]]
+    ) -> RoutingResult | None:
+        import httpx
+
+        flat = _flatten_models(available_models)
+        try:
+            async with httpx.AsyncClient(timeout=ROUTING_REQUEST_TIMEOUT_S) as client:
+                response = await client.post(
+                    f"{self._base_url}/chat/completions",
+                    json={
+                        "model": self._model,
+                        "temperature": 0,
+                        "messages": [
+                            {"role": "system", "content": _build_rubric(available_models)},
+                            {"role": "user", "content": message[:4000]},
+                        ],
+                        "response_format": {"type": "json_object"},
+                    },
+                )
+                response.raise_for_status()
+                verdict = json.loads(response.json()["choices"][0]["message"]["content"])
+        except Exception as exc:  # noqa: BLE001 - local judges fail open
+            self.last_error = f"Ollama routing judge failed: {failure_detail(exc)}"
+            return None
+        model = verdict.get("model")
+        if not isinstance(model, str) or model not in flat:
+            self.last_error = "Ollama routing judge chose a model outside the allowed list"
+            return None
+        harness = next(
+            (name for name, models in available_models.items() if model in models), None
+        )
+        return RoutingResult(
+            model=model, rationale=str(verdict.get("rationale", "")), harness=harness
+        )
+
+
+def ollama_routing_client_from_environment() -> OllamaRoutingClient | None:
+    """Build the local judge only when an operator names its model explicitly."""
+    model = os.environ.get(_OLLAMA_ROUTING_MODEL_ENV, "").strip()
+    if not model:
+        return None
+    base_url = os.environ.get(_OLLAMA_ROUTING_BASE_URL_ENV, "http://127.0.0.1:11434/v1")
+    return OllamaRoutingClient(base_url=base_url, model=model)
 
 
 def _bearer_auth(token: str) -> httpx.Auth:
@@ -1136,6 +1498,22 @@ def _bare_id(model: str, prefixes: Sequence[str] | None = None) -> str:
     return bare.replace(".", "-").lower().removesuffix("[1m]")
 
 
+def automatic_routing_model_allowed(
+    model: str,
+    *,
+    prefixes: Sequence[str] | None = None,
+    allow_gpt_5_6_sol: bool = False,
+) -> bool:
+    """Whether automatic routing may offer or apply *model*.
+
+    Sol remains a valid explicit model choice. Smart Routing excludes it by
+    default, but a session may explicitly opt in to offer it to the router.
+    """
+    return allow_gpt_5_6_sol or _bare_id(model, prefixes) != _bare_id(
+        SMART_ROUTING_TASK_V1_CODEX_ARMS[1]
+    )
+
+
 def _model_family(model: str) -> str:
     """Tag *model* with the harness family that can serve it.
 
@@ -1382,6 +1760,8 @@ class TaskV1RouteOptionSource:
         self,
         harnesses: Sequence[str],
         catalog: dict[str, list[str]],
+        *,
+        strict_candidates: bool = False,
     ) -> list[RouteOptionSpec]:
         """Offer the catalog plus whatever arms the router's menu requires.
 
@@ -1401,6 +1781,8 @@ class TaskV1RouteOptionSource:
                     _bare_id(router_id, self._model_prefixes),
                     RouteOptionSpec(model=router_id, harness=harness),
                 )
+        if strict_candidates:
+            return list(offered.values())
         for arm in self.menu(harnesses or list(catalog)):
             key = _bare_id(arm, self._model_prefixes)
             existing = offered.get(key)
@@ -1802,6 +2184,8 @@ class ExternalRoutingClient:
         self,
         message: str,
         available_models: dict[str, list[str]],
+        *,
+        strict_candidates: bool = False,
     ) -> RoutingResult | None:
         import httpx
         from google.protobuf import json_format
@@ -1816,7 +2200,9 @@ class ExternalRoutingClient:
         # The seam turns the catalog into router vocabulary and injects
         # whatever arms the router's scenario menu demands.
         harnesses = list(available_models)
-        specs = self._source.build_route_options(harnesses, available_models)
+        specs = self._source.build_route_options(
+            harnesses, available_models, strict_candidates=strict_candidates
+        )
         if not specs:
             return None
         options = [pb.RouteOption(model=s.model, harness=s.harness) for s in specs]
@@ -2011,6 +2397,9 @@ async def route_session_harness(
     catalog: Mapping[str, Sequence[str]] | None = None,
     gateway_backed: bool = True,
     allow_static_fallback: bool = True,
+    allow_databricks_kimi: bool = False,
+    allow_gpt_5_6_sol: bool = False,
+    allow_codex_subscription_models: bool = True,
 ) -> tuple[str | None, str | None, dict[str, Any] | None, str | None]:
     """Pick the best harness + model for a new session via the routing client.
 
@@ -2112,6 +2501,14 @@ async def route_session_harness(
             if in_family:
                 harness_models[h] = in_family
 
+    # A Codex CLI subscription has no gateway catalog to top up from.  Its
+    # explicit local router may still route an auto-harness session onto the
+    # Codex runner using the same subscription-only candidates as a later turn.
+    if isinstance(backends.local, CodexSubscriptionRoutingClient):
+        for h in candidate_harnesses:
+            if h in ("codex", "codex-native") and h not in harness_models:
+                harness_models[h] = list(backends.local.fallback_models)
+
     # Fall back to the static table when neither catalog produced routable
     # candidates (e.g. a child session whose catalog only lists "self" under an
     # unrecognized worker name, or the runner was unreachable), and to top up
@@ -2133,9 +2530,45 @@ async def route_session_harness(
     if not harness_models:
         return None, None, None, "No routable harnesses are available on this runner."
 
+    # Databricks is an explicit, profile-backed routing source alongside the
+    # Codex subscription. Its allowlist does not have to appear in Codex's
+    # local catalog: a selected endpoint is launched through its profile.
+    if isinstance(backends.local, CodexSubscriptionRoutingClient):
+        configured_databricks, _databricks_status = (
+            await configured_databricks_routing_models() if allow_databricks_kimi else ([], None)
+        )
+        allowed_databricks = set(configured_databricks)
+        harness_models = {
+            name: [
+                model
+                for model in models
+                if (allow_codex_subscription_models and not _is_databricks_routing_model(model))
+                or (allow_databricks_kimi and model in allowed_databricks)
+            ]
+            for name, models in harness_models.items()
+        }
+        if configured_databricks:
+            # Codex's local catalog advertises subscription models only. Add
+            # the independently validated Databricks arm to the Codex SDK
+            # harness; the runner switches its transport to the profile when
+            # this arm wins the routing decision.
+            target = next((name for name in candidate_harnesses if name == "codex"), None)
+            if target is not None:
+                existing = harness_models.setdefault(target, [])
+                existing.extend(model for model in configured_databricks if model not in existing)
+        harness_models = {name: models for name, models in harness_models.items() if models}
+        if not harness_models:
+            return None, None, None, "No routable harnesses are available on this runner."
+
     try:
         call = await route_with_fallback(
-            backends, user_message, harness_models, gateway_backed=gateway_backed
+            backends,
+            user_message,
+            harness_models,
+            gateway_backed=gateway_backed,
+            allow_gpt_5_6_sol=allow_gpt_5_6_sol,
+            strict_candidate_allowlist=allow_databricks_kimi
+            or not allow_codex_subscription_models,
         )
     except Exception as exc:  # routing failures must not block session creation
         _logger.exception("smart_routing: route_session_harness failed")
@@ -2228,6 +2661,8 @@ async def route_session_harness(
         "rationale": result.rationale,
         "router_source": call.source,
     }
+    if result.reasoning_effort is not None:
+        verdict["reasoning_effort"] = result.reasoning_effort
     if raw_model and _bare_id(raw_model, prefixes) != _bare_id(chosen_model, prefixes):
         verdict["raw_model"] = raw_model
 
@@ -2250,6 +2685,9 @@ async def route_turn(
     catalog: Sequence[str] | None = None,
     gateway_backed: bool = True,
     allow_static_fallback: bool = True,
+    allow_databricks_kimi: bool = False,
+    allow_gpt_5_6_sol: bool = False,
+    allow_codex_subscription_models: bool = True,
 ) -> tuple[str | None, dict[str, Any] | None]:
     """Pick the best model for a turn via the deployment's routing backends.
 
@@ -2319,6 +2757,16 @@ async def route_turn(
         # names models this pane cannot be switched to. Decline the turn rather
         # than route it onto an unreachable endpoint.
         models = infer_models(harness) if allow_static_fallback else None
+        # A Codex CLI subscription is deliberately off-gateway, so its model
+        # fallback is separate from infer_models(), whose tables are all
+        # Databricks endpoint ids.  It is only enabled by the explicit local
+        # subscription router and only for a Codex session.
+        if (
+            models is None
+            and isinstance(backends.local, CodexSubscriptionRoutingClient)
+            and harness in ("codex", "codex-native")
+        ):
+            models = list(backends.local.fallback_models)
         if models is None:
             _logger.info(
                 "smart_routing: route_turn skipped for session=%s: "
@@ -2330,6 +2778,24 @@ async def route_turn(
         available = {harness or "": models}
 
     prefixes = routing_settings().model_prefixes
+    databricks_status: str | None = None
+    if isinstance(backends.local, CodexSubscriptionRoutingClient):
+        configured_databricks, databricks_status = (
+            await configured_databricks_routing_models() if allow_databricks_kimi else ([], None)
+        )
+        allowed_databricks = set(configured_databricks)
+        available = {
+            name: [
+                model
+                for model in models
+                if (allow_codex_subscription_models and not _is_databricks_routing_model(model))
+                or (allow_databricks_kimi and model in allowed_databricks)
+            ]
+            for name, models in available.items()
+        }
+        if configured_databricks and harness == "codex":
+            existing = available.setdefault(harness, [])
+            existing.extend(model for model in configured_databricks if model not in existing)
     # A turn cannot change the harness, so a model its gateway bars is not a
     # candidate at all. The seam still injects whatever arms the router's menu
     # requires, so dropping these rows never makes that menu partial.
@@ -2355,7 +2821,12 @@ async def route_turn(
     _prep_s = time.monotonic() - _prep_started
     _route_started = time.monotonic()
     call = await route_with_fallback(
-        backends, user_message, available, gateway_backed=gateway_backed
+        backends,
+        user_message,
+        available,
+        gateway_backed=gateway_backed,
+        allow_gpt_5_6_sol=allow_gpt_5_6_sol,
+        strict_candidate_allowlist=allow_databricks_kimi or not allow_codex_subscription_models,
     )
     _logger.info(
         "smart_routing: session=%s prep=%.3fs router=%.3fs catalog_fetch=%s candidates=%d",
@@ -2401,6 +2872,10 @@ async def route_turn(
         "rationale": result.rationale,
         "router_source": call.source,
     }
+    if result.reasoning_effort is not None:
+        verdict["reasoning_effort"] = result.reasoning_effort
+    if allow_databricks_kimi and databricks_status is not None:
+        verdict["rationale"] = f"{result.rationale} {databricks_status} Fell back to Codex."
     if raw_model and _bare_id(raw_model, prefixes) != _bare_id(model, prefixes):
         verdict["raw_model"] = raw_model
     return model, verdict

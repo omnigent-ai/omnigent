@@ -21,6 +21,10 @@ export interface RoutingDecisionExtras {
   attemptedOverride?: string | null;
   /** Which router answered — `"databricks-aigw"` or `"oss-llm"`; absent on legacy rows. */
   routerSource?: string | null;
+  /** Reasoning effort the router applied, absent for explicit pins or unsupported routes. */
+  reasoningEffort?: string | null;
+  /** Deterministic server label for an automatic subscription route. */
+  displayLabel?: string | null;
 }
 
 const SCOPES = new Set<string>(["session", "turn", "child_session", "native_subagent"]);
@@ -54,6 +58,8 @@ export function routingExtrasFromWire(rec: Record<string, unknown>): RoutingDeci
       attemptedOverride: str(rec.attempted_override),
     }),
     ...(str(rec.router_source) !== undefined && { routerSource: str(rec.router_source) }),
+    ...(str(rec.reasoning_effort) !== undefined && { reasoningEffort: str(rec.reasoning_effort) }),
+    ...(str(rec.display_label) !== undefined && { displayLabel: str(rec.display_label) }),
   };
 }
 
@@ -75,7 +81,36 @@ export function routingExtras(
     ...(source.rawModel != null && { rawModel: source.rawModel }),
     ...(source.attemptedOverride != null && { attemptedOverride: source.attemptedOverride }),
     ...(source.routerSource != null && { routerSource: source.routerSource }),
+    ...(source.reasoningEffort != null && { reasoningEffort: source.reasoningEffort }),
+    ...(source.displayLabel != null && { displayLabel: source.displayLabel }),
   };
+}
+
+/**
+ * Deterministic display identifier for an automatic Codex-subscription pick.
+ *
+ * The effort is intentionally restricted to Light, Medium, and High: a
+ * missing or manual-only value means the task kept a user pin or uses a
+ * provider/default that the router cannot truthfully name.
+ */
+export function codexSubscriptionRouteLabel(
+  model: string,
+  routerSource: string | null | undefined,
+  reasoningEffort: string | null | undefined,
+): string | null {
+  const effortLabels: Record<string, string> = {
+    low: "light",
+    medium: "medium",
+    high: "high",
+  };
+  const effortLabel = reasoningEffort ? effortLabels[reasoningEffort] : undefined;
+  if (routerSource !== "codex-subscription") return null;
+  if (model.toLowerCase().includes("kimi") && model.toLowerCase().startsWith("databricks-")) {
+    return model;
+  }
+  if (!effortLabel) return null;
+  const readableModel = model.replace(/^gpt-(\d+)-(\d+)(?=-|$)/, "gpt-$1.$2");
+  return `codex-subscription-${readableModel}-${effortLabel}`;
 }
 
 /**

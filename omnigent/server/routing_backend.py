@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -30,7 +30,15 @@ _logger = logging.getLogger(__name__)
 
 #: Which router produced a decision. ``"databricks-aigw"`` is the external
 #: ``task_v1`` service; ``"oss-llm"`` is the built-in judge.
-RouterSource = Literal["databricks-aigw", "oss-llm"]
+RouterSource = Literal["databricks-aigw", "oss-llm", "codex-subscription", "ollama"]
+
+
+def _local_router_source(client: RoutingClient) -> RouterSource:
+    """Return a truthful source label, preserving the legacy OSS default."""
+    source = getattr(client, "router_source", "oss-llm")
+    if source in {"codex-subscription", "ollama"}:
+        return cast(RouterSource, source)
+    return "oss-llm"
 
 
 @dataclass(frozen=True)
@@ -107,7 +115,7 @@ def select_router(
     if gateway_backed and external is not None:
         return RouterChoice(client=external, source="databricks-aigw")
     if backends.local is not None:
-        return RouterChoice(client=backends.local, source="oss-llm")
+        return RouterChoice(client=backends.local, source=_local_router_source(backends.local))
     return None
 
 
@@ -132,6 +140,8 @@ async def route_with_fallback(
     available_models: dict[str, list[str]],
     *,
     gateway_backed: bool,
+    allow_gpt_5_6_sol: bool = False,
+    strict_candidate_allowlist: bool = False,
 ) -> RoutedCall | None:
     """Call the deployment's router, falling back to the judge when it fails.
 
@@ -151,17 +161,81 @@ async def route_with_fallback(
         external one only when there is no judge to fall back to, so each
         caller's existing fail-open handling still sees it.
     """
+    # Keep this at the backend boundary so every automatic-routing caller
+    # (new sessions, turns, and subagents) shares the same policy.  The
+    # external client's route-options seam still injects its protocol-required
+    # arms after this point.
+    from omnigent.server.smart_routing import automatic_routing_model_allowed
+
+    candidates = {
+        harness: [
+            model
+            for model in models
+            if automatic_routing_model_allowed(model, allow_gpt_5_6_sol=allow_gpt_5_6_sol)
+        ]
+        for harness, models in available_models.items()
+    }
+    candidates = {harness: models for harness, models in candidates.items() if models}
+    if not candidates:
+        _logger.info("routing: no automatic-routing-eligible candidates remain")
+        return None
+
+    allowed_models = {model for models in candidates.values() for model in models}
+
+    async def ask(client: RoutingClient) -> RoutingResult | None:
+        """Ask an external router without expanding a strict candidate menu."""
+        from omnigent.server.smart_routing import ExternalRoutingClient
+
+        if strict_candidate_allowlist and isinstance(client, ExternalRoutingClient):
+            return await client.route(message, candidates, strict_candidates=True)
+        return await client.route(message, candidates)
+
+    def allowed(result: RoutingResult | None) -> RoutingResult | None:
+        model = getattr(result, "model", None)
+        if strict_candidate_allowlist and model not in allowed_models:
+            _logger.warning("routing: declining model outside strict allowlist %r", model)
+            return None
+        if isinstance(model, str) and not automatic_routing_model_allowed(
+            model, allow_gpt_5_6_sol=allow_gpt_5_6_sol
+        ):
+            _logger.warning("routing: declining excluded automatic-routing model %r", model)
+            return None
+        return result
+
+    from omnigent.server.smart_routing import (
+        configured_routing_judge,
+        ollama_routing_client_from_environment,
+    )
+
+    judge = configured_routing_judge()
+    if judge == "ollama":
+        ollama = ollama_routing_client_from_environment()
+        if ollama is None:
+            _logger.warning("routing: Ollama judge selected but no model was configured")
+            return None
+        return RoutedCall(result=allowed(await ask(ollama)), source="ollama", client=ollama)
+    if judge == "databricks":
+        external = usable_external(backends)
+        if external is None:
+            _logger.warning(
+                "routing: Databricks judge selected but no routing service is configured"
+            )
+            return None
+        return RoutedCall(
+            result=allowed(await ask(external)), source="databricks-aigw", client=external
+        )
+
     choice = select_router(backends, gateway_backed=gateway_backed)
     if choice is None:
         return None
     if choice.source != "databricks-aigw" or backends.local is None:
         return RoutedCall(
-            result=await choice.client.route(message, available_models),
+            result=allowed(await ask(choice.client)),
             source=choice.source,
             client=choice.client,
         )
     try:
-        result = await choice.client.route(message, available_models)
+        result = allowed(await ask(choice.client))
     except Exception:  # noqa: BLE001 — the judge is the fallback for any failure
         _logger.warning(
             "routing: the external router raised; falling back to the built-in judge",
@@ -176,8 +250,8 @@ async def route_with_fallback(
             getattr(choice.client, "last_error", None),
         )
     return RoutedCall(
-        result=await backends.local.route(message, available_models),
-        source="oss-llm",
+        result=allowed(await ask(backends.local)),
+        source=_local_router_source(backends.local),
         client=backends.local,
     )
 

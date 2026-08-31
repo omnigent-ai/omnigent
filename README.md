@@ -405,6 +405,33 @@ works with four kinds of credentials:
 Defaults are per agent, so a Claude default and a Codex default coexist. You
 can also switch models in the middle of a session with the `/model` command.
 
+#### Smart routing with a Codex subscription
+
+If `omni setup` has configured your logged-in Codex CLI as the default OpenAI
+subscription provider, you can opt into local Smart Routing without an API key
+or a separate judge model. Merge the [`routing:` block from this safe
+template](examples/codex-subscription-smart-routing.yaml) into
+`~/.omnigent/config.yaml`; keep the existing `providers:` block that `omni
+setup` created.
+
+```yaml
+routing:
+  provider: codex-subscription
+```
+
+Restart the local runtime after saving the file:
+
+```bash
+omni stop
+omni start
+```
+
+The router chooses an eligible Codex subscription model and reasoning effort
+locally for Smart-Routing sessions. A model or effort you choose explicitly
+continues to take precedence. The setting intentionally contains no credential;
+use `omni setup` (and the Codex CLI login it invokes) to manage subscription
+access.
+
 <details>
 <summary>Gateway base URLs (OpenRouter, Ollama)</summary>
 

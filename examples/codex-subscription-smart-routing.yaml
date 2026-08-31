@@ -1,0 +1,10 @@
+# Add this block to ~/.omnigent/config.yaml after `omni setup` has configured
+# a ChatGPT subscription through the Codex CLI as the default OpenAI provider.
+#
+# Do not replace the existing file: `omni setup` owns the `providers:` block
+# that records the local Codex subscription. This setting contains no token,
+# API key, or account identifier.
+routing:
+  # Choose models and reasoning effort locally from the Codex subscription
+  # catalog. No separate judge-model request or API credential is required.
+  provider: codex-subscription

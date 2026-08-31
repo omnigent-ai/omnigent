@@ -1102,6 +1102,11 @@ def _build_session_response(
         model_override=conv.model_override,
         cost_control_mode_override=conv.cost_control_mode_override,
         subagent_routing_override=conv.subagent_routing_override,
+        gpt_5_6_sol_routing_enabled=labels.get("omnigent.routing.gpt_5_6_sol") == "on",
+        databricks_kimi_routing_enabled=labels.get("omnigent.routing.databricks_kimi") == "on",
+        codex_subscription_routing_enabled=(
+            labels.get("omnigent.routing.codex_subscription") != "off"
+        ),
         context_window=context_window,
         last_total_tokens=last_total_tokens,
         # Seed the client's cost indicator on resume. Uses the SUBTREE
@@ -4137,6 +4142,7 @@ def _build_native_terminal_message_event(
     conv: Conversation,
     body: SessionEventInput,
     model_override: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
     """
     Build the runner event that delivers a web message to a native TUI.
@@ -4183,6 +4189,8 @@ def _build_native_terminal_message_event(
     # inject as ONE locked step, so the switch can't race the message.
     if model_override is not None:
         event["model_override"] = model_override
+    if reasoning_effort is not None:
+        event["reasoning_effort"] = reasoning_effort
     return event
 
 
@@ -4194,6 +4202,7 @@ async def _forward_native_terminal_message(
     file_store: FileStore | None = None,
     artifact_store: ArtifactStore | None = None,
     model_override: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> None:
     """
     Forward one Omnigent web-chat message to the native terminal harness.
@@ -4222,7 +4231,12 @@ async def _forward_native_terminal_message(
         the injection request.
     """
     display_name, _, harness = _native_terminal_runtime(conv)
-    event = _build_native_terminal_message_event(conv, body, model_override=model_override)
+    event = _build_native_terminal_message_event(
+        conv,
+        body,
+        model_override=model_override,
+        reasoning_effort=reasoning_effort,
+    )
     _logger.info(
         "%s terminal message forward starting: session=%s block_types=%s model_override=%s",
         display_name,
@@ -4685,6 +4699,16 @@ def _out_of_family_spawn_notice(
     )
 
 
+def _routed_reasoning_effort(
+    verdict: Mapping[str, Any] | None, current_effort: str | None
+) -> str | None:
+    """Return a subscription-router effort only when the user did not pin one."""
+    if current_effort is not None or not isinstance(verdict, Mapping):
+        return None
+    effort = verdict.get("reasoning_effort")
+    return effort if isinstance(effort, str) else None
+
+
 def _publish_routed_model(session_id: str, model: str) -> None:
     """
     Publish a ``session.model`` SSE for a router-selected model.
@@ -4908,6 +4932,10 @@ async def _forward_event_to_runner(
     effective_runner_override = (
         body.model_override if body.model_override is not None else conv.model_override
     )
+    # Routing persists its chosen effort onto the conversation below. Preserve
+    # whether the user had already pinned one so the decision card records the
+    # actual automatic pick instead of treating that persisted value as a pin.
+    _user_effort_pinned = conv.reasoning_effort is not None
     # ── Auto-harness resolution ───────────────────────────────────────
     # When the session was created with harness_override="auto", the real
     # harness + model are determined here on the first message where user
@@ -4953,6 +4981,13 @@ async def _forward_event_to_runner(
                 runner_client=runner_client,
                 gateway_backed=_auto_backed,
                 allow_static_fallback=_auto_backed,
+                allow_databricks_kimi=(
+                    conv.labels.get("omnigent.routing.databricks_kimi") == "on"
+                ),
+                allow_gpt_5_6_sol=(conv.labels.get("omnigent.routing.gpt_5_6_sol") == "on"),
+                allow_codex_subscription_models=(
+                    conv.labels.get("omnigent.routing.codex_subscription") != "off"
+                ),
             )
             try:
                 # Always clear the "auto" sentinel even when routing
@@ -4966,6 +5001,16 @@ async def _forward_event_to_runner(
                 if _auto_model is not None and effective_runner_override is None:
                     _conv_updates["model_override"] = _auto_model
                     effective_runner_override = _auto_model
+                if (
+                    _auto_model is not None
+                    and (
+                        _auto_effort := _routed_reasoning_effort(
+                            _auto_verdict, conv.reasoning_effort
+                        )
+                    )
+                    is not None
+                ):
+                    _conv_updates["reasoning_effort"] = _auto_effort
                 _updated = await asyncio.to_thread(
                     conversation_store.update_conversation,
                     session_id,
@@ -5102,6 +5147,13 @@ async def _forward_event_to_runner(
                     harness_candidates=_child_candidates,
                     gateway_backed=_child_backed,
                     allow_static_fallback=_child_backed,
+                    allow_databricks_kimi=(
+                        conv.labels.get("omnigent.routing.databricks_kimi") == "on"
+                    ),
+                    allow_gpt_5_6_sol=(conv.labels.get("omnigent.routing.gpt_5_6_sol") == "on"),
+                    allow_codex_subscription_models=(
+                        conv.labels.get("omnigent.routing.codex_subscription") != "off"
+                    ),
                 )
                 if _routed_model is not None:
                     effective_runner_override = _routed_model
@@ -5109,6 +5161,12 @@ async def _forward_event_to_runner(
                     _child_updates: dict[str, Any] = {}
                     if _routed_model is not None:
                         _child_updates["model_override"] = _routed_model
+                        if (
+                            _child_effort := _routed_reasoning_effort(
+                                _verdict, conv.reasoning_effort
+                            )
+                        ) is not None:
+                            _child_updates["reasoning_effort"] = _child_effort
                     if _routed_harness is not None:
                         _child_updates["harness_override"] = _routed_harness
                     if _child_updates:
@@ -5160,6 +5218,13 @@ async def _forward_event_to_runner(
                     catalog=await _native_turn_catalog(session_id, conv, runner_client),
                     gateway_backed=_turn_backed,
                     allow_static_fallback=_turn_backed,
+                    allow_databricks_kimi=(
+                        conv.labels.get("omnigent.routing.databricks_kimi") == "on"
+                    ),
+                    allow_gpt_5_6_sol=(conv.labels.get("omnigent.routing.gpt_5_6_sol") == "on"),
+                    allow_codex_subscription_models=(
+                        conv.labels.get("omnigent.routing.codex_subscription") != "off"
+                    ),
                 )
                 if _turn_route_err is not None:
                     # Not routed, and visibly so — the turn runs on the
@@ -5183,6 +5248,10 @@ async def _forward_event_to_runner(
                                 conversation_store.update_conversation,
                                 session_id,
                                 model_override=_routed_model,
+                                reasoning_effort=_routed_reasoning_effort(
+                                    _verdict, conv.reasoning_effort
+                                )
+                                or conv.reasoning_effort,
                             )
                             _publish_routed_model(session_id, _turn_spelling)
                         except (OSError, ValueError):
@@ -5283,6 +5352,7 @@ async def _forward_event_to_runner(
                 _auto_card_verdict,
                 scope="session",
                 harness=_auto_harness,
+                effort_pinned=_user_effort_pinned,
             )
             if not _auto_route_failed:
                 # A failed call is NOT this session's routing decision: the
@@ -5302,6 +5372,7 @@ async def _forward_event_to_runner(
                     scope="session",
                     harness=_auto_harness,
                     decision_id=_auto_decision_id,
+                    effort_pinned=_user_effort_pinned,
                 )
         if _routed_model is not None and _verdict is not None:
             _decision_scope = "child_session" if _parent_routing_on else "turn"
@@ -5329,6 +5400,7 @@ async def _forward_event_to_runner(
                 scope=_decision_scope,
                 harness=_routed_harness or _resolve_harness(conv),
                 attempted_override=_overridden,
+                effort_pinned=_user_effort_pinned,
             )
             if not _route_failed:
                 # A failed call is NOT this session's routing decision: the
@@ -5350,6 +5422,7 @@ async def _forward_event_to_runner(
                     scope=_decision_scope,
                     harness=_routed_harness or _resolve_harness(conv),
                     decision_id=_decision_id,
+                    effort_pinned=_user_effort_pinned,
                     attempted_override=_overridden,
                 )
     except (httpx.HTTPError, ConnectionError) as exc:
@@ -5608,6 +5681,9 @@ async def _dispatch_session_event_to_runner_impl(
         _native_routing_enabled = (
             conv.cost_control_mode_override == "on" and conv.parent_conversation_id is None
         ) or _native_parent_routing_on
+        # The routed effort is persisted before the card is emitted. Snapshot
+        # the user pin first so automatic decisions keep their real effort.
+        _user_effort_pinned = conv.reasoning_effort is not None
         _native_routed_model: str | None = None
         _native_verdict: dict[str, Any] | None = None
         # Set when nothing was routed — the call failed, or the family rule
@@ -5663,6 +5739,13 @@ async def _dispatch_session_event_to_runner_impl(
                     catalog=await _native_turn_catalog(session_id, conv, _native_runner_client),
                     gateway_backed=_native_backed,
                     allow_static_fallback=_native_backed,
+                    allow_databricks_kimi=(
+                        conv.labels.get("omnigent.routing.databricks_kimi") == "on"
+                    ),
+                    allow_gpt_5_6_sol=(conv.labels.get("omnigent.routing.gpt_5_6_sol") == "on"),
+                    allow_codex_subscription_models=(
+                        conv.labels.get("omnigent.routing.codex_subscription") != "off"
+                    ),
                 )
                 if _native_route_err is not None:
                     _native_routed_model, _native_verdict = _unavailable_routing_card(
@@ -5688,6 +5771,10 @@ async def _dispatch_session_event_to_runner_impl(
                             conversation_store.update_conversation,
                             session_id,
                             model_override=_native_routed_model,
+                            reasoning_effort=_routed_reasoning_effort(
+                                _native_verdict, conv.reasoning_effort
+                            )
+                            or conv.reasoning_effort,
                         )
                         _publish_routed_model(session_id, _native_applied_model)
                     except (OSError, ValueError):
@@ -5719,6 +5806,7 @@ async def _dispatch_session_event_to_runner_impl(
                 model_override=(
                     _native_routed_model if _native_applied_model is not None else None
                 ),
+                reasoning_effort=_routed_reasoning_effort(_native_verdict, conv.reasoning_effort),
             )
             forwarded = True
         finally:
@@ -5737,6 +5825,7 @@ async def _dispatch_session_event_to_runner_impl(
                 _native_verdict,
                 scope=_native_scope,
                 harness=_resolve_harness(conv),
+                effort_pinned=_user_effort_pinned,
             )
             if not _native_route_failed:
                 # The label is the route-once gate, so a failed call must not
@@ -5755,6 +5844,7 @@ async def _dispatch_session_event_to_runner_impl(
                     scope=_native_scope,
                     harness=_resolve_harness(conv),
                     decision_id=_native_decision_id,
+                    effort_pinned=_user_effort_pinned,
                 )
         return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
     item_id = await _forward_event_to_runner(
@@ -7279,6 +7369,28 @@ def _external_router_usable(caps: Any = None) -> bool:  # type: ignore[explicit-
     return usable_external(backends_from_caps(caps)) is not None
 
 
+def _native_routing_has_restricted_candidates(body: SessionCreateRequest) -> bool:
+    """Whether a native Smart Routing create may not use a CLI default.
+
+    Enabling a Databricks allowlist or disabling Codex subscription candidates
+    makes the configured menu authoritative.  A router outage must therefore
+    reject the create instead of starting an unrelated installed CLI on its
+    own default model.
+    """
+    return bool(getattr(body, "databricks_kimi_routing_enabled", False)) or not bool(
+        getattr(body, "codex_subscription_routing_enabled", True)
+    )
+
+
+def _restricted_native_routing_error(error: str | None) -> str:
+    """Explain why a restricted Smart Routing create was not started."""
+    detail = error or "The router returned no allowed model."
+    return (
+        f"{detail} Smart Routing did not start a default model because this session has "
+        "a restricted candidate allowlist."
+    )
+
+
 def _judge_only_harness_note(harness: str, verdict: dict[str, Any]) -> str:
     """Explain on the chip why only the model was routed.
 
@@ -7740,6 +7852,9 @@ async def _resolve_fixed_native_model_routing(
     from omnigent.server.smart_routing import models_in_family, route_session_harness
 
     host = await _routing_host_for_create(body, request, user_id)
+    allow_databricks = bool(getattr(body, "databricks_kimi_routing_enabled", False))
+    allow_sol = bool(getattr(body, "gpt_5_6_sol_routing_enabled", False))
+    allow_codex_subscription = bool(getattr(body, "codex_subscription_routing_enabled", True))
     # Off the gateway the built-in judge answers, and the static table's
     # ``databricks-*`` ids are unreachable — the host's pre-launch catalog is the
     # only provider-accurate candidate source.
@@ -7750,6 +7865,9 @@ async def _resolve_fixed_native_model_routing(
         catalog=await _pre_session_model_catalog(request, host, (harness,)),
         gateway_backed=backed,
         allow_static_fallback=backed,
+        allow_databricks_kimi=allow_databricks,
+        allow_gpt_5_6_sol=allow_sol,
+        allow_codex_subscription_models=allow_codex_subscription,
     )
     if model is None or verdict is None:
         return None, None, error or "Routing unavailable; using the harness default model."
@@ -7782,10 +7900,13 @@ async def _resolve_native_smart_routing(
     create, terminal launch and all, so nothing is launched twice.
 
     Falls back to the first installed candidate when routing is unavailable, so
-    the session still lands on a terminal (with the CLI's own default model).
-    Same candidate when only the built-in judge is configured: choosing between
-    two panes is the workspace router's job, so a judge-only deployment routes
-    the default pane's MODEL and says so on the chip.
+    an unrestricted session still lands on a terminal (with the CLI's own
+    default model). A session with a Databricks allowlist or with subscription
+    models disabled instead fails closed: its default CLI model is not an
+    allowed routing candidate. Same candidate when only the built-in judge is
+    configured: choosing between two panes is the workspace router's job, so a
+    judge-only deployment routes the default pane's MODEL and says so on the
+    chip.
 
     :param body: The create request; ``smart_routing_message`` carries the
         routing text and ``host_id`` selects whose CLIs are on offer.
@@ -7811,6 +7932,9 @@ async def _resolve_native_smart_routing(
     )
 
     host = await _routing_host_for_create(body, request, user_id)
+    allow_databricks = bool(getattr(body, "databricks_kimi_routing_enabled", False))
+    allow_sol = bool(getattr(body, "gpt_5_6_sol_routing_enabled", False))
+    allow_codex_subscription = bool(getattr(body, "codex_subscription_routing_enabled", True))
     # Both arms must be gateway-backed before the WORKSPACE router may choose
     # between them: an arm off the gateway cannot run its picks, and the pick is
     # made after the create commits, so there is no safe half-menu. That only
@@ -7830,6 +7954,7 @@ async def _resolve_native_smart_routing(
     # default pane and routes only its model with the built-in judge — a normal
     # Smart Routing session, minus the harness half — instead of declining.
     judge_only = not _external_router_usable()
+    restricted_candidates = _native_routing_has_restricted_candidates(body)
     candidates = (installed[0],) if judge_only else installed
     harness, model, verdict, error = await route_session_harness(
         body.smart_routing_message or "",
@@ -7837,11 +7962,16 @@ async def _resolve_native_smart_routing(
         catalog=await _pre_session_model_catalog(request, host, candidates),
         gateway_backed=backed,
         allow_static_fallback=backed,
+        allow_databricks_kimi=allow_databricks,
+        allow_gpt_5_6_sol=allow_sol,
+        allow_codex_subscription_models=allow_codex_subscription,
     )
     if judge_only:
         kept = native_coding_agent_for_harness(candidates[0])
         kept_name = kept.agent_name if kept is not None else None
         if model is None or verdict is None:
+            if restricted_candidates:
+                return None, None, None, _restricted_native_routing_error(error)
             return (
                 kept_name,
                 None,
@@ -7852,6 +7982,15 @@ async def _resolve_native_smart_routing(
             # One pane on offer, so the seam resolves any pick onto it — and an
             # out-of-family model would reach the launch as a ``--model`` this
             # CLI cannot run. Keep the pane, pin nothing, say why.
+            if restricted_candidates:
+                return (
+                    None,
+                    None,
+                    None,
+                    _restricted_native_routing_error(
+                        f"Not applied: this {candidates[0]} session cannot run {model}."
+                    ),
+                )
             return (
                 kept_name,
                 None,
@@ -7866,6 +8005,8 @@ async def _resolve_native_smart_routing(
         )
     native_agent = native_coding_agent_for_harness(harness) if harness is not None else None
     if native_agent is None:
+        if restricted_candidates:
+            return None, None, None, _restricted_native_routing_error(error)
         # Routing unavailable (or it named something that is not a native
         # terminal) — land on the first installed CLI so the session still
         # opens a terminal; the CLI keeps its own default model.
@@ -7986,8 +8127,9 @@ async def _create_session_from_existing_agent(
     # Fixed native harness + Smart Routing on: the harness is the caller's own
     # choice, so only the MODEL is routed — and it has to happen here, since the
     # terminal launches with the row and its turns originate in the TUI (the
-    # server never sees the first message pre-inference). Fails open: no pin, a
-    # decision card with the reason, and the CLI's default model.
+    # server never sees the first message pre-inference). Unrestricted sessions
+    # fail open with no pin and the CLI's default model; restricted candidate
+    # menus fail closed so that default cannot escape their allowlist.
     # A spec that hands its brain harness to the router (``smart_routing_harness:
     # auto``) takes the sentinel path below instead of any create-time pick: the
     # harness is not decided until the first message, so there is no single
@@ -8011,6 +8153,11 @@ async def _create_session_from_existing_agent(
         ) = await _resolve_fixed_native_model_routing(
             body, request, user_id, _fixed_native_harness
         )
+        if _fixed_routed_model is None and _native_routing_has_restricted_candidates(body):
+            raise OmnigentError(
+                _restricted_native_routing_error(_fixed_routing_error),
+                code=ErrorCode.INVALID_INPUT,
+            )
 
     # Authorize parent_session_id before inheriting anything.
     # The caller must own or have READ access to the parent session;
@@ -8053,7 +8200,14 @@ async def _create_session_from_existing_agent(
             if _native_smart_routing
             else _fixed_routed_model or body.model_override
         ),
-        reasoning_effort=body.reasoning_effort,
+        reasoning_effort=(
+            body.reasoning_effort
+            if body.reasoning_effort is not None
+            else _routed_reasoning_effort(
+                _native_routing_verdict if _native_smart_routing else _fixed_routing_verdict,
+                None,
+            )
+        ),
     )
 
     # Validated before any row exists so a bad value never creates an
@@ -8443,6 +8597,20 @@ async def _create_session_from_existing_agent(
         conv.labels.update(_merged)
     elif body.labels:
         await asyncio.to_thread(conversation_store.set_labels, conv.id, body.labels)
+    # Candidate opt-ins are session-owned preferences, not user-provided
+    # labels. Persist them after the wrapper labels so the first routed turn
+    # sees the same policy the create-time router used.
+    _routing_preferences = {
+        "omnigent.routing.gpt_5_6_sol": "on" if body.gpt_5_6_sol_routing_enabled else "off",
+        "omnigent.routing.databricks_kimi": "on"
+        if body.databricks_kimi_routing_enabled
+        else "off",
+        "omnigent.routing.codex_subscription": "on"
+        if body.codex_subscription_routing_enabled
+        else "off",
+    }
+    await asyncio.to_thread(conversation_store.set_labels, conv.id, _routing_preferences)
+    conv.labels.update(_routing_preferences)
 
     if harness_override == "auto" or _native_smart_routing:
         # Routing replaces the "auto" sentinel (at the first message for a
@@ -8470,6 +8638,7 @@ async def _create_session_from_existing_agent(
                 _native_routing_verdict,
                 scope="session",
                 harness=_routed_native.harness if _routed_native is not None else None,
+                effort_pinned=body.reasoning_effort is not None,
             )
             # The same prompt is submitted again inside the harness, where the
             # first-prompt hook would score it a second time for the verdict
@@ -8498,6 +8667,7 @@ async def _create_session_from_existing_agent(
                 _fixed_routing_verdict,
                 scope="session",
                 harness=_fixed_native_harness,
+                effort_pinned=body.reasoning_effort is not None,
             )
             await _stamp_routing_decision_label(conv.id, conversation_store, _fixed_decision_id)
             if _fixed_decision_id is not None:
