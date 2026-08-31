@@ -154,14 +154,16 @@ class Uuid16(TypeDecorator[str]):
             return dialect.type_descriptor(MySQLBinary(16))
         return dialect.type_descriptor(LargeBinary(16))
 
-    def process_bind_param(self, value: str | uuid.UUID | None, _dialect: object) -> bytes | None:
+    def process_bind_param(self, value: str | uuid.UUID | None, dialect: object) -> bytes | None:
+        del dialect
         if value is None:
             return None
         return uuid_to_bytes(value)
 
     def process_result_value(
-        self, value: bytes | memoryview | str | None, _dialect: object
+        self, value: bytes | memoryview | str | None, dialect: object
     ) -> str | None:
+        del dialect
         if value is None:
             return None
         if isinstance(value, str):

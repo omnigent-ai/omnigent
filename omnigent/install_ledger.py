@@ -12,9 +12,9 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import NotRequired, TypeAlias, TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 
-_JsonObject: TypeAlias = dict[str, object]
+from omnigent.json_types import JsonObject as _JsonObject
 
 SCHEMA_VERSION = 1
 LEDGER_NAME = "install_ledger.json"

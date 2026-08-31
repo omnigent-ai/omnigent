@@ -196,6 +196,11 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     assert captured["session_key"] == "main"
     assert captured["resource_role"] == PI_NATIVE_TERMINAL_ROLE
     assert captured["spec"].command == "pi"
+    config = json.loads(
+        Path(captured["spec"].env[pi_native_bridge.PI_NATIVE_CONFIG_ENV_VAR]).read_text()
+    )
+    tool_names = {tool["name"] for tool in config["tools"]}
+    assert {"list_comments", "sys_session_list"} <= tool_names
     # The fresh terminal is surfaced on the live stream for the Terminal toggle.
     assert any(evt.get("type") == "session.resource.created" for evt in published)
 

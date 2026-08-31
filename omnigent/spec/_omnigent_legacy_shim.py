@@ -42,8 +42,9 @@ import importlib
 import inspect
 import json
 from collections.abc import Awaitable, Mapping
-from typing import Protocol, TypeAlias, cast
+from typing import Protocol, cast
 
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.policies.types import EvaluationContext
 from omnigent.spec.types import Phase
 
@@ -58,8 +59,6 @@ from omnigent.spec.types import Phase
 # reshaped.
 _LEGACY_FIRST_PARAM = "content"
 _LEGACY_SECOND_PARAM = "phase"
-
-_JsonObject: TypeAlias = dict[str, object]
 
 
 class _PolicyCallable(Protocol):

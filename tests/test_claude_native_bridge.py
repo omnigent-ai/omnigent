@@ -3873,6 +3873,48 @@ async def test_serve_mcp_survives_handler_exception_and_keeps_serving(
 
 
 @pytest.mark.asyncio
+async def test_start_tool_relay_accepts_pi_native_bridge_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Relay startup accepts Pi-native's persistent bridge root."""
+    from omnigent import pi_native_bridge
+
+    pi_root = tmp_path / ".omnigent" / "pi-native"
+    monkeypatch.setattr("omnigent.pi_native_bridge._BRIDGE_ROOT", pi_root)
+    bridge_dir = pi_native_bridge.prepare_bridge_dir("conv_pi")
+    relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+
+    async def _executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
+        """Return an empty result for the unused relay tool callback."""
+        del name, arguments
+        return {}
+
+    relay = None
+    try:
+        relay = start_tool_relay(
+            bridge_dir=bridge_dir,
+            tools=[
+                {
+                    "name": "sys_session_list",
+                    "description": "List Omnigent sessions.",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            tool_executor=_executor,
+            loop=asyncio.get_running_loop(),
+        )
+        assert relay_file.exists(), (
+            "Pi-native relay did not write tool_relay.json under the persistent bridge root"
+        )
+        relay_info = json.loads(relay_file.read_text(encoding="utf-8"))
+        assert relay_info["tools"][0]["name"] == "sys_session_list"
+    finally:
+        if relay is not None:
+            relay.close()
+
+
+@pytest.mark.asyncio
 async def test_start_tool_relay_accepts_codex_native_bridge_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

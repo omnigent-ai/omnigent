@@ -1,28 +1,56 @@
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, type ComponentType } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
-import { ChatPage } from "@/pages/ChatPage";
-import { NotFoundPage } from "@/pages/NotFoundPage";
+import { ChatPage as ChatPageImpl } from "@/pages/ChatPage";
+import { NotFoundPage as NotFoundPageImpl } from "@/pages/NotFoundPage";
+import { useOmnigentPageView } from "@/lib/analytics";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
 
-// Lazy-load the accounts pages so the bundle a header / OIDC
-// deploy ships (where accounts is off) doesn't include them in the
-// main entry chunk. They're separate chunks that only download
-// when the user actually navigates to /login or /register — which
-// never happens in non-accounts deploys because the route table
-// below doesn't register them. (Members / Policies are lazy-loaded
-// too, but inside SettingsPage now that they're settings
-// sub-categories rather than standalone routes.)
-const LoginPage = lazy(() => import("@/pages/LoginPage").then((m) => ({ default: m.LoginPage })));
-const RegisterPage = lazy(() =>
-  import("@/pages/RegisterPage").then((m) => ({ default: m.RegisterPage })),
+// Bind a page component to its analytics page-view id. Declaring the id here,
+// beside the component, keeps the route table clean and means no route ships
+// without one. Re-fires on pathname change (see useOmnigentPageView), so a page
+// kept mounted across a param change (ChatPage across `/` ↔ `/c/:id`) still emits
+// one view per destination under the same id.
+//
+// SettingsPage opts out (stays unwrapped): its id is param-derived
+// (`settings.<section>`), so it calls useOmnigentPageView itself.
+function withPageView<P extends object>(id: string, Component: ComponentType<P>): ComponentType<P> {
+  return function WithPageView(props: P) {
+    useOmnigentPageView(id);
+    return <Component {...props} />;
+  };
+}
+
+// Every `*Page` here is wrapped with its page-view id. Accounts pages stay lazy
+// so a non-accounts (header / OIDC) deploy doesn't ship them in the main chunk —
+// their routes aren't registered there, so the chunk never downloads. (Members /
+// Policies are lazy inside SettingsPage now that they're settings sub-categories.)
+const ChatPage = withPageView("chat", ChatPageImpl);
+const NotFoundPage = withPageView("not_found", NotFoundPageImpl);
+const LoginPage = withPageView(
+  "login",
+  lazy(() => import("@/pages/LoginPage").then((m) => ({ default: m.LoginPage }))),
 );
-const SetupPage = lazy(() => import("@/pages/SetupPage").then((m) => ({ default: m.SetupPage })));
-const ApprovePage = lazy(() =>
-  import("@/pages/ApprovePage").then((m) => ({ default: m.ApprovePage })),
+const RegisterPage = withPageView(
+  "register",
+  lazy(() => import("@/pages/RegisterPage").then((m) => ({ default: m.RegisterPage }))),
 );
-const InboxPage = lazy(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage })));
-const TasksPage = lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage })));
+const SetupPage = withPageView(
+  "setup",
+  lazy(() => import("@/pages/SetupPage").then((m) => ({ default: m.SetupPage }))),
+);
+const ApprovePage = withPageView(
+  "approve",
+  lazy(() => import("@/pages/ApprovePage").then((m) => ({ default: m.ApprovePage }))),
+);
+const InboxPage = withPageView(
+  "inbox",
+  lazy(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage }))),
+);
+const TasksPage = withPageView(
+  "tasks",
+  lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage }))),
+);
 const SettingsPage = lazy(() =>
   import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
 );

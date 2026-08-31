@@ -1506,6 +1506,7 @@ class TerminalInstance:
         *,
         on_activity: Callable[[], None] | None = None,
         on_exit: Callable[[], None] | None = None,
+        on_tick: Callable[[], None] | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         replace: bool = False,
@@ -1544,6 +1545,12 @@ class TerminalInstance:
         :param on_exit: Optional sync callback invoked when the watcher
             observes that tmux has disappeared. Same non-blocking contract
             as *on_idle*.
+        :param on_tick: Optional sync callback invoked once per poll tick
+            (after the exit check, before the pane diff), regardless of
+            whether the pane changed. Lets a caller drive an out-of-band
+            status source — e.g. the claude-native watcher reading Claude's
+            ``sessions/<pid>.json`` — on the same cadence without a second
+            thread. Same non-blocking contract as *on_idle*.
         :param idle_threshold_s: Per-watcher diff-track idle threshold in
             seconds passed to :class:`_IdleDetector`, e.g. ``1.0`` for the
             claude-native status watcher. ``None`` uses the module
@@ -1559,11 +1566,11 @@ class TerminalInstance:
         """
         if not self.running:
             raise RuntimeError("Cannot start idle watcher before launch")
-        if on_idle is None and on_activity is None and on_exit is None:
+        if on_idle is None and on_activity is None and on_exit is None and on_tick is None:
             raise ValueError(
                 "start_idle_watcher_thread requires at least one of "
-                "on_idle / on_activity / on_exit — a watcher with none would poll "
-                "tmux forever with no effect."
+                "on_idle / on_activity / on_exit / on_tick — a watcher with none "
+                "would poll tmux forever with no effect."
             )
         if self._idle_thread is not None and self._idle_thread.is_alive():
             if not replace:
@@ -1578,6 +1585,7 @@ class TerminalInstance:
                 "on_idle": on_idle,
                 "on_activity": on_activity,
                 "on_exit": on_exit,
+                "on_tick": on_tick,
                 "idle_threshold_s": idle_threshold_s,
                 "poll_interval_s": poll_interval_s,
             },
@@ -1593,6 +1601,7 @@ class TerminalInstance:
         on_idle: Callable[[], None] | None = None,
         on_activity: Callable[[], None] | None = None,
         on_exit: Callable[[], None] | None = None,
+        on_tick: Callable[[], None] | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
     ) -> None:
@@ -1615,6 +1624,9 @@ class TerminalInstance:
             tick the pane content changed. Skipped when ``None``.
         :param on_exit: Optional callback fired when tmux disappears.
             Skipped when ``None``.
+        :param on_tick: Optional per-tick callback fired every poll after
+            the exit check (see :meth:`start_idle_watcher_thread`); skipped
+            when ``None``.
         :param idle_threshold_s: Per-watcher diff-track idle threshold in
             seconds forwarded to :class:`_IdleDetector`, e.g. ``1.0``.
             ``None`` uses the module default.
@@ -1653,6 +1665,12 @@ class TerminalInstance:
                 self.running = False
                 if on_exit is not None:
                     self._fire_watch_callback(on_exit, "exit")
+                return
+            # Per-tick out-of-band status hook (e.g. claude-native reading
+            # Claude's sessions/<pid>.json). Fired after the exit checks so
+            # it never runs for a dead pane, and before the pane diff so an
+            # authoritative file status can preempt the PTY-derived edge.
+            if on_tick is not None and not self._fire_watch_callback(on_tick, "tick"):
                 return
             # A pane change that lands within the recent-interaction window
             # is a client-driven repaint (attach/detach reflow, focus,
@@ -1715,6 +1733,30 @@ class TerminalInstance:
         except RuntimeError:
             return False
         return "1" in out.split()
+
+    def pane_pid_sync(self) -> int | None:
+        """Return the pid of the pane's foreground process, or ``None``.
+
+        This is the pid tmux ``exec``'d into the pane — for a native agent
+        terminal that's the agent CLI itself (e.g. ``claude``). Used by the
+        claude-native status watcher to key Claude's ``sessions/<pid>.json``
+        metadata file. Synchronous sibling of the other ``*_sync`` probes so
+        the threaded watcher can call it without an event loop.
+
+        :returns: The pane pid, or ``None`` when tmux fails or reports no
+            usable value (server gone, pane dead).
+        """
+        try:
+            out = self._tmux_output_sync("list-panes", "-t", self.tmux_target, "-F", "#{pane_pid}")
+        except RuntimeError:
+            return None
+        first = out.split()
+        if not first:
+            return None
+        try:
+            return int(first[0])
+        except ValueError:
+            return None
 
     def _fire_watch_callback(self, callback: Callable[[], None], kind: str) -> bool:
         """

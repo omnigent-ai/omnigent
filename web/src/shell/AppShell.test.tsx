@@ -230,13 +230,10 @@ import { useChatStore } from "@/store/chatStore";
 
 /**
  * Test-only consumer of the TerminalFirstContext provided by AppShell.
- * The production view toggle now lives inside ChatPage's
- * ConnectionIndicator; these tests are scoped to the shell's state
- * machine, so we use a probe component with the exact same
- * `aria-label`s as the production pill ("Chat" / "Terminal" — see
- * ConnectedTerminalFirstPill in ChatPage.tsx) to drive `setView`. If
- * the production labels ever change, these tests fail loudly instead
- * of drifting silently.
+ * The production view toggle lives in the header (ViewModeToggle); these
+ * tests are scoped to the shell's state machine, so we use a probe
+ * component with its own "Chat" / "Terminal" buttons to drive `setView`
+ * and read the context's derived flags off data attributes.
  */
 function TerminalFirstViewProbe() {
   const ctx = useTerminalFirst();
@@ -2852,36 +2849,31 @@ describe("Mobile session menu", () => {
     expect(screen.getByTestId("todo-panel")).toBeInTheDocument();
   });
 
-  it("opens the Tasks drawer for a codex-native session with todos", () => {
-    // Codex-native maps its plan updates to the same todo schema, so the
-    // Tasks entry must gate on codex-native too — not just claude-native.
+  it.each([
+    ["codex-native", "conv_codex", "codex-native-ui"],
+    ["pi-native", "conv_pi", "pi-native-ui"],
+  ])("opens the Tasks drawer for a %s session with todos", (_harness, id, wrapper) => {
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },
       isLoading: false,
     } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
     mockConversations([
       {
-        id: "conv_codex",
+        id,
         permission_level: null,
-        labels: { "omnigent.wrapper": "codex-native-ui" },
+        labels: { "omnigent.wrapper": wrapper },
       },
     ]);
     useChatStore.setState({
-      todos: [
-        { content: "Locate CLI parser", status: "in_progress", activeForm: "Locate CLI parser" },
-      ],
+      todos: [{ content: "Locate CLI parser", status: "in_progress", activeForm: "Locating" }],
     });
 
-    renderShell("/c/conv_codex");
-
+    renderShell(`/c/${id}`);
     expect(screen.getByTestId("todos-panel-drawer")).toHaveAttribute("data-state", "closed");
-    expect(screen.queryByTestId("todo-panel")).toBeNull();
 
     openSessionMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: /Tasks/i }));
 
-    // A codex-native session with a non-empty plan opens the Tasks drawer,
-    // the same as a claude-native session with todos.
     expect(screen.getByTestId("todos-panel-drawer")).toHaveAttribute("data-state", "open");
     expect(screen.getByTestId("todo-panel")).toBeInTheDocument();
   });

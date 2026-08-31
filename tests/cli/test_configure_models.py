@@ -1755,6 +1755,33 @@ def test_overview_lists_configured_acp_agents_as_rows(isolated_config, monkeypat
     assert "Custom ACP agent" not in names
 
 
+def test_setup_reports_invalid_acp_omnigent_mcp(isolated_config) -> None:
+    config_path = os.path.join(isolated_config, "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.safe_dump(
+            {
+                "acp": {
+                    "agents": [
+                        {
+                            "name": "OpenClaw",
+                            "command": "openclaw acp",
+                            "omnigent_mcp": "false",
+                        }
+                    ]
+                }
+            },
+            f,
+        )
+
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+
+    assert result.exit_code != 0
+    assert (
+        "Invalid acp.agents configuration: acp agent omnigent_mcp must be a boolean"
+        in result.output
+    )
+
+
 def test_overview_always_lists_openclaw_import_row(isolated_config, monkeypatch) -> None:
     """OpenClaw import remains available even when discovery finds nothing."""
     options, selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(

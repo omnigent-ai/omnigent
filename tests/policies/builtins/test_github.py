@@ -26,7 +26,13 @@ from typing import Any
 
 import pytest
 
+from omnigent.policies.builtins._shell import SHELL_TOOLS
+from omnigent.policies.builtins.github import _DEFAULT_SHELL_TOOLS as _github_default_shell_tools
 from omnigent.policies.builtins.github import github_policy
+from omnigent.policies.builtins.orchestration import _SHELL_TOOLS as _orchestration_shell_tools
+from omnigent.policies.builtins.working_dir import (
+    _DEFAULT_SHELL_TOOLS as _working_dir_default_shell_tools,
+)
 from omnigent.policies.function import FunctionPolicy, resolve_function_policy
 from omnigent.policies.registry import get_registry, load_registry, validate_factory_params
 from omnigent.policies.schema import PolicyEvent, PolicyResponse
@@ -332,6 +338,34 @@ def test_shell_push_to_url_repo_denied() -> None:
     policy = github_policy(write_repos=[_REPO])
     result = policy(_sh("git push https://github.com/octo/secret main"))
     assert result is not None and result["result"] == "DENY"
+
+
+@pytest.mark.parametrize("tool", sorted(SHELL_TOOLS))
+def test_shell_surface_covers_every_harness(tool: str) -> None:
+    """Every harness's shell tool is inspected by default, not just sys_os_shell.
+
+    Most ``git push`` runs on a native harness, so a default of
+    ``("sys_os_shell",)`` left this policy inspecting nothing at all on the
+    sessions that matter: an admin setting ``write_repos`` got an enforcement
+    boundary that silently did not exist. An ALLOW here means that harness's
+    shell surface is uninspected again.
+
+    :param tool: A shell tool name from the shared default set.
+    """
+    policy = github_policy(write_repos=[_REPO])
+    result = policy(tc(tool, {"command": "git push https://github.com/octo/secret main"}))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_shell_tool_defaults_match_sibling_policies() -> None:
+    """The three shell-surface policies must gate the same tool names.
+
+    They each carried their own literal and drifted: blast_radius covered all
+    six, working_dir two, github one. Fails if any of them is narrowed again.
+    """
+    assert _github_default_shell_tools is SHELL_TOOLS
+    assert _working_dir_default_shell_tools is SHELL_TOOLS
+    assert _orchestration_shell_tools is SHELL_TOOLS
 
 
 def test_shell_push_bad_branch_denied() -> None:

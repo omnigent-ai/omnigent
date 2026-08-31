@@ -17,6 +17,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from pathlib import Path
 from typing import TypeAlias
 
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.native_server_transport import (
     NativeEvent,
     NativeLaunchConfig,
@@ -37,7 +38,6 @@ _logger = logging.getLogger(__name__)
 
 ClientFactory = Callable[[], OpenCodeClient]
 
-_JsonObject: TypeAlias = dict[str, object]
 _JsonMapping: TypeAlias = Mapping[str, object]
 
 # Public surface of this transport module. ``ClientFactory`` is the documented

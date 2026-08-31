@@ -29,6 +29,7 @@ from urllib.parse import quote
 
 import httpx
 
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.opencode_native_bridge import update_active_message_id, update_last_event_id
 from omnigent.opencode_native_client import OpenCodeClient, OpenCodeEvent
 from omnigent.opencode_native_permissions import (
@@ -77,7 +78,6 @@ _OPENCODE_REAUTH_HINT = (
 # Bound the dedupe set so a long-lived session can't grow it without limit.
 _MAX_DEDUPE_KEYS = 8192
 
-_JsonObject: TypeAlias = dict[str, object]
 _JsonMapping: TypeAlias = Mapping[str, object]
 
 

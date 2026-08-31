@@ -267,6 +267,9 @@ omnigent hermes                      # Hermes Agent (Nous Research)
 omnigent pi                          # Pi
 ```
 
+Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
+its coding agents or drive a live OpenClaw Gateway session over ACP.
+
 #### 🐙 Polly and 🟠🔵 Debby
 
 Two example agents ship with the repo, and they make good first sessions:

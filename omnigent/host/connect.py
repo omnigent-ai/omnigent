@@ -592,7 +592,24 @@ def _build_runner_env(
         for name in base_env.get(RUNNER_ENV_PASSTHROUGH_ENV_VAR, "").split(",")
         if name.strip()
     }
-    forwarded = HARNESS_CREDENTIAL_ENV_VARS | extra_names
+    # Forward env vars that the providers config references via
+    # ``api_key_ref: env:VAR`` or ``api_key: $VAR``. Without this, a user
+    # who configures a gateway provider with a custom env var (e.g.
+    # ``api_key_ref: env:MY_TOKEN``) would need to manually add it to
+    # OMNIGENT_RUNNER_ENV_PASSTHROUGH — their credential resolves fine in
+    # the CLI/daemon but silently drops before reaching the runner subprocess.
+    from omnigent.errors import OmnigentError as _OmnigentError
+
+    try:
+        from omnigent.onboarding.provider_config import (
+            load_config,
+            provider_credential_env_vars,
+        )
+
+        config_env_vars = provider_credential_env_vars(load_config())
+    except (OSError, _OmnigentError):
+        config_env_vars = frozenset()
+    forwarded = HARNESS_CREDENTIAL_ENV_VARS | extra_names | config_env_vars
     env = {
         key: value
         for key, value in base_env.items()
@@ -1175,7 +1192,7 @@ class HostProcess:
             env[PROCESS_LOG_FILE_ENV_VAR] = str(log_path)
             try:
                 with child_logging_popen_kwargs(env) as logging_kwargs:
-                    proc = subprocess.Popen(
+                    proc: subprocess.Popen[bytes] = subprocess.Popen(
                         [sys.executable, "-m", "omnigent.runner._entry"],
                         env=env,
                         # Runners are WS-tunnel clients with no interactive input.

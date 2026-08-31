@@ -75,6 +75,7 @@ from typing import Any
 
 from omnigent.policies.builtins._shell import (
     MAX_SHELL_NESTING,
+    SHELL_TOOLS,
     real_invocation_tokens,
     split_command_segments,
     unwrap_shell_command,
@@ -87,8 +88,9 @@ from omnigent.policies.schema import PolicyEvent, PolicyResponse
 # so ``mcp__github__`` wins over a bare ``github__``.
 _DEFAULT_TOOL_PREFIXES: tuple[str, ...] = ("mcp__github__", "github__")
 
-# Shell tools whose command string this policy parses for git / gh invocations.
-_DEFAULT_SHELL_TOOLS: tuple[str, ...] = ("sys_os_shell",)
+# Shell tools whose command string this policy parses for git / gh invocations:
+# every harness's, since most ``git push`` runs on a native harness.
+_DEFAULT_SHELL_TOOLS: frozenset[str] = SHELL_TOOLS
 
 # Pulls ``owner/repo`` out of any GitHub URL (HTTPS, SSH, scp-style). The
 # ``[:/]+`` after the host matches both ``github.com/owner`` and the scp-style
@@ -934,11 +936,12 @@ def github_policy(
         canonicalizing MCP tool names. ``None`` uses the standard
         ``mcp__github__`` / ``github__``.
     :param shell_tools: Names of the shell / terminal tools whose ``command``
-        argument is parsed for ``git`` / ``gh`` invocations. ``None`` uses the
-        built-in OS shell, ``["sys_os_shell"]``. Override this if the agent
-        exposes shell access through a differently-named tool (e.g. a custom
-        terminal); list every such tool, since git/gh run through any tool not
-        listed here are not inspected by this policy.
+        argument is parsed for ``git`` / ``gh`` invocations. ``None`` uses every
+        harness's shell tool (:data:`~omnigent.policies.builtins._shell.SHELL_TOOLS`
+        — Omnigent, Claude/Codex, Cursor, Pi, Hermes, Goose). Override this only
+        if the agent exposes shell access through a differently-named tool (e.g.
+        a custom terminal); list every such tool, since git/gh run through any
+        tool not listed here are not inspected by this policy.
     :param deny_reason: Reason prefix attached to DENY decisions.
     :returns: A one-argument policy callable returning a :class:`PolicyResponse`
         or ``None`` (abstain → ALLOW).
@@ -1194,7 +1197,8 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
         "description": (
             "Controls GitHub access across MCP tools (official per-operation server and the "
             "github_read_api_call / github_write_api_call HTTP-proxy wrapper) and git/gh shell "
-            "commands run via sys_os_shell. Restricts reads to read_repos (unless read_all), and "
+            "commands. Supports Omnigent, Claude/Codex, Cursor, Pi, Hermes, and Goose shell "
+            "tools. Restricts reads to read_repos (unless read_all), and "
             "writes to write_repos plus optional write_branches. Shell commands whose target repo "
             "or branch cannot be determined return ASK for human approval."
         ),
@@ -1238,7 +1242,7 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
                     "items": {"type": "string"},
                     "description": "Shell/terminal tools whose command arg is parsed for "
                     "git/gh; git/gh run through tools not listed here are not "
-                    "inspected (default: sys_os_shell).",
+                    "inspected (default: every harness's shell tool).",
                 },
             },
         },

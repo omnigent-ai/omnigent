@@ -213,13 +213,34 @@ def build_opencode_omnigent_mcp_server(
     claude_cfg = build_mcp_config(bridge_dir, python_executable=python_executable)
     # build_mcp_config returns {"mcpServers": {"<name>": {command, args, env}}};
     # opencode wants a flat command list + ``environment``.
-    name, server = next(iter(claude_cfg["mcpServers"].items()))
+    servers = claude_cfg.get("mcpServers")
+    if not isinstance(servers, dict) or not servers:
+        raise ValueError("Claude MCP config is missing mcpServers")
+    name, server = next(iter(servers.items()))
+    if not isinstance(server, dict):
+        raise ValueError("Claude MCP server config is malformed")
+    command = server.get("command")
+    args = server.get("args", [])
+    if (
+        not isinstance(command, str)
+        or not isinstance(args, list)
+        or not all(isinstance(arg, str) for arg in args)
+    ):
+        raise ValueError("Claude MCP server command is malformed")
     entry: dict[str, object] = {
         "type": "local",
-        "command": [server["command"], *server.get("args", [])],
+        "command": [command, *args],
         "enabled": True,
     }
-    env = dict(server.get("env", {}) or {})
+    env_value = server.get("env")
+    if env_value is None:
+        env: dict[str, str] = {}
+    elif isinstance(env_value, dict) and all(
+        isinstance(key, str) and isinstance(value, str) for key, value in env_value.items()
+    ):
+        env = dict(env_value)
+    else:
+        raise ValueError("Claude MCP server environment is malformed")
     if env:
         entry["environment"] = env
     return {str(name): entry}

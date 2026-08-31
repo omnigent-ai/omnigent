@@ -169,6 +169,28 @@ executor:
 CLI flags such as `--harness qwen` and `--model <id>` can override or supply
 missing executor values.
 
+## Custom ACP agents
+
+`harness: acp:<slug>` runs any configured Agent Client Protocol server command.
+Register commands in `~/.omnigent/config.yaml` under `acp.agents`; the slug is
+derived from the agent name.
+
+OpenClaw's Gateway ACP bridge is one such server. It rejects per-session
+`mcpServers`, so disable Omnigent's MCP relay for that entry and let OpenClaw
+use its own tools, routing, memory, and channels:
+
+```yaml
+acp:
+  agents:
+    - name: OpenClaw
+      command: openclaw acp --url <gateway-url> --token-file <token-file>
+      omnigent_mcp: false
+```
+
+Then run it with `omni run --harness acp:openclaw` or select `OpenClaw` in the
+app. See the [OpenClaw integration guide](openclaw.md) for registry import,
+Gateway setup, and compatibility details.
+
 ## Local OS access
 
 Declare `os_env` only for agents that need local file/shell tools.

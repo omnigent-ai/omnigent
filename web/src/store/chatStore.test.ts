@@ -442,6 +442,197 @@ describe("chatStore — switchTo", () => {
     expect(state.conversationLoadError).toBeNull();
   });
 
+  it("paints a cached transcript immediately and revalidates it silently", async () => {
+    const cachedItems = [
+      userMessage("cache_1", "cached prompt"),
+      assistantMessage("cache_1", "cached answer"),
+    ];
+    seedSession("conv_cached", cachedItems);
+    seedSession("conv_other", []);
+    await useChatStore.getState().switchTo("conv_cached");
+
+    const livePreview: AnyBlock = {
+      type: "text_done",
+      ctx: {
+        agent: null,
+        depth: 0,
+        turn: 0,
+        timestamp: 0,
+        responseId: "live:preview",
+        itemId: "live:preview",
+      },
+      fullText: "not cacheable",
+      hasCodeBlocks: false,
+    };
+    useChatStore.setState((state) => ({ blocks: [...state.blocks, livePreview] }));
+    await useChatStore.getState().switchTo("conv_other");
+
+    let releaseItems: (() => void) | null = null;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("/v1/sessions/conv_cached/items?") && releaseItems === null) {
+        return new Promise<Response>((resolve) => {
+          releaseItems = () => resolve(defaultFetchHandler(input, init));
+        }) as unknown as Response;
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const revisit = useChatStore.getState().switchTo("conv_cached");
+    const immediate = useChatStore.getState();
+    expect(immediate.loadingConversation).toBe(false);
+    expect(immediate.blocks.map((b) => b.ctx.itemId)).toEqual(cachedItems.map((item) => item.id));
+
+    await tick();
+    expect(releaseItems).not.toBeNull();
+    releaseItems!();
+    await revisit;
+
+    const settled = useChatStore.getState();
+    expect(settled.blocks.map((b) => b.ctx.itemId)).toEqual(cachedItems.map((item) => item.id));
+    expect(settled.loadingMoreHistory).toBe(false);
+  });
+
+  it("bridges a multi-page cache gap without resetting the older-history cursor", async () => {
+    const before = Array.from({ length: 30 }, (_, i) =>
+      userMessage(`cache_before_${i}`, `before ${i}`),
+    );
+    const gap = Array.from({ length: 45 }, (_, i) => userMessage(`cache_gap_${i}`, `gap ${i}`));
+    seedSession("conv_cached_gap", before);
+    seedSession("conv_other", []);
+
+    await useChatStore.getState().switchTo("conv_cached_gap");
+    const cachedOldest = useChatStore.getState().oldestItemId;
+    await useChatStore.getState().switchTo("conv_other");
+
+    seedSession("conv_cached_gap", [...before, ...gap]);
+    await useChatStore.getState().switchTo("conv_cached_gap");
+
+    const state = useChatStore.getState();
+    expect(state.blocks.map((b) => b.ctx.itemId)).toEqual(
+      [...before.slice(-SESSION_HISTORY_PAGE_SIZE), ...gap].map((item) => item.id),
+    );
+    expect(state.oldestItemId).toBe(cachedOldest);
+    expect(state.hasMoreHistory).toBe(true);
+  });
+
+  it("keeps cached history and applies session metadata when a later backfill page fails", async () => {
+    const before = Array.from({ length: 30 }, (_, i) =>
+      userMessage(`cache_error_before_${i}`, `before ${i}`),
+    );
+    const gap = Array.from({ length: 45 }, (_, i) =>
+      userMessage(`cache_error_gap_${i}`, `gap ${i}`),
+    );
+    seedSession("conv_cached_error", before);
+    seedSession("conv_other", []);
+
+    await useChatStore.getState().switchTo("conv_cached_error");
+    const cachedBlockIds = useChatStore.getState().blocks.map((block) => block.ctx.itemId);
+    await useChatStore.getState().switchTo("conv_other");
+
+    seedSession("conv_cached_error", [...before, ...gap]);
+    sessionCostControlOverrides.set("conv_cached_error", "on");
+    let itemFetches = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("/v1/sessions/conv_cached_error/items?")) {
+        itemFetches += 1;
+        if (itemFetches === 3) {
+          return mockResponse({ error: "boom" }, { ok: false, status: 500 });
+        }
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    try {
+      await useChatStore.getState().switchTo("conv_cached_error");
+    } finally {
+      warn.mockRestore();
+    }
+
+    const state = useChatStore.getState();
+    expect(itemFetches).toBe(3);
+    expect(state.blocks.map((block) => block.ctx.itemId)).toEqual(cachedBlockIds);
+    expect(state.costControlModeOverride).toBe("on");
+    expect(state.loadingMoreHistory).toBe(false);
+    expect(state.conversationLoadError).toBeNull();
+  });
+
+  it("replaces the cached window when the gap exceeds the backfill cap", async () => {
+    const before = Array.from({ length: 30 }, (_, i) =>
+      userMessage(`cache_cap_before_${i}`, `before ${i}`),
+    );
+    const gap = Array.from({ length: 100 }, (_, i) =>
+      userMessage(`cache_cap_gap_${i}`, `gap ${i}`),
+    );
+    seedSession("conv_cached_cap", before);
+    seedSession("conv_other", []);
+
+    await useChatStore.getState().switchTo("conv_cached_cap");
+    await useChatStore.getState().switchTo("conv_other");
+    seedSession("conv_cached_cap", [...before, ...gap]);
+    await useChatStore.getState().switchTo("conv_cached_cap");
+
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
+      gap.slice(-SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+    );
+    await useChatStore.getState().loadMoreHistory();
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
+      gap.slice(-2 * SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+    );
+  });
+
+  it("replaces a cached transcript that no longer overlaps server history", async () => {
+    seedSession("conv_cached_replaced", [userMessage("cache_old", "old")]);
+    seedSession("conv_other", []);
+    await useChatStore.getState().switchTo("conv_cached_replaced");
+    await useChatStore.getState().switchTo("conv_other");
+
+    const replacement = userMessage("cache_new", "new");
+    seedSession("conv_cached_replaced", [replacement]);
+    await useChatStore.getState().switchTo("conv_cached_replaced");
+
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([replacement.id]);
+  });
+
+  it("evicts the least-recently-written transcript after ten entries", async () => {
+    for (let i = 0; i <= 10; i += 1) {
+      const id = `conv_cache_lru_${i}`;
+      seedSession(id, [userMessage(`cache_lru_${i}`, `message ${i}`)]);
+      // Sequential switches are required because each one caches the prior session.
+      // oxlint-disable-next-line eslint/no-await-in-loop
+      await useChatStore.getState().switchTo(id);
+    }
+
+    const revisit = useChatStore.getState().switchTo("conv_cache_lru_0");
+    expect(useChatStore.getState().loadingConversation).toBe(true);
+    expect(useChatStore.getState().blocks).toEqual([]);
+    await revisit;
+  });
+
+  it("keeps a superseded conversation cacheable after redirect navigation", async () => {
+    const items = [userMessage("cache_superseded", "old")];
+    seedSession("conv_superseded_cache", items);
+    seedSession("conv_other", []);
+    await useChatStore.getState().switchTo("conv_superseded_cache");
+
+    handleSessionEvent({
+      type: "session_superseded",
+      conversationId: "conv_superseded_cache",
+      targetConversationId: "conv_replacement",
+      reason: "clear",
+    });
+    await useChatStore.getState().switchTo("conv_other");
+
+    const revisit = useChatStore.getState().switchTo("conv_superseded_cache");
+    expect(useChatStore.getState().loadingConversation).toBe(false);
+    expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual(
+      items.map((item) => item.id),
+    );
+    await revisit;
+  });
+
   it("hydrates pendingUserMessages from the snapshot's pending_inputs (native rebind)", async () => {
     // The core fix: a native web message that hasn't round-tripped
     // through the transcript yet is replayed by the server in

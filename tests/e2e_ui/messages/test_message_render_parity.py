@@ -76,12 +76,13 @@ def _ensure_chat_view(page: Page) -> None:
 
     :param page: The Playwright page, on the session's chat surface.
     """
-    view_mode = page.get_by_role("group", name="View mode")
+    view_mode = page.get_by_test_id("view-mode-toggle")
     if view_mode.count() == 0:
         return
-    chat_button = view_mode.get_by_role("button", name="Chat")
-    expect(chat_button).to_be_visible(timeout=30_000)
-    chat_button.click()
+    view_mode.click()
+    chat_item = page.get_by_role("menuitemradio", name="Chat")
+    expect(chat_item).to_be_visible(timeout=30_000)
+    chat_item.click()
 
 
 def _turn_prompt(index: int, user_marker: str, assistant_token: str) -> str:

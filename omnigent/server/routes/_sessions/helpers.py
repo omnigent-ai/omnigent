@@ -108,17 +108,87 @@ from omnigent.server.routes._session_create_validation import (
 # Shared constants, state, and small dataclasses live in the _sessions.common
 # leaf module; import them here so this module and its re-exporters see the same
 # objects. The mutable caches are shared by reference across the package.
-from omnigent.server.routes._sessions.common import *
-
 # Runtime bindings that tests patch on the historical ``sessions`` facade are
-# imported from common as facade-delegating proxies (kept out of common's
-# ``__all__`` so the star import above never overwrites them). Resolving them
-# here means a facade-level monkeypatch is honoured in this module too.
+# imported from common as facade-delegating proxies. They stay out of common's
+# ``__all__`` and the facade's explicit re-exports, preserving its real runtime
+# bindings so a facade-level monkeypatch is honoured in this module too.
 from omnigent.server.routes._sessions.common import (  # noqa: F401
+    _APPROVAL_TYPE,
+    _CHILD_PREVIEW_LIMIT,
+    _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY,
+    _CLAUDE_NATIVE_EDIT_TOOLS,
+    _CLAUDE_NATIVE_HARNESS,
+    _CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS,
+    _CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY,
+    _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
+    _CLAUDE_NATIVE_TOOL_USE_ID_LABEL_KEY,
+    _CLAUDE_NATIVE_UI_LABEL_KEY,
+    _CLAUDE_NATIVE_UI_LABEL_VALUE,
+    _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
+    _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
+    _CODEX_NATIVE_COLLABORATION_MODES,
+    _CODEX_NATIVE_HARNESS,
+    _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
+    _CODEX_NATIVE_SUBAGENT_NICKNAME_LABEL_KEY,
+    _CODEX_NATIVE_SUBAGENT_PARENT_THREAD_ID_LABEL_KEY,
+    _CODEX_NATIVE_SUBAGENT_PROMPT_LABEL_KEY,
+    _CODEX_NATIVE_SUBAGENT_ROLE_LABEL_KEY,
+    _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY,
+    _CODEX_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY,
+    _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
+    _COMPACT_LOCKS,
+    _CURSOR_FORK_HISTORY_HARNESSES,
+    _CURSOR_NATIVE_HARNESS,
+    _DENY_SENTINEL_PREFIX,
     _ELICITATION_MODE,
+    _EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT,
+    _FORK_HISTORY_NATIVE_HARNESSES,
+    _HOOK_ELICITATION_ID_RE,
+    _HOST_LAUNCH_RESULT_TIMEOUT_S,
+    _LABEL_VALUE_MAX_LEN,
+    _LAST_TASK_ERROR_CODE_LABEL_KEY,
+    _LAST_TASK_ERROR_MESSAGE_LABEL_KEY,
+    _MAX_TERMINAL_LAUNCH_ARG_LEN,
+    _MAX_TERMINAL_LAUNCH_ARGS,
+    _MODEL_TOKEN_KEYS,
+    _NATIVE_POLICY_NOT_ENFORCED_CODE,
+    _NATIVE_TERMINAL_ENSURE_FAILED_CODE,
+    _PI_NATIVE_WRAPPER_LABEL_VALUE,
+    _RUNNER_CONVICTION_POLL_S,
+    _RUNNER_FORWARD_TIMEOUT,
+    _SERVER_STREAM_EVENT_ADAPTER,
+    _SESSION_STREAM_HEARTBEAT_INTERVAL_S,
+    _SHARED_DISCOVERY_KEY,
+    _SLASH_COMMAND_TYPE,
+    _STOP_RUNNER_RESULT_TIMEOUT_S,
+    _STOP_SESSION_TYPE,
+    _TURN_ACTOR_LABEL,
+    _UI_ADDED_AGENT_TITLE_PREFIX,
+    _UPLOAD_READ_CHUNK_BYTES,
+    COST_CONTROL_OVERRIDE_VALUES,
+    _logger,
+    _managed_launch_tasks,
+    _model_options_cache,
+    _model_options_inflight,
+    _model_options_stale,
+    _native_ask_gate_locks,
+    _pending_policy_ask_writes,
+    _pushed_model_options_cache,
+    _read_explicit_unread,
+    _read_last_seen,
+    _runner_skills_cache,
+    _runner_skills_inflight,
+    _session_active_response_cache,
+    _session_background_task_count_cache,
+    _session_mcp_startup_cache,
+    _session_sandbox_status_cache,
+    _session_status_cache,
+    _session_terminal_pending_cache,
+    _session_todos_cache,
     build_policy_engine,
     get_agent_cache,
     get_caps,
+    get_server_host_registry,
     get_server_runner_router,
     session_stream,
     set_server_runner_router,
@@ -3489,7 +3559,7 @@ async def _persist_session_status_error_labels(
     )
     try:
         await asyncio.to_thread(conversation_store.set_labels, session_id, updates)
-    except Exception:
+    except Exception:  # noqa: BLE001
         _logger.exception(
             "Failed to persist session status error labels for %s",
             session_id,
@@ -4270,7 +4340,7 @@ async def _provision_managed_sandbox(
         tracker.fail(session_id, str(exc.detail))
         _publish_sandbox_status(session_id, "failed", str(exc.detail))
         return None
-    except Exception:
+    except Exception:  # noqa: BLE001
         # Broad on purpose: this is a fire-and-forget task — an
         # unexpected error must settle the tracker (or a waiting
         # message POST hangs until its timeout) and must not escape
@@ -5549,7 +5619,7 @@ async def _emit_server_routing_decision(
     try:
         persisted = await asyncio.to_thread(conversation_store.append, session_id, [routing_item])
         persisted_id: str | None = persisted[0].id if persisted else None
-    except Exception:
+    except Exception:  # noqa: BLE001
         _logger.exception(
             "Server routing: routing_decision persist failed for session=%s",
             session_id,
@@ -5893,7 +5963,7 @@ async def _relay_persist_error_once(
             [item],
         )
         return "persisted"
-    except Exception:
+    except Exception:  # noqa: BLE001
         _logger.exception(
             "Relay error persist failed for session=%s",
             session_id,
@@ -5921,7 +5991,7 @@ async def _relay_persist(
             session_id,
             [item],
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         _logger.exception(
             "Relay persist failed for session=%s",
             session_id,
@@ -6004,7 +6074,7 @@ async def _flush_relay_text(
             ),
         )
         persisted = await asyncio.to_thread(conversation_store.append, session_id, [item])
-    except Exception:
+    except Exception:  # noqa: BLE001
         # Keep text_acc + the in-flight buffer so the narration isn't lost:
         # it still replays on reconnect and is retried at the next flush.
         _logger.exception(
@@ -8199,7 +8269,7 @@ async def _handle_advise_models_mcp(
             continue
         try:
             verdict = await routing_client.route(task_text, harness_models)
-        except Exception:  # routing failures must not crash the advisor
+        except Exception:  # noqa: BLE001  # routing failures must not crash the advisor
             _logger.exception("_handle_advise_models_mcp: route failed task=%r", title)
             verdict = None
         if verdict is None:

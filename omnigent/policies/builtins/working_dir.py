@@ -54,6 +54,7 @@ from typing import Any, Literal
 
 from omnigent.policies.builtins._shell import (
     MAX_SHELL_NESTING,
+    SHELL_TOOLS,
     real_invocation_tokens,
     split_command_segments,
     unwrap_shell_command,
@@ -75,10 +76,9 @@ _GIT_VALUE_OPTS: frozenset[str] = frozenset(
     {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"}
 )
 
-# Shell tools whose command string this policy parses, by default.
-# Includes both the Omnigent built-in OS shell and Claude Code / Codex
-# native ``Bash`` tool (surfaced via the ``PreToolUse`` hook contract).
-_DEFAULT_SHELL_TOOLS: tuple[str, ...] = ("sys_os_shell", "Bash")
+# Shell tools whose command string this policy parses, by default: every
+# harness's, so the worktree confinement isn't inert on a native session.
+_DEFAULT_SHELL_TOOLS: frozenset[str] = SHELL_TOOLS
 
 
 @dataclass(frozen=True)
@@ -270,9 +270,10 @@ def block_working_dir_changes(
     :param action: What a gated command yields — ``"deny"`` (block it) or
         ``"ask"`` (park for human approval). Defaults to ``"deny"``.
     :param shell_tools: Names of the shell tools whose ``command`` argument is
-        parsed. ``None`` uses the defaults: ``["sys_os_shell", "Bash"]``
-        (Omnigent built-in + Claude/Codex native). Commands run through
-        a tool not listed here are not inspected.
+        parsed. ``None`` uses every harness's shell tool
+        (:data:`~omnigent.policies.builtins._shell.SHELL_TOOLS` — Omnigent,
+        Claude/Codex, Cursor, Pi, Hermes, Goose). Commands run through a tool
+        not listed here are not inspected.
     :returns: A one-argument policy callable returning a :class:`PolicyResponse`
         (DENY / ASK) on a gated command, or ``None`` to abstain (ALLOW).
     :raises ValueError: If *action* is not ``"deny"`` / ``"ask"``, or if both
@@ -427,10 +428,11 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
         "kind": "factory",
         "name": "Block Working Directory & Worktree Changes",
         "description": (
-            "Gates shell commands (sys_os_shell and Claude/Codex native Bash) "
-            "that switch the working directory (cd / chdir / pushd / popd, "
+            "Gates shell commands that switch the working directory "
+            "(cd / chdir / pushd / popd, "
             "git -C) or git worktrees (git worktree add / move / remove). "
-            "Optionally allow cd into specific directories via allowed_dirs. "
+            "Supports Omnigent, Claude/Codex, Cursor, Pi, Hermes, and Goose "
+            "shell tools. Optionally allow cd into specific directories via allowed_dirs. "
             "Chained, wrapped (bash -c), and env-prefixed commands are parsed "
             "so the gate cannot be trivially bypassed."
         ),
@@ -464,7 +466,7 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Shell tools whose command arg is parsed "
-                    "(default: sys_os_shell, Bash).",
+                    "(default: every harness's shell tool).",
                 },
             },
         },

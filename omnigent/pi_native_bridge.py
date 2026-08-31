@@ -12,9 +12,8 @@ import time
 import uuid
 from importlib.resources import files
 from pathlib import Path
-from typing import TypeAlias
 
-_JsonObject: TypeAlias = dict[str, object]
+from omnigent.json_types import JsonObject as _JsonObject
 
 # Per-process tiebreaker for inbox ordering. The extension delivers inbox
 # files in lexicographic filename order, so a high-resolution timestamp alone
@@ -32,6 +31,11 @@ _EXTENSION_FILE = "omnigent_pi_native_extension.js"
 _EXTENSION_PACKAGE = "omnigent.resources.pi_native"
 _INBOX_DIR = "inbox"
 _SESSIONS_DIR = "sessions"
+
+
+def bridge_root() -> Path:
+    """Return the root directory used for native Pi bridge files."""
+    return _BRIDGE_ROOT
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:

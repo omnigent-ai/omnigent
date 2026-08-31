@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse, urlunparse
 
 from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
+from omnigent.json_types import JsonValue
 from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VAR,
     strip_runner_auth_secrets,
@@ -54,10 +55,6 @@ if TYPE_CHECKING:
 from .sandbox import (
     run_launcher as _run_launcher,
 )
-
-# Any JSON-shaped leaf — used for the encode/decode serializer helpers that
-# mirror the pattern in ``omnigent/sandbox.py`` and ``omnigent/uc_tools.py``.
-JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 
 # Result dict returned by ``read`` / ``write`` / ``edit`` / ``shell`` and the
 # corresponding ``_*_impl`` helpers. Keys vary by op (content/offset/total_lines

@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, TypeAlias, cast
 import pydantic
 
 from omnigent import model_catalog
+from omnigent.json_types import JsonValue
 from omnigent.llms.adapters._content import redact_inline_data_uris
 from omnigent.spec.types import RetryPolicy
 
@@ -55,9 +56,6 @@ logger = logging.getLogger(__name__)
 # duplicate OpenAI's own SDK types.
 ResponsesItem: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 OpenAIKwargs: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
-
-# Plain JSON value — recursive union used by ``_to_plain_data``.
-JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 
 
 def _redact_inline_base64(value: Any) -> Any:  # type: ignore[explicit-any]

@@ -37,6 +37,7 @@ from omnigent.entities.session_resources import (
 )
 
 if TYPE_CHECKING:
+    from omnigent.claude_native_status_file import SessionStatusPoller
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.inner.os_env import OSEnvironment
     from omnigent.inner.terminal import TerminalInstance
@@ -1044,6 +1045,34 @@ class SessionResourceRegistry:
         # means "never emitted", so the first changed tick always fires.
         last_activity_emit: dict[str, float | None] = {"value": None}
 
+        def _publish_status(status: str) -> None:
+            # Publish one running/idle edge: dedup against the last value,
+            # memo for exit classification, and hop to the loop (publishers
+            # are loop-only). Shared by the PTY edges and the claude-native
+            # status-file poller so both go through the same dedup/memo.
+            if status_publisher is None or last_status["value"] == status:
+                return
+            last_status["value"] = status
+            self._set_session_status_memo(session_id, status)
+            loop.call_soon_threadsafe(status_publisher, session_id, status)
+
+        # claude-native prefers Claude's own ``sessions/<pid>.json`` status
+        # (present since Claude Code v2.1.139) over the PTY frame-diff: it
+        # flips on the real turn edge and distinguishes ``waiting`` (needs
+        # input) from ``busy``. Built only for the claude-native role; other
+        # native roles stay PTY-only. ``None`` (old Claude, missing file)
+        # leaves the PTY watcher authoritative — see ``poller.active`` gating
+        # in the PTY edges below.
+        status_poller = (
+            self._build_claude_native_status_poller(
+                session_id=session_id,
+                instance=instance,
+                on_status=_publish_status,
+            )
+            if emit_status and resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
+            else None
+        )
+
         def _on_activity() -> None:
             # Runs on the watcher daemon thread; hop to the loop so the
             # loop-only publishers (queue.put_nowait) are touched safely.
@@ -1064,12 +1093,12 @@ class SessionResourceRegistry:
                     loop.call_soon_threadsafe(activity_publisher, session_id, resource_id)
             # Pane changed → the agent is working. Coalesce to the
             # idle→running edge so a continuously-redrawing pane doesn't
-            # re-emit ``running`` every poll.
-            if emit_status and status_publisher is not None and last_status["value"] != "running":
-                last_status["value"] = "running"
-                # Track for exit classification: a pane exit now reads as a crash.
-                self._set_session_status_memo(session_id, "running")
-                loop.call_soon_threadsafe(status_publisher, session_id, "running")
+            # re-emit ``running`` every poll. Skipped while the status-file
+            # poller is authoritative (it owns the edge, and the file
+            # distinguishes ``waiting`` from ``busy`` — which the pane
+            # diff can't); the PTY edge resumes if the poller falls back.
+            if emit_status and (status_poller is None or not status_poller.active):
+                _publish_status("running")
 
         def _on_exit() -> None:
             def _schedule() -> None:
@@ -1123,13 +1152,13 @@ class SessionResourceRegistry:
             # Pane quiet for the claude-native status threshold → the
             # agent has stopped. Edge-triggered: re-arms only after new
             # output mutates the pane (which flips back to ``running``).
-            if status_publisher is not None and last_status["value"] != "idle":
-                last_status["value"] = "idle"
-                # Track for exit classification: a pane exit now reads as clean.
-                # Edge ordering: the watcher thread runs idle/exit serially, so
-                # this idle commits before any later on_exit reads the memo.
-                self._set_session_status_memo(session_id, "idle")
-                loop.call_soon_threadsafe(status_publisher, session_id, "idle")
+            # Skipped while the status-file poller is authoritative — the
+            # 1s pane-quiescence heuristic would otherwise race the file's
+            # real turn edge; the PTY idle resumes if the poller falls back.
+            # Edge ordering: the watcher thread runs idle/exit serially, so
+            # this idle commits before any later on_exit reads the memo.
+            if status_poller is None or not status_poller.active:
+                _publish_status("idle")
             # Clear the activity throttle so the next working episode emits
             # its first pulse immediately, keeping the activity badge
             # aligned with the running-status edge (which also re-fires on
@@ -1137,13 +1166,71 @@ class SessionResourceRegistry:
             # behind it.
             last_activity_emit["value"] = None
 
+        def _on_tick() -> None:
+            # Drive the status-file poller on the watcher cadence. No-op
+            # once it resolves the file and every read is unchanged, cheap
+            # (one ``stat``) otherwise; retires to the PTY watcher if the
+            # file never appears (old Claude) or later vanishes.
+            if status_poller is not None:
+                status_poller.tick()
+
         instance.start_idle_watcher_thread(
             on_activity=_on_activity,
             on_idle=_on_idle,
             on_exit=_on_exit,
+            on_tick=_on_tick if status_poller is not None else None,
             idle_threshold_s=_CLAUDE_NATIVE_STATUS_IDLE_THRESHOLD_SECONDS,
             poll_interval_s=_CLAUDE_NATIVE_STATUS_POLL_INTERVAL_SECONDS,
             replace=replace,
+        )
+
+    def _build_claude_native_status_poller(
+        self,
+        *,
+        session_id: str,
+        instance: TerminalInstance,
+        on_status: Callable[[str], None],
+    ) -> SessionStatusPoller:
+        """Build the claude-native ``sessions/<pid>.json`` status poller.
+
+        Keyed primarily by the terminal's pane pid (which equals Claude's
+        pid on this launch path, so the file is ``<pane_pid>.json``), with
+        Claude's own session uuid — read lazily from the bridge state once
+        a hook reports it — as a cross-check and scan fallback.
+
+        Lazy-imported so the generic runner module keeps no claude-native
+        import at load time (mirrors the rest of the native wiring).
+
+        :param session_id: Owning session/conversation id, used to derive
+            the bridge directory holding the captured Claude session uuid.
+        :param instance: The launched terminal instance (exposes
+            ``pane_pid_sync``).
+        :param on_status: Callback fired with ``running`` / ``idle`` on each
+            status transition.
+        :returns: A ``SessionStatusPoller`` the watcher drives per tick.
+        """
+        from omnigent.claude_native_bridge import (
+            bridge_dir_for_conversation_id,
+            read_claude_session_id,
+        )
+        from omnigent.claude_native_status_file import SessionStatusPoller
+
+        bridge_dir = bridge_dir_for_conversation_id(session_id)
+
+        def _session_id_getter() -> str | None:
+            # Best-effort: the bridge records Claude's uuid only after the
+            # first hook fires. ``None`` before then simply means the poller
+            # relies on the pid match (already scoped to this process) until
+            # the cross-check becomes available.
+            try:
+                return read_claude_session_id(bridge_dir)
+            except Exception:  # noqa: BLE001 - best-effort cross-check; never break the watcher.
+                return None
+
+        return SessionStatusPoller(
+            on_status=on_status,
+            pane_pid_getter=instance.pane_pid_sync,
+            session_id_getter=_session_id_getter,
         )
 
     async def _handle_terminal_exit(

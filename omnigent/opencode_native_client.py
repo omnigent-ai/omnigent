@@ -25,6 +25,8 @@ from typing import TypeAlias
 
 import httpx
 
+from omnigent.json_types import JsonObject as _JsonObject
+
 _logger = logging.getLogger(__name__)
 
 # Pinned OpenCode CLI/API version range. The source monorepo reports
@@ -34,7 +36,6 @@ OPENCODE_MAX_VERSION_EXCLUSIVE = "1.18.0"
 
 _DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
-_JsonObject: TypeAlias = dict[str, object]
 _JsonMapping: TypeAlias = Mapping[str, object]
 
 

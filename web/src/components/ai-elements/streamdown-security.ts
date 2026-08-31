@@ -1,5 +1,5 @@
 import { cjk } from "@streamdown/cjk";
-import { math } from "@streamdown/math";
+import { createMathPlugin } from "@streamdown/math";
 import { mermaid } from "@streamdown/mermaid";
 import { defaultRehypePlugins, type LinkSafetyConfig, type StreamdownProps } from "streamdown";
 import { lazyCodePlugin } from "./lazyCodePlugin";
@@ -18,7 +18,12 @@ type StreamdownHardenPlugin = StreamdownPluginTuple & {
   1: StreamdownHardenOptions;
 };
 
-export const STREAMDOWN_PLUGINS = { cjk, code: lazyCodePlugin, math, mermaid };
+export const STREAMDOWN_PLUGINS = {
+  cjk,
+  code: lazyCodePlugin,
+  math: createMathPlugin({ singleDollarTextMath: true }),
+  mermaid,
+};
 export const SECURE_STREAMDOWN_REHYPE_PLUGINS = createSecureStreamdownRehypePlugins();
 
 // Streamdown enables a link-safety confirmation modal by default: clicking any

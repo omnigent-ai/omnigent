@@ -24,6 +24,7 @@ from cachetools import TTLCache
 from websockets.asyncio.client import ClientConnection
 
 from omnigent import model_catalog
+from omnigent.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
     from omnigent.onboarding.provider_config import ProviderEntry
@@ -53,7 +54,6 @@ from omnigent.inner.databricks_executor import _databricks_gateway_host
 
 _logger = logging.getLogger(__name__)
 
-_JsonObject: TypeAlias = dict[str, object]
 CodexMessage: TypeAlias = _JsonObject
 CodexParams: TypeAlias = _JsonObject
 

@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import cast
 
-_JsonObject = dict[str, object]
+from omnigent.json_types import JsonObject as _JsonObject
 
 
 class FrameKind(str, Enum):

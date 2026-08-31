@@ -27,6 +27,7 @@ import { PresenceAvatars } from "@/components/PresenceAvatars";
 import type { Agent } from "@/hooks/useAgents";
 import { cn } from "@/lib/utils";
 import { TAB_BADGE_BASE } from "./railTabs";
+import { ViewModeToggle } from "./ViewModeToggle";
 
 /**
  * Gating flags + handlers for the mobile-only session-menu FAB (the
@@ -272,6 +273,9 @@ export function ChatHeader({
         {/* Agent info: tools & policies for the bound agent. Desktop-only
             popover; self-hides when the agent has neither configured. */}
         {conversationId && <AgentInfoButton agent={boundAgent} sessionId={conversationId} />}
+        {/* Chat/Terminal switcher for terminal-first sessions — self-gates to
+            null otherwise (and in the iOS shell, where it's the native bar). */}
+        {conversationId && <ViewModeToggle />}
         {/* Mobile-only three-dot menu folding the action buttons above
             (Share · Agent info) so the header stays
             uncluttered on a phone. The right-panel/rail control is

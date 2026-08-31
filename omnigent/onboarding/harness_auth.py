@@ -284,7 +284,12 @@ def detect_adoptable_credentials() -> list[DetectedCredential]:
         family = getattr(provider, "family", None)
         kind = getattr(provider, "kind", None)
         source = getattr(provider, "source", None)
-        if family not in _SUPPORTED_FAMILIES or kind != "key" or not isinstance(source, str):
+        if (
+            not isinstance(family, str)
+            or family not in _SUPPORTED_FAMILIES
+            or kind != "key"
+            or not isinstance(source, str)
+        ):
             continue
         # Only env-var sources are adoptable by reference (env:<VAR>); a CLI
         # login isn't a key the UI can point a provider entry at.

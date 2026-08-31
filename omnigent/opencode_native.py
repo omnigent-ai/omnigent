@@ -26,7 +26,6 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TypeAlias
 
 import click
 import httpx
@@ -44,6 +43,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
@@ -66,8 +66,6 @@ _logger = logging.getLogger(__name__)
 # Built-in native-UI agent name (matches the descriptor's
 # ``wrapper_agent_name`` and the web native registry).
 _AGENT_NAME = "opencode-native-ui"
-
-_JsonObject: TypeAlias = dict[str, object]
 
 
 def _materialize_opencode_agent_spec(

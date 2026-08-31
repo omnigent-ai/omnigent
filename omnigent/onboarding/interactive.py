@@ -214,6 +214,43 @@ def _render_menu(
     return buf.getvalue()
 
 
+def _count_terminal_lines(rendered: str, width: int) -> int:
+    """Count the visual terminal lines that *rendered* occupies.
+
+    ``rendered.count("\\n")`` undercounts when Rich wraps a logical line
+    across multiple terminal rows (e.g. a long status label near the edge).
+    Each logical line's display-cell width, divided by *width* (with ceiling),
+    gives the real number of rows it occupies — which is what the cursor-up
+    escape needs to erase the full frame.
+
+    :param rendered: ANSI-escaped string as produced by :func:`_render_menu`.
+    :param width: Terminal column count used when rendering.
+    :returns: Total visual rows the string occupies.
+    """
+    import re
+
+    if not rendered:
+        return 0
+    # Strip ANSI escape sequences to measure plain display width.
+    ansi_re = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+    total = 0
+    for line in rendered.split("\n"):
+        plain = ansi_re.sub("", line)
+        line_cells = cell_len(plain)
+        # A zero-width line still occupies one row — except the empty segment
+        # that split() produces after the very last newline (a phantom row).
+        if line_cells == 0:
+            total += 1
+        else:
+            total += max(1, -(-line_cells // width))  # ceiling division
+    # split() yields one extra empty segment after the final newline; the
+    # trailing newline itself is the line separator, not a new line, so
+    # subtract that phantom row.
+    if rendered.endswith("\n"):
+        total -= 1
+    return max(total, 0)
+
+
 def _normalize_selectable(options: list[str], selectable: list[bool] | None) -> list[bool]:
     """Validate/expand the *selectable* mask for a menu.
 
@@ -448,7 +485,7 @@ def select(
         sys.stdout.write("\033[J")  # Clear from cursor to end of screen.
         sys.stdout.write(rendered)
         sys.stdout.flush()
-        prev_lines[0] = rendered.count("\n")
+        prev_lines[0] = _count_terminal_lines(rendered, width)
 
     try:
         old_attrs = termios.tcgetattr(fd)

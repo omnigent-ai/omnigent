@@ -316,6 +316,17 @@ describe("quick pin/unpin hover button", () => {
     expect(screen.getByTestId("project-list-actions")).not.toHaveClass("size-7");
   });
 
+  it("hides the Projects list-actions kebab when there are no projects", () => {
+    // With no projects, the kebab has nothing to offer (no expand/collapse, no
+    // sessions to select) and would open empty — so it's hidden entirely,
+    // leaving just the "New project" button.
+    mocks.projects = [];
+    renderSidebar();
+
+    expect(screen.queryByTestId("project-list-actions")).toBeNull();
+    expect(screen.getByTestId("new-project")).toBeInTheDocument();
+  });
+
   it("toggles the pin without opening the kebab menu, moving the row under Pinned", () => {
     renderSidebar();
 

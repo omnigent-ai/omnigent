@@ -167,6 +167,59 @@ def test_threaded_idle_watcher_keeps_last_pane_text_on_exit(tmp_path: Path) -> N
     assert instance.last_pane_text() == "startup failed\ntry config"
 
 
+def test_threaded_idle_watcher_fires_on_tick_each_poll(tmp_path: Path) -> None:
+    """``on_tick`` fires every poll (not only on pane change), so the
+    claude-native status-file poller runs on the watcher cadence.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    """
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    # A steady, unchanging pane: no activity edges, but ticks still fire.
+    instance._capture_pane_for_idle_or_none = lambda: "steady frame"  # type: ignore[method-assign]
+    instance._pane_is_dead = lambda: False  # type: ignore[method-assign]
+    ticks = threading.Event()
+    count = {"n": 0}
+
+    def _on_tick() -> None:
+        count["n"] += 1
+        if count["n"] >= 3:
+            ticks.set()
+
+    instance.start_idle_watcher_thread(on_tick=_on_tick, poll_interval_s=0.01)
+    assert ticks.wait(timeout=1.0)
+    instance._stop_idle_watcher_thread()
+    assert count["n"] >= 3
+
+
+def test_pane_pid_sync_returns_pane_process_pid(tmp_path: Path) -> None:
+    """``pane_pid_sync`` parses the tmux ``#{pane_pid}`` value.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    """
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    instance._tmux_output_sync = lambda *args: "54321\n"  # type: ignore[method-assign]
+    assert instance.pane_pid_sync() == 54321
+
+    # A tmux failure (server gone) yields ``None`` rather than raising.
+    def _raise(*args: object) -> str:
+        raise RuntimeError("no server")
+
+    instance._tmux_output_sync = _raise  # type: ignore[method-assign]
+    assert instance.pane_pid_sync() is None
+
+
 @dataclass
 class _ProcessWithStdout:
     """

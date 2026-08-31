@@ -55,6 +55,27 @@ _GRACEFUL_SHUTDOWN_TUNNEL_TIMEOUT_S = 15.0
 _MANAGED_MINT_REFRESH_SKEW_S = 300.0
 _logger = logging.getLogger(__name__)
 
+# Module-level singleton set once at runner startup. All later
+# _make_auth_token_factory() calls return this instance so every call site
+# shares the proxy bearer, even after RUNNER_INITIAL_AUTH_TOKEN has been
+# popped from the environment.
+_runner_auth_factory: Callable[[], str | None] | None = None
+
+
+def _set_runner_auth_factory(factory: Callable[[], str | None] | None) -> None:
+    """Set the runner-process auth factory singleton.
+
+    Called once at startup so every subsequent :func:`_make_auth_token_factory`
+    call returns this instance instead of building a new one. Exposed as a
+    function rather than a bare module assignment so callers (including those
+    running as ``__main__``, where the module object differs from the imported
+    ``omnigent.runner._entry``) can set it on the canonical module.
+
+    :param factory: The auth token factory to install as the singleton.
+    """
+    global _runner_auth_factory
+    _runner_auth_factory = factory
+
 
 def _server_url_from_env() -> str:
     """Return the required Omnigent server URL from the runner environment.
@@ -321,6 +342,7 @@ class _InitialAuthTokenFactory:
         :param server_url: Omnigent server URL used by the fallback resolver.
         """
         self._initial_token: str | None = token
+        self._last_initial_token: str = token  # retained for managed-mint proxy auth
         self._server_url = server_url
         self._fallback_factory: Callable[[], str | None] | None = None
         self._fallback_resolved = False
@@ -335,7 +357,7 @@ class _InitialAuthTokenFactory:
                 self._fallback_factory = _make_auth_token_factory(
                     self._server_url,
                     _allow_initial_token=False,
-                    _allow_delegated_mint=False,
+                    _proxy_bearer=self._last_initial_token,
                 )
                 self._fallback_resolved = True
             if self._fallback_factory is None:
@@ -357,6 +379,7 @@ def _make_auth_token_factory(
     *,
     _allow_initial_token: bool = True,
     _allow_delegated_mint: bool = True,
+    _proxy_bearer: str | None = None,
 ) -> Callable[[], str | None] | None:
     """Build a callable that mints fresh auth tokens.
 
@@ -392,6 +415,23 @@ def _make_auth_token_factory(
     :returns: A sync callable returning a bearer token string, or
         ``None`` when no refresh mechanism is available.
     """
+    # Return the runner-process singleton when it has been set and no
+    # caller-specific overrides are requested. This ensures every harness
+    # setup or terminal-creation call made after runner startup reuses the
+    # factory that already has the proxy bearer, rather than constructing a
+    # fresh one after RUNNER_INITIAL_AUTH_TOKEN has been popped from env.
+    # Also match when the caller explicitly passes the same URL the runner
+    # was started with — in-runner helpers like native_policy_hook pass
+    # server_url explicitly but still want the shared factory.
+    _runner_url = os.environ.get(_RUNNER_SERVER_URL_ENV_VAR)
+    if (
+        _runner_auth_factory is not None
+        and _allow_initial_token
+        and _allow_delegated_mint
+        and _proxy_bearer is None
+        and (server_url is None or server_url == _runner_url)
+    ):
+        return _runner_auth_factory
     resolved_server_url = server_url or os.environ.get(_RUNNER_SERVER_URL_ENV_VAR)
 
     # Consume the host bearer before any credential discovery. Removing it
@@ -423,7 +463,9 @@ def _make_auth_token_factory(
     delegated_auth = os.environ.get(RUNNER_DELEGATED_AUTH_ENV_VAR, "").strip() == "1"
     binding_token = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, "").strip()
     if _allow_delegated_mint and delegated_auth and resolved_server_url and binding_token:
-        delegated_factory = _make_managed_mint_factory(resolved_server_url, binding_token)
+        delegated_factory = _make_managed_mint_factory(
+            resolved_server_url, binding_token, proxy_bearer=_proxy_bearer
+        )
         if delegated_factory is not None:
             return delegated_factory
 
@@ -523,6 +565,8 @@ def _make_auth_token_factory(
 def _make_managed_mint_factory(
     server_url: str,
     binding_token: str,
+    *,
+    proxy_bearer: str | None = None,
 ) -> Callable[[], str | None] | None:
     """Build a token factory that mints a managed runner's owner JWT.
 
@@ -542,6 +586,10 @@ def _make_managed_mint_factory(
         ``"https://omnigent.example.com"``.
     :param binding_token: The runner's tunnel binding token (the sandbox's
         only credential), presented to the mint endpoint.
+    :param proxy_bearer: Optional bearer to include on the mint request so
+        an Apps proxy lets it through. Used when a host-injected initial
+        bearer is available (the minted JWT takes over on subsequent
+        refreshes).
     :returns: A sync callable returning a fresh owner JWT, or ``None`` only
         when the server *definitively* will not mint for this runner (HTTP
         400 no-auth/header mode, 404 older server without the endpoint, or a
@@ -567,7 +615,9 @@ def _make_managed_mint_factory(
     # transient failure (network blip, 5xx, timeout) installs it anyway so the
     # next callback re-mints, rather than leaving the runner unauthenticated
     # until process restart.
-    factory = _ManagedMintTokenFactory(mint_url, server_url, binding_token)
+    factory = _ManagedMintTokenFactory(
+        mint_url, server_url, binding_token, proxy_bearer=proxy_bearer
+    )
     factory()
     if factory.declined:
         return None
@@ -589,15 +639,27 @@ class _ManagedMintTokenFactory:
     factory, then the first real mint learns the server never mints).
     """
 
-    def __init__(self, mint_url: str, server_url: str, binding_token: str) -> None:
+    def __init__(
+        self,
+        mint_url: str,
+        server_url: str,
+        binding_token: str,
+        *,
+        proxy_bearer: str | None = None,
+    ) -> None:
         """
         :param mint_url: Fully-qualified ``/v1/runners/{id}/token`` URL.
         :param server_url: Omnigent server base URL.
         :param binding_token: The runner's tunnel binding token.
+        :param proxy_bearer: Optional bearer for the Apps proxy. Seeded with
+            the host's initial bearer; replaced by the minted JWT after the
+            first successful mint so the proxy sees a valid credential on
+            every subsequent refresh.
         """
         self._mint_url = mint_url
         self._server_url = server_url
         self._binding_token = binding_token
+        self._proxy_bearer = proxy_bearer
         self._cached_token: str | None = None
         self._cached_expires_at = 0.0
         self.declined = False
@@ -619,7 +681,10 @@ class _ManagedMintTokenFactory:
             return self._cached_token
         try:
             token, expires_at = _mint_managed_owner_token(
-                self._mint_url, self._server_url, self._binding_token
+                self._mint_url,
+                self._server_url,
+                self._binding_token,
+                proxy_bearer=self._proxy_bearer,
             )
         except httpx.HTTPStatusError as exc:
             response = exc.response
@@ -636,6 +701,9 @@ class _ManagedMintTokenFactory:
             return self._still_valid_cached_token(now)
         self._cached_token = token
         self._cached_expires_at = expires_at
+        # Promote the minted JWT to proxy bearer so subsequent refreshes
+        # through the Apps proxy are authenticated with a valid credential.
+        self._proxy_bearer = token
         return token
 
     def _still_valid_cached_token(self, now: float) -> str | None:
@@ -653,6 +721,8 @@ def _mint_managed_owner_token(
     mint_url: str,
     server_url: str,
     binding_token: str,
+    *,
+    proxy_bearer: str | None = None,
 ) -> tuple[str, float]:
     """Mint one managed-runner owner JWT from the server.
 
@@ -661,6 +731,10 @@ def _mint_managed_owner_token(
         routing header (``X-Databricks-Org-Id``) when applicable.
     :param binding_token: The runner's tunnel binding token, sent as the
         ``X-Omnigent-Runner-Tunnel-Token`` header to authenticate the mint.
+    :param proxy_bearer: Optional bearer for a Databricks Apps proxy sitting
+        in front of the Omnigent server. The proxy requires a valid
+        ``Authorization`` header even on unauthenticated-to-Omnigent
+        endpoints; the binding token alone is not enough to pass it.
     :returns: ``(jwt, expires_at_epoch_seconds)``.
     :raises httpx.HTTPError: On network failure or a non-2xx response.
     :raises KeyError: If the response is missing the expected fields.
@@ -674,7 +748,7 @@ def _mint_managed_owner_token(
     headers = {
         "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
         RUNNER_TUNNEL_TOKEN_HEADER: binding_token,
-        **databricks_request_headers(server_url),
+        **databricks_request_headers(server_url, bearer_token=proxy_bearer),
     }
     with httpx.Client(timeout=10.0) as client:
         response = client.post(mint_url, headers=headers)
@@ -1153,6 +1227,18 @@ def create_app(
         _pane_reaper = getattr(app.state, "native_pane_reaper", None)
         if _pane_reaper is not None:
             await _pane_reaper.start()
+        # Backstop for a hard host/runner death (SIGKILL / OOM / crash) that
+        # ran no graceful teardown: a codex app-server spawned in its own
+        # session outlives its runner. Reconciling the crash-safe registry at
+        # boot reaps any such orphan whose owner lock is no longer held (its
+        # runner is gone), so a fresh runner on the host cleans up what a dead
+        # predecessor left. Held owner locks (live sibling runners) are skipped.
+        from omnigent.codex_native_process_registry import (
+            reconcile_codex_native_process_registry,
+        )
+
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(reconcile_codex_native_process_registry)
 
     async def _stop_pm() -> None:
         """Stop runner-owned resources for graceful process exit.
@@ -1162,6 +1248,14 @@ def create_app(
         _pane_reaper = getattr(app.state, "native_pane_reaper", None)
         if _pane_reaper is not None:
             await _pane_reaper.shutdown()
+        # Close host-spawned codex-native app-servers before the process exits.
+        # Each is spawned in its own session (survives the runner's death), and a
+        # host-initiated stop tears the runner down without a per-session DELETE,
+        # so without this they orphan as lingering ``codex`` processes.
+        from omnigent.runner.native import teardown_all_codex_native_app_servers
+
+        with contextlib.suppress(Exception):
+            await teardown_all_codex_native_app_servers()
         await pm.shutdown()
         await _terminal_registry.shutdown()
         if mcp_manager is not None:
@@ -1197,6 +1291,15 @@ async def _run_tunnel_from_env() -> None:
 
     server_url = _server_url_from_env()
     auth_token_factory = _make_auth_token_factory()
+    # Write the singleton to the canonical module so it is visible to all
+    # importers even when this file runs as __main__ (which Python treats as a
+    # separate module object from omnigent.runner._entry). Importing the
+    # canonical name here ensures sys.modules registers it before any
+    # harness code tries to read it.
+    import omnigent.runner._entry as _canonical_entry
+
+    _canonical_entry._set_runner_auth_factory(auth_token_factory)
+    _set_runner_auth_factory(auth_token_factory)
     auth_token = auth_token_factory() if auth_token_factory is not None else None
     binding_token = _runner_tunnel_binding_token_from_env()
     parent_pid = _runner_parent_pid_from_env()

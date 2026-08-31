@@ -3560,8 +3560,11 @@ async def _forward_available_items(
     # numerator fallback only when the statusLine hasn't fired yet
     # (e.g. cold-resume before the first render tick).
     status_state = await asyncio.to_thread(read_claude_context_state, bridge_dir)
-    resolved_context_window = (
+    context_window_value = (
         status_state.get("context_window_size") if status_state is not None else None
+    )
+    resolved_context_window = (
+        context_window_value if isinstance(context_window_value, int) else None
     )
     usage_from_status = (
         _usage_from_status_state(status_state) if status_state is not None else None

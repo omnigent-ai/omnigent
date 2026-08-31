@@ -19,6 +19,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Literal, TypeAlias
 
+from omnigent.json_types import JsonObject as _JsonObject
+
 OPENCODE_NATIVE_HARNESS = "opencode-native"
 
 # OpenCode's accepted reply tokens.
@@ -27,7 +29,6 @@ OpenCodeReply = Literal["once", "always", "reject"]
 # Omnigent-side normalized decisions used by the forwarder.
 PolicyDecision = Literal["allow_once", "allow_always", "reject", "ask"]
 
-_JsonObject: TypeAlias = dict[str, object]
 _JsonMapping: TypeAlias = Mapping[str, object]
 
 

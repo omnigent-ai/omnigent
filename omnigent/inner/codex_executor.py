@@ -1433,10 +1433,8 @@ class _CodexAppServerSession:
         if stdin is not None:
             with suppress(Exception):
                 stdin.close()
-            wait_closed = getattr(stdin, "wait_closed", None)
-            if callable(wait_closed):
-                with suppress(Exception):
-                    await wait_closed()
+            with suppress(Exception):
+                await stdin.wait_closed()
         for task in (self._reader_task, self._stderr_task):
             if task is not None:
                 task.cancel()

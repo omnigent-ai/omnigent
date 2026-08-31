@@ -406,7 +406,7 @@ async def serve_tunnel(
                 )
             else:
                 http_status = _websocket_http_status(exc)
-                if http_status in _REFRESHABLE_HTTP_STATUSES:
+                if http_status is not None and http_status in _REFRESHABLE_HTTP_STATUSES:
                     _invalidate_auth_token_factory(auth_token_factory)
                     auth_token = await _handle_refreshable_auth_failure(
                         auth_token_factory, http_status, exc

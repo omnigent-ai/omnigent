@@ -595,6 +595,34 @@ class TestBuildModelsJson(unittest.TestCase):
         self.assertEqual(p["databricks"]["baseUrl"], "https://openrouter.ai/api/v1")
         self.assertEqual(p["databricks-completions"]["baseUrl"], "https://openrouter.ai/api/v1")
 
+    def test_generic_openai_providers_include_auth_header(self):
+        # Generic (non-Databricks) OpenAI-compatible gateways expect
+        # ``Authorization: Bearer <token>``.  The "databricks" and
+        # "databricks-completions" provider entries must carry
+        # ``authHeader: True`` so Pi sends that header rather than the
+        # Databricks-native auth scheme which the gateway does not recognise
+        # (resulting in a 401 "Missing Authentication header").
+        result = _build_models_json(
+            "https://host.example.com",
+            "tok",
+            {"openai": "https://openrouter.ai/api/v1"},
+        )
+        p = result["providers"]
+        self.assertTrue(p["databricks"].get("authHeader"), "databricks entry missing authHeader")
+        self.assertTrue(
+            p["databricks-completions"].get("authHeader"),
+            "databricks-completions entry missing authHeader",
+        )
+
+    def test_databricks_native_providers_omit_auth_header(self):
+        # On the Databricks-native path (no openai base_url), the "databricks"
+        # and "databricks-completions" entries must NOT carry ``authHeader``
+        # (the workspace endpoint uses a different auth scheme).
+        result = _build_models_json("https://host.example.com", "tok")
+        p = result["providers"]
+        self.assertNotIn("authHeader", p["databricks"])
+        self.assertNotIn("authHeader", p["databricks-completions"])
+
     def test_generic_openai_model_uses_configured_responses_wire(self):
         result = _build_models_json(
             "https://unused.example.com",

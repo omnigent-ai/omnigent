@@ -3164,7 +3164,7 @@ def _set_opencode_default_model(current: str | None) -> str | None:
     if current is not None:
         clear_index = len(options)
         options.append("Clear default (use OpenCode's own default)")
-    default = models.index(current) if current in models else 0
+    default = models.index(current) if current is not None and current in models else 0
     # Even filtered to reachable providers the list can exceed the screen, so
     # bound the picker to a scrolling viewport sized to the terminal (leaving
     # room for the title / status / footer / "N more" markers).
@@ -3778,7 +3778,10 @@ def _run_configure_harnesses_interactive() -> None:
             openclaw_agents_to_acp_entries,
         )
 
-        acp_summary = acp_config_summary()
+        try:
+            acp_summary = acp_config_summary()
+        except ValueError as exc:
+            raise click.ClickException(f"Invalid acp.agents configuration: {exc}") from exc
         for agent in acp_summary.agents:
             rows.append(
                 (

@@ -65,8 +65,9 @@ class CodexNativeProcessOwnerLock:
 
         :returns: None.
         """
-        with contextlib.suppress(OSError):
-            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        if fcntl is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
         with contextlib.suppress(OSError):
             os.close(self.fd)
         with contextlib.suppress(OSError):
@@ -97,6 +98,7 @@ def acquire_codex_native_process_owner_lock() -> CodexNativeProcessOwnerLock | N
     if fcntl is None:
         return None
     root = _codex_native_state_root() / _OWNER_LOCK_DIR
+    fd: int | None = None
     try:
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         path = root / f"{uuid.uuid4().hex}.lock"
@@ -104,9 +106,11 @@ def acquire_codex_native_process_owner_lock() -> CodexNativeProcessOwnerLock | N
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         _logger.warning("codex-native process owner lock create failed", exc_info=True)
-        with contextlib.suppress(NameError, OSError):
-            os.close(fd)
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
         return None
+    assert fd is not None
     return CodexNativeProcessOwnerLock(path=path, fd=fd)
 
 

@@ -2424,7 +2424,7 @@ def test_render_history_item_renders_slash_command_metadata() -> None:
     assert "/grill-me review this plan" in rendered
 
 
-class _StubSkillSession:
+class _StubSkillSession(_SessionsChatReplAdapter):
     """Session stub that records structured skill slash-command sends."""
 
     model = "agent"
@@ -2604,15 +2604,16 @@ async def test_new_command_resets_session_without_clearing_screen(
     )
 
 
-class _StubSessionsModeSession:
+class _StubSessionsModeSession(_SessionsChatReplAdapter):
     """``_StubSession`` plus the async ``start_new_conversation`` hook the
     sessions-mode adapter exposes. Used to assert the slash-command
     handlers prefer the new async method over sync ``reset()``."""
 
+    model = "agent"
+
     def __init__(self, *, raise_on_start: Exception | None = None) -> None:
         self.reset_calls = 0
         self.start_new_calls = 0
-        self.model = "agent"
         self._raise_on_start = raise_on_start
 
     def reset(self) -> None:

@@ -579,13 +579,19 @@ class AcpExecutor(Executor):
         if self._session_id is not None:
             return self._session_id
 
-        mcp_servers = self._mcp.session_new_servers(
-            tools=self._omnigent_tools,
-            tool_executor=getattr(self, "_tool_executor", None),
-            loop=asyncio.get_event_loop(),
-            enabled=self._config.omnigent_mcp,
-        )
-        params: _AcpJsonObject = {"cwd": self._cwd, "mcpServers": mcp_servers}
+        params: _AcpJsonObject = {
+            "cwd": self._cwd,
+            # ACP requires this field even when no per-session MCP servers are
+            # configured. Keep it empty when Omnigent MCP is disabled.
+            "mcpServers": [],
+        }
+        if self._config.omnigent_mcp:
+            params["mcpServers"] = self._mcp.session_new_servers(
+                tools=self._omnigent_tools,
+                tool_executor=getattr(self, "_tool_executor", None),
+                loop=asyncio.get_event_loop(),
+                enabled=True,
+            )
         client_id: str | None = None
         if self._config.session_id_mode == "client":
             client_id = secrets.token_urlsafe(16)

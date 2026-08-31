@@ -99,6 +99,18 @@ describe("UserBubble markdown rendering", () => {
     const cell = await screen.findByText("1", { selector: "td, td *" });
     expect(cell.closest("table")).not.toBeNull();
   });
+
+  it("renders CJK text around explicit inline math", async () => {
+    const { container } = renderBubble(userBubble(String.raw`中文 \(\sqrt{x + 1}\) 文本`));
+
+    await waitFor(() => expect(container.querySelector(".katex")).not.toBeNull());
+    expect(container.textContent).toContain("中文");
+    expect(container.textContent).toContain("文本");
+    const katex = container.querySelector(".katex") as HTMLElement;
+    expect(katex.querySelector(".sqrt")).not.toBeNull();
+    expect(katex.textContent).toContain("x");
+    expect(katex.textContent).toContain("1");
+  });
 });
 
 describe("UserBubble system messages", () => {

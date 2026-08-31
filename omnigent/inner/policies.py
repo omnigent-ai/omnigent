@@ -56,6 +56,11 @@ PolicyCallableResult: TypeAlias = object
 # ``{"action": str, "reason": str|None, "set_labels": dict}`` but values
 # arrive from LLM output, so we keep them open and narrow field-by-field.
 PolicyResponsePayload: TypeAlias = dict[str, object]
+PolicyPhase: TypeAlias = Literal["request", "response", "tool_call", "tool_result"]
+
+
+def _default_policy_phases() -> list[PolicyPhase]:
+    return ["request", "response"]
 
 
 class _LabelRule(Protocol):
@@ -121,9 +126,7 @@ class Policy:
     # (rare — most paths pass a name from the YAML loader or a test).
     # Error messages and executor IDs fall back to ``"<unnamed>"``.
     name: str | None = None
-    on: list[Literal["request", "response", "tool_call", "tool_result"]] = field(
-        default_factory=lambda: ["request", "response"]
-    )
+    on: list[PolicyPhase] = field(default_factory=_default_policy_phases)
     _runtime_context: PolicyRuntimeContext | None = field(
         default=None,
         init=False,
