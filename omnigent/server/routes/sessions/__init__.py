@@ -211,7 +211,6 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY as _CODEX_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY,
     _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE as _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE as _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
-    _COMPACT_LOCKS as _COMPACT_LOCKS,
     _COMPACT_TYPE as _COMPACT_TYPE,
     _CURSOR_FORK_HISTORY_HARNESSES as _CURSOR_FORK_HISTORY_HARNESSES,
     _CURSOR_NATIVE_HARNESS as _CURSOR_NATIVE_HARNESS,
@@ -551,9 +550,6 @@ from omnigent.server.routes._sessions.helpers import (
     _build_policy_engine_from_spec_impl as _build_policy_engine_from_spec,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _compact_lock_impl as _compact_lock,
-)
-from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner_impl as _forward_session_change_to_runner,
 )
 from omnigent.server.routes._sessions.helpers import (
@@ -745,7 +741,6 @@ if TYPE_CHECKING:
         "_agent_carries_native_fork_history",
         "_agent_is_native",
         "_build_policy_engine_from_spec",
-        "_compact_lock",
         "_dispatch_session_event_to_runner",
         "_ensure_runner_relay_ready",
         "_forward_session_change_to_runner",

@@ -743,13 +743,12 @@ async def test_events_compact_on_codex_native_injects_slash_command(
 
 
 @pytest.mark.asyncio
-async def test_events_compact_on_codex_native_returns_204_when_no_terminal() -> None:
+async def test_events_compact_on_codex_native_returns_503_when_no_terminal() -> None:
     """
-    Codex-native compact returns 204 when no live terminal is registered.
+    Codex-native compact returns 503 when no live terminal is registered.
 
-    Without a running codex terminal the ``/compact`` slash command
-    has nowhere to go.  204 tells the Omnigent server to fall back to
-    its own AP-side compaction (or skip it).
+    Without a running codex terminal the ``/compact`` slash command has
+    nowhere to go. 503 tells the caller to reconnect first.
     """
     codex_native_spec = AgentSpec(
         spec_version=1,
@@ -786,8 +785,8 @@ async def test_events_compact_on_codex_native_returns_204_when_no_terminal() -> 
             json={"type": "compact"},
         )
 
-    assert resp.status_code == 204, (
-        f"Codex-native compact with no terminal must return 204; "
+    assert resp.status_code == 503, (
+        f"Codex-native compact with no terminal must return 503; "
         f"got {resp.status_code}: {resp.text}"
     )
 
@@ -1742,14 +1741,15 @@ async def test_events_compact_on_opencode_native_summarizes_from_model_override(
 
 
 @pytest.mark.asyncio
-async def test_events_compact_on_opencode_native_204_when_model_unresolvable(
+async def test_events_compact_on_opencode_native_503_when_model_unresolvable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """
-    No resolvable model → 204 and ``/summarize`` is never called.
+    No resolvable model → 503 and ``/summarize`` is never called.
 
-    The 204 tells the Omnigent server to run its own AP-side compaction.
+    Without a model the compaction has nowhere to go; 503 tells the caller
+    to switch the model first.
     """
     resp, client = await _drive_opencode_native_compact(
         monkeypatch,
@@ -1760,8 +1760,8 @@ async def test_events_compact_on_opencode_native_204_when_model_unresolvable(
         model_override=None,
     )
 
-    assert resp.status_code == 204, (
-        f"opencode-native compact must 204 when no model resolves; "
+    assert resp.status_code == 503, (
+        f"opencode-native compact must 503 when no model resolves; "
         f"got {resp.status_code}: {resp.text}"
     )
     assert client.summarize_calls == [], (
