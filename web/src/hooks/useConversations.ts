@@ -259,6 +259,11 @@ export function markSessionsDeleting(ids: Iterable<string>): void {
   for (const id of ids) deletingSessionIds.add(id);
 }
 
+/** Whether a session has an optimistic delete in flight (tombstoned). */
+export function isSessionDeleting(id: string): boolean {
+  return deletingSessionIds.has(id);
+}
+
 /**
  * Stop hiding sessions — their delete failed, so the rows return.
  * Omit `ids` to release every tombstone at once.
