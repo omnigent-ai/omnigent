@@ -179,9 +179,11 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
     }
 )
 
-# Source identity belongs only to the original imported session. Unlike runtime
-# instance labels, these survive an in-place agent switch but never a fork.
-_FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS
+# Source identity belongs only to the original imported session, and a fork is
+# born unarchived so it must not inherit its parent's archive time. Unlike
+# runtime instance labels, these survive an in-place agent switch but never a
+# fork.
+_FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {ARCHIVED_AT_LABEL_KEY}
 
 
 @dataclass(frozen=True)

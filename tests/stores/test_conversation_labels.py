@@ -471,3 +471,21 @@ def test_archive_stamps_archived_at_once_and_clears_on_unarchive(
     restored = conversation_store.get_conversation(conv.id)
     assert restored is not None
     assert ARCHIVED_AT_LABEL_KEY not in restored.labels
+
+
+def test_fork_does_not_inherit_archived_at_label(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A fork is born unarchived, so it must not carry the source's
+    archive time: a stale inherited stamp would make a never-archived
+    clone look retention-expired the moment it is archived."""
+    source = conversation_store.create_conversation()
+    conversation_store.update_conversation(source.id, archived=True)
+    archived = conversation_store.get_conversation(source.id)
+    assert archived is not None
+    assert ARCHIVED_AT_LABEL_KEY in archived.labels
+
+    fork = conversation_store.fork_conversation(source.id)
+    forked = conversation_store.get_conversation(fork.id)
+    assert forked is not None
+    assert ARCHIVED_AT_LABEL_KEY not in forked.labels
