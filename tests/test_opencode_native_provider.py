@@ -623,6 +623,7 @@ def test_extract_progress_token_variants() -> None:
 
 
 def test_mcp_progress_heartbeat_lifecycle() -> None:
+    import itertools
     import threading
     import time
 
@@ -649,7 +650,7 @@ def test_mcp_progress_heartbeat_lifecycle() -> None:
         assert all(m["method"] == "notifications/progress" for m in written_messages)
         assert all(m["params"]["progressToken"] == "test-token" for m in written_messages)
         progresses = [m["params"]["progress"] for m in written_messages]
-        assert all(b > a for a, b in zip(progresses, progresses[1:], strict=False))
+        assert all(b > a for a, b in itertools.pairwise(progresses))
 
         # Once exited, no more messages are emitted
         count_at_exit = len(written_messages)
