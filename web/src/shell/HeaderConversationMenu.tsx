@@ -35,6 +35,9 @@ import {
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
@@ -223,19 +226,17 @@ export function HeaderConversationMenu({
           Agent info
         </DropdownMenuItem>
       )}
-      {/* Rename lives here only on mobile — the native shells hide the
-          breadcrumb, so this menu is the sole entry point. On desktop the
-          shortcut is clicking the breadcrumb title (HeaderTitle). */}
-      {isMobile && (
-        <DropdownMenuItem
-          data-testid="header-rename-conversation"
-          className={itemClass}
-          onSelect={() => setRenameOpen(true)}
-        >
-          <PencilIcon className="size-3.5" />
-          Rename
-        </DropdownMenuItem>
-      )}
+      {/* Rename is also reachable on desktop by clicking the breadcrumb title
+          (HeaderTitle); on mobile the native shells hide the breadcrumb, so this
+          menu is the sole entry point. */}
+      <DropdownMenuItem
+        data-testid="header-rename-conversation"
+        className={itemClass}
+        onSelect={() => setRenameOpen(true)}
+      >
+        <PencilIcon className="size-3.5" />
+        Rename
+      </DropdownMenuItem>
       <DropdownMenuItem
         data-testid="header-mark-unread-conversation"
         className={itemClass}
@@ -244,10 +245,12 @@ export function HeaderConversationMenu({
         <MailIcon className="size-3.5" />
         Mark as unread
       </DropdownMenuItem>
-      {/* Move to project lives here only on mobile — the native mobile shells
-          hide the breadcrumb, so this menu is the sole entry point. On desktop
-          the shortcut is the breadcrumb's folder tag (HeaderProjectTag). */}
-      {isMobile && (
+      {/* Move to project is also reachable on desktop via the breadcrumb's
+          folder tag (HeaderProjectTag); on mobile the native shells hide the
+          breadcrumb, so this menu is the sole entry point. */}
+      {isMobile ? (
+        // Mobile has no room for a side flyout, so this item swaps the menu body
+        // to the project picker in place (see the `projectPickerOpen` branch).
         <DropdownMenuItem
           data-testid="header-move-to-project"
           className={cn("whitespace-nowrap", itemClass)}
@@ -259,6 +262,21 @@ export function HeaderConversationMenu({
           <FolderInputIcon className="size-3.5" />
           {currentProject ? "Move session" : "Add to project"}
         </DropdownMenuItem>
+      ) : (
+        <DropdownMenuSub>
+          <DropdownMenuSubTrigger
+            data-testid="header-move-to-project"
+            className="whitespace-nowrap"
+          >
+            <FolderInputIcon className="size-3.5" />
+            {currentProject ? "Move session" : "Add to project"}
+          </DropdownMenuSubTrigger>
+          {/* A native submenu flyout — no separate popover layer, so no
+              open/dismiss race with the parent menu. */}
+          <DropdownMenuSubContent className="min-w-56">
+            <ProjectPicker currentProject={currentProject} onSelect={handleProjectSelect} />
+          </DropdownMenuSubContent>
+        </DropdownMenuSub>
       )}
       {workspaceItems && (
         <>
@@ -324,7 +342,7 @@ export function HeaderConversationMenu({
               <DropdownMenuSeparator />
             </>
           )}
-          {isMobile && projectPickerOpen ? (
+          {projectPickerOpen ? (
             <>
               <DropdownMenuItem
                 data-testid="header-project-picker-back"
