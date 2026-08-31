@@ -40,3 +40,11 @@ what to look for, and why it's wrong.
 - **A "clear/reset" must not clobber unrelated config.** An edit that rewrites a
   config file to remove one key must preserve every other key — no full-file
   overwrite that drops the user's other settings.
+
+## Input validation ordering
+
+- **No filesystem existence oracle before cheaper gates.** When a handler
+  validates a caller-supplied path, run the capability/mode checks first
+  (does this target support the option at all? is this a mode where the
+  option is even accepted?) before probing the filesystem — otherwise a
+  rejected call still reveals whether arbitrary paths exist.

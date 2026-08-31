@@ -1511,6 +1511,19 @@ def _subagent_file_ids_from_args(args: _JsonObject) -> list[str]:
     return list(raw_ids)
 
 
+def _subagent_workspace_from_args(args: _JsonObject) -> str | None:
+    """Extract the optional create-time workspace from a sub-agent send."""
+    raw_args = args.get("args")
+    if not isinstance(raw_args, dict):
+        return None
+    workspace = raw_args.get("workspace")
+    if workspace is None:
+        return None
+    if not isinstance(workspace, str) or not workspace:
+        raise ValueError("'workspace' must be a non-empty string when provided")
+    return workspace
+
+
 async def _teardown_failed_child(
     server_client: httpx.AsyncClient,
     child_session_id: str,
@@ -1709,6 +1722,53 @@ def _find_subagent_spec(sub_agent_name: str, agent_spec: AgentSpec | None) -> Ag
     if sub_agent_name == RESEARCHER_NAME:
         return reconstruct_researcher_spec(agent_spec)
     return None
+
+
+def _canonical_subagent_workspace(
+    workspace: str,
+    *,
+    sub_agent_name: str,
+    agent_spec: AgentSpec | None,
+) -> str:
+    """Validate a child workspace against its configured filesystem root."""
+    # Capability check first: a sub-agent without a configured boundary can
+    # never accept a workspace, so fail on that before probing the requested
+    # path (no filesystem existence oracle for incapable sub-agents).
+    sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
+    os_env = getattr(sub_spec, "os_env", None) if sub_spec is not None else None
+    configured_root = getattr(os_env, "cwd", None) if os_env is not None else None
+    if not isinstance(configured_root, str) or not configured_root:
+        raise ValueError(f"sub-agent {sub_agent_name!r} has no configured os_env.cwd boundary")
+
+    requested = Path(workspace)
+    if not requested.is_absolute():
+        raise ValueError("'workspace' must be an absolute path")
+    try:
+        canonical = requested.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"workspace does not exist or cannot be resolved: {workspace!r}") from exc
+    if not canonical.is_dir():
+        raise ValueError(f"workspace is not a directory: {workspace!r}")
+
+    # A relative os_env.cwd resolves against the runner process cwd — the
+    # same base the harness spawn uses — so boundary and sandbox agree.
+    root = Path(configured_root).expanduser()
+    try:
+        canonical_root = root.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(
+            f"sub-agent {sub_agent_name!r} os_env.cwd does not exist: {configured_root!r}"
+        ) from exc
+    if not canonical_root.is_dir():
+        raise ValueError(
+            f"sub-agent {sub_agent_name!r} os_env.cwd is not a directory: {configured_root!r}"
+        )
+    if not canonical.is_relative_to(canonical_root):
+        raise ValueError(
+            f"workspace {str(canonical)!r} is outside sub-agent {sub_agent_name!r} "
+            f"root {str(canonical_root)!r}"
+        )
+    return str(canonical)
 
 
 def _subagent_harness(sub_agent_name: str, agent_spec: AgentSpec | None) -> str | None:
@@ -1990,6 +2050,11 @@ async def _execute_subagent_tool(
     except (ValueError, TypeError) as exc:
         return f"Error: sys_session_send invalid 'cost_budget': {exc}"
 
+    try:
+        workspace = _subagent_workspace_from_args(args)
+    except ValueError as exc:
+        return f"Error: sys_session_send invalid 'workspace': {exc}"
+
     # By-session-id mode: post to an existing direct child instead of
     # spawning/continuing a named (agent, title) sub-agent.
     target_session_id = args.get("session_id")
@@ -2007,6 +2072,13 @@ async def _execute_subagent_tool(
                 "Error: sys_session_send 'model' applies only when a "
                 "sub-agent session is first created; it cannot change an "
                 "existing session. Re-send without 'model' to continue "
+                f"session {target_session_id!r}."
+            )
+        if workspace is not None:
+            return (
+                "Error: sys_session_send 'workspace' applies only when a "
+                "sub-agent session is first created; it cannot change an "
+                "existing session. Re-send without 'workspace' to continue "
                 f"session {target_session_id!r}."
             )
         if file_ids:
@@ -2118,6 +2190,14 @@ async def _execute_subagent_tool(
                 f"{child_session_id}. Re-send without 'model' to continue "
                 "it, or sys_session_close it first to spawn a fresh "
                 "session on the requested model."
+            )
+        if workspace is not None:
+            return (
+                f"Error: sys_session_send 'workspace' applies only when a "
+                f"sub-agent session is first created; {sub_agent_name!r} "
+                f"title {session_name!r} already exists as "
+                f"{child_session_id}. Re-send without 'workspace' to continue "
+                "it, or sys_session_close it first to spawn a fresh session."
             )
         if file_ids:
             return (
@@ -2259,6 +2339,20 @@ async def _execute_subagent_tool(
                     f"Install/upgrade it with: {install} "
                     f"(or don't dispatch to {sub_agent_name!r} here)."
                 )
+        # Canonicalize the per-child workspace only on the create path —
+        # after the existing-child lookup — so a continuation send is
+        # rejected with the create-time-only error above without this
+        # dispatch ever probing the filesystem for the supplied path.
+        canonical_workspace: str | None = None
+        if workspace is not None:
+            try:
+                canonical_workspace = _canonical_subagent_workspace(
+                    workspace,
+                    sub_agent_name=sub_agent_name,
+                    agent_spec=agent_spec,
+                )
+            except ValueError as exc:
+                return f"Error: sys_session_send invalid 'workspace': {exc}"
         # Create child session on the server (no initial items —
         # those go via a separate POST so the server forwards them
         # to the runner and triggers a turn).
@@ -2268,6 +2362,8 @@ async def _execute_subagent_tool(
             "title": f"{sub_agent_name}:{session_name}",
             "sub_agent_name": sub_agent_name,
         }
+        if canonical_workspace is not None:
+            create_body["workspace"] = canonical_workspace
         if harness_override_canonical is not None:
             create_body["harness_override"] = harness_override_canonical
         if model is not None:

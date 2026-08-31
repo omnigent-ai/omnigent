@@ -48,6 +48,7 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
 from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runtime import (
     pending_elicitations,
     user_session_stream,
@@ -198,6 +199,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
+from omnigent.version import VERSION
 
 
 def register_core_routes(
@@ -429,15 +431,16 @@ def register_core_routes(
         if _terminal_first_create:
             _publish_terminal_pending(resp.id, True)
         _rc = await _get_runner_client(resp.id, runner_router)
-        if _rc is not None and conv is not None:
+        # The init payload builder requires an agent_id; skip the eager
+        # notify for the (theoretical) agent-less row instead of raising.
+        if _rc is not None and conv is not None and conv.agent_id is not None:
             try:
                 await _rc.post(
                     "/v1/sessions",
-                    json={
-                        "session_id": resp.id,
-                        "agent_id": conv.agent_id,
-                        "sub_agent_name": conv.sub_agent_name,
-                    },
+                    json=build_runner_session_init_payload(
+                        conv,
+                        server_version=VERSION,
+                    ),
                     timeout=10.0,
                 )
             except (httpx.HTTPError, ConnectionError):
