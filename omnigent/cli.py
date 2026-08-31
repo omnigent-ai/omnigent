@@ -3331,13 +3331,10 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     (302 to the workspace OAuth page, or a DatabricksRealm 401) means
     the run would otherwise die much later with an opaque "non-JSON
     response (status=302)" traceback from the session-create call. A
-    401/403 answer to an *authed* probe can mask that signature (the edge
-    rejects an expired bearer with 403 "Invalid access token" before
-    emitting its challenge), so it re-probes unauthenticated to classify
-    the edge before giving up. First, it asks the SDK for a fresh
-    workspace token; only then does a TTY run the same flow ``omnigent
-    login`` would, while headless invocations get the exact command to
-    run instead.
+    rejected bearer can hide that signature behind a bare 401/403, so the
+    probe falls back to the saved workspace or an unauthenticated retry.
+    It then asks the SDK for a fresh workspace token before prompting a
+    TTY or giving headless invocations the exact login command.
 
     Non-Databricks postures are deliberately left alone: local accounts
     servers auto-authenticate downstream (magic-link redeem), and
@@ -3375,13 +3372,8 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     workspace_host = _databricks_workspace_login_target(server, probe)
     credential_rejected = False
     if workspace_host is None and probe.status_code in (401, 403):
-        # A bearer the edge rejects (an expired/invalid Databricks OAuth
-        # token answers 403 "Invalid access token") masks the edge
-        # signature the shape classifier keys on. The `omnigent login`
-        # pointer record already names the fronting workspace — trust it;
-        # without one, re-probe unauthenticated so the bare edge answer
-        # can be classified. A non-Databricks rejection (e.g. a
-        # permission refusal) matches neither and is left alone.
+        # A rejected bearer can hide the edge signature. Prefer the saved
+        # workspace; otherwise re-probe without credentials.
         workspace_host = load_databricks_workspace_host(server)
         if workspace_host is None and "Authorization" in headers:
             try:
