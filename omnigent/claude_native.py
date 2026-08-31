@@ -4918,7 +4918,18 @@ def _claude_transcript_records_from_session_items(
     records: list[_JsonObject] = []
     parent_uuid: str | None = None
     tool_parent_by_call_id: dict[str, str] = {}
+    previous_item: _JsonObject | None = None
     for index, item in enumerate(items):
+        # A forwarder retry that slipped past idempotency persists as an
+        # adjacent row identical in everything but the store envelope
+        # (id/created_at). Drop it so store duplicates don't become
+        # duplicated model context on every resume; genuine adjacent
+        # repeats differ in payload or response_id and survive.
+        if previous_item is not None and _transcript_items_equal_ignoring_envelope(
+            item, previous_item
+        ):
+            continue
+        previous_item = item
         # Compaction items carry the post-compaction context. Replace
         # all prior records with the compacted messages so the
         # reconstructed transcript reflects the compacted state.
@@ -5130,6 +5141,33 @@ def _claude_transcript_record_from_session_item(
         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "message": message,
         **extra,
+    }
+
+
+def _transcript_items_equal_ignoring_envelope(
+    item: _JsonObject,
+    other: _JsonObject,
+) -> bool:
+    """
+    Compare two session items ignoring store-envelope fields.
+
+    A duplicate row created by a forwarder retry re-post is byte-identical
+    in payload but differs in the store-assigned ``id`` and ``created_at``.
+    Everything else — including ``response_id``, which differs across
+    genuine turns — participates in the comparison, so a user legitimately
+    repeating the same message in a later turn is not collapsed. The filter
+    assumes a turn never legitimately emits byte-identical adjacent payloads
+    within the same ``response_id``; such a repeat would be collapsed too.
+
+    :param item: Flat API item dict, e.g.
+        ``{"type": "message", "role": "user", "content": [...]}``.
+    :param other: The item to compare against.
+    :returns: ``True`` when the items are equal apart from ``id`` and
+        ``created_at``.
+    """
+    envelope = ("id", "created_at")
+    return {k: v for k, v in item.items() if k not in envelope} == {
+        k: v for k, v in other.items() if k not in envelope
     }
 
 

@@ -5754,3 +5754,173 @@ def test_item_search_text_seam_redirects_persisted_value(db_uri: str) -> None:
             ).scalars()
         )
     assert stored == ["custom-search-text"]
+
+
+# ── Idempotent append (stable_id) ─────────────────────
+
+
+def test_append_with_stable_id_is_idempotent(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A re-append under the same stable id returns the stored item once.
+
+    The retry contract for at-least-once producers (transcript
+    forwarders): a timed-out POST's disposition is unknown, so the same
+    item may arrive again — and concurrent forwarders tailing one
+    transcript derive the same stable id for the same record.
+    """
+    conv = conversation_store.create_conversation()
+    stable = "ab" * 16
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id=stable,
+    )
+    [first] = conversation_store.append(conv.id, [item])
+    assert first.id == stable
+    assert first.deduplicated is False
+
+    [second] = conversation_store.append(conv.id, [item])
+    assert second.id == stable
+    assert second.deduplicated is True
+
+    page = conversation_store.list_items(conv.id)
+    assert [i.id for i in page.data if i.id == stable] == [stable]
+
+
+def test_append_without_stable_id_still_duplicates(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """No stable id keeps the legacy contract: every append inserts."""
+    conv = conversation_store.create_conversation()
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+    )
+    [a] = conversation_store.append(conv.id, [item])
+    [b] = conversation_store.append(conv.id, [item])
+    assert a.id != b.id
+    assert b.deduplicated is False
+
+
+def test_append_dedupe_does_not_burn_a_position(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A dedupe hit allocates no position: later items stay contiguous."""
+    conv = conversation_store.create_conversation()
+    stable = "cd" * 16
+    dup = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "one"}]),
+        stable_id=stable,
+    )
+    conversation_store.append(conv.id, [dup])
+    # duplicate + a genuinely new item in one batch
+    fresh = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(
+            role="assistant",
+            content=[{"type": "output_text", "text": "two"}],
+            agent="worker",
+        ),
+    )
+    [got_dup, got_fresh] = conversation_store.append(conv.id, [dup, fresh])
+    assert got_dup.deduplicated is True
+    assert got_fresh.deduplicated is False
+    page = conversation_store.list_items(conv.id)
+    assert len(page.data) == 2
+
+
+def test_pure_dedupe_append_leaves_conversation_metadata_alone(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A duplicate-only re-post must not make the conversation look active."""
+    conv = conversation_store.create_conversation()
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id="ef" * 16,
+    )
+    conversation_store.append(conv.id, [item])
+    before = conversation_store.get_conversation(conv.id)
+    assert before is not None
+
+    conversation_store.append(conv.id, [item])
+    after = conversation_store.get_conversation(conv.id)
+    assert after is not None
+    assert after.updated_at == before.updated_at
+
+
+def test_same_stable_id_twice_in_one_batch_inserts_once(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """In-batch twins collapse instead of colliding on the primary key."""
+    conv = conversation_store.create_conversation()
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id="0a" * 16,
+    )
+    [a, b] = conversation_store.append(conv.id, [item, item])
+    assert a.id == b.id
+    assert a.deduplicated is False
+    assert b.deduplicated is True
+    assert len(conversation_store.list_items(conv.id).data) == 1
+
+
+def test_repeated_persisted_twin_batch_leaves_conversation_metadata_alone(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retry batch repeating one already-persisted stable id is a pure duplicate.
+
+    Concurrent forwarders can deliver the same record twice in one batch
+    after it already persisted: every item resolves to the stored row, so
+    nothing inserts and the conversation must not look active.
+    """
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id="1b" * 16,
+    )
+    conversation_store.append(conv.id, [item])
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+    [a, b] = conversation_store.append(conv.id, [item, item])
+    assert a.deduplicated is True
+    assert b.deduplicated is True
+    assert a.id == b.id
+    after = conversation_store.get_conversation(conv.id)
+    assert after is not None
+    assert after.updated_at == 1000
+    assert len(conversation_store.list_items(conv.id).data) == 1
+
+
+def test_has_item_probes_persisted_ids(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``has_item`` sees a persisted stable id, scoped to its conversation."""
+    conv = conversation_store.create_conversation()
+    other = conversation_store.create_conversation()
+    stable = "2c" * 16
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id=stable,
+    )
+    assert conversation_store.has_item(conv.id, stable) is False
+    conversation_store.append(conv.id, [item])
+    assert conversation_store.has_item(conv.id, stable) is True
+    assert conversation_store.has_item(other.id, stable) is False

@@ -214,6 +214,16 @@ class _ConversationStore:
             result.append(persisted)
         return result
 
+    def has_item(self, conversation_id: str, item_id: str) -> bool:
+        """Return whether an appended item carries ``item_id``.
+
+        :param conversation_id: The conversation id (unused).
+        :param item_id: Item id to probe.
+        :returns: ``True`` when a recorded item has that id.
+        """
+        del conversation_id
+        return any(item.id == item_id for item in self.appended_items)
+
     def list_items(
         self,
         conversation_id: str,
@@ -3991,6 +4001,130 @@ async def test_kiro_external_prompt_matches_pending_and_reports_skipped_input() 
         assert matched_user.data.content == [{"type": "input_text", "text": "tell me a joke"}]
         assert matched_user.created_by == "alice@example.com"
         assert first != second
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_kiro_skipped_entries_persist_before_the_matched_item() -> None:
+    """Failed Kiro prompts must precede the accepted prompt in stored order."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "823dbd1aab969b5a813fac59bb977a77"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    for text in ("first failed", "second failed", "tell me a joke"):
+        pending_inputs.record(
+            sid, [{"type": "input_text", "text": text}], created_by="alice@example.com"
+        )
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "tell me a joke"}],
+            },
+            "response_id": "kiro:prompt-joke",
+            "source_id": "kiro:prompt-joke:0",
+        },
+    )
+
+    try:
+        item_id = await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        # Stored order mirrors the live broadcast: both skipped web inputs
+        # (each a user message + error pair) precede the accepted prompt.
+        assert [i.type for i in store.appended_items] == [
+            "message",
+            "error",
+            "message",
+            "error",
+            "message",
+        ]
+        first_user, _err1, second_user, _err2, matched_user = store.appended_items
+        assert first_user.data.content == [{"type": "input_text", "text": "first failed"}]
+        assert second_user.data.content == [{"type": "input_text", "text": "second failed"}]
+        assert matched_user.data.content == [{"type": "input_text", "text": "tell me a joke"}]
+        assert item_id == matched_user.id
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_kiro_duplicate_repost_restores_skipped_entries_unpersisted() -> None:
+    """A duplicate re-post restores skipped drains instead of persisting them."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    class _DedupingStore(_ConversationStore):
+        """Store whose matched item is already persisted: every append dedupes."""
+
+        def has_item(self, conversation_id: str, item_id: str) -> bool:
+            del conversation_id, item_id
+            return True
+
+        def append(self, conversation_id: str, items: list[Any]) -> list[Any]:
+            del conversation_id
+            return [
+                ConversationItem(
+                    id=item.stable_id,
+                    type=item.type,
+                    status="completed",
+                    response_id=item.response_id,
+                    created_at=1,
+                    data=item.data,
+                    deduplicated=True,
+                )
+                for item in items
+            ]
+
+    pending_inputs.reset_for_tests()
+    store = _DedupingStore()
+    sid = "823dbd1aab969b5a813fac59bb977a77"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    recorded = [
+        pending_inputs.record(
+            sid, [{"type": "input_text", "text": text}], created_by="alice@example.com"
+        )
+        for text in ("first failed", "second failed", "tell me a joke")
+    ]
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "tell me a joke"}],
+            },
+            "response_id": "kiro:prompt-joke",
+            "source_id": "kiro:prompt-joke:0",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        # Nothing persisted (no error items for the skipped drains), and the
+        # queue is back in its original order for the next genuine message.
+        assert store.appended_items == []
+        snapshot = pending_inputs.snapshot_for(sid)
+        assert [entry["pending_id"] for entry in snapshot] == recorded
     finally:
         pending_inputs.reset_for_tests()
 

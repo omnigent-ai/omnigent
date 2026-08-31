@@ -8140,6 +8140,124 @@ def test_claude_transcript_records_handles_compaction_item() -> None:
     assert boundaries[0]["compactMetadata"]["postTokens"] == 4321
 
 
+def test_transcript_records_drop_adjacent_store_duplicates() -> None:
+    """Adjacent items identical apart from id/created_at collapse to one record.
+
+    A forwarder retry re-post persists as an adjacent row that differs only
+    in the store envelope (id, created_at). The resume-transcript builder
+    must emit one record for the run so store duplicates don't become
+    duplicated model context on every cold resume.
+    """
+    items: list[dict[str, Any]] = [
+        {
+            "id": "msg_1",
+            "created_at": 100,
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "same payload"}],
+            "response_id": "resp_1",
+        },
+        {
+            "id": "msg_2",
+            "created_at": 105,
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "same payload"}],
+            "response_id": "resp_1",
+        },
+        {
+            "id": "msg_3",
+            "created_at": 110,
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "reply"}],
+            "response_id": "resp_1",
+        },
+    ]
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+        bridge_dir=Path("/tmp/test-bridge"),
+    )
+    user_records = [r for r in records if r.get("type") == "user"]
+    assert len(user_records) == 1, f"Expected 1 user record, got {user_records}"
+    assert len(records) == 2
+    # Parent chain stays intact across the dropped duplicate.
+    assert records[1]["parentUuid"] == records[0]["uuid"]
+
+
+def test_transcript_records_keep_genuine_repeats_across_turns() -> None:
+    """A user genuinely repeating a message in a later turn is NOT collapsed.
+
+    Genuine repeats differ in ``response_id`` (a new turn), so the
+    envelope-ignoring comparison keeps both. Only retry re-posts — same
+    payload AND same response_id — collapse.
+    """
+    items: list[dict[str, Any]] = [
+        {
+            "id": "msg_1",
+            "created_at": 100,
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "try again"}],
+            "response_id": "resp_1",
+        },
+        {
+            "id": "msg_2",
+            "created_at": 200,
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "try again"}],
+            "response_id": "resp_2",
+        },
+    ]
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+        bridge_dir=Path("/tmp/test-bridge"),
+    )
+    assert len(records) == 2, f"Genuine repeats must both survive: {records}"
+
+
+def test_transcript_records_collapse_runs_of_three_or_more_duplicates() -> None:
+    """A run of N adjacent duplicates (multi-retry) collapses to one record,
+    and the item after the run still chains to the survivor."""
+    duplicate = {
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "retried thrice"}],
+        "response_id": "resp_1",
+    }
+    items: list[dict[str, Any]] = [
+        {**duplicate, "id": f"msg_{n}", "created_at": 100 + n} for n in range(4)
+    ]
+    items.append(
+        {
+            "id": "msg_after",
+            "created_at": 300,
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "done"}],
+            "response_id": "resp_1",
+        }
+    )
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+        bridge_dir=Path("/tmp/test-bridge"),
+    )
+    assert len(records) == 2
+    assert records[0]["type"] == "user"
+    assert records[1]["type"] == "assistant"
+    assert records[1]["parentUuid"] == records[0]["uuid"]
+
+
 def test_websocket_connect_passes_ssl_context_for_wss(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

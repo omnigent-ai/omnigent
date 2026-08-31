@@ -2021,6 +2021,46 @@ class SqlAlchemyConversationStore(ConversationStore):
             # SQLite the database-level lock already serializes.
             self._lock_conversation(session, conversation_id)
 
+            # Idempotent-append probe: one query for the whole batch. Rows
+            # already persisted under a stable id ARE those items' append
+            # result; running under the lock just taken serializes with a
+            # concurrent retry (READ COMMITTED gives this statement a fresh
+            # snapshot after the lock wait), so it cannot double-insert.
+            stable_ids = [item.stable_id for item in items if item.stable_id is not None]
+            existing_by_id: dict[str, SqlConversationItem] = {}
+            deduped_by_id: dict[str, ConversationItem] = {}
+            if stable_ids:
+                existing_rows = (
+                    session.execute(
+                        select(SqlConversationItem).where(
+                            SqlConversationItem.workspace_id == current_workspace_id(),
+                            SqlConversationItem.conversation_id == conversation_id,
+                            SqlConversationItem.id.in_(stable_ids),
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                decoded = self._decode_item_data_batch([row.data for row in existing_rows])
+                existing_by_id = {row.id: row for row in existing_rows}
+                deduped_by_id.update(
+                    {
+                        row.id: _to_item(row, data).model_copy(update={"deduplicated": True})
+                        for row, data in zip(existing_rows, decoded, strict=True)
+                    }
+                )
+                if all(item.stable_id in existing_by_id for item in items):
+                    # Pure duplicate re-post: nothing inserts, so leave
+                    # ``updated_at`` and the position counter untouched — a
+                    # retry must not make an old conversation look active.
+                    # Membership (not a length compare) so a batch repeating
+                    # one persisted stable id still counts as pure.
+                    return [
+                        deduped_by_id[item.stable_id]
+                        for item in items
+                        if item.stable_id is not None
+                    ]
+
             # Bump updated_at on the conversation.
             conv_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             if conv_row is not None:
@@ -2056,7 +2096,20 @@ class SqlAlchemyConversationStore(ConversationStore):
             completed_status = encode_item_status("completed")  # items are final on append
             fts_rows: list[tuple[str, str, str]] = []
             row_values: list[dict[str, object]] = []
+            batch_stable: dict[str, ConversationItem] = {}
             for item in items:
+                if item.stable_id is not None:
+                    if item.stable_id in existing_by_id:
+                        persisted.append(deduped_by_id[item.stable_id])
+                        continue
+                    if item.stable_id in batch_stable:
+                        # Same stable id twice in one batch: the first
+                        # occurrence is this one's result too (inserting both
+                        # would collide on the primary key).
+                        persisted.append(
+                            batch_stable[item.stable_id].model_copy(update={"deduplicated": True})
+                        )
+                        continue
                 position = next_pos
                 next_pos += 1
                 data_dict = item.data.model_dump(exclude_none=True)
@@ -2066,7 +2119,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # the whole INSERT aborts and the item never persists.
                 data = self._encode_item_data(strip_nul_bytes(json.dumps(data_dict)))
                 search = self._item_search_text(item)
-                item_id = generate_item_id(item.type)
+                item_id = item.stable_id or generate_item_id(item.type)
                 values: dict[str, object] = {
                     "workspace_id": workspace_id,
                     "id": item_id,
@@ -2101,6 +2154,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                         created_by=item.created_by,
                     )
                 )
+                if item.stable_id is not None:
+                    batch_stable[item.stable_id] = persisted[-1]
             # One executemany for the batch: positions are pre-allocated above so
             # the rows carry no inter-row dependency, and a single round-trip
             # persists all N. A per-row ORM add round-trips per item, which
@@ -2115,6 +2170,30 @@ class SqlAlchemyConversationStore(ConversationStore):
                 conv_row.next_position = next_pos
 
         return persisted
+
+    def has_item(self, conversation_id: str, item_id: str) -> bool:
+        """
+        Return whether an item with ``item_id`` exists in a conversation.
+
+        Point lookup on the (workspace_id, conversation_id, id) primary
+        key; loads no item data. Used as the pre-append duplicate probe
+        for stable-id items (see :meth:`append`).
+
+        :param conversation_id: Unique conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param item_id: Item id to probe, e.g. a stable id derived
+            from a forwarder ``source_id``.
+        :returns: ``True`` when the item is already persisted.
+        """
+        with self._conv_session("has_conversation_item") as session:
+            row = session.execute(
+                select(SqlConversationItem.id).where(
+                    SqlConversationItem.workspace_id == current_workspace_id(),
+                    SqlConversationItem.conversation_id == conversation_id,
+                    SqlConversationItem.id == item_id,
+                )
+            ).first()
+            return row is not None
 
     def list_projects(
         self,

@@ -618,12 +618,36 @@ class ConversationStore(ABC):
         Append items to a conversation. Assigns a globally unique
         ID and timestamp to each item.
 
+        An item carrying ``stable_id`` appends idempotently: its id is the
+        stable id, and when an item with that id already exists the stored
+        item is returned in its place — flagged ``deduplicated`` — instead
+        of inserting a duplicate. The existence check rides the append's
+        own transaction, so idempotency costs no extra query.
+
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
         :param items: List of :class:`NewConversationItem` objects
             to persist.
         :returns: The persisted :class:`ConversationItem` list
             with store-assigned IDs and timestamps.
+        """
+        ...
+
+    @abstractmethod
+    def has_item(self, conversation_id: str, item_id: str) -> bool:
+        """
+        Return whether an item with ``item_id`` exists in a conversation.
+
+        Existence probe for idempotent-append callers that must know
+        *before* appending whether a stable-id item is a duplicate
+        re-post, e.g. to decide whether order-sensitive sibling persists
+        that precede the append should run at all.
+
+        :param conversation_id: Unique conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param item_id: Item id to probe, e.g. a stable id derived
+            from a forwarder ``source_id``.
+        :returns: ``True`` when the item is already persisted.
         """
         ...
 

@@ -787,6 +787,13 @@ class NewConversationItem(BaseModel):
     response_id: str
     data: ItemData
     created_by: str | None = None
+    # Deterministic item id for idempotent appends. When set, the store uses
+    # it as the item's id and treats an already-persisted item with this id
+    # as the append's result instead of inserting a duplicate — the retry
+    # contract for at-least-once producers (a transcript forwarder cannot
+    # know whether a timed-out POST committed). Same 32-hex shape the store
+    # mints itself; ``None`` keeps the store-assigned random id.
+    stable_id: str | None = None
 
     @model_validator(mode="after")
     def check_type_matches_data(self) -> NewConversationItem:
@@ -797,6 +804,8 @@ class NewConversationItem(BaseModel):
         :raises ValueError: If ``type`` does not match ``data``.
         """
         _validate_type_matches_data(self.type, self.data)
+        if self.stable_id is not None and not re.fullmatch(r"[0-9a-f]{32}", self.stable_id):
+            raise ValueError("stable_id must be a 32-char lowercase hex string")
         return self
 
 
@@ -823,6 +832,10 @@ class ConversationItem(BaseModel):
     created_at: int
     data: ItemData
     created_by: str | None = None
+    # In-process signal only (excluded from every dump / API shape): ``True``
+    # when an idempotent append found this item already persisted under its
+    # ``stable_id``, so the caller can skip a duplicate's side effects.
+    deduplicated: bool = Field(default=False, exclude=True)
 
     @model_validator(mode="after")
     def check_type_matches_data(self) -> ConversationItem:

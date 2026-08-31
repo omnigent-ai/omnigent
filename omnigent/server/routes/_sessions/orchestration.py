@@ -13,6 +13,7 @@ import json
 import math
 import secrets
 import time
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Literal, cast
 
@@ -2201,6 +2202,29 @@ async def _persist_external_conversation_item(
     :returns: Store-assigned conversation item id.
     """
     item = _parse_external_conversation_item(body)
+    # An at-least-once producer (the native transcript forwarders) retries a
+    # timed-out POST it cannot know the disposition of, so the item's id is
+    # derived from its ``source_id`` and the append is idempotent — the
+    # dedupe check rides the append's own transaction, under its
+    # conversation lock, costing the hot path no extra query. A dedupe hit
+    # comes back flagged so the duplicate's side effects are unwound below
+    # (no re-broadcast, and a wrongly-drained pending input is restored).
+    source_id = body.data.get("source_id")
+    if source_id is not None:
+        if not isinstance(source_id, str) or not source_id.strip() or len(source_id) > 256:
+            raise OmnigentError(
+                "external_conversation_item data.source_id must be a "
+                "non-empty string of at most 256 characters",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        item = item.model_copy(
+            update={
+                "stable_id": uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"omnigent-external-item:{session_id}:{source_id.strip()}",
+                ).hex
+            }
+        )
     # A native user message round-tripping back from the transcript:
     # drain its optimistic pending-input entry (FIFO) and fold the
     # entry's file blocks (image / file) into the item BEFORE persisting.
@@ -2210,6 +2234,7 @@ async def _persist_external_conversation_item(
     # Claude (not a queued web message) and has no pending entry, so
     # draining for it would hand the queued message's uploads to the marker.
     cleared_pending_id: str | None = None
+    drained: pending_inputs.DrainedInput | None = None
     skipped_kiro_pending: list[pending_inputs.DrainedInput] = []
     if (
         item.type == "message"
@@ -2240,22 +2265,54 @@ async def _persist_external_conversation_item(
             # No pending entry — direct terminal input. Fall back to the
             # identity authenticated on the forwarder's own request.
             item = item.model_copy(update={"created_by": created_by})
-    for skipped in skipped_kiro_pending:
-        await _persist_skipped_kiro_pending_input(
-            session_id,
-            skipped,
-            conversation_store,
+    # Skipped Kiro entries persist BEFORE the matched item so their stored
+    # positions precede it, matching the live broadcast order — unless the
+    # matched item is a duplicate re-post, in which case the skipped drains
+    # belong to LATER messages and are restored (below), not persisted.
+    skipped_persisted = False
+    if skipped_kiro_pending:
+        matched_already_persisted = item.stable_id is not None and await asyncio.to_thread(
+            conversation_store.has_item, session_id, item.stable_id
         )
+        if not matched_already_persisted:
+            for skipped in skipped_kiro_pending:
+                await _persist_skipped_kiro_pending_input(
+                    session_id,
+                    skipped,
+                    conversation_store,
+                )
+            skipped_persisted = True
     pending_background_title = prepare_background_session_title(
         coordinator=background_title_coordinator,
         conversation=conv,
         event=SessionEventInput(type=item.type, data=item.data.model_dump()),
     )
     persisted_items = await asyncio.to_thread(conversation_store.append, session_id, [item])
+    persisted = persisted_items[0]
+    if persisted.deduplicated:
+        # A re-post of an already-committed item: nothing new to render or
+        # title, and every pending entry the drain above consumed belongs
+        # to a LATER user message — put them back at the front in their
+        # original queue order (skipped entries preceded the match; restore
+        # prepends, so restore in reverse). Skipped entries persisted above
+        # (the probe raced a concurrent retry) stay persisted.
+        restorable = [drained] if skipped_persisted else [*skipped_kiro_pending, drained]
+        for entry in reversed(restorable):
+            if entry is not None:
+                pending_inputs.restore(session_id, entry)
+        return persisted.id
+    if not skipped_persisted:
+        # Probe said duplicate but the append inserted anyway (row vanished
+        # in between): persist the skipped drains late rather than lose them.
+        for skipped in skipped_kiro_pending:
+            await _persist_skipped_kiro_pending_input(
+                session_id,
+                skipped,
+                conversation_store,
+            )
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
     if pending_background_title is not None:
         pending_background_title.schedule()
-    persisted = persisted_items[0]
     _publish_external_conversation_item(
         session_id, persisted, cleared_pending_id=cleared_pending_id
     )

@@ -284,6 +284,30 @@ def resolve_oldest(conversation_id: str) -> DrainedInput | None:
         )
 
 
+def restore(conversation_id: str, drained: DrainedInput) -> None:
+    """
+    Put a drained entry back at the FRONT of the pending queue.
+
+    Compensation for a drain whose persist turned out to be a duplicate
+    (an idempotent external-item append deduplicated the retry): the
+    entry belongs to the NEXT user message, and it was the oldest when
+    drained, so it returns to the head to keep FIFO intact.
+
+    :param conversation_id: Conversation/session id, e.g.
+        ``"conv_abc123"``.
+    :param drained: The entry returned by :func:`resolve_oldest` or
+        :func:`resolve_matching_text`.
+    """
+    entry = _Entry(
+        pending_id=drained.pending_id,
+        content=copy.deepcopy(drained.content),
+        created_by=drained.created_by,
+    )
+    with _lock:
+        entries = _pending.get(conversation_id, {})
+        _pending[conversation_id] = {drained.pending_id: entry, **entries}
+
+
 def resolve_matching_text(conversation_id: str, text: str) -> MatchedDrain:
     """
     Drain through the first pending entry whose text matches ``text``.
