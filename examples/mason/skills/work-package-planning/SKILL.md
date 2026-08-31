@@ -12,8 +12,6 @@ migration→dependent code), parallel groups, and a clear per-claim acceptance
 criterion. Split unrelated subsystems or contracts a reviewer cannot hold in
 mind; size for coherence, not finding count.
 
-Read commit subjects before auditing: `git log --format='%h %s%n%b' <range> |
-grep -inE 'not fixed|not started|piece [0-9]|step[s]? [0-9]|partial|out of scope'`.
 For each finding apply the destination test: compare `git show --stat
 <claiming-commit>` with the directory named by the finding's evidence. If the
 commit never entered the consumer directory, classify it as MISSING LAYER

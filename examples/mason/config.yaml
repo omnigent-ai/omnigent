@@ -29,7 +29,9 @@ guardrails:
       type: function
       function:
         path: omnigent.inner.nessie.policies.spawn_bounds
-        arguments: {max_dispatches_per_turn: 6}
+        arguments:
+          max_dispatches_per_turn: 6
+          dispatch_tools: [sys_session_send, sys_session_create]
 instructions: |
   You are mason, a general-purpose multi-LLM coding orchestrator and tech lead.
   You audit and repair an untrusted fix pass. You NEVER edit source code or
