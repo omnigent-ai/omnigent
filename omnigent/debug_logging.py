@@ -6,12 +6,13 @@ extra logging handler that also forwards each record, as JSON, to a Databricks
 Delta table through the ZeroBus REST ingest endpoint, so a whole session's logs
 can be queried in one place (see the Omnigent Debuggability Plan, OMNI-4198).
 
-The sink is enabled only when the ``OMNIGENT_DEBUG_LOG_*`` environment variables
-are present -- the internal ``omni`` config CLI sets them for internal users, so
-the feature is off by default for OSS users and customers. Uploading is
-best-effort and fully non-blocking: records are queued and flushed by a daemon
-thread, and any failure (auth, network, overflow) drops rows rather than
-disrupting the process.
+By default, the sink is enabled only when the ``OMNIGENT_DEBUG_LOG_*``
+environment variables are present -- the internal ``omni`` config CLI sets them
+for internal users, so the feature is off by default for OSS users and
+customers. Integrations can instead provide their own batch-send function.
+Delivery is best-effort and fully non-blocking: records are queued and flushed
+by a daemon thread, and any failure drops rows rather than disrupting the
+process.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ import time
 import traceback
 import urllib.parse
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextvars import ContextVar
 from dataclasses import dataclass
 
@@ -481,30 +482,36 @@ class _TokenSource:
         return token, time.time() + expires_in
 
 
-class ZerobusLogHandler(logging.Handler):
-    """Non-blocking logging handler that batches records to a ZeroBus table."""
+DebugLogRow = dict[str, object]
+DebugLogSend = Callable[[list[DebugLogRow]], None]
 
-    def __init__(self, config: DebugLogConfig, source: str) -> None:
+
+class DebugLogHandler(logging.Handler):
+    """Non-blocking handler that queues rows and sends them in batches.
+
+    ``send`` runs on the handler's daemon thread and receives a prepared batch
+    of debug-log row objects. It owns only delivery; this handler retains record
+    serialization, queue overflow, batching, flush timing, and shutdown drains.
+    """
+
+    def __init__(self, source: str, send: DebugLogSend) -> None:
         super().__init__()
-        self._config = config
         self._source = source
+        self._send = send
         self._closed = False
-        self._delivered_any = False
         self._start_worker()
         atexit.register(self.close)
 
     def _start_worker(self) -> None:
-        """Create the queue/client and launch the uploader thread.
+        """Create the queue and launch the sender thread.
 
         Re-invoked by :meth:`emit` when the thread has stopped — after a
         ``logging.config.dictConfig()`` (uvicorn) or an ``os.fork()`` (the
         runner ``_zygote``), which leave the handler attached but kill the
-        thread. Fresh queue/client/thread let delivery resume; the inherited
-        ones (whose locks are in an indeterminate post-fork state) are dropped.
+        thread. A fresh queue/thread lets delivery resume; the inherited ones
+        (whose locks are in an indeterminate post-fork state) are dropped.
         """
-        self._queue: queue.Queue[dict[str, object]] = queue.Queue(maxsize=_QUEUE_MAX_RECORDS)
-        self._client = httpx.Client(timeout=_HTTP_TIMEOUT_S)
-        self._tokens = _TokenSource(self._config, self._client)
+        self._queue: queue.Queue[DebugLogRow] = queue.Queue(maxsize=_QUEUE_MAX_RECORDS)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="omnigent-debug-log", daemon=True)
         self._thread.start()
@@ -525,10 +532,9 @@ class ZerobusLogHandler(logging.Handler):
         # logging.shutdown() on every handler — which close()s this one and stops
         # its uploader thread while leaving it attached to root; os.fork() (the
         # runner _zygote) likewise kills the thread. Receiving a record means the
-        # handler is still live, so revive the worker (fresh queue/client/thread)
-        # and delivery resumes on the next line. A real shutdown emits nothing
-        # afterward, so this never fights atexit. emit() is serialized by the
-        # Handler lock, so the restart happens once.
+        # handler is still live, so revive it with fresh worker state. A real
+        # shutdown emits nothing afterward, so this never fights atexit. emit()
+        # is serialized by the Handler lock, so the restart happens once.
         if self._closed or not self._thread.is_alive():
             try:
                 self._closed = False
@@ -553,37 +559,28 @@ class ZerobusLogHandler(logging.Handler):
                 pass
 
     def _run(self) -> None:
-        # This worker owns the client captured at start and closes it on exit,
-        # so close() never shuts the client down from another thread while a
-        # post/token-mint is in flight (which raises inside httpx and would
-        # otherwise kill this thread with an uncaught exception).
-        client = self._client
         try:
             while not self._stop.is_set():
                 try:
                     batch = self._collect_batch(self._FLUSH_WAIT)
                     if batch:
-                        self._post(batch)
+                        self._send(batch)
                 except Exception:  # noqa: BLE001 — the uploader thread must never die
-                    # A transient error (or a closed client during a shutdown
-                    # race) must not kill the worker: emit()'s self-heal only
-                    # revives a *stopped* thread, so a crash would silently end
-                    # delivery for the process. Drop and keep going.
+                    # A sender failure must not kill the worker: emit()'s
+                    # self-heal only revives a *stopped* thread, so a crash would
+                    # silently end delivery for the process. Drop and continue.
                     time.sleep(0.1)
             # Best-effort drain of whatever is left on shutdown.
             remaining = self._collect_batch(0.0)
             if remaining:
-                self._post(remaining)
+                self._send(remaining)
         except Exception:  # noqa: BLE001 — shutdown drain is best-effort
             pass
-        finally:
-            with contextlib.suppress(Exception):
-                client.close()
 
     _FLUSH_WAIT = _FLUSH_INTERVAL_S
 
-    def _collect_batch(self, wait: float) -> list[dict[str, object]]:
-        batch: list[dict[str, object]] = []
+    def _collect_batch(self, wait: float) -> list[DebugLogRow]:
+        batch: list[DebugLogRow] = []
         try:
             batch.append(self._queue.get(timeout=wait) if wait else self._queue.get_nowait())
         except queue.Empty:
@@ -595,7 +592,44 @@ class ZerobusLogHandler(logging.Handler):
                 break
         return batch
 
-    def _post(self, batch: list[dict[str, object]]) -> None:
+    def close(self) -> None:
+        if self._closed:
+            return
+        # Capture the worker being stopped: a concurrent emit() can revive the
+        # handler during the join and replace self._stop/self._thread.
+        stop, thread = self._stop, self._thread
+        self._closed = True
+        stop.set()
+        thread.join(timeout=5.0)
+        super().close()
+
+
+class ZerobusLogHandler(DebugLogHandler):
+    """Default batched debug-log handler that delivers through ZeroBus."""
+
+    def __init__(self, config: DebugLogConfig, source: str) -> None:
+        self._config = config
+        self._delivered_any = False
+        super().__init__(source, self._post)
+
+    def _start_worker(self) -> None:
+        # Recreate the transport on every worker start. After a fork, inherited
+        # httpx/token locks may be indeterminate and must not be reused.
+        self._client = httpx.Client(timeout=_HTTP_TIMEOUT_S)
+        self._tokens = _TokenSource(self._config, self._client)
+        super()._start_worker()
+
+    def _run(self) -> None:
+        # The worker owns the client captured at start, so close() never shuts
+        # it down while a post or token mint is in flight.
+        client = self._client
+        try:
+            super()._run()
+        finally:
+            with contextlib.suppress(Exception):
+                client.close()
+
+    def _post(self, batch: list[DebugLogRow]) -> None:
         payload = json.dumps(batch)
         for attempt in range(3):
             token = self._tokens.token()
@@ -647,25 +681,10 @@ class ZerobusLogHandler(logging.Handler):
             time.sleep(min(0.5 * 2**attempt, 3.0))
         _diag("post_dropped", "dropped %d row(s) after 3 failed insert attempts", len(batch))
 
-    def close(self) -> None:
-        if self._closed:
-            return
-        # Signal the worker and let it finish and close its own client. Capture
-        # the worker we are tearing down first: a concurrent emit() (under the
-        # handler lock) can revive the sink during the join below, reassigning
-        # self._stop/_thread to fresh ones. Do NOT close the client here — the
-        # worker's shutdown drain may still be minting a token / posting, and
-        # closing it underneath raises inside httpx and kills the thread.
-        stop, thread = self._stop, self._thread
-        self._closed = True
-        stop.set()
-        thread.join(timeout=5.0)
-        super().close()
-
 
 # Process-wide sink; recreated only if a prior instance was closed (e.g. a
 # logging reconfigure closed the root handlers out from under us).
-_active_sink: ZerobusLogHandler | None = None
+_active_sink: DebugLogHandler | None = None
 _sink_lock = threading.Lock()
 
 # Dedicated logger for the server's outgoing SSE-event stream. It gets the sink
@@ -698,33 +717,49 @@ def sse_event_logger() -> logging.Logger:
     return logging.getLogger(SSE_LOGGER_NAME)
 
 
-def attach_debug_log_sink(loggers: list[logging.Logger], *, source: str, level: int) -> None:
+def attach_debug_log_sink(
+    loggers: list[logging.Logger],
+    *,
+    source: str,
+    level: int,
+    send: DebugLogSend | None = None,
+) -> None:
     """Attach the shared debug-log sink to *loggers* when configured.
 
-    A no-op unless the ``OMNIGENT_DEBUG_LOG_*`` variables are set. Reuses one
-    handler per process; ``Logger.addHandler`` is idempotent for a given
-    instance, so repeated calls do not double-ship.
+    ``send`` is an optional integration hook receiving each prepared batch on a
+    daemon thread. When omitted, the sink uses ZeroBus and is a no-op unless the
+    ``OMNIGENT_DEBUG_LOG_*`` variables are set. Reuses one handler per process;
+    ``Logger.addHandler`` is idempotent for a given instance, so repeated calls
+    do not double-ship.
     """
     global _active_sink
-    config = config_from_env()
-    if config is None:
-        return
+    config: DebugLogConfig | None = None
+    if send is None:
+        config = config_from_env()
+        if config is None:
+            return
     with _sink_lock:
         if _active_sink is None or _active_sink.closed:
             try:
-                _active_sink = ZerobusLogHandler(config, source)
+                if send is not None:
+                    _active_sink = DebugLogHandler(source, send)
+                elif config is not None:
+                    _active_sink = ZerobusLogHandler(config, source)
+                else:
+                    return
             except Exception:  # noqa: BLE001 — the sink must never break logging setup
-                # Honor the module's best-effort contract: handler construction
-                # (httpx client, uploader thread, probe timer) failing must not
-                # take down configure_process_logging() and thus process startup.
+                # Handler construction must not take down process logging setup.
                 _logger.warning("debug-log sink disabled: handler init failed", exc_info=True)
                 return
-            _logger.info(
-                "debug-log sink enabled: source=%s table=%s endpoint=%s",
-                source,
-                config.table,
-                config.insert_url,
-            )
+            if config is None:
+                _logger.info("debug-log sink enabled: source=%s custom sender", source)
+            else:
+                _logger.info(
+                    "debug-log sink enabled: source=%s table=%s endpoint=%s",
+                    source,
+                    config.table,
+                    config.insert_url,
+                )
         _active_sink.setLevel(level)
         for target in loggers:
             target.addHandler(_active_sink)

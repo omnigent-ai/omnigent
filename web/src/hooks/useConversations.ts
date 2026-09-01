@@ -302,6 +302,66 @@ function withoutDeletingSessions(page: ConversationsPage): ConversationsPage {
   };
 }
 
+// ── Recently-created keep-alive ───────────────────────────────────────
+//
+// The push stream inserts a just-created session into the sidebar instantly
+// (SessionUpdatesProvider → insertNewRowsIntoPages), but the create path also
+// fires a `["conversations"]` refetch, and on the search-indexed deployment
+// that fetch lags the write — so it comes back WITHOUT the new session and
+// replaces the cache, dropping the row until the index catches up (it flashes
+// in, then out). We keep the row in the first-page fetch until the index
+// reflects it — the additive mirror of the delete tombstone above.
+const recentlyCreatedSessions = new Map<string, Conversation>();
+
+/** Grace window for the server's async create reindex. */
+const CREATED_KEEPALIVE_MS = 60_000;
+
+/** Keep a just-created session in the first-page list fetch until it's indexed. */
+export function markRecentlyCreated(conv: Conversation): void {
+  recentlyCreatedSessions.set(conv.id, conv);
+  setTimeout(() => recentlyCreatedSessions.delete(conv.id), CREATED_KEEPALIVE_MS);
+}
+
+/** Clear the keep-alive map — exported for test cleanup (mirrors `unmarkSessionsDeleting`). */
+export function clearRecentlyCreated(): void {
+  recentlyCreatedSessions.clear();
+}
+
+/**
+ * Prepend recently-created rows the first page doesn't yet include (the index
+ * hasn't caught up). Only the unfiltered, unsearched first page — a create sorts
+ * newest-first. Once the fetch returns the row itself, the keep-alive is dropped.
+ * Applied before `withoutDeletingSessions`, so a create-then-delete stays gone.
+ */
+function withRecentlyCreated(
+  page: ConversationsPage,
+  after: string | undefined,
+  searchQuery: string,
+  project: string | undefined,
+  includeArchived: boolean,
+  queryClient: QueryClient,
+): ConversationsPage {
+  if (after !== undefined || searchQuery || project || recentlyCreatedSessions.size === 0) {
+    return page;
+  }
+  const present = new Set(page.data.map((c) => c.id));
+  const inject: Conversation[] = [];
+  for (const [id, snapshot] of recentlyCreatedSessions) {
+    // Already listed — skip (no duplicate). Don't drop the entry: a sibling
+    // list catching up first must not disarm the keep-alive for a still-lagging
+    // list; the 60s timer is the sole cleanup.
+    if (present.has(id)) continue;
+    // Inject the freshest copy: the cache row (kept current by WS overlays)
+    // beats the frozen snapshot, so a WS-confirmed title — or archive flag —
+    // isn't reverted by re-injecting stale data.
+    const row = findCachedConversationRow(queryClient, id) ?? snapshot;
+    if (row.archived && !includeArchived) continue;
+    inject.push(row);
+  }
+  if (inject.length === 0) return page;
+  return { ...page, data: [...inject, ...page.data], first_id: inject[0].id };
+}
+
 /**
  * Fetch a single session as a sidebar-shaped ``Conversation`` object.
  *
@@ -348,11 +408,13 @@ async function fetchConversationsPage({
   searchQuery,
   includeArchived,
   project,
+  queryClient,
 }: {
   after?: string;
   searchQuery: string;
   includeArchived: boolean;
   project?: string;
+  queryClient: QueryClient;
 }): Promise<ConversationsPage> {
   // `updated_at` matches the sidebar's sort, which keeps server
   // pagination consistent with the visible order as the user scrolls.
@@ -391,7 +453,9 @@ async function fetchConversationsPage({
   // falling back to the modal. host_id is fixed for a session's life, so this
   // can't seed a stale value; a hostless row clears any prior mapping.
   for (const row of page.data) setSessionHost(row.id, row.host_id);
-  return withoutDeletingSessions(page);
+  return withoutDeletingSessions(
+    withRecentlyCreated(page, after, searchQuery, project, includeArchived, queryClient),
+  );
 }
 
 /**
@@ -432,6 +496,7 @@ export function useConversations(
   // enter the sidebar without making every consumer poll `/v1/sessions`.
   // If the socket is down, all consumers use a safety poll.
   const streamConnected = useSessionUpdatesConnected();
+  const queryClient = useQueryClient();
   return useInfiniteQuery({
     // Keep the base three-element key for the unfiltered callers (byte-for-byte
     // unchanged, so the sidebar / rename / push-delta paths are untouched); only
@@ -447,6 +512,7 @@ export function useConversations(
           searchQuery,
           includeArchived,
           project,
+          queryClient,
         });
       // Time the first full-list load per app session; skip pagination
       // (pageParam set) and every later fetch (poll / reconcile / invalidation).

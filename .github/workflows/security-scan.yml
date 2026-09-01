@@ -73,6 +73,8 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
+          # Trusted-CI-bot allowlist in should-scan.sh (GitHub-set, not PR-controlled).
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           # For the skip-security-scan label waiver + author check (read-only).
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}

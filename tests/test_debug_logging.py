@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 
 import pytest
 
@@ -269,6 +270,39 @@ def test_emit_revives_closed_uploader(_configured_env: None) -> None:
         sink.close()
 
 
+def test_custom_send_receives_prepared_rows_without_zerobus_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    batches: list[list[dl.DebugLogRow]] = []
+    delivered = threading.Event()
+
+    def send(batch: list[dl.DebugLogRow]) -> None:
+        batches.append(batch)
+        delivered.set()
+
+    sink = dl.DebugLogHandler("integration", send)
+    try:
+        record = logging.LogRecord(
+            "integration.logger",
+            logging.INFO,
+            __file__,
+            1,
+            "hello %s",
+            ("world",),
+            None,
+        )
+        sink.emit(record)
+
+        assert delivered.wait(timeout=1.0)
+        assert len(batches) == 1
+        assert len(batches[0]) == 1
+        assert batches[0][0]["source"] == "integration"
+        assert batches[0][0]["message"] == "hello world"
+    finally:
+        sink.close()
+
+
 def test_ignored_loggers_are_dropped() -> None:
     # httpx/httpcore records are chatty HTTP-client noise and must be dropped;
     # everything else is kept.
@@ -284,6 +318,40 @@ def test_attach_is_noop_when_disabled() -> None:
     target.handlers.clear()
     dl.attach_debug_log_sink([target], source="runner", level=logging.INFO)
     assert not any(isinstance(h, dl.ZerobusLogHandler) for h in target.handlers)
+
+
+def test_attach_uses_custom_send_without_zerobus_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    monkeypatch.setattr(dl, "_active_sink", None)
+    target = logging.getLogger("test.debug_logging.custom")
+    target.handlers.clear()
+    target.setLevel(logging.INFO)
+    batches: list[list[dl.DebugLogRow]] = []
+    delivered = threading.Event()
+
+    def send(batch: list[dl.DebugLogRow]) -> None:
+        batches.append(batch)
+        delivered.set()
+
+    dl.attach_debug_log_sink(
+        [target],
+        source="custom",
+        level=logging.INFO,
+        send=send,
+    )
+    sink = dl._active_sink
+    assert sink is not None
+    assert type(sink) is dl.DebugLogHandler
+    try:
+        target.info("custom delivery")
+        assert delivered.wait(timeout=1.0)
+        assert batches[0][0]["message"] == "custom delivery"
+    finally:
+        target.removeHandler(sink)
+        dl.sse_event_logger().removeHandler(sink)
+        sink.close()
 
 
 def test_runner_primary_session_id(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -30,6 +30,8 @@ import {
   useTogglePinnedConversation,
   fetchPinnedConversations,
   unmarkSessionsDeleting,
+  markRecentlyCreated,
+  clearRecentlyCreated,
   PINNED_CONVERSATIONS_KEY,
   type Conversation,
   type PinnedConversationsResult,
@@ -62,6 +64,8 @@ afterEach(() => {
   // settles, in module-level state that would otherwise leak into the next
   // test (which reuses the same ids against a fresh cache).
   unmarkSessionsDeleting();
+  // Same for the recently-created keep-alive.
+  clearRecentlyCreated();
 });
 
 describe("renameConversation", () => {
@@ -747,6 +751,146 @@ describe("useStopAndDeleteConversation cache eviction", () => {
     // The project list IS refreshed (DB-direct, no reindex race) so a project
     // emptied by the delete drops its now-empty folder without a reload.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
+  });
+});
+
+describe("recently-created keep-alive", () => {
+  const listResponse = (ids: string[]) =>
+    mockResponse({
+      object: "list",
+      data: ids.map((id) => ({
+        id,
+        object: "conversation",
+        title: id,
+        created_at: 0,
+        updated_at: 1,
+      })),
+      first_id: ids[0] ?? null,
+      last_id: ids.at(-1) ?? null,
+      has_more: false,
+    });
+
+  it("keeps a just-created session in the first-page fetch until the index catches up", async () => {
+    // The session was just created and eagerly inserted, but the search-indexed
+    // list fetch lags and comes back without it.
+    markRecentlyCreated({
+      id: "conv_new",
+      object: "conversation",
+      title: "New",
+      created_at: 0,
+      updated_at: 9,
+      labels: {},
+      permission_level: null,
+    });
+    fetchMock.mockResolvedValueOnce(listResponse(["conv_old"]));
+
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useConversations("", true, {}), { wrapper });
+
+    // The lagging fetch omits conv_new, but the keep-alive prepends it so the
+    // row doesn't flash out of the sidebar.
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    expect(result.current.data!.pages[0].data.map((c) => c.id)).toEqual(["conv_new", "conv_old"]);
+  });
+
+  it("drops the keep-alive (no duplicate) once the fetch returns the row", async () => {
+    markRecentlyCreated({
+      id: "conv_new",
+      object: "conversation",
+      title: "New",
+      created_at: 0,
+      updated_at: 9,
+      labels: {},
+      permission_level: null,
+    });
+    // The index has caught up: the fetch now includes conv_new itself.
+    fetchMock.mockResolvedValueOnce(listResponse(["conv_new", "conv_old"]));
+
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useConversations("", true, {}), { wrapper });
+
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    // No duplicate: the row appears once, from the server response.
+    expect(result.current.data!.pages[0].data.map((c) => c.id)).toEqual(["conv_new", "conv_old"]);
+  });
+
+  it("injects the fresh cache row, not the stale snapshot (no title revert)", async () => {
+    // Registered at create time with no title yet…
+    markRecentlyCreated({
+      id: "conv_new",
+      object: "conversation",
+      title: null,
+      created_at: 0,
+      updated_at: 9,
+      labels: {},
+      permission_level: null,
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    // …but a WS frame has since titled it in another cached list variant.
+    queryClient.setQueryData(["conversations", "", false], {
+      pages: [
+        {
+          data: [
+            {
+              id: "conv_new",
+              object: "conversation",
+              title: "Auto Title",
+              created_at: 0,
+              updated_at: 9,
+              labels: {},
+              permission_level: null,
+            },
+          ],
+          first_id: "conv_new",
+          last_id: "conv_new",
+          has_more: false,
+        },
+      ],
+      pageParams: [undefined],
+    });
+    // The lagging fetch (this variant) still omits conv_new.
+    fetchMock.mockResolvedValueOnce(listResponse(["conv_old"]));
+
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useConversations("", true, {}), { wrapper });
+
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    const injected = result.current.data!.pages[0].data.find((c) => c.id === "conv_new");
+    // The WS-confirmed title wins over the frozen snapshot's null title.
+    expect(injected?.title).toBe("Auto Title");
+  });
+
+  it("does not disarm the keep-alive when a sibling fetch already lists the row", async () => {
+    markRecentlyCreated({
+      id: "conv_new",
+      object: "conversation",
+      title: "New",
+      created_at: 0,
+      updated_at: 9,
+      labels: {},
+      permission_level: null,
+    });
+    // First list catches up (row present) — must NOT drop the global entry.
+    fetchMock.mockResolvedValueOnce(listResponse(["conv_new", "conv_old"]));
+    const qc1 = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result: r1 } = renderHook(() => useConversations("", true, {}), {
+      wrapper: ({ children }) => createElement(QueryClientProvider, { client: qc1 }, children),
+    });
+    await waitFor(() => expect(r1.current.data).toBeDefined());
+
+    // A second (still-lagging) list must still get the row from the keep-alive.
+    fetchMock.mockResolvedValueOnce(listResponse(["conv_old"]));
+    const qc2 = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result: r2 } = renderHook(() => useConversations("", true, {}), {
+      wrapper: ({ children }) => createElement(QueryClientProvider, { client: qc2 }, children),
+    });
+    await waitFor(() => expect(r2.current.data).toBeDefined());
+    expect(r2.current.data!.pages[0].data.map((c) => c.id)).toEqual(["conv_new", "conv_old"]);
   });
 });
 

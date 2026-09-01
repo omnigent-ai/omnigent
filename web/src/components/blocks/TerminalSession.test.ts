@@ -496,6 +496,7 @@ describe("TerminalSession", () => {
     onInput?: () => void,
     clipboardEnabled = true,
     onClipboardRequest?: (text: string) => void,
+    focusOnConnect = true,
   ) {
     const states: ConnectionState[] = [];
     const container = document.createElement("div");
@@ -509,6 +510,7 @@ describe("TerminalSession", () => {
       onInput,
       clipboardEnabled,
       onClipboardRequest,
+      focusOnConnect,
     );
     return { session, states, container, socket: FakeWebSocket.instances.at(-1)! };
   }
@@ -526,6 +528,31 @@ describe("TerminalSession", () => {
       (m) => typeof m === "string" && m.includes('"type":"resize"'),
     );
     expect(resizeFrame).toBeDefined();
+    session.dispose();
+  });
+
+  it("grabs keyboard focus on open when focusOnConnect is set", () => {
+    // WHY: a foreground surface should claim the keyboard as it comes up.
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    const focusSpy = vi.spyOn(term, "focus");
+
+    socket.open();
+
+    expect(focusSpy).toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it("does not grab focus on open when focusOnConnect is false", () => {
+    // WHY: the workspace-rail shell connects in the background on a session
+    // switch — it must not yank focus off the chat composer.
+    const { socket, session } = makeSession(undefined, undefined, true, undefined, false);
+    const term = (session as unknown as { term: Terminal }).term;
+    const focusSpy = vi.spyOn(term, "focus");
+
+    socket.open();
+
+    expect(focusSpy).not.toHaveBeenCalled();
     session.dispose();
   });
 

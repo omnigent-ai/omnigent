@@ -1933,6 +1933,10 @@ function MainAgentSurface({
     if (!isIOSShell()) return;
     return () => setNativeServerSwitcherHidden(true);
   }, []);
+  // Keys the transcript so a warm switch (no hydration remount) still re-runs
+  // its mount-only scroll-to-bottom and anchor capture. Store id, not the URL
+  // prop, which leads the mirrored blocks by a commit (see the switchTo effect).
+  const activeConversationId = useChatStore((s) => s.conversationId);
   // The conversation's scroll container + the StickToBottom controls needed to
   // override its bottom-lock, lifted out of the context by
   // ConversationScrollRefBridge so the pinned-but-unmasked JumpToTopButton can
@@ -2111,7 +2115,10 @@ function MainAgentSurface({
             ChatHeader overlay's controls (geometry in index.css). Dropped
             when the Plan accordion is pinned above — its solid bar already
             occludes content scrolling past the viewport's top edge. */}
-            <Conversation className={cn(!hasTasks && "chat-scroll-fade", "flex-1")}>
+            <Conversation
+              key={activeConversationId ?? "landing"}
+              className={cn(!hasTasks && "chat-scroll-fade", "flex-1")}
+            >
               {/* Override ConversationContent's default spacing so the thread keeps
               16px side gutters and consecutive agent turns read as one thread.
               The left inset grows *continuously* as the conversation area

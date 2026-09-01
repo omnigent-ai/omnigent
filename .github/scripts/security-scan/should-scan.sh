@@ -38,6 +38,9 @@
 #
 # Env in:  EVENT_NAME          (github.event_name)
 #          AUTHOR_ASSOCIATION  (github.event.pull_request.author_association)
+#          PR_AUTHOR           (github.event.pull_request.user.login; trusted-CI-bot
+#                               allowlist, checked without an API call so the gate
+#                               pollers short-circuit too)
 #          MAINTAINERS         (space-separated, from merge-ready/load-maintainers.sh;
 #                               optional -- used only to trust private-membership
 #                               maintainer AUTHORS, not for the label waiver)
@@ -102,6 +105,22 @@ author_is_maintainer() {
   done
   return 1
 }
+
+# Trusted CI bots (omni-resolve-agent, omnigent-ci) open SAME-REPO PRs from a
+# trusted internal pipeline via their GitHub App, and every such PR is still
+# gated by Maintainer Approval + human review before merge. The PR author login
+# is set by GitHub and is not settable from PR contents, and a fork PR's author
+# is never one of these bots. Checked from PR_AUTHOR with NO API call, so this
+# short-circuits the per-workflow gate pollers too (they pass no token) -- not
+# just the scan -- sparing the shared GITHUB_TOKEN budget their high PR volume
+# was exhausting. Add a login here only for a bot whose PRs are trusted to skip
+# the diff scan.
+TRUSTED_BOTS="omni-resolve-agent[bot] omnigent-ci[bot]"
+if [[ -n "${PR_AUTHOR:-}" ]]; then
+  for bot in $TRUSTED_BOTS; do
+    [[ "$PR_AUTHOR" == "$bot" ]] && { emit false "trusted CI bot ($PR_AUTHOR)"; exit 0; }
+  done
+fi
 
 case "${AUTHOR_ASSOCIATION:-}" in
   OWNER | MEMBER | COLLABORATOR)
