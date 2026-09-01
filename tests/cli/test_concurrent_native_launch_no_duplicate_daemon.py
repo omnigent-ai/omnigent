@@ -44,8 +44,6 @@ from pathlib import Path
 
 import pytest
 
-# Eager import keeps subprocess.Popen resolvable before we patch it.
-import omnigent.host.connect  # noqa: F401
 from omnigent import cli
 from omnigent.cli import _ensure_host_daemon
 

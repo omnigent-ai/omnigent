@@ -608,12 +608,12 @@ def test_concurrent_ensure_host_daemon_elects_one_daemon(
         return cli._SpawnedDaemonProcess(pid=pid, log_path=str(tmp_path / "host.log"))
 
     monkeypatch.setattr(cli, "_spawn_host_daemon_process", _spawn)
-    errors: list[BaseException] = []
+    errors: list[Exception] = []
 
     def _ensure() -> None:
         try:
             _ensure_host_daemon("https://server.example.com")
-        except BaseException as exc:  # pragma: no cover - asserted below
+        except Exception as exc:  # pragma: no cover - asserted below
             errors.append(exc)
 
     first = threading.Thread(target=_ensure)

@@ -16,6 +16,7 @@ import psutil
 import pytest
 from click.testing import CliRunner
 
+from omnigent import cli as cli_module
 from omnigent.cli import _add_daemon_host_status, _ensure_host_daemon, _host_daemon_alive, cli
 from omnigent.host.local_server import LocalServerStartup
 
@@ -49,8 +50,6 @@ def _persist_fake_daemon_claim(
     **_kwargs: object,
 ) -> object:
     """Simulate the child-side registry claim for patched daemon spawns."""
-    import omnigent.cli as cli_module
-
     assert isinstance(spawned, cli_module._SpawnedDaemonProcess)
     mode = "local" if target == "local" else "server"
     cli_module._write_daemon_record(
