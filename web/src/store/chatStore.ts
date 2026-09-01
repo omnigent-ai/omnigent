@@ -108,6 +108,7 @@ import type {
   SkillSummary,
 } from "@/lib/types";
 import { uploadFile } from "@/lib/filesApi";
+import { attachmentKey } from "@/lib/attachments";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
@@ -1596,9 +1597,15 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const tempId = `pend_${pendingSeq}`;
     const pendingFileBlocks: MessageContentBlock[] = (files ?? []).map((file) => {
       const filename = file.name || "image.png";
+      // Key the placeholder id on the File's stable identity, not its name:
+      // pasted screenshots all arrive named "image.png", so a name-derived
+      // id would collide across attachments and strand a ghost chip (React
+      // dedupes on the shared key) until a refresh replaces it with the
+      // server's unique file_id.
+      const fileId = `pending:${attachmentKey(file)}`;
       return file.type.startsWith("image/")
-        ? { type: "input_image" as const, file_id: `pending:${filename}`, filename }
-        : { type: "input_file" as const, file_id: `pending:${filename}`, filename };
+        ? { type: "input_image" as const, file_id: fileId, filename }
+        : { type: "input_file" as const, file_id: fileId, filename };
     });
     const content: MessageContentBlock[] = [
       ...pendingFileBlocks,
