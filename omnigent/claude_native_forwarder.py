@@ -63,6 +63,18 @@ _HOOKS_FILE = "hooks.jsonl"
 # surviving a cursor rewind that re-reads an already-persisted summary.
 _MAX_PERSISTED_COMPACTION_SEQS = 16
 
+# Substrings Claude Code writes to a ``/compact`` command's stdout when it
+# declines to compact (context too small to summarize). Claude fires the
+# ``PreCompact`` hook — which raises the "Compacting conversation…" spinner
+# — BEFORE deciding there's nothing to do, then aborts without ever writing
+# an ``isCompactSummary`` record or firing the ``SessionStart source=compact``
+# completion hook. Without an explicit dismissal the spinner is stranded.
+# Matched case-insensitively against the slash-command ``output``.
+_COMPACTION_NOOP_OUTPUT_MARKERS: tuple[str, ...] = (
+    "not enough messages to compact",
+    "nothing to compact",
+)
+
 # Cap on the in-memory ``(message_id, index)`` dedupe ring for streamed
 # deltas. The byte offset already prevents re-reading on the normal
 # path; this guards the rare truncation/rewind case where the deltas
@@ -3537,6 +3549,9 @@ async def _forward_available_items(
             return updated
         retry_tracker.clear(retry_key)
         await _maybe_sync_effort_from_slash_command(client, session_id=session_id, item=item)
+        await _maybe_dismiss_stranded_compaction_spinner(
+            client, session_id=session_id, bridge_dir=bridge_dir, item=item
+        )
         seen.add(item.source_id)
         seen_source_ids.append(item.source_id)
         updated = TranscriptForwardState(
@@ -4541,15 +4556,16 @@ async def _post_external_compaction_status(
     "Compacting conversation…" spinner while Claude runs the real
     compaction in the terminal. ``"in_progress"`` is sent from the
     ``PreCompact`` hook and ``"completed"`` from the post-compaction
-    ``SessionStart`` (``source == "compact"``) hook. The Omnigent server maps
+    ``SessionStart`` (``source == "compact"``) hook; ``"failed"`` dismisses a
+    stranded spinner when Claude declined to compact. The Omnigent server maps
     these to the ``response.compaction.in_progress`` /
-    ``response.compaction.completed`` SSE events the web client already
-    renders.
+    ``response.compaction.completed`` / ``response.compaction.failed`` SSE
+    events the web client already renders.
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
-    :param status: Compaction status value, ``"in_progress"`` or
-        ``"completed"``.
+    :param status: Compaction status value, ``"in_progress"``,
+        ``"completed"``, or ``"failed"``.
     :returns: None.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
@@ -5204,6 +5220,110 @@ async def _note_transcript_summary_without_token(bridge_dir: Path) -> None:
         )
 
     await asyncio.to_thread(_mutate)
+
+
+def _is_compaction_noop_output(output: object) -> bool:
+    """
+    Whether a ``/compact`` slash-command output is a "nothing to compact" refusal.
+
+    Claude Code declines to compact when the context is too small to
+    summarize, writing e.g. "Not enough messages to compact." to the
+    command's stdout. Matched case-insensitively against the known markers.
+
+    :param output: The ``slash_command`` item's ``output`` value, if any.
+    :returns: ``True`` when the output signals Claude declined to compact.
+    """
+    if not isinstance(output, str):
+        return False
+    lowered = output.lower()
+    return any(marker in lowered for marker in _COMPACTION_NOOP_OUTPUT_MARKERS)
+
+
+async def _discard_pending_compaction(bridge_dir: Path) -> bool:
+    """
+    Drop an in-flight ``PreCompact`` token that will never complete.
+
+    Called when a ``/compact`` refusal ("Not enough messages to compact.")
+    is observed: Claude fired ``PreCompact`` (raising the spinner) but then
+    aborted, so neither completion signal will ever arrive. Clears the
+    pending token so a later, genuine compaction reconciles cleanly, and
+    closes any completion-ack window.
+
+    :param bridge_dir: Native Claude bridge directory.
+    :returns: ``True`` when a pending token was cleared, ``False`` when
+        there was nothing pending (so the caller skips the dismissal post).
+    """
+
+    def _mutate() -> bool:
+        state = _read_compaction_state(bridge_dir)
+        if state.pending is None:
+            return False
+        _write_compaction_state(
+            bridge_dir,
+            CompactionForwardState(
+                pending=None,
+                last_seq=state.last_seq,
+                persisted_seqs=state.persisted_seqs,
+                last_precompact_cursor=state.last_precompact_cursor,
+                expect_completion_ack=False,
+                expect_completion_ack_seq=0,
+            ),
+        )
+        return True
+
+    return await asyncio.to_thread(_mutate)
+
+
+async def _maybe_dismiss_stranded_compaction_spinner(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    item: ClaudeTranscriptItem,
+) -> None:
+    """
+    Dismiss the "Compacting…" spinner when Claude declines to compact.
+
+    A ``/compact`` that Claude refuses ("Not enough messages to compact.")
+    still fires ``PreCompact`` first, so the forwarder already posted
+    ``external_compaction_status: in_progress`` and the web UI is showing
+    the spinner. No ``isCompactSummary`` record or ``SessionStart
+    source=compact`` hook follows a refusal, so without this the spinner is
+    stranded forever. Post ``failed`` (which the web UI maps to
+    ``response.compaction.failed`` → remove the loading block) and drop the
+    dangling ``PreCompact`` token. Best-effort — logged, not raised.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
+    :param item: A just-forwarded item; only a ``/compact`` ``slash_command``
+        whose ``output`` signals a refusal triggers the dismissal.
+    :returns: None.
+    """
+    if item.item_type != "slash_command" or item.data.get("name") != "compact":
+        return
+    if not _is_compaction_noop_output(item.data.get("output")):
+        return
+    # Only dismiss when there is actually an in-flight PreCompact token — the
+    # refusal spinner we raised. A refusal with no pending token means the
+    # spinner was never raised (or already resolved), so a ``failed`` post
+    # would be spurious.
+    if not await _discard_pending_compaction(bridge_dir):
+        return
+    try:
+        await _post_external_compaction_status(
+            client,
+            session_id=session_id,
+            status="failed",
+        )
+    except httpx.HTTPError:
+        _logger.warning(
+            "Failed to dismiss stranded compaction spinner after a /compact refusal; "
+            "session=%s bridge_dir=%s",
+            session_id,
+            bridge_dir,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
 
 
 async def _claim_standalone_completion(bridge_dir: Path) -> int | None:
