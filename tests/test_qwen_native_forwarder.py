@@ -39,7 +39,6 @@ from omnigent.qwen_native_forwarder import (
     _ForwardState,
     _new_seen,
     _read_new_compaction_statuses,
-    _read_new_events,
     _read_new_forward_events,
     _read_state,
     _write_state,
@@ -140,7 +139,7 @@ def test_could_not_load_marker_stripped() -> None:
 def test_read_new_events_incremental_and_partial_line(tmp_path: Path) -> None:
     f = tmp_path / "out.ndjson"
     f.write_bytes(_ev_bytes(_user_ev("u1", "q")))
-    items, off = _read_new_events(f, 0, set(), _AGENT)
+    items, off, _, _ = _read_new_forward_events(f, 0, set(), _AGENT, "")
     assert [i.uuid for i in items] == ["u1"]
     assert off == f.stat().st_size
 
@@ -151,7 +150,7 @@ def test_read_new_events_incremental_and_partial_line(tmp_path: Path) -> None:
         complete_size = f.stat().st_size
         fh.write(b'{"type":"assistant","uuid":"a2"')  # no newline yet
         fh.flush()
-    items, off2 = _read_new_events(f, off, {"u1"}, _AGENT)
+    items, off2, _, _ = _read_new_forward_events(f, off, {"u1"}, _AGENT, "")
     assert [i.uuid for i in items] == ["a1"]
     # Offset stops at the last newline — the partial line is not consumed.
     assert off2 == complete_size
@@ -161,20 +160,20 @@ def test_read_new_events_detects_truncation(tmp_path: Path) -> None:
     f = tmp_path / "out.ndjson"
     # A long first line so the stale offset exceeds the post-truncation size.
     f.write_bytes(_ev_bytes(_user_ev("u1", "first message, intentionally long " * 4)))
-    _, off = _read_new_events(f, 0, set(), _AGENT)
+    _, off, _, _ = _read_new_forward_events(f, 0, set(), _AGENT, "")
     assert off > 0
     # A relaunched terminal truncates + writes a shorter line; size < offset
     # must rewind so the fresh content is not skipped.
     f.write_bytes(_ev_bytes(_user_ev("u2", "fresh")))
     assert f.stat().st_size < off
-    items, _ = _read_new_events(f, off, set(), _AGENT)
+    items, _, _, _ = _read_new_forward_events(f, off, set(), _AGENT, "")
     assert [i.uuid for i in items] == ["u2"]
 
 
 def test_malformed_line_tolerated(tmp_path: Path) -> None:
     f = tmp_path / "out.ndjson"
     f.write_bytes(b"not json\n" + _ev_bytes(_user_ev("u1", "ok")))
-    items, _ = _read_new_events(f, 0, set(), _AGENT)
+    items, _, _, _ = _read_new_forward_events(f, 0, set(), _AGENT, "")
     assert [i.uuid for i in items] == ["u1"]
 
 

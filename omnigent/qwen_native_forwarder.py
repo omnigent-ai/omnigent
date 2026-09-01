@@ -56,7 +56,7 @@ import logging
 import os
 import re
 import time
-from collections.abc import Collection, Container, Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -296,6 +296,8 @@ def _event_to_terminal(
             or last_assistant_stop_reason == "tool_use"
         ):
             return None
+        # message_stop carries no error channel: a v0.21 turn that dies is
+        # surfaced by the runner's terminal-exit watcher, not this edge.
         failed = False
         output = last_assistant_text or None
     else:
@@ -309,52 +311,6 @@ def _event_to_terminal(
         output=output,
         response_id=f"qwen:{uuid}",
     )
-
-
-def _read_new_events(
-    events_file: Path, offset: int, seen: Container[str], agent_name: str
-) -> tuple[list[_MirrorItem], int]:
-    """Read NDJSON lines past *offset*, returning new mirror items + the new offset.
-
-    Detects a truncated/recreated event file (``size < offset``) and rewinds to 0.
-    Only fully terminated lines (ending in ``\\n``) are consumed; a trailing
-    partial line is left for the next poll by not advancing past it.
-    """
-    try:
-        size = events_file.stat().st_size
-    except OSError:
-        return [], offset
-    if size < offset:
-        offset = 0  # file truncated by a relaunched terminal
-    if size == offset:
-        return [], offset
-    try:
-        with open(events_file, "rb") as fh:
-            fh.seek(offset)
-            data = fh.read(size - offset)
-    except OSError:
-        return [], offset
-    # Only consume up to the last newline; keep any trailing partial line.
-    last_nl = data.rfind(b"\n")
-    if last_nl == -1:
-        return [], offset  # no complete line yet
-    consumed = data[: last_nl + 1]
-    new_offset = offset + len(consumed)
-    items: list[_MirrorItem] = []
-    for raw in consumed.split(b"\n"):
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            event = json.loads(raw.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            continue  # tolerate a malformed line rather than stalling the tail
-        if not isinstance(event, dict):
-            continue
-        item = _event_to_item(event, agent_name)
-        if item is not None and item.uuid not in seen:
-            items.append(item)
-    return items, new_offset
 
 
 def _read_new_forward_events(
@@ -659,7 +615,7 @@ def _compaction_status_from_record(record: dict[str, object]) -> str | None:
 def _read_new_compaction_statuses(recording: Path, offset: int) -> tuple[list[str], int]:
     """Read NDJSON lines past *offset*, returning new compaction statuses + offset.
 
-    Same tail discipline as :func:`_read_new_events` (truncation rewind, only
+    Same tail discipline as :func:`_read_new_forward_events` (truncation rewind, only
     newline-terminated lines consumed), but scoped to ``chat_compression`` records.
     """
     try:
