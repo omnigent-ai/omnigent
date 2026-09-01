@@ -134,7 +134,7 @@ def test_could_not_load_marker_stripped() -> None:
 def test_read_new_events_incremental_and_partial_line(tmp_path: Path) -> None:
     f = tmp_path / "out.ndjson"
     f.write_bytes(_ev_bytes(_user_ev("u1", "q")))
-    items, off = _read_new_events(f, 0, set(), _AGENT)
+    items, _, off = _read_new_events(f, 0, set(), _AGENT)
     assert [i.uuid for i in items] == ["u1"]
     assert off == f.stat().st_size
 
@@ -145,7 +145,7 @@ def test_read_new_events_incremental_and_partial_line(tmp_path: Path) -> None:
         complete_size = f.stat().st_size
         fh.write(b'{"type":"assistant","uuid":"a2"')  # no newline yet
         fh.flush()
-    items, off2 = _read_new_events(f, off, {"u1"}, _AGENT)
+    items, _, off2 = _read_new_events(f, off, {"u1"}, _AGENT)
     assert [i.uuid for i in items] == ["a1"]
     # Offset stops at the last newline — the partial line is not consumed.
     assert off2 == complete_size
@@ -155,20 +155,20 @@ def test_read_new_events_detects_truncation(tmp_path: Path) -> None:
     f = tmp_path / "out.ndjson"
     # A long first line so the stale offset exceeds the post-truncation size.
     f.write_bytes(_ev_bytes(_user_ev("u1", "first message, intentionally long " * 4)))
-    _, off = _read_new_events(f, 0, set(), _AGENT)
+    _, _, off = _read_new_events(f, 0, set(), _AGENT)
     assert off > 0
     # A relaunched terminal truncates + writes a shorter line; size < offset
     # must rewind so the fresh content is not skipped.
     f.write_bytes(_ev_bytes(_user_ev("u2", "fresh")))
     assert f.stat().st_size < off
-    items, _ = _read_new_events(f, off, set(), _AGENT)
+    items, _, _ = _read_new_events(f, off, set(), _AGENT)
     assert [i.uuid for i in items] == ["u2"]
 
 
 def test_malformed_line_tolerated(tmp_path: Path) -> None:
     f = tmp_path / "out.ndjson"
     f.write_bytes(b"not json\n" + _ev_bytes(_user_ev("u1", "ok")))
-    items, _ = _read_new_events(f, 0, set(), _AGENT)
+    items, _, _ = _read_new_events(f, 0, set(), _AGENT)
     assert [i.uuid for i in items] == ["u1"]
 
 
@@ -531,6 +531,52 @@ async def test_forward_loop_posts_new_events_and_persists(
     state = _read_state(bridge)
     assert state.offset > 0
     assert "u1" in (state.seen_uuids or [])
+
+
+async def test_forward_loop_posts_terminal_status_for_success_and_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    events_file_path(bridge).write_bytes(
+        _ev_bytes({"type": "result", "subtype": "success", "result": "Done"})
+        + _ev_bytes(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "result": "Tool failed",
+            }
+        )
+    )
+    posted: list[tuple[str, str | None]] = []
+
+    async def _fake_status(
+        _client: object, *, session_id: str, status: str, output: str | None = None
+    ) -> None:
+        assert session_id == "conv"
+        posted.append((status, output))
+
+    monkeypatch.setattr(fwd, "post_external_session_status", _fake_status)
+    task = asyncio.create_task(
+        fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0.01,
+        )
+    )
+    for _ in range(200):
+        if len(posted) == 2:
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await task
+
+    assert posted == [("idle", "Done"), ("failed", "Tool failed")]
 
 
 async def test_compaction_mirror_seeds_at_eof_and_posts_new(

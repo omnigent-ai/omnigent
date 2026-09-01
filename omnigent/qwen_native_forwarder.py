@@ -26,9 +26,10 @@ Event shapes consumed (others are ignored defensively):
   these as web elicitation cards. This forwarder ignores them (they carry no
   transcript prose to mirror).
 
-Status (``running``/``idle``) is intentionally NOT posted here: the runner's
-PTY-activity watcher owns those edges for qwen-native (see
-:mod:`omnigent.runner.app`), exactly as for goose-/cursor-native.
+The terminating ``result`` record posts ``external_session_status`` (``idle``
+for success, ``failed`` otherwise). This is the authoritative turn-completion
+edge used to deliver a headless sub-agent's result to its parent; PTY activity
+remains the source of non-terminal UI status.
 
 This module also hosts the **compaction mirror** (:func:`supervise_qwen_compaction_mirror`).
 qwen compaction (its *compression*) is invisible on the ``--json-file`` stream
@@ -57,6 +58,7 @@ from pathlib import Path
 
 import httpx
 
+from omnigent._native_post_delivery import post_external_session_status
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 from omnigent.qwen_native_bridge import events_file_path
 
@@ -161,6 +163,14 @@ class _MirrorItem:
     response_id: str
 
 
+@dataclass(frozen=True)
+class _TerminalStatus:
+    """Terminal session status derived from qwen's per-turn ``result`` record."""
+
+    status: str
+    output: str | None
+
+
 def _text_from_content(content: object) -> str:
     """Join the ``text`` blocks of a stream-json message ``content`` array.
 
@@ -221,10 +231,20 @@ def _event_to_item(event: dict[str, object], agent_name: str) -> _MirrorItem | N
     )
 
 
+def _event_to_terminal_status(event: dict[str, object]) -> _TerminalStatus | None:
+    """Map qwen's terminating ``result`` record to the shared native status edge."""
+    if event.get("type") != "result":
+        return None
+    result = event.get("result")
+    output = result.strip() if isinstance(result, str) and result.strip() else None
+    succeeded = event.get("subtype") == "success" and event.get("is_error") is not True
+    return _TerminalStatus(status="idle" if succeeded else "failed", output=output)
+
+
 def _read_new_events(
     events_file: Path, offset: int, seen: Container[str], agent_name: str
-) -> tuple[list[_MirrorItem], int]:
-    """Read NDJSON lines past *offset*, returning new mirror items + the new offset.
+) -> tuple[list[_MirrorItem], list[_TerminalStatus], int]:
+    """Read NDJSON lines past *offset*, returning items, terminal edges, and offset.
 
     Detects a truncated/recreated event file (``size < offset``) and rewinds to 0.
     Only fully terminated lines (ending in ``\\n``) are consumed; a trailing
@@ -233,24 +253,25 @@ def _read_new_events(
     try:
         size = events_file.stat().st_size
     except OSError:
-        return [], offset
+        return [], [], offset
     if size < offset:
         offset = 0  # file truncated by a relaunched terminal
     if size == offset:
-        return [], offset
+        return [], [], offset
     try:
         with open(events_file, "rb") as fh:
             fh.seek(offset)
             data = fh.read(size - offset)
     except OSError:
-        return [], offset
+        return [], [], offset
     # Only consume up to the last newline; keep any trailing partial line.
     last_nl = data.rfind(b"\n")
     if last_nl == -1:
-        return [], offset  # no complete line yet
+        return [], [], offset  # no complete line yet
     consumed = data[: last_nl + 1]
     new_offset = offset + len(consumed)
     items: list[_MirrorItem] = []
+    terminal_statuses: list[_TerminalStatus] = []
     for raw in consumed.split(b"\n"):
         raw = raw.strip()
         if not raw:
@@ -264,7 +285,10 @@ def _read_new_events(
         item = _event_to_item(event, agent_name)
         if item is not None and item.uuid not in seen:
             items.append(item)
-    return items, new_offset
+        terminal_status = _event_to_terminal_status(event)
+        if terminal_status is not None:
+            terminal_statuses.append(terminal_status)
+    return items, terminal_statuses, new_offset
 
 
 async def _post_conversation_item(
@@ -323,13 +347,20 @@ async def forward_qwen_events_to_session(
     async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:
             try:
-                items, new_offset = await asyncio.to_thread(
+                items, terminal_statuses, new_offset = await asyncio.to_thread(
                     _read_new_events, target, offset, seen, agent_name
                 )
                 for item in items:
                     await _post_conversation_item(client, session_id=session_id, item=item)
                     seen[item.uuid] = None
-                if new_offset != offset or items:
+                for terminal_status in terminal_statuses:
+                    await post_external_session_status(
+                        client,
+                        session_id=session_id,
+                        status=terminal_status.status,
+                        output=terminal_status.output,
+                    )
+                if new_offset != offset or items or terminal_statuses:
                     offset = new_offset
                     _write_state(
                         bridge_dir,
