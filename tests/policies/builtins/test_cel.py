@@ -121,7 +121,9 @@ def test_state_updates_pass_through_as_plain_python_values() -> None:
             '"state_updates": ['
             '{"key": "risk", "action": "increment", "value": 2},'
             '{"key": "last_tool", "action": "set", "value": event.data.name},'
-            '{"key": "seen_tools", "action": "append", "value": ["shell", true, null]}'
+            '{"key": "weight", "action": "set", "value": 1.5},'
+            '{"key": "seen_tools", "action": "append", "value": ["shell", true, null]},'
+            '{"key": "raw", "action": "set", "value": b"abc"}'
             "]"
             "}"
         )
@@ -134,7 +136,9 @@ def test_state_updates_pass_through_as_plain_python_values() -> None:
         "state_updates": [
             {"key": "risk", "action": "increment", "value": 2},
             {"key": "last_tool", "action": "set", "value": "sys_os_shell"},
+            {"key": "weight", "action": "set", "value": 1.5},
             {"key": "seen_tools", "action": "append", "value": ["shell", True, None]},
+            {"key": "raw", "action": "set", "value": b"abc"},
         ],
     }
 
@@ -176,6 +180,14 @@ async def test_state_updates_coerce_through_function_policy() -> None:
         ("call_count", StateUpdateAction.INCREMENT, 1),
         ("last_decision", StateUpdateAction.SET, "allowed"),
     ]
+
+
+def test_state_updates_must_be_a_list() -> None:
+    """Malformed CEL state_updates reports the authoring error."""
+    evaluate = cel_policy(expression='{"result": "ALLOW", "state_updates": "bad"}')
+
+    with pytest.raises(TypeError, match="state_updates must be a list"):
+        evaluate({"type": "request"})
 
 
 # ── Abstain (non-map returns) ───────────────────────────────────
