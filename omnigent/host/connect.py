@@ -92,7 +92,7 @@ from omnigent.host.git_worktree import (
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.inner import _proc
-from omnigent.onboarding.ambient import detect_providers
+from omnigent.onboarding.ambient import detect_providers_noninteractive
 from omnigent.onboarding.harness_auth import (
     adopt_env_credential,
     detect_adoptable_credentials,
@@ -2539,14 +2539,18 @@ class HostProcess:
         :returns: Result frame with the non-secret credential descriptors.
         """
         try:
-            ambient = detect_providers()
+            ambient = detect_providers_noninteractive()
         except Exception:  # a status read must always settle
             _logger.exception("Failed to detect ambient providers")
             ambient = []
         detected = detect_adoptable_credentials(ambient)
         try:
             providers = [
-                entry.as_dict() for entry in build_provider_inventory(detected=list(ambient))
+                entry.as_dict()
+                for entry in build_provider_inventory(
+                    detected=list(ambient),
+                    harness_readiness=self._configured_harnesses,
+                )
             ]
         except Exception:  # malformed config must not hang the UI
             _logger.exception("Failed to build provider inventory")

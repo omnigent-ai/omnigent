@@ -1531,6 +1531,8 @@ def test_detect_credentials_round_trip() -> None:
                     "multiple_profiles": "unsupported",
                     "interactive_cli": "supported",
                 },
+                "connection_state": "authentication_required",
+                "connection_detail": "The claude CLI has no locally detected credential.",
             }
         ],
     )
@@ -1585,6 +1587,8 @@ def test_detect_credentials_result_drops_unknown_provider_fields() -> None:
             "multiple_profiles": "unknown",
             "interactive_cli": "unsupported",
         },
+        "connection_state": "connected",
+        "connection_detail": "A credential is configured locally.",
         "api_key": "must-not-cross-the-tunnel",
         "base_url": "https://private.example",
     }
@@ -1604,6 +1608,76 @@ def test_detect_credentials_result_drops_unknown_provider_fields() -> None:
     assert len(decoded.providers) == 1
     assert "api_key" not in decoded.providers[0]
     assert "base_url" not in decoded.providers[0]
+
+
+def _provider_row(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "id": "work",
+        "display_name": "Work",
+        "kind": "gateway",
+        "origin": "configured",
+        "source": "config",
+        "configuration_state": "valid",
+        "error": None,
+        "families": ["openai"],
+        "surfaces": ["openai"],
+        "default_for": ["openai"],
+        "default_models": {},
+        "cli": None,
+        "profile": None,
+        "model_provider": None,
+        "capabilities": {
+            "model_discovery": "supported",
+            "usage_status": "unsupported",
+            "multiple_profiles": "unknown",
+            "interactive_cli": "unsupported",
+        },
+    }
+    row.update(overrides)
+    return row
+
+
+def _decode_providers(*rows: dict[str, object]) -> list[dict[str, object]]:
+    decoded = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.detect_credentials_result",
+                "request_id": "r3",
+                "credentials": [],
+                "providers": list(rows),
+            }
+        )
+    )
+    assert isinstance(decoded, HostDetectCredentialsResultFrame)
+    return decoded.providers
+
+
+def test_provider_row_from_older_host_defaults_connection_state_to_unknown() -> None:
+    [row] = _decode_providers(_provider_row())
+
+    assert row["connection_state"] == "unknown"
+    assert row["connection_detail"] == "This host does not report provider connection state."
+
+
+def test_provider_row_rejects_unknown_connection_state_without_dropping_row() -> None:
+    [row] = _decode_providers(
+        _provider_row(connection_state="future-state", connection_detail="future detail")
+    )
+
+    assert row["connection_state"] == "unknown"
+    assert row["connection_detail"] == "future detail"
+
+
+def test_provider_row_preserves_allowlisted_connection_state() -> None:
+    [row] = _decode_providers(
+        _provider_row(
+            connection_state="authentication_required",
+            connection_detail="Sign in on this host to use it.",
+        )
+    )
+
+    assert row["connection_state"] == "authentication_required"
+    assert row["connection_detail"] == "Sign in on this host to use it."
 
 
 def test_fs_request_round_trip() -> None:

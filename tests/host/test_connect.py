@@ -3032,14 +3032,14 @@ def test_handle_detect_credentials_returns_non_secret_descriptors(
 
     monkeypatch.setattr(
         connect,
-        "detect_providers",
+        "detect_providers_noninteractive",
         lambda: [SimpleNamespace(family="anthropic", kind="key", source="$ANTHROPIC_API_KEY")],
     )
     provider = {"id": "claude", "kind": "subscription"}
     monkeypatch.setattr(
         connect,
         "build_provider_inventory",
-        lambda *, detected: [SimpleNamespace(as_dict=lambda: provider)],
+        lambda *, detected, harness_readiness: [SimpleNamespace(as_dict=lambda: provider)],
     )
     host = _make_host_process()
     result = host._handle_detect_credentials(HostDetectCredentialsFrame(request_id="d1"))

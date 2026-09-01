@@ -19,6 +19,7 @@ from omnigent.onboarding import ambient
 from omnigent.onboarding.ambient import (
     DetectedProvider,
     detect_providers,
+    detect_providers_noninteractive,
 )
 
 # Every provider env var ambient may read — cleared in the base fixture so
@@ -933,6 +934,20 @@ def test_claude_cli_login_still_detected_without_managed_gateway(clean_env, monk
     monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
     claude_rows = [d for d in detect_providers() if d.name == "claude"]
     assert [(d.kind, d.source) for d in claude_rows] == [("subscription", "claude CLI login")]
+
+
+def test_noninteractive_detection_never_runs_the_cli_auth_probe(clean_env, monkeypatch) -> None:
+    """Status reads must not invoke the macOS CLI/Keychain fallback."""
+    from omnigent.onboarding import harness_install
+
+    def _forbidden_cli_probe(key: str) -> bool:
+        raise AssertionError(f"status read probed {key!r} CLI authentication")
+
+    monkeypatch.setattr(harness_install, "harness_cli_logged_in", _forbidden_cli_probe)
+    monkeypatch.setattr(ambient.sys, "platform", "darwin")
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
+
+    assert detect_providers_noninteractive() == []
 
 
 def test_claude_managed_gateway_synthesizes_a_subscription_entry(clean_env, monkeypatch) -> None:

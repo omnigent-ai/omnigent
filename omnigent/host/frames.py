@@ -1972,6 +1972,16 @@ def _decode_detect_credentials_result(msg: _JsonObject) -> HostDetectCredentials
 
 
 _PROVIDER_CAPABILITY_VALUES = frozenset({"supported", "unsupported", "unknown"})
+_PROVIDER_CONNECTION_STATES = frozenset(
+    {
+        "connected",
+        "authentication_required",
+        "misconfigured",
+        "unavailable",
+        "unknown",
+    }
+)
+_UNKNOWN_CONNECTION_DETAIL = "This host does not report provider connection state."
 
 
 def _decode_provider_inventory(raw: object) -> list[_JsonObject]:
@@ -2041,6 +2051,14 @@ def _decode_provider_inventory(raw: object) -> list[_JsonObject]:
             optional_strings[key] = value
         if not valid:
             continue
+        raw_state = item.get("connection_state")
+        state = raw_state if raw_state in _PROVIDER_CONNECTION_STATES else "unknown"
+        raw_detail = item.get("connection_detail")
+        detail = (
+            raw_detail
+            if isinstance(raw_detail, str) and raw_detail
+            else (_UNKNOWN_CONNECTION_DETAIL if state == "unknown" else "")
+        )
         providers.append(
             {
                 **{key: item[key] for key in required},
@@ -2048,6 +2066,8 @@ def _decode_provider_inventory(raw: object) -> list[_JsonObject]:
                 "default_models": default_models,
                 **optional_strings,
                 "capabilities": capabilities,
+                "connection_state": state,
+                "connection_detail": detail,
             }
         )
     return providers

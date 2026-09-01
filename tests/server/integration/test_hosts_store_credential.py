@@ -50,7 +50,7 @@ pytestmark = [
 
 _HOST_ID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
 _HOST_NAME = "credential-test-laptop"
-_PROVIDER = {
+_PROVIDER: dict[str, object] = {
     "id": "claude",
     "display_name": "Claude",
     "kind": "subscription",
@@ -71,6 +71,8 @@ _PROVIDER = {
         "multiple_profiles": "unsupported",
         "interactive_cli": "supported",
     },
+    "connection_state": "connected",
+    "connection_detail": "A usable claude credential is configured locally.",
 }
 
 
@@ -578,11 +580,15 @@ async def test_detect_credentials_returns_non_secret_descriptors(
     ]
 
 
-async def test_detect_credentials_hidden_when_flag_off(
+async def test_mutation_helpers_stay_hidden_but_provider_inventory_is_available_when_flag_off(
+    cred_setup: tuple[
+        FastAPI, HostRegistry, list[HostStoreSecretFrame], dict[str, dict[str, Any]]
+    ],
     cred_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:
-    """With the flag off the detect route is 404."""
-    _app, registry, host_store, conv_store = cred_app
+    """The mutation flag does not hide the read-only provider inventory."""
+    _app, registry, _received, _replies = cred_setup
+    _original_app, _same_registry, host_store, conv_store = cred_app
     off_app = FastAPI()
     off_app.include_router(
         create_hosts_router(
@@ -597,7 +603,8 @@ async def test_detect_credentials_hidden_when_flag_off(
         resp = await client.get(f"/v1/hosts/{_HOST_ID}/credentials/detected")
         providers_resp = await client.get(f"/v1/hosts/{_HOST_ID}/providers")
     assert resp.status_code == 404
-    assert providers_resp.status_code == 404
+    assert providers_resp.status_code == 200
+    assert providers_resp.json() == {"object": "provider_inventory", "providers": [_PROVIDER]}
 
 
 async def test_provider_inventory_returns_host_configuration(

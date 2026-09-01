@@ -1532,14 +1532,12 @@ def create_hosts_router(
     ) -> dict[str, Any]:
         """List the connected host's configured and ambient providers.
 
-        Uses the same host-side provider parsing and ambient detection as Omni
-        Setup. The response contains only display metadata and conservative
-        capability states; credentials, secret references, and endpoints never
-        cross the tunnel.
+        Uses the host's non-interactive provider parsing and ambient detection.
+        The response contains only display metadata and conservative capability
+        and connection states; credentials, secret references, and endpoints
+        never cross the tunnel. Unlike the mutation endpoints next to it, this
+        read-only inventory is always available.
         """
-        if not flags.enabled(Feature.HARNESS_INSTALL):
-            raise HTTPException(status_code=404, detail="not found")
-
         user_id = require_user(request, auth_provider)
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:

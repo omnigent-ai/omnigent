@@ -567,7 +567,7 @@ def claude_managed_gateway_display_name(paths: tuple[Path, ...] | None = None) -
     return urlsplit(base_url).hostname or "Claude Code gateway"
 
 
-def _claude_login_detected() -> bool:
+def _claude_login_detected(*, allow_cli_auth_probe: bool = True) -> bool:
     """Return whether a usable Claude Code subscription login is present.
 
     File-first, with a macOS Keychain fallback. Claude Code stores its OAuth
@@ -598,7 +598,7 @@ def _claude_login_detected() -> bool:
     """
     if claude_auth_has_credential(_claude_credentials_path()):
         return True
-    if sys.platform == "darwin":
+    if allow_cli_auth_probe and sys.platform == "darwin":
         # macOS stores the Claude OAuth token in the Keychain, not the file
         # checked above. Ask the CLI itself (``claude auth status`` reads the
         # Keychain) rather than reimplement Keychain access here. Lazy import
@@ -710,7 +710,23 @@ def detect_providers() -> list[DetectedProvider]:
     return _detect_providers_now()
 
 
-def _detect_providers_now() -> list[DetectedProvider]:
+def detect_providers_noninteractive() -> list[DetectedProvider]:
+    """Detect providers without invoking a CLI or credential-store prompt.
+
+    This is the status-surface variant of :func:`detect_providers`. It keeps
+    structural evidence that can be inspected silently (environment presence,
+    credential/config files, managed settings, and the local Ollama socket),
+    but never consumes the interactive prewarm and never runs the macOS
+    ``claude auth status`` fallback that reads Keychain. A Keychain-only login
+    is therefore intentionally absent until a cached/provider-specific signal
+    can describe it as unknown.
+
+    :returns: Provider detections available without a CLI or secret-store read.
+    """
+    return _detect_providers_now(allow_cli_auth_probe=False)
+
+
+def _detect_providers_now(*, allow_cli_auth_probe: bool = True) -> list[DetectedProvider]:
     """Run the ambient-credential sweep (see :func:`detect_providers`)."""
     detected: list[DetectedProvider] = []
 
@@ -772,7 +788,7 @@ def _detect_providers_now() -> list[DetectedProvider]:
                 source="Claude Code managed settings",
             )
         )
-    elif _claude_login_detected():
+    elif _claude_login_detected(allow_cli_auth_probe=allow_cli_auth_probe):
         detected.append(
             DetectedProvider(
                 name="claude",
