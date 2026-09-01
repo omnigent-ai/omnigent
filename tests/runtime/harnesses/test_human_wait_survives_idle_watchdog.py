@@ -159,6 +159,8 @@ def use_wedged_fast_heartbeat(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setenv("HARNESS_TEST_FIXTURE", "wedged_fast_heartbeat")
     monkeypatch.setenv("HARNESS_TURN_TIMEOUT_S", "2")
+    # Pin the absolute cap so an ambient override can't end the turn first.
+    monkeypatch.setenv("HARNESS_TURN_ABSOLUTE_TIMEOUT_S", "60")
 
 
 @pytest.fixture
@@ -176,6 +178,8 @@ def use_parking_elicit_fast_heartbeat_short_idle(monkeypatch: pytest.MonkeyPatch
     """
     monkeypatch.setenv("HARNESS_TEST_FIXTURE", "parking_elicit_fast_heartbeat")
     monkeypatch.setenv("HARNESS_TURN_TIMEOUT_S", "2")
+    # Pin the absolute cap so an ambient override can't end the turn first.
+    monkeypatch.setenv("HARNESS_TURN_ABSOLUTE_TIMEOUT_S", "60")
 
 
 @pytest.fixture
@@ -187,6 +191,8 @@ def use_parking_elicit_fast_heartbeat_normal_idle(monkeypatch: pytest.MonkeyPatc
     """
     monkeypatch.setenv("HARNESS_TEST_FIXTURE", "parking_elicit_fast_heartbeat")
     monkeypatch.setenv("HARNESS_TURN_TIMEOUT_S", "10")
+    # Pin the absolute cap so an ambient override can't end the turn first.
+    monkeypatch.setenv("HARNESS_TURN_ABSOLUTE_TIMEOUT_S", "60")
 
 
 @pytest.fixture
