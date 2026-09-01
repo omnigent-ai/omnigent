@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Any
+
 import pytest
 from sqlalchemy import event, text
 
@@ -21,6 +24,7 @@ from omnigent.session_import import (
     IMPORT_SOURCE_LABEL_KEY,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.conversation_store import PROJECT_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -5754,3 +5758,315 @@ def test_item_search_text_seam_redirects_persisted_value(db_uri: str) -> None:
             ).scalars()
         )
     assert stored == ["custom-search-text"]
+
+
+# ── Connection-checkout budget ─────────────────────────
+
+# A well-formed id that no fixture creates, so the batch reads are exercised
+# with a partial hit (ids without a row are omitted from the result).
+_MISSING_ID = "ffffffffffffffffffffffffffffffff"
+
+
+def _count_checkouts(*engines: Any) -> tuple[list[int], Callable[[], None]]:
+    """Count pool checkouts across ``engines`` (deduplicated).
+
+    Attach *after* any setup writes so only the read under test is counted.
+
+    :returns: ``(count, detach)`` — a one-element list incremented per
+        checkout, plus a zero-arg callable that removes the listeners.
+    """
+    count = [0]
+
+    def _on_checkout(_dbapi: object, _record: object, _proxy: object) -> None:
+        count[0] += 1
+
+    unique = list(dict.fromkeys(engines))
+    for engine in unique:
+        event.listen(engine, "checkout", _on_checkout)
+
+    def _detach() -> None:
+        for engine in unique:
+            event.remove(engine, "checkout", _on_checkout)
+
+    return count, _detach
+
+
+def _select_query_names(
+    store: SqlAlchemyConversationStore,
+    call: Callable[[], object],
+) -> list[str | None]:
+    """Run ``call`` and return the semantic query name of every SELECT it issues.
+
+    :param store: Store whose engines are instrumented.
+    :param call: Zero-arg callable performing the read under test.
+    :returns: One name per SELECT, in execution order.
+    """
+    from omnigent.db import current_query_name
+
+    names: list[str | None] = []
+
+    def _capture(
+        _conn: object,
+        _cursor: object,
+        statement: str,
+        _params: object,
+        _ctx: object,
+        _many: bool,
+    ) -> None:
+        if statement.lstrip().upper().startswith("SELECT"):
+            names.append(current_query_name())
+
+    engines = list(dict.fromkeys([store._conv_engine, store._engine]))
+    for engine in engines:
+        event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        call()
+    finally:
+        for engine in engines:
+            event.remove(engine, "before_cursor_execute", _capture)
+    return names
+
+
+def _grant_owner(db_uri: str, conversation_id: str, user_id: str = "alice") -> None:
+    """Give ``user_id`` an owner grant so the ACL-scoped read paths return rows."""
+    from omnigent.server.auth import LEVEL_OWNER
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    SqlAlchemyPermissionStore(db_uri).grant(user_id, conversation_id, LEVEL_OWNER)
+
+
+def test_list_conversations_costs_one_checkout(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+    db_uri: str,
+) -> None:
+    """The list path's four reads must share one pool checkout.
+
+    ``list_conversations`` fans out to the permission pre-fetch, the page
+    query, the ``agent_name`` resolution and the metadata merge — four
+    checkouts, so four ``pool_pre_ping`` round trips on Lakebase, and the
+    message-send path rescans the spawn tree with it on every event. Counting
+    checkouts (not milliseconds) keeps this immune to load noise.
+    """
+    agent = agent_store.create(
+        "ag_0f1a2b3c0f1a2b3c0f1a2b3c0f1a2b3c",
+        "code-assistant",
+        "ag_0f1a2b3c/bundle",
+    )
+    created = conversation_store.create_conversation(
+        title="budget-list",
+        agent_id=agent.id,
+        runner_id="runner_list",
+        host_id="4f64b6ee625f4e8259185c35c6e63f3d",
+        workspace="/tmp/ws",
+        git_branch="feature/x",
+    )
+    conversation_store.set_labels(created.id, {"tag": "value"})
+    _grant_owner(db_uri, created.id)
+
+    count, detach = _count_checkouts(conversation_store._conv_engine, conversation_store._engine)
+    try:
+        page = conversation_store.list_conversations(
+            accessible_by="alice",
+            owned_by="alice",
+            agent_name="code-assistant",
+        )
+    finally:
+        detach()
+
+    assert count[0] == 1, f"list_conversations must take one checkout, got {count[0]}"
+    assert [c.id for c in page.data] == [created.id]
+    conv = page.data[0]
+    # AP-table fields.
+    assert conv.title == "budget-list"
+    assert conv.labels == {"tag": "value"}
+    # Omnigent-metadata fields — all None if the metadata read were dropped.
+    assert (conv.runner_id, conv.host_id) == (
+        "runner_list",
+        "4f64b6ee625f4e8259185c35c6e63f3d",
+    )
+    assert (conv.workspace, conv.git_branch) == ("/tmp/ws", "feature/x")
+
+
+def test_get_conversations_costs_one_checkout(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The bulk fetch's AP rows, labels and metadata share one checkout."""
+    created = conversation_store.create_conversation(
+        title="budget-bulk",
+        runner_id="runner_bulk",
+        host_id="4f64b6ee625f4e8259185c35c6e63f3d",
+        workspace="/tmp/ws",
+        git_branch="feature/y",
+    )
+    conversation_store.set_labels(created.id, {"tag": "value"})
+
+    count, detach = _count_checkouts(conversation_store._conv_engine, conversation_store._engine)
+    try:
+        by_id = conversation_store.get_conversations([created.id, _MISSING_ID])
+    finally:
+        detach()
+
+    assert count[0] == 1, f"get_conversations must take one checkout, got {count[0]}"
+    assert list(by_id) == [created.id]
+    conv = by_id[created.id]
+    assert conv.title == "budget-bulk"
+    assert conv.labels == {"tag": "value"}
+    assert (conv.runner_id, conv.host_id) == (
+        "runner_bulk",
+        "4f64b6ee625f4e8259185c35c6e63f3d",
+    )
+    assert (conv.workspace, conv.git_branch) == ("/tmp/ws", "feature/y")
+
+
+def test_get_session_connectivity_costs_one_checkout(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The sidebar's online-dot batch pays one checkout for both bulk reads."""
+    created = conversation_store.create_conversation(
+        title="budget-conn",
+        runner_id="runner_conn",
+        host_id="4f64b6ee625f4e8259185c35c6e63f3d",
+        workspace="/tmp/ws",
+    )
+    conversation_store.set_labels(created.id, {IMPORT_SOURCE_LABEL_KEY: "claude"})
+
+    count, detach = _count_checkouts(conversation_store._conv_engine, conversation_store._engine)
+    try:
+        connectivity = conversation_store.get_session_connectivity([created.id, _MISSING_ID])
+    finally:
+        detach()
+
+    assert count[0] == 1, f"get_session_connectivity must take one checkout, got {count[0]}"
+    assert list(connectivity) == [created.id]
+    entry = connectivity[created.id]
+    # Omnigent-metadata fields.
+    assert (entry.runner_id, entry.host_id) == (
+        "runner_conn",
+        "4f64b6ee625f4e8259185c35c6e63f3d",
+    )
+    # AP-side label read — False if the label query were dropped.
+    assert entry.imported is True
+    assert entry.needs_workspace is False
+
+
+def test_list_projects_costs_one_checkout(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """The owner-scoped project list pays one checkout, not one per DB.
+
+    The sidebar always scopes by ``owned_by``, so the ACL pre-fetch on
+    ``session_permissions`` plus the label scan is the shape that matters; an
+    unscoped call only ever issued the label scan.
+    """
+    created = conversation_store.create_conversation(title="budget-projects")
+    conversation_store.set_labels(created.id, {PROJECT_LABEL_KEY: "proj"})
+    _grant_owner(db_uri, created.id)
+
+    count, detach = _count_checkouts(conversation_store._conv_engine, conversation_store._engine)
+    try:
+        projects = conversation_store.list_projects(accessible_by="alice", owned_by="alice")
+    finally:
+        detach()
+
+    assert count[0] == 1, f"list_projects must take one checkout, got {count[0]}"
+    # Empty if either the ACL pre-fetch or the label scan were dropped.
+    assert projects == ["proj"]
+
+
+def test_list_conversations_by_runner_id_costs_one_checkout(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The runner-reconnect fan-out pays one checkout for its three reads."""
+    created = conversation_store.create_conversation(
+        title="budget-runner",
+        runner_id="runner_reconnect",
+        host_id="4f64b6ee625f4e8259185c35c6e63f3d",
+        workspace="/tmp/ws",
+        git_branch="feature/z",
+    )
+    conversation_store.set_labels(created.id, {"tag": "value"})
+
+    count, detach = _count_checkouts(conversation_store._conv_engine, conversation_store._engine)
+    try:
+        convs = conversation_store.list_conversations_by_runner_id("runner_reconnect")
+    finally:
+        detach()
+
+    assert count[0] == 1, f"list_conversations_by_runner_id must take one checkout, got {count[0]}"
+    assert [c.id for c in convs] == [created.id]
+    conv = convs[0]
+    assert conv.title == "budget-runner"
+    # The runner session-init envelope is built from these labels.
+    assert conv.labels == {"tag": "value"}
+    assert (conv.workspace, conv.git_branch) == ("/tmp/ws", "feature/z")
+
+
+def test_list_reads_keep_their_semantic_query_names(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """Sharing one checkout must not collapse or rename the reads.
+
+    Every statement still runs under its caller's semantic name even though
+    several ``with`` blocks now reuse one session: the name is scoped by the
+    ``with`` block, not by the session. Asserted as a set plus a floor on the
+    count, because the statement count varies with page shape.
+    """
+    created = conversation_store.create_conversation(
+        title="named-list",
+        runner_id="runner_named",
+    )
+    conversation_store.set_labels(created.id, {PROJECT_LABEL_KEY: "proj"})
+    _grant_owner(db_uri, created.id)
+
+    cases: list[tuple[str, Callable[[], object], int]] = [
+        (
+            "list_conversations",
+            lambda: conversation_store.list_conversations(accessible_by="alice"),
+            3,
+        ),
+        ("get_conversations", lambda: conversation_store.get_conversations([created.id]), 3),
+        (
+            "get_session_connectivity",
+            lambda: conversation_store.get_session_connectivity([created.id]),
+            2,
+        ),
+        ("list_projects", lambda: conversation_store.list_projects(owned_by="alice"), 2),
+        (
+            "list_conversations_by_runner_id",
+            lambda: conversation_store.list_conversations_by_runner_id("runner_named"),
+            3,
+        ),
+    ]
+    for method, call, min_selects in cases:
+        names = _select_query_names(conversation_store, call)
+        expected = f"omnigent.conversation_store.{method}"
+        assert set(names) == {expected}, (method, names)
+        assert len(names) >= min_selects, (method, names)
+
+
+def test_list_read_inside_outer_scope_keeps_its_own_query_name(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A nested read joins the outer scope's session but not its query name.
+
+    The auth path already opens a ``shared_read_scope`` around its own reads,
+    so a store read called inside one reuses that session. The name must still
+    follow the ``with`` block, otherwise every nested query would be attributed
+    to whichever read opened the session first.
+    """
+    from omnigent.db.utils import shared_read_scope
+
+    created = conversation_store.create_conversation(title="nested-name")
+
+    def _both() -> None:
+        with shared_read_scope():
+            conversation_store.list_projects()
+            conversation_store.get_session_connectivity([created.id])
+
+    names = _select_query_names(conversation_store, _both)
+
+    assert names[0] == "omnigent.conversation_store.list_projects"
+    assert set(names[1:]) == {"omnigent.conversation_store.get_session_connectivity"}

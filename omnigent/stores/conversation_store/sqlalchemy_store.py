@@ -65,6 +65,7 @@ from omnigent.db.utils import (
     insert_fts_bulk,
     make_named_managed_session_maker,
     now_epoch,
+    shared_read_scope,
     strip_nul_bytes,
 )
 from omnigent.entities import (
@@ -1117,6 +1118,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             ).all()
         return {row.id: row.runner_id for row in rows}
 
+    @shared_read_scope()
     def get_session_connectivity(
         self, conversation_ids: list[str]
     ) -> dict[str, SessionConnectivity]:
@@ -1128,6 +1130,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         fork-source connectivity marker — instead of the per-id
         ``get_conversation`` + labels fan-out the sidebar online-dot used
         to drive. See the abstract method for the contract.
+
+        The two reads share one pool checkout per engine, so single-DB mode
+        pays one instead of two — with ``pool_pre_ping`` each checkout is a
+        network round trip, and the sidebar polls this for every session.
 
         :param conversation_ids: Session/conversation IDs to look up,
             e.g. ``["conv_abc123", "conv_def456"]``.
@@ -1182,12 +1188,16 @@ class SqlAlchemyConversationStore(ConversationStore):
             for row in meta_rows
         }
 
+    @shared_read_scope()
     def get_conversations(self, conversation_ids: list[str]) -> dict[str, Conversation]:
         """
         Bulk variant of :meth:`get_conversation` — one ``SELECT ... WHERE
         id IN (...)`` for the rows plus one batched label query, so the
         watch-set rescan costs a constant number of round-trips instead
         of one per id. Missing ids are omitted from the result.
+
+        The AP reads and the Omnigent metadata read share one pool checkout
+        per engine, so single-DB mode pays one instead of two.
 
         :param conversation_ids: Conversation ids to fetch,
             e.g. ``["conv_abc123", "conv_def456"]``. Duplicates are
@@ -2117,6 +2127,7 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         return persisted
 
+    @shared_read_scope()
     def list_projects(
         self,
         accessible_by: str | None = None,
@@ -2135,6 +2146,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         (``omni_*``) to keep this internal storage key distinct from the
         user-facing "project" term and from any future reserved keys; it is
         never surfaced as a label in the UI.
+
+        The ACL pre-fetch and the label scan share one pool checkout per
+        engine, so an ACL-scoped call costs one in single-DB mode instead of
+        two (an unscoped call already needs only the label scan).
 
         :param accessible_by: When set, restrict to sessions that
             ``accessible_by`` has a permission row for (mirrors the
@@ -2224,6 +2239,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             )
 
+    @shared_read_scope()
     def list_conversations(
         self,
         limit: int = 20,
@@ -2248,6 +2264,12 @@ class SqlAlchemyConversationStore(ConversationStore):
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
+
+        Every read here — the permission pre-fetch, the page query, the
+        ``agent_name`` and project resolutions, the metadata merge — shares one
+        pool checkout per engine. Single-DB mode drops from up to four
+        checkouts to one, which matters because the message-send path rescans
+        the spawn tree with this on every event.
 
         :param limit: Maximum number of conversations to return.
         :param after: Cursor conversation ID; return
@@ -2371,7 +2393,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         with self._conv_session("list_conversations") as session:
             # Bound the content-search scan server-side (Postgres only). SET
             # LOCAL scopes to this transaction and reverts on commit, so it
-            # can't leak to the connection's next pooled use. See
+            # can't leak to the connection's next pooled use — the shared read
+            # scope commits when this call returns, which bounds it here. See
             # _SEARCH_STATEMENT_TIMEOUT_MS. A worker-thread query is not stopped
             # by a client disconnect, so this is the only server-side bound.
             is_postgres = session.bind is not None and session.bind.dialect.name == "postgresql"
@@ -3134,12 +3157,16 @@ class SqlAlchemyConversationStore(ConversationStore):
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
+    @shared_read_scope()
     def list_conversations_by_runner_id(
         self,
         runner_id: str,
     ) -> list[Conversation]:
         """
         Return all conversations bound to the given ``runner_id``.
+
+        The metadata scan and the AP row + label reads share one pool checkout
+        per engine, so single-DB mode pays one instead of two.
 
         :param runner_id: Runner identifier, e.g.
             ``"runner_token_a1b2c3d4..."``.

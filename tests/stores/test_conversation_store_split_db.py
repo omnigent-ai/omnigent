@@ -634,3 +634,182 @@ def test_delete_conversation_keeps_template_agent(
 
     asyncio.run(store.delete_conversation(conv.id))
     assert _col(omnigent_db, "agents", "id") == ["191cbf904e3223e9e00ac9a1abfe79a5"]
+
+
+# ── Connection-checkout budget ─────────────────────────
+
+
+def _per_engine_checkouts(store: SqlAlchemyConversationStore) -> tuple[dict[str, int], Any]:
+    """Count checkouts per engine on a split-DB store.
+
+    :param store: A split-DB store (asserted, so a single-DB fixture cannot
+        silently make the per-engine expectation trivial).
+    :returns: ``(counts, detach)`` — a ``{"conv": n, "omnigent": n}`` mapping
+        and a zero-arg callable that removes the listeners.
+    """
+    from sqlalchemy import event
+
+    assert store._conv_engine is not store._engine, "fixture must be split-DB"
+    counts: dict[str, int] = {"conv": 0, "omnigent": 0}
+
+    def _mk(tag: str) -> Any:
+        def _on_checkout(_dbapi: object, _record: object, _proxy: object) -> None:
+            counts[tag] += 1
+
+        return _on_checkout
+
+    conv_hook, omni_hook = _mk("conv"), _mk("omnigent")
+    event.listen(store._conv_engine, "checkout", conv_hook)
+    event.listen(store._engine, "checkout", omni_hook)
+
+    def _detach() -> None:
+        event.remove(store._conv_engine, "checkout", conv_hook)
+        event.remove(store._engine, "checkout", omni_hook)
+
+    return counts, _detach
+
+
+def test_list_conversations_takes_one_checkout_per_engine(
+    store: SqlAlchemyConversationStore,
+    omnigent_db: Path,
+) -> None:
+    """Split-DB keeps one checkout per engine — not one overall — and still merges.
+
+    The single-DB collapse comes from ``shared_read_scope``, which keys its
+    shared session by engine. Here the metadata, permission and project tables
+    genuinely live on another engine, so their checkout cannot be shared away;
+    what must not regress is the routing or the per-engine budget. Without the
+    scope this shape cost four checkouts (permission pre-fetch, page query,
+    project member pre-fetch, metadata merge).
+    """
+    from omnigent.server.auth import LEVEL_OWNER
+    from omnigent.stores.conversation_store import PROJECT_LABEL_KEY
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    created = store.create_conversation(
+        title="split-list",
+        runner_id="runner_split",
+        host_id="a6bfc420101272fcd5906a9eff904dfd",
+        workspace="/tmp/ws",
+    )
+    store.set_labels(created.id, {PROJECT_LABEL_KEY: "proj"})
+    SqlAlchemyPermissionStore(f"sqlite:///{omnigent_db}").grant("alice", created.id, LEVEL_OWNER)
+
+    counts, detach = _per_engine_checkouts(store)
+    try:
+        page = store.list_conversations(
+            accessible_by="alice",
+            owned_by="alice",
+            project="proj",
+        )
+    finally:
+        detach()
+
+    assert counts == {"conv": 1, "omnigent": 1}, counts
+    assert [c.id for c in page.data] == [created.id]
+    conv = page.data[0]
+    assert conv.title == "split-list"
+    assert (conv.runner_id, conv.host_id) == (
+        "runner_split",
+        "a6bfc420101272fcd5906a9eff904dfd",
+    )
+    assert conv.workspace == "/tmp/ws"
+
+
+def test_get_conversations_takes_one_checkout_per_engine(
+    store: SqlAlchemyConversationStore,
+) -> None:
+    """The bulk fetch still reads metadata from the Omnigent DB, one checkout each."""
+    created = store.create_conversation(
+        title="split-bulk",
+        runner_id="runner_split",
+        host_id="a6bfc420101272fcd5906a9eff904dfd",
+        workspace="/tmp/ws",
+    )
+    store.set_labels(created.id, {"tag": "value"})
+
+    counts, detach = _per_engine_checkouts(store)
+    try:
+        by_id = store.get_conversations([created.id])
+    finally:
+        detach()
+
+    assert counts == {"conv": 1, "omnigent": 1}, counts
+    conv = by_id[created.id]
+    assert conv.labels == {"tag": "value"}
+    assert (conv.runner_id, conv.host_id) == (
+        "runner_split",
+        "a6bfc420101272fcd5906a9eff904dfd",
+    )
+
+
+def test_get_session_connectivity_takes_one_checkout_per_engine(
+    store: SqlAlchemyConversationStore,
+) -> None:
+    """Connectivity reads metadata on one engine and its labels on the other."""
+    from omnigent.session_import import IMPORT_SOURCE_LABEL_KEY
+
+    created = store.create_conversation(
+        title="split-conn",
+        runner_id="runner_split",
+        host_id="a6bfc420101272fcd5906a9eff904dfd",
+        workspace="/tmp/ws",
+    )
+    store.set_labels(created.id, {IMPORT_SOURCE_LABEL_KEY: "claude"})
+
+    counts, detach = _per_engine_checkouts(store)
+    try:
+        connectivity = store.get_session_connectivity([created.id])
+    finally:
+        detach()
+
+    assert counts == {"conv": 1, "omnigent": 1}, counts
+    entry = connectivity[created.id]
+    assert entry.runner_id == "runner_split"
+    assert entry.imported is True
+
+
+def test_list_projects_takes_one_checkout_per_engine(
+    store: SqlAlchemyConversationStore,
+    omnigent_db: Path,
+) -> None:
+    """The ACL pre-fetch stays on the Omnigent DB, the label scan on the AP DB."""
+    from omnigent.server.auth import LEVEL_OWNER
+    from omnigent.stores.conversation_store import PROJECT_LABEL_KEY
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    created = store.create_conversation(title="split-projects")
+    store.set_labels(created.id, {PROJECT_LABEL_KEY: "proj"})
+    SqlAlchemyPermissionStore(f"sqlite:///{omnigent_db}").grant("alice", created.id, LEVEL_OWNER)
+
+    counts, detach = _per_engine_checkouts(store)
+    try:
+        projects = store.list_projects(accessible_by="alice", owned_by="alice")
+    finally:
+        detach()
+
+    assert counts == {"conv": 1, "omnigent": 1}, counts
+    assert projects == ["proj"]
+
+
+def test_list_conversations_by_runner_id_takes_one_checkout_per_engine(
+    store: SqlAlchemyConversationStore,
+) -> None:
+    """The runner fan-out reads metadata on one engine, rows + labels on the other."""
+    created = store.create_conversation(
+        title="split-runner",
+        runner_id="runner_split",
+        workspace="/tmp/ws",
+    )
+    store.set_labels(created.id, {"tag": "value"})
+
+    counts, detach = _per_engine_checkouts(store)
+    try:
+        convs = store.list_conversations_by_runner_id("runner_split")
+    finally:
+        detach()
+
+    assert counts == {"conv": 1, "omnigent": 1}, counts
+    assert [c.id for c in convs] == [created.id]
+    assert convs[0].labels == {"tag": "value"}
+    assert convs[0].workspace == "/tmp/ws"

@@ -626,6 +626,10 @@ def shared_read_scope() -> Iterator[None]:
     strictly READ-ONLY burst — an access-control check, a snapshot assembly —
     where the per-call checkout dominates the actual query time.
 
+    Usable as a decorator (``@shared_read_scope()``) on a method that is
+    read-only end to end — preferable to a ``with`` wrapper when the reads sit
+    in sibling ``with`` blocks that would otherwise all need reindenting.
+
     Nesting reuses the outer scope. Write makers (``immediate=True``) never
     participate, so they keep their own ``BEGIN IMMEDIATE`` isolation even
     when nested here. Never hold this open across network I/O: it pins a
