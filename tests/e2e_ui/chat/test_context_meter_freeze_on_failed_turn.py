@@ -213,9 +213,7 @@ def test_context_ring_updates_when_turn_fails_after_usage_observed(
             # turn fails. Wait for the turn to settle as failed: the error
             # pill renders from the response.failed event.
             _send(page, f"Continue. {token2}")
-            expect(page.locator('[data-testid="error-pill"]').first).to_be_visible(
-                timeout=240_000
-            )
+            expect(page.locator('[data-testid="error-pill"]').first).to_be_visible(timeout=240_000)
             expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)
 
             # ── The reproduction assertion: the harness observed a
@@ -237,6 +235,6 @@ def test_context_ring_updates_when_turn_fails_after_usage_observed(
             respawned.terminate()
             try:
                 respawned.wait(timeout=5)
-            except Exception:  # noqa: BLE001 — best-effort teardown
+            except Exception:  # best-effort teardown
                 respawned.kill()
                 respawned.wait(timeout=5)
