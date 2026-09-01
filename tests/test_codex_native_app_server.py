@@ -753,6 +753,66 @@ async def test_codex_launch_catalog_is_stale_unresolvable_launch_is_not_stale(
     assert await codex_native_app_server.codex_launch_catalog_is_stale() is False
 
 
+# ── catalog fingerprint keys on the CLI binary ───────────
+
+
+def _default_codex_launch() -> Any:
+    """A bare ``model=None`` launch shape for fingerprinting."""
+    from omnigent import codex_native_app_server
+
+    return codex_native_app_server.NativeCodexLaunch(config_overrides=[], model=None, profile=None)
+
+
+def test_codex_catalog_fingerprint_changes_when_the_cli_is_upgraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An upgraded Codex CLI misses the catalog its predecessor wrote.
+
+    The catalog stores the model names one binary answered with. Without
+    the binary in the key, an in-place upgrade keeps serving the old names
+    until the entry ages out.
+    """
+    from omnigent import codex_native_app_server
+
+    codex = tmp_path / "codex"
+    codex.write_text("old build")
+    codex.chmod(0o755)
+    # Resolve through the same override ladder the probe launches with.
+    monkeypatch.setenv("OMNIGENT_CODEX_PATH", str(codex))
+    launch = _default_codex_launch()
+
+    before = codex_native_app_server.codex_catalog_fingerprint(launch)
+
+    codex.write_text("a longer, newer build")
+    after = codex_native_app_server.codex_catalog_fingerprint(launch)
+
+    assert before != after
+
+
+def test_codex_catalog_fingerprint_is_stable_for_one_binary(tmp_path: Path) -> None:
+    """An unchanged binary keeps its catalog, so no probe is repaid."""
+    from omnigent import codex_native_app_server
+
+    codex = tmp_path / "codex"
+    codex.write_text("build")
+    launch = _default_codex_launch()
+
+    assert codex_native_app_server.codex_catalog_fingerprint(
+        launch, codex_path=str(codex)
+    ) == codex_native_app_server.codex_catalog_fingerprint(launch, codex_path=str(codex))
+
+
+def test_codex_catalog_fingerprint_survives_a_missing_binary(tmp_path: Path) -> None:
+    """A binary the resolver cannot find still yields a usable key."""
+    from omnigent import codex_native_app_server
+
+    fingerprint = codex_native_app_server.codex_catalog_fingerprint(
+        _default_codex_launch(), codex_path=str(tmp_path / "absent")
+    )
+
+    assert isinstance(fingerprint, str) and fingerprint
+
+
 def _test_app_server(
     tmp_path: Path,
     codex_home: Path,

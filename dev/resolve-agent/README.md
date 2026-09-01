@@ -87,7 +87,9 @@ the review gate after the fact.
 ## What it does
 
 1. Recovers the repro handoff (verdict, facets, journey, `bug_url`) and the e2e
-   test's content from the `session` or `ci_link`.
+   test's content from the `session` or `ci_link`. CI recovery reads the compact
+   artifact checkpoint and preserved test files first, using multi-megabyte job
+   logs only as a compatibility fallback for older bundles.
 2. **Looks for an open PR already fixing the bug.** This decides the path:
    - **Existing fix PR** → checks it out, runs the repro test against it (pass =
      it fixes the bug; fail = it doesn't — the key review finding), reviews the

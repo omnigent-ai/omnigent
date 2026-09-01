@@ -9,6 +9,7 @@
  *
  * Sections:
  *
+ * - **General** — app-wide behavior preferences.
  * - **Appearance** — theme mode (System / Light / Dark), terminal theme,
  *   default transcript view, Workspace panel default, and UI/code font controls.
  * - **Git** — Git behavior: the global "always use a random worktree" default
@@ -36,11 +37,13 @@ import {
   useEffect,
   useId,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import {
   ArchiveRestoreIcon,
   AlertTriangleIcon,
+  DownloadIcon,
   KeyRoundIcon,
   Loader2Icon,
   LaptopMinimalIcon,
@@ -57,8 +60,10 @@ import {
   SquareIcon,
   TerminalIcon,
   Trash2Icon,
+  UploadIcon,
   UserCogIcon,
   XIcon,
+  ClockIcon,
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
@@ -89,6 +94,7 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
+import { MOD_KEY } from "@/components/KeyboardShortcut";
 import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
 import { changePassword, logout } from "@/lib/accountsApi";
 import { getCurrentIsAdmin, getCurrentUserId, resolveIdentity } from "@/lib/identity";
@@ -108,11 +114,8 @@ import { absoluteTime } from "@/lib/relativeTime";
 import { useNavigate } from "@/lib/routing";
 import { useSettingsRoute } from "@/shell/settingsNav";
 import { ImportSessionsPanel } from "@/shell/ImportSessionsPanel";
-import {
-  normalizeResolvedTheme,
-  normalizeThemeMode,
-  type ThemeMode,
-} from "@/components/theme/themeMode";
+import { isThemeMode, normalizeThemeMode, type ThemeMode } from "@/components/theme/themeMode";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import {
   applyDesktopUiFontSize,
   applyUiFontFamily,
@@ -163,7 +166,17 @@ import {
   type TranscriptViewDefault,
 } from "@/lib/transcriptViewPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
+import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import {
+  readSubmitWithModEnter,
+  writeSubmitWithModEnter,
+} from "@/lib/composerSendShortcutPreferences";
 import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
+import {
+  archivedAtSeconds,
+  readRetentionDays,
+  writeRetentionDays,
+} from "@/lib/retentionPreferences";
 import {
   DEFAULT_HIDE_UNCONFIGURED_HARNESSES,
   readHideUnconfiguredHarnesses,
@@ -189,6 +202,12 @@ import {
 } from "@/lib/customTheme";
 import { useIsEmbedded } from "@/lib/embedded";
 import { getOmnigentThemeSettingsUrl } from "@/lib/host";
+import {
+  applyImportedSettings,
+  collectSettings,
+  downloadSettings,
+  readSettingsFile,
+} from "@/lib/settingsPortability";
 import {
   type CliStatus,
   getCliStatus,
@@ -283,6 +302,7 @@ export function SettingsPage() {
   return (
     <PageScroll contentClassName="px-8" extraBottom="2.5rem">
       {section === "appearance" && <AppearanceSection />}
+      {section === "general" && <GeneralSection />}
       {section === "git" && <GitSection />}
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "import" && <ImportSection />}
@@ -515,9 +535,9 @@ function WorkspacePanelDefaultControl() {
 }
 
 function ColorThemeControl() {
-  // Render each chip in the currently-resolved mode so it matches the app now.
-  const { resolvedTheme } = useTheme();
-  const isDark = normalizeResolvedTheme(resolvedTheme) === "dark";
+  // Render each chip in the currently-resolved mode so it matches the app now
+  // (honoring the embed's forced theme, not just next-themes' resolvedTheme).
+  const isDark = useResolvedThemeMode() === "dark";
   const [selection, setSelection] = useState<ThemeSelection>(() => readThemePalette());
   const [customTheme, setCustomTheme] = useState<CustomTheme>(() => readCustomTheme());
   const labelId = useId();
@@ -736,6 +756,9 @@ function AppearanceSection() {
   const { setTheme } = useTheme();
   const [resetKey, setResetKey] = useState(0);
   const [isResetDialogOpen, setIsResetDialogOpen] = useState(false);
+  const [isImportDialogOpen, setIsImportDialogOpen] = useState(false);
+  const [importError, setImportError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const resetAppearance = () => {
     // Reset every appearance preference back to the product default.
@@ -797,6 +820,33 @@ function AppearanceSection() {
     setIsResetDialogOpen(false);
   };
 
+  const exportSettings = () => {
+    const exported = collectSettings();
+    if (exported) downloadSettings(exported);
+  };
+
+  const handleImportFile = async (file: File) => {
+    setImportError(null);
+    try {
+      const imported = await readSettingsFile(file);
+      applyImportedSettings(imported);
+
+      // Apply DOM side-effects so imported settings take effect immediately.
+      // Note: web-theme is stored as plain string by next-themes, not JSON.
+      const themeMode = imported.settings["web-theme"];
+      if (themeMode && isThemeMode(themeMode)) setTheme(themeMode);
+      applyDesktopUiFontSize(readUiFontSizePx());
+      applyUiFontFamily(readUiFontFamily());
+      applyThemePalette(readThemePalette());
+      applyCustomTheme(readCustomTheme());
+
+      setIsImportDialogOpen(false);
+      setResetKey((k) => k + 1);
+    } catch (err) {
+      setImportError(err instanceof Error ? err.message : "Import failed.");
+    }
+  };
+
   return (
     <Section
       title="Appearance"
@@ -808,7 +858,7 @@ function AppearanceSection() {
           <div className="flex flex-col gap-3">
             <span className="text-ui font-medium">Theme</span>
             <p className="text-sm text-muted-foreground">
-              Light and dark mode are controlled by the host application.
+              Light and dark mode are configured in Databricks preferences.
               {themeSettingsUrl ? (
                 <>
                   {" "}
@@ -816,7 +866,7 @@ function AppearanceSection() {
                     href={themeSettingsUrl}
                     className="font-medium text-primary underline underline-offset-2 hover:text-primary/80"
                   >
-                    Change it in your settings
+                    Click to open Databricks user preferences page.
                   </a>
                   .
                 </>
@@ -852,7 +902,28 @@ function AppearanceSection() {
         <UiCodeFontWeightControl />
       </div>
 
-      <div className="mt-8 flex items-center justify-end">
+      <div className="mt-8 flex items-center justify-end gap-2">
+        <Button
+          variant="outline"
+          size="sm"
+          data-testid="export-settings-button"
+          onClick={exportSettings}
+        >
+          <DownloadIcon className="size-4" />
+          Export
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          data-testid="import-settings-button"
+          onClick={() => {
+            setImportError(null);
+            setIsImportDialogOpen(true);
+          }}
+        >
+          <UploadIcon className="size-4" />
+          Import
+        </Button>
         <Dialog open={isResetDialogOpen} onOpenChange={setIsResetDialogOpen}>
           <DialogTrigger asChild>
             <Button
@@ -890,6 +961,53 @@ function AppearanceSection() {
           </DialogContent>
         </Dialog>
       </div>
+
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".json"
+        className="hidden"
+        data-testid="import-settings-file-input"
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) void handleImportFile(file);
+          e.target.value = "";
+        }}
+      />
+      <Dialog open={isImportDialogOpen} onOpenChange={setIsImportDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Import settings</DialogTitle>
+            <DialogDescription>
+              Choose an exported Omnigent settings file to apply. This will overwrite your current
+              appearance and preference settings.
+            </DialogDescription>
+          </DialogHeader>
+          {importError && (
+            <div
+              role="alert"
+              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+            >
+              {importError}
+            </div>
+          )}
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button variant="outline" size="sm">
+                Cancel
+              </Button>
+            </DialogClose>
+            <Button
+              variant="default"
+              size="sm"
+              data-testid="import-settings-choose-file"
+              onClick={() => fileInputRef.current?.click()}
+            >
+              Choose file
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Section>
   );
 }
@@ -939,6 +1057,89 @@ function AlwaysUseWorktreeControl() {
         componentId="settings.git.always_use_worktree"
       />
     </div>
+  );
+}
+
+/**
+ * Opt-in dispatch for messages sent while the agent is working.
+ */
+function AlwaysSteerControl() {
+  const [value, setValue] = useState(() => readAlwaysSteer());
+  const labelId = useId();
+  const toggle = useCallback((next: boolean) => {
+    setValue(next);
+    writeAlwaysSteer(next);
+  }, []);
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span id={labelId} className="text-ui font-medium">
+          Always steer
+        </span>
+        <span className="text-ui text-muted-foreground">
+          Send follow-ups straight into the running turn instead of queuing them. The agent folds
+          each one into its current work where the harness supports it, otherwise at the next turn.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        checked={value}
+        onCheckedChange={toggle}
+        data-testid="always-steer-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.always_steer"
+      />
+    </div>
+  );
+}
+
+function ComposerSendShortcutControl() {
+  const [enabled, setEnabled] = useState(() => readSubmitWithModEnter());
+  const labelId = useId();
+  const descriptionId = useId();
+  const toggle = useCallback((next: boolean) => {
+    setEnabled(next);
+    writeSubmitWithModEnter(next);
+  }, []);
+
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span id={labelId} className="text-ui font-medium">
+          Submit with {MOD_KEY} + Enter on desktop
+        </span>
+        <div id={descriptionId} className="text-ui text-muted-foreground">
+          <p>Off: Enter submits and Shift+Enter inserts a newline.</p>
+          <p>On: Enter inserts a newline and {MOD_KEY}+Enter submits.</p>
+        </div>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        aria-describedby={descriptionId}
+        checked={enabled}
+        onCheckedChange={toggle}
+        data-testid="composer-submit-with-mod-enter-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.submit_with_mod_enter"
+      />
+    </div>
+  );
+}
+
+/** App-wide behavior settings. */
+function GeneralSection() {
+  return (
+    <Section title="General" description="Configure general Omnigent behavior.">
+      <div className="flex flex-col gap-3">
+        <h2 className="text-ui font-medium">Composer</h2>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <ComposerSendShortcutControl />
+          <div className="mt-4 border-t border-border pt-4">
+            <AlwaysSteerControl />
+          </div>
+        </div>
+      </div>
+    </Section>
   );
 }
 
@@ -1882,6 +2083,25 @@ function dateGroupLabel(timestampSec: number, now: Date = new Date()): string {
   return date.toLocaleDateString(undefined, { month: "long", year: "numeric" });
 }
 
+const RETENTION_OPTIONS: { label: string; value: string; days: number | null }[] = [
+  { label: "Never", value: "never", days: null },
+  { label: "After 7 days", value: "7", days: 7 },
+  { label: "After 30 days", value: "30", days: 30 },
+  { label: "After 60 days", value: "60", days: 60 },
+  { label: "After 90 days", value: "90", days: 90 },
+];
+
+function retentionDaysToSelectValue(days: number | null): string {
+  if (days === null) return "never";
+  return String(days);
+}
+
+function selectValueToRetentionDays(value: string): number | null {
+  if (value === "never") return null;
+  const parsed = parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
 function ImportSection() {
   return (
     <Section
@@ -1896,6 +2116,10 @@ function ImportSection() {
 function ArchivedSection() {
   // `undefined` = all projects; a name scopes the list to that project.
   const [project, setProject] = useState<string | undefined>(undefined);
+  const [retentionDays, setRetentionDays] = useState<number | null>(() => readRetentionDays());
+  const [deleteExpiredOpen, setDeleteExpiredOpen] = useState(false);
+  const bulkDelete = useBulkDeleteConversations();
+  const viewerId = useViewerId();
 
   // Picker options: every project that has an archived session. Sourced from a
   // dedicated hook that pages through ALL archived sessions server-side —
@@ -1926,6 +2150,24 @@ function ArchivedSection() {
     () => (listQuery.data?.pages ?? []).flatMap((p) => p.data).filter((c) => c.archived === true),
     [listQuery.data],
   );
+
+  const cutoff = useMemo(() => {
+    if (retentionDays === null) return null;
+    return Math.floor(Date.now() / 1000) - retentionDays * 86400;
+  }, [retentionDays]);
+
+  const expiredSessions = useMemo(() => {
+    if (cutoff === null) return [];
+    return archived.filter((c) => archivedAtSeconds(c) < cutoff);
+  }, [archived, cutoff]);
+
+  // Filter expired sessions to only owned ones (same pattern as ArchivedBulkActionBar)
+  const ownedExpiredSessions = useMemo(() => {
+    return expiredSessions.filter((c) => {
+      const owner = c.owner;
+      return owner === null || owner === viewerId;
+    });
+  }, [expiredSessions, viewerId]);
 
   const groupedArchived = useMemo(() => {
     const now = new Date();
@@ -1988,9 +2230,38 @@ function ArchivedSection() {
       title="Archived sessions"
       description="Sessions you've archived. Restore one to the sidebar, or delete it for good."
     >
-      <div className="mb-4 flex items-center gap-2">
+      <div className="mb-4 flex flex-wrap items-center gap-x-6 gap-y-2">
+        <div className="flex items-center gap-2">
+          <label htmlFor="archived-retention" className="text-ui text-muted-foreground">
+            Mark as expired after
+          </label>
+          <Select
+            value={retentionDaysToSelectValue(retentionDays)}
+            onValueChange={(value) => {
+              const days = selectValueToRetentionDays(value);
+              setRetentionDays(days);
+              writeRetentionDays(days);
+            }}
+          >
+            <SelectTrigger
+              id="archived-retention"
+              aria-label="Mark archived sessions as expired after"
+              data-testid="archived-retention"
+              className="w-40"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent position="popper" align="start">
+              {RETENTION_OPTIONS.map((opt) => (
+                <SelectItem key={opt.value} value={opt.value}>
+                  {opt.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
         {items.length > 0 && (
-          <>
+          <div className="flex items-center gap-2">
             <label htmlFor="archived-project-filter" className="text-ui text-muted-foreground">
               Project
             </label>
@@ -2019,7 +2290,7 @@ function ArchivedSection() {
                 ))}
               </SelectContent>
             </Select>
-          </>
+          </div>
         )}
         {!selectionMode && archived.length > 0 && (
           <Button
@@ -2044,6 +2315,71 @@ function ArchivedSection() {
         />
       )}
 
+      {ownedExpiredSessions.length > 0 && (
+        <div className="mb-4 flex items-center gap-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2">
+          <ClockIcon className="size-4 shrink-0 text-destructive" />
+          <span className="text-ui flex-1">
+            {ownedExpiredSessions.length === 1
+              ? "1 expired session"
+              : `${ownedExpiredSessions.length} expired sessions`}{" "}
+            {listQuery.hasNextPage ? "on loaded pages " : ""}past the {retentionDays}-day retention
+            period.
+          </span>
+          <Button
+            type="button"
+            variant="destructive"
+            size="sm"
+            data-testid="delete-expired"
+            disabled={bulkDelete.isPending}
+            onClick={() => setDeleteExpiredOpen(true)}
+          >
+            Delete expired
+          </Button>
+          <Dialog open={deleteExpiredOpen} onOpenChange={setDeleteExpiredOpen}>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>Delete expired sessions?</DialogTitle>
+                <DialogDescription>
+                  {ownedExpiredSessions.length === 1
+                    ? "1 owned archived session"
+                    : `${ownedExpiredSessions.length} owned archived sessions`}{" "}
+                  older than {retentionDays} days {listQuery.hasNextPage ? "on loaded pages " : ""}
+                  will be permanently deleted. This cannot be undone.
+                  {listQuery.hasNextPage && (
+                    <span className="mt-2 block text-sm">
+                      Note: More archived sessions may exist on unfetched pages. Click "Load more"
+                      to see all expired sessions before deleting.
+                    </span>
+                  )}
+                </DialogDescription>
+              </DialogHeader>
+              <DialogFooter>
+                <Button
+                  variant="ghost"
+                  onClick={() => setDeleteExpiredOpen(false)}
+                  disabled={bulkDelete.isPending}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  variant="destructive"
+                  disabled={bulkDelete.isPending}
+                  onClick={() => {
+                    bulkDelete.mutate({ ids: ownedExpiredSessions.map((c) => c.id) });
+                    setDeleteExpiredOpen(false);
+                  }}
+                >
+                  Delete{" "}
+                  {ownedExpiredSessions.length === 1
+                    ? "1 session"
+                    : `${ownedExpiredSessions.length} sessions`}
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+        </div>
+      )}
+
       {listQuery.isLoading ? (
         <p className="text-ui text-muted-foreground">Loading…</p>
       ) : archived.length === 0 && !listQuery.hasNextPage ? (
@@ -2066,6 +2402,7 @@ function ArchivedSection() {
                       <ArchivedRow
                         key={conv.id}
                         conversation={conv}
+                        cutoff={cutoff}
                         selectionMode={selectionMode}
                         isSelected={selectedIds.has(conv.id)}
                         onToggleSelected={toggleSelected}
@@ -2273,15 +2610,18 @@ function ArchivedBulkActionBar({
  */
 function ArchivedRow({
   conversation,
+  cutoff,
   selectionMode,
   isSelected,
   onToggleSelected,
 }: {
   conversation: Conversation;
+  cutoff: number | null;
   selectionMode: boolean;
   isSelected: boolean;
   onToggleSelected: (id: string) => void;
 }) {
+  const isExpired = cutoff !== null && archivedAtSeconds(conversation) < cutoff;
   const navigate = useNavigate();
   const archive = useArchiveConversation();
   const del = useStopAndDeleteConversation();
@@ -2312,8 +2652,13 @@ function ArchivedRow({
         <div className="truncate text-ui font-medium" title={label}>
           {label}
         </div>
-        <div className="text-sm text-muted-foreground">
-          {absoluteTime(conversation.updated_at * 1000)}
+        <div className="flex items-center gap-1.5 text-sm text-muted-foreground">
+          <span>{absoluteTime(conversation.updated_at * 1000)}</span>
+          {isExpired && (
+            <span className="rounded bg-destructive/10 px-1.5 py-0.5 text-xs font-medium text-destructive">
+              Expired
+            </span>
+          )}
         </div>
       </div>
       {/* Actions reveal on hover (desktop) / always shown on touch.

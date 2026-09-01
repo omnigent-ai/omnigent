@@ -275,6 +275,45 @@ def test_configure_process_logging_publishes_its_log_path(
             handler.close()
 
 
+def test_configure_process_logging_forwards_custom_debug_log_send(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from omnigent import debug_logging
+
+    captured: list[object] = []
+
+    def send(batch: list[dict[str, object]]) -> None:
+        captured.append(batch)
+
+    def attach(
+        loggers: list[logging.Logger],
+        *,
+        source: str,
+        level: int,
+        send: debug_logging.DebugLogSend | None = None,
+    ) -> None:
+        captured.extend((loggers, source, level, send))
+
+    monkeypatch.setattr(debug_logging, "attach_debug_log_sink", attach)
+    logger_name = "omnigent.test_custom_debug_send"
+    configure_process_logging(
+        "integration",
+        log_path=tmp_path / "integration.log",
+        level=logging.WARNING,
+        logger_names=(logger_name,),
+        root=False,
+        debug_log_send=send,
+    )
+    try:
+        assert captured[1:] == ["integration", logging.WARNING, send]
+    finally:
+        logger = logging.getLogger(logger_name)
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+
+
 def test_unlink_if_empty_sweeps_only_empty_files(tmp_path: Path) -> None:
     """The exit sweep removes an empty log, keeps a written one, tolerates absence."""
     empty = tmp_path / "empty.log"

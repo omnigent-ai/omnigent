@@ -168,6 +168,7 @@ from omnigent.server.schemas import (
     AutomaticSessionRenameResponse,
     CreatedSessionResponse,
     PaginatedList,
+    ProjectSessionCreateRequest,
     ReadStatePutRequest,
     SessionAgentChangedEvent,
     SessionCreateRequest,
@@ -342,7 +343,7 @@ def register_core_routes(
     )
     async def create_session(
         request: Request,
-    ) -> SessionResponse | CreatedSessionResponse:
+    ) -> SessionResponse | CreatedSessionResponse | dict[str, Any]:
         """
         Create a session.
 
@@ -365,11 +366,27 @@ def register_core_routes(
         user_id = _require_user(request, auth_provider)
         content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
         if content_type == "multipart/form-data":
-            return await _create_bundled_session_from_multipart(request, user_id)
+            result, project_warnings = await _create_bundled_session_from_multipart(
+                request, user_id
+            )
+            if project_warnings:
+                return {
+                    **result.model_dump(mode="json"),
+                    "warnings": list(project_warnings),
+                }
+            return result
 
         try:
             payload = await request.json()
-            body = SessionCreateRequest.model_validate(payload)
+            # Dispatch on the VALUE, not key presence: a null project_id is
+            # "no project", so it must keep the legacy request shape (and its
+            # 422 contract) byte-identical to an absent key.
+            create_model = (
+                ProjectSessionCreateRequest
+                if isinstance(payload, dict) and payload.get("project_id") is not None
+                else SessionCreateRequest
+            )
+            body = create_model.model_validate(payload)
         except json.JSONDecodeError as exc:
             raise HTTPException(
                 status_code=422,
@@ -390,7 +407,7 @@ def register_core_routes(
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
-        resp = await _create_session_from_existing_agent(
+        resp, project_warnings = await _create_session_from_existing_agent(
             conversation_store,
             agent_store,
             runner_router,
@@ -403,6 +420,7 @@ def register_core_routes(
             file_store=file_store,
             artifact_store=artifact_store,
             background_title_coordinator=background_title_coordinator,
+            project_store=project_store,
         )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
@@ -576,12 +594,17 @@ def register_core_routes(
                 resp.runner_id = runner_id
                 resp.host_id = launch_host_id
 
+        if project_warnings:
+            return {
+                **resp.model_dump(mode="json"),
+                "warnings": list(project_warnings),
+            }
         return resp
 
     async def _create_bundled_session_from_multipart(
         request: Request,
         user_id: str | None,
-    ) -> CreatedSessionResponse:
+    ) -> tuple[CreatedSessionResponse, tuple[dict[str, str], ...]]:
         """
         Handle multipart ``POST /v1/sessions`` with inline agent upload.
 
@@ -618,6 +641,16 @@ def register_core_routes(
         if not isinstance(bundle, StarletteUploadFile):
             raise HTTPException(status_code=422, detail=[_multipart_missing_detail("bundle")])
         parsed_metadata = _parse_session_create_metadata(metadata)
+        from omnigent.server.routes._session_create_validation import (
+            resolve_project_session_create,
+        )
+
+        project_resolution = await resolve_project_session_create(
+            body=parsed_metadata,
+            user_id=user_id,
+            project_store=project_store,
+        )
+        parsed_metadata = project_resolution.body
         _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
         _reject_server_reserved_label_seed(parsed_metadata.labels)
 
@@ -674,7 +707,7 @@ def register_core_routes(
                 sandbox_provider=parsed_metadata.sandbox_provider,
                 workspace=parsed_metadata.workspace,
             )
-        return result
+        return result, project_resolution.warnings
 
     # ── GET /sessions/projects ────────────────────────────────────
     #
@@ -2380,15 +2413,47 @@ def register_core_routes(
             else None
         )
 
-        # Keep the fork filed in the source's first-class project, but only
-        # when the forker owns that project — projects are owner-private, so
-        # a fork of a shared session filed in someone else's project stays
-        # unfiled (a foreign project id would show in no folder view).
+        # Keep the fork filed in the source's first-class project, but route
+        # that inherited (not caller-requested) decision through the same
+        # ownership/default chokepoint as a direct create. The fork never asked
+        # for a project, so a source whose agent mismatches its project emits
+        # no warnings here and is never strict-rejected — the mismatch belongs
+        # to the source session, not this request. Forks do not inherit
+        # workspace or worktree settings, so explicit nulls preserve those fork
+        # semantics. A shared source's foreign project retains the historical
+        # terminal behavior: silently leave the fork unfiled.
         fork_project_id = None
-        if source.project_id is not None and project_store is not None:
-            owned = await asyncio.to_thread(project_store.get, source.project_id, user_id=user_id)
-            if owned is not None:
-                fork_project_id = source.project_id
+        from omnigent.server.routes._session_create_validation import (
+            resolve_project_session_create,
+        )
+
+        fork_create_body = (
+            ProjectSessionCreateRequest(
+                project_id=source.project_id,
+                agent_id=base_agent.id,
+                workspace=None,
+                git=None,
+            )
+            if source.project_id is not None
+            else SessionCreateRequest(
+                agent_id=base_agent.id,
+                workspace=None,
+                git=None,
+            )
+        )
+
+        try:
+            fork_resolution = await resolve_project_session_create(
+                body=fork_create_body,
+                user_id=user_id,
+                project_store=project_store,
+                warn_on_mismatch=False,
+            )
+        except OmnigentError as exc:
+            if source.project_id is None or exc.code != ErrorCode.NOT_FOUND:
+                raise
+        else:
+            fork_project_id = fork_resolution.project_id
 
         try:
             new_conv = await asyncio.to_thread(

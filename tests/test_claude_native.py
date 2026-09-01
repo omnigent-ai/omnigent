@@ -9431,17 +9431,82 @@ def test_parse_claude_model_aliases_reads_the_usage_line() -> None:
             {"label": "Opus in plan mode, else Sonnet"},
             id="prose-label-kept-verbatim",
         ),
+        pytest.param(
+            json.dumps({"type": "result", "result": "Current model: `Sonnet 5` (effort: high)"}),
+            {"label": "Sonnet 5"},
+            id="markdown-backticks-around-the-name-are-stripped",
+        ),
+        pytest.param(
+            json.dumps({"type": "result", "result": "Current model: `Opus 5 (1M context)`"}),
+            {"label": "Opus 5 (1M context)"},
+            id="markdown-backticks-around-the-whole-label-are-stripped",
+        ),
+        pytest.param(
+            json.dumps({"type": "result", "result": "Current model: `Opus 5 (effort: high)`"}),
+            {"label": "Opus 5"},
+            id="effort-suffix-inside-the-backticks-still-strips",
+        ),
+        pytest.param(
+            json.dumps(
+                {"type": "result", "result": "Current model: `Opus 5 (1M context) (default)`"}
+            ),
+            {"label": "Opus 5 (1M context)"},
+            id="default-marker-on-the-enumeration-run-is-stripped",
+        ),
+        pytest.param(
+            json.dumps({"type": "result", "result": "Current model: Sonnet 5 (default)"}),
+            {"label": "Sonnet 5"},
+            id="default-marker-without-backticks-is-stripped",
+        ),
         pytest.param("Current model: Opus 5\nnot json", {}, id="non-stream-json-yields-nothing"),
     ],
 )
 def test_parse_claude_current_model(stdout: str, expected: dict[str, str]) -> None:
     """The stream-json run's exact id and printed label parse verbatim.
 
-    Only the trailing ``(effort: …)`` suffix is stripped from the label —
-    context markers and prose like opusplan's description survive, because
-    the parser knows no model names.
+    Only markdown backticks and the trailing ``(effort: …)`` / ``(default)``
+    suffixes are stripped from the label — context markers and prose like
+    opusplan's description survive, because the parser knows no model names.
     """
     assert claude_native._parse_claude_current_model(stdout) == expected
+
+
+@pytest.mark.parametrize(
+    ("alias", "label", "model", "expected"),
+    [
+        pytest.param(
+            "sonnet[1m]",
+            "`Sonnet 5`",
+            "claude-sonnet-5[1m]",
+            "Sonnet 5 (1M context)",
+            id="marker-appended-outside-stripped-backticks",
+        ),
+        pytest.param(
+            "opus[1m]",
+            "`Opus 5 (1M context)`",
+            "claude-opus-5[1m]",
+            "Opus 5 (1M context)",
+            id="marker-already-present-inside-backticks",
+        ),
+    ],
+)
+def test_claude_alias_row_marks_1m_context_consistently(
+    alias: str, label: str, model: str, expected: str
+) -> None:
+    """A markdown-quoted harness label cannot split the 1M-context marker.
+
+    Backticks leave at parse time, so the marker lands on plain text and
+    the guard against a duplicate marker sees the name it is guarding.
+    """
+    resolution = claude_native._parse_claude_current_model(
+        json.dumps({"type": "system", "subtype": "init", "model": model})
+        + "\n"
+        + json.dumps({"type": "result", "result": f"Current model: {label} (effort: high)"})
+    )
+
+    row = claude_native._claude_alias_row(alias, resolution)
+
+    assert row == {"id": alias, "model": model, "displayName": expected}
 
 
 async def test_probe_claude_model_options_runs_bare(
@@ -9848,3 +9913,62 @@ def test_claude_catalog_serves_model(
     assert (
         claude_native.claude_catalog_serves_model(_subscription_catalog(), model, config) is served
     )
+
+
+# ── catalog fingerprint keys on the CLI binary ───────────
+
+
+def _point_claude_at(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
+    """Make the fingerprint resolve the Claude binary to *path*."""
+    monkeypatch.setattr(
+        "omnigent.claude_launcher.resolve_claude_launch",
+        lambda command, args: (str(path), list(args)),
+    )
+
+
+def test_catalog_fingerprint_changes_when_the_cli_is_upgraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An upgraded Claude Code misses the catalog its predecessor wrote.
+
+    The catalog stores the model names one binary printed. Without the
+    binary in the key, an upgrade keeps serving the old names until the
+    entry ages out, which hides models a release adds or renames.
+    """
+    old_release = tmp_path / "2.1.247"
+    new_release = tmp_path / "2.1.250"
+    old_release.write_text("old")
+    new_release.write_text("newer build")
+    link = tmp_path / "claude"
+    link.symlink_to(old_release)
+    _point_claude_at(monkeypatch, link)
+
+    before = claude_native.claude_catalog_fingerprint(None)
+
+    link.unlink()
+    link.symlink_to(new_release)
+    after = claude_native.claude_catalog_fingerprint(None)
+
+    assert before != after
+
+
+def test_catalog_fingerprint_is_stable_for_one_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unchanged binary keeps its catalog, so no probe is repaid."""
+    binary = tmp_path / "claude"
+    binary.write_text("build")
+    _point_claude_at(monkeypatch, binary)
+
+    assert claude_native.claude_catalog_fingerprint(None) == (
+        claude_native.claude_catalog_fingerprint(None)
+    )
+
+
+def test_catalog_fingerprint_survives_a_missing_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A binary the resolver cannot find still yields a usable key."""
+    _point_claude_at(monkeypatch, tmp_path / "absent")
+
+    assert isinstance(claude_native.claude_catalog_fingerprint(None), str)

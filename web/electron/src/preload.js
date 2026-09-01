@@ -70,11 +70,9 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     return () => ipcRenderer.removeListener("omnigent:notification-activated", listener);
   },
   /**
-   * Subscribe to deep-link navigations. When the user clicks an
-   * `omnigent://.../c/<id>` link for a server this window is already on, the
-   * main process sends the in-app path here so the SPA routes to it in-place
-   * (no reload) — same path shape as onNotificationActivated. Returns an
-   * unsubscribe function.
+   * Subscribe to in-app navigation from the main process. Native menu actions
+   * and same-server deep links send a basename-less path so the SPA can route
+   * in place without reloading. Returns an unsubscribe function.
    * @param {(path: string) => void} callback
    * @returns {() => void}
    */

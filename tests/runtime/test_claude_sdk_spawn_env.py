@@ -91,6 +91,30 @@ def test_databricks_auth_sets_databricks_env_vars() -> None:
     assert env["HARNESS_CLAUDE_SDK_DATABRICKS_PROFILE"] == "my-profile"
 
 
+def test_anthropic_prefixed_model_is_stripped_for_the_claude_cli() -> None:
+    """
+    ``executor.model: anthropic/<name>`` hands the claude CLI the bare
+    ``<name>`` — the CLI rejects vendor-prefixed model ids.
+
+    Failure means a spec pinning the provider-routed spelling gets its
+    prefixed id forwarded verbatim to the Anthropic Messages endpoint,
+    where the claude CLI errors with "There's an issue with the selected
+    model".
+    """
+    spec = _make_spec(model="anthropic/claude-sonnet-4-6")
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
+
+
+def test_bare_model_is_passed_through_unchanged() -> None:
+    """A bare (unprefixed) model id reaches the claude CLI as written."""
+    spec = _make_spec(model="claude-sonnet-4-6")
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
+
+
 def test_api_key_auth_sets_helper_env_var() -> None:
     """
     ``executor.auth: {type: api_key, api_key: …}`` sets

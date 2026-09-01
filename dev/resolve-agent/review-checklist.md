@@ -21,6 +21,13 @@ what to look for, and why it's wrong.
 - **No order-dependence / shared mutable state** across tests — a test that only
   passes after another ran, or mutates a module/global without restoring it.
 
+- **claude-sdk e2e mocks must script for parallel API calls.** The claude CLI
+  opens more than one API call at turn start (main + side calls), and only the
+  main call's stream events reach the executor. A mock queue with a single
+  scripted entry can be consumed by a side call, silently testing a different
+  failure than the journey intends — script enough identical entries that the
+  main call deterministically sees the intended response.
+
 ## UI / affordances
 
 - **Don't offer an action the code can't perform.** Flag a menu/UI option gated on
@@ -40,3 +47,18 @@ what to look for, and why it's wrong.
 - **A "clear/reset" must not clobber unrelated config.** An edit that rewrites a
   config file to remove one key must preserve every other key — no full-file
   overwrite that drops the user's other settings.
+
+- **Copy the environment with `os.environ.copy()`.** Wrapping the environ in a
+  dump-style constructor (dict / json.dumps / str / repr of the whole environ)
+  trips the security exfil scan on added lines; the repo idiom
+  `os.environ.copy()` is equivalent and passes.
+
+## Rollback / cleanup
+
+- **Cleanup of an adopted resource must not destroy pre-existing user state.**
+  When an operation *recreates or adopts* something that predates the request (an
+  existing branch, an existing directory, an existing config), its
+  rollback/cleanup path must remove only what the operation itself created —
+  never force-delete the pre-existing thing (e.g. `git branch -D` on a branch the
+  user owned before the call, losing unpushed commits). Check every failure path
+  that shares a cleanup helper with the create-from-scratch flow.

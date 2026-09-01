@@ -132,7 +132,10 @@ _MAX_CONCURRENT_MCP_REQUESTS = 64
 # ``tmux.json`` after the Claude terminal launches; the harness
 # tails it and shells out to tmux.
 _TMUX_READY_TIMEOUT_S = 30.0
-_TMUX_SEND_TIMEOUT_S = 5.0
+# Per-command tmux budget. 10s matches every other native bridge: a tmux
+# server starved by parallel worker boots on a large worktree can stall
+# past 5s while still healthy, and a shorter budget kills the delivery.
+_TMUX_SEND_TIMEOUT_S = 10.0
 # Claude Code renders this prompt glyph in its input box once the TUI
 # is interactive. We poll ``capture-pane`` for it before injecting the
 # first message so keystrokes typed during Claude's boot aren't dropped.
@@ -1391,6 +1394,7 @@ def build_hook_settings(
     api_key_helper: str | None = None,
     launch_model: str | None = None,
     launch_permission_mode: str | None = None,
+    launch_bypass_permissions: bool = False,
     launch_effort: str | None = None,
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
@@ -1420,6 +1424,11 @@ def build_hook_settings(
     :param launch_permission_mode: Effective launch permission mode from
         ``--permission-mode``. Mirrored into ``permissions.defaultMode``
         for the same re-exec hardening.
+    :param launch_bypass_permissions: ``True`` when this launch requests
+        bypass mode (``--dangerously-skip-permissions`` or
+        ``--permission-mode bypassPermissions``), which sets
+        ``skipDangerousModePermissionPrompt`` so the one-time acceptance
+        dialog never blocks a host-spawned terminal.
     :param launch_effort: Effective launch effort from ``--effort``.
         Mirrored into ``effortLevel`` for restart/re-exec parity.
     :param subagent_router_dir: Directory where the runner advertises its
@@ -1673,6 +1682,14 @@ def build_hook_settings(
         settings["model"] = launch_model
     if launch_permission_mode:
         settings["permissions"] = {"defaultMode": launch_permission_mode}
+    if launch_bypass_permissions:
+        # Bypass mode shows a one-time "Bypass Permissions mode" acceptance
+        # dialog. Like the trust/onboarding gates it fires no
+        # PermissionRequest hook, so a host-spawned terminal has nobody to
+        # answer it and the session hangs with a blank web UI. Claude checks
+        # the org policy (``disableBypassPermissionsMode``) BEFORE this
+        # consent gate, so a managed host still strips bypass regardless.
+        settings["skipDangerousModePermissionPrompt"] = True
     if launch_effort and launch_effort in CLAUDE_EFFORTS:
         settings["effortLevel"] = launch_effort
     if api_key_helper:
@@ -1832,6 +1849,7 @@ def augment_claude_args(
         api_key_helper=api_key_helper,
         launch_model=_arg_value(claude_args, "--model"),
         launch_permission_mode=_arg_value(claude_args, "--permission-mode"),
+        launch_bypass_permissions=_args_request_bypass_permissions(claude_args),
         launch_effort=_arg_value(claude_args, "--effort"),
         subagent_router_dir=subagent_router_dir,
         turn_routing=turn_routing,
@@ -1887,6 +1905,21 @@ def _arg_value(args: tuple[str, ...], flag: str) -> str | None:
             if candidate and not candidate.startswith("--"):
                 value = candidate
     return value
+
+
+def _args_request_bypass_permissions(args: tuple[str, ...]) -> bool:
+    """Return whether ``args`` launch Claude Code in bypass-permissions mode.
+
+    Both spellings count: the standalone ``--dangerously-skip-permissions``
+    flag, and ``--permission-mode bypassPermissions`` (the form
+    ``permission_mode: bypassPermissions`` in a worker bundle becomes).
+
+    :param args: Claude CLI args, e.g. ``("--dangerously-skip-permissions",)``.
+    :returns: ``True`` when this launch requests bypass mode.
+    """
+    return "--dangerously-skip-permissions" in args or (
+        _arg_value(args, "--permission-mode") == "bypassPermissions"
+    )
 
 
 def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
@@ -3237,52 +3270,6 @@ def inject_interrupt(
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     # No ``-l``: tmux must interpret ``Escape`` as a key name.
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Escape")
-
-
-# Option-1 label in Claude Code's plan-review dialog: proof that dialog is
-# what's on screen before a verdict is keyed into it.
-_PLAN_DIALOG_MARKER = "Yes, and use auto mode"
-
-_PLAN_VERDICT_KEYS = {"auto": "1", "manual": "2", "reject": "Escape"}
-
-
-def inject_plan_verdict(
-    bridge_dir: Path,
-    *,
-    verdict: str,
-    timeout_s: float = _TMUX_READY_TIMEOUT_S,
-) -> bool:
-    """
-    Answer Claude Code's plan-review dialog by keystroke.
-
-    Claude Code ignores a ``PermissionRequest`` hook's ``allow`` for
-    ``ExitPlanMode`` — that dialog is answerable only from the TUI — so a
-    web-UI plan verdict has to be keyed in the way a local user would.
-    Every other gated tool honors the hook decision instead.
-
-    The pane check is the only guard available (the verdict carries no tool
-    identity), and it doubles as the "already answered in the terminal" case.
-
-    :param bridge_dir: Bridge directory path, e.g.
-        ``/tmp/omnigent/claude-native/<digest>``.
-    :param verdict: ``"auto"`` (approve + auto mode), ``"manual"``
-        (approve, keep approving edits), or ``"reject"``.
-    :param timeout_s: Seconds to wait for ``tmux.json``, e.g. ``1.0``.
-    :returns: ``True`` when the keystroke was sent, ``False`` when the
-        plan dialog was not showing.
-    :raises ValueError: If *verdict* is not a known option.
-    :raises RuntimeError: If the tmux target is not advertised in time,
-        or if the ``tmux send-keys`` invocation fails.
-    """
-    key = _PLAN_VERDICT_KEYS.get(verdict)
-    if key is None:
-        raise ValueError(f"unknown plan verdict {verdict!r}")
-    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    if _PLAN_DIALOG_MARKER not in _capture_pane(info["socket_path"], info["tmux_target"]):
-        return False
-    # No ``-l``: tmux must read ``Escape`` as a key name, not literal text.
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], key)
-    return True
 
 
 def kill_session(
@@ -4945,6 +4932,122 @@ def _stdio_jsonrpc_loop(
         )
 
 
+_MCP_PROGRESS_INTERVAL_S: float = 15.0
+
+
+def _extract_progress_token(params: object) -> str | int | None:
+    """
+    Extract a progress token from MCP request params, if present.
+
+    :param params: Decoded MCP request params (usually a dict).
+    :returns: Progress token (str or int) or None.
+    """
+    if not isinstance(params, dict):
+        return None
+    meta = params.get("_meta")
+    if isinstance(meta, dict):
+        token = meta.get("progressToken")
+        if isinstance(token, (str, int)) and not isinstance(token, bool):
+            return token
+    token = params.get("progressToken")
+    if isinstance(token, (str, int)) and not isinstance(token, bool):
+        return token
+    return None
+
+
+def _is_relay_tool_call(params: object, bridge_dir: Path) -> bool:
+    """
+    Whether a ``tools/call`` targets a tool routed through the Omnigent relay.
+
+    :param params: Decoded MCP request params (usually a dict).
+    :param bridge_dir: Bridge directory used to resolve the active relay.
+    :returns: ``True`` when the named tool is served by the relay.
+    """
+    if not isinstance(params, dict):
+        return False
+    name = params.get("name")
+    if not isinstance(name, str) or not name:
+        return False
+    try:
+        return name in _read_relay_tool_names(bridge_dir)
+    except Exception:  # noqa: BLE001 - relay lookup failure means "not relayed"
+        return False
+
+
+class _McpProgressHeartbeat:
+    """Context manager emitting periodic MCP progress notifications to reset client timeouts."""
+
+    def __init__(
+        self,
+        progress_token: str | int | None,
+        stdout_lock: threading.Lock,
+        *,
+        framed: bool = False,
+        interval_s: float = _MCP_PROGRESS_INTERVAL_S,
+    ) -> None:
+        self._progress_token = progress_token
+        self._stdout_lock = stdout_lock
+        self._framed = framed
+        self._interval_s = interval_s
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._progress_token is None or self._interval_s <= 0:
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name="mcp-progress-heartbeat",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+            # Only forget a thread that actually exited; a writer blocked on a
+            # full stdout pipe stays tracked (it exits on its next stop check).
+            if not thread.is_alive():
+                self._thread = None
+
+    def _run(self) -> None:
+        # Emit an immediate first tick so the client learns the call is alive
+        # right away, then keep ticking every interval. MCP requires
+        # ``progress`` to increase on every notification; a constant value may
+        # be ignored (or rejected) by conforming clients.
+        tick = 0
+        while not self._stop_event.is_set():
+            tick += 1
+            notification: _JsonObject = {
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": {
+                    "progressToken": self._progress_token,
+                    "progress": tick,
+                },
+            }
+            try:
+                _write_jsonrpc(notification, self._stdout_lock, framed=self._framed)
+            except Exception:  # noqa: BLE001 - progress failure must not interrupt execution
+                break
+            if self._stop_event.wait(self._interval_s):
+                break
+
+    def __enter__(self) -> _McpProgressHeartbeat:
+        self.start()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: object,
+        exc_val: object,
+        exc_tb: object,
+    ) -> None:
+        self.stop()
+
+
 def _handle_and_write_mcp_request(
     request_id: object,
     method: str,
@@ -4969,8 +5072,19 @@ def _handle_and_write_mcp_request(
     :returns: None after the response is written.
     """
     # A request failure must not tear down the long-lived MCP server.
+    # Heartbeat only relay-routed calls: the relay's own 300 s budget
+    # guarantees they terminate, so keep-alive is safe. A hung LOCAL tool
+    # must stay killable by the client's static timeout, so it gets no
+    # heartbeat that would reset that deadline forever.
+    progress_token = (
+        _extract_progress_token(params)
+        if method == "tools/call" and _is_relay_tool_call(params, bridge_dir)
+        else None
+    )
+    heartbeat = _McpProgressHeartbeat(progress_token, stdout_lock, framed=framed)
     try:
-        result = _handle_mcp_request(method, params, tools, bridge_dir)
+        with heartbeat:
+            result = _handle_mcp_request(method, params, tools, bridge_dir)
         response: _JsonObject = {
             "jsonrpc": "2.0",
             "id": request_id,

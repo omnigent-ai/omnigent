@@ -160,7 +160,6 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY,
     _CODEX_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY,
     _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
-    _COMPACT_LOCKS,
     _CURSOR_FORK_HISTORY_HARNESSES,
     _CURSOR_NATIVE_HARNESS,
     _DENY_SENTINEL_PREFIX,
@@ -209,6 +208,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _read_last_seen,
     _runner_skills_cache,
     _runner_skills_inflight,
+    _runner_skills_stale,
     _session_active_response_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
@@ -283,6 +283,7 @@ from omnigent.spec.types import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
+    ARCHIVED_AT_LABEL_KEY,
     PINNED_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
@@ -4507,13 +4508,16 @@ def _invalidate_runner_backed_snapshot_state(
     """
     Drop runner-derived session snapshot overlays for one session.
 
-    Skills are discovered from the bound runner, so they are dropped and
-    re-fetched at the next snapshot. The native model catalog is instead
-    marked stale by default: it must outlive runner death so the model
-    picker stays populated (and offline model/effort changes stay possible)
-    while the session is asleep — a stale catalog keeps serving until a
-    live-runner re-fetch replaces it. Runner teardown additionally cancels
-    any in-flight fetch so a dead runner cannot land a late stale value.
+    Skills are discovered from the bound runner, so they are marked stale
+    and re-fetched at the next snapshot — but they keep serving until that
+    lands, because the request asking for the refresh is the same one whose
+    response fills the composer's slash-command menu. The native model
+    catalog is marked stale for the same reason, and additionally must
+    outlive runner death so the model picker stays populated (and offline
+    model/effort changes stay possible) while the session is asleep. Runner
+    teardown cancels any in-flight fetch so a dead runner cannot land a late
+    stale value, and drops the skills outright — they belong to the runner
+    that went away.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
@@ -4528,12 +4532,18 @@ def _invalidate_runner_backed_snapshot_state(
     """
     from omnigent.server.smart_routing import invalidate_runner_catalog
 
-    _runner_skills_cache.pop(session_id, None)
+    # Only worth marking when there is something to keep serving: a session
+    # with no cached skills already re-fetches on the next read, and marking
+    # it would leave an id behind for every cold session ever opened.
+    if session_id in _runner_skills_cache:
+        _runner_skills_stale.add(session_id)
     # Routing's candidate catalog is runner-derived too: a rebind or a relaunch
     # can change which models the session can be switched onto, so it must not
     # keep routing off the previous runner's list.
     invalidate_runner_catalog(session_id)
     if cancel_inflight:
+        _runner_skills_cache.pop(session_id, None)
+        _runner_skills_stale.discard(session_id)
         inflight = _runner_skills_inflight.pop(session_id, None)
         if inflight is not None:
             inflight.cancel()
@@ -7154,124 +7164,6 @@ async def _flush_relay_text(
     session_stream.publish(session_id, done_event.model_dump())
 
 
-def _compact_lock(session_id: str) -> asyncio.Lock:
-    """
-    Return the lock serializing explicit compaction for one session.
-
-    Call-time proxy to the facade so a test's ``monkeypatch.setattr`` of
-    this name on ``sessions`` is honored by sibling impl callers.
-    """
-    from omnigent.server.routes import sessions as _facade
-
-    return _facade._compact_lock(session_id)
-
-
-def _compact_lock_impl(session_id: str) -> asyncio.Lock:
-    """
-    Return the lock serializing explicit compaction for one session.
-
-    Concurrent ``/compact`` events for the same session must not overlap;
-    different sessions get distinct locks so they may compact concurrently.
-    Get-or-create is race-free because there is no ``await`` between the
-    lookup and the insert (single event loop).
-
-    :param session_id: Session/conversation id being compacted.
-    :returns: A process-wide :class:`asyncio.Lock` shared by every concurrent
-        caller for the same ``session_id``.
-    """
-    lock = _COMPACT_LOCKS.get(session_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _COMPACT_LOCKS[session_id] = lock
-    return lock
-
-
-async def _run_compact_locked(
-    session_id: str,
-    conv: Conversation,
-    agent_store: AgentStore,
-    agent_cache: AgentCache | None,
-) -> None:
-    """
-    Run explicit compaction while holding the per-session compact lock.
-
-    :param session_id: Session/conversation identifier.
-    :param conv: Conversation row.
-    :param agent_store: Agent store for spec lookup.
-    :param agent_cache: Agent cache for bundle loading.
-    """
-    lock = _compact_lock(session_id)
-    async with lock:
-        if conv.agent_id is None:
-            raise OmnigentError("Session has no agent binding", code=ErrorCode.INTERNAL_ERROR)
-        if agent_cache is None:
-            raise OmnigentError(
-                "Compaction is unavailable: agent cache is not configured",
-                code=ErrorCode.INTERNAL_ERROR,
-            )
-        # Recheck after acquiring — a turn may have started while waiting.
-        if _session_status_cache.get(session_id) in ("running", "waiting"):
-            raise OmnigentError(
-                "Cannot compact while a turn is running; cancel or wait for it to finish first",
-                code=ErrorCode.CONFLICT,
-            )
-        agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
-        if agent is None or agent.bundle_location is None:
-            raise OmnigentError(
-                f"Agent not found: {conv.agent_id!r}",
-                code=ErrorCode.NOT_FOUND,
-            )
-        loaded = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
-        )
-        spec = loaded.spec
-        if spec.llm is not None:
-            llm_config = spec.llm
-        elif spec.executor.model is not None:
-            from omnigent.spec.types import LLMConfig
-
-            llm_config = LLMConfig(model=spec.executor.model, connection=spec.executor.connection)
-        else:
-            harness = spec.executor.harness_kind
-            raise OmnigentError(
-                f"/compact is unavailable for this {harness} session because the agent "
-                "does not declare an LLM model for server-side compaction. Configure "
-                "`llm.model` or `executor.model`, or use a harness-native compaction "
-                "control when one is available.",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        task_id = f"compact_{int(time.time() * 1000)}"
-        # compact() publishes its own in_progress / completed SSE events when
-        # conversation_id is set, and the web UI's compaction bubble owns the
-        # busy state from those. Deliberately no ``session.status`` bracket:
-        # compaction is not an agent turn, so reporting running→idle would
-        # invent one — and its idle would land mid-turn on a session that is
-        # genuinely working, which clients then had to second-guess.
-        from omnigent.runtime.workflow import compact_conversation_now
-
-        try:
-            await compact_conversation_now(
-                task_id=task_id,
-                conversation_id=session_id,
-                spec=spec,
-                llm_config=llm_config,
-                tool_schemas=[],
-                preserve_recent_window=1,
-            )
-        except Exception as exc:
-            _logger.exception(
-                "Explicit session compaction failed for %s",
-                session_id,
-                extra={"session_id": session_id},
-            )
-            detail = str(exc) or repr(exc)
-            _publish_compaction_failed(session_id)
-            raise OmnigentError(
-                f"Compaction failed while generating a summary: {detail}",
-                code=ErrorCode.INTERNAL_ERROR,
-            ) from exc
-
-
 def _agent_provider_family(agent: Agent) -> str | None:
     """Return the provider family of an agent's harness, or ``None``.
 
@@ -8366,6 +8258,7 @@ async def _create_session_worktree(
             repo_path=source_repo,
             branch_name=git.branch_name,
             base_branch=git.base_branch,
+            existing_branch=git.existing_branch,
         )
     except WorktreeHostUnavailableError as exc:
         # Host offline / unresponsive — infra, not user input.
@@ -8863,6 +8756,14 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
+    # The archive timestamp is stamped by the server on the archive transition
+    # only; a client write would forge the retention clock, including on shared
+    # sessions the caller does not own.
+    if ARCHIVED_AT_LABEL_KEY in labels:
+        raise OmnigentError(
+            f"label {ARCHIVED_AT_LABEL_KEY!r} is server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
     # Pins are per-user: the client may only write the bare canonical
     # ``omnigent.pinned`` key (which the route rewrites to the CALLER's per-user
     # key). A suffixed ``omnigent.pinned.<user>`` is server-derived — accepting
@@ -8990,6 +8891,7 @@ def _persist_stored_session_bundle(
             terminal_launch_args=metadata.terminal_launch_args,
             parent_conversation_id=metadata.parent_session_id,
             runner_id=runner_id,
+            project_id=metadata.project_id,
         )
     except ConversationNotFoundError as exc:
         # Parent was authorized by the caller but vanished (deleted)
@@ -9819,6 +9721,7 @@ async def _load_runner_skills(
         )
         return
     _runner_skills_cache[session_id] = skills
+    _runner_skills_stale.discard(session_id)
     # Nudge any subscribed client to re-read the (now-warm) snapshot so
     # its slash-command menu fills without waiting for the next bind.
     _publish_runner_skills(session_id)
@@ -10156,7 +10059,6 @@ __all__ = [
     "_codex_subagent_labels_from_body",
     "_coerce_cumulative_field",
     "_collect_descendant_conversation_ids",
-    "_compact_lock",
     "_consume_pre_resolved_harness_elicitation",
     "_create_and_publish_antigravity_child",
     "_create_and_publish_codex_child",
@@ -10302,7 +10204,6 @@ __all__ = [
     "_resolve_subagent_spec",
     "_resource_event_item_from_sse",
     "_routing_decision_item_from_sse",
-    "_run_compact_locked",
     "_same_provider_family",
     "_same_provider_family_impl",
     "_seed_missing_title",
