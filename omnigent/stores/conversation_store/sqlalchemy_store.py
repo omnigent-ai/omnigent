@@ -1918,6 +1918,63 @@ class SqlAlchemyConversationStore(ConversationStore):
                 has_more=has_more,
             )
 
+    def get_item(self, conversation_id: str, item_id: str) -> ConversationItem | None:
+        with self._conv_session("get_item") as session:
+            row = session.execute(
+                select(SqlConversationItem)
+                .options(
+                    load_only(
+                        SqlConversationItem.id,
+                        SqlConversationItem.type,
+                        SqlConversationItem.status,
+                        SqlConversationItem.response_id,
+                        SqlConversationItem.created_at,
+                        SqlConversationItem.data,
+                        SqlConversationItem.created_by,
+                    )
+                )
+                .where(
+                    SqlConversationItem.workspace_id == current_workspace_id(),
+                    SqlConversationItem.conversation_id == conversation_id,
+                    SqlConversationItem.id == item_id,
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            return _to_item(row, self._decode_item_data_batch([row.data])[0])
+
+    def list_items_by_response_id(
+        self,
+        conversation_id: str,
+        response_id: str,
+    ) -> list[ConversationItem]:
+        with self._conv_session("list_items_by_response_id") as session:
+            rows = list(
+                session.execute(
+                    select(SqlConversationItem)
+                    .options(
+                        load_only(
+                            SqlConversationItem.id,
+                            SqlConversationItem.type,
+                            SqlConversationItem.status,
+                            SqlConversationItem.response_id,
+                            SqlConversationItem.created_at,
+                            SqlConversationItem.position,
+                            SqlConversationItem.data,
+                            SqlConversationItem.created_by,
+                        )
+                    )
+                    .where(
+                        SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id == conversation_id,
+                        SqlConversationItem.response_id == response_id,
+                    )
+                    .order_by(asc(SqlConversationItem.position))
+                ).scalars()
+            )
+            decoded = self._decode_item_data_batch([row.data for row in rows])
+            return [_to_item(row, data) for row, data in zip(rows, decoded, strict=True)]
+
     def list_latest_message_items_for_conversations(
         self,
         conversation_ids: list[str],

@@ -23,6 +23,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 from pydantic import ValidationError
+from sqlalchemy.exc import SQLAlchemyError
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.db.utils import generate_agent_id, generate_task_id
@@ -56,6 +57,8 @@ from omnigent.host.frames import (
     WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
 from omnigent.llms.context_window import resolve_effective_context_window
+from omnigent.memory import capture_runtime
+from omnigent.memory.capture_models import MemoryCaptureTarget
 from omnigent.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
@@ -4759,6 +4762,9 @@ async def _forward_event_to_runner(
     has_mcp_servers: bool = False,
     created_by: str | None = None,
     host_store: HostStore | None = None,
+    framework_instructions: str | None = None,
+    memory_capture_targets: tuple[MemoryCaptureTarget, ...] = (),
+    memory_account_subject: str | None = None,
 ) -> str:
     """
     Persist a user event and forward it to the runner.
@@ -4801,6 +4807,26 @@ async def _forward_event_to_runner(
         session_id,
         [item],
     )
+    memory_capture: dict[str, object] | None = None
+    if memory_capture_targets and memory_account_subject is not None:
+        try:
+            workspace_id = memory_capture_targets[0].scope.workspace_id
+            if any(target.scope.workspace_id != workspace_id for target in memory_capture_targets):
+                raise ValueError("memory capture targets span workspaces")
+            memory_capture = await capture_runtime.register_intent(
+                conversation_store,
+                workspace_id=workspace_id,
+                source_item_id=persisted_items[0].id,
+                conversation_id=session_id,
+                account_subject=memory_account_subject,
+                targets=memory_capture_targets,
+            )
+        except (OSError, RuntimeError, SQLAlchemyError, ValueError):
+            _logger.warning(
+                "Memory capture intent registration failed for session=%s",
+                session_id,
+                exc_info=True,
+            )
     await _seed_missing_title_from_user_message(
         conv,
         item,
@@ -4878,6 +4904,10 @@ async def _forward_event_to_runner(
         # resolved copy — id-based dedup, not a role/content guess.
         "persisted_item_id": persisted_items[0].id,
     }
+    if framework_instructions:
+        runner_body["framework_instructions"] = framework_instructions
+    if memory_capture is not None:
+        runner_body["memory_capture"] = memory_capture
     # Persist the turn-initiating actor so /policies/evaluate and MCP
     # tools/call can read it back on any server replica.  Skip system-driven
     # forwards (sub-agent results, parent-wake carry created_by=None) — they
@@ -5471,6 +5501,9 @@ async def _dispatch_session_event_to_runner_impl(
     runner_router: RunnerRouter | None = None,
     native_terminal_ready: bool = False,
     host_store: HostStore | None = None,
+    framework_instructions: str | None = None,
+    memory_capture_targets: tuple[MemoryCaptureTarget, ...] = (),
+    memory_account_subject: str | None = None,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -5770,6 +5803,9 @@ async def _dispatch_session_event_to_runner_impl(
         has_mcp_servers=has_mcp_servers,
         created_by=created_by,
         host_store=host_store,
+        framework_instructions=framework_instructions,
+        memory_capture_targets=memory_capture_targets,
+        memory_account_subject=memory_account_subject,
     )
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 
@@ -6354,6 +6390,33 @@ async def _relay_runner_stream_once(
                             },
                         )
                         continue
+
+                    if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES:
+                        _terminal_response = event.get("response")
+                        _terminal_response_id = (
+                            _terminal_response.get("id")
+                            if isinstance(_terminal_response, dict)
+                            else None
+                        )
+                        if not isinstance(_terminal_response_id, str) or not _terminal_response_id:
+                            _terminal_response_id = current_response_id
+                        _memory_capture = event.get("memory_capture")
+                        if isinstance(_terminal_response_id, str) and _terminal_response_id:
+                            try:
+                                await capture_runtime.settle_intent(
+                                    conversation_store,
+                                    _memory_capture,
+                                    response_id=_terminal_response_id,
+                                    completed=evt_type == "response.completed",
+                                )
+                            except (OSError, RuntimeError, SQLAlchemyError, ValueError):
+                                _logger.warning(
+                                    "Memory capture intent settlement failed for session=%s",
+                                    session_id,
+                                    exc_info=True,
+                                )
+                        event.pop("memory_capture", None)
+                        event.pop("source_item_id", None)
 
                     # Accumulate LLM token usage from the harness
                     # response so policy callables can read

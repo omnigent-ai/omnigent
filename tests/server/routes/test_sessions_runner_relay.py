@@ -11,9 +11,12 @@ from typing import Any
 
 import pytest
 
+from omnigent.entities import MessageData, NewConversationItem
+from omnigent.memory import MemoryCaptureTarget, MemoryScope, capture_runtime
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.memory_capture_store import SqlAlchemyMemoryCaptureStore
 from tests.server.helpers import start_session_stream_collector
 
 
@@ -367,6 +370,105 @@ async def test_relay_text_flush_publishes_persisted_item(db_uri: str) -> None:
             await asyncio.wait_for(handle.task, timeout=1.0)
         sessions_module._runner_relay_tasks.clear()
         session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal_type", "expected_status", "expect_job"),
+    [
+        ("response.completed", "completed", True),
+        ("response.failed", "cancelled", False),
+    ],
+)
+async def test_relay_settles_capture_only_for_durable_completed_turn(
+    db_uri: str,
+    terminal_type: str,
+    expected_status: str,
+    expect_job: bool,
+) -> None:
+    from omnigent.server.routes import sessions as sessions_module
+
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    capture_store = SqlAlchemyMemoryCaptureStore(db_uri)
+    capture_runtime.configure(conversation_store, capture_store)
+    conversation = conversation_store.create_conversation()
+    [source] = conversation_store.append(
+        conversation.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="turn_input",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "Remember my preference"}],
+                ),
+                created_by="alice",
+            )
+        ],
+    )
+    correlation = await capture_runtime.register_intent(
+        conversation_store,
+        workspace_id=0,
+        source_item_id=source.id,
+        conversation_id=conversation.id,
+        account_subject="alice",
+        targets=(
+            MemoryCaptureTarget(
+                provider="qm-notebook",
+                scope=MemoryScope(0, "personal", "alice"),
+                capture_mode="review",
+                policy_hash="a" * 64,
+            ),
+        ),
+    )
+    assert correlation is not None
+    response_id = f"resp_capture_{terminal_type.rsplit('.', 1)[1]}"
+    terminal: dict[str, Any] = {
+        "type": terminal_type,
+        "response": {"id": response_id, "model": "debby"},
+        "source_item_id": source.id,
+        "memory_capture": correlation,
+    }
+    if terminal_type == "response.failed":
+        terminal["error"] = {"message": "failed"}
+    release = asyncio.Event()
+    release.set()
+    runner = _ScriptedRunnerClient(
+        release,
+        [
+            {
+                "type": "response.in_progress",
+                "response": {"id": response_id, "model": "debby"},
+                "source_item_id": source.id,
+                "memory_capture": correlation,
+            },
+            {"type": "response.output_text.delta", "delta": "Understood."},
+            terminal,
+        ],
+    )
+    try:
+        await sessions_module._relay_runner_stream(
+            conversation.id,
+            runner,  # type: ignore[arg-type]
+            conversation_store,
+        )
+    finally:
+        capture_runtime.configure(conversation_store, None)
+
+    intent_id = correlation["intent_id"]
+    assert isinstance(intent_id, str)
+    intent = capture_store.get_intent(0, intent_id)
+    assert intent is not None
+    assert intent.status == expected_status
+    claimed = capture_store.claim_next(
+        worker_id="worker",
+        now=intent.completed_at or 10**10,
+        lease_seconds=30,
+    )
+    assert (claimed is not None) is expect_job
+    if claimed is not None:
+        assert claimed.source_item_id == source.id
+        assert claimed.response_id == response_id
 
 
 class _TunnelCloseStreamResponse:

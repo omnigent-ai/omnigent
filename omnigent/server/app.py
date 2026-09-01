@@ -33,6 +33,10 @@ from omnigent.harness_plugins import (
     NativeHarnessProvider,
     native_provider_for_key,
 )
+from omnigent.memory import capture_runtime, erasure_runtime
+from omnigent.memory.capture_worker import MemoryCaptureWorker
+from omnigent.memory.erasure_worker import MemoryErasureWorker
+from omnigent.memory.runtime import MemoryRuntime, create_memory_runtime_from_env
 from omnigent.resources import examples as _examples_resources
 from omnigent.runtime import (
     get_terminal_registry,
@@ -53,6 +57,7 @@ from omnigent.server.background_session_titles import (
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.mcp_pool import ServerMcpPool
+from omnigent.server.memory_capture import RunnerMemoryExtractor
 from omnigent.server.performance_metrics import (
     ServerMetricsOtelPublisher,
     ServerPerformanceMetrics,
@@ -68,6 +73,8 @@ from omnigent.server.routes.default_policies import create_default_policies_rout
 from omnigent.server.routes.dictation import create_dictation_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
+from omnigent.server.routes.memory_erasures import create_memory_erasures_router
+from omnigent.server.routes.memory_reviews import create_memory_reviews_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.projects import create_projects_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
@@ -96,6 +103,8 @@ from omnigent.stores import (
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import SessionConnectivity, runner_seen_is_fresh
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.memory_capture_store import SqlAlchemyMemoryCaptureStore
+from omnigent.stores.memory_erasure_store import SqlAlchemyMemoryErasureStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 from omnigent.stores.project_store import ProjectStore
@@ -955,6 +964,9 @@ def create_app(
     public_sharing: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
+    memory_runtime: MemoryRuntime | None = None,
+    memory_capture_store: SqlAlchemyMemoryCaptureStore | None = None,
+    memory_erasure_store: SqlAlchemyMemoryErasureStore | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1080,6 +1092,18 @@ def create_app(
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
+    configured_memory_runtime = memory_runtime or create_memory_runtime_from_env()
+    active_memory_runtime = (
+        configured_memory_runtime
+        if resolved_feature_flags.enabled(Feature.MEMORY_RUNTIME)
+        else None
+    )
+    active_memory_capture_store = memory_capture_store or SqlAlchemyMemoryCaptureStore(
+        conversation_store.storage_location
+    )
+    active_memory_erasure_store = memory_erasure_store or SqlAlchemyMemoryErasureStore(
+        conversation_store.storage_location
+    )
 
     # First-boot admin bootstrap for the accounts auth provider.
     # Runs before any route is mounted so the login page is never
@@ -1139,6 +1163,32 @@ def create_app(
         RunnerBackgroundTitleGenerator(runner_router),
         additional_instructions=title_instructions,
     )
+    memory_capture_worker = (
+        MemoryCaptureWorker(
+            store=active_memory_capture_store,
+            conversation_store=conversation_store,
+            extractor=RunnerMemoryExtractor(runner_router),
+            providers=active_memory_runtime.capture_providers(),
+        )
+        if active_memory_runtime is not None
+        and active_memory_capture_store is not None
+        and active_memory_runtime.capture_providers()
+        else None
+    )
+    capture_runtime.configure(
+        conversation_store,
+        active_memory_capture_store,
+        memory_capture_worker.wake if memory_capture_worker is not None else None,
+    )
+    memory_erasure_worker = (
+        MemoryErasureWorker(
+            store=active_memory_erasure_store,
+            providers=configured_memory_runtime.erase_providers(),
+        )
+        if configured_memory_runtime is not None and configured_memory_runtime.erase_providers()
+        else None
+    )
+    erasure_runtime.configure(conversation_store, active_memory_erasure_store)
     # Shared between the host tunnel (which records ``host.runner_exited``
     # reports from daemons) and the runner status endpoint (which surfaces
     # them to clients waiting for a launched runner to connect).
@@ -1347,6 +1397,10 @@ def create_app(
             # endpoints (see routes/scheduled_tasks.py); there is no startup
             # sweep and no periodic reconcile.
 
+        if memory_capture_worker is not None:
+            memory_capture_worker.start()
+        if memory_erasure_worker is not None:
+            memory_erasure_worker.start()
         try:
             yield
         finally:
@@ -1355,6 +1409,14 @@ def create_app(
             # cancel. Only the per-job scheduler holds timers that need stopping.
             if scheduled_task_scheduler is not None:
                 scheduled_task_scheduler.stop()
+            if memory_capture_worker is not None:
+                await memory_capture_worker.stop()
+            if memory_erasure_worker is not None:
+                await memory_erasure_worker.stop()
+            if configured_memory_runtime is not None:
+                await configured_memory_runtime.aclose()
+            capture_runtime.configure(conversation_store, None)
+            erasure_runtime.configure(conversation_store, None)
             metrics_publish_task.cancel()
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task
@@ -1392,6 +1454,10 @@ def create_app(
     app.state.runner_router = runner_router
     app.state.runner_session_initializer = runner_session_initializer
     app.state.background_title_coordinator = background_title_coordinator
+    app.state.memory_capture_worker = memory_capture_worker
+    app.state.memory_capture_store = active_memory_capture_store
+    app.state.memory_erasure_worker = memory_erasure_worker
+    app.state.memory_erasure_store = active_memory_erasure_store
     app.state.host_registry = host_registry
     app.state.host_store = host_store
     app.state.agent_store = agent_store
@@ -2287,6 +2353,7 @@ def create_app(
             # files a session into a project (owner-private membership).
             project_store=project_store,
             background_title_coordinator=background_title_coordinator,
+            memory_runtime=active_memory_runtime,
         ),
         prefix="/v1",
         tags=["sessions"],
@@ -2397,6 +2464,26 @@ def create_app(
         create_policy_registry_router(auth_provider=auth_provider),
         prefix="/v1",
         tags=["policy_registry"],
+    )
+    app.include_router(
+        create_memory_reviews_router(
+            active_memory_capture_store,
+            auth_provider=auth_provider,
+            worker=memory_capture_worker,
+        ),
+        prefix="/v1",
+        tags=["memory"],
+    )
+    app.include_router(
+        create_memory_erasures_router(
+            active_memory_erasure_store,
+            capture_store=active_memory_capture_store,
+            memory_runtime=configured_memory_runtime,
+            auth_provider=auth_provider,
+            worker=memory_erasure_worker,
+        ),
+        prefix="/v1",
+        tags=["memory"],
     )
     if scheduled_task_store is not None:
         app.include_router(

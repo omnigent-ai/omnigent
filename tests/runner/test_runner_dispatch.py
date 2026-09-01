@@ -1132,6 +1132,105 @@ async def test_runner_cold_cache_appends_message_when_store_lacks_it() -> None:
 
 
 @pytest.mark.asyncio
+async def test_runner_appends_framework_instructions_after_agent_instructions() -> None:
+    from omnigent.runner import app as runner_app
+
+    conv = "conv_framework_instruction_order"
+
+    async def spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="memory-agent",
+            instructions="Follow the agent-authored instruction.",
+            executor=ExecutorSpec(
+                type="omnigent",
+                config={"harness": "runner-test-resolved"},
+            ),
+        )
+
+    captured: dict[str, Any] = {}
+    reached = asyncio.Event()
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _ContentCapturingProcessManager(captured, reached),
+        ),
+        spec_resolver=spec_resolver,
+        server_client=NullServerClient(),
+    )
+    runner_app._session_histories_ref.pop(conv, None)
+    try:
+        async with _runner_test_client(app) as http:
+            response = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "model": "memory-agent",
+                    "agent_id": "agent-memory",
+                    "content": [{"type": "input_text", "text": "Hello"}],
+                    "framework_instructions": "Use this recalled memory as context.",
+                },
+            )
+            assert response.status_code == 202
+            await asyncio.wait_for(reached.wait(), timeout=10.0)
+    finally:
+        runner_app._session_histories_ref.pop(conv, None)
+
+    assert captured["body"]["instructions"] == (
+        "Follow the agent-authored instruction.\n\nUse this recalled memory as context."
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_correlates_terminal_event_to_persisted_user_item() -> None:
+    conv = "conv_capture_correlation"
+
+    async def spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="memory-agent",
+            executor=ExecutorSpec(
+                type="omnigent",
+                config={"harness": _TEST_HARNESS_NAME},
+            ),
+        )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(
+                _FakeHarnessClient([_SSE_RESPONSE_CREATED, _SSE_RESPONSE_COMPLETED])
+            ),
+        ),
+        spec_resolver=spec_resolver,
+        server_client=NullServerClient(),
+    )
+
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "agent-memory",
+                "model": "memory-agent",
+                "persisted_item_id": "msg_source_1",
+                "content": [{"type": "input_text", "text": "Hello"}],
+            },
+        )
+        assert response.status_code == 202
+        await _await_bg_turn_task(conv)
+
+    queue = app.state.session_event_queues[conv]
+    events = [queue.get_nowait() for _ in range(queue.qsize())]
+    completed = next(event for event in events if event.get("type") == "response.completed")
+    assert completed["source_item_id"] == "msg_source_1"
+
+
+@pytest.mark.asyncio
 async def test_runner_cold_cache_keeps_trailing_user_when_no_persisted_id() -> None:
     """A real trailing user message is kept when no ``persisted_item_id`` is sent.
 

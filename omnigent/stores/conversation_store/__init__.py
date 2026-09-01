@@ -595,6 +595,16 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def get_item(self, conversation_id: str, item_id: str) -> ConversationItem | None: ...
+
+    @abstractmethod
+    def list_items_by_response_id(
+        self,
+        conversation_id: str,
+        response_id: str,
+    ) -> list[ConversationItem]: ...
+
+    @abstractmethod
     def list_latest_message_items_for_conversations(
         self,
         conversation_ids: list[str],

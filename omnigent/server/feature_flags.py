@@ -22,6 +22,7 @@ class Feature(StrEnum):
 
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
+    MEMORY_RUNTIME = "memory_runtime"
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,13 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Install and configure missing harnesses from the web UI",
         owner="onboarding",
         review_by_release="0.11.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.MEMORY_RUNTIME,
+        description="Unified memory runtime shadow and read-only rollout",
+        owner="runtime",
+        review_by_release="0.12.0",
+        frontend_visible=False,
     ),
 )
 

@@ -15,6 +15,7 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 
+from omnigent.db.db_models import current_workspace_id
 from omnigent.entities import (
     ErrorData,
     NewConversationItem,
@@ -29,6 +30,8 @@ from omnigent.host.frames import (
 from omnigent.host.frames import (
     WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
+from omnigent.memory import MemoryTurnContext, erasure_runtime
+from omnigent.memory.runtime import MemoryRuntime
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
@@ -49,6 +52,7 @@ from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
     LEVEL_READ,
+    RESERVED_USER_LOCAL,
     AuthProvider,
 )
 from omnigent.server.background_session_titles import (
@@ -131,6 +135,7 @@ from omnigent.server.routes._sessions.helpers import (
     _build_skill_slash_command_policy_body,
     _dispatch_skill_slash_command_to_runner,
     _evaluate_output_policy,
+    _extract_user_text_for_routing,
     _forward_session_change_to_runner,
     _get_runner_client,
     _get_runner_client_for_resource_access,
@@ -367,6 +372,7 @@ def register_events_routes(
     host_registry: HostRegistry | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     runner_tunnel_tokens: frozenset[str] | None = None,
+    memory_runtime: MemoryRuntime | None = None,
 ) -> None:
     """Register the events, stream, and delete routes on router."""
 
@@ -1851,6 +1857,7 @@ def register_events_routes(
         # asyncio.to_thread wrapper covers the rare cold-cache path
         # where the bundle is extracted from disk for the first time.
         _has_mcp_servers = False
+        _loaded_spec = None
         if _agent is not None and agent_cache is not None and _agent.bundle_location:
             try:
                 _loaded_agent = await asyncio.to_thread(
@@ -1858,13 +1865,61 @@ def register_events_routes(
                     _agent.id,
                     _agent.bundle_location,
                 )
+                _loaded_spec = _loaded_agent.spec
                 _has_mcp_servers = bool(_loaded_agent.spec.mcp_servers)
             except Exception:
                 _logger.warning(
-                    "Failed to load agent spec for MCP hint for session=%s",
+                    "Failed to load agent spec for session=%s; "
+                    "MCP discovery and memory recall skipped",
                     session_id,
                     exc_info=True,
                 )
+        memory_instruction: str | None = None
+        memory_capture_targets = ()
+        memory_account_subject: str | None = None
+        if (
+            memory_runtime is not None
+            and _loaded_spec is not None
+            and body.type == "message"
+            and body.data.get("role") == "user"
+        ):
+            query = _extract_user_text_for_routing(body)
+            account_subject = created_by or user_id
+            if account_subject is None and auth_provider is None:
+                account_subject = RESERVED_USER_LOCAL
+            if query and account_subject:
+                if await erasure_runtime.subject_is_disabled(
+                    conversation_store,
+                    workspace_id=current_workspace_id(),
+                    account_subject=account_subject,
+                ):
+                    account_subject = None
+            if query and account_subject:
+                operation_id = f"memory_{secrets.token_hex(16)}"
+                context = MemoryTurnContext(
+                    operation_id=operation_id,
+                    workspace_id=current_workspace_id(),
+                    account_subject=account_subject,
+                    conversation_id=session_id,
+                    query=query,
+                )
+                try:
+                    prepared = await memory_runtime.prepare(
+                        _loaded_spec,
+                        context,
+                        injection_supported=not _is_native_terminal_session(conv),
+                        capture_supported=not _is_native_terminal_session(conv),
+                    )
+                    memory_instruction = prepared.framework_instruction
+                    memory_capture_targets = prepared.capture_targets
+                    memory_account_subject = context.account_subject
+                except Exception:
+                    _logger.warning(
+                        "Memory recall failed open for session=%s operation=%s",
+                        session_id,
+                        operation_id,
+                        exc_info=True,
+                    )
         pending_background_title = prepare_background_session_title(
             coordinator=background_title_coordinator,
             conversation=conv,
@@ -1922,6 +1977,9 @@ def register_events_routes(
             # Read only for the gateway-backing check that decides which router
             # serves this turn; absent, routing keeps its default posture.
             host_store=getattr(request.app.state, "host_store", None),
+            framework_instructions=memory_instruction,
+            memory_capture_targets=memory_capture_targets,
+            memory_account_subject=memory_account_subject,
         )
         if pending_background_title is not None:
             pending_background_title.schedule()

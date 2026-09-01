@@ -92,6 +92,11 @@ from omnigent.runner.background_titles import (
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMPT_CHARS
 from omnigent.runner.codex.goal import CodexGoalRunner
 from omnigent.runner.launch_failure import FailureDiagnosis, classify_terminal_failure
+from omnigent.runner.memory_extraction import (
+    MemoryExtractionContext,
+    MemoryExtractionHarnessError,
+    extract_memory_candidates,
+)
 from omnigent.runner.native import (
     _AUTO_OPENCODE_SERVERS,
     _COST_POPUP_REPOP_TASKS,
@@ -165,6 +170,8 @@ from omnigent.runtime.prompt import (
     raw_author_instructions,
 )
 from omnigent.server.schemas import (
+    BackgroundMemoryExtractionRequest,
+    BackgroundMemoryExtractionResponse,
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
 )
@@ -1140,6 +1147,8 @@ class TurnDispatch:
     agent_version: int | None = None
     spawn_env: dict[str, str] | None = None
     client_side_tool_names: frozenset[str] = frozenset()
+    source_item_id: str | None = None
+    memory_capture: dict[str, object] | None = None
 
 
 @dataclasses.dataclass
@@ -3208,6 +3217,82 @@ def create_runner_app(
         return BackgroundSessionTitleResponse(
             status="generated",
             title=" ".join(title.split()),
+        )
+
+    @app.post(
+        "/v1/sessions/{conversation_id}/background-memory-extraction",
+        response_model=BackgroundMemoryExtractionResponse,
+    )
+    async def generate_background_memory_extraction(
+        conversation_id: str,
+        body: BackgroundMemoryExtractionRequest,
+    ) -> BackgroundMemoryExtractionResponse | JSONResponse:
+        if process_manager is None:
+            return JSONResponse(
+                status_code=501,
+                content={
+                    "error": "not_implemented",
+                    "detail": "Memory extraction requires a HarnessProcessManager.",
+                },
+            )
+        sub_agent_name = body.sub_agent_name or await _recover_sub_agent_name(conversation_id)
+        resolver_agent_id = body.agent_id or _session_agent_ids.get(conversation_id)
+        resolver_cwd = await _session_runtime_cwd(conversation_id)
+        try:
+            harness, spawn_env = await _resolve_harness_config(
+                agent_id=resolver_agent_id,
+                spec_resolver=spec_resolver,
+                session_id=conversation_id,
+                model_override=body.model_override,
+                harness_override=body.harness_override,
+                sub_agent_name=sub_agent_name,
+                cwd=resolver_cwd,
+            )
+        except (httpx.HTTPError, RuntimeError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "spec_resolver_failed",
+                    "detail": _client_safe_error_detail(exc, context="spec resolve"),
+                },
+            )
+        if is_native_harness(harness):
+            return BackgroundMemoryExtractionResponse(status="unsupported")
+        context = MemoryExtractionContext(
+            user_text=body.user_text,
+            assistant_text=body.assistant_text,
+            tool_outcomes=tuple(body.tool_outcomes),
+            harness=harness,
+            spawn_env=dict(spawn_env or {}),
+            process_manager=process_manager,
+            cwd=resolver_cwd,
+        )
+        try:
+            candidates = await extract_memory_candidates(context)
+        except TimeoutError:
+            return JSONResponse(
+                status_code=504,
+                content={
+                    "error": "memory_extraction_timeout",
+                    "detail": "Memory extraction timed out.",
+                },
+            )
+        except MemoryExtractionHarnessError as exc:
+            return JSONResponse(
+                status_code=502,
+                content={"error": "memory_extraction_failed", "detail": str(exc)},
+            )
+        except (ImportError, OSError, RuntimeError) as exc:
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error": "memory_extraction_failed",
+                    "detail": _client_safe_error_detail(exc, context="memory extraction"),
+                },
+            )
+        return BackgroundMemoryExtractionResponse(
+            status="generated",
+            candidates=candidates,
         )
 
     async def _initialize_session(body: _JsonObject) -> JSONResponse:
@@ -6671,15 +6756,26 @@ def create_runner_app(
             )
             # Gated harnesses use nullable to avoid the fallback literal.
             _authored_bg = raw_author_instructions(cached_spec) is not None
+            raw_framework_instructions = msg_body.get("framework_instructions")
+            framework_instructions = (
+                (raw_framework_instructions,)
+                if isinstance(raw_framework_instructions, str)
+                and raw_framework_instructions.strip()
+                else ()
+            )
             if harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES:
                 instructions = build_instructions_nullable(
-                    cached_spec, _raw_per_request_instructions, []
+                    cached_spec,
+                    _raw_per_request_instructions,
+                    [],
+                    framework_instructions=framework_instructions,
                 )
             else:
                 instructions = build_instructions(
                     cached_spec,
                     _raw_per_request_instructions,
                     [],
+                    framework_instructions=framework_instructions,
                 )
             # Warn once per (conversation, harness, delivery) if the agent has
             # authored instructions but the harness can't deliver them.
@@ -6716,6 +6812,14 @@ def create_runner_app(
                 or msg_body.get("has_mcp_servers") is True
             ),
             instructions=instructions,
+            source_item_id=(
+                value
+                if isinstance((value := msg_body.get("persisted_item_id")), str) and value
+                else None
+            ),
+            memory_capture=(
+                value if isinstance((value := msg_body.get("memory_capture")), dict) else None
+            ),
         )
 
         harness_body: _JsonObject = {
@@ -7359,6 +7463,27 @@ def create_runner_app(
 
                             _defer_publish = False
                             if event is not None:
+                                _source_item_id = dispatch.source_item_id if dispatch else None
+                                if (
+                                    isinstance(_source_item_id, str)
+                                    and _source_item_id
+                                    and event.get("type")
+                                    in {
+                                        "response.in_progress",
+                                        "response.completed",
+                                        "response.failed",
+                                        "response.cancelled",
+                                    }
+                                ):
+                                    event["source_item_id"] = _source_item_id
+                                _memory_capture = dispatch.memory_capture if dispatch else None
+                                if isinstance(_memory_capture, dict) and event.get("type") in {
+                                    "response.in_progress",
+                                    "response.completed",
+                                    "response.failed",
+                                    "response.cancelled",
+                                }:
+                                    event["memory_capture"] = _memory_capture
                                 if event.get("type") == "response.created":
                                     resp_obj = event.get("response") or {}
                                     _response_id = resp_obj.get("id")

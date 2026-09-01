@@ -15,20 +15,11 @@ import pytest
 
 from omnigent.tools.base import ToolContext
 from omnigent.tools.builtins import get_builtin_tool
-from omnigent.tools.builtins import hindsight as hindsight_mod
 from omnigent.tools.builtins.hindsight import (
     HindsightRecallTool,
     HindsightReflectTool,
     HindsightRetainTool,
 )
-
-
-@pytest.fixture(autouse=True)
-def _clear_created_banks() -> None:
-    """Reset the process-level bank cache so create_bank assertions isolate."""
-    hindsight_mod._CREATED_BANKS.clear()
-    yield
-    hindsight_mod._CREATED_BANKS.clear()
 
 
 def _mock_client() -> MagicMock:
@@ -97,31 +88,15 @@ def test_schema_shape(cls: type, param: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_retain_stores_and_creates_bank(tool_ctx: ToolContext) -> None:
+def test_retain_is_disabled_before_client_creation(tool_ctx: ToolContext) -> None:
     client = _mock_client()
     tool = HindsightRetainTool(_cfg(bank_id="alice"))
-    with patch("hindsight_client.Hindsight", return_value=client):
+    with patch("hindsight_client.Hindsight", return_value=client) as constructor:
         result = tool.invoke(json.dumps({"content": "I prefer dark mode."}), tool_ctx)
-    assert result == "Stored to long-term memory."
-    client.retain.assert_called_once_with(bank_id="alice", content="I prefer dark mode.")
-    client.create_bank.assert_called_once_with(bank_id="alice", name="alice")
-
-
-def test_retain_bank_defaults_to_agent_id(tool_ctx: ToolContext) -> None:
-    client = _mock_client()
-    tool = HindsightRetainTool(_cfg())  # no bank_id
-    with patch("hindsight_client.Hindsight", return_value=client):
-        tool.invoke(json.dumps({"content": "x"}), tool_ctx)
-    # conftest tool_ctx has agent_id="agent_test"
-    assert client.retain.call_args.kwargs["bank_id"] == "agent_test"
-
-
-def test_retain_with_tags(tool_ctx: ToolContext) -> None:
-    client = _mock_client()
-    tool = HindsightRetainTool(_cfg(bank_id="b", tags="env:prod, team:core"))
-    with patch("hindsight_client.Hindsight", return_value=client):
-        tool.invoke(json.dumps({"content": "x"}), tool_ctx)
-    assert client.retain.call_args.kwargs["tags"] == ["env:prod", "team:core"]
+    assert result.startswith("Hindsight retain disabled:")
+    constructor.assert_not_called()
+    client.create_bank.assert_not_called()
+    client.retain.assert_not_called()
 
 
 def test_retain_missing_content_returns_error(tool_ctx: ToolContext) -> None:

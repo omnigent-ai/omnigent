@@ -40,6 +40,13 @@ from omnigent.spec.types import (
     LLMConfig,
     LocalToolInfo,
     MCPServerConfig,
+    MemoryCaptureMode,
+    MemoryProviderName,
+    MemoryProviderSpec,
+    MemoryRecallMode,
+    MemoryRolloutMode,
+    MemoryScopeKind,
+    MemorySpec,
     ModalityConfig,
     Phase,
     PhaseSelector,
@@ -243,6 +250,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
             retry=llm.retry,
         )
     compaction = _parse_compaction(raw.get("compaction"))
+    memory = _parse_memory(raw.get("memory"))
     guardrails = _parse_guardrails(raw.get("guardrails"), expand_env=expand_env)
     os_env = _parse_os_env(raw.get("os_env"))
     terminals = _parse_terminals(raw.get("terminals"))
@@ -315,6 +323,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         timers=timers,
         spawn=spawn,
         agent_session_sharing=agent_session_sharing,
+        memory=memory,
     )
 
 
@@ -425,6 +434,197 @@ def _parse_interaction(
     return InteractionConfig(
         conversational=bool(conversational),
         modalities=modalities,
+    )
+
+
+def _parse_memory(raw: object) -> MemorySpec | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise OmnigentError(
+            f"memory must be a YAML mapping, got {type(raw).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+    allowed_root = {"mode", "max_context_chars", "providers"}
+    unknown_root = sorted(str(key) for key in raw if key not in allowed_root)
+    if unknown_root:
+        raise OmnigentError(
+            f"memory has unknown fields: {', '.join(unknown_root)}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+    mode_raw = raw.get("mode", "off")
+    modes = {"off", "shadow", "read_only", "explicit_capture", "automatic_capture"}
+    if not isinstance(mode_raw, str) or mode_raw not in modes:
+        raise OmnigentError(
+            f"memory.mode must be one of {sorted(modes)}, got {mode_raw!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    mode = cast(MemoryRolloutMode, mode_raw)
+
+    max_context_chars = _parse_int_field(
+        raw.get("max_context_chars", 6_000), "memory.max_context_chars"
+    )
+    if not 1 <= max_context_chars <= 24_000:
+        raise OmnigentError(
+            "memory.max_context_chars must be between 1 and 24000",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+    providers_raw = raw.get("providers", [])
+    if not isinstance(providers_raw, list):
+        raise OmnigentError(
+            f"memory.providers must be a list, got {type(providers_raw).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+    providers: list[MemoryProviderSpec] = []
+    seen_providers: set[str] = set()
+    provider_names = {"qm-notebook", "hindsight", "company-brain"}
+    scope_kinds = {"personal", "conversation", "org"}
+    recall_modes = {"off", "ambient", "conditional", "explicit"}
+    capture_modes = {"off", "explicit", "review"}
+    allowed_provider = {
+        "provider",
+        "scopes",
+        "recall",
+        "capture",
+        "fail_open",
+        "timeout_ms",
+        "max_results",
+        "max_chars",
+    }
+
+    for index, provider_raw in enumerate(providers_raw):
+        at = f"memory.providers[{index}]"
+        if not isinstance(provider_raw, dict):
+            raise OmnigentError(
+                f"{at} must be a YAML mapping, got {type(provider_raw).__name__}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        unknown = sorted(str(key) for key in provider_raw if key not in allowed_provider)
+        if unknown:
+            raise OmnigentError(
+                f"{at} has unknown fields: {', '.join(unknown)}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
+        provider_value = provider_raw.get("provider")
+        if not isinstance(provider_value, str) or provider_value not in provider_names:
+            raise OmnigentError(
+                f"{at}.provider must be one of {sorted(provider_names)}, got {provider_value!r}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if provider_value in seen_providers:
+            raise OmnigentError(
+                f"memory provider {provider_value!r} may only be configured once",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        seen_providers.add(provider_value)
+
+        scopes_raw = provider_raw.get("scopes")
+        if not isinstance(scopes_raw, list) or not scopes_raw:
+            raise OmnigentError(
+                f"{at}.scopes must be a non-empty list",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if any(not isinstance(scope, str) or scope not in scope_kinds for scope in scopes_raw):
+            raise OmnigentError(
+                f"{at}.scopes entries must be one of {sorted(scope_kinds)}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        scopes = cast(list[MemoryScopeKind], scopes_raw)
+        if len(scopes) != len(set(scopes)):
+            raise OmnigentError(
+                f"{at}.scopes must not contain duplicates",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if provider_value == "qm-notebook" and "conversation" in scopes:
+            raise OmnigentError(
+                f"{at}.scopes must not use conversation scope for qm-notebook",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if provider_value == "company-brain" and scopes != ["org"]:
+            raise OmnigentError(
+                f"{at}.scopes must be exactly ['org'] for company-brain",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
+        recall_raw = provider_raw.get("recall", "off")
+        if not isinstance(recall_raw, str) or recall_raw not in recall_modes:
+            raise OmnigentError(
+                f"{at}.recall must be one of {sorted(recall_modes)}, got {recall_raw!r}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        recall = cast(MemoryRecallMode, recall_raw)
+
+        capture_raw = provider_raw.get("capture", "off")
+        if not isinstance(capture_raw, str) or capture_raw not in capture_modes:
+            raise OmnigentError(
+                f"{at}.capture must be one of {sorted(capture_modes)}, got {capture_raw!r}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        capture = cast(MemoryCaptureMode, capture_raw)
+        if provider_value == "company-brain" and capture != "off":
+            raise OmnigentError(
+                f"{at}.capture must be 'off' for company-brain",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if provider_value == "hindsight" and capture != "off":
+            raise OmnigentError(
+                f"{at}.capture must be 'off'; governed Hindsight writes are not implemented",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if capture != "off" and "org" in scopes:
+            raise OmnigentError(
+                f"{at}.capture must be 'off' for org scope",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
+        fail_open = provider_raw.get("fail_open", True)
+        if not isinstance(fail_open, bool):
+            raise OmnigentError(
+                f"{at}.fail_open must be a boolean",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
+        timeout_ms = _parse_int_field(provider_raw.get("timeout_ms", 1_000), f"{at}.timeout_ms")
+        if not 1 <= timeout_ms <= 30_000:
+            raise OmnigentError(
+                f"{at}.timeout_ms must be between 1 and 30000",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        max_results = _parse_int_field(provider_raw.get("max_results", 8), f"{at}.max_results")
+        if not 1 <= max_results <= 50:
+            raise OmnigentError(
+                f"{at}.max_results must be between 1 and 50",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        max_chars = _parse_int_field(provider_raw.get("max_chars", 4_000), f"{at}.max_chars")
+        if not 1 <= max_chars <= 12_000:
+            raise OmnigentError(
+                f"{at}.max_chars must be between 1 and 12000",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
+        providers.append(
+            MemoryProviderSpec(
+                provider=cast(MemoryProviderName, provider_value),
+                scopes=scopes,
+                recall=recall,
+                capture=capture,
+                fail_open=fail_open,
+                timeout_ms=timeout_ms,
+                max_results=max_results,
+                max_chars=max_chars,
+            )
+        )
+
+    return MemorySpec(
+        mode=mode,
+        max_context_chars=max_context_chars,
+        providers=providers,
     )
 
 

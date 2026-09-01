@@ -47,11 +47,10 @@ def test_hindsight_tools_relayed_to_native_harnesses(name: str) -> None:
     assert name in _NATIVE_RELAY_BUILTIN_TOOLS
 
 
-def test_retain_dispatch_uses_agent_id_as_bank() -> None:
-    """With no config bank_id, the bank defaults to the threaded agent_id."""
+def test_retain_dispatch_is_disabled_before_client_write() -> None:
     client = MagicMock()
     spec = _spec({"api_key": "hsk_test"})
-    with patch("hindsight_client.Hindsight", return_value=client):
+    with patch("hindsight_client.Hindsight", return_value=client) as constructor:
         result = asyncio.run(
             _execute_hindsight_tool(
                 {"content": "DuckDB is my favorite db"},
@@ -61,9 +60,9 @@ def test_retain_dispatch_uses_agent_id_as_bank() -> None:
                 agent_id="ag_remy",
             )
         )
-    assert result == "Stored to long-term memory."
-    assert client.retain.call_args.kwargs["bank_id"] == "ag_remy"
-    assert client.retain.call_args.kwargs["content"] == "DuckDB is my favorite db"
+    assert result.startswith("Hindsight retain disabled:")
+    constructor.assert_not_called()
+    client.retain.assert_not_called()
 
 
 def test_recall_dispatch_honors_config_bank_id() -> None:
@@ -87,7 +86,7 @@ def test_recall_dispatch_honors_config_bank_id() -> None:
     assert client.recall.call_args.kwargs["bank_id"] == "remy-ui-test"
 
 
-def test_dispatch_missing_api_key_returns_error() -> None:
+def test_dispatch_retain_is_disabled_even_without_api_key() -> None:
     spec = _spec({})  # no api_key
     result = asyncio.run(
         _execute_hindsight_tool(
@@ -97,7 +96,6 @@ def test_dispatch_missing_api_key_returns_error() -> None:
             agent_id="ag_remy",
         )
     )
-    assert "api_key" in result.lower()
-    # never echoes the success string when it couldn't store
+    assert result.startswith("Hindsight retain disabled:")
     assert result != "Stored to long-term memory."
     json.dumps(result)  # result is a plain string

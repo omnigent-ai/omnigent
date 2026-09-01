@@ -46,11 +46,6 @@ _logger = logging.getLogger(__name__)
 
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 
-# Banks already ensured-to-exist this process, so ``retain`` doesn't issue a
-# redundant create_bank on every call. Module-level (not per-instance) because
-# ToolManager builds a fresh tool instance per agent load.
-_CREATED_BANKS: set[str] = set()
-
 
 def _csv(value: str | None) -> list[str] | None:
     """Parse a comma-separated config string into a tag list, or None."""
@@ -115,22 +110,9 @@ class _HindsightToolBase(Tool):
     def _max_tokens(self) -> int:
         return int(self._config.get("max_tokens", "4096"))
 
-    def _ensure_bank(self, client: Hindsight, bank: str) -> None:
-        """Create the bank once per process; tolerate it already existing."""
-        if bank in _CREATED_BANKS:
-            return
-        try:
-            client.create_bank(bank_id=bank, name=bank)
-        except Exception as e:
-            # Bank likely already exists; treat as created either way. Logged at
-            # debug so a real auth/network failure is visible here rather than
-            # only surfacing later on the retain call.
-            _logger.debug("create_bank(%r) failed (assuming it exists): %s", bank, e)
-        _CREATED_BANKS.add(bank)
-
 
 class HindsightRetainTool(_HindsightToolBase):
-    """Store information in Hindsight long-term memory."""
+    """Deprecated write surface; removal planned for 0.70."""
 
     @classmethod
     def name(cls) -> str:
@@ -139,11 +121,8 @@ class HindsightRetainTool(_HindsightToolBase):
     @classmethod
     def description(cls) -> str:
         return (
-            "Persist information to long-term memory (Hindsight) so it survives "
-            "across conversations and sessions. Call this whenever the user "
-            "shares a durable fact, preference, or decision, or asks you to "
-            "remember something — conversation context alone is lost between "
-            "sessions, so acknowledging a fact in chat does NOT save it."
+            "Hindsight retention is disabled. Durable memory writes must use "
+            "the authenticated, review-gated framework memory workflow."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -170,15 +149,10 @@ class HindsightRetainTool(_HindsightToolBase):
             content = json.loads(arguments).get("content") if arguments else None
             if not content:
                 return "Error: 'content' parameter is required."
-            client = self._client()
-            bank = self._bank(ctx)
-            self._ensure_bank(client, bank)
-            kwargs: dict[str, Any] = {"bank_id": bank, "content": content}
-            tags = _csv(self._config.get("tags"))
-            if tags:
-                kwargs["tags"] = tags
-            client.retain(**kwargs)
-            return "Stored to long-term memory."
+            return (
+                "Hindsight retain disabled: the legacy tool lacks authenticated "
+                "tenant identity and retry-safe capture semantics."
+            )
         except Exception as e:
             _logger.error("Hindsight retain failed: %s", e)
             return f"Hindsight retain failed: {e}"

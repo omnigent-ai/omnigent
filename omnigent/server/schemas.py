@@ -2304,6 +2304,32 @@ class BackgroundSessionTitleResponse(BaseModel):
     title: str | None = None
 
 
+class BackgroundMemoryExtractionRequest(BaseModel):
+    user_text: str = Field(min_length=1, max_length=8_000)
+    assistant_text: str = Field(min_length=1, max_length=16_000)
+    tool_outcomes: list[str] = Field(default_factory=list, max_length=100)
+    agent_id: str | None = None
+    model_override: str | None = None
+    harness_override: str | None = None
+    sub_agent_name: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class BackgroundMemoryCandidate(BaseModel):
+    kind: Literal["fact", "preference", "decision", "entity", "relationship", "procedure"]
+    text: str = Field(min_length=1, max_length=1_000)
+    confidence: float = Field(ge=0, le=1)
+    sensitivity: Literal["public", "internal", "personal", "sensitive"]
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class BackgroundMemoryExtractionResponse(BaseModel):
+    status: Literal["generated", "unsupported"]
+    candidates: list[BackgroundMemoryCandidate] = Field(default_factory=list, max_length=20)
+
+
 class CodexGoalObject(BaseModel):
     """
     Current Codex goal state for a Codex-native session.

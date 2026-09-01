@@ -487,6 +487,50 @@ def test_append_and_list_items(conversation_store: SqlAlchemyConversationStore) 
     assert page.data[1].data.role == "assistant"
 
 
+def test_get_item_and_list_items_by_response_id(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+    items = conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="turn_user",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "I prefer brief answers"}],
+                ),
+                created_by="alice",
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_capture",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "Understood"}],
+                    agent="test-agent",
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_other",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "Other turn"}],
+                    agent="test-agent",
+                ),
+            ),
+        ],
+    )
+
+    source = conversation_store.get_item(conv.id, items[0].id)
+    assert source == items[0]
+    assert conversation_store.get_item(conv.id, "f" * 32) is None
+    episode = conversation_store.list_items_by_response_id(conv.id, "resp_capture")
+    assert episode == [items[1]]
+
+
 def test_append_records_human_author_attribution(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
