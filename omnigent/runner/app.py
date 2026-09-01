@@ -15,6 +15,7 @@ import functools
 import itertools
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -136,7 +137,7 @@ from omnigent.runner.native import (
     _unwrap_resolved_spec,
 )
 from omnigent.runner.native import orchestration as _native_runtime
-from omnigent.runner.native.interrupt import NativeInterruptRunner
+from omnigent.runner.native.interrupt import MarkSubagentTerminalAndWake, NativeInterruptRunner
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -414,8 +415,12 @@ def resolve_subagent_launch_timeout_s() -> float:
     if not raw:
         return _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
+        value = None
+    # Non-finite values (nan/inf) would silently disable reaping without the
+    # explicit ``<= 0`` "disabled" intent — reject them like non-numeric input.
+    if value is None or not math.isfinite(value):
         _logger.warning(
             "Invalid %s=%r; using default %ss",
             _SUBAGENT_LAUNCH_TIMEOUT_S_ENV,
@@ -423,6 +428,7 @@ def resolve_subagent_launch_timeout_s() -> float:
             _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S,
         )
         return _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S
+    return value
 
 
 _SUBAGENT_DELIVERY_DELIVERED = "delivered"
@@ -1754,7 +1760,9 @@ def mark_subagent_work_terminal(
         # (the watcher's ``idle`` edge) can be recorded — and delivered — before
         # the turn's real ``failed`` edge lands. The failure must replace it and
         # be re-delivered, or the parent is left believing the turn succeeded
-        # and the error text is silently dropped.
+        # and the error text is silently dropped. A parent may act on the false
+        # success before the re-delivery arrives — that window is inherent to
+        # the edge race; re-delivery is the mitigation, not a prevention.
         if status == "failed" and entry.status == "completed":
             entry.status = status
             entry.output = output
@@ -1843,6 +1851,7 @@ def reap_stalled_subagent_launches(
     *,
     now: float | None = None,
     timeout_s: float | None = None,
+    mark_terminal: MarkSubagentTerminalAndWake | None = None,
 ) -> list[_SubagentWorkEntry]:
     """
     Fail sub-agent dispatches stuck in ``launching`` beyond the liveness budget.
@@ -1851,16 +1860,22 @@ def reap_stalled_subagent_launches(
     status) within the budget never started; without this sweep the dispatched
     work wedges forever and the parent is never told. Each reaped entry is
     marked ``failed`` and its failure is delivered to the parent inbox through
-    the normal terminal-delivery path.
+    ``mark_terminal``.
 
     :param now: Clock override for tests, e.g. ``time.time()``.
     :param timeout_s: Budget override for tests; defaults to
         :func:`resolve_subagent_launch_timeout_s`.
+    :param mark_terminal: Terminal-delivery callback. Production passes the
+        app's ``mark_subagent_terminal_and_wake`` seam so the reaped failure
+        also schedules the parent wake POST — the sole signal that rouses an
+        idle parent to drain its inbox. Defaults to the inbox-only
+        :func:`mark_subagent_work_terminal`.
     :returns: The entries that were failed by this sweep.
     """
     budget = resolve_subagent_launch_timeout_s() if timeout_s is None else timeout_s
     if budget <= 0:
         return []
+    deliver = mark_subagent_work_terminal if mark_terminal is None else mark_terminal
     current = time.time() if now is None else now
     reaped: list[_SubagentWorkEntry] = []
     for entry in list(_subagent_work_by_child.values()):
@@ -1874,7 +1889,7 @@ def reap_stalled_subagent_launches(
             entry.parent_session_id,
             entry.child_session_id,
         )
-        mark_subagent_work_terminal(
+        deliver(
             entry.child_session_id,
             status="failed",
             output=(
@@ -1890,6 +1905,7 @@ def reap_stalled_subagent_launches(
 async def run_subagent_launch_reaper(
     *,
     interval_s: float = SUBAGENT_LAUNCH_REAP_INTERVAL_S,
+    mark_terminal: MarkSubagentTerminalAndWake | None = None,
 ) -> None:
     """
     Periodically sweep for sub-agent dispatches wedged in ``launching``.
@@ -1898,12 +1914,15 @@ async def run_subagent_launch_reaper(
     process manager. Sweep errors are logged and never end the loop.
 
     :param interval_s: Seconds between sweeps, e.g. ``30.0``.
+    :param mark_terminal: Terminal-delivery callback forwarded to each sweep;
+        the entrypoint passes the app's wake-scheduling seam so a reaped
+        failure wakes the parent, not just its inbox.
     :returns: None.
     """
     while True:
         await asyncio.sleep(interval_s)
         try:
-            reap_stalled_subagent_launches()
+            reap_stalled_subagent_launches(mark_terminal=mark_terminal)
         except Exception:  # noqa: BLE001 — the sweep is a backstop; never die.
             _logger.warning("sub-agent launch reaper sweep failed", exc_info=True)
 
@@ -3884,7 +3903,6 @@ def create_runner_app(
 
     @app.get("/v1/sessions/{session_id}/stream")
     async def stream_session(session_id: str) -> StreamingResponse:
-
         async def _event_generator() -> AsyncIterator[bytes]:
             queue = _session_event_queues.get(session_id)
             if queue is None:
@@ -6223,7 +6241,6 @@ def create_runner_app(
     async def _check_and_start_next_turn(
         session_id: str,
     ) -> None:
-
         _seq = _ingest_next_seq.get(session_id, 0)
         _ingest_next_seq[session_id] = _seq + 1
         _cond = _ingest_cond.get(session_id)
@@ -6371,6 +6388,10 @@ def create_runner_app(
         if ack.entry is not None and ack.delivered_now:
             _schedule_subagent_wake(ack.entry)
         return ack
+
+    # Seam for the entrypoint's launch reaper (and tests): terminal delivery
+    # that also schedules the parent wake POST, not just the inbox insert.
+    app.state.mark_subagent_terminal_and_wake = _mark_subagent_terminal_and_wake
 
     _native_interrupt_runner = NativeInterruptRunner(
         server_client=server_client,

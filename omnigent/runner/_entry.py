@@ -1393,11 +1393,15 @@ def create_app(
             await asyncio.to_thread(reconcile_codex_native_process_registry)
         # Liveness backstop for sub-agent dispatches wedged in ``launching``:
         # a child that never emits any edge would otherwise hold the parent's
-        # work handle open forever with no error surfaced.
+        # work handle open forever with no error surfaced. The app's
+        # wake-scheduling seam is passed so a reaped failure also wakes the
+        # idle parent — the inbox insert alone would never be read.
         from omnigent.runner.app import run_subagent_launch_reaper
 
         app.state.subagent_launch_reaper = asyncio.create_task(
-            run_subagent_launch_reaper(),
+            run_subagent_launch_reaper(
+                mark_terminal=app.state.mark_subagent_terminal_and_wake,
+            ),
             name="runner-subagent-launch-reaper",
         )
 

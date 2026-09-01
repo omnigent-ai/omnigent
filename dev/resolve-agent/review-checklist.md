@@ -35,6 +35,16 @@ what to look for, and why it's wrong.
   `subprocess.*` that drops the inherited environment strips `PATH`, auth, and
   proxy vars — extend `os.environ.copy()` instead of replacing it.
 
+## Delivery / signaling
+
+- **A backstop that records a failure must also fire the wake/notify signal the
+  normal path fires.** A reaper/sweeper that marks work failed by calling only
+  the record-keeping function (inbox insert, status write) while skipping the
+  wake/notification the regular terminal path schedules leaves the consumer
+  hanging exactly as before — a failure recorded where nobody reads it is still
+  a silent loss. Route backstops through the same delivery seam, and test that
+  the wake fires, not just that the record exists.
+
 ## Config / data safety
 
 - **A "clear/reset" must not clobber unrelated config.** An edit that rewrites a

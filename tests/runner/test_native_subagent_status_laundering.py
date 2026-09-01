@@ -280,3 +280,92 @@ async def test_started_dispatch_is_not_reaped_by_launch_liveness() -> None:
     finally:
         runner_app.unregister_subagent_work(child_id)
         runner_app._session_inboxes_ref.pop(parent_id, None)
+
+
+@pytest.mark.asyncio
+async def test_reaped_dispatch_wakes_parent_not_just_inbox() -> None:
+    """
+    A launch-reaped failure must schedule the parent wake POST.
+
+    The wake POST is the sole delivery signal for an idle parent: it only
+    drains its inbox when a turn is triggered, and nothing else will rouse a
+    parent whose child wedged in ``launching``. A reap that inserts the
+    failure into the inbox without the wake leaves the parent hanging exactly
+    as before — the failure is recorded where nobody will ever read it.
+    """
+    from omnigent.runner import app as runner_app
+
+    parent_id = uuid.uuid4().hex
+    child_id = uuid.uuid4().hex
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    wake_bodies: list[dict[str, Any]] = []
+    wake_seen = asyncio.Event()
+
+    class _WakeRecordingServerClient(NullServerClient):
+        """Records wake POSTs aimed at the parent session's events route."""
+
+        async def post(self, url: str, **kwargs: Any) -> Any:
+            if url.rstrip("/").endswith(f"/v1/sessions/{parent_id}/events"):
+                wake_bodies.append(kwargs.get("json") or {})
+                wake_seen.set()
+            return self._Response()
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=_WakeRecordingServerClient(),  # type: ignore[arg-type]
+    )
+
+    runner_app._session_inboxes_ref[parent_id] = inbox
+    entry = runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="claude-native",
+        title="impl",
+    )
+
+    try:
+        reaped = runner_app.reap_stalled_subagent_launches(
+            now=entry.created_at + 200.0,
+            timeout_s=180.0,
+            mark_terminal=app.state.mark_subagent_terminal_and_wake,
+        )
+        assert reaped == [entry]
+        assert entry.status == "failed"
+        payload = inbox.get_nowait()
+        assert payload["status"] == "failed"
+
+        await asyncio.wait_for(wake_seen.wait(), timeout=5.0)
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    notice = wake_bodies[0]["data"]["content"][0]["text"]
+    assert "finished (failed)" in notice, (
+        f"the reap's wake notice must tell the parent the dispatch failed, got {notice!r}"
+    )
+
+
+def test_launch_timeout_resolver_rejects_non_finite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``nan``/``inf`` overrides must not silently disable the launch reaper.
+
+    ``float("nan")`` makes every ``elapsed < budget`` comparison false and
+    ``inf`` makes it always true-to-skip — either silently disables reaping
+    without the explicit ``<= 0`` "disabled" intent. Non-finite values are
+    rejected like non-numeric ones, falling back to the default.
+    """
+    from omnigent.runner import app as runner_app
+
+    default = runner_app._DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S
+    for bad in ("nan", "inf", "-inf", "+inf", "bogus"):
+        monkeypatch.setenv("OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S", bad)
+        assert runner_app.resolve_subagent_launch_timeout_s() == default, bad
+    # Explicit disable and a valid override still work.
+    monkeypatch.setenv("OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S", "0")
+    assert runner_app.resolve_subagent_launch_timeout_s() == 0.0
+    monkeypatch.setenv("OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S", "45.5")
+    assert runner_app.resolve_subagent_launch_timeout_s() == 45.5
+    monkeypatch.delenv("OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S")
+    assert runner_app.resolve_subagent_launch_timeout_s() == default
