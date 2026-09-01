@@ -1343,6 +1343,9 @@ async def test_capability_probe_failure_does_not_block_registration(
 async def test_dedicated_host_probes_only_its_prevalidated_harness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from omnigent.host import connect as connect_mod
+
+    connect_mod._invalidate_quick_probe_cache()
     checked: list[str] = []
 
     def _configured(harness: str) -> bool:
@@ -1359,8 +1362,18 @@ async def test_dedicated_host_probes_only_its_prevalidated_harness(
     host = _make_host_process()
 
     await host._initialize_capabilities()
+    result = await host._handle_launch(
+        HostLaunchRunnerFrame(
+            request_id="req_cached_readiness",
+            binding_token="test_token_abc",
+            workspace="/not-reached",
+            harness="codex",
+        )
+    )
 
     assert checked == ["codex"]
+    assert result.status == "failed"
+    assert result.error_code == "workspace_missing"
     assert host._configured_harnesses == {"codex": True}
     assert host._gateway_inference == {"codex": False}
     _cleanup_host(host)

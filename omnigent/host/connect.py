@@ -1557,7 +1557,7 @@ class HostProcess:
         # Off the loop: the check runs ``<cli> --version``, up to 10s on a hung
         # CLI, which inline would stall the keepalive pong and every other frame.
         if frame.harness is not None and not await asyncio.to_thread(
-            harness_is_configured, frame.harness
+            _harness_now_configured, frame.harness
         ):
             return HostLaunchRunnerResultFrame(
                 request_id=frame.request_id,
@@ -2995,7 +2995,9 @@ class HostProcess:
         """Collect harness readiness without letting a probe break the channel."""
         try:
             if self._dedicated_harness is not None:
-                available = await asyncio.to_thread(harness_is_configured, self._dedicated_harness)
+                available = await asyncio.to_thread(
+                    _harness_now_configured, self._dedicated_harness
+                )
                 return {self._dedicated_harness: available}
             return await asyncio.to_thread(configured_harness_map)
         except Exception as exc:
