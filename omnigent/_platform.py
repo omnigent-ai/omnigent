@@ -56,6 +56,52 @@ def _cli_fallback_dirs() -> tuple[Path, ...]:
     return tuple(dirs)
 
 
+# Executable-container magics that identify a binary built for a *different*
+# kernel. A file wearing one of these on the wrong OS is guaranteed ENOEXEC,
+# so the resolver can skip it and keep walking its fallback ladder.
+_ELF_MAGIC = b"\x7fELF"
+_PE_MAGIC = b"MZ"
+_MACHO_MAGICS = (
+    b"\xfe\xed\xfa\xce",  # 32-bit big-endian
+    b"\xce\xfa\xed\xfe",  # 32-bit little-endian
+    b"\xfe\xed\xfa\xcf",  # 64-bit big-endian
+    b"\xcf\xfa\xed\xfe",  # 64-bit little-endian
+    b"\xca\xfe\xba\xbe",  # fat/universal
+    b"\xbe\xba\xfe\xca",  # fat/universal, swapped
+)
+
+
+def _confidently_unrunnable(path: str | Path) -> bool:
+    """Return ``True`` only when this kernel is certain to refuse exec'ing *path*.
+
+    A stale or wrong-platform CLI install (e.g. a Mach-O ``claude`` on Linux,
+    or an ELF one on macOS) passes the resolver's existence + ``X_OK`` probes
+    but dies at ``execve`` with ``ENOEXEC`` (``[Errno 8] Exec format error``).
+    Detect just that *definitive* mismatch from the file's magic bytes so the
+    resolver can fall through to a later runnable candidate.
+
+    Deliberately conservative: shebang scripts always pass, unknown formats
+    pass (the kernel gets the final say), same-OS binaries of another CPU
+    arch pass (Rosetta/binfmt emulation may run them), and any read error
+    passes. Only a wrong-OS executable container is rejected.
+    """
+    if IS_WINDOWS:
+        # Windows resolves interpreters via PATHEXT associations, not magic.
+        return False
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4)
+    except OSError:
+        return False
+    if head.startswith(b"#!"):
+        return False
+    if IS_LINUX:
+        return head in _MACHO_MAGICS or head.startswith(_PE_MAGIC)
+    if IS_DARWIN:
+        return head.startswith((_ELF_MAGIC, _PE_MAGIC))
+    return False
+
+
 def _parse_node_version(name: str) -> tuple[int, ...]:
     """Parse an nvm version dir name (e.g. ``"v20.5.0"``) into a sortable tuple.
 
@@ -97,26 +143,52 @@ def resolve_cli_binary(
         override = os.environ.get(env_var, "").strip()
         if override:
             resolved = which(override)
-            if resolved:
-                return resolved
-            if os.access(override, os.X_OK) and os.path.isfile(override):
-                return override
-            # A set-but-unresolvable override (typo, moved/non-executable
-            # binary) silently falling through to PATH would launch a
-            # *different* binary than intended — warn so the misconfig surfaces.
-            _logger.warning(
-                "%s=%r does not resolve to an executable file; falling back to PATH for %r.",
-                env_var,
-                override,
-                name,
-            )
+            if resolved is None and os.access(override, os.X_OK) and os.path.isfile(override):
+                resolved = override
+            if resolved is not None:
+                if not _confidently_unrunnable(resolved):
+                    return resolved
+                _logger.warning(
+                    "%s=%r resolves to %r, which is not runnable on this platform "
+                    "(wrong executable format); falling back to PATH for %r.",
+                    env_var,
+                    override,
+                    resolved,
+                    name,
+                )
+            else:
+                # A set-but-unresolvable override (typo, moved/non-executable
+                # binary) silently falling through to PATH would launch a
+                # *different* binary than intended — warn so the misconfig
+                # surfaces.
+                _logger.warning(
+                    "%s=%r does not resolve to an executable file; falling back to PATH for %r.",
+                    env_var,
+                    override,
+                    name,
+                )
+    candidates: list[str] = []
     on_path = which(name)
     if on_path is not None:
-        return on_path
+        candidates.append(on_path)
     for directory in _cli_fallback_dirs():
         candidate = directory / name
         if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
+            candidates.append(str(candidate))
+    for candidate_path in candidates:
+        if _confidently_unrunnable(candidate_path):
+            # A stale wrong-platform install (the ENOEXEC / "[Errno 8] Exec
+            # format error" driver) must not shadow a runnable one further
+            # down the ladder.
+            _logger.warning(
+                "Skipping %r: the file exists but is not runnable on this "
+                "platform (wrong executable format); trying the next %r "
+                "install location.",
+                candidate_path,
+                name,
+            )
+            continue
+        return candidate_path
     return None
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -453,6 +454,131 @@ def test_cli_fallback_dirs_no_nvm_dir_is_safe(monkeypatch, tmp_path):
     monkeypatch.setattr(_platform.Path, "home", staticmethod(lambda: tmp_path))
     dirs = _platform._cli_fallback_dirs()
     assert tmp_path / ".local" / "bin" in dirs
+
+
+# A wrong-OS executable container for whichever POSIX kernel runs the tests:
+# Mach-O arm64 magic on Linux, ELF magic on macOS. Either one is a file the
+# kernel is guaranteed to refuse with ENOEXEC ([Errno 8] Exec format error).
+_WRONG_OS_BINARY = (
+    b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 64
+    if _platform.IS_DARWIN
+    else b"\xcf\xfa\xed\xfe\x0c\x00\x00\x01" + b"\x00" * 64
+)
+
+
+def _write_executable(path, payload: bytes | str) -> None:
+    if isinstance(payload, str):
+        path.write_text(payload)
+    else:
+        path.write_bytes(payload)
+    path.chmod(0o755)
+
+
+@pytest.mark.skipif(_platform.IS_WINDOWS, reason="POSIX exec-format probing")
+def test_resolve_cli_binary_skips_unrunnable_ladder_rung(monkeypatch, tmp_path):
+    """A wrong-format install on an early rung must not shadow a runnable one.
+
+    The reported startup death: a stale wrong-architecture ``claude`` in
+    ``~/.local/bin`` resolves first, then dies at ``execve`` with
+    ``[Errno 8] Exec format error`` while the working install further down
+    the ladder is never tried. The resolver must fall through to it.
+    """
+    broken_dir = tmp_path / "broken-bin"
+    good_dir = tmp_path / "good-bin"
+    for d in (broken_dir, good_dir):
+        d.mkdir()
+    _write_executable(broken_dir / "tool", _WRONG_OS_BINARY)
+    good = good_dir / "tool"
+    _write_executable(good, "#!/bin/sh\nexit 0\n")
+    monkeypatch.delenv("OMNIGENT_TESTCLI_PATH", raising=False)
+    monkeypatch.setattr(_platform.shutil, "which", lambda name: None)
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (broken_dir, good_dir))
+    assert _platform.resolve_cli_binary("tool", env_var="OMNIGENT_TESTCLI_PATH") == str(good)
+
+
+@pytest.mark.skipif(_platform.IS_WINDOWS, reason="POSIX exec-format probing")
+def test_resolve_cli_binary_skips_unrunnable_path_hit(monkeypatch, tmp_path):
+    """Even a PATH hit is skipped when its executable format cannot run here."""
+    broken = tmp_path / "tool"
+    _write_executable(broken, _WRONG_OS_BINARY)
+    good_dir = tmp_path / "bin"
+    good_dir.mkdir()
+    good = good_dir / "tool"
+    _write_executable(good, "#!/bin/sh\nexit 0\n")
+    monkeypatch.delenv("OMNIGENT_TESTCLI_PATH", raising=False)
+    monkeypatch.setattr(
+        _platform.shutil, "which", lambda name: str(broken) if name == "tool" else None
+    )
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (good_dir,))
+    assert _platform.resolve_cli_binary("tool", env_var="OMNIGENT_TESTCLI_PATH") == str(good)
+
+
+@pytest.mark.skipif(_platform.IS_WINDOWS, reason="POSIX exec-format probing")
+def test_resolve_cli_binary_returns_none_when_only_unrunnable(monkeypatch, tmp_path, caplog):
+    """All-broken candidates resolve to None, with a warning naming the skip."""
+    broken_dir = tmp_path / "bin"
+    broken_dir.mkdir()
+    _write_executable(broken_dir / "tool", _WRONG_OS_BINARY)
+    monkeypatch.delenv("OMNIGENT_TESTCLI_PATH", raising=False)
+    monkeypatch.setattr(_platform.shutil, "which", lambda name: None)
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (broken_dir,))
+    with caplog.at_level("WARNING"):
+        resolved = _platform.resolve_cli_binary("tool", env_var="OMNIGENT_TESTCLI_PATH")
+    assert resolved is None
+    assert "not runnable" in caplog.text
+
+
+@pytest.mark.skipif(_platform.IS_WINDOWS, reason="POSIX exec-format probing")
+def test_resolve_cli_binary_unrunnable_env_override_falls_back(monkeypatch, tmp_path, caplog):
+    """An explicit override pointing at a wrong-format file warns and falls back."""
+    broken = tmp_path / "tool"
+    _write_executable(broken, _WRONG_OS_BINARY)
+    monkeypatch.setenv("OMNIGENT_TESTCLI_PATH", str(broken))
+    monkeypatch.setattr(
+        _platform.shutil,
+        "which",
+        lambda name: "/usr/bin/tool" if name == "tool" else None,
+    )
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
+    with caplog.at_level("WARNING"):
+        resolved = _platform.resolve_cli_binary("tool", env_var="OMNIGENT_TESTCLI_PATH")
+    assert resolved == "/usr/bin/tool"
+    assert "not runnable" in caplog.text
+
+
+@pytest.mark.skipif(_platform.IS_WINDOWS, reason="POSIX exec-format probing")
+def test_confidently_unrunnable_is_conservative(tmp_path):
+    """Only a definitive wrong-OS container is rejected — everything else runs.
+
+    Shebang scripts, unknown formats, same-OS binaries (which may run under
+    Rosetta/binfmt emulation), unreadable files, and short files must all
+    pass; the kernel keeps the final say on those.
+    """
+    script = tmp_path / "script"
+    _write_executable(script, "#!/bin/sh\nexit 0\n")
+    assert not _platform._confidently_unrunnable(script)
+
+    unknown = tmp_path / "unknown"
+    _write_executable(unknown, b"\x00\x01\x02\x03garbage")
+    assert not _platform._confidently_unrunnable(unknown)
+
+    short = tmp_path / "short"
+    _write_executable(short, b"\x7f")
+    assert not _platform._confidently_unrunnable(short)
+
+    missing = tmp_path / "missing"
+    assert not _platform._confidently_unrunnable(missing)
+
+    # The running interpreter is a same-OS native binary: must pass.
+    assert not _platform._confidently_unrunnable(sys.executable)
+
+    wrong_os = tmp_path / "wrong-os"
+    _write_executable(wrong_os, _WRONG_OS_BINARY)
+    assert _platform._confidently_unrunnable(wrong_os)
+
+    pe = tmp_path / "windows.exe"
+    _write_executable(pe, b"MZ" + b"\x00" * 64)
+    assert _platform._confidently_unrunnable(pe)
 
 
 def test_malloc_tuning_env_empty_off_linux(monkeypatch: pytest.MonkeyPatch) -> None:
