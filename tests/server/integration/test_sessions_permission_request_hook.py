@@ -343,6 +343,72 @@ async def test_qwen_permission_request_hook_allow_round_trip(
     assert resp.json() == {"action": "accept"}
 
 
+async def test_native_permission_hook_decline_can_skip_the_interrupt(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``interrupt_on_decline: False`` returns the decline without interrupting.
+
+    A mirror that answers the vendor's own on-screen prompt (the claude-native
+    pane mirror sends its "No" digit) leaves the harness to continue from that
+    denial — so the route must not also interrupt the turn, which would abort
+    work the person only meant to redirect. Mirrors that have no such lever
+    (hermes/goose/qwen) omit the flag and keep the interrupt.
+
+    Catches: the flag being ignored (a redirected turn dies), and the default
+    silently flipping for the mirrors that rely on the interrupt.
+    """
+    from omnigent.server.routes.sessions import routes_hooks
+
+    interrupts: list[tuple[str, dict[str, Any]]] = []
+
+    async def _record_interrupt(session_id: str, _router: Any, change: dict[str, Any]) -> None:
+        interrupts.append((session_id, change))
+
+    monkeypatch.setattr(routes_hooks, "_forward_session_change_to_runner", _record_interrupt)
+
+    agent = await create_test_agent(client, "test-native-decline-no-interrupt")
+    session_id = await _create_session(client, agent["id"])
+
+    async def _decline(elicitation_id: str, payload: dict[str, Any]) -> httpx.Response:
+        drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+        await asyncio.sleep(0.05)
+        hook_task = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{session_id}/hooks/native-permission-request",
+                json=payload,
+            )
+        )
+        await drain_task
+        verdict = await _post_approval(client, session_id, elicitation_id, "decline")
+        assert verdict.status_code == 202, verdict.text
+        return await hook_task
+
+    base = {
+        "agent": "Claude Code",
+        "policy_name": "claude_native_permission",
+        "operation_type": "Bash command",
+        "message": "Claude is waiting in the terminal: Do you want to proceed?",
+        "content_preview": "for d in a b; do echo $d; done",
+    }
+
+    quiet_id = f"elicit_claude_pane_{session_id}_quiet"
+    resp = await _decline(
+        quiet_id, {**base, "elicitation_id": quiet_id, "interrupt_on_decline": False}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["action"] == "decline"
+    assert interrupts == []
+
+    # Same route, flag omitted → the interrupt still fires for the mirrors
+    # whose only lever is the verdict.
+    loud_id = f"elicit_claude_pane_{session_id}_loud"
+    resp = await _decline(loud_id, {**base, "elicitation_id": loud_id})
+    assert resp.status_code == 200, resp.text
+    assert [change for _session, change in interrupts] == [{"type": "interrupt"}]
+
+
 async def test_cursor_permission_request_hook_stamps_ask_user_question_extra(
     client: httpx.AsyncClient,
 ) -> None:

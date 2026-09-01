@@ -3453,6 +3453,7 @@ async def _attach_with_transcript_forwarder(
     # broadcast hazard this avoids.
     skip_existing_transcript = prepared.reattached or prepared.cold_resumed
     forwarder: asyncio.Task[None] | None = None
+    permission_mirror: asyncio.Task[None] | None = None
     if run_transcript_forwarder:
         forwarder = asyncio.create_task(
             supervise_forwarder(
@@ -3465,6 +3466,22 @@ async def _attach_with_transcript_forwarder(
                 auth=auth,
             ),
             name="claude-native-transcript-forwarder",
+        )
+        # Safety net for approval prompts the ``PermissionRequest`` hook
+        # failed to route to the web UI: without it the session blocks on a
+        # prompt only the terminal shows. Owned by whichever process runs
+        # the forwarder, for the same reason — one tailer per bridge.
+        from omnigent.claude_native_permissions import supervise_claude_permission_mirror
+
+        permission_mirror = asyncio.create_task(
+            supervise_claude_permission_mirror(
+                base_url=base_url,
+                headers=headers,
+                session_id=prepared.session_id,
+                bridge_dir=prepared.bridge_dir,
+                auth=auth,
+            ),
+            name="claude-native-permission-mirror",
         )
         startup_profiler.mark("transcript forwarder started")
     else:
@@ -3505,6 +3522,20 @@ async def _attach_with_transcript_forwarder(
                 close_attach_on_terminal_gone=attach is attach_local_terminal,
             )
     finally:
+        if permission_mirror is not None:
+            permission_mirror.cancel()
+            try:
+                await permission_mirror
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001 — cleanup must run regardless
+                # Same contract as the forwarder below: the mirror is a
+                # best-effort safety net, so a bug in it must not skip the
+                # terminal stop call.
+                _logger.warning(
+                    "claude-native permission mirror raised on shutdown",
+                    exc_info=True,
+                )
         if forwarder is not None:
             forwarder.cancel()
             try:

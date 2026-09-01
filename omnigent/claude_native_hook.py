@@ -22,6 +22,7 @@ from omnigent.claude_native_bridge import (
     read_permission_hook_config,
     read_seen_claude_session_ids,
     record_hook_event,
+    record_permission_trace,
     transcript_has_forked_from_marker,
     transcript_has_recent_local_command,
     url_component,
@@ -837,24 +838,30 @@ def _main_permission_request(argv: list[str]) -> int:
     from omnigent.native_policy_hook import policy_hook_reauth
 
     args = _parse_permission_args(argv)
+    bridge_dir = Path(args.bridge_dir)
     raw = sys.stdin.read()
     try:
         payload = json.loads(raw or "{}")
     except json.JSONDecodeError as exc:
         print(f"omnigent claude permission hook: malformed JSON: {exc}", file=sys.stderr)
+        record_permission_trace(bridge_dir, "malformed_payload", detail=str(exc))
         return 0
     if not isinstance(payload, dict):
         print("omnigent claude permission hook: expected JSON object", file=sys.stderr)
+        record_permission_trace(bridge_dir, "malformed_payload", detail="not a JSON object")
         return 0
-    bridge_dir = Path(args.bridge_dir)
+    raw_tool_name = payload.get("tool_name")
+    tool_name = raw_tool_name if isinstance(raw_tool_name, str) else None
     session_id = read_active_session_id(bridge_dir)
     if not session_id:
         print("omnigent claude permission hook: active session missing", file=sys.stderr)
+        record_permission_trace(bridge_dir, "no_active_session", tool_name=tool_name)
         return 0
     config = read_permission_hook_config(bridge_dir)
     ap_server_url = args.omnigent_server_url or config.get("ap_server_url")
     if not isinstance(ap_server_url, str) or not ap_server_url:
         print("omnigent claude permission hook: Omnigent server URL missing", file=sys.stderr)
+        record_permission_trace(bridge_dir, "no_server_url", tool_name=tool_name)
         return 0
     headers = _parse_headers(args.omnigent_auth_headers_json)
     if not headers:
@@ -872,6 +879,7 @@ def _main_permission_request(argv: list[str]) -> int:
         f"{ap_server_url.rstrip('/')}/v1/sessions/"
         f"{url_component(session_id)}/hooks/permission-request"
     )
+    record_permission_trace(bridge_dir, "posting", tool_name=tool_name, session_id=session_id)
     resp = _post_hook_with_reattach(
         url,
         headers,
@@ -880,9 +888,18 @@ def _main_permission_request(argv: list[str]) -> int:
         reauth=policy_hook_reauth(ap_server_url, headers),
     )
     if resp is None:
+        # Out of retry budget or a hard rejection: the prompt is now the
+        # terminal's alone. Recorded so the runner-side mirror can say why
+        # it had to surface the pane prompt itself.
+        record_permission_trace(bridge_dir, "undelivered", tool_name=tool_name)
         return 0
     if resp.content:
+        record_permission_trace(bridge_dir, "delivered", tool_name=tool_name)
         sys.stdout.write(resp.text)
+        return 0
+    # Empty 2xx is the server's fail-ask: nobody answered in the web UI
+    # (timeout) or the prompt was resolved in the terminal.
+    record_permission_trace(bridge_dir, "deferred", tool_name=tool_name)
     return 0
 
 

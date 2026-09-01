@@ -1285,7 +1285,8 @@ def register_hooks_routes(
 
         :param request: FastAPI request carrying the detected prompt
             (``elicitation_id``, ``message``, ``content_preview``,
-            ``operation_type``, optional ``agent`` / ``policy_name``).
+            ``operation_type``, optional ``agent`` / ``policy_name`` /
+            ``interrupt_on_decline``).
         :param session_id: Omnigent conversation id from the URL path.
         :returns: An ``ElicitationResult`` (``{"action": …}``) on a web verdict,
             or ``200`` with empty body on TUI-resolution / timeout / disconnect.
@@ -1329,6 +1330,14 @@ def register_hooks_routes(
         policy_name = payload.get("policy_name")
         if not isinstance(policy_name, str) or not policy_name:
             policy_name = "native_permission"
+        # Whether a decline should also interrupt the native harness. True for
+        # the mirrors whose only lever is the verdict itself; False for one that
+        # answers the vendor's own prompt with a decline keystroke, where the
+        # harness continues from that denial and an interrupt would abort the
+        # turn the person only meant to redirect.
+        interrupt_on_decline = payload.get("interrupt_on_decline")
+        if not isinstance(interrupt_on_decline, bool):
+            interrupt_on_decline = True
         extras: dict[str, Any] = {}
         ask_user_question = payload.get("ask_user_question")
         if isinstance(ask_user_question, dict) and isinstance(
@@ -1358,7 +1367,7 @@ def register_hooks_routes(
         )
         if result is None:
             return Response(status_code=status.HTTP_200_OK)
-        if result.action == "decline":
+        if result.action == "decline" and interrupt_on_decline:
             # Explicit user decline: interrupt the native harness before
             # returning the decline so the abort signal arrives first.
             await _forward_session_change_to_runner(

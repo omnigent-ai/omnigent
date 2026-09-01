@@ -7040,8 +7040,25 @@ async def _auto_create_claude_terminal(
     # mirrors the CLI client's ``prepared.cold_resumed`` handling in
     # ``claude_native.py``.
     from omnigent.claude_native_forwarder import supervise_forwarder
+    from omnigent.claude_native_permissions import supervise_claude_permission_mirror
 
     async def _supervise_bridge() -> None:
+        # Safety net for approval prompts the ``PermissionRequest`` hook failed
+        # to route to the web UI, which would otherwise block the session on a
+        # prompt only the embedded terminal shows (see
+        # :mod:`omnigent.claude_native_permissions`). A sibling task rather
+        # than a ``gather`` arm so the forwarder still starts on this tick, and
+        # so a mirror crash can never take the transcript down with it.
+        permission_mirror = asyncio.create_task(
+            supervise_claude_permission_mirror(
+                base_url=server_url,
+                headers=_runner_headers,
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                auth=_runner_auth,
+            ),
+            name=f"claude-permission-mirror-{session_id}",
+        )
         try:
             await supervise_forwarder(
                 base_url=server_url,
@@ -7054,6 +7071,9 @@ async def _auto_create_claude_terminal(
                 auth=_runner_auth,
             )
         finally:
+            permission_mirror.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await permission_mirror
             await _shutdown_session_router_async(session_id, _subagent_router)
             await _shutdown_session_turn_router_async(session_id, _claude_turn_router)
 

@@ -101,6 +101,16 @@ _TOOL_RELAY_FILE = "tool_relay.json"
 _TOOL_RELAY_ENV_FILE = "tool_relay.env"
 _TMUX_FILE = "tmux.json"
 _PERMISSION_HOOK_FILE = "permission_hook.json"
+# Append-only outcome trace for the ``PermissionRequest`` hook. The hook's
+# own diagnostics go to stderr, which Claude Code discards for a zero-exit
+# hook — so a prompt that failed to reach the web UI used to leave no trace
+# anywhere and the session just sat blocked. Every hook invocation records
+# its outcome here instead.
+_PERMISSION_TRACE_FILE = "permission_trace.jsonl"
+# Cap the trace so a long session cannot grow it without bound. Rewritten
+# (tail-kept) once it exceeds the cap; only the recent tail has diagnostic
+# value, and readers ask for the last few entries.
+_PERMISSION_TRACE_MAX_LINES = 500
 _CONTEXT_FILE = "context.json"
 _USER_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 _MCP_SERVER_NAME = "omnigent"
@@ -229,15 +239,20 @@ _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 0.75
 SWITCH_MODEL_DIALOG_HINT = "Switch model?"
 EFFORT_DIALOG_HINT = "Change effort level?"
 _CONFIRM_DIALOG_HINTS = (SWITCH_MODEL_DIALOG_HINT, EFFORT_DIALOG_HINT)
+# Title every Claude Code tool permission prompt renders above its numbered
+# options ("Do you want to proceed?", "Do you want to make this edit to
+# x.py?"). Public because the runner-side permission mirror
+# (:mod:`omnigent.claude_native_permissions`) detects the same prompt from the
+# pane and must not re-spell the marker.
+PERMISSION_PROMPT_HINT = "Do you want to "
 # Surfaces a confirm Enter must never land on: they are never a slash command's
 # own confirmation, and their default answer commits something the person did
 # not ask for — the ``/model`` picker writes a new global default into
 # ``~/.claude/settings.json``, and a tool permission prompt approves the tool.
-# Every Claude Code permission prompt is titled "Do you want to …"; the second
-# signature catches the remembered-approval row of the wider ones.
+# The second signature catches the remembered-approval row of the wider prompts.
 _FOREIGN_DIALOG_HINTS = (
     _MODEL_PICKER_OPEN_HINT,
-    "Do you want to ",
+    PERMISSION_PROMPT_HINT,
     "Yes, and don't ask again",
 )
 # Seconds to wait for a confirmation dialog before concluding none appears.
@@ -1332,6 +1347,68 @@ def read_permission_hook_config(bridge_dir: Path) -> _JsonObject:
     """
     payload = _read_json_file(bridge_dir / _PERMISSION_HOOK_FILE)
     return payload if isinstance(payload, dict) else {}
+
+
+def record_permission_trace(bridge_dir: Path, outcome: str, **fields: object) -> None:
+    """
+    Append one ``PermissionRequest`` hook outcome to the bridge trace.
+
+    Best-effort and never raises: tracing must not turn a permission
+    prompt into a failed hook. Trimmed to the last
+    :data:`_PERMISSION_TRACE_MAX_LINES` entries.
+
+    :param bridge_dir: Bridge directory path.
+    :param outcome: Short outcome slug, e.g. ``"delivered"``,
+        ``"undelivered"``, ``"deferred"``, ``"no_server_url"``.
+    :param fields: Extra diagnostic fields to record alongside it, e.g.
+        ``tool_name="Bash"``. Never pass credentials.
+    :returns: None.
+    """
+    entry: _JsonObject = {"at": time.time(), "outcome": outcome, "pid": os.getpid()}
+    entry.update({key: value for key, value in fields.items() if value is not None})
+    path = bridge_dir / _PERMISSION_TRACE_FILE
+    # The bridge dir is created (and secured) at prep time; this only appends,
+    # so a missing dir simply fails the write. Swallowing everything is
+    # deliberate: the caller is blocking a live permission prompt, and no
+    # tracing failure may turn that into a failed hook.
+    try:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, separators=(",", ":"), default=str) + "\n")
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if len(lines) > _PERMISSION_TRACE_MAX_LINES:
+            path.write_text(
+                "\n".join(lines[-_PERMISSION_TRACE_MAX_LINES:]) + "\n", encoding="utf-8"
+            )
+    except Exception:  # noqa: BLE001 — tracing must never break the prompt
+        return
+
+
+def read_recent_permission_traces(bridge_dir: Path, limit: int = 5) -> list[_JsonObject]:
+    """
+    Read the most recent ``PermissionRequest`` hook outcomes, newest last.
+
+    Lets the runner-side permission mirror say *why* the web card is
+    missing (the hook never ran vs. it could not reach the server) in the
+    warning it logs before surfacing the prompt itself.
+
+    :param bridge_dir: Bridge directory path.
+    :param limit: Maximum number of trailing entries to return.
+    :returns: Parsed trace entries, oldest first; empty when absent or
+        unreadable.
+    """
+    try:
+        lines = (bridge_dir / _PERMISSION_TRACE_FILE).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    entries: list[_JsonObject] = []
+    for line in lines[-limit:] if limit > 0 else []:
+        try:
+            parsed = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            entries.append(parsed)
+    return entries
 
 
 def update_permission_hook_auth_headers(
@@ -3889,6 +3966,64 @@ def claude_pane_ready(bridge_dir: Path) -> bool:
     if any(text in pane for text in _CONFIRM_DIALOG_HINTS):
         return False
     return _claude_prompt_rendered(pane)
+
+
+def _pane_coordinates(bridge_dir: Path) -> tuple[str, str] | None:
+    """
+    Read the advertised tmux socket + pane target for a bridge dir.
+
+    :param bridge_dir: Bridge directory path holding ``tmux.json``.
+    :returns: ``(socket_path, tmux_target)``, or ``None`` when the pane
+        has not been advertised yet.
+    """
+    payload = _read_json_file(bridge_dir / _TMUX_FILE)
+    if not isinstance(payload, dict):
+        return None
+    socket_path = payload.get("socket_path")
+    tmux_target = payload.get("tmux_target")
+    if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
+        return None
+    return socket_path, tmux_target
+
+
+def capture_claude_pane(bridge_dir: Path) -> str | None:
+    """
+    Return the visible Claude pane text, or ``None`` when no pane exists.
+
+    Used by the runner-side permission mirror
+    (:mod:`omnigent.claude_native_permissions`) to notice a permission
+    prompt that the ``PermissionRequest`` hook failed to route to the web
+    UI. ``None`` (no advertised tmux target) is distinct from ``""`` (a
+    live but torn capture); both mean "no prompt visible" to the caller.
+
+    :param bridge_dir: The claude-native bridge dir holding ``tmux.json``.
+    :returns: The captured pane text, or ``None`` when no live pane exists.
+    """
+    coordinates = _pane_coordinates(bridge_dir)
+    if coordinates is None:
+        return None
+    return _capture_pane(*coordinates)
+
+
+def send_claude_pane_keys(bridge_dir: Path, *keys: str) -> None:
+    """
+    Send one or more keys to the Claude pane (tmux ``send-keys``).
+
+    Used by the permission mirror to answer Claude's own prompt from a web
+    verdict, e.g. ``"1"`` for its "Yes" row. Each key is a tmux key
+    name/argument, so multi-byte keys like ``"Escape"`` are interpreted
+    rather than typed literally.
+
+    :param bridge_dir: The claude-native bridge dir holding ``tmux.json``.
+    :param keys: tmux key arguments, e.g. ``"1"`` or ``"Escape"``.
+    :returns: None.
+    :raises RuntimeError: If the pane is not advertised or send-keys fails.
+    """
+    coordinates = _pane_coordinates(bridge_dir)
+    if coordinates is None:
+        raise RuntimeError("claude-native tmux target not advertised")
+    socket_path, tmux_target = coordinates
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, *keys)
 
 
 def _restore_occupied_input(socket_path: str, tmux_target: str) -> None:
