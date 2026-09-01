@@ -84,6 +84,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             "features.computer_use=false",
             "features.image_generation=false",
             "features.multi_agent=false",
+            "features.plugins=false",
             "features.tool_search=false",
         ):
             args.extend(("--config", override))

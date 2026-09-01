@@ -661,6 +661,7 @@ async def test_codex_native_title_uses_ephemeral_tool_free_exec(
     assert "--skip-git-repo-check" in args
     assert args[args.index("--model") + 1] == "gpt-5.4-mini"
     assert "features.shell_tool=false" in args
+    assert "features.plugins=false" in args
     assert 'web_search="disabled"' in args
     assert all("sk-sentinel-do-not-use" not in arg for arg in args)
     assert "omnigent-codex-title-" in captured["kwargs"]["cwd"]
