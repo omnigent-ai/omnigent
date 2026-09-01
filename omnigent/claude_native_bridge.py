@@ -3163,8 +3163,8 @@ def inject_user_message(
     # "old promptnew prompt" with no separator).
     # Ctrl-A (Home) + Ctrl-K (kill-to-end) is the safest pair —
     # Ctrl-U only clears backwards from cursor.
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-a")
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-k")
+    _send_keys(info["socket_path"], info["tmux_target"], "C-a")
+    _send_keys(info["socket_path"], info["tmux_target"], "C-k")
     # Escape unsupported slash commands (e.g. ``/help``, ``/exit``) so the
     # Claude Code TUI treats them as user text instead of invoking a state
     # that Omnigent cannot drive. Allowed commands (``/clear``,
@@ -3216,7 +3216,7 @@ def inject_user_message(
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     time.sleep(_PASTE_SETTLE_S)
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
+    _send_keys(info["socket_path"], info["tmux_target"], "Enter")
     if not draft_seen:
         # The draft was never observed, so its absence proves nothing —
         # verification would trivially "pass". Submit blind as before.
@@ -3235,7 +3235,7 @@ def inject_user_message(
         if not _draft_in_input_box(pane, needle):
             return
         if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
-            _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
+            _send_keys(info["socket_path"], info["tmux_target"], "Enter")
             last_enter = time.monotonic()
     raise RuntimeError(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
@@ -3269,7 +3269,7 @@ def inject_interrupt(
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     # No ``-l``: tmux must interpret ``Escape`` as a key name.
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Escape")
+    _send_keys(info["socket_path"], info["tmux_target"], "Escape")
 
 
 def kill_session(
@@ -3375,9 +3375,9 @@ def inject_slash_command(
     # paste below concatenates with their text and Enter submits
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
     # not interrupt an in-flight generation.
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-u")
+    _send_keys(socket_path, tmux_target, "C-u")
     # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
-    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
+    _send_keys(socket_path, tmux_target, command, literal=True)
     # Same delivery hazards as inject_user_message: a coalesced or dropped
     # Enter leaves the command drafted while the persisted session value
     # claims it applied. Wait for the command to render, submit, verify it
@@ -3391,7 +3391,7 @@ def inject_slash_command(
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     time.sleep(_PASTE_SETTLE_S)
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    _send_keys(socket_path, tmux_target, "Enter")
     if draft_seen:
         # Re-send only while the command verifiably still sits in the box —
         # a one-poll-stale retry can at worst hit the empty composer (no-op)
@@ -3407,7 +3407,7 @@ def inject_slash_command(
                 submitted = True
                 break
             if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
-                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+                _send_keys(socket_path, tmux_target, "Enter")
                 last_enter = time.monotonic()
         if not submitted:
             raise RuntimeError(
@@ -3474,7 +3474,7 @@ def _confirm_tui_dialog(
             foreign,
         )
         return False
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    _send_keys(socket_path, tmux_target, "Enter")
     return False
 
 
@@ -3597,7 +3597,7 @@ def set_permission_mode(
         if current == mode:
             return current
         # No ``-l``: tmux must interpret ``BTab`` as the shift+tab key.
-        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "BTab")
+        _send_keys(socket_path, tmux_target, "BTab")
         settled = _read_settled_permission_mode(socket_path, tmux_target, previous=current)
         if settled is not None:
             current = settled
@@ -3666,7 +3666,7 @@ def _confirm_and_verify_dialog_closed(
         :data:`SWITCH_MODEL_DIALOG_HINT`.
     :returns: None.
     """
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    _send_keys(socket_path, tmux_target, "Enter")
     last_enter = time.monotonic()
     deadline = last_enter + _CONFIRM_DIALOG_ACCEPT_TIMEOUT_S
     while time.monotonic() < deadline:
@@ -3677,7 +3677,7 @@ def _confirm_and_verify_dialog_closed(
         if pane.strip() and hint not in pane:
             return
         if time.monotonic() - last_enter >= _CONFIRM_DIALOG_RETRY_INTERVAL_S:
-            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            _send_keys(socket_path, tmux_target, "Enter")
             last_enter = time.monotonic()
 
 
@@ -3798,6 +3798,128 @@ def post_tools_changed(
                 raise RuntimeError(f"tools-changed POST failed with HTTP {resp.status}")
     except error.URLError as exc:
         raise RuntimeError(f"failed to notify Claude tool list change: {exc}") from exc
+
+
+# tmux >= 3.5 rejects ``send-keys`` with this message while every attached
+# client is read-only — the exact state the web Terminal viewer creates by
+# attaching a read-only control-mode client (``tmux -C attach -r``).
+_READONLY_CLIENT_ERROR = "client is read-only"
+# Prefix for the keystroke-fallback tmux buffer. Each invocation appends a
+# random suffix: interrupts, dialog confirms, and the model-change endpoint
+# can inject concurrently with a message delivery, and a shared name would
+# let one load-buffer overwrite another's bytes between its load and paste.
+_KEYS_BUFFER_PREFIX = "omnigent-keys-"
+# Raw byte sequences for the tmux key names this module sends. All are
+# terminal-mode independent, so pasting them into the pane is byte-for-byte
+# what ``send-keys`` would have written.
+_KEY_NAME_BYTES: Mapping[str, bytes] = {
+    "C-a": b"\x01",
+    "C-k": b"\x0b",
+    "C-u": b"\x15",
+    "Enter": b"\r",
+    "Escape": b"\x1b",
+    "BTab": b"\x1b[Z",
+}
+
+
+def _send_keys(socket_path: str, tmux_target: str, *keys: str, literal: bool = False) -> None:
+    """
+    Send keystrokes into the pane, tolerating read-only-only clients.
+
+    ``send-keys`` is the primary path, but tmux >= 3.5 rejects it with
+    ``client is read-only`` while every attached client is read-only —
+    the state the web Terminal viewer creates by attaching read-only
+    (``tmux -C attach -r``), which made web chat delivery fail whenever
+    that viewer was the session's sole client. On that rejection the
+    same bytes are re-delivered through ``load-buffer`` +
+    ``paste-buffer``, which have no client-writability gate, so
+    delivery never depends on who happens to be watching the pane.
+
+    :param socket_path: Absolute path to the tmux socket, e.g.
+        ``"/tmp/.../tmux.sock"``.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param keys: tmux key names (e.g. ``"Enter"``, ``"C-a"``) or, with
+        *literal*, literal text chunks.
+    :param literal: Send *keys* as literal text (``send-keys -l``).
+    :returns: None.
+    :raises RuntimeError: If tmux fails for any other reason, or a key
+        name has no raw-byte fallback while the fallback is needed.
+    """
+    argv = ["send-keys", "-l"] if literal else ["send-keys"]
+    argv += ["-t", tmux_target, *keys]
+    try:
+        _run_tmux(socket_path, *argv)
+    except RuntimeError as exc:
+        if _READONLY_CLIENT_ERROR not in str(exc):
+            raise
+        _paste_key_bytes(socket_path, tmux_target, _key_fallback_bytes(keys, literal=literal))
+
+
+def _key_fallback_bytes(keys: tuple[str, ...], *, literal: bool) -> bytes:
+    """
+    Translate ``send-keys`` arguments into the raw bytes they produce.
+
+    :param keys: The key names or literal chunks passed to
+        :func:`_send_keys`, e.g. ``("Enter",)``.
+    :param literal: Whether *keys* are literal text (``send-keys -l``).
+    :returns: The pane-input bytes, e.g. ``b"\\r"``.
+    :raises RuntimeError: If a key name has no known byte sequence —
+        loud, so a new key name added upstream cannot silently deliver
+        the wrong bytes.
+    """
+    if literal:
+        return "".join(keys).encode("utf-8")
+    payload = bytearray()
+    for key in keys:
+        seq = _KEY_NAME_BYTES.get(key)
+        if seq is None:
+            raise RuntimeError(
+                f"tmux rejected send-keys ({_READONLY_CLIENT_ERROR}) and key "
+                f"{key!r} has no raw-byte fallback"
+            )
+        payload.extend(seq)
+    return bytes(payload)
+
+
+def _paste_key_bytes(socket_path: str, tmux_target: str, payload: bytes) -> None:
+    """
+    Deliver raw keystroke bytes into the pane via a tmux buffer.
+
+    ``load-buffer`` + ``paste-buffer`` are not gated on attached-client
+    writability, so this works while every attached client is
+    read-only. ``-r`` pastes the bytes untranslated and there is no
+    ``-p``: the bytes must arrive as keystrokes, not wrapped in
+    bracketed-paste markers. The buffer name is unique per invocation
+    so concurrent injections on one session cannot clobber each other
+    between the load and the paste.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param payload: Exact bytes to write, e.g. ``b"\\r"``.
+    :returns: None.
+    :raises RuntimeError: If a tmux invocation fails.
+    """
+    buffer_name = _KEYS_BUFFER_PREFIX + secrets.token_hex(8)
+    with tempfile.NamedTemporaryFile(
+        prefix="omnigent_keys_", suffix=".bin", delete=False
+    ) as keys_file:
+        keys_file.write(payload)
+        keys_path = keys_file.name
+    try:
+        _run_tmux(socket_path, "load-buffer", "-b", buffer_name, keys_path)
+        _run_tmux(
+            socket_path,
+            "paste-buffer",
+            "-r",  # no line-ending translation — the bytes are already exact
+            "-d",  # drop the buffer after pasting (no stale copies server-side)
+            "-b",
+            buffer_name,
+            "-t",
+            tmux_target,
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(keys_path)
 
 
 def _run_tmux(socket_path: str, *args: str) -> None:
@@ -3948,7 +4070,7 @@ def _restore_occupied_input(socket_path: str, tmux_target: str) -> None:
             confirmed = True
         elif last_escape is None or now - last_escape >= _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S:
             _logger.info("claude-native: dismissing %s covering the input box", surface)
-            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
+            _send_keys(socket_path, tmux_target, "Escape")
             last_escape = now
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
