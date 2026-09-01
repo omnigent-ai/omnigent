@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from types import SimpleNamespace
 
 import pytest
 
+from omnigent.entities.conversation import synthesize_conversation_title
 from omnigent.server.background_session_titles import (
     BACKGROUND_TITLE_MAX_CHARS,
     CUSTOM_BACKGROUND_TITLE_MAX_CHARS,
@@ -79,6 +81,43 @@ async def test_prepare_background_title_from_message(db_uri: str) -> None:
         agent_id=agent_id,
     )
     assert pending.expected_seed_title == "please investigate the authentication timeout"
+
+
+async def test_prepare_background_title_matches_the_seed_for_attachments(db_uri: str) -> None:
+    """The expected seed drops attachment markers, exactly like the seeder.
+
+    Flattening first joined the marker onto the prompt's own line, so the
+    compare-and-swap never matched and an image-started session went unnamed.
+    """
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation(kind="default")
+
+    async def generator(_request: BackgroundTitleRequest) -> str:
+        return "Review the mockup"
+
+    pending = prepare_background_session_title(
+        coordinator=BackgroundSessionTitleCoordinator(store, generator),
+        conversation=conversation,
+        event=SessionEventInput(
+            type="message",
+            data={
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "what is wrong here"},
+                    {"type": "input_text", "text": "[Attached: /tmp/omnigent/shot.png]"},
+                ],
+            },
+        ),
+    )
+
+    assert pending is not None
+    assert pending.expected_seed_title == synthesize_conversation_title(
+        [
+            {"type": "input_text", "text": "what is wrong here"},
+            {"type": "input_text", "text": "[Attached: /tmp/omnigent/shot.png]"},
+        ]
+    )
+    assert pending.expected_seed_title == "what is wrong here"
 
 
 async def test_prepare_background_title_from_slash_command(db_uri: str) -> None:
@@ -339,6 +378,76 @@ async def test_custom_title_instructions_truncate_oversized_output(db_uri: str) 
     expected = "x" * (CUSTOM_BACKGROUND_TITLE_MAX_CHARS - 1) + "…"
     assert store.get_conversation(session_id).title == expected
     assert len(expected) == CUSTOM_BACKGROUND_TITLE_MAX_CHARS
+
+
+async def test_background_rename_publishes_a_live_title_event(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A generated title reaches open clients without waiting for a reconcile.
+
+    Without the event the sidebar kept the old name until a later write, which
+    is why a generated name used to appear only on a subsequent turn.
+    """
+    from omnigent.server.routes._sessions import common as sessions_common
+
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = _seed_session(store, "Investigate authentication timeout")
+    published: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        sessions_common,
+        "session_stream",
+        SimpleNamespace(publish=lambda sid, frame: published.append((sid, frame))),
+    )
+
+    async def generator(_request: BackgroundTitleRequest) -> str:
+        return "Debug authentication timeout"
+
+    coordinator = BackgroundSessionTitleCoordinator(store, generator)
+    coordinator.schedule(
+        session_id=session_id,
+        prompt="please investigate the authentication timeout",
+        expected_seed_title="Investigate authentication timeout",
+    )
+    await coordinator.wait_for_idle()
+
+    assert len(published) == 1
+    published_session_id, frame = published[0]
+    assert published_session_id == session_id
+    assert frame["type"] == "session.title"
+    assert frame["conversation_id"] == session_id
+    assert frame["title"] == "Debug authentication timeout"
+
+
+async def test_declined_background_rename_publishes_nothing(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A title the compare-and-swap refused is never announced."""
+    from omnigent.server.routes._sessions import common as sessions_common
+
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = _seed_session(store, "Auth work")
+    published: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        sessions_common,
+        "session_stream",
+        SimpleNamespace(publish=lambda sid, frame: published.append((sid, frame))),
+    )
+
+    async def generator(_request: BackgroundTitleRequest) -> str:
+        return "Debug authentication timeout"
+
+    coordinator = BackgroundSessionTitleCoordinator(store, generator)
+    coordinator.schedule(
+        session_id=session_id,
+        prompt="please investigate the authentication timeout",
+        expected_seed_title="Investigate authentication timeout",
+    )
+    await coordinator.wait_for_idle()
+
+    assert published == []
+    assert store.get_conversation(session_id).title == "Auth work"
 
 
 async def test_manual_rename_wins_background_title_race(db_uri: str) -> None:

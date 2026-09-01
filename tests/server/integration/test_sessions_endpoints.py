@@ -1645,9 +1645,10 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
         }
     ]
     event_types = [event["type"] for _, event in published]
-    assert event_types == ["response.output_item.done"]
-    assert published[0][1]["item"]["type"] == "slash_command"
-    assert published[0][1]["item"]["id"] == visible["id"]
+    assert event_types == ["session.title", "response.output_item.done"]
+    assert published[0][1]["title"] == "/grill-me review this rollout"
+    assert published[1][1]["item"]["type"] == "slash_command"
+    assert published[1][1]["item"]["id"] == visible["id"]
 
     # The dispatch also seeds the sidebar title from the typed command,
     # mirroring the plain-message path. Without it, a session whose FIRST
@@ -3519,7 +3520,9 @@ async def test_post_external_conversation_item_persists_and_streams_visible_item
         "stderr": "",
     }
 
+    # The first user message also names the untitled session, and says so.
     assert [event["type"] for _, event in published] == [
+        "session.title",
         "session.input.consumed",
         "response.output_item.done",
         "response.output_item.done",
@@ -3527,12 +3530,13 @@ async def test_post_external_conversation_item_persists_and_streams_visible_item
         "response.output_item.done",
         "response.output_item.done",
     ]
-    assert published[0][1]["data"]["data"]["content"][0]["text"] == "read TODO"
-    assert published[1][1]["item"]["type"] == "function_call"
-    assert published[2][1]["item"]["type"] == "function_call_output"
-    assert published[3][1]["item"]["type"] == "message"
-    assert published[4][1]["item"]["type"] == "terminal_command"
+    assert published[0][1]["title"] == "read TODO"
+    assert published[1][1]["data"]["data"]["content"][0]["text"] == "read TODO"
+    assert published[2][1]["item"]["type"] == "function_call"
+    assert published[3][1]["item"]["type"] == "function_call_output"
+    assert published[4][1]["item"]["type"] == "message"
     assert published[5][1]["item"]["type"] == "terminal_command"
+    assert published[6][1]["item"]["type"] == "terminal_command"
 
 
 async def test_post_external_function_call_output_caps_oversized_output(
@@ -8109,7 +8113,11 @@ async def test_post_external_conversation_item_auto_assigns_response_id(
     assert isinstance(persisted_response_id, str) and persisted_response_id, (
         "auto-assigned response_id must be a non-empty string"
     )
-    assert published[0][1]["type"] == "session.input.consumed"
+    # The first user message also names the untitled session, and says so.
+    assert [event["type"] for _, event in published] == [
+        "session.title",
+        "session.input.consumed",
+    ]
 
 
 async def test_external_user_message_seeds_title_on_claude_native_session(

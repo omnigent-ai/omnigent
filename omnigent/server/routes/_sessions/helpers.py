@@ -101,6 +101,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
 )
+from omnigent.server.background_session_titles import publish_session_title
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
     MANAGED_SANDBOX_LABEL_NAMESPACE,
@@ -6545,6 +6546,9 @@ async def _seed_missing_title(
     yield no usable text. Mutates ``conv.title`` in place on success
     so callers holding the row see the persisted value.
 
+    Compare-and-swap rather than a plain update: ``conv`` was read at
+    the route boundary, so a rename typed in the UI since then wins.
+
     :param conv: The conversation row for the session.
     :param content: Title-candidate blocks, e.g.
         ``[{"type": "input_text", "text": "/debate kafka vs sqs"}]``.
@@ -6557,12 +6561,14 @@ async def _seed_missing_title(
     if title is None:
         return
     updated = await asyncio.to_thread(
-        conversation_store.update_conversation,
+        conversation_store.rename_conversation_if_title_matches,
         conv.id,
-        title=title,
+        "",  # the stored form of "untitled"
+        title,
     )
     if updated is not None:
         conv.title = updated.title
+        publish_session_title(conv.id, title)
 
 
 async def _seed_missing_title_from_user_message(

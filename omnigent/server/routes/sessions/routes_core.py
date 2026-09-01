@@ -70,6 +70,7 @@ from omnigent.server.auth import (
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
+    publish_session_title,
 )
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.permissions import check_session_access
@@ -1572,6 +1573,7 @@ def register_core_routes(
         )
         if updated is None:
             return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
+        publish_session_title(session_id, title)
         return AutomaticSessionRenameResponse(renamed=True, title=updated.title)
 
     @router.patch(

@@ -108,6 +108,7 @@ from omnigent.server.auth import (
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
+    background_title_content,
     prepare_background_session_title,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
@@ -289,6 +290,7 @@ from omnigent.server.routes._sessions.helpers import (
     _resource_event_item_from_sse,
     _routing_decision_item_from_sse,
     _RunnerForwardResult,
+    _seed_missing_title,
     _seed_missing_title_from_user_message,
     _session_status_from_cache,
     _session_status_with_child_rollup,
@@ -5725,6 +5727,10 @@ async def _dispatch_session_event_to_runner_impl(
         finally:
             if not forwarded and pending_id is not None:
                 pending_inputs.resolve(session_id, pending_id)
+        # This bypass persists nothing, so the round-trip is the only other
+        # writer — too late to keep the row off its "Claude Code" fallback for
+        # the whole first turn, and too late for the background titler's seed.
+        await _seed_missing_title(conv, background_title_content(body), conversation_store)
         # Emit the routing chip AFTER forwarding the message to the
         # terminal so the live SSE stream delivers the user bubble
         # (echoed back by the CLI) before the chip.
