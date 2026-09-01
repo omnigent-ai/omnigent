@@ -245,13 +245,20 @@ def catalog_session(
 def _expand_list_models_tool_call(page: Page) -> None:
     """Expand the ``sys_list_models`` tool call in the transcript.
 
-    A lone call renders directly as a ``sys_list_models(...)`` trigger;
-    completed multi-step turns fold calls into a collapsed "Called N tools"
-    group — expand groups when present, then click the call trigger so its
-    output preview (the catalog JSON) is on screen.
+    The completed turn first folds behind ``Worked for Ns``. That fold mounts
+    open while its close animation starts, so clicking a nested tool before it
+    settles races the outer close and hides the output again. Wait for the
+    settled closed state, reopen it as a user would, then expand any inner tool
+    group and the call itself.
 
     :param page: The Playwright page, on the parent session.
     """
+    worked = page.get_by_role("button", name=re.compile(r"^Worked(?: for)?"))
+    expect(worked.first).to_be_visible(timeout=30_000)
+    expect(worked.first).to_have_attribute("data-state", "closed", timeout=30_000)
+    worked.first.click()
+    expect(worked.first).to_have_attribute("data-state", "open", timeout=30_000)
+
     direct = page.get_by_role("button", name=re.compile(r"^sys_list_models\("))
     if not direct.count():
         groups = page.get_by_text(re.compile(r"^Called \d+ tools?$"))
