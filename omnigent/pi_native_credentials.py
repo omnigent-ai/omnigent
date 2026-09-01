@@ -897,9 +897,14 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     if real_workspace_url and transport.auth_command:
         token = _run_auth_command(transport.auth_command)
         if token:
-            claude_models, gpt_models, completions_models, gemini_models = _fetch_pi_model_lists(
-                real_workspace_url, token
-            )
+            try:
+                claude_models, gpt_models, completions_models, gemini_models = (
+                    _fetch_pi_model_lists(real_workspace_url, token)
+                )
+            except Exception:  # noqa: BLE001 — network failure must not break launch
+                _LOGGER.info(
+                    "pi-native: could not fetch workspace model list; showing default model only"
+                )
         else:
             _LOGGER.info(
                 "pi-native: auth command produced no token; Pi will show only the selected model"

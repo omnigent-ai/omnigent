@@ -2086,3 +2086,163 @@ def test_gateway_provider_max_output_tokens_validation_rejects_negative() -> Non
     }
     with pytest.raises(OmnigentError, match="max_output_tokens"):
         load_providers(config)
+
+
+# ---------------------------------------------------------------------------
+# _cli_config_pi_provider must prefer live-served Claude models over the catalog
+# ---------------------------------------------------------------------------
+
+
+def test_cli_config_pi_provider_uses_live_discovery_over_catalog_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """cli-config Databricks path: live discovery wins over the catalog default.
+
+    When discovery succeeds and returns only ``system.ai.*`` ids, the selected
+    model must be one of those — not the curated ``databricks-claude-fable-5``
+    that ``model_catalog.resolve_catalog_model`` returns (which the gateway
+    answers with 501 / model-not-found when the model is unserved).
+
+    Regression guard: ``_cli_config_pi_provider`` previously
+    used ``model or catalog_default``, ignoring ``_default_claude_model_from``
+    even when a live Claude list was successfully fetched.
+    """
+    from omnigent.runtime.credentials.databricks import WorkspaceCreds
+
+    # Stub catalog default to an unserved id (the bug: this must NOT win).
+    UNSERVED_DEFAULT = "databricks-claude-fable-5"
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_catalog_model",
+        lambda provider_name, *, family, **kwargs: SimpleNamespace(model_id=UNSERVED_DEFAULT),
+    )
+
+    # Stub workspace credentials and live model discovery.
+    LIVE_CLAUDE: list[creds._PiModelEntry] = [
+        {"id": "system.ai.claude-opus-5"},
+        {"id": "system.ai.claude-sonnet-4-6"},
+    ]
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda host, token: (LIVE_CLAUDE, [], [], []),
+    )
+    monkeypatch.setattr(
+        creds,
+        "resolve_databricks_workspace",
+        lambda profile: WorkspaceCreds(host="https://wkspc.example.com", token="tok"),
+    )
+    monkeypatch.setattr(
+        creds,
+        "_run_auth_command",
+        lambda cmd: "live-bearer-token",
+    )
+    monkeypatch.setattr(
+        creds,
+        "_databricks_workspace_url_for_gateway",
+        lambda url, **_kw: "https://wkspc.example.com",
+    )
+
+    # Write the codex config so _cli_config_databricks_transport can parse it.
+    _write_codex_config(tmp_path, _DATABRICKS_CODEX_CONFIG)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    provider = creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_config)
+
+    assert provider is not None, "provider must resolve (not fall through to Pi login)"
+    live_ids = {str(e["id"]) for e in LIVE_CLAUDE}
+    assert provider.model in live_ids, (
+        f"expected live Claude model (one of {sorted(live_ids)}), "
+        f"got {provider.model!r} — unserved catalog default slipped through"
+    )
+    assert provider.model != UNSERVED_DEFAULT, (
+        f"selected model must not be the unserved catalog default {UNSERVED_DEFAULT!r}"
+    )
+
+
+def test_cli_config_pi_provider_explicit_override_wins_over_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Explicit model override must still win regardless of discovery results.
+
+    The served-default fix must not break the explicit-override path: when a session
+    pins a specific model, that model is used verbatim, even if it is not in
+    the live list (callers are responsible for validating overrides).
+    """
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_catalog_model",
+        lambda *_a, **_kw: SimpleNamespace(model_id="databricks-claude-fable-5"),
+    )
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda host, token: ([{"id": "system.ai.claude-opus-5"}], [], [], []),
+    )
+    monkeypatch.setattr(
+        creds,
+        "resolve_databricks_workspace",
+        lambda profile: __import__(
+            "omnigent.runtime.credentials.databricks", fromlist=["WorkspaceCreds"]
+        ).WorkspaceCreds(host="https://wkspc.example.com", token="tok"),
+    )
+    monkeypatch.setattr(creds, "_run_auth_command", lambda cmd: "token")
+    monkeypatch.setattr(
+        creds,
+        "_databricks_workspace_url_for_gateway",
+        lambda url, **_kw: "https://wkspc.example.com",
+    )
+    _write_codex_config(tmp_path, _DATABRICKS_CODEX_CONFIG)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    PINNED = "databricks-claude-sonnet-4-6"
+    provider = creds.resolve_pi_native_provider(
+        model=PINNED,
+        config_loader=_cli_config_databricks_config,
+    )
+
+    assert provider is not None
+    assert provider.model == PINNED, f"pinned model override must survive; got {provider.model!r}"
+
+
+def test_cli_config_pi_provider_discovery_failure_falls_back_to_catalog_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """When live discovery fails, the catalog default is the correct fallback.
+
+    The served-default fix must not change behavior when the workspace API call fails:
+    the code should still produce a provider (using the catalog default as
+    the model), rather than returning None or raising.
+    """
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_catalog_model",
+        lambda *_a, **_kw: SimpleNamespace(model_id="catalog-databricks-claude-default"),
+    )
+
+    def _fetch_boom(host: str, token: str) -> None:
+        raise RuntimeError("network blip")
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _fetch_boom)
+    monkeypatch.setattr(
+        creds,
+        "resolve_databricks_workspace",
+        lambda profile: __import__(
+            "omnigent.runtime.credentials.databricks", fromlist=["WorkspaceCreds"]
+        ).WorkspaceCreds(host="https://wkspc.example.com", token="tok"),
+    )
+    monkeypatch.setattr(creds, "_run_auth_command", lambda cmd: "token")
+    monkeypatch.setattr(
+        creds,
+        "_databricks_workspace_url_for_gateway",
+        lambda url, **_kw: "https://wkspc.example.com",
+    )
+    _write_codex_config(tmp_path, _DATABRICKS_CODEX_CONFIG)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    provider = creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_config)
+
+    assert provider is not None
+    assert provider.model == "catalog-databricks-claude-default", (
+        f"discovery failure must fall back to catalog default; got {provider.model!r}"
+    )
