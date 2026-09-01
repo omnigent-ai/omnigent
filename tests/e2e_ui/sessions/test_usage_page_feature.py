@@ -268,7 +268,10 @@ def test_pagination_load_more_button_appears_and_loads_next_page(
     expect(page.get_by_role("heading", name="Usage", exact=True)).to_be_visible(timeout=30_000)
     expect(page.get_by_text("Session from page 1")).to_be_visible()
 
-    load_more_button = page.get_by_role("button", name="Load More")
+    # exact=True: the sidebar's conversation list has its own "Load more"
+    # button when the server carries enough sessions; match only the usage
+    # table's pagination button.
+    load_more_button = page.get_by_role("button", name="Load More", exact=True)
     expect(load_more_button).to_be_visible()
 
     load_more_button.click()
