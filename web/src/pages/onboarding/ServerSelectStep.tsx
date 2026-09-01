@@ -28,7 +28,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
-import type { ConnectResult } from "@/pages/onboarding/ServerSelectorV2";
+import type { ConnectResult, ServerCheckResult } from "@/pages/onboarding/ServerSelectorV2";
 import { cn } from "@/lib/utils";
 
 const DEFAULT_LOCAL = "http://localhost:6767";
@@ -51,7 +51,9 @@ const JOIN_BENEFITS: { label: string; icon: ComponentType<LucideProps> }[] = [
 
 /** Strip the scheme for display, matching the shell's setup page. */
 function displayName(url: string): string {
-  return url.replace(/^https?:\/\//i, "");
+  // Strip the scheme and a bare trailing slash (origins normalize to
+  // "http://host/" — the slash is noise in the label).
+  return url.replace(/^https?:\/\//i, "").replace(/\/$/, "");
 }
 
 function isLocal(url: string): boolean {
@@ -91,6 +93,9 @@ export function normalizeServerUrl(raw: string): string | null {
   }
 }
 
+/** Advisory reachability status for a just-added server. */
+type CheckStatus = "checking" | "ok" | "reachable" | "unreachable";
+
 export function ServerSelectStep({
   initialUrl,
   error,
@@ -100,6 +105,7 @@ export function ServerSelectStep({
   onConnect,
   onRemove,
   onCopy,
+  onCheckServer,
 }: {
   initialUrl: string;
   error?: string;
@@ -113,49 +119,90 @@ export function ServerSelectStep({
   onRemove?: (url: string) => void;
   /** Copy text to the clipboard (native shell bridge — file:// blocks navigator.clipboard). */
   onCopy: (text: string) => void;
+  /** Advisory reachability probe for a just-added server. */
+  onCheckServer: (url: string) => Promise<ServerCheckResult>;
 }) {
-  // Selection: a listed server, or null when the user is typing a new URL.
-  const listed = [...managedServers, ...recentServers];
-  const [selected, setSelected] = useState<string | null>(listed[0] ?? null);
+  // Servers the user added this session (prepended to the persisted recents;
+  // they only become real recents once actually connected to).
+  const [addedServers, setAddedServers] = useState<string[]>([]);
+  const listed = [...addedServers, ...managedServers, ...recentServers];
+
+  // Exclusive focus: EITHER a listed server is selected (Join connects to it)
+  // OR the input is active (Add adds a server; Join is disabled). Focusing the
+  // input deselects; selecting a server clears the input.
+  const [selected, setSelected] = useState<string | null>(null);
+  // Pre-fill the input with the just-failed URL (retry after a bad connect
+  // reloads with ?url=), else empty. The default localhost is a listed recent,
+  // not something to type.
   const [typedUrl, setTypedUrl] = useState(
-    initialUrl && initialUrl !== DEFAULT_LOCAL ? initialUrl : "",
+    error && initialUrl && initialUrl !== DEFAULT_LOCAL ? initialUrl : "",
   );
   const [invalid, setInvalid] = useState(false);
   // The URL the shell flagged as "doesn't look like Omnigent" — a second
   // connect on the same URL proceeds (force); editing the input clears it.
   const [unconfirmedUrl, setUnconfirmedUrl] = useState<string | null>(null);
-  // Message from a rejected connect (e.g. main-side normalizeUrl rejected an
-  // input the renderer accepted), so a failed Join shows something.
+  // Message from a rejected connect, so a failed Join shows something.
   const [connectError, setConnectError] = useState<string | null>(null);
+  // Advisory per-server reachability status (added servers only).
+  const [checks, setChecks] = useState<Record<string, CheckStatus>>({});
   // The server whose info dialog is open, or null.
   const [infoUrl, setInfoUrl] = useState<string | null>(null);
 
-  // If the server lists arrive after mount, default-select the first one.
+  // Default-select the first listed server on mount (mirrors "a recent is
+  // pre-selected"), but not while the user is composing a new URL.
   const firstListed = managedServers[0] ?? recentServers[0] ?? null;
   useEffect(() => {
-    if (firstListed !== null) setSelected((prev) => prev ?? firstListed);
+    if (firstListed !== null)
+      setSelected((prev) => (prev === null && typedUrl === "" ? firstListed : prev));
+    // typedUrl intentionally omitted: only seed once from the arriving list.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [firstListed]);
 
-  const typedNormalized = normalizeServerUrl(typedUrl);
-  // Connect target: a selected list entry (already normalized), else the typed
-  // URL if it parses. null when neither is usable.
-  const chosen = selected ?? typedNormalized;
+  const clearInputState = () => {
+    setInvalid(false);
+    setUnconfirmedUrl(null);
+    setConnectError(null);
+  };
 
-  const connect = async (url: string | null) => {
+  // Pick a listed server (exclusive with the input).
+  const select = (url: string) => {
+    setSelected(url);
+    setTypedUrl("");
+    clearInputState();
+  };
+
+  // Add the typed URL to the list, select it, and fire an advisory reachability
+  // probe. Join is immediately usable on the added server; the check is async
+  // and never blocks it.
+  const addServer = () => {
+    const url = normalizeServerUrl(typedUrl);
     if (url === null) {
       setInvalid(true);
       return;
     }
+    if (!listed.includes(url)) setAddedServers((prev) => [url, ...prev]);
+    setSelected(url);
+    setTypedUrl("");
+    clearInputState();
+    setChecks((prev) => ({ ...prev, [url]: "checking" }));
+    onCheckServer(url)
+      .then((r) => setChecks((prev) => ({ ...prev, [url]: r.status })))
+      .catch(() => setChecks((prev) => ({ ...prev, [url]: "unreachable" })));
+  };
+
+  // Connect to the selected server. Second click on an unconfirmed URL forces.
+  const join = async () => {
+    if (selected === null) return;
     setConnectError(null);
-    // A second click on the already-warned URL forces through.
-    const force = unconfirmedUrl === url;
-    const result = await onConnect(url, force);
-    setUnconfirmedUrl(result.needsConfirm ? url : null);
+    const force = unconfirmedUrl === selected;
+    const result = await onConnect(selected, force);
+    setUnconfirmedUrl(result.needsConfirm ? selected : null);
     setConnectError(result.error ?? null);
   };
 
   const removeServer = (url: string) => {
     onRemove?.(url);
+    setAddedServers((prev) => prev.filter((u) => u !== url));
     if (selected === url) setSelected(null);
   };
 
@@ -201,12 +248,11 @@ export function ServerSelectStep({
           onChange={(e) => {
             setTypedUrl(e.target.value);
             setSelected(null);
-            setInvalid(false);
-            setUnconfirmedUrl(null);
-            setConnectError(null);
+            clearInputState();
           }}
+          onFocus={() => setSelected(null)}
           onKeyDown={(e) => {
-            if (e.key === "Enter") connect(typedNormalized);
+            if (e.key === "Enter") addServer();
           }}
           placeholder="Enter Omnigent server URL"
           className="border-0 px-0 shadow-none focus-visible:ring-0"
@@ -215,7 +261,7 @@ export function ServerSelectStep({
         <button
           type="button"
           disabled={typedUrl.trim().length === 0}
-          onClick={() => connect(typedNormalized)}
+          onClick={addServer}
           className="flex shrink-0 items-center gap-1 text-base text-muted-foreground disabled:opacity-50"
         >
           <Plus className="size-4" aria-hidden />
@@ -245,10 +291,12 @@ export function ServerSelectStep({
         </div>
       ) : (
         <div className="mt-2 flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto">
-          {listed.map((url, index) => {
+          {listed.map((url) => {
             const isSelected = selected === url;
-            // Managed (org-provided) servers can't be removed by the user.
-            const removable = onRemove != null && recentServers.includes(url);
+            // Managed (org-provided) servers can't be removed; added + recent can.
+            const removable = onRemove != null && !managedServers.includes(url);
+            const check = checks[url];
+            const isFirstRecent = url === recentServers[0] && addedServers.length === 0;
             return (
               <div
                 key={url}
@@ -259,13 +307,7 @@ export function ServerSelectStep({
               >
                 <button
                   type="button"
-                  onClick={() => {
-                    setSelected(url);
-                    setTypedUrl("");
-                    setInvalid(false);
-                    setUnconfirmedUrl(null);
-                    setConnectError(null);
-                  }}
+                  onClick={() => select(url)}
                   className="flex min-w-0 flex-1 items-center gap-3 text-left"
                   aria-pressed={isSelected}
                 >
@@ -288,12 +330,26 @@ export function ServerSelectStep({
                   <span className="flex min-w-0 flex-1 flex-col">
                     <span className="truncate text-base text-foreground">{serverTitle(url)}</span>
                     <span className="flex items-center gap-1.5 text-base text-muted-foreground">
-                      {index === 0 && (
+                      {isFirstRecent && (
                         <span className="rounded-full bg-muted px-1.5 py-0.5 text-[11px] leading-none">
                           Last used
                         </span>
                       )}
-                      <span className="truncate">{isLocal(url) ? "Local" : "Remote"}</span>
+                      {check ? (
+                        <span
+                          className={cn("truncate", check === "unreachable" && "text-destructive")}
+                        >
+                          {check === "checking"
+                            ? "Checking…"
+                            : check === "ok"
+                              ? "Omnigent server"
+                              : check === "reachable"
+                                ? "Reachable"
+                                : "Can't reach"}
+                        </span>
+                      ) : (
+                        <span className="truncate">{isLocal(url) ? "Local" : "Remote"}</span>
+                      )}
                     </span>
                   </span>
                 </button>
@@ -331,7 +387,7 @@ export function ServerSelectStep({
         <Button variant="outline" className="flex-1" onClick={onBack}>
           Back
         </Button>
-        <Button className="flex-1" disabled={chosen === null} onClick={() => connect(chosen)}>
+        <Button className="flex-1" disabled={selected === null} onClick={join}>
           Join
         </Button>
       </div>

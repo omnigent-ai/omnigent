@@ -12,6 +12,7 @@ function makeSetup(over: Partial<ServerSelectorV2Setup> = {}): ServerSelectorV2S
     onConnect: vi.fn().mockResolvedValue({}),
     onStartLocal: vi.fn().mockResolvedValue({ ok: true }),
     onCopy: vi.fn(),
+    onCheckServer: vi.fn().mockResolvedValue({ status: "ok" }),
     onCloudSetup: vi.fn(),
     onSwitchToLegacy: vi.fn(),
     ...over,
@@ -27,7 +28,9 @@ describe("ServerSelectorV2", () => {
   it("Get started advances to the deployment-mode step", () => {
     render(<ServerSelectorV2 setup={makeSetup()} />);
     fireEvent.click(screen.getByRole("button", { name: /get started/i }));
-    expect(screen.getByRole("heading", { name: /where do you want your sessions/i })).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: /where do you want your sessions/i }),
+    ).toBeInTheDocument();
   });
 
   it("Join a server advances to the server-select step", () => {
@@ -51,7 +54,9 @@ describe("ServerSelectorV2", () => {
     fireEvent.pointerDown(screen.getByRole("button", { name: /server selector settings/i }), {
       button: 0,
     });
-    fireEvent.click(screen.getByRole("menuitem", { name: /switch to legacy selector experience/i }));
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: /switch to legacy selector experience/i }),
+    );
     expect(onSwitchToLegacy).toHaveBeenCalledOnce();
   });
 });

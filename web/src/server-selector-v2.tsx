@@ -23,6 +23,7 @@ interface OmnigentSetup {
   getManagedServers: () => Promise<string[]>;
   getRecentServers: () => Promise<string[]>;
   forgetRecentServer?: (url: string) => Promise<string[]>;
+  checkServer?: (url: string) => Promise<{ status: "ok" | "reachable" | "unreachable" }>;
   copyText: (text: string) => Promise<unknown>;
   setServerSelectorV2?: (enabled: boolean) => Promise<unknown>;
   getCliStatus: () => Promise<{ installed?: boolean }>;
@@ -117,6 +118,17 @@ function SetupApp() {
             .catch(() => {});
         }
       : undefined,
+    // Advisory reachability probe for a just-added server. Resolves a status;
+    // never blocks Join. Absent bridge (browser preview) → treat as unreachable.
+    onCheckServer: async (url) => {
+      const bridge = setupBridge();
+      if (!bridge?.checkServer) return { status: "unreachable" as const };
+      try {
+        return await bridge.checkServer(url);
+      } catch {
+        return { status: "unreachable" as const };
+      }
+    },
     // Copy via the shell's native clipboard bridge — navigator.clipboard is
     // denied on the file:// wizard page.
     onCopy: (text) => {

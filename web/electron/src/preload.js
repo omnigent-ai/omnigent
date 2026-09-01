@@ -428,6 +428,12 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
   getRecentServers: () => ipcRenderer.invoke("omnigent:get-recent-servers"),
   /** Drop one recent server from the saved list; resolves the remaining ones. */
   forgetRecentServer: (url) => ipcRenderer.invoke("omnigent:forget-recent-server", url),
+  /**
+   * Advisory reachability probe for a server URL; resolves
+   * `{status: "ok" | "reachable" | "unreachable"}`. Never gates connecting.
+   * @param {string} url
+   */
+  checkServer: (url) => ipcRenderer.invoke("omnigent:check-server", url),
   /** Copy text from the bundled setup page to the native clipboard. */
   copyText: (text) => ipcRenderer.invoke("omnigent:copy-setup-text", text),
   /**
@@ -436,8 +442,7 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
    * var forces the choice.
    * @param {boolean} enabled
    */
-  setServerSelectorV2: (enabled) =>
-    ipcRenderer.invoke("omnigent:set-server-selector-v2", enabled),
+  setServerSelectorV2: (enabled) => ipcRenderer.invoke("omnigent:set-server-selector-v2", enabled),
   /**
    * Whether the `omnigent` CLI is installed/runnable, e.g.
    * `{installed, path, version, source, installCommand}`.

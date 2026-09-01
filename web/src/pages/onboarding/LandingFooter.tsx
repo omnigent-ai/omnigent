@@ -9,10 +9,30 @@ import { Button } from "@/components/ui/button";
 import { AndroidGlyph, AppleGlyph, DiscordGlyph } from "@/pages/onboarding/brandGlyphs";
 
 const LINKS: { key: string; label: string; icon: ReactNode; href: string }[] = [
-  { key: "ios", label: "iOS App", icon: <AppleGlyph />, href: "https://omnigent.ai/docs/interact/mobile#ios-app" },
-  { key: "android", label: "Android App", icon: <AndroidGlyph />, href: "https://omnigent.ai/docs/interact/mobile#android-app" },
-  { key: "github", label: "GitHub", icon: <GithubMono size={16} />, href: "https://github.com/omnigent-ai/omnigent" },
-  { key: "discord", label: "Join Discord", icon: <DiscordGlyph />, href: "https://discord.gg/omnigent" },
+  {
+    key: "ios",
+    label: "iOS App",
+    icon: <AppleGlyph />,
+    href: "https://omnigent.ai/docs/interact/mobile#ios-app",
+  },
+  {
+    key: "android",
+    label: "Android App",
+    icon: <AndroidGlyph />,
+    href: "https://omnigent.ai/docs/interact/mobile#android-app",
+  },
+  {
+    key: "github",
+    label: "GitHub",
+    icon: <GithubMono size={16} />,
+    href: "https://github.com/omnigent-ai/omnigent",
+  },
+  {
+    key: "discord",
+    label: "Join Discord",
+    icon: <DiscordGlyph />,
+    href: "https://discord.gg/omnigent",
+  },
 ];
 
 export function LandingFooter() {

@@ -53,10 +53,17 @@ export interface ServerSelectorV2Setup {
   onRemoveServer?: (url: string) => void;
   /** Copy text to the clipboard via the shell's native bridge. */
   onCopy: (text: string) => void;
+  /** Advisory reachability probe for a just-added server URL. */
+  onCheckServer: (url: string) => Promise<ServerCheckResult>;
   /** Open the Cloud deploy docs in the user's browser. */
   onCloudSetup: () => void;
   /** Revert to the classic (legacy) setup page. */
   onSwitchToLegacy: () => void;
+}
+
+/** Result of the advisory reachability probe. */
+export interface ServerCheckResult {
+  status: "ok" | "reachable" | "unreachable";
 }
 
 type Step = "landing" | "mode" | "server" | "terminal";
@@ -130,6 +137,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             onConnect={setup.onConnect}
             onRemove={setup.onRemoveServer}
             onCopy={setup.onCopy}
+            onCheckServer={setup.onCheckServer}
           />
         )}
       </AnimatedOmnigentPanel>

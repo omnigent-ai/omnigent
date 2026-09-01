@@ -2452,6 +2452,35 @@ function registerIpc() {
     return excludingManagedServers(remaining, managed);
   });
 
+  // Setup page → reachability/validity probe for a server the user just added.
+  // Advisory only (never gates Join): resolves one of
+  //   "ok"        — responded and looks like an Omnigent server (has the manifest)
+  //   "reachable" — responded, but the manifest is absent (old/unknown server)
+  //   "unreachable" — no response (network error / timeout / bad URL)
+  ipcMain.handle("omnigent:check-server", async (event, url) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("check-server is only available to the setup page");
+    }
+    let origin;
+    try {
+      origin = new URL(normalizeUrl(url)).origin;
+    } catch {
+      return { status: "unreachable" };
+    }
+    // Manifest present → definitively an Omnigent server.
+    const manifest = await fetchServerManifest(origin);
+    if (manifest.manifestVersion >= 1) return { status: "ok" };
+    // No manifest: distinguish "host answered" from "nothing there" with a
+    // liveness fetch (any HTTP response counts as reachable). Short timeout;
+    // a 4xx/5xx still means something is listening.
+    try {
+      await fetch(origin, { redirect: "manual", signal: AbortSignal.timeout(3000) });
+      return { status: "reachable" };
+    } catch {
+      return { status: "unreachable" };
+    }
+  });
+
   // Setup page → toggle the revamped server selector (settings.server_selector_v2)
   // and reload the sending window to the chosen page. Both setup pages drive
   // this: the classic page's CLI modal switches TO the new one, the V2 page's
