@@ -539,6 +539,95 @@ def test_managed_mint_factory_no_factory_when_server_definitively_refuses(
     assert _make_managed_mint_factory("https://s.example.com", "btok") is None
 
 
+def test_definitive_mint_refusal_is_not_reprobed_by_later_factory_builds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A remembered refusal makes later factory builds issue no mint request.
+
+    Several startup call sites each build an auth token factory. On a server
+    that never mints (no auth provider, or header/proxy auth mode) the outer
+    factory resolves to ``None``, so the process-wide singleton is never
+    installed and every one of those calls re-runs resolution — re-probing the
+    mint endpoint with a blocking POST, before the tunnel is even up, for a
+    refusal this process already learned.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+
+    mint_calls: list[int] = []
+
+    def _refuses(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Reject the mint the way a no-auth / header-mode server does (400)."""
+        del server_url, binding_token
+        mint_calls.append(1)
+        request = httpx.Request("POST", mint_url)
+        raise httpx.HTTPStatusError(
+            "unsupported", request=request, response=httpx.Response(400, request=request)
+        )
+
+    def _no_sdk(profile: str | None = None) -> tuple[Any, str]:
+        """Stand in for _resolve_databricks_auth with no credentials."""
+        raise DatabricksAuthError("no Databricks credentials configured")
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://omnigent.example.com")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "host-binding-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.delenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
+    monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _no_sdk)
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _refuses)
+
+    # One probe learns the refusal — including for the delegated-mint fallback
+    # the same call would otherwise re-probe after credential discovery fails.
+    assert _make_auth_token_factory() is None
+    assert mint_calls == [1]
+
+    # Every later startup call site reuses it: no further request.
+    assert _make_auth_token_factory() is None
+    assert _make_auth_token_factory() is None
+    assert _make_auth_token_factory() is None
+    assert mint_calls == [1]
+
+
+def test_transient_mint_failure_is_not_remembered_across_factory_builds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only definitive refusals are remembered; a boot blip is re-probed.
+
+    A transient failure installs a factory armed to retry, and a later build
+    must probe again rather than inherit a cached "no" — otherwise one blip at
+    boot would leave the runner unauthenticated until process restart.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _blip_then_mint(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Fail the first probe with a connection error, then mint."""
+        del mint_url, server_url, binding_token
+        calls.append(1)
+        if len(calls) == 1:
+            raise httpx.ConnectError("mint endpoint unreachable at boot")
+        return ("jwt-1", time.time() + 1800)
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _blip_then_mint)
+
+    first = _make_managed_mint_factory("https://s.example.com", "btok")
+    assert first is not None  # installed despite the boot blip
+
+    second = _make_managed_mint_factory("https://s.example.com", "btok")
+    assert second is not None  # the blip was not cached as a refusal
+    assert second() == "jwt-1"
+    assert len(calls) == 2  # failed probe + the probe that succeeded
+
+
 def test_managed_mint_factory_installs_for_retry_on_transient_boot_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

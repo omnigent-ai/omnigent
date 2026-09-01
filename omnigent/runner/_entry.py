@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import gc
+import hashlib
 import logging
 import os
 import signal
@@ -67,6 +68,27 @@ _logger = logging.getLogger(__name__)
 # shares the proxy bearer, even after RUNNER_INITIAL_AUTH_TOKEN has been
 # popped from the environment.
 _runner_auth_factory: Callable[[], str | None] | None = None
+
+# Mint attempts the server definitively refused, keyed by
+# ``(mint_url, proxy-bearer digest)``. Whether a server mints at all is a
+# property of its auth configuration, so the refusal is remembered and later
+# probes skip the blocking POST. Only definitive refusals land here; a
+# transient failure must keep installing a retrying factory.
+_declined_mint_probes: set[tuple[str, str]] = set()
+
+
+def _declined_mint_probe_cache() -> set[tuple[str, str]]:
+    """Return the process-wide declined-mint cache.
+
+    Read through the canonical module so the runner's ``__main__`` copy of this
+    file and later importers share one cache — the same split
+    :func:`_set_runner_auth_factory` exists for.
+
+    :returns: The mutable set of definitively-refused mint attempts.
+    """
+    import omnigent.runner._entry as canonical
+
+    return canonical._declined_mint_probes
 
 
 def _set_runner_auth_factory(factory: Callable[[], str | None] | None) -> None:
@@ -716,11 +738,25 @@ def _make_managed_mint_factory(
         bare requests. A post-install 401/403 with no still-valid cache
         latches ``proxy_auth_failed`` instead, which
         :class:`_InitialAuthTokenFactory` answers by re-resolving SDK/OIDC.
+
+    A definitive refusal is remembered per ``(mint_url, proxy bearer)`` for the
+    life of the process, so the several startup callers that each build a
+    factory pay for the probe once rather than once apiece. Transient failures
+    are never remembered.
     """
     from omnigent.runner.identity import token_bound_runner_id
 
     runner_id = token_bound_runner_id(binding_token)
     mint_url = f"{server_url.rstrip('/')}/v1/runners/{runner_id}/token"
+
+    # Reuse a refusal already learned for this exact attempt rather than
+    # spending another blocking round trip on it. ``mint_url`` already carries
+    # the server URL and the binding-token digest; the proxy bearer joins the
+    # key because an Apps OAuth redirect depends on which bearer was presented.
+    declined_probes = _declined_mint_probe_cache()
+    probe_key = (mint_url, hashlib.sha256((proxy_bearer or "").encode()).hexdigest())
+    if probe_key in declined_probes:
+        return None
 
     # Construction probe. Decline to install the factory ONLY when the
     # server definitively will not mint for this runner — HTTP 400 (no auth
@@ -734,7 +770,12 @@ def _make_managed_mint_factory(
         mint_url, server_url, binding_token, proxy_bearer=proxy_bearer
     )
     factory()
-    if factory.declined or factory.proxy_auth_failed:
+    if factory.declined:
+        declined_probes.add(probe_key)
+        return None
+    if factory.proxy_auth_failed:
+        # Not remembered: the presented bearer died, which a caller answers by
+        # re-resolving SDK/OIDC. It says nothing about whether the server mints.
         return None
     return factory
 

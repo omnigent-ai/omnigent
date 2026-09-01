@@ -74,6 +74,21 @@ def _ensure_subprocess_pythonpath(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PYTHONPATH", new_path)
 
 
+@pytest.fixture(autouse=True)
+def _reset_declined_mint_probes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give each test a fresh managed-mint refusal cache.
+
+    ``_make_managed_mint_factory`` remembers a definitive refusal for the life
+    of the process, so without this a test that drives the refusal would make
+    every later test using the same server URL and binding token see a cached
+    "no" instead of probing.
+
+    :param monkeypatch: Pytest monkeypatch fixture; restores the cache at
+        teardown.
+    """
+    monkeypatch.setattr("omnigent.runner._entry._declined_mint_probes", set())
+
+
 def _drain_session_event_queue(queue: asyncio.Queue[Any] | None) -> list[dict[str, Any]]:
     """
     Drain and return every dict item currently on a runner session queue.
