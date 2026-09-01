@@ -11,7 +11,8 @@
  *
  * - **General** — app-wide behavior preferences.
  * - **Appearance** — theme mode (System / Light / Dark), terminal theme,
- *   default transcript view, Workspace panel default, and UI/code font controls.
+ *   default transcript view, Workspace panel and tab defaults, and UI/code font
+ *   controls.
  * - **Git** — Git behavior: the global "always use a random worktree" default
  *   and the default base branch pre-filled when naming a new worktree branch.
  * - **Keyboard shortcuts** — the full shortcuts reference, shown inline.
@@ -43,7 +44,11 @@ import {
 import {
   ArchiveRestoreIcon,
   AlertTriangleIcon,
+  BotIcon,
   DownloadIcon,
+  FileDiffIcon,
+  FilesIcon,
+  GlobeIcon,
   KeyRoundIcon,
   Loader2Icon,
   LaptopMinimalIcon,
@@ -165,6 +170,12 @@ import {
   writeTranscriptViewDefault,
   type TranscriptViewDefault,
 } from "@/lib/transcriptViewPreferences";
+import {
+  DEFAULT_WORKSPACE_TAB,
+  readDefaultWorkspaceTab,
+  writeDefaultWorkspaceTab,
+  type DefaultWorkspaceTab,
+} from "@/lib/workspaceTabPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import {
@@ -369,6 +380,17 @@ const workspacePanelCards: {
   { value: "collapsed", label: "Collapsed", icon: PanelRightCloseIcon },
 ];
 
+const workspaceTabCards: {
+  value: DefaultWorkspaceTab;
+  label: string;
+  icon: typeof FilesIcon;
+}[] = [
+  { value: "files", label: "Files", icon: FilesIcon },
+  { value: "changes", label: "Changes", icon: FileDiffIcon },
+  { value: "subagents", label: "Agents", icon: BotIcon },
+  { value: "browser", label: "Browser", icon: GlobeIcon },
+];
+
 /** Centered icon + label body shared by the Mode and Terminal theme cards. */
 function iconCardBody(Icon: typeof SunIcon, label: string) {
   return (
@@ -527,6 +549,36 @@ function WorkspacePanelDefaultControl() {
         items={workspacePanelCards.map((card) => ({
           value: card.value,
           testId: `workspace-panel-default-${card.value}`,
+          body: iconCardBody(card.icon, card.label),
+        }))}
+      />
+    </ThemeSubsection>
+  );
+}
+
+/** Fallback tab for sessions without a remembered Workspace tab. */
+function WorkspaceTabDefaultControl() {
+  const [value, setValue] = useState(() => readDefaultWorkspaceTab());
+  const labelId = useId();
+  const choose = useCallback((next: DefaultWorkspaceTab) => {
+    setValue(next);
+    writeDefaultWorkspaceTab(next);
+  }, []);
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Default Workspace tab"
+      helper="Used when a chat has no remembered tab. Unavailable tabs fall back to Files, then the first available tab."
+    >
+      <CardRadioGroup<DefaultWorkspaceTab>
+        labelledBy={labelId}
+        value={value}
+        onSelect={choose}
+        className="grid grid-cols-2 gap-3 sm:grid-cols-4"
+        cardClassName="items-center gap-2 p-4"
+        items={workspaceTabCards.map((card) => ({
+          value: card.value,
+          testId: `workspace-tab-default-${card.value}`,
           body: iconCardBody(card.icon, card.label),
         }))}
       />
@@ -775,6 +827,8 @@ function AppearanceSection() {
 
     writeWorkspacePanelDefault(WORKSPACE_PANEL_DEFAULT);
 
+    writeDefaultWorkspaceTab(DEFAULT_WORKSPACE_TAB);
+
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
 
     applyDesktopUiFontSize(UI_FONT_SIZE_DEFAULT);
@@ -801,6 +855,7 @@ function AppearanceSection() {
           "omnigent:custom-theme",
           "omnigent:default-transcript-view",
           "omnigent:default-workspace-panel",
+          "omnigent:default-workspace-tab",
           "omnigent:hide-unconfigured-harnesses",
         ]) {
           window.localStorage.removeItem(key);
@@ -884,6 +939,8 @@ function AppearanceSection() {
         <TranscriptViewDefaultControl />
 
         <WorkspacePanelDefaultControl />
+
+        <WorkspaceTabDefaultControl />
 
         <HideUnconfiguredHarnessesControl />
 

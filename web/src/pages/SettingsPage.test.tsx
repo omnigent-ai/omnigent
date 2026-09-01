@@ -358,6 +358,38 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:default-transcript-view")).toBe("terminal");
   });
 
+  it("selects and persists the default Workspace tab", () => {
+    renderPage("/settings/appearance");
+
+    expect(screen.getByRole("radiogroup", { name: "Default Workspace tab" })).toBeInTheDocument();
+    expect(screen.getByTestId("workspace-tab-default-files")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(localStorage.getItem("omnigent:default-workspace-tab")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("workspace-tab-default-subagents"));
+    expect(screen.getByTestId("workspace-tab-default-subagents")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(localStorage.getItem("omnigent:default-workspace-tab")).toBe("subagents");
+  });
+
+  it("seeds the default Workspace tab from storage", () => {
+    localStorage.setItem("omnigent:default-workspace-tab", "changes");
+    renderPage("/settings/appearance");
+
+    expect(screen.getByTestId("workspace-tab-default-changes")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.getByTestId("workspace-tab-default-files")).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+  });
+
   it("renders the color theme dropdown, defaults to Omnigent, and applies a palette on change", () => {
     localStorage.clear();
     renderPage("/settings/appearance");
@@ -556,6 +588,7 @@ describe("SettingsPage", () => {
     });
     fireEvent.click(screen.getByTestId("transcript-view-default-terminal"));
     fireEvent.click(screen.getByTestId("workspace-panel-default-collapsed"));
+    fireEvent.click(screen.getByTestId("workspace-tab-default-subagents"));
     fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
@@ -573,6 +606,7 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
     expect(localStorage.getItem("omnigent:default-transcript-view")).toBe("terminal");
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
+    expect(localStorage.getItem("omnigent:default-workspace-tab")).toBe("subagents");
     expect(localStorage.getItem("omnigent:ui-font-size")).toBe("15");
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("15");
     expect(localStorage.getItem("omnigent:code-font-weight")).toBe("500");
@@ -599,7 +633,7 @@ describe("SettingsPage", () => {
     expect((screen.getByTestId("color-theme-select") as HTMLSelectElement).value).toBe("omni");
     expect(document.documentElement.getAttribute("data-theme")).toBeNull();
 
-    // Terminal theme, transcript view, workspace panel, and harness visibility are restored.
+    // Terminal theme, transcript view, workspace defaults, and harness visibility are restored.
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "true");
     expect(screen.getByTestId("transcript-view-default-chat")).toHaveAttribute(
       "aria-checked",
@@ -609,6 +643,11 @@ describe("SettingsPage", () => {
       "aria-checked",
       "true",
     );
+    expect(screen.getByTestId("workspace-tab-default-files")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(localStorage.getItem("omnigent:default-workspace-tab")).toBeNull();
     expect(screen.getByTestId("hide-unconfigured-harnesses-toggle")).toHaveAttribute(
       "aria-checked",
       "false",
