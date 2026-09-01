@@ -36,13 +36,24 @@ import {
 import { TruncatedBanner } from "./TruncatedBanner";
 import "./pdfViewer.css";
 
-// Point pdf.js at its worker. Vite imports the worker entry as a static asset so
-// the bundled SPA emits it as a hashed file without relying on the package
-// path resolving from `node_modules`.
-// oxlint-disable-next-line import/default -- Vite's `?url` import returns the asset URL.
-import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
-
-pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+// Point pdf.js at its worker via a real Worker instance, mirroring
+// monacoSetup.ts. Only the `new Worker(new URL(..., import.meta.url))` pattern
+// gets emitted as a content-hashed asset by BOTH Vite (standalone) and the
+// embed library build (which the universe monolith's rspack then re-emits). A
+// `workerSrc` string — whether from `?url` or `new URL(...).toString()` — is
+// treated as a generic asset and INLINED as a `data:` URL in the embed lib
+// build; the browser can't load a module worker from a data: URL, which is why
+// managed omnigent failed to render PDFs.
+//
+// Eager at module scope, but this module is lazy-loaded (only when a PDF opens,
+// via CodeViewer) so the worker is created once and reused for the app
+// lifetime. It bypasses pdf.js's fake-worker fallback, so a restrictive worker
+// CSP or a non-Worker environment (jsdom) throws on import — importing tests
+// must mock this module (CodeViewer.test.tsx already mocks ./PdfViewer).
+pdfjs.GlobalWorkerOptions.workerPort = new Worker(
+  new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url),
+  { type: "module" },
+);
 
 const MIN_SCALE = 0.5;
 const MAX_SCALE = 3;
@@ -123,7 +134,6 @@ export function PdfViewer({
   onSetActiveSelection,
 }: PdfViewerProps) {
   const canEdit = useCanEdit(conversationId);
-  const [url, setUrl] = useState<string | null>(null);
   const [numPages, setNumPages] = useState(0);
   const [errored, setErrored] = useState(false);
   const [scale, setScale] = useState(1);
@@ -138,20 +148,22 @@ export function PdfViewer({
   const activeSelectionRef = useRef(activeSelection);
   activeSelectionRef.current = activeSelection;
 
-  // Build/revoke the object URL when the file changes. A truncated PDF is a
-  // partial byte stream that pdf.js can't parse, so skip the blob and show the
-  // error/banner UI instead of flashing a failed render.
+  // Hand pdf.js a Blob rather than an object URL. A URL string makes pdf.js run
+  // its own fetch on the main thread and build request Headers — under the
+  // managed (embedded) host that fetch path threw "Failed to construct
+  // 'Headers'" and the PDF never rendered. react-pdf reads a Blob via FileReader
+  // (no fetch), and — crucially — decodes fresh bytes on each load: pdf.js
+  // transfers/detaches the buffer it's handed, so a shared `{ data }` array
+  // would fail its second load (StrictMode's double-mount, a retry, a remount)
+  // with a detached-ArrayBuffer DataCloneError. The Blob is re-read each time,
+  // so every load gets its own buffer. Memoized so the Document only reloads
+  // when the file changes. A truncated PDF is a partial byte stream pdf.js can't
+  // parse, so show the error/banner UI instead.
+  const pdfFile = useMemo(() => (data.truncated ? null : fileContentToBlob(data)), [data]);
+
   useEffect(() => {
-    if (data.truncated) {
-      setUrl(null);
-      setErrored(true);
-      return;
-    }
-    setErrored(false);
+    setErrored(!!data.truncated);
     setNumPages(0);
-    const objectUrl = URL.createObjectURL(fileContentToBlob(data));
-    setUrl(objectUrl);
-    return () => URL.revokeObjectURL(objectUrl);
   }, [data]);
 
   // Measure the container so pages fit its width (minus padding) at scale 1.
@@ -339,9 +351,9 @@ export function PdfViewer({
       </div>
 
       <div ref={containerRef} className="pdf-viewer min-h-0 flex-1 overflow-auto bg-muted/30 p-4">
-        {url && (
+        {pdfFile && (
           <Document
-            file={url}
+            file={pdfFile}
             onLoadSuccess={(doc) => setNumPages(doc.numPages)}
             onLoadError={() => setErrored(true)}
             loading={centered("Loading PDF…")}

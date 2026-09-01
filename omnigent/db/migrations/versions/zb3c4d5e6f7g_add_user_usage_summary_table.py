@@ -1,7 +1,7 @@
 """Add user_usage_summary table for pre-computed breakdowns.
 
 Revision ID: zb3c4d5e6f7g
-Revises: e5d9bc8ac650
+Revises: ga1b2c3d4e5f
 Create Date: 2026-08-30 00:00:00.000000
 
 Adds a new ``user_usage_summary`` table to store pre-aggregated usage breakdowns
@@ -40,7 +40,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "zb3c4d5e6f7g"
-down_revision: str | None = "e5d9bc8ac650"
+down_revision: str | None = "ga1b2c3d4e5f"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

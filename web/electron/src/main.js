@@ -1953,6 +1953,7 @@ function buildMenu() {
     {
       id: "new_window",
       label: "New Window",
+      accelerator: "CmdOrCtrl+Shift+N",
       click: () => newWindow(),
     },
     {

@@ -11,7 +11,12 @@ from playwright.sync_api import Page, Route, expect
 from tests.e2e_ui.conftest import fetch_with_retry
 
 
-def _patch_session_as_codex_native(page: Page, session_id: str) -> list[dict]:
+def _patch_session_as_codex_native(
+    page: Page,
+    session_id: str,
+    *,
+    custom_agent: bool = False,
+) -> list[dict]:
     """Patch the browser's session snapshot into a codex-native response.
 
     The server fixture seeds a normal ``hello_world`` session so the page can
@@ -22,6 +27,8 @@ def _patch_session_as_codex_native(page: Page, session_id: str) -> list[dict]:
 
     :param page: Playwright page before navigation.
     :param session_id: Session id to patch, e.g. ``"conv_abc123"``.
+    :param custom_agent: Remove the presentation wrapper label and report the
+        resolved ``codex-native`` harness, matching a YAML custom agent.
     :returns: Captured PATCH request bodies.
     """
     latest_payload: dict | None = None
@@ -67,11 +74,13 @@ def _patch_session_as_codex_native(page: Page, session_id: str) -> list[dict]:
             route.continue_()
             return
 
-        payload["labels"] = {
-            **payload.get("labels", {}),
-            "omnigent.wrapper": "codex-native-ui",
-        }
-        payload["harness"] = "codex"
+        labels = dict(payload.get("labels", {}))
+        if custom_agent:
+            labels.pop("omnigent.wrapper", None)
+        else:
+            labels["omnigent.wrapper"] = "codex-native-ui"
+        payload["labels"] = labels
+        payload["harness"] = "codex-native" if custom_agent else "codex"
         payload["llm_model"] = "gpt-5.5"
         payload["reasoning_effort"] = "xhigh"
         payload["model_options"] = [
@@ -151,6 +160,37 @@ def test_codex_native_picker_uses_raw_model_metadata(
     expect(effort_row).to_contain_text("xhigh")
     # Codex effort ids render raw (not title-cased) even in the shared Select.
     assert effort_row.evaluate("el => getComputedStyle(el).textTransform") == "none"
+
+
+def test_custom_codex_native_agent_keeps_model_and_effort_controls(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Expose Codex controls from the resolved harness without a wrapper label.
+
+    YAML custom agents do not receive the built-in ``omnigent.wrapper``
+    presentation label. The authoritative session snapshot still identifies
+    their resolved harness as ``codex-native``, which is sufficient evidence
+    that model and reasoning-effort overrides are supported.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` for a real server-backed
+        session; the browser snapshot is patched to a custom codex-native agent.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    _patch_session_as_codex_native(page, session_id, custom_agent=True)
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    label = page.get_by_test_id("composer-model-effort-label")
+    expect(label).to_contain_text("Codex Pretty 5.5 xhigh", timeout=15_000)
+
+    gear = page.get_by_test_id("composer-config-gear")
+    expect(gear).to_be_visible()
+    gear.click()
+    expect(page.get_by_test_id("composer-config-model")).to_be_visible()
+    expect(page.get_by_test_id("composer-config-effort")).to_contain_text("xhigh")
 
 
 def test_codex_native_plan_mode_toggle_uses_codex_session_patch(

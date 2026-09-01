@@ -2690,6 +2690,7 @@ class _CodexAppServerSession:
                 break
 
         message_buffers: dict[str, str] = {}
+        last_reasoning_item_id: str | None = None
         pending_tool_results: dict[str, _PendingToolResult] = {}
         observed_builtin_tool_ids: set[str] = set()
         completed_builtin_tool_ids: set[str] = set()
@@ -2899,6 +2900,18 @@ class _CodexAppServerSession:
                     raw_reasoning_delta = params.get("delta")
                     if not isinstance(raw_reasoning_delta, str) or not raw_reasoning_delta:
                         continue
+                    # Each reasoning paragraph streams as its own item, so a
+                    # new itemId marks a paragraph boundary. Surface it as a
+                    # reasoning_started marker: downstream reducers flush the
+                    # prior paragraph's held tail and insert a separator.
+                    raw_reasoning_item_id = params.get("itemId")
+                    if isinstance(raw_reasoning_item_id, str) and raw_reasoning_item_id:
+                        if (
+                            last_reasoning_item_id is not None
+                            and raw_reasoning_item_id != last_reasoning_item_id
+                        ):
+                            yield ReasoningChunk(delta="", event_type="reasoning_started")
+                        last_reasoning_item_id = raw_reasoning_item_id
                     yield ReasoningChunk(delta=raw_reasoning_delta, event_type="reasoning_text")
                     continue
 

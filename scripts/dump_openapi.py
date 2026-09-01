@@ -20,7 +20,10 @@ This script:
 5. Rewrites the ``text/event-stream`` content entries on the SSE
    routes to use the OAS 3.2 ``itemSchema`` keyword in place of
    FastAPI's 3.1 ``schema`` keyword.
-6. Writes the result to ``openapi.json`` at the repo root.
+6. Stamps numeric ``format`` (``int64`` / ``double``) onto formatless
+   component schemas so typed-language generators pick the same
+   width as the Python producer.
+7. Writes the result to ``openapi.json`` at the repo root.
 
 Run with no arguments to (re)generate the file. Pass ``--check``
 in CI to verify the on-disk file is up to date — non-zero exit
@@ -711,6 +714,51 @@ def _reformat_component_schemas(components: dict[str, Any]) -> None:
             _reformat_schema_node(schema)
 
 
+# Payload keys that can hold numbers without being schema nodes. Walking
+# them would stamp ``format`` onto example values, not types.
+_SCHEMA_PAYLOAD_KEYS: frozenset[str] = frozenset(
+    {"default", "example", "examples", "const", "enum"},
+)
+
+
+def _annotate_number_formats(components: dict[str, Any]) -> None:
+    """
+    Stamp numeric ``format`` on formatless schema nodes.
+
+    Pydantic emits no numeric format, so generators guess: a formatless
+    ``number`` becomes float32 / BigDecimal and a formatless
+    ``integer`` becomes int32, neither of which matches Python's float
+    (binary64) or int (arbitrary width). Uses setdefault so the model
+    layer stays authoritative wherever it sets a format itself.
+
+    Scoped to ``components.schemas`` so request examples and other
+    data payloads are not rewritten.
+    """
+
+    def walk(node: Any, *, keys_are_names: bool = False) -> None:
+        # ``keys_are_names`` marks maps whose keys are user-chosen names
+        # (schema/property names), so a property literally named
+        # ``default`` or ``enum`` is still a schema node to stamp.
+        if isinstance(node, dict):
+            if not keys_are_names:
+                if node.get("type") == "number":
+                    node.setdefault("format", "double")
+                elif node.get("type") == "integer":
+                    node.setdefault("format", "int64")
+            for key, value in node.items():
+                if keys_are_names:
+                    walk(value)
+                elif key in ("properties", "patternProperties"):
+                    walk(value, keys_are_names=True)
+                elif key not in _SCHEMA_PAYLOAD_KEYS:
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(components.get("schemas", {}), keys_are_names=True)
+
+
 def _normalize_inline_descriptions(node: Any) -> None:
     """
     Final safety net: normalize inline reST in any remaining description.
@@ -741,7 +789,8 @@ def _enrich_spec(spec: dict[str, Any]) -> None:
     human-readable descriptions, and ``components.securitySchemes`` —
     none of which FastAPI emits — tags the untagged utility routes, and
     rewrites reST docstrings (operations, parameters, and component
-    schemas) as Markdown.
+    schemas) as Markdown, and stamps numeric ``format`` on formatless
+    component schemas.
     Mutates ``spec`` in place. See the module-level enrichment
     constants for the rationale behind each value.
 
@@ -760,6 +809,7 @@ def _enrich_spec(spec: dict[str, Any]) -> None:
     _retag_session_resources(paths)
     _reformat_descriptions(paths)
     _reformat_component_schemas(components)
+    _annotate_number_formats(components)
     _normalize_inline_descriptions(spec)
 
 

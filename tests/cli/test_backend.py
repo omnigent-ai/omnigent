@@ -2095,6 +2095,185 @@ def test_databricks_preflight_non_interactive_overrides_tty(
     assert login_calls == []
 
 
+def _patch_rejected_credential_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pointer_workspace: str | None,
+    unauthed_status: int,
+    unauthed_realm: bool,
+) -> list[str]:
+    """Wire the pre-flight for a stale-bearer run the edge rejects with 403.
+
+    The credential chain mints a (stale) bearer, the authed ``/v1/me``
+    probe answers a bare 403 (no edge signature — the shape an expired
+    Databricks OAuth token gets), and the SDK can mint no fresh token.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param pointer_workspace: Workspace host the stored ``omnigent login``
+        pointer record names, or ``None`` when no record exists.
+    :param unauthed_status: Status the credential-less re-probe answers.
+    :param unauthed_realm: Whether that re-probe carries the
+        DatabricksRealm challenge.
+    :returns: Capture list of the URLs each probe was sent to with
+        ``"authed"``/``"unauthed"`` markers.
+    """
+    import httpx
+
+    probes: list[str] = []
+
+    def _get(url: str, **kwargs: object) -> httpx.Response:
+        headers = kwargs.get("headers")
+        authed = isinstance(headers, dict) and "Authorization" in headers
+        probes.append("authed" if authed else "unauthed")
+        if authed:
+            return httpx.Response(
+                403,
+                json={"error_code": 403, "message": "Invalid access token. [ReqId: x]"},
+                request=httpx.Request("GET", url),
+            )
+        realm_headers = (
+            {"www-authenticate": 'Bearer realm="DatabricksRealm"'} if unauthed_realm else {}
+        )
+        return httpx.Response(
+            unauthed_status, headers=realm_headers, request=httpx.Request("GET", url)
+        )
+
+    monkeypatch.setattr(
+        "omnigent.chat._remote_headers",
+        lambda server_url=None, *, host_id=None: {"Authorization": "Bearer stale"},
+    )
+    monkeypatch.setattr(httpx, "get", _get)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_workspace_host", lambda server: pointer_workspace
+    )
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: None)
+    monkeypatch.setattr(cli, "_databricks_workspace_auth_info", lambda workspace: None)
+    monkeypatch.setattr(
+        cli, "_databricks_login", lambda *args, **kwargs: pytest.fail("browser login ran")
+    )
+    return probes
+
+
+def test_databricks_preflight_expired_credential_routes_to_reauth_via_pointer_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 403-rejected stale bearer surfaces the re-login hint, not the raw 403.
+
+    The edge rejects an expired bearer with a bare 403 (no OAuth redirect,
+    no DatabricksRealm challenge), so the shape classifier alone can't see
+    Databricks — the stored ``omnigent login`` pointer record names the
+    fronting workspace and must route the run to reauth instead of letting
+    it die at session-create with the raw ``Invalid access token`` error.
+    """
+    probes = _patch_rejected_credential_preflight(
+        monkeypatch,
+        pointer_workspace="https://example.databricks.com",
+        unauthed_status=403,
+        unauthed_realm=False,
+    )
+
+    with pytest.raises(click.ClickException) as exc:
+        cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
+
+    assert "expired or was revoked" in str(exc.value)
+    assert f"omnigent login {_HOST_DATABRICKS_SERVER}" in str(exc.value)
+    # The pointer record answered; no credential-less re-probe was needed.
+    assert probes == ["authed"]
+
+
+def test_databricks_preflight_expired_credential_routes_to_reauth_via_reprobe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a pointer record, a credential-less re-probe classifies the edge.
+
+    Ambient workspace-CLI profile credentials (no ``omnigent login`` record)
+    can also go stale; the bare re-probe surfaces the DatabricksRealm
+    challenge the stale bearer masked, so the run still routes to reauth.
+    """
+    probes = _patch_rejected_credential_preflight(
+        monkeypatch,
+        pointer_workspace=None,
+        unauthed_status=401,
+        unauthed_realm=True,
+    )
+
+    with pytest.raises(click.ClickException) as exc:
+        cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
+
+    assert "expired or was revoked" in str(exc.value)
+    assert f"omnigent login {_HOST_DATABRICKS_SERVER}" in str(exc.value)
+    assert probes == ["authed", "unauthed"]
+
+
+def test_databricks_preflight_leaves_non_databricks_403_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 403 from a non-Databricks server is not misread as an expired login.
+
+    No pointer record and no edge signature on the credential-less
+    re-probe means the rejection is the server's own (e.g. a permission
+    refusal) — suggesting a re-login could not help, so the pre-flight
+    steps aside and lets the connect path report the real error.
+    """
+    probes = _patch_rejected_credential_preflight(
+        monkeypatch,
+        pointer_workspace=None,
+        unauthed_status=403,
+        unauthed_realm=False,
+    )
+
+    cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
+
+    assert probes == ["authed", "unauthed"]
+
+
+def test_databricks_preflight_rejected_credential_recovers_via_sdk_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected stale bearer still recovers silently when the SDK can refresh."""
+    import httpx
+
+    stored: list[tuple[str, str]] = []
+
+    def _get(url: str, **kwargs: object) -> httpx.Response:
+        headers = kwargs.get("headers")
+        auth = headers.get("Authorization") if isinstance(headers, dict) else None
+        if auth == "Bearer fresh-token":
+            return httpx.Response(200, request=httpx.Request("GET", url))
+        return httpx.Response(
+            403,
+            json={"error_code": 403, "message": "Invalid access token. [ReqId: x]"},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(
+        "omnigent.chat._remote_headers",
+        lambda server_url=None, *, host_id=None: {"Authorization": "Bearer stale"},
+    )
+    monkeypatch.setattr(httpx, "get", _get)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_workspace_host",
+        lambda server: "https://example.databricks.com",
+    )
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: None)
+    monkeypatch.setattr(
+        cli,
+        "_databricks_workspace_auth_info",
+        lambda workspace: cli._DatabricksWorkspaceAuthInfo(token="fresh-token", profile_name=None),
+    )
+    monkeypatch.setattr(
+        cli, "_databricks_login", lambda *args, **kwargs: pytest.fail("browser login ran")
+    )
+    monkeypatch.setattr(
+        "omnigent.cli_auth.store_databricks_auth",
+        lambda server, workspace, user_id=None, org_id=None: stored.append((server, workspace)),
+    )
+
+    cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
+
+    assert stored == [(_HOST_DATABRICKS_SERVER, "https://example.databricks.com")]
+
+
 def _patch_foreground_host(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

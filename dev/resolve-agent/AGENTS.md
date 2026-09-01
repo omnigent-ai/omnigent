@@ -99,26 +99,32 @@ The repro worktree is gone, so recover from the run's artifacts and logs with th
 `gh` CLI. Be **tolerant** — the exact artifact layout may vary, so try in order
 and fall back rather than assuming a fixed structure:
 
-1. `gh run view <ci_link> --log` (and `--json` for metadata) to read the job
-   output. repro-agent's final message is echoed in its step log **untruncated**,
-   so the log carries two things you need: the final ```json handoff block (parse
-   `verdict`/`facets`/`test_path`/`journey`/`bug_url`/`session_id` from it) and,
-   immediately before it, the **complete verbatim source of the e2e test** pasted
-   as a path-labelled code block (repro-agent's contract). Prefer reading the test
-   body from that inline block in the log — unlike a live session transcript, the
-   CI log is not truncated, so the pasted test is complete here.
+1. Download this run's `repro-bundle-<run-id>` artifact first. If it contains
+   top-level `repro-handoff.json`, parse and validate that checkpoint before
+   reading the full job log: it is the smallest, most direct structured source
+   for `verdict`/`facets`/`test_path`/`journey`/`bug_url`/`session_id`. Copy each
+   test named by `test_path` from the artifact's `files/` tree into your checkout.
+   Also retain `patch.diff`, recordings, and `run.log` as supporting evidence.
+
+   The checkpoint is intentionally raw: a producing workflow may have classified
+   a forward-compatible schema as unknown while your newer consumer understands
+   it. Validate it yourself against the authoritative input `bug_url`; do not
+   reject it merely because the old run reported an unknown handoff.
+
+2. Only when the artifact checkpoint is absent or invalid, inspect `run.log` from
+   the downloaded bundle, then fall back to `gh run view <ci_link> --log`. The
+   final repro message is echoed in the job log **untruncated**, so its last
+   ```json block can recover the handoff. The log may also carry the complete
+   verbatim source of the e2e test as a path-labelled code block; use that only
+   when the artifact's `files/` tree did not preserve the test.
 
    **This run's handoff is authoritative.** The `ci_link` you were given names
    exactly one repro run, and its `bug_url` is the bug you resolve — no other.
    You are running on a **shared server that hosts many other repro sessions**;
    do **not** call `sys_session_list` and pick "a" repro session, and do not
    resolve a different bug because its session looks handy on this server. If you
-   cannot find the handoff block in this run's log, stop with `needs_more_info` —
-   never fall back to a bug you found by browsing the server.
-2. `gh run download <run-id>` to pull artifacts as a fallback for the test's
-   content — an authored test file or a diff/patch artifact — if the log's inline
-   block is unavailable or was clipped. Either way, materialize the full test into
-   your checkout at `test_path`.
+   cannot find a handoff in this run's artifact or logs, stop with
+   `needs_more_info` — never fall back to a bug you found by browsing the server.
 3. If the run also recorded a shareable `session_id` you can reach, read it with
    `sys_session_get_history` for richer context — but **only** the exact
    `session_id` this run's handoff named. Before trusting it, confirm that
@@ -611,6 +617,17 @@ Once the set is genuinely green:
    diff). Follow the repo's commit conventions. You likely committed already in
    2B.6 to produce the review diff; if the cross-vendor review led to further
    changes, amend or add a follow-up commit so the branch reflects the final fix.
+   **Never commit workspace artifacts.** The commit must contain only the fix and
+   its reproduction test — nothing else. In particular, **never** stage or commit
+   the `recordings/` clips or any `.omnigent/` handoff files (e.g.
+   `.omnigent/repro-handoff.json`): recordings are workspace artifacts that ride
+   in the PR's Demo section / CI artifact bundle, not in the diff (see
+   [`dev/recording-lanes.md`](../recording-lanes.md)). Do **not** use a blanket
+   `git add -A` / `git add .` that sweeps them in — stage the fix and test paths
+   explicitly, and run `git status` / `git diff --cached --stat` before committing
+   to confirm the staged set is only the fix + test. If a recording or handoff
+   file already landed in an earlier commit on this branch, remove it (e.g.
+   `git rm --cached`) so it never reaches the PR.
 2. **If the input has `skip_push: true`, stop here** — the fix is committed
    locally; do **not** push and do **not** open a PR. Report the branch name in
    your output (`pushed_branch`) so a human can inspect, push, and PR it. (The

@@ -317,8 +317,8 @@ from omnigent.server.schemas import (
     ElicitationResult,
     ErrorDetail,
     NativeModelOption,
+    SessionCreateInput,
     SessionCreateMetadata,
-    SessionCreateRequest,
     SessionEventInput,
     SessionListItem,
     SessionModelEvent,
@@ -347,6 +347,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.project_store import ProjectStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.events import NativeSessionUsageEvent as _TelNativeSessionUsageEvent
 from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedEvent
@@ -7404,7 +7405,7 @@ def _ungatewayed_model_routing_error(harness: str) -> str:
 
 
 async def _reject_ungatewayed_model_routing(
-    body: SessionCreateRequest,
+    body: SessionCreateInput,
     request: Request,
     user_id: str | None,
     agent: Agent,
@@ -7540,7 +7541,7 @@ async def _pre_session_model_catalog(
 
 
 async def _routing_host_for_create(
-    body: SessionCreateRequest,
+    body: SessionCreateInput,
     request: Request,
     user_id: str | None,
 ) -> Host | None:
@@ -7604,7 +7605,7 @@ def _create_resolved_harness(
 
 
 def _fixed_native_routing_harness(
-    body: SessionCreateRequest,
+    body: SessionCreateInput,
     agent: Agent,
     agent_cache: AgentCache | None,
 ) -> str | None:
@@ -7643,7 +7644,7 @@ def _fixed_native_routing_harness(
 
 
 def _spec_routes_its_own_harness(
-    body: SessionCreateRequest,
+    body: SessionCreateInput,
     agent: Agent,
     agent_cache: AgentCache | None,
 ) -> bool:
@@ -7690,7 +7691,7 @@ def _spec_routes_its_own_harness(
 
 
 def _spawn_pins_its_harness(
-    body: SessionCreateRequest,
+    body: SessionCreateInput,
     agent: Agent,
     agent_cache: AgentCache | None,
 ) -> bool:
@@ -7724,7 +7725,7 @@ def _spawn_pins_its_harness(
 
 
 async def _resolve_fixed_native_model_routing(
-    body: SessionCreateRequest,
+    body: SessionCreateInput,
     request: Request,
     user_id: str | None,
     harness: str,
@@ -7777,7 +7778,7 @@ async def _resolve_fixed_native_model_routing(
 
 
 async def _resolve_native_smart_routing(
-    body: SessionCreateRequest,
+    body: SessionCreateInput,
     request: Request,
     user_id: str | None,
 ) -> tuple[str | None, str | None, dict[str, Any] | None, str | None]:
@@ -7893,7 +7894,7 @@ async def _create_session_from_existing_agent(
     conversation_store: ConversationStore,
     agent_store: AgentStore,
     runner_router: RunnerRouter | None,
-    body: SessionCreateRequest,
+    body: SessionCreateInput,
     request: Request,
     agent_cache: AgentCache | None = None,
     user_id: str | None = None,
@@ -7902,7 +7903,8 @@ async def _create_session_from_existing_agent(
     file_store: FileStore | None = None,
     artifact_store: ArtifactStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
-) -> SessionResponse:
+    project_store: ProjectStore | None = None,
+) -> tuple[SessionResponse, tuple[dict[str, str], ...]]:
     """
     Create a session bound to an already-registered agent.
 
@@ -7936,6 +7938,18 @@ async def _create_session_from_existing_agent(
         403/404 if ``parent_session_id`` or session-scoped ``agent_id``
         fails authorization.
     """
+    from omnigent.server.routes._session_create_validation import (
+        resolve_project_session_create,
+    )
+
+    project_resolution = await resolve_project_session_create(
+        body=body,
+        user_id=user_id,
+        project_store=project_store,
+    )
+    body = project_resolution.body
+    assert body.agent_id is not None
+
     _reject_reserved_cost_control_label_seed(body.labels)
     _reject_server_reserved_label_seed(body.labels)
 
@@ -8296,6 +8310,31 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
+    if reasoning_effort is None:
+        effort_spec: AgentSpec | None = sub_spec
+        if effort_spec is None and agent_cache is not None and agent.bundle_location is not None:
+            try:
+                effort_loaded = await asyncio.to_thread(
+                    agent_cache.load,
+                    agent.id,
+                    agent.bundle_location,
+                    expand_env=agent.session_id is None,
+                )
+                effort_spec = effort_loaded.spec if effort_loaded is not None else None
+            except (OSError, ValueError, RuntimeError, KeyError, AttributeError, ImportError):
+                _logger.warning(
+                    "create: spec load for reasoning_effort default failed "
+                    "(agent=%s); session starts with no spec-level effort",
+                    agent.id,
+                    exc_info=True,
+                )
+        spec_effort = effort_spec.executor.reasoning_effort if effort_spec is not None else None
+        if spec_effort is not None:
+            _, reasoning_effort = validate_session_model_metadata(
+                model_override=None,
+                reasoning_effort=spec_effort,
+            )
+
     try:
         conv = conversation_store.create_conversation(
             agent_id=agent.id,
@@ -8308,6 +8347,7 @@ async def _create_session_from_existing_agent(
             workspace=canonical_workspace,
             git_branch=git_branch,
             terminal_launch_args=validated_launch_args,
+            project_id=project_resolution.project_id,
         )
     except NameAlreadyExistsError as exc:
         if (
@@ -8319,7 +8359,10 @@ async def _create_session_from_existing_agent(
                 host_id=body.host_id,
                 worktree_path=created_worktree_path,
                 branch=git_branch,
-                delete_branch=True,
+                # A recreated worktree checked out a pre-existing branch —
+                # remove the directory but keep the user's branch (and its
+                # unpushed commits).
+                delete_branch=body.git is None or not body.git.existing_branch,
                 request=request,
                 reason="create-rollback",
             )
@@ -8341,7 +8384,9 @@ async def _create_session_from_existing_agent(
                 host_id=body.host_id,
                 worktree_path=created_worktree_path,
                 branch=git_branch,
-                delete_branch=True,
+                # Same branch-preservation rule as the NameAlreadyExists
+                # rollback above: never -D a pre-existing branch.
+                delete_branch=body.git is None or not body.git.existing_branch,
                 request=request,
                 reason="create-rollback",
             )
@@ -8613,12 +8658,15 @@ async def _create_session_from_existing_agent(
     # Re-read rather than reusing the local ``conv``: the label-only branch
     # above and ``_forward_event_to_runner`` can mutate the row after it was
     # built, so a fresh read is what keeps the create response current.
-    return await _get_session_snapshot(
-        conversation_store,
-        conv.id,
-        agent_store=agent_store,
-        agent_cache=agent_cache,
-        liveness_lookup=liveness_lookup,
+    return (
+        await _get_session_snapshot(
+            conversation_store,
+            conv.id,
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+            liveness_lookup=liveness_lookup,
+        ),
+        project_resolution.warnings,
     )
 
 
@@ -8669,6 +8717,13 @@ def _create_session_from_bundle(
         enforce_handler_allowlist=not local_single_user_enabled(),
     )
     assert spec.name is not None
+
+    if metadata.reasoning_effort is None and spec.executor.reasoning_effort is not None:
+        _, seeded_effort = validate_session_model_metadata(
+            model_override=None,
+            reasoning_effort=spec.executor.reasoning_effort,
+        )
+        metadata = metadata.model_copy(update={"reasoning_effort": seeded_effort})
 
     agent_id = generate_agent_id()
     agent_bundle_location = bundle_location(agent_id, bundle_bytes)

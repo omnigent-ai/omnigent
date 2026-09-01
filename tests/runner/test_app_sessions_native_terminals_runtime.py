@@ -632,6 +632,10 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert bridge_state is not None
     assert bridge_state.thread_id == thread_id
     assert bridge_state.socket_path == app_server.listen_url
+    # The bridge state must carry the session workspace: without it the
+    # Codex executor starts turns with the runner process's own cwd, so
+    # web-driven shell tools run from the wrong directory.
+    assert bridge_state.cwd == str(tmp_path / "workspace")
 
 
 @pytest.mark.asyncio
@@ -3063,6 +3067,7 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
             bridge_dir=tmp_path,
             codex_ws_url="ws://127.0.0.1:1",
             codex_home=tmp_path / "codex-home",
+            workspace=str(tmp_path / "workspace"),
             event_client=_Client(),  # type: ignore[arg-type]
             routing_summary="provider 'test' (model=gpt-test)",
         )
@@ -3126,6 +3131,7 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
             bridge_dir=tmp_path,
             codex_ws_url="ws://127.0.0.1:1",
             codex_home=tmp_path / "codex-home",
+            workspace=str(tmp_path / "workspace"),
             event_client=_Client(),  # type: ignore[arg-type]
             routing_summary="provider 'test' (model=gpt-test)",
         )
@@ -3139,6 +3145,69 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
     # A RuntimeError must never be described as a timeout.
     if not isinstance(exc, TimeoutError):
         assert "timed out" not in recorded
+
+
+@pytest.mark.asyncio
+async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    The fresh-session bridge state must carry the session workspace as ``cwd``.
+
+    A runner-owned codex-native session's shell tools run wherever
+    ``CodexNativeBridgeState.cwd`` points; when the discovery path writes the
+    state without it, the Codex executor falls back to the harness process's
+    own working directory (the runner service's cwd), so web-driven shell
+    commands run from the wrong directory instead of the selected workspace.
+    """
+    from omnigent import codex_native_forwarder
+    from omnigent.runner.app import (
+        _AUTO_CODEX_APP_SERVERS,
+        _codex_discover_thread_and_forward,
+    )
+
+    thread_id = "019e96aa-abcd-7343-8d3b-6f914d60936b"
+    workspace = tmp_path / "selected-workspace"
+
+    async def _fake_wait(*_args: object, **_kwargs: object) -> str:
+        return thread_id
+
+    async def _fake_supervise(**_kwargs: object) -> None:
+        return None
+
+    class _Client:
+        async def close(self) -> None:
+            return None
+
+    class _AppServer:
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _fake_wait)
+    monkeypatch.setattr(codex_native_forwarder, "supervise_forwarder", _fake_supervise)
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+
+    session_id = "9f1f7f7bd7f24f80a621d9a3ba3fbc10"
+    _AUTO_CODEX_APP_SERVERS[session_id] = _AppServer()
+    try:
+        await _codex_discover_thread_and_forward(
+            session_id=session_id,
+            bridge_dir=tmp_path,
+            codex_ws_url="ws://127.0.0.1:1",
+            codex_home=tmp_path / "codex-home",
+            workspace=str(workspace),
+            event_client=_Client(),  # type: ignore[arg-type]
+            routing_summary="provider 'test' (model=gpt-test)",
+        )
+    finally:
+        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    state = codex_native_bridge.read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.thread_id == thread_id
+    assert state.cwd == str(workspace)
 
 
 @pytest.mark.asyncio

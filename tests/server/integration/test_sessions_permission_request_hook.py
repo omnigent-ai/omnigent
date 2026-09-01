@@ -1307,6 +1307,12 @@ async def test_permission_request_hook_surfaces_exit_plan_mode_input(
     # without the allow_all_edits flag.
     assert resp.json()["hookSpecificOutput"]["decision"] == {
         "behavior": "allow",
+        # ExitPlanMode is a requiresUserInteraction tool: Claude Code coerces a
+        # bare allow back to an interactive prompt unless the decision echoes
+        # ``updatedInput``. It mirrors the model's own tool_input (a no-op to
+        # the plan), and its presence is what lets a web-UI approval exit plan
+        # mode with no TUI keystroke.
+        "updatedInput": payload["tool_input"],
         "updatedPermissions": [{"type": "setMode", "mode": "default", "destination": "session"}],
     }
 
@@ -1369,6 +1375,9 @@ async def test_permission_request_hook_exit_plan_mode_auto_accept_round_trip(
     assert decision["updatedPermissions"] == [
         {"type": "setMode", "mode": "auto", "destination": "session"}
     ]
+    # updatedInput rides along on the auto path too — the requiresUserInteraction
+    # escape hatch is mode-independent.
+    assert decision["updatedInput"] == payload["tool_input"]
 
 
 async def test_permission_request_hook_decline_forwards_feedback_message(
@@ -2084,6 +2093,55 @@ async def test_codex_mcp_elicitation_hook_accept_round_trip(
         "action": "accept",
         "content": {"date": "tomorrow"},
         "_meta": None,
+    }
+
+
+async def test_codex_mcp_elicitation_hook_persists_web_session_approval(
+    client: httpx.AsyncClient,
+) -> None:
+    """Web can return a Codex-advertised session persistence choice."""
+    agent = await create_test_agent(client, "test-codex-mcp-persist-session")
+    session_id = await _create_session(client, agent["id"])
+    payload = {
+        "id": 8,
+        "method": "mcpServer/elicitation/request",
+        "params": {
+            "threadId": "thread_123",
+            "turnId": "turn_123",
+            "serverName": "omnigent",
+            "mode": "form",
+            "message": 'Allow the omnigent MCP server to run tool "sys_read_inbox"?',
+            "requestedSchema": {"type": "object", "properties": {}},
+            "_meta": {
+                "codex_approval_kind": "mcp_tool_call",
+                "persist": ["session", "always"],
+            },
+        },
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    assert event["params"]["_meta"] == payload["params"]["_meta"]
+    verdict = await client.post(
+        f"/v1/sessions/{session_id}/elicitations/{event['elicitation_id']}/resolve",
+        json={"action": "accept", "_meta": {"persist": "session"}},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "action": "accept",
+        "content": None,
+        "_meta": {"persist": "session"},
     }
 
 

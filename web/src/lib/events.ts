@@ -11,6 +11,7 @@
 import type { RoutingDecisionExtras } from "./routingDecision";
 import type {
   BackgroundTaskInfo,
+  CodexPersistMode,
   ErrorInfo,
   ModelUsage,
   RememberScope,
@@ -268,6 +269,8 @@ export interface ElicitationRequest {
    * where the allow rule is meaningful.
    */
   rememberScope?: RememberScope | null;
+  /** Codex-native MCP approval persistence modes advertised by the request. */
+  codexPersistModes?: CodexPersistMode[];
 }
 
 /**

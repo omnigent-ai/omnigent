@@ -455,6 +455,61 @@ class SqlAccountToken(OmnigentBase):
     )
 
 
+class SqlConnection(OmnigentBase):
+    """
+    SQLAlchemy model for the ``connections`` table.
+
+    One row per ``(workspace_id, user_id, provider, account_id)`` recording a
+    user's connected third-party integration (GitHub App today; MCP connectors
+    later). Backs the "Connect …" flows and the per-user sandbox credential
+    broker that vends the secret to managed sandboxes on demand.
+
+    The secret material is stored as one encrypted JSON blob
+    (:attr:`secret_enc`, AWS KMS ciphertext via
+    :class:`omnigent.stores.credential_store.secret_cipher.KmsSecretCipher`)
+    so any provider's secret shape fits without a schema change — plaintext
+    never touches the database.
+    Non-secret provider metadata (login, ids, scopes, expiries) lives in
+    :attr:`metadata_json`. See ``designs/CREDENTIAL_STORE.md``.
+
+    :param user_id: The omnigent user the connection belongs to —
+        email in header/OIDC modes, username in accounts mode.
+    :param provider: Integration provider key, e.g. ``"github"``.
+    :param account_id: Provider account discriminator; ``""`` for the user's
+        single account for that provider (in the PK so multi-account needs no
+        migration).
+    :param secret_enc: Encrypted JSON secret blob (all secret material).
+    :param metadata_json: Non-secret provider metadata as a JSON object.
+    :param created_at: Unix epoch seconds the connection was first made.
+    :param updated_at: Unix epoch seconds of the last refresh/reconnect.
+    """
+
+    __tablename__ = "connections"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(64), primary_key=True)
+    account_id: Mapped[str] = mapped_column(
+        String(128), primary_key=True, nullable=False, server_default=""
+    )
+    # Both plain Text, deliberately (not CompressedText): secret_enc is KMS
+    # ciphertext (base64) — high-entropy, so compression buys nothing — and
+    # metadata_json is a small fixed set of provider fields (login, ids, scopes,
+    # expiries), far below the size where zstd's framing overhead pays off.
+    # Neither is filtered or pattern-matched in SQL.
+    secret_enc: Mapped[str] = mapped_column(Text, nullable=False)
+    metadata_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
 class SqlDeviceGrant(OmnigentBase):
     """
     SQLAlchemy model for the ``device_grants`` table.
