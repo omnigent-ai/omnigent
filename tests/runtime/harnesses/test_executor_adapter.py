@@ -155,6 +155,12 @@ def use_error(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
+def use_error_with_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MockExecutor that yields an ExecutorError carrying observed usage."""
+    monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "error_with_usage")
+
+
+@pytest.fixture
 def use_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
     """MockExecutor that yields a provider-side TurnCancelled."""
     monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "cancelled")
@@ -401,6 +407,41 @@ async def test_executor_error_terminates_with_response_failed(
     # via the RuntimeError wrap in the adapter; the scaffold
     # builds an ErrorDetail with the exception's str().
     assert "mock error" in error_detail["message"]
+
+
+async def test_executor_error_usage_reaches_response_failed(
+    use_error_with_usage: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """An ExecutorError's observed usage rides on the response.failed event.
+
+    A turn that fails after the model call started has already observed its
+    prompt size. The adapter must stash that usage on the turn context so the
+    scaffold's terminal ``response.failed`` carries it — otherwise the web
+    client's context-occupancy ring freezes at the previous successful turn's
+    value exactly when the session is in trouble.
+
+    Regression guard: pre-fix the adapter dropped ``ExecutorError.usage``
+    and the failed response carried ``usage: null``.
+    """
+    conv_id = "conv_err_usage"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    events: list[_ParsedSSEEvent] = []
+    async with client.stream(
+        "POST", f"/v1/sessions/{conv_id}/events", json=_start_turn_body()
+    ) as response:
+        async for event in _stream_iter(response):
+            events.append(event)
+
+    assert events[-1].event == "response.failed"
+    usage = events[-1].data["response"]["usage"]
+    assert usage is not None
+    # context_tokens is the window-fill figure the ring renders from.
+    assert usage["context_tokens"] == 100_000
+    assert usage["input_tokens"] == 400
+    # The failure is still a failure — the error detail must not be
+    # displaced by the usage payload.
+    assert events[-1].data["response"]["error"] is not None
 
 
 async def test_turn_cancelled_terminates_with_response_cancelled(
@@ -2457,3 +2498,22 @@ def test_translate_event_emits_subagent_tool_call() -> None:
         "Wrote mathutils.py",
     )
     assert json.loads(ev.arguments) == {"file_path": "mathutils.py"}
+
+
+def test_interrupt_slice_covers_pi_rpc_session_close_reap_budget() -> None:
+    """_INTERRUPT_SLICE_S must be >= _PiRpcSession.close()'s reap wait_for budget.
+
+    When the outer slice fires first it injects a CancelledError into close()'s
+    inner wait_for -- not the TimeoutError its except clause catches -- so the
+    SIGKILL fallback never runs and the Pi subprocess is orphaned. The fix
+    raises the slice to 3.0s to give close() room to time out cleanly first.
+    """
+    from omnigent.inner.pi_executor import _RPC_SESSION_CLOSE_REAP_TIMEOUT_S
+    from omnigent.runtime.harnesses._executor_adapter import _INTERRUPT_SLICE_S
+
+    assert _INTERRUPT_SLICE_S >= _RPC_SESSION_CLOSE_REAP_TIMEOUT_S, (
+        f"_INTERRUPT_SLICE_S={_INTERRUPT_SLICE_S} is shorter than "
+        f"_PiRpcSession.close()'s {_RPC_SESSION_CLOSE_REAP_TIMEOUT_S}s wait_for; "
+        "outer slice fires first, injects CancelledError (not TimeoutError) "
+        "into close(), SIGKILL fallback is skipped, Pi subprocess orphaned."
+    )

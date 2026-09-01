@@ -13,6 +13,12 @@ against** — the local server `omnigent run` spins up, or a server passed with
 reproduce in — reproducing on the running app **is** the reproduction. Your
 whole session is browsable in that app afterward.
 
+**Environment note:** when you run under `--server` you're inside a
+Databricks-network session where the public npm/PyPI registries are blocked —
+point package installs at the internal proxies. See
+[`dev/agent-environment.md`](../agent-environment.md) before running any
+`npm`/`pnpm`/`pip`/`uv` install.
+
 You do **not** fix the bug. Finding the root cause and implementing a fix — and
 proving the fix with a before/after test transition — is a separate step; it
 consumes your session (the reconstructed journey, the e2e test, and your notes)
@@ -303,6 +309,16 @@ You author the test as the reproduction artifact. You do **not** run a
 before/after fix proof — that is the fix step's job (it builds a candidate fix
 and verifies the same test goes fail→pass).
 
+**Checkpoint the handoff before long finishing work.** As soon as Step 2 settles
+the overall verdict, atomically write the complete Output JSON object to
+`.omnigent/repro-handoff.json` in the workspace (create `.omnigent/` if needed;
+write a temporary sibling and rename it into place). Update that checkpoint if
+later test or recording work changes any handoff field. The checkpoint is a
+crash-safe copy of the final machine-readable handoff: it must use the exact
+fixed shape documented under Output, including `bug_url`, `verdict`, and
+`session_id`. Do this **before** authoring or recording work that could exhaust
+the turn, so CI can still dispatch the fix step if the final response is cut off.
+
 **Show the test inline in your final message.** After you write the file to
 disk, also paste its **complete, verbatim source** into your final message as a
 fenced code block (labelled with the path), so anyone browsing this session sees
@@ -345,6 +361,10 @@ block — the machine-readable handoff to the fix step and to the caller that
 labels the issue. This block is parsed programmatically by taking the last
 ```json fence in the message, so the format and its position are **not** your
 choice:
+
+- Load `.omnigent/repro-handoff.json`, update it with the final test and
+  recording results, atomically rewrite it, and emit that same object in the
+  final fence. The checkpoint and final block must not disagree.
 
 - You may write comprehensive prose above the block (a human-readable summary,
   the journey, the per-facet notes) — that's fine and encouraged. Then, as the

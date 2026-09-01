@@ -463,7 +463,13 @@ def _branding_png(color: tuple[int, int, int, int]) -> bytes:
     return output.getvalue()
 
 
-def _build_branding_app(db_uri: str, tmp_path: Path, label: str) -> FastAPI:
+def _build_branding_app(
+    db_uri: str,
+    tmp_path: Path,
+    label: str,
+    *,
+    server_config: dict[str, object] | None = None,
+) -> FastAPI:
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 
     artifact_store = LocalArtifactStore(str(tmp_path / f"artifacts-{label}"))
@@ -476,6 +482,25 @@ def _build_branding_app(db_uri: str, tmp_path: Path, label: str) -> FastAPI:
             artifact_store=artifact_store,
             cache_dir=tmp_path / f"cache-{label}",
         ),
+        server_config=server_config,
+    )
+
+
+def test_session_title_instructions_are_wired_into_coordinator(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "custom-titles",
+        server_config={"session_title_instructions": "Prefix titles with the current date."},
+    )
+
+    assert (
+        app.state.background_title_coordinator._additional_instructions
+        == "Prefix titles with the current date."
     )
 
 
@@ -1866,3 +1891,21 @@ def test_load_debug_routers_collects_entries() -> None:
     _router, prefix, tags = entries[0]
     assert prefix == "/debug"
     assert tags == ["debug"]
+
+
+def test_session_id_from_request_parses_session_path() -> None:
+    """The exception handlers read the session id off the request path.
+
+    A ``/v1/sessions/<id>/…`` path yields the id (threaded into the 500 log so
+    the debug-logs row is correlated); anything else yields ``None``.
+    """
+    from types import SimpleNamespace
+
+    def _req(path: str) -> object:
+        return SimpleNamespace(url=SimpleNamespace(path=path))
+
+    parse = server_app._session_id_from_request
+    assert parse(_req("/v1/sessions/conv_abc/events")) == "conv_abc"  # type: ignore[arg-type]
+    assert parse(_req("/v1/sessions/conv_abc")) == "conv_abc"  # type: ignore[arg-type]
+    assert parse(_req("/health")) is None  # type: ignore[arg-type]
+    assert parse(_req("/v1/sessions")) is None  # type: ignore[arg-type]

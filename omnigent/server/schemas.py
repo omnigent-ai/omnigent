@@ -12,11 +12,24 @@ delineator further down:
 from __future__ import annotations
 
 import re
-from typing import Annotated, Any, Literal, get_args
+from typing import Annotated, Any, Literal, Self, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, Strict, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    Strict,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
-from omnigent.entities import ConversationItem
+from omnigent.entities import (
+    DEFAULT_GENERATED_TITLE_MAX_CHARS,
+    USER_SESSION_TITLE_MAX_CHARS,
+    ConversationItem,
+)
 
 # ── Shared ──────────────────────────────────────────────────────
 
@@ -1193,6 +1206,9 @@ class ElicitationResult(BaseModel):
         binary approve/reject elicitations and for ``decline`` /
         ``cancel`` actions. Values are restricted to JSON scalars
         and string lists per the MCP spec.
+    :param meta: Optional MCP result metadata. Codex uses
+        ``_meta.persist`` to distinguish one-time, session-scoped,
+        and persistent MCP tool approvals.
     """
 
     action: Literal["accept", "decline", "cancel"]
@@ -1200,6 +1216,21 @@ class ElicitationResult(BaseModel):
     # ElicitResult.content value type — keep them aligned so an MCP
     # client can bridge to our endpoint without translation.
     content: dict[str, str | int | float | bool | list[str] | None] | None = None
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+    # ``_meta`` must serialize under its alias so the verdict survives the
+    # resolve route's dump -> re-validate round-trip, but an unset ``_meta``
+    # must not appear at all: hook replies are compared verbatim.
+    model_config = ConfigDict(serialize_by_alias=True)
+
+    @model_serializer(mode="wrap")
+    def _omit_unset_meta(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Drop ``_meta`` when unset, keeping other ``None`` fields intact."""
+        data = handler(self)
+        if self.meta is None:
+            data.pop("_meta", None)
+            data.pop("meta", None)
+        return data
 
 
 # ── Sessions (/v1/sessions) ────────────────────────────────────
@@ -1276,29 +1307,41 @@ class SessionGitOptions(BaseModel):
         invalid with ``existing_worktree``.
     :param existing_worktree: When ``True``, bind to the pre-existing
         worktree at ``workspace`` instead of creating one (see above).
+    :param existing_branch: When ``True``, ``branch_name`` already
+        exists and the host checks it out into a fresh worktree (the
+        deleted-worktree recreate path) instead of creating a new
+        branch. Create mode only; invalid with ``existing_worktree``
+        and with ``base_branch`` (an existing branch has no base to
+        fork).
     """
 
     branch_name: str
     base_branch: str | None = None
     existing_worktree: bool = False
+    existing_branch: bool = False
 
     @model_validator(mode="after")
     def _check_existing_worktree(self) -> SessionGitOptions:
-        """Reject ``base_branch`` in bind mode (422).
+        """Reject incoherent mode combinations (422).
 
         ``base_branch`` selects the ref a *new* branch forks from; it is
-        meaningless when binding to a worktree that already exists.
+        meaningless when binding to a worktree that already exists or
+        when checking out an existing branch. ``existing_worktree`` and
+        ``existing_branch`` are distinct modes and cannot combine.
 
         :returns: The validated instance.
-        :raises ValueError: If ``base_branch`` is set with
-            ``existing_worktree``.
+        :raises ValueError: If the flags combine incoherently.
         """
         if self.existing_worktree and self.base_branch is not None:
             raise ValueError("base_branch cannot be set when existing_worktree is true")
+        if self.existing_branch and self.base_branch is not None:
+            raise ValueError("base_branch cannot be set when existing_branch is true")
+        if self.existing_branch and self.existing_worktree:
+            raise ValueError("existing_branch and existing_worktree cannot both be true")
         return self
 
 
-class SessionCreateRequest(BaseModel):
+class _SessionCreateRequestBase(BaseModel):
     """
     JSON request body for ``POST /v1/sessions``.
 
@@ -1431,9 +1474,12 @@ class SessionCreateRequest(BaseModel):
         message event instead.
     """
 
-    agent_id: str
+    # Declared here, in the legacy field position, so validation errors keep
+    # main's ordering. Concrete public models narrow the wire type below.
+    agent_id: Any
+    project_id: str | None = None
     initial_items: list[SessionEventInput] = Field(default_factory=list)
-    title: str | None = None
+    title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] = Field(default_factory=dict)
     parent_session_id: str | None = None
     sub_agent_name: str | None = None
@@ -1451,7 +1497,7 @@ class SessionCreateRequest(BaseModel):
     smart_routing_message: str | None = None
 
     @model_validator(mode="after")
-    def _check_git_requires_host(self) -> SessionCreateRequest:
+    def _check_git_requires_host(self) -> Self:
         """
         Reject ``git`` without ``host_id`` at validation time.
 
@@ -1463,12 +1509,12 @@ class SessionCreateRequest(BaseModel):
         :returns: The validated instance.
         :raises ValueError: If ``git`` is set but ``host_id`` is not.
         """
-        if self.git is not None and self.host_id is None:
+        if self.git is not None and self.host_id is None and self.project_id is None:
             raise ValueError("git worktree creation requires host_id")
         return self
 
     @model_validator(mode="after")
-    def _check_managed_host_fields(self) -> SessionCreateRequest:
+    def _check_managed_host_fields(self) -> Self:
         """
         Enforce the per-``host_type`` workspace and host-id contract.
 
@@ -1519,6 +1565,26 @@ class SessionCreateRequest(BaseModel):
                 "external hosts take an absolute path on the host"
             )
         return self
+
+
+class SessionCreateRequest(_SessionCreateRequestBase):
+    """Legacy create shape, preserving required-string ``agent_id``."""
+
+    agent_id: str
+
+
+class ProjectSessionCreateRequest(_SessionCreateRequestBase):
+    """Project-opted create shape whose agent may be filled by the server.
+
+    The public legacy :class:`SessionCreateRequest` deliberately keeps
+    ``agent_id`` required so requests without ``project_id`` retain their exact
+    validation and OpenAPI contract.
+    """
+
+    agent_id: str | None = None
+
+
+SessionCreateInput = SessionCreateRequest | ProjectSessionCreateRequest
 
 
 class SessionCreateMetadata(BaseModel):
@@ -1575,7 +1641,8 @@ class SessionCreateMetadata(BaseModel):
         valid with ``host_type: "managed"``.
     """
 
-    title: str | None = None
+    title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
+    project_id: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     reasoning_effort: str | None = None
     host_id: str | None = None
@@ -2184,7 +2251,7 @@ class UpdateSessionRequest(BaseModel):
     """
 
     runner_id: str | None = None
-    title: str | None = None
+    title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] | None = None
     reasoning_effort: str | None = None
     model_override: str | None = None
@@ -2204,7 +2271,7 @@ class UpdateSessionRequest(BaseModel):
 class AutomaticSessionRenameRequest(BaseModel):
     """Request body for the current-agent automatic rename endpoint."""
 
-    title: str = Field(min_length=2, max_length=60)
+    title: str = Field(min_length=2, max_length=DEFAULT_GENERATED_TITLE_MAX_CHARS)
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2221,6 +2288,7 @@ class BackgroundSessionTitleRequest(BaseModel):
     """Private runner request for isolated background title inference."""
 
     prompt: str = Field(min_length=1, max_length=20_000)
+    additional_instructions: str | None = Field(default=None, max_length=4_000)
     agent_id: str | None = None
     model_override: str | None = None
     harness_override: str | None = None
@@ -2352,11 +2420,44 @@ class SessionForkRequest(BaseModel):
         the last item of that response are copied — items after it are
         dropped from the fork. When ``None`` (default), the full history
         is copied.
+    :param model_override: Per-session LLM model override to apply to the
+        fork, e.g. ``"claude-opus-4-7"``. **Omitting** the field inherits
+        the source's model (same as today, within the same provider
+        family); an explicit value overrides it, and a clear alias
+        (``"default"``, ``"off"``, ``"reset"``) resets the fork to the
+        bound agent's default. Validated against a conservative model-id
+        charset. Set by the web fork dialog's model picker.
+    :param reasoning_effort: Per-session reasoning-effort override to apply
+        to the fork, e.g. ``"high"``. **Omitting** the field inherits the
+        source's effort; an explicit value overrides it, and a clear alias
+        (``"default"``, ``"off"``, ``"reset"``) resets it. Validated
+        against the shared effort vocabulary; provider support is enforced
+        at launch. Set by the web fork dialog's effort picker.
+    :param terminal_launch_args: Per-session native-terminal pass-through
+        args to apply to the fork, e.g. ``["--permission-mode", "auto"]``
+        (the fork dialog's permission-/approval-mode selector).
+        **Omitting** the field keeps today's behavior — the source's args
+        are carried on a same-agent fork and dropped on an agent switch. A
+        list (including ``[]``, which clears them) replaces them wholesale.
+        Bounds (count / length) are validated server-side.
+    :param codex_bypass_sandbox: Opt-in for the DANGEROUS codex-native
+        full-bypass (``--dangerously-bypass-approvals-and-sandbox``) on the
+        fork. The source's bypass label is ALWAYS dropped on a fork (a
+        bypass-armed source can never silently re-arm its clone), so this is
+        the only way a fork enables it — an explicit, banner-gated opt-in
+        from the dialog, mirroring the new-session approval selector. ``True``
+        stamps ``omnigent.codex_native.bypass_sandbox`` on the fork; ``False``
+        / omitted leaves the fork in Codex's normal approval/sandbox stance.
+        Only meaningful for a codex-native target; ignored otherwise.
     """
 
-    title: str | None = None
+    title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     agent_id: str | None = None
     up_to_response_id: str | None = None
+    model_override: str | None = None
+    reasoning_effort: str | None = None
+    terminal_launch_args: list[str] | None = None
+    codex_bypass_sandbox: bool = False
 
     model_config = ConfigDict(extra="forbid")
 

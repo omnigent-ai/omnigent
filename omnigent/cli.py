@@ -619,8 +619,8 @@ def _migrate_legacy_state_dir() -> None:
 # Resolved at call time so tests can control cwd.
 _LOCAL_CONFIG_RELPATH: Path = Path(".omnigent") / "config.yaml"
 
-# Keys that ``omnigent config`` accepts.  Mirrors the option names in
-# the ``run`` command so the mapping is explicit and auditable.
+# User-facing keys that ``omnigent config`` accepts. Most mirror ``run``
+# options; session-title guidance configures server-owned metadata generation.
 _AUTO_OPEN_CONVERSATION_CONFIG_KEY = "auto_open_conversation"
 _GLOBAL_CONFIG_KEYS: frozenset[str] = frozenset(
     {
@@ -631,9 +631,11 @@ _GLOBAL_CONFIG_KEYS: frozenset[str] = frozenset(
         # ``omni opencode`` TUI launches on; set via `omni setup` → OpenCode.
         "opencode_model",
         "server",
+        "session_title_instructions",
         _AUTO_OPEN_CONVERSATION_CONFIG_KEY,
     }
 )
+_USER_LEVEL_ONLY_CONFIG_KEYS: frozenset[str] = frozenset({"session_title_instructions"})
 _BOOLEAN_CONFIG_KEYS: frozenset[str] = frozenset({_AUTO_OPEN_CONVERSATION_CONFIG_KEY})
 _CONFIG_TRUE_VALUES: frozenset[str] = frozenset({"1", "true", "yes", "on"})
 _CONFIG_FALSE_VALUES: frozenset[str] = frozenset({"0", "false", "no", "off"})
@@ -2148,13 +2150,13 @@ def main() -> None:
     if log_to_stderr:
         os.environ[LOG_TO_STDERR_ENV_VAR] = "1"
 
-    # Bare ``omnigent`` with no args behaves like ``omnigent run`` on an
-    # interactive terminal: ``run`` resolves the configured default agent /
-    # first-run plan and drops into ``setup`` when nothing is configured. In
-    # a non-interactive context (pipe, CI, no TTY) fall back to ``--help`` so
-    # we never launch a REPL that would hang waiting on stdin.
+    # Bare ``omnigent`` with no args behaves like ``omnigent start`` on an
+    # interactive terminal: bring up the local server / host in the background
+    # and return, rather than dropping into an agent REPL. In a non-interactive
+    # context (pipe, CI, no TTY) fall back to ``--help`` so we never block on a
+    # sign-in prompt. Use ``omnigent run`` to launch the default agent.
     if not argv:
-        argv = ["run"] if sys.stdin.isatty() else ["--help"]
+        argv = ["start"] if sys.stdin.isatty() else ["--help"]
 
     # Shorthand: ``omnigent --harness claude [opts]`` →
     # ``run --harness claude [opts]``. Click group-level options are
@@ -3150,7 +3152,10 @@ def _load_or_create_host_id() -> str | None:
 
     try:
         return load_or_create_host_identity(CONFIG_PATH).host_id
-    except OSError:
+    except (OSError, ValueError):
+        # OSError: identity file unwritable. ValueError: a malformed persisted /
+        # env host_id — a foreground host has nothing to key on, so degrade to
+        # None; the loud fail-fast is on the `omnigent host` connect path.
         return None
 
 
@@ -3281,10 +3286,11 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     today. A non-200 answer that carries the Databricks edge signature
     (302 to the workspace OAuth page, or a DatabricksRealm 401) means
     the run would otherwise die much later with an opaque "non-JSON
-    response (status=302)" traceback from the session-create call. First,
-    it asks the SDK for a fresh workspace token; only then does a TTY run
-    the same flow ``omnigent login`` would, while headless invocations get
-    the exact command to run instead.
+    response (status=302)" traceback from the session-create call. A
+    rejected bearer can hide that signature behind a bare 401/403, so the
+    probe falls back to the saved workspace or an unauthenticated retry.
+    It then asks the SDK for a fresh workspace token before prompting a
+    TTY or giving headless invocations the exact login command.
 
     Non-Databricks postures are deliberately left alone: local accounts
     servers auto-authenticate downstream (magic-link redeem), and
@@ -3304,14 +3310,15 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     import httpx as _httpx
 
     from omnigent.chat import _remote_headers
-    from omnigent.cli_auth import load_databricks_org_id, store_databricks_auth
+    from omnigent.cli_auth import (
+        load_databricks_org_id,
+        load_databricks_workspace_host,
+        store_databricks_auth,
+    )
 
+    headers = _remote_headers(server_url=server, host_id=None)
     try:
-        probe = _httpx.get(
-            f"{server}/v1/me",
-            headers=_remote_headers(server_url=server, host_id=None),
-            timeout=10.0,
-        )
+        probe = _httpx.get(f"{server}/v1/me", headers=headers, timeout=10.0)
     except _httpx.HTTPError:
         # Unreachable / transient: let the connect path raise its own,
         # already-actionable error rather than failing the pre-flight.
@@ -3319,12 +3326,28 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     if probe.status_code == 200:
         return
     workspace_host = _databricks_workspace_login_target(server, probe)
+    credential_rejected = False
+    if workspace_host is None and probe.status_code in (401, 403):
+        # A rejected bearer can hide the edge signature. Prefer the saved
+        # workspace; otherwise re-probe without credentials.
+        workspace_host = load_databricks_workspace_host(server)
+        if workspace_host is None and "Authorization" in headers:
+            try:
+                unauthed_probe = _httpx.get(f"{server}/v1/me", timeout=10.0)
+            except _httpx.HTTPError:
+                return
+            workspace_host = _databricks_workspace_login_target(server, unauthed_probe)
+        credential_rejected = workspace_host is not None and "Authorization" in headers
     if workspace_host is None:
         return
     org_id = load_databricks_org_id(server)
-    token = _databricks_workspace_token(workspace_host)
-    if token is not None:
-        refreshed_probe = _verify_databricks_server_token(server, token, org_id)
+    auth_info = _databricks_workspace_auth_info(workspace_host)
+    if auth_info is not None:
+        if org_id is None:
+            org_id = _workspace_hosted_profile_org_id(
+                server, workspace_host, auth_info.profile_name
+            )
+        refreshed_probe = _verify_databricks_server_token(server, auth_info.token, org_id)
         if refreshed_probe.status_code == 200:
             store_databricks_auth(server, workspace_host, org_id=org_id)
             return
@@ -3333,13 +3356,21 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     # `omnigent login` back to the same API base.
     display = ServerUrl(api_base=server, org_id=org_id).display
     login_cmd = f"omnigent login {display}"
+    state = (
+        f"Your Databricks credential for {display} has expired or was revoked"
+        if credential_rejected
+        else f"Not signed in to {display}"
+    )
     if non_interactive or not sys.stdin.isatty():
         raise click.ClickException(
-            f"Not signed in to {display} (Databricks-fronted; /v1/me answered "
+            f"{state} (Databricks-fronted; /v1/me answered "
             f"HTTP {probe.status_code}). Run `{login_cmd}` and retry."
         )
-    click.echo(f"Not signed in to {display} — running `{login_cmd}` first.")
-    _databricks_login(server, workspace_host, org_id=org_id)
+    click.echo(f"{state} — running `{login_cmd}` first.")
+    # Login selector comes from the URL, not the stored org_id used above: on a
+    # single-tenant host a replayed ?o= makes `databricks auth login --host` skip
+    # workspace_id resolution, so the grant isn't workspace-bound (matches `login`).
+    _databricks_login(server, workspace_host, org_id=_org_id_from_url(server))
 
 
 def _ensure_backend(server: str | None) -> str:
@@ -3953,7 +3984,10 @@ def server(
     )
     from omnigent.server.app import create_app
     from omnigent.server.auth import create_auth_provider
-    from omnigent.server.server_config import config_str_list
+    from omnigent.server.server_config import (
+        SESSION_TITLE_INSTRUCTIONS_KEY,
+        config_str_list,
+    )
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
     from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
     from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -3963,6 +3997,15 @@ def server(
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
 
     cfg = _load_config(config_path)
+    title_server_config = cfg
+    if config_path is None:
+        global_cfg = _load_global_config()
+        title_instructions = global_cfg.get(SESSION_TITLE_INSTRUCTIONS_KEY)
+        title_server_config = (
+            {SESSION_TITLE_INSTRUCTIONS_KEY: title_instructions}
+            if title_instructions is not None
+            else {}
+        )
 
     # Let the server-config reader (branding) see the same ``-c`` file.
     if config_path:
@@ -4150,7 +4193,7 @@ def server(
         admins=config_str_list(cfg.get("admins")),
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
-        server_config=cfg,
+        server_config=title_server_config,
     )
 
     click.echo(f"Starting omnigent server on {host}:{port}")
@@ -5725,9 +5768,9 @@ def polly(run_args: tuple[str, ...]) -> None:
     # :param run_args: Pass-through args for ``run``.
     """Launch polly, the bundled multi-agent coding orchestrator.
 
-    Shorthand for ``omnigent run`` on the packaged polly agent — the same
-    agent a bare ``omnigent`` launches when a Claude credential is
-    configured. All ``run`` options are accepted and forwarded.
+    Shorthand for ``omnigent run`` on the packaged polly agent — the default
+    agent ``omnigent run`` launches when a Claude credential is configured.
+    All ``run`` options are accepted and forwarded.
 
     \b
     Examples:
@@ -9804,6 +9847,19 @@ def _harness_deep_merge_keys(
     return ()
 
 
+def _validate_config_set_scope(settings: Mapping[str, object], *, is_global: bool) -> None:
+    """Reject project-local writes for settings owned by the shared server."""
+    if is_global:
+        return
+    user_only = sorted(settings.keys() & _USER_LEVEL_ONLY_CONFIG_KEYS)
+    if user_only:
+        names = ", ".join(repr(key) for key in user_only)
+        raise click.ClickException(
+            f"Config key(s) {names} can only be set with --global because they "
+            "configure the shared local server."
+        )
+
+
 def _validate_unset_keys(unset_keys: tuple[str, ...]) -> list[str]:
     """
     Validate keys passed to ``--unset`` against ``_GLOBAL_CONFIG_KEYS``.
@@ -9898,31 +9954,46 @@ def _print_config_defaults() -> None:
 
     :returns: None. Side effect: writes to stdout.
     """
-    # Only the user-facing run defaults (the keys ``config set`` accepts).
+    # Only user-facing defaults (the keys ``config set`` accepts).
     # Internal blocks (``providers``, ``host``, ``tui``) are omitted — the
     # ``providers`` block is shown in the credentials-by-harness section.
     global_cfg = {k: v for k, v in _load_global_config().items() if k in _GLOBAL_CONFIG_KEYS}
-    local_cfg = {k: v for k, v in _load_local_config().items() if k in _GLOBAL_CONFIG_KEYS}
-    if not global_cfg and not local_cfg:
+    raw_local_cfg = {k: v for k, v in _load_local_config().items() if k in _GLOBAL_CONFIG_KEYS}
+    global_path = _effective_global_config_path()
+    local_path = Path.cwd() / _LOCAL_CONFIG_RELPATH
+    local_is_global = bool(raw_local_cfg) and local_path.resolve() == global_path.resolve()
+    ignored_local_keys = (
+        [] if local_is_global else sorted(raw_local_cfg.keys() & _USER_LEVEL_ONLY_CONFIG_KEYS)
+    )
+    local_cfg = {
+        k: v
+        for k, v in raw_local_cfg.items()
+        if local_is_global or k not in _USER_LEVEL_ONLY_CONFIG_KEYS
+    }
+    if not global_cfg and not local_cfg and not ignored_local_keys:
         click.echo(
             f"  (none set — `{cli_invocation()} config set key=value` for project,\n"
             f"   or `{cli_invocation()} config set --global key=value` for user-level)"
         )
         return
-    global_path = _effective_global_config_path()
-    local_path = Path.cwd() / _LOCAL_CONFIG_RELPATH
     # When the cwd IS the home directory, the project-level path
     # (``cwd/.omnigent/config.yaml``) resolves to the SAME file as the
     # user-level path (``~/.omnigent/config.yaml``). Dedup on the resolved
     # absolute path so the one file is shown once, not twice under two
     # spellings. ``resolve()`` collapses ``~`` and symlinks for the compare.
-    local_is_global = local_cfg and local_path.resolve() == global_path.resolve()
     if global_cfg:
         click.echo(f"  # {_display_config_path(global_path)}")
         _print_config_default_rows(global_cfg)
     if local_cfg and not local_is_global:
         click.echo(f"  # {local_path}")
         _print_config_default_rows(local_cfg)
+    if ignored_local_keys:
+        if not local_cfg:
+            click.echo(f"  # {local_path}")
+        click.echo(
+            "  # ignored user-level-only setting(s): "
+            f"{', '.join(ignored_local_keys)} (set with --global)"
+        )
 
 
 class _ConfigGroup(click.Group):
@@ -10221,7 +10292,8 @@ def config_set(is_global: bool, settings: tuple[str, ...]) -> None:
     ``~/.gitconfig``). Project values take precedence.
 
     Supported keys: auto_open_conversation, default_agent, harness,
-    model, server.
+    model, server, session_title_instructions. Session title instructions
+    configure the shared local server and require ``--global``.
 
     :param is_global: When ``True``, write to ``~/.omnigent/config.yaml``;
         when ``False``, to ``.omnigent/config.yaml`` in cwd.
@@ -10233,14 +10305,13 @@ def config_set(is_global: bool, settings: tuple[str, ...]) -> None:
       omnigent config set default_agent=examples/hello_world.yaml
       omnigent config set --global server=https://<app>.databricksapps.com
     """
+    parsed = _parse_config_settings(settings, resolve_paths=is_global)
+    _validate_config_set_scope(parsed, is_global=is_global)
+    deep_keys = _harness_deep_merge_keys(parsed)
     if is_global:
-        parsed = _parse_config_settings(settings, resolve_paths=True)
-        deep_keys = _harness_deep_merge_keys(parsed)
         _save_global_config(parsed, (), deep_keys)
         config_path: Path = _effective_global_config_path()
     else:
-        parsed = _parse_config_settings(settings, resolve_paths=False)
-        deep_keys = _harness_deep_merge_keys(parsed)
         _save_local_config(parsed, (), deep_keys)
         config_path = Path.cwd() / _LOCAL_CONFIG_RELPATH
     click.echo(f"Set {len(parsed)} key(s) in {config_path}")
@@ -10363,9 +10434,23 @@ def setup(internal_beta: bool) -> None:
         )
         return
 
-    # --no-internal-beta: the standard model/credential picker. It warns
-    # about missing Node/tmux itself, configures providers/defaults, and
-    # returns; the user then starts a session with ``omnigent run``.
+    # --no-internal-beta: validate existing providers before entering the
+    # picker so malformed user config is reported as an actionable CLI error,
+    # not an application crash from the picker's ambient-adoption step.
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.onboarding.provider_config import load_providers
+
+    try:
+        load_providers(_load_global_config())
+    except OmnigentError as exc:
+        if exc.code != ErrorCode.INVALID_INPUT:
+            raise
+        path = _display_config_path(_effective_global_config_path())
+        raise click.ClickException(f"Invalid provider configuration in {path}: {exc}") from None
+
+    # The picker warns about missing Node/tmux itself, configures
+    # providers/defaults, and returns; the user then starts a session with
+    # ``omnigent run``.
     _run_configure_harnesses_interactive()
 
 
@@ -11207,6 +11292,23 @@ def _databricks_default_workspace_id(workspace_host: str) -> str | None:
     return databrickscfg_workspace_id_for_host(workspace_host)
 
 
+def _workspace_hosted_profile_org_id(
+    server: str,
+    workspace_host: str,
+    profile_name: str | None = None,
+) -> str | None:
+    """Return the CLI-recorded workspace id for workspace-hosted Omnigent."""
+    from omnigent.server_url import is_workspace_hosted_url
+
+    if not is_workspace_hosted_url(server):
+        return None
+    if profile_name:
+        from omnigent.inner.databricks_executor import databrickscfg_workspace_id_for_profile
+
+        return databrickscfg_workspace_id_for_profile(profile_name)
+    return _databricks_default_workspace_id(workspace_host)
+
+
 def _databricks_host_needs_org_selector(workspace_host: str) -> bool:
     """Whether *workspace_host* fronts many workspaces and needs a ``?o=`` selector.
 
@@ -11265,11 +11367,6 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
         databricks_sdk_installed,
     )
 
-    # User-facing: the display form (workspace /omnigent URL with ?o= when
-    # known) — the API mount is an implementation detail.
-    display = ServerUrl(api_base=server, org_id=org_id).display
-    click.echo(f"{display} authenticates via the Databricks workspace {workspace_host}.")
-
     if not databricks_sdk_installed():
         raise click.ClickException(
             "Logging in to a Databricks-fronted server (a Databricks App or "
@@ -11279,6 +11376,15 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
         )
 
     from omnigent.cli_auth import is_workspace_hosted_url
+
+    auth_info = _databricks_workspace_auth_info(workspace_host)
+    if org_id is None and auth_info is not None:
+        org_id = _workspace_hosted_profile_org_id(server, workspace_host, auth_info.profile_name)
+
+    # User-facing: the display form (workspace /omnigent URL with ?o= when
+    # known) — the API mount is an implementation detail.
+    display = ServerUrl(api_base=server, org_id=org_id).display
+    click.echo(f"{display} authenticates via the Databricks workspace {workspace_host}.")
 
     # An account-fronting workspace mount serves many workspaces under one host,
     # so the login URL carries no ?o= selector — but the Databricks CLI still
@@ -11291,20 +11397,26 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
         and _databricks_host_needs_org_selector(workspace_host)
     )
 
-    token = _databricks_workspace_token(workspace_host)
+    token = auth_info.token if auth_info is not None else None
     fresh_login_done = False
     if token is None:
-        token = _login_and_mint_workspace_token(workspace_host, org_id)
+        auth_info = _login_and_mint_workspace_auth_info(workspace_host, org_id)
+        token = auth_info.token
         fresh_login_done = True
+        if org_id is None:
+            org_id = _workspace_hosted_profile_org_id(
+                server, workspace_host, auth_info.profile_name
+            )
 
     # Inherit the workspace the CLI selected: the browser login (or a prior one)
     # auto-selected a workspace and recorded its id in the profile; replaying it
     # as ?o= routes the account token to that workspace. Without it the login
     # would fail on an account host it could have completed unattended.
-    if account_host_without_selector:
+    if org_id is None and (account_host_without_selector or is_workspace_hosted_url(server)):
         org_id = _databricks_default_workspace_id(workspace_host)
         if org_id:
             click.echo(f"Routing to workspace {org_id}, selected during the Databricks login.")
+            display = ServerUrl(api_base=server, org_id=org_id).display
 
     # Verify the workspace token actually gets through the edge to THIS
     # server (the user may lack access to it), and learn our identity
@@ -11319,7 +11431,14 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
             f"The cached Databricks credentials were rejected by {display} "
             f"(HTTP {verify.status_code}) — refreshing the workspace login."
         )
-        token = _login_and_mint_workspace_token(workspace_host, org_id)
+        auth_info = _login_and_mint_workspace_auth_info(workspace_host, org_id)
+        token = auth_info.token
+        if org_id is None:
+            org_id = _workspace_hosted_profile_org_id(
+                server, workspace_host, auth_info.profile_name
+            )
+            if org_id:
+                display = ServerUrl(api_base=server, org_id=org_id).display
         verify = _verify_databricks_server_token(server, token, org_id)
     if verify.status_code != 200:
         raise click.ClickException(
@@ -11361,14 +11480,21 @@ def _login_and_mint_workspace_token(workspace_host: str, org_id: str | None = No
         missing, the login exits non-zero, or no token resolves after
         a successful login.
     """
+    return _login_and_mint_workspace_auth_info(workspace_host, org_id).token
+
+
+def _login_and_mint_workspace_auth_info(
+    workspace_host: str, org_id: str | None = None
+) -> _DatabricksWorkspaceAuthInfo:
+    """Run the browser login and return the selected workspace auth info."""
     _run_databricks_browser_login(workspace_host, org_id)
-    token = _databricks_workspace_token(workspace_host)
-    if token is None:
+    auth_info = _databricks_workspace_auth_info(workspace_host)
+    if auth_info is None:
         raise click.ClickException(
             f"Workspace login completed but no token resolves for {workspace_host}. "
             f"Run `databricks auth token --host {workspace_host}` to debug."
         )
-    return token
+    return auth_info
 
 
 def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None) -> None:
@@ -11448,6 +11574,29 @@ def _verify_databricks_server_token(
         ) from exc
 
 
+@dataclass(frozen=True)
+class _DatabricksWorkspaceAuthInfo:
+    token: str
+    profile_name: str | None
+
+
+def _databricks_workspace_auth_info(workspace_host: str) -> _DatabricksWorkspaceAuthInfo | None:
+    """Mint a bearer and remember the Databricks profile that supplied it."""
+    from omnigent.inner.databricks_executor import (
+        DatabricksAuthError,
+        _resolve_databricks_auth,
+    )
+
+    try:
+        auth, _host = _resolve_databricks_auth(host=workspace_host)
+        token = auth.current_token()
+    except (DatabricksAuthError, ImportError, ValueError):
+        return None
+    if not token:
+        return None
+    return _DatabricksWorkspaceAuthInfo(token=token, profile_name=auth.profile_name)
+
+
 def _databricks_workspace_token(workspace_host: str) -> str | None:
     """Mint a bearer for a workspace from the host-keyed OAuth cache.
 
@@ -11456,25 +11605,17 @@ def _databricks_workspace_token(workspace_host: str) -> str | None:
     :returns: A bearer token, or ``None`` when no cached grant
         resolves (the caller should run ``databricks auth login``).
     """
-    from omnigent.inner.databricks_executor import (
-        DatabricksAuthError,
-        _resolve_databricks_auth,
-    )
-
-    try:
-        auth, _host = _resolve_databricks_auth(host=workspace_host)
-        return auth.current_token()
-    except (DatabricksAuthError, ImportError, ValueError):
-        return None
+    info = _databricks_workspace_auth_info(workspace_host)
+    return info.token if info is not None else None
 
 
 def _remember_default_server(server: str) -> None:
     """
     Persist *server* as the user-level default after a successful login.
 
-    A bare ``omnigent`` (and ``omnigent host``) fall back to the
-    configured ``server`` key when no ``--server`` is passed (see
-    :func:`run` and :func:`host`). Without this, a user who runs
+    A bare ``omnigent`` (which starts the host) and ``omnigent host`` fall
+    back to the configured ``server`` key when no ``--server`` is passed (see
+    :func:`start` and :func:`host`). Without this, a user who runs
     ``omnigent login <server>`` and then bare ``omnigent`` is still routed
     at whatever default ``setup`` baked in — the confusing "I just logged
     in, yet I'm asked to log in again to a different server" path.

@@ -64,6 +64,7 @@ from omnigent.inner.codex_executor import (
     write_codex_hooks_file,
 )
 from omnigent.inner.databricks_executor import _databricks_gateway_host
+from omnigent.process_logging import log_info_once, log_once
 
 _logger = logging.getLogger(__name__)
 
@@ -989,21 +990,32 @@ async def probe_codex_model_options(*, codex_path: str | None = None) -> list[_J
     return mark_launch_default(rows, pinned_model)
 
 
-def codex_catalog_fingerprint(launch: NativeCodexLaunch) -> str:
-    """The launch-config fingerprint keying codex's shared model catalog.
+def codex_catalog_fingerprint(launch: NativeCodexLaunch, *, codex_path: str | None = None) -> str:
+    """The launch fingerprint keying codex's shared model catalog.
 
     One formula for every consumer (host boot probe, runner launch, live
     write-back), so they read and write the same catalog file. Callers
     fingerprint the SHAPE — a ``model=None`` resolution — so per-session
     picks never fragment the catalog.
 
+    The Codex executable is part of the key. The catalog holds that
+    binary's own answer, so an upgraded CLI must re-probe instead of
+    serving model names the previous release printed. The binary is
+    resolved the same way the probe launches it.
+
     :param launch: The resolved launch (``resolve_native_codex_launch``).
+    :param codex_path: Optional Codex executable override, matching the
+        one the caller's probe would launch.
     :returns: A stable fingerprint string.
     """
-    from omnigent.model_catalog_store import fingerprint_of
+    from omnigent.model_catalog_store import binary_identity, fingerprint_of
 
     return fingerprint_of(
-        "codex-native", launch.profile, launch.model, tuple(launch.config_overrides)
+        "codex-native",
+        launch.profile,
+        launch.model,
+        tuple(launch.config_overrides),
+        binary_identity(codex_path or _find_codex_cli()),
     )
 
 
@@ -1025,22 +1037,26 @@ async def codex_launch_catalog(*, codex_path: str | None = None) -> list[_JsonOb
     except Exception:  # noqa: BLE001 — a broken provider config means no catalog
         _logger.warning("codex catalog: launch shape resolution failed", exc_info=True)
         return None
-    fingerprint = codex_catalog_fingerprint(launch)
+    fingerprint = codex_catalog_fingerprint(launch, codex_path=codex_path)
 
     async def _probe() -> list[_JsonObject] | None:
         try:
             return await probe_codex_model_options(codex_path=codex_path)
         except Exception:  # noqa: BLE001 — probe failure means "no catalog", never a crash
-            _logger.warning("codex catalog probe failed", exc_info=True)
+            # Best-effort probe re-run on every catalog fetch; log once so a
+            # persistently failing probe doesn't flood the logs.
+            log_once(_logger, logging.WARNING, "codex catalog probe failed", exc_info=True)
             return None
 
     return await model_catalog_store.ensure_catalog("codex-native", fingerprint, _probe)
 
 
-async def codex_launch_catalog_is_stale() -> bool:
+async def codex_launch_catalog_is_stale(*, codex_path: str | None = None) -> bool:
     """
     Whether the default launch shape's stored catalog is past the TTL.
 
+    :param codex_path: Optional Codex executable override, matching the
+        one :func:`codex_launch_catalog` would probe with.
     :returns: ``True`` when the store holds only a stale entry; ``False``
         when it is fresh, absent, or the launch shape cannot resolve.
     """
@@ -1050,7 +1066,9 @@ async def codex_launch_catalog_is_stale() -> bool:
         launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
     except Exception:  # noqa: BLE001 — a broken provider config means no catalog
         return False
-    return model_catalog_store.catalog_is_stale("codex-native", codex_catalog_fingerprint(launch))
+    return model_catalog_store.catalog_is_stale(
+        "codex-native", codex_catalog_fingerprint(launch, codex_path=codex_path)
+    )
 
 
 def _build_native_codex_app_server_argv(
@@ -2263,12 +2281,18 @@ class NativeCodexLaunch:
         outcome (provider / profile / model, or the login-fallback state),
         set at resolution time and surfaced in the startup-timeout error so
         hosted users can diagnose without runner-log access (see #2745).
+    :param login_required: ``True`` when the launch defers to Codex's own
+        login while no usable stored credential exists — the TUI will park
+        on the sign-in screen and never start a thread on its own. Lets a
+        headless caller fail the turn fast with an actionable error instead
+        of burning the thread-start timeout.
     """
 
     config_overrides: list[str]
     model: str | None
     profile: str | None
     summary: str = ""
+    login_required: bool = False
 
 
 _MODEL_PROVIDER_OVERRIDE_PREFIX = "model_provider="
@@ -2587,6 +2611,21 @@ def _first_routable_codex_provider(
     return None
 
 
+def _codex_login_usable() -> bool:
+    """Whether Codex's own stored login can carry a launch that defers to it.
+
+    Reads the same ``auth.json`` the launched Codex process will use (the
+    bridged ``CODEX_HOME`` source), so a login-fallback launch can be marked
+    doomed (``login_required``) only when the sign-in screen is genuinely
+    what the TUI will render.
+
+    :returns: ``True`` when a usable stored credential exists.
+    """
+    from omnigent.onboarding.ambient import codex_auth_has_credential
+
+    return codex_auth_has_credential(_codex_home_config_source_from_env() / "auth.json")
+
+
 def _resolve_subscription_launch(
     entry: ProviderEntry, model: str | None, explicit: dict[str, object]
 ) -> NativeCodexLaunch:
@@ -2608,19 +2647,14 @@ def _resolve_subscription_launch(
         providers.
     :returns: The resolved :class:`NativeCodexLaunch`.
     """
-    from omnigent.onboarding.ambient import codex_auth_has_credential
-
     # Pin codex's built-in ``openai`` provider: the bridged config.toml may
     # set a custom default ``model_provider`` (e.g. isaac's Databricks AI
     # Gateway), which would silently hijack a Subscription selection. A
     # no-op when the user's config sets no custom default.
     subscription_overrides = ['model_provider="openai"']
-    # Resolve against the same CODEX_HOME the native server bridges from
-    # (``_populate_codex_home_config``) so this "is Codex logged in?" check reads
-    # the exact auth.json the launched Codex process will use.
-    real_codex_home = _codex_home_config_source_from_env()
-    if codex_auth_has_credential(real_codex_home / "auth.json"):
-        _logger.info(
+    if _codex_login_usable():
+        log_info_once(
+            _logger,
             "native-codex routing: Codex CLI login (subscription provider %r; Codex is logged in)",
             entry.name,
         )
@@ -2633,7 +2667,8 @@ def _resolve_subscription_launch(
     fallback = _first_routable_codex_provider(explicit, exclude=entry.name, model=model)
     if fallback is not None:
         return fallback
-    _logger.info(
+    log_info_once(
+        _logger,
         "native-codex routing: Codex CLI login (subscription provider %r has no usable "
         "Codex login and no alternative provider is configured)",
         entry.name,
@@ -2647,6 +2682,7 @@ def _resolve_subscription_launch(
             "login and no alternative provider is configured) — the TUI likely renders "
             "the sign-in screen and never starts a thread"
         ),
+        login_required=True,
     )
 
 
@@ -2746,9 +2782,8 @@ def resolve_native_codex_launch(
                 # (:func:`_resolve_subscription_launch`) — never do that for
                 # an explicit spec declaration: silently running a credential
                 # the spec did not name is worse than the login screen.
-                from omnigent.onboarding.ambient import codex_auth_has_credential
-
-                if codex_auth_has_credential(_codex_home_config_source_from_env() / "auth.json"):
+                spec_codex_logged_in = _codex_login_usable()
+                if spec_codex_logged_in:
                     state = "Codex is logged in"
                 else:
                     state = (
@@ -2760,16 +2795,19 @@ def resolve_native_codex_launch(
                     model=model,
                     profile=None,
                     summary=f"Codex CLI login (spec provider {spec_entry.name!r}; {state})",
+                    login_required=not spec_codex_logged_in,
                 )
             launch = _codex_provider_launch(spec_entry, model)
             if launch is not None:
                 if launch.profile is not None:
-                    _logger.info(
+                    log_info_once(
+                        _logger,
                         "native-codex routing: Databricks ucode profile %r (spec auth)",
                         launch.profile,
                     )
                 else:
-                    _logger.info(
+                    log_info_once(
+                        _logger,
                         "native-codex routing: provider %r (spec auth, model=%s)",
                         spec_entry.name,
                         launch.model,
@@ -2798,6 +2836,7 @@ def resolve_native_codex_launch(
                 model=model,
                 profile=None,
                 summary="Codex CLI login (global auth block, non-Databricks; no provider routing)",
+                login_required=not _codex_login_usable(),
             )
         entry = default_provider_for_harness(effective_config_with_detected(explicit), "codex")
 
@@ -2814,7 +2853,8 @@ def resolve_native_codex_launch(
         # This keeps rollout metadata, app-server, and remote TUI routing on
         # one immutable provider selection during cold resume.
         provider_id = config_detection.model_provider
-        _logger.info(
+        log_info_once(
+            _logger,
             "native-codex routing: config.toml provider %r (ambient fallback, model=%s)",
             provider_id,
             model,
@@ -2827,10 +2867,11 @@ def resolve_native_codex_launch(
         )
 
     if entry is None:
-        _logger.info(
+        log_info_once(
+            _logger,
             "native-codex routing: Codex CLI login (no provider configured for the Codex "
             "harness, no Databricks profile). Run `omnigent setup --no-internal-beta` to route "
-            "through a provider."
+            "through a provider.",
         )
         return NativeCodexLaunch(
             config_overrides=no_provider_overrides,
@@ -2842,6 +2883,7 @@ def resolve_native_codex_launch(
                 f"screen and never starts a thread; run `{cli_invocation()} setup` "
                 "to route through a provider"
             ),
+            login_required=not _codex_login_usable(),
         )
     if entry.kind == SUBSCRIPTION_KIND:
         return _resolve_subscription_launch(entry, model, explicit)
@@ -2849,9 +2891,13 @@ def resolve_native_codex_launch(
     launch = _codex_provider_launch(entry, model)
     if launch is not None:
         if launch.profile is not None:
-            _logger.info("native-codex routing: Databricks ucode profile %r", launch.profile)
+            log_info_once(
+                _logger, "native-codex routing: Databricks ucode profile %r", launch.profile
+            )
         else:
-            _logger.info("native-codex routing: provider %r (model=%s)", entry.name, launch.model)
+            log_info_once(
+                _logger, "native-codex routing: provider %r (model=%s)", entry.name, launch.model
+            )
         return launch
     # Default provider can't route on its own (no openai surface / no usable
     # credential / unresolvable secret) → Codex's own login.
@@ -2869,6 +2915,7 @@ def resolve_native_codex_launch(
             "usable openai credential) — the TUI likely renders the sign-in screen "
             "and never starts a thread"
         ),
+        login_required=not _codex_login_usable(),
     )
 
 

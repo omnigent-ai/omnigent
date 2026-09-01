@@ -155,7 +155,19 @@ def create_host_tunnel_router(
             host_id = uuid_to_bytes(host_id).hex()
         except InvalidUuidError:
             _logger.warning("Refusing host tunnel: malformed host id %r", host_id)
-            await ws.close(code=4003, reason="invalid host id")
+            # Refuse with a real HTTP 400 + body rather than a bare pre-accept
+            # close: the latter reaches the client as an opaque 403 (empty
+            # body), indistinguishable from an auth failure. A 400 that names
+            # the problem lets the host surface an actionable error.
+            await _refuse_upgrade(
+                ws,
+                status=400,
+                reason=(
+                    f"Invalid host id {host_id!r}: host ids must be UUIDs. Set "
+                    "OMNIGENT_HOST_ID to a UUID (or unset it to have one "
+                    "generated) and reconnect."
+                ),
+            )
             return
 
         # Authenticate from the handshake BEFORE accepting the upgrade,

@@ -8,7 +8,10 @@ from pathlib import Path
 import pytest
 import yaml
 
-from omnigent.host.identity import load_or_create_host_identity
+from omnigent.host.identity import (
+    load_host_identity_if_present,
+    load_or_create_host_identity,
+)
 
 
 def test_create_identity_when_no_config(tmp_path: Path) -> None:
@@ -178,3 +181,111 @@ def test_env_override_requires_both_vars(tmp_path: Path, monkeypatch: pytest.Mon
 
     with pytest.raises(ValueError, match="must be set together"):
         load_or_create_host_identity(tmp_path / "config.yaml")
+
+
+def test_env_non_uuid_host_id_raises_actionable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A non-UUID OMNIGENT_HOST_ID must fail loud and locally with an
+    actionable message — not sail through to be refused remotely by the
+    tunnel as an opaque 403. Regression for the customer-reported case
+    where host_id was a human-readable name.
+    """
+    monkeypatch.setenv("OMNIGENT_HOST_ID", "superagent-databricks-host")
+    monkeypatch.setenv("OMNIGENT_HOST_NAME", "supercell")
+
+    with pytest.raises(ValueError) as excinfo:
+        load_or_create_host_identity(tmp_path / "config.yaml")
+
+    msg = str(excinfo.value)
+    assert "OMNIGENT_HOST_ID" in msg, "error must name the env var to fix"
+    assert "UUID" in msg, "error must state host ids are UUIDs"
+    assert "superagent-databricks-host" in msg, "error must echo the bad value"
+
+
+def test_env_dashed_uuid_host_id_accepted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A canonical dashed uuid is accepted (it resolves to the same host bytes
+    the server stores, whether or not the client canonicalises the string)."""
+    from omnigent.db.db_models import uuid_to_bytes
+
+    dashed = "329c39d0-3aad-39cc-f2f8-597d596676bd"
+    monkeypatch.setenv("OMNIGENT_HOST_ID", dashed)
+    monkeypatch.setenv("OMNIGENT_HOST_NAME", "managed-env")
+
+    identity = load_or_create_host_identity(tmp_path / "config.yaml")
+
+    assert uuid_to_bytes(identity.host_id) == uuid_to_bytes(dashed)
+
+
+def test_env_legacy_prefixed_host_id_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A legacy ``host_<hex>`` id is accepted and normalised to bare hex."""
+    monkeypatch.setenv("OMNIGENT_HOST_ID", "host_329c39d03aad39ccf2f8597d596676bd")
+    monkeypatch.setenv("OMNIGENT_HOST_NAME", "managed-env")
+
+    identity = load_or_create_host_identity(tmp_path / "config.yaml")
+
+    assert identity.host_id == "329c39d03aad39ccf2f8597d596676bd"
+
+
+@pytest.mark.parametrize(
+    "configured_host_id",
+    [
+        "329c39d0-3aad-39cc-f2f8-597d596676bd",
+        "host_329c39d03aad39ccf2f8597d596676bd",
+    ],
+)
+def test_config_uuid_host_id_normalized(tmp_path: Path, configured_host_id: str) -> None:
+    """Dashed and legacy-prefixed config ids resolve to the same bare UUID."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"host": {"host_id": configured_host_id, "name": "my-laptop"}})
+    )
+
+    identity = load_or_create_host_identity(config_path)
+
+    assert identity.host_id == "329c39d03aad39ccf2f8597d596676bd"
+
+
+def test_config_non_uuid_host_id_raises_actionable(tmp_path: Path) -> None:
+    """
+    A non-UUID host_id persisted in config.yaml is rejected with a message
+    that points at the config file, not silently forwarded to the server.
+    """
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"host": {"host_id": "not-a-uuid", "name": "my-laptop"}})
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        load_or_create_host_identity(config_path)
+
+    msg = str(excinfo.value)
+    assert "UUID" in msg
+    assert str(config_path) in msg, "error must name the config file to fix"
+    assert "not-a-uuid" in msg
+
+
+def test_if_present_env_non_uuid_host_id_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The read-only sibling is TOLERANT: a malformed env host_id yields None, not
+    a raise. This path is the passive slice-key fallback every request's header
+    builder funnels through, so a bad id must degrade to "no slice key" rather
+    than crash unrelated commands — the fail-fast lives on the connect path
+    (load_or_create_host_identity)."""
+    monkeypatch.setenv("OMNIGENT_HOST_ID", "superagent-databricks-host")
+    monkeypatch.setenv("OMNIGENT_HOST_NAME", "supercell")
+
+    assert load_host_identity_if_present(Path("/nonexistent/config.yaml")) is None
+
+
+def test_if_present_config_non_uuid_host_id_returns_none(tmp_path: Path) -> None:
+    """A bad host_id in config.yaml also degrades to None on the read-only path,
+    for the same reason as the env override above."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"host": {"host_id": "not-a-uuid", "name": "my-laptop"}})
+    )
+
+    assert load_host_identity_if_present(config_path) is None

@@ -269,6 +269,9 @@ omnigent hermes                      # Hermes Agent (Nous Research)
 omnigent pi                          # Pi
 ```
 
+`omnigent agy` requires agy 1.1.13 or newer. When `GEMINI_API_KEY` is set,
+direct Gemini API authentication takes precedence over agy's saved OAuth login.
+
 Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
 its coding agents or drive a live OpenClaw Gateway session over ACP.
 
@@ -347,6 +350,41 @@ omnigent start   # starts the local server and registers this machine as a host
 Open the server URL it prints, hit **New Chat**, pick your machine, and go.
 Check status with `omnigent server status`; stop everything with
 `omnigent stop`.
+
+<details>
+<summary>Customize automatic session titles</summary>
+
+Set additional natural-language requirements for the isolated title generator:
+
+```bash
+omnigent config set --global \
+  'session_title_instructions=Prefix titles with the current date as lowercase mon-dd. Use PR-number-short-name for pull requests, issue-number-short-description for issues, and a short snake_case activity otherwise.'
+```
+
+The title generator receives the current date as `YYYY-MM-DD`, then applies
+these requirements to the first user message. The setting is server-owned and
+does not alter an agent's portable instructions. Default generated titles are
+limited to 100 characters; custom title requirements may use up to 200.
+Default titles over 100 characters are rejected, leaving the first-message
+fallback title in place. Custom titles over 200 characters are truncated with
+a trailing ellipsis. Manually assigned titles are also limited to 200
+characters. The setting applies to new sessions after the local Omnigent
+server restarts.
+For longer instructions, edit `~/.omnigent/config.yaml` directly and use a YAML
+block scalar:
+
+```yaml
+session_title_instructions: |
+  Prefix every title with the current date as lowercase mon-dd.
+  For pull requests use mon-dd-PR-number-short-name.
+  For issues use mon-dd-issue-number-short-description.
+  For other work use mon-dd-short_snake_case_activity.
+```
+
+Server operators can set the same key in the YAML passed to
+`omnigent server --config`.
+
+</details>
 
 ### 3. Choose & switch models
 

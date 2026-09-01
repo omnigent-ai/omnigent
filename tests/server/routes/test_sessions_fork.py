@@ -16,6 +16,7 @@ from starlette.testclient import TestClient
 
 from omnigent.entities import Agent, Conversation, ConversationItem, MessageData, PagedList
 from omnigent.errors import OmnigentError
+from omnigent.server.routes import _session_create_validation as create_validation
 from omnigent.server.routes.sessions import create_sessions_router
 
 # ── Minimal store stubs ──────────────────────────────────────────
@@ -131,6 +132,14 @@ class _ConversationStore:
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
         copy_terminal_launch_args: bool = True,
+        override_model_override: str | None = None,
+        override_model_override_set: bool = False,
+        override_reasoning_effort: str | None = None,
+        override_reasoning_effort_set: bool = False,
+        override_terminal_launch_args: list[str] | None = None,
+        override_terminal_launch_args_set: bool = False,
+        dropped_label_keys: frozenset[str] = frozenset(),
+        extra_labels: dict[str, str] | None = None,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
@@ -184,6 +193,14 @@ class _ConversationStore:
                 "cloned_agent_description": cloned_agent_description,
                 "copy_model_settings": copy_model_settings,
                 "copy_terminal_launch_args": copy_terminal_launch_args,
+                "override_model_override": override_model_override,
+                "override_model_override_set": override_model_override_set,
+                "override_reasoning_effort": override_reasoning_effort,
+                "override_reasoning_effort_set": override_reasoning_effort_set,
+                "override_terminal_launch_args": override_terminal_launch_args,
+                "override_terminal_launch_args_set": override_terminal_launch_args_set,
+                "dropped_label_keys": dropped_label_keys,
+                "extra_labels": extra_labels,
                 "carry_history_into_native": carry_history_into_native,
                 "resume_source_native_session": resume_source_native_session,
                 "presentation_labels": presentation_labels,
@@ -360,7 +377,7 @@ def _build_app(
 
 
 @pytest.mark.asyncio
-async def test_fork_session_happy_path() -> None:
+async def test_fork_session_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     """POST /sessions/{id}/fork returns 201, clones the agent, and
     binds the fork to the cloned agent.
 
@@ -392,6 +409,15 @@ async def test_fork_session_happy_path() -> None:
         }
     )
     client = TestClient(_build_app(conv_store, agent_store=agent_store))
+    original_resolver = create_validation.resolve_project_session_create
+    chokepoint_calls = 0
+
+    async def _recording_resolver(**kwargs: Any) -> Any:
+        nonlocal chokepoint_calls
+        chokepoint_calls += 1
+        return await original_resolver(**kwargs)
+
+    monkeypatch.setattr(create_validation, "resolve_project_session_create", _recording_resolver)
 
     resp = client.post(
         "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={"title": "My Fork"}
@@ -421,6 +447,7 @@ async def test_fork_session_happy_path() -> None:
         f"Copied items should preserve content and order, got {item_texts}"
     )
     assert body["title"] == "My Fork"
+    assert chokepoint_calls == 1
 
     # The agent clone is created INSIDE fork_conversation (atomically), not
     # via a separate agent_store.create — a pre-created row would leak as a
@@ -449,6 +476,98 @@ async def test_fork_session_happy_path() -> None:
     assert fork_call["agent_id"] == body["agent_id"], (
         "Fork must bind the same cloned agent id it asked the store to create"
     )
+
+
+@pytest.mark.asyncio
+async def test_fork_session_run_config_overrides_pass_through() -> None:
+    """The dialog's model / effort / launch-args picks reach the store as
+    explicit overrides with their set-flags on.
+
+    Omitting these fields must leave the store on the inherit path
+    (``override_*_set=False``), so the flags gate on the request having sent
+    each field — a regression here would either drop a user's pick or clobber
+    an inherited value the user never touched.
+    """
+    conv = _make_conversation()
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={
+            "model_override": "opus",
+            "reasoning_effort": "high",
+            "terminal_launch_args": ["--permission-mode", "auto"],
+        },
+    )
+
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    fork_call = conv_store.fork_calls[0]
+    assert fork_call["override_model_override_set"] is True
+    assert fork_call["override_model_override"] == "opus"
+    assert fork_call["override_reasoning_effort_set"] is True
+    assert fork_call["override_reasoning_effort"] == "high"
+    assert fork_call["override_terminal_launch_args_set"] is True
+    assert fork_call["override_terminal_launch_args"] == ["--permission-mode", "auto"]
+    # Explicit launch args ⇒ drop the source's copied mode labels so a stale
+    # permission-mode label can't shadow the freshly chosen mode.
+    assert "omnigent.claude_native.permission_mode" in fork_call["dropped_label_keys"]
+
+
+@pytest.mark.asyncio
+async def test_fork_session_run_config_omitted_inherits() -> None:
+    """A fork with no run-config fields leaves every override unset, so the
+    store keeps today's inherit behavior (and drops no mode labels)."""
+    conv = _make_conversation()
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    fork_call = conv_store.fork_calls[0]
+    assert fork_call["override_model_override_set"] is False
+    assert fork_call["override_reasoning_effort_set"] is False
+    assert fork_call["override_terminal_launch_args_set"] is False
+    assert fork_call["dropped_label_keys"] == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_fork_session_run_config_clear_aliases() -> None:
+    """A "default" model/effort (the picker's Default row) reaches the store as
+    a cleared override — set-flag on, value None — resetting the fork to the
+    bound agent's default rather than inheriting the source's."""
+    conv = _make_conversation()
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"model_override": "default", "reasoning_effort": "default"},
+    )
+
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    fork_call = conv_store.fork_calls[0]
+    assert fork_call["override_model_override_set"] is True
+    assert fork_call["override_model_override"] is None
+    assert fork_call["override_reasoning_effort_set"] is True
+    assert fork_call["override_reasoning_effort"] is None
+
+
+@pytest.mark.asyncio
+async def test_fork_session_400_invalid_model_override() -> None:
+    """A shell-/flag-shaped model id is rejected before any fork happens."""
+    conv = _make_conversation()
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"model_override": "--rm -rf"},
+    )
+
+    assert resp.status_code == 400, f"got {resp.status_code}: {resp.text}"
+    assert conv_store.fork_calls == [], "No fork should happen on a bad model override"
 
 
 @pytest.mark.asyncio
@@ -766,6 +885,139 @@ async def test_fork_switch_binds_target_agent_bundle() -> None:
     # The fork binds the cloned agent id it asked the store to create.
     assert fork_call["agent_id"] is not None
     assert fork_call["agent_id"] != "087b7cb7ac30abf4debfaa578d052ec6"
+
+
+@pytest.mark.asyncio
+async def test_fork_switch_drops_claude_permission_mode_label() -> None:
+    """An agent switch drops the source's claude-native permission-mode label.
+
+    That label is Claude-specific and rides alongside launch args, which a
+    switching fork already drops. Carrying the label onto a switched fork would
+    leave stale mode metadata that could hydrate a wrong mode in native-wrapper
+    UI state, so the route lists it in ``dropped_label_keys`` whenever the agent
+    changes — independent of whether the dialog sent explicit launch args.
+    """
+    conv = _make_conversation()
+    conv_store = _ConversationStore(
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={
+            "e9f8f58523cec9a57d3bdf93be543e8c": [
+                _make_item("9980c8a9248139f14f4165e5d53088aa", "Hello")
+            ]
+        },
+    )
+    client = TestClient(_build_app(conv_store, agent_store=_switch_agent_store()))
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"agent_id": "44b4151dd6cdfed6ee19430832398e05"},
+    )
+
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    dropped = conv_store.fork_calls[0]["dropped_label_keys"]
+    assert "omnigent.claude_native.permission_mode" in dropped, (
+        f"agent switch must drop the claude permission-mode label, got {dropped!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fork_same_agent_keeps_permission_mode_label() -> None:
+    """A same-agent fork with no explicit launch args drops NO mode labels.
+
+    The permission-mode label is Claude-specific but valid for a same-agent
+    fork (same CLI), so it must carry over — the drop is gated on an agent
+    switch or an explicit launch-args pick, neither of which applies here.
+    """
+    conv = _make_conversation()
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    assert conv_store.fork_calls[0]["dropped_label_keys"] == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_fork_codex_bypass_stamps_label_on_codex_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bypass opt-in stamps the codex label via ``extra_labels``.
+
+    The source's own bypass label is always dropped (instance-scoped), so this
+    explicit, banner-gated request field is the ONLY path that arms bypass on a
+    fork — and the store applies ``extra_labels`` AFTER the drop, so the opt-in
+    wins. Gated on the target actually being codex-native.
+    """
+    conv = _make_conversation()
+    conv_store = _ConversationStore(
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={
+            "e9f8f58523cec9a57d3bdf93be543e8c": [
+                _make_item("9980c8a9248139f14f4165e5d53088aa", "Hi")
+            ]
+        },
+    )
+    # The codex target (44b4…) must report codex-native so the route stamps.
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_agent_cache",
+        lambda: _StubAgentCache(
+            {
+                "087b7cb7ac30abf4debfaa578d052ec6": "claude_sdk",
+                "44b4151dd6cdfed6ee19430832398e05": "codex-native",
+            }
+        ),
+    )
+    client = TestClient(_build_app(conv_store, agent_store=_switch_agent_store()))
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"agent_id": "44b4151dd6cdfed6ee19430832398e05", "codex_bypass_sandbox": True},
+    )
+
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    extra = conv_store.fork_calls[0]["extra_labels"]
+    assert extra == {"omnigent.codex_native.bypass_sandbox": "1"}, (
+        f"bypass opt-in must stamp the codex bypass label, got {extra!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fork_codex_bypass_rejected_on_non_codex_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Arming bypass for a non-codex target is a 400 (the label is inert there).
+
+    Refusing rather than silently ignoring keeps the dangerous flag from being
+    set on a fork it can't apply to — the request is a client bug.
+    """
+    conv = _make_conversation()
+    conv_store = _ConversationStore(
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={
+            "e9f8f58523cec9a57d3bdf93be543e8c": [
+                _make_item("9980c8a9248139f14f4165e5d53088aa", "Hi")
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_agent_cache",
+        lambda: _StubAgentCache(
+            {
+                "087b7cb7ac30abf4debfaa578d052ec6": "claude_sdk",
+                "280d725b404d2915f9e9d6cccce91303": "claude-native",
+            }
+        ),
+    )
+    client = TestClient(_build_app(conv_store, agent_store=_switch_agent_store()))
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"agent_id": "280d725b404d2915f9e9d6cccce91303", "codex_bypass_sandbox": True},
+    )
+
+    assert resp.status_code == 400, f"got {resp.status_code}: {resp.text}"
+    assert conv_store.fork_calls == [], "no fork should happen on an invalid bypass opt-in"
 
 
 @pytest.mark.asyncio

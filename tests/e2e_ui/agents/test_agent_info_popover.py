@@ -30,7 +30,7 @@ import pytest
 from playwright.sync_api import Page, expect
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-_COMPOSER = "Ask the agent anything…"
+_COMPOSER = "Send a message…"
 _AGENT_INFO_TRIGGER = '[data-testid="agent-info-trigger"]'
 _AGENT_INFO_PANEL = '[data-testid="agent-info-panel"]'
 _REPO_ROOT = Path(__file__).resolve().parents[3]

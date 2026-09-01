@@ -6,6 +6,11 @@ node_modules/
 .pnpm-debug.log*
 reviews/
 
+# repro/resolve-agent workspace artifact — the machine-readable handoff.
+# Rides in the PR Demo section / CI artifact bundle, never in the diff.
+# Gitignored so a stray `git add` can't sweep it into a PR.
+.omnigent/
+
 # Generated artifact; never committed.
 .pytest_cache/
 __pycache__/
@@ -87,3 +92,4 @@ web/storybook-static/
 # DAB local state directory (created by `databricks bundle deploy`).
 deploy/databricks/.databricks/
 web/package-lock.json
+recordings/

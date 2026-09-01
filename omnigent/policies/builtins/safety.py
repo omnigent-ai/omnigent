@@ -25,11 +25,18 @@ _ALLOW: PolicyResponse = {"result": "ALLOW"}
 
 _SYS_OS_TOOLS = frozenset({"sys_os_read", "sys_os_write", "sys_os_edit", "sys_os_shell"})
 
+# Claude Code / Codex native tools that MUTATE a file, surfaced via the
+# PreToolUse hook contract. Single source of truth: the write policies in
+# ``omnigent.policies.builtins.orchestration`` build their gated sets from
+# this, and it must stay equal to ``_CLAUDE_NATIVE_EDIT_TOOLS`` in
+# ``omnigent.server.routes._sessions.common`` (asserted in the tests).
+NATIVE_WRITE_TOOLS: frozenset[str] = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
+
 # Claude Code and Codex native tool names surfaced via the PreToolUse /
 # PostToolUse hook contract (see ``omnigent.native_policy_hook``).
 # These bypass Omnigent' ``sys_os_*`` MCP tools and execute directly
 # inside the CLI subprocess.
-_NATIVE_OS_TOOLS = frozenset({"Bash", "Read", "Write", "Edit", "Glob", "Grep"})
+_NATIVE_OS_TOOLS = NATIVE_WRITE_TOOLS | {"Bash", "Read", "Glob", "Grep"}
 
 # Cursor SDK native tool names surfaced via the preToolUse hook
 # (see ``omnigent.inner.cursor_policy_hook``). Cursor uses ``Shell``
@@ -77,6 +84,14 @@ _GOOSE_NATIVE_OS_TOOLS = frozenset(
 # explicitly so opencode coverage does not silently depend on that set, and add
 # the file-search categories (``grep`` / ``glob``) pi lacks.
 _OPENCODE_NATIVE_OS_TOOLS = frozenset({"bash", "edit", "read", "grep", "glob"})
+
+# Codex in-process harness tool names surfaced as observational
+# ``ToolCallRequest`` events. The codex app-server executor translates
+# ``commandExecution`` items to a ``ToolCallRequest(name="shell")`` and
+# ``fileChange`` items to ``ToolCallRequest(name="apply_patch")``. Only
+# the shell tool needs to be in the OS gate here; apply_patch carries no
+# ``command`` argument, so the shell-preview branch below is not reached.
+_CODEX_IN_PROCESS_OS_TOOLS = frozenset({"shell"})
 
 
 # ── Rate limiting ────────────────────────────────────────────────────────────
@@ -222,8 +237,8 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
     - **Omnigent built-in OS tools** (``sys_os_read``,
       ``sys_os_write``, ``sys_os_edit``, ``sys_os_shell``).
     - **Claude Code native tools** (``Bash``, ``Read``, ``Write``,
-      ``Edit``, ``Glob``, ``Grep``) — surfaced via the
-      ``PreToolUse`` hook contract.
+      ``Edit``, ``MultiEdit``, ``NotebookEdit``, ``Glob``, ``Grep``) —
+      surfaced via the ``PreToolUse`` hook contract.
     - **Codex native tools** — uses the same ``PreToolUse`` hook
       contract with the same tool names (e.g. ``Bash``).
     - **Cursor SDK native tools** (``Shell``) — surfaced via the
@@ -232,6 +247,9 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
     - **Pi native tools** (``read``, ``bash``, ``write``, ``edit``)
       — surfaced via the pi ``tool_call`` extension hook. Lowercase
       and distinct from the Claude/Codex casing.
+    - **Goose native tools** (``developer__shell`` and the
+      ``developer__*`` file tools) — surfaced via the goose
+      extension hook.
     - **Hermes Agent tools** (``terminal``, ``execute_code``,
       ``read_file``, ``write_file``, ``search_files``) — surfaced
       via the ``pre_tool_call`` shell hook.
@@ -261,20 +279,33 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
         | _HERMES_OS_TOOLS
         | _GOOSE_NATIVE_OS_TOOLS
         | _OPENCODE_NATIVE_OS_TOOLS
+        | _CODEX_IN_PROCESS_OS_TOOLS
     )
     if tool in _all_os_tools:
         args = data.get("arguments", {})
         # Build a short preview of what the tool is doing.
-        if tool in ("sys_os_shell", "Bash", "bash", "Shell", "terminal", "developer__shell"):
+        if tool in (
+            "sys_os_shell",
+            "Bash",
+            "bash",
+            "Shell",
+            "terminal",
+            "developer__shell",
+            "shell",
+        ):
             preview = args.get("command", "") if isinstance(args, dict) else ""
         elif tool in ("Grep", "Glob", "search_files", "grep", "glob"):
             preview = args.get("pattern", "") if isinstance(args, dict) else ""
         elif tool == "execute_code":
-            preview = args.get("code", "")[:80] if isinstance(args, dict) else ""
+            code = args.get("code") if isinstance(args, dict) else None
+            preview = code[:80] if isinstance(code, str) else ""
         else:
-            # Omnigent tools use ``path``; Claude native tools use ``file_path``.
+            # Omnigent tools use ``path``; Claude native tools use ``file_path``,
+            # except NotebookEdit which uses ``notebook_path``.
             preview = (
-                (args.get("path") or args.get("file_path", "")) if isinstance(args, dict) else ""
+                (args.get("path") or args.get("file_path") or args.get("notebook_path") or "")
+                if isinstance(args, dict)
+                else ""
             )
         return {
             "result": "ASK",
@@ -705,9 +736,11 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         "kind": "callable",
         "name": "Require Approval for File & Shell Operations",
         "description": "Asks for user approval before any file or shell tool call — "
-        "covers Omnigent sys_os_* tools, Claude Code native tools "
-        "(Bash, Read, Write, Edit, Glob, Grep), Codex native tools, "
+        "covers Omnigent sys_os_* tools, Claude Code and Codex native tools "
+        "(Bash, Read, Write, Edit, MultiEdit, NotebookEdit, Glob, Grep), "
+        "Cursor native tools (Shell), Pi native tools (read, bash, write, edit), "
         "opencode native tools (bash, edit, read, grep, glob), "
+        "Goose native tools (developer__shell and the developer__* file tools), "
         "and Hermes Agent tools (terminal, execute_code, read_file, write_file, search_files)",
         "params_schema": None,
     },

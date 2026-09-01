@@ -677,3 +677,54 @@ async def test_run_turn_passes_hermes_home_env(
         _, call_kwargs = mock_create.call_args
         assert "env" in call_kwargs
         assert call_kwargs["env"]["HERMES_HOME"] == str(executor._hermes_home)
+
+
+@pytest.mark.asyncio
+async def test_interrupt_session_terminates_live_process(tmp_path: pathlib.Path) -> None:
+    """A live subprocess (returncode None) is terminated and True returned."""
+    executor = HermesExecutor(hermes_path="/usr/bin/hermes-fake", cwd=str(tmp_path))
+    mock_proc = MagicMock()
+    mock_proc.returncode = None
+    mock_proc.wait = AsyncMock(return_value=0)
+    executor._proc = mock_proc
+
+    assert await executor.interrupt_session("some-key") is True
+    mock_proc.terminate.assert_called_once()
+    mock_proc.kill.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_session_escalates_to_kill_when_sigterm_ignored(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A subprocess that ignores SIGTERM is SIGKILLed after the grace wait."""
+    executor = HermesExecutor(hermes_path="/usr/bin/hermes-fake", cwd=str(tmp_path))
+    mock_proc = MagicMock()
+    mock_proc.returncode = None
+
+    async def _never_exits() -> int:
+        # Cancelled by interrupt_session's real grace-period wait_for.
+        await asyncio.sleep(3600)
+        return 0
+
+    mock_proc.wait = _never_exits
+    executor._proc = mock_proc
+
+    assert await executor.interrupt_session("some-key") is True
+    mock_proc.terminate.assert_called_once()
+    mock_proc.kill.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_session_returns_false_when_finished_or_absent(
+    tmp_path: pathlib.Path,
+) -> None:
+    """No process, or an already-exited one, yields False with no terminate."""
+    executor = HermesExecutor(hermes_path="/usr/bin/hermes-fake", cwd=str(tmp_path))
+    assert await executor.interrupt_session("some-key") is False
+
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+    executor._proc = mock_proc
+    assert await executor.interrupt_session("some-key") is False
+    mock_proc.terminate.assert_not_called()

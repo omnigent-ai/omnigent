@@ -8,7 +8,6 @@ import {
 } from "react";
 import {
   ArchiveIcon,
-  CheckIcon,
   ChevronLeftIcon,
   EllipsisIcon,
   FolderInputIcon,
@@ -18,7 +17,6 @@ import {
   PencilIcon,
   PinIcon,
   PinOffIcon,
-  SearchIcon,
   ShareIcon,
   Trash2Icon,
 } from "lucide-react";
@@ -47,15 +45,16 @@ import {
   type Conversation,
   useArchiveConversation,
   useMoveToProject,
-  useProjects,
   useRenameConversation,
   useStopAndDeleteConversation,
   useTogglePinnedConversation,
 } from "@/hooks/useConversations";
+import { ProjectPicker } from "./ProjectPicker";
 import { markConversationUnread } from "@/hooks/useUnseenConversations";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { Link, useNavigate } from "@/lib/routing";
+import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showToast } from "@/components/ui/toast";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
@@ -87,63 +86,6 @@ function ArchivedToast() {
 
 function showArchivedToast() {
   showToast(<ArchivedToast />);
-}
-
-function ProjectPicker({
-  currentProject,
-  onSelect,
-}: {
-  currentProject: string | null;
-  onSelect: (project: string) => void;
-}) {
-  const { data: projects = [] } = useProjects();
-  const [search, setSearch] = useState("");
-  const filtered = search
-    ? projects.filter((project) => project.name.toLowerCase().includes(search.toLowerCase()))
-    : projects;
-
-  return (
-    <>
-      <div className="flex items-center gap-2 border-b px-2 py-1.5">
-        <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
-        <input
-          aria-label="Search projects"
-          className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
-          placeholder="Search projects"
-          value={search}
-          onChange={(event) => setSearch(event.target.value)}
-          onKeyDown={(event) => event.stopPropagation()}
-        />
-      </div>
-      <div className="max-h-48 overflow-y-auto">
-        {filtered.map((project) => (
-          <DropdownMenuItem
-            key={project.name}
-            className="px-2 py-1"
-            onSelect={() => onSelect(project.name)}
-          >
-            <span className="flex-1 truncate text-left">{project.name}</span>
-            {currentProject === project.name && (
-              <CheckIcon className="size-3.5 shrink-0 text-primary" />
-            )}
-          </DropdownMenuItem>
-        ))}
-        {filtered.length === 0 && (
-          <p className="px-2 py-1.5 text-sm text-muted-foreground">No projects yet.</p>
-        )}
-      </div>
-      {currentProject && (
-        <div className="border-t pt-1">
-          <DropdownMenuItem className="px-2 py-1" onSelect={() => onSelect("")}>
-            Remove from{" "}
-            <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
-              {currentProject}
-            </span>
-          </DropdownMenuItem>
-        </div>
-      )}
-    </>
-  );
 }
 
 export function HeaderConversationMenu({
@@ -231,15 +173,16 @@ export function HeaderConversationMenu({
 
   const archiveConversation = () => {
     closeMenu();
-    archive.mutate(
-      { id: conversation.id, archived: true },
-      {
-        onSuccess: () => {
-          navigate("/", { replace: true });
-          showArchivedToast();
-        },
-      },
-    );
+    // The row leaves the sidebar optimistically (useArchiveConversation flips
+    // the cached `archived` flag in onMutate), and we're viewing the session
+    // being archived, so leave its chat surface now — synchronously, like
+    // confirmDelete — rather than in an onSuccess callback that fires a
+    // round-trip later with a stale active session.
+    navigate("/", { replace: true });
+    archive.mutate({ id: conversation.id, archived: true });
+    // Fire NOW, not in a mutate onSuccess: navigating away unmounts this menu,
+    // and per-call mutate callbacks don't fire once their observer unmounts.
+    showArchivedToast();
   };
 
   const mainItems = (
@@ -284,6 +227,9 @@ export function HeaderConversationMenu({
           Agent info
         </DropdownMenuItem>
       )}
+      {/* Rename is also reachable on desktop by clicking the breadcrumb title
+          (HeaderTitle); on mobile the native shells hide the breadcrumb, so this
+          menu is the sole entry point. */}
       <DropdownMenuItem
         data-testid="header-rename-conversation"
         className={itemClass}
@@ -300,7 +246,12 @@ export function HeaderConversationMenu({
         <MailIcon className="size-3.5" />
         Mark as unread
       </DropdownMenuItem>
+      {/* Move to project is also reachable on desktop via the breadcrumb's
+          folder tag (HeaderProjectTag); on mobile the native shells hide the
+          breadcrumb, so this menu is the sole entry point. */}
       {isMobile ? (
+        // Mobile has no room for a side flyout, so this item swaps the menu body
+        // to the project picker in place (see the `projectPickerOpen` branch).
         <DropdownMenuItem
           data-testid="header-move-to-project"
           className={cn("whitespace-nowrap", itemClass)}
@@ -321,6 +272,8 @@ export function HeaderConversationMenu({
             <FolderInputIcon className="size-3.5" />
             {currentProject ? "Move session" : "Add to project"}
           </DropdownMenuSubTrigger>
+          {/* A native submenu flyout — no separate popover layer, so no
+              open/dismiss race with the parent menu. */}
           <DropdownMenuSubContent className="min-w-56">
             <ProjectPicker currentProject={currentProject} onSelect={handleProjectSelect} />
           </DropdownMenuSubContent>
@@ -390,7 +343,7 @@ export function HeaderConversationMenu({
               <DropdownMenuSeparator />
             </>
           )}
-          {isMobile && projectPickerOpen ? (
+          {projectPickerOpen ? (
             <>
               <DropdownMenuItem
                 data-testid="header-project-picker-back"
@@ -423,6 +376,7 @@ export function HeaderConversationMenu({
               autoFocus
               aria-label="Session name"
               data-testid="header-rename-conversation-input"
+              maxLength={USER_SESSION_TITLE_MAX_CHARS}
               value={renameTitle}
               onChange={(event) => setRenameTitle(event.target.value)}
               onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => {

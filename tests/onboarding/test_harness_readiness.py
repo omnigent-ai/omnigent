@@ -18,18 +18,19 @@ from omnigent.onboarding.harness_readiness import (
 
 
 @pytest.fixture(autouse=True)
-def _isolate_cursor_credential(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Isolate cursor + copilot credential sources so their readiness is deterministic.
+def _isolate_cli_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Isolate CLI credential sources so their readiness is deterministic.
 
     Cursor readiness keys off a configured ``CURSOR_API_KEY`` and copilot off a
     GitHub token (the ``cursor:`` / ``copilot:`` config blocks or the
     environment), so point the config home at an empty tmp dir and clear any
     ambient ``CURSOR_API_KEY`` / ``COPILOT_GITHUB_TOKEN`` / ``GH_TOKEN`` /
     ``GITHUB_TOKEN`` — otherwise a developer's real key would flip their verdict
-    under these tests.
+    under these tests. Antigravity similarly accepts ``GEMINI_API_KEY``.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
         monkeypatch.delenv(var, raising=False)
     # Copilot also accepts a ``gh auth login`` session as a token, so a developer's
@@ -139,6 +140,8 @@ def test_sdk_and_unknown_harnesses_are_never_gated(
         "native-cursor",
         "kiro-native",
         "native-kiro",
+        "antigravity-native",
+        "native-antigravity",
         "goose-native",
         "native-goose",
         "hermes",
@@ -163,6 +166,8 @@ def test_cli_harness_configured_only_when_binary_installed(
     breaks every native launch (if it stayed False).
     """
     _all_clis_installed(monkeypatch)
+    if harness in {"antigravity-native", "native-antigravity"}:
+        monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
     assert harness_is_configured(harness) is True
     _no_clis_installed(monkeypatch)
     assert harness_is_configured(harness) is False
@@ -227,8 +232,10 @@ def test_claude_ready_via_configured_provider_without_cli_login(
         "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: True
     )
 
-    def _must_not_probe(_key: str, **_kw: object) -> bool:
-        raise AssertionError("CLI login probed despite a configured provider")
+    def _must_not_probe(key: str, **_kw: object) -> bool:
+        if key == "anthropic":
+            raise AssertionError("Claude login probed despite a configured provider")
+        return False
 
     monkeypatch.setattr(hi, "harness_cli_logged_in", _must_not_probe)
     assert configured_harness_map()["claude-native"] is True
@@ -637,7 +644,7 @@ def test_configured_harness_map_reports_version_too_low_for_outdated_clis(
 def test_antigravity_native_requires_credential(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``antigravity-native`` needs both the ``agy`` binary and a stored credential."""
+    """``antigravity-native`` needs both the ``agy`` binary and a credential."""
     import omnigent.onboarding.gemini_auth as _ga
 
     _all_clis_installed(monkeypatch)

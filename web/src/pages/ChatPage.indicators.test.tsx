@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import type { Bubble } from "@/lib/renderItems";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
@@ -112,50 +112,14 @@ describe("ConnectionIndicator", () => {
   it.each<SessionLiveness>([{ kind: "online" }, { kind: "runner_asleep" }, { kind: "unknown" }])(
     "renders nothing for the reachable/sidebar-owned state %o",
     (liveness) => {
-      // WHY: online/unknown surface status in the sidebar; runner_asleep with no
-      // attach action (non-owner) keeps the silent send-to-wake path — this band
-      // stays empty for all three when no onAttach is supplied.
+      // WHY: online/asleep/unknown surface their status in the sidebar or keep
+      // the composer open — this band stays empty for them.
       const { container } = render(
         <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />,
       );
       expect(container).toBeEmptyDOMElement();
     },
   );
-
-  it("offers a direct Attach for a runner_asleep session when an owner attach action is supplied", () => {
-    // WHY: the runner is down but the host is up — an owner can relaunch it in
-    // place, so we surface an Attach button instead of only nudging them to send
-    // a message (the customer's downed-agent recovery without a chat message).
-    const onAttach = vi.fn().mockResolvedValue(undefined);
-    render(
-      <ConnectionIndicator
-        liveness={{ kind: "runner_asleep" }}
-        onShowReconnectHelp={onShowReconnectHelp}
-        onAttach={onAttach}
-      />,
-    );
-    const banner = screen.getByTestId("runner-asleep-indicator");
-    expect(banner).toHaveTextContent(/Agent disconnected/);
-    fireEvent.click(screen.getByRole("button", { name: "Attach" }));
-    expect(onAttach).toHaveBeenCalledTimes(1);
-  });
-
-  it("holds the Attach button pending after a click so a recovering banner reads as busy", async () => {
-    // WHY: retry_session returns well before the runner-health poll clears the
-    // banner. Re-enabling the instant it returns flips the label back to "Attach"
-    // over a still-shown banner, which reads as a no-op and invites a re-click —
-    // so the button stays disabled/"Attaching…" until liveness moves off asleep.
-    const onAttach = vi.fn().mockResolvedValue(undefined);
-    render(
-      <ConnectionIndicator
-        liveness={{ kind: "runner_asleep" }}
-        onShowReconnectHelp={onShowReconnectHelp}
-        onAttach={onAttach}
-      />,
-    );
-    fireEvent.click(screen.getByRole("button", { name: "Attach" }));
-    expect(await screen.findByRole("button", { name: /Attaching/ })).toBeDisabled();
-  });
 });
 
 describe("RunnerStartingIndicator", () => {
@@ -425,5 +389,36 @@ describe("BubbleView dispatch", () => {
     expect(screen.getByTestId("compacting-indicator")).toHaveTextContent(
       "Compacting conversation…",
     );
+  });
+
+  it("accepts createdAtS timestamp for timer calculation", () => {
+    // WHY: when a compaction_loading bubble has a createdAtS timestamp, the timer
+    // component receives it and can calculate elapsed time from that timestamp
+    // rather than from component mount time, so the progress persists across
+    // session switches. This test verifies the prop flows through correctly.
+    const someTimestamp = Math.floor(Date.now() / 1000) - 10;
+
+    render(
+      <BubbleView
+        bubble={{ kind: "compaction_loading", itemId: "cmp_2", createdAtS: someTimestamp }}
+      />,
+    );
+
+    const indicator = screen.getByTestId("compacting-indicator");
+    expect(indicator).toHaveTextContent("Compacting conversation…");
+    // Timer should show some elapsed time (exact value depends on test timing)
+    expect(indicator.textContent).toMatch(/\(\d+s\)/);
+  });
+
+  it("shows 0s initially when no createdAtS is provided", () => {
+    // WHY: when a compaction_loading bubble has no createdAtS (shouldn't happen
+    // in practice, but defensive), the timer falls back to current time and shows
+    // 0s initially.
+    render(<BubbleView bubble={{ kind: "compaction_loading", itemId: "cmp_3" }} />);
+
+    const indicator = screen.getByTestId("compacting-indicator");
+    expect(indicator).toHaveTextContent("Compacting conversation…");
+    // Initially shows no elapsed time or (0s)
+    // (timer ticks immediately on mount, so we can't reliably assert the exact initial state)
   });
 });

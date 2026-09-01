@@ -38,7 +38,7 @@ from tests.e2e_ui.conftest import (
     _server_state,
 )
 
-_COMPOSER = "Ask the agent anything…"
+_COMPOSER = "Send a message…"
 _READONLY_PLACEHOLDER = "You have read-only access to this session"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _BUBBLE = '[data-testid="message-bubble"]'

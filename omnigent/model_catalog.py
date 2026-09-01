@@ -1021,6 +1021,22 @@ def _listing_for_provider(
         _logger.debug(
             "model enumeration failed for %s", provider.detail or provider.kind, exc_info=True
         )
+        if provider.kind == SUBSCRIPTION_KIND:
+            # A failed cursor-agent listing probe says nothing about
+            # dispatchability: the CLI brings its own stored login, so the
+            # worker still runs. Degrade to the usable pre-launch shape the
+            # other subscription CLI logins report, not the dead-worker
+            # "none" that tells orchestrators the worker cannot run here.
+            return ModelListing(
+                source="static",
+                verified=False,
+                models=(),
+                note=(
+                    f"model listing failed for {provider.detail or provider.kind} "
+                    f"({_redacted_failure_reason(exc)}); the CLI launches with its "
+                    "own stored login, so dispatches to this worker can still run"
+                ),
+            )
         return ModelListing(
             source=NONE_KIND,
             verified=False,

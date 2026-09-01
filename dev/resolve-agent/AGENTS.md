@@ -23,6 +23,12 @@ against**. Your working directory is an `omnigent-ai/omnigent` checkout — the
 product repo where the bug lives, the code you may change, and where the tests
 belong.
 
+**Environment note:** when you run under `--server` you're inside a
+Databricks-network session where the public npm/PyPI registries are blocked —
+point package installs at the internal proxies. See
+[`dev/agent-environment.md`](../agent-environment.md) before running any
+`npm`/`pnpm`/`pip`/`uv` install.
+
 ## Input contract
 
 You are invoked with a **pointer to a completed repro run** — not the bug report
@@ -93,26 +99,32 @@ The repro worktree is gone, so recover from the run's artifacts and logs with th
 `gh` CLI. Be **tolerant** — the exact artifact layout may vary, so try in order
 and fall back rather than assuming a fixed structure:
 
-1. `gh run view <ci_link> --log` (and `--json` for metadata) to read the job
-   output. repro-agent's final message is echoed in its step log **untruncated**,
-   so the log carries two things you need: the final ```json handoff block (parse
-   `verdict`/`facets`/`test_path`/`journey`/`bug_url`/`session_id` from it) and,
-   immediately before it, the **complete verbatim source of the e2e test** pasted
-   as a path-labelled code block (repro-agent's contract). Prefer reading the test
-   body from that inline block in the log — unlike a live session transcript, the
-   CI log is not truncated, so the pasted test is complete here.
+1. Download this run's `repro-bundle-<run-id>` artifact first. If it contains
+   top-level `repro-handoff.json`, parse and validate that checkpoint before
+   reading the full job log: it is the smallest, most direct structured source
+   for `verdict`/`facets`/`test_path`/`journey`/`bug_url`/`session_id`. Copy each
+   test named by `test_path` from the artifact's `files/` tree into your checkout.
+   Also retain `patch.diff`, recordings, and `run.log` as supporting evidence.
+
+   The checkpoint is intentionally raw: a producing workflow may have classified
+   a forward-compatible schema as unknown while your newer consumer understands
+   it. Validate it yourself against the authoritative input `bug_url`; do not
+   reject it merely because the old run reported an unknown handoff.
+
+2. Only when the artifact checkpoint is absent or invalid, inspect `run.log` from
+   the downloaded bundle, then fall back to `gh run view <ci_link> --log`. The
+   final repro message is echoed in the job log **untruncated**, so its last
+   ```json block can recover the handoff. The log may also carry the complete
+   verbatim source of the e2e test as a path-labelled code block; use that only
+   when the artifact's `files/` tree did not preserve the test.
 
    **This run's handoff is authoritative.** The `ci_link` you were given names
    exactly one repro run, and its `bug_url` is the bug you resolve — no other.
    You are running on a **shared server that hosts many other repro sessions**;
    do **not** call `sys_session_list` and pick "a" repro session, and do not
    resolve a different bug because its session looks handy on this server. If you
-   cannot find the handoff block in this run's log, stop with `needs_more_info` —
-   never fall back to a bug you found by browsing the server.
-2. `gh run download <run-id>` to pull artifacts as a fallback for the test's
-   content — an authored test file or a diff/patch artifact — if the log's inline
-   block is unavailable or was clipped. Either way, materialize the full test into
-   your checkout at `test_path`.
+   cannot find a handoff in this run's artifact or logs, stop with
+   `needs_more_info` — never fall back to a bug you found by browsing the server.
 3. If the run also recorded a shareable `session_id` you can reach, read it with
    `sys_session_get_history` for richer context — but **only** the exact
    `session_id` this run's handoff named. Before trusting it, confirm that
@@ -266,8 +278,11 @@ reproduction test is your objective instrument.
    through **and** produce the after; when it carries none, still produce the
    after and note the missing before. Only omit the after clip when it is
    genuinely unobtainable (recorder tooling missing, or the fixture can't come
-   online after the SPA build) — say so explicitly in your review comment and in
-   `evidence`, naming the blocker. A missing upstream before-clip is never that
+   online after the SPA build **and** the leaked runner env is stripped) — say so
+   explicitly in your review comment and in `evidence`, naming the blocker. An
+   `online: false` seen while `OMNIGENT_RUNNER_ID` is still set is your own
+   un-stripped env, not a blocker: re-run with the `env -u` prefix from
+   `dev/recording-lanes.md` first. A missing upstream before-clip is never that
    blocker. Never drop it silently.
 4. **Review the diff** for quality, not just green: does it address the **root
    cause** or only mask the symptom? Does it miss facets or obvious adjacent edge
@@ -296,6 +311,14 @@ reproduction test is your objective instrument.
      --body '…'`. A genuine independent verification — the "someone checked it, take
      your pass" signal a maintainer wants. Note in the body that it's an automated
      reviewer's approval and a maintainer's approval is still required to merge.
+     **"Polly clean" here means a real Polly review actually ran and came back
+     clean** — a fresh `<!-- polly-review-bot -->` comment for the current head,
+     every finding fixed or justified (4.3), **not** a green check. If you could not
+     get a real Polly review to run (the dispatch failed, no comment ever landed,
+     or you only ever saw the phantom green check on a fork PR), you have **not**
+     verified this precondition: do **not** approve. Leave a `--comment` review
+     that states the fail→pass evidence *and* that a Polly review could not be
+     obtained, and let a maintainer take over the review from there.
    - **`not_fixed` / `partially_fixed`** → `gh pr review <pr> --request-changes
      --body '…'` naming what still fails.
    - **You pushed fixes to this PR** (in-repo branch) **or took it over** (fork) →
@@ -311,7 +334,10 @@ reproduction test is your objective instrument.
    **fork PR** you can't push to *and it needs a fix*, take over by opening your
    own PR that carries their commits + your fix (crediting them). If the fork PR
    needs no fix, keep it as-is. Either way you **do** iterate CI and Polly, rather
-   than triggering one review and stopping. Record `mode: "reviewed_existing_pr"`
+   than triggering one review and stopping — and on a fork PR you must actually
+   dispatch Polly and wait for its comment, because the automatic check reports a
+   green `pass` there without ever running (see 4.3). Record
+   `mode: "reviewed_existing_pr"`
    and its `pr_url` when you keep it; if a fork takeover made you open your own,
    record `mode: "authored_fix"` with the fork PR in `reviewed_pr_url`.
 
@@ -482,7 +508,12 @@ produces*:
   and the handoff (`recordings`). Omit it **only** for the genuine environmental
   blockers named in `dev/recording-lanes.md` (tooling missing, server won't come
   online, `api`-surface facet with nothing to film) — and then say which, with the
-  evidence; never report an after-clip you didn't actually produce.
+  evidence; never report an after-clip you didn't actually produce. When you run
+  inside a server-spawned runner (`OMNIGENT_RUNNER_ID` is set), a recorder
+  `online: false` is **not** an environmental blocker until you have stripped the
+  leaked runner/host env vars per `dev/recording-lanes.md`; an un-stripped
+  `online: false` is your own env and must be re-run with the `env -u` prefix, not
+  filed as "runner won't come online."
 
 ### 2B.6 — Get an independent cross-vendor review before you open the PR
 
@@ -514,10 +545,12 @@ server and runner you already run on; no new infrastructure.
    PR bots later catch a new recurring class, add a line to that checklist so the
    next run catches it up front.
 3. **Read the review back** (`sys_session_get_history` on the child) and **act on
-   it**: fix any blocking/security finding it surfaces, re-run the deliverable
+   every finding it surfaces — not only the blocking/security ones**: address each
+   (fix it at the root, or record why it's not actionable), re-run the deliverable
    (back through 2B.5) so it stays green, and — because the diff changed — refresh
-   the review or note why a finding was left. Do not open the PR with an
-   unaddressed blocking finding.
+   the review or note why a finding was left. Treat a non-blocking note the same way
+   you will treat Polly's in 4.3: judge it by whether it's correct, not by its
+   label. Do not open the PR with an unaddressed finding of any severity.
 4. **If no different-vendor bundle is reachable** (e.g. codex isn't configured in
    this environment), do **not** silently fall back to reviewing your own work as
    if it were independent. Skip the spawn and record `cross_review: "skipped: no
@@ -576,6 +609,12 @@ gh auth setup-git   # route git pushes through gh's credential helper with this 
   the command output. **Never** substitute a guess like "token expired" or "PAT
   is read-only" — those are false and drop the hand-off silently. Only a real,
   quoted failure goes in `maintainer_review`.
+- CI may also configure `omnigent.forkPushTokenFile`. That is a separate
+  maintainer credential for one purpose only: pushing a fix to an existing fork
+  PR whose author enabled maintainer edits. Never export it as `GH_TOKEN` and
+  never pass it to `gh`; PR creation, comments, reviews, labels, and every other
+  visible action must continue using the App token so GitHub attributes them to
+  `omni-resolve-agent[bot]`.
 
 Once the set is genuinely green:
 
@@ -584,6 +623,17 @@ Once the set is genuinely green:
    diff). Follow the repo's commit conventions. You likely committed already in
    2B.6 to produce the review diff; if the cross-vendor review led to further
    changes, amend or add a follow-up commit so the branch reflects the final fix.
+   **Never commit workspace artifacts.** The commit must contain only the fix and
+   its reproduction test — nothing else. In particular, **never** stage or commit
+   the `recordings/` clips or any `.omnigent/` handoff files (e.g.
+   `.omnigent/repro-handoff.json`): recordings are workspace artifacts that ride
+   in the PR's Demo section / CI artifact bundle, not in the diff (see
+   [`dev/recording-lanes.md`](../recording-lanes.md)). Do **not** use a blanket
+   `git add -A` / `git add .` that sweeps them in — stage the fix and test paths
+   explicitly, and run `git status` / `git diff --cached --stat` before committing
+   to confirm the staged set is only the fix + test. If a recording or handoff
+   file already landed in an earlier commit on this branch, remove it (e.g.
+   `git rm --cached`) so it never reaches the PR.
 2. **If the input has `skip_push: true`, stop here** — the fix is committed
    locally; do **not** push and do **not** open a PR. Report the branch name in
    your output (`pushed_branch`) so a human can inspect, push, and PR it. (The
@@ -660,12 +710,25 @@ can land a fix depends on where its branch lives:
   → you have write access. Push fixes the same as the author path, then re-check.
   Say in your review comments that you pushed, so the author isn't surprised.
 - **Fork PR** (the head branch is on a contributor's fork, `head.repo.fork ==
-  true`) → you **cannot** push to it. An App installation token is scoped to
-  `omnigent-ai/omnigent` only; GitHub does not honor "allow edits from maintainers"
-  for an App token (that grant is for maintainer *users*), so a push to the fork
-  branch is rejected. **Do not attempt the push** — it will always fail. Instead:
-  - **If the fork PR needs a fix** (repro test fails against it, CI is red from its
-    diff, or Polly flags a real blocking defect) → **take over: open your own PR**
+  true`) → the App token cannot push there, but CI may provide an isolated
+  maintainer credential specifically for that transport. Read
+  `maintainerCanModify`, `headRepositoryOwner`, `headRepository`, and
+  `headRefName` from `gh pr view`.
+  - If `maintainerCanModify` is true and
+    `git config --get omnigent.forkPushTokenFile` names a readable file, preserve
+    the contributor's branch. Keep the App token exported as `GH_TOKEN` for all
+    visible actions. For the push only, use CI's credential-isolating helper:
+    ```bash
+    omnigent-push-fork --repo <owner>/<repo> --branch <head-branch>
+    ```
+    The helper uses `GIT_ASKPASS`, clears the checkout's App-token extraheader
+    only for that push, and keeps the maintainer token out of command arguments,
+    remote URLs, and git's failure output. Never read or copy the token file
+    yourself, and never use it for `gh pr comment`/`review`/`create`; those
+    commands must remain bot-attributed through the App token.
+  - **If the fork PR needs a fix** and maintainer edits are disabled, the token
+    file is absent, or the isolated push returns a real permission error →
+    **take over: open your own PR**
     that includes their work plus your fix. This is the same mechanic as the
     "approach is wrong" escape hatch (Step 2A), but the reason is different — the
     approach is fine, you just can't push the fix to a fork. Build it so the
@@ -683,7 +746,7 @@ can land a fix depends on where its branch lives:
       yours and close it **as the very next commands — before you emit the interim
       handoff (Step 3.5) and before you start driving Step 4**:
       ```
-      gh pr comment <fork-pr> --body 'Superseded by #<your-pr> — I took this over to add a fix I could not push to your fork (App tokens can’t push to forks). Your commits are carried over with credit. Thanks @<author>!'
+      gh pr comment <fork-pr> --body 'Superseded by #<your-pr> — I took this over to add a fix because maintainer fork updates were unavailable. Your commits are carried over with credit. Thanks @<author>!'
       gh pr close <fork-pr>
       ```
       Do **not** defer this to the end of Step 4: the session can drop mid-turn
@@ -915,37 +978,66 @@ gh pr view <pr> --json comments \
   --jq '[.comments[] | select(.body | startswith("<!-- polly-review-bot -->"))] | last | .body'
 ```
 
+**A green "Polly AI Review" check is not proof Polly reviewed anything.** On a
+**fork PR** the automatic `pull_request` run has no LLM credentials (GitHub
+withholds secrets from fork events), so the workflow's credentials gate skips every
+real step and the check still reports `pass` in a few seconds — a green check with
+no review behind it. Never read the check status as "Polly is clean." The **only**
+evidence of a real review is a fresh `<!-- polly-review-bot -->` **comment** for
+the current head; if the query above returns empty, Polly has **not** reviewed this
+head, no matter what `gh pr checks` says.
+
 Polly runs automatically when the PR first becomes ready, but on a **reviewed PR**
-that already opened before you arrived it may not have run for the current head —
-so kick off the first review yourself. **Trigger it via the workflow's
+that already opened before you arrived — and on **every fork PR**, where the
+automatic run always skips — it will not have posted a real review for the current
+head, so you must kick one off yourself. **Trigger it via the workflow's
 `workflow_dispatch` entry point, not a `/review` comment**: Polly's comment handler
 **ignores `/review` from `[bot]` accounts, and you are one** (`omni-resolve-agent[bot]`),
 so a `/review` comment you post is silently dropped. `workflow_dispatch` has no
-bot/association gate:
+bot/association gate, and it reviews a prefetched diff so it works even for a fork
+PR whose automatic run skipped:
 
 ```
 gh workflow run polly-review.yml -R omnigent-ai/omnigent -f pr=<pr>
 ```
 
-Wait for the review to land (a few minutes), then triage the newest comment:
+Your App token carries `actions: write`, so this dispatch is expected to succeed;
+a `403` means the App lost that permission — record `polly_review` as "could not
+dispatch — App lacks actions:write" and flag it, rather than falling back to the
+green check as if the review were clean.
 
-- **Critical findings present** — anything under **Blocking issues** or **Security
-  vulnerabilities** that is a real defect in the PR's diff. Fix each one at the root
-  (same fail→pass discipline as Step 2B — add/adjust a targeted test where it
-  makes sense), re-run the affected tests, then land the fix per the
-  **push-or-take-over rule**: `git commit` + `git push` when you can push to the
-  branch; on a **fork PR** you can't push to, take over into your own PR (Step 4
-  preamble) and continue on it.
-  - After **pushing** a fix (to your PR or an in-repo branch), **re-trigger the
-    review** the same way — another `gh workflow run polly-review.yml -f pr=<pr>`
-    (again: not a `/review` comment from you). Then poll for a **new**
-    `<!-- polly-review-bot -->` comment and triage again.
-- **No critical findings** — only non-blocking notes or a clean summary → the
-  review is clean; you're done with this loop. You may address cheap non-blocking
-  notes if they're clearly right, but they don't gate.
+Wait for a **new** `<!-- polly-review-bot -->` comment to land (a few minutes) —
+never treat the review as done on the green check alone — then **triage every
+finding under *all* headings, not just Blocking/Security**. Polly's bucketing is a hint, not a
+verdict: a real defect regularly lands under **Non-blocking notes** (a missed edge
+case, a subtly wrong condition, a dropped error path), and "non-blocking" is not a
+licence to ignore it. Go through the newest comment finding by finding — Blocking
+issues, Security vulnerabilities, **and** Non-blocking notes — and for each one do
+exactly one of:
 
-Repeat push → re-trigger → re-read within the round cap until no critical Polly
-findings remain. Record the final state in the handoff (`polly_review`). If a
+- **Fix it** — the default for anything that is, or might be, a real defect or a
+  cheap correctness/robustness win. Fix at the root (same fail→pass discipline as
+  Step 2B — add/adjust a targeted test where it makes sense), re-run the affected
+  tests, then land the fix per the **push-or-take-over rule**: `git commit` +
+  `git push` when you can push to the branch; on a **fork PR** you can't push to,
+  take over into your own PR (Step 4 preamble) and continue on it. **Re-assess a
+  non-blocking note as if it were blocking** — decide by whether it's *correct*,
+  not by which heading Polly filed it under.
+- **Justify skipping it** — only when it is genuinely not actionable in this PR: a
+  false positive, purely stylistic/subjective, or out of scope (a pre-existing
+  issue your diff didn't introduce). State *which* finding and *why* — in a PR
+  reply to Polly's comment and in the handoff (`polly_review`). Never skip a
+  finding silently, and never skip one merely because it's labelled non-blocking.
+
+After **pushing** any fix (to your PR or an in-repo branch), **re-trigger the
+review** — another `gh workflow run polly-review.yml -f pr=<pr>` (again: not a
+`/review` comment from you) — then poll for a **new** `<!-- polly-review-bot -->`
+comment and triage it again the same way.
+
+Repeat push → re-trigger → re-read within the round cap until **every** finding on
+the newest review is either fixed or has a recorded justification — no unaddressed
+notes of any severity remain. Record the final state in the handoff
+(`polly_review`), including which non-blocking notes you fixed vs. justified. If a
 recurring class of bug shows up here, add a one-line check to
 `dev/resolve-agent/review-checklist.md` so the pre-PR reviewer catches it next
 time.
@@ -1216,10 +1308,14 @@ Field meanings:
   and whether each was diff-caused vs pre-existing/flaky/infra. If a fork PR needed
   a fix and you took over into your own PR, this reflects **your** PR's checks.
   Empty when `skip_push` was set or you stopped before there was a PR to land.
-- `polly_review` — the result of the Step 4.3 automated-review loop: `clean` (no
-  blocking/security findings) with how many review rounds it took and what you
-  fixed, or the unresolved critical findings if you hit the round cap. Empty when
-  no PR was opened.
+- `polly_review` — the result of the Step 4.3 automated-review loop: `clean` (every
+  finding on the newest **real review comment** addressed — blocking, security, **and**
+  non-blocking) with how many review rounds it took, what you fixed, and which
+  non-blocking notes you fixed vs. justified skipping; or the unresolved findings if
+  you hit the round cap. If a real review never ran — the dispatch failed or no
+  `<!-- polly-review-bot -->` comment ever landed (a phantom green check does not
+  count) — say so here explicitly; that state also blocks an approving review (see
+  the review-verdict step). Empty when no PR was opened.
 - `ui_preview` — the result of Step 4.1 (run on every PR, not just frontend fixes):
   the **preview URL** (verbatim, so the ticket write-back can surface it and a
   reviewer can `omnigent claude -p '<prompt>' --server <url>`), or why it failed to

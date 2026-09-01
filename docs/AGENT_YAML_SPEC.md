@@ -57,6 +57,7 @@ of the agent YAML.
 executor:
   harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, ...
   model: databricks-claude-opus-4-7
+  reasoning_effort: high     # optional spec default: low | medium | high | xhigh (harness-dependent)
   auth:
     type: databricks
     profile: oss             # Databricks profile for model routing
@@ -64,6 +65,13 @@ executor:
 
 Set the Databricks profile under `executor.auth`. The older top-level
 `executor.profile` shorthand is legacy and should not be used in new specs.
+
+`executor.reasoning_effort` sets the agent's default reasoning effort. It applies
+to the main session and to every sub-agent dispatch that doesn't pass its own
+per-dispatch effort, and is validated against the harness's effort vocabulary at
+launch. The older `llm.reasoning_effort` is still accepted as a back-compat alias
+(lifted to `executor.reasoning_effort` at parse time); when both are set,
+`executor.reasoning_effort` takes precedence.
 
 The `cursor` harness (Cursor's `cursor-agent`) is the exception: it talks
 only to Cursor's own backend and has no custom API base-URL, so the Databricks

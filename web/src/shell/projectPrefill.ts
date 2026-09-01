@@ -94,15 +94,23 @@ export function projectPrefillStep(
 
   if (!state.agentSeeded) {
     const { agents, lastAgentId, config } = inputs;
-    // Need the pickable agents to judge whether a stored / last-used agent is
-    // still selectable; wait for them.
-    if (agents !== undefined) {
+    // A blank/whitespace-only stored id is "not configured", not a real agent
+    // — fall through to the generic default instead of seeding a value the
+    // composer could only surface as "agent unavailable".
+    if (config?.agentId != null && config.agentId.trim() !== "") {
+      // A configured agent seeds verbatim, without waiting for (or checking)
+      // the picker list — the create API accepts session-scoped agents the
+      // caller can read, so absence from the list doesn't mean unusable.
+      // Never substitute the last-used agent for a configured one; if the id
+      // truly can't be resolved the composer surfaces an explicit
+      // "configured agent unavailable" state instead.
       next = { ...next, agentSeeded: true };
-      if (config?.agentId != null && agents.some((a) => a.id === config.agentId)) {
-        writes.agentId = config.agentId;
-      } else if (lastAgentId && agents.some((a) => a.id === lastAgentId)) {
-        // No configured agent (or it's no longer available) — seed the
-        // last-used agent so the composer never sits without one.
+      writes.agentId = config.agentId;
+    } else if (agents !== undefined) {
+      // No configured agent: need the pickable agents to judge whether the
+      // last-used agent is still selectable; wait for them.
+      next = { ...next, agentSeeded: true };
+      if (lastAgentId && agents.some((a) => a.id === lastAgentId)) {
         writes.agentId = lastAgentId;
       }
     }
@@ -153,13 +161,22 @@ function locationStep(
     configHostOnline &&
     !inputs.sandboxSelected &&
     (selectedHostId === null || selectedHostId === config!.hostId);
-  if (configHostUsable) {
-    writes.hostId = config!.hostId;
-    // A configured workspace seeds the field; without one, the composer's
-    // home-fallback fills it. Any opt-in worktree (config.useWorktree) is
-    // handled by a dedicated post-settle effect once the workspace is in place
-    // (see NewChatDialog's worktree effect).
-    if (config!.workspace != null) writes.workspace = config!.workspace;
-  }
+  if (configHostUsable) writes.hostId = config!.hostId;
+  // A configured workspace seeds the field even when the config host is
+  // offline (or config names no host) — dropping the hint would let a
+  // generic recent path fill in, which can belong to another project.
+  // Deliberate tradeoff: the generic default then fills selectedHostId with a
+  // DIFFERENT host, so host and workspace can diverge (a path that may not
+  // exist there) — accepted over losing the project's workspace hint. Only
+  // a sandbox pick or an explicit switch to a different host suppresses it.
+  // Without one, the composer's home-fallback fills the field. Any opt-in
+  // worktree (config.useWorktree) is handled by a dedicated post-settle
+  // effect once the workspace is in place (see NewChatDialog's worktree
+  // effect).
+  const workspaceUsable =
+    config?.workspace != null &&
+    !inputs.sandboxSelected &&
+    (selectedHostId === null || selectedHostId === config.hostId);
+  if (workspaceUsable) writes.workspace = config!.workspace;
   return settled(state);
 }

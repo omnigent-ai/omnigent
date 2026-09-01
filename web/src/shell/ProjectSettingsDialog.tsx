@@ -35,7 +35,7 @@ import { Switch } from "@/components/ui/switch";
 import { useProjectConfig, useUpdateProjectConfig } from "@/hooks/useConversations";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
-import { sortAgentsForDisplay } from "@/lib/agentGrouping";
+import { selectableSessionAgents } from "@/lib/agentGrouping";
 import { sandboxOptionLabel } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
@@ -103,7 +103,12 @@ export function ProjectSettingsDialog({
   const loadFailed = projectId !== null && isError;
   const updateConfig = useUpdateProjectConfig();
   const hosts = useHosts();
-  const { data: agents } = useAvailableAgents();
+  // Pin the stored default agent into discovery so an already-configured
+  // session-scoped agent (archived / paginated out of the scan) still
+  // resolves here — matching what the composer's prefill will see.
+  const { data: agents } = useAvailableAgents({
+    pinnedAgentIds: stored?.agent_id != null ? [stored.agent_id] : [],
+  });
   const info = useServerInfo();
   // Sandbox is only a real default when the server can provision managed
   // sandbox hosts — mirror the composer's gate so we don't offer a target that
@@ -179,27 +184,31 @@ export function ProjectSettingsDialog({
     // Guard against submitting a blank draft seeded from a failed load, which
     // the server would read as "clear the stored defaults".
     if (loadFailed) return;
-    // Build the config from set fields only — an unset slot is an absent key,
-    // so the whole object is `{}` when nothing is configured (the server treats
-    // that as "clear the stored defaults").
-    const config: ProjectConfig = {};
+    // Preserve config keys owned by other dialogs, then replace only the fields
+    // this form edits.
+    const config: ProjectConfig = { ...(stored ?? {}) };
     if (hostId !== NONE) config.host_id = hostId;
+    else delete config.host_id;
     // A workspace is host-relative and only meaningful with a concrete host —
     // don't persist a stale path from a since-cleared host, and drop it for the
     // sandbox (a sandbox create provisions its own workspace and ignores this).
     const ws =
       hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE ? trimOrUndef(workspace) : undefined;
     if (ws) config.workspace = ws;
+    else delete config.workspace;
     if (agentId) config.agent_id = agentId;
+    else delete config.agent_id;
     // Store the worktree choice only when it overrides the user-global default;
     // while it matches, leave the key unset so the project keeps inheriting
     // (and an all-default dialog still clears to {}).
     if (useWorktree !== readAlwaysUseWorktree()) config.use_worktree = useWorktree;
+    else delete config.use_worktree;
     // A base branch only forks a worktree, so it's only meaningful when the
     // worktree default is on — drop it otherwise so it can't linger as a stale,
     // invisible default after the toggle is turned off.
     const base = useWorktree ? trimOrUndef(baseBranch) : undefined;
     if (base) config.base_branch = base;
+    else delete config.base_branch;
 
     updateConfig.mutate(
       { id: projectId, name: projectName, config },
@@ -224,7 +233,10 @@ export function ProjectSettingsDialog({
 
   // Agent picker groups, mirroring the composer's split (native harness CLIs vs
   // SDK / bundle agents). The picker takes both lists and a selection.
-  const agentList = useMemo(() => sortAgentsForDisplay(agents ?? []), [agents]);
+  // Same resolver as the composer's picker (selectableSessionAgents): the two
+  // surfaces must offer the SAME set, or a project could pin a default the
+  // composer refuses to show — and then silently substitutes another for.
+  const agentList = useMemo(() => selectableSessionAgents(agents ?? []), [agents]);
   const harnessEntries = useMemo(() => agentList.filter(isNativeCodingAgent), [agentList]);
   const agentEntries = useMemo(() => agentList.filter((a) => !isNativeCodingAgent(a)), [agentList]);
   const selectedAgent = agentList.find((a) => a.id === agentId) ?? null;

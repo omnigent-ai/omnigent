@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import { clearSessionDrafts, hasSessionDraft } from "@/lib/sessionDrafts";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
@@ -105,6 +106,23 @@ function textarea() {
   return screen.getByLabelText("Message the agent") as HTMLTextAreaElement;
 }
 
+function forceDesktopCoarsePointer(): () => void {
+  const original = window.matchMedia;
+  window.matchMedia = ((query: string) => ({
+    matches: query.includes("pointer: coarse"),
+    media: query,
+    onchange: null,
+    addListener: () => {},
+    removeListener: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    dispatchEvent: () => false,
+  })) as typeof window.matchMedia;
+  return () => {
+    window.matchMedia = original;
+  };
+}
+
 /** The currently highlighted menu row, or null when none is highlighted. */
 function activeRow(): HTMLElement | null {
   return document.querySelector('[data-active="true"]');
@@ -112,6 +130,12 @@ function activeRow(): HTMLElement | null {
 
 function renderWithTooltips(ui: ReactElement) {
   return render(<TooltipProvider>{ui}</TooltipProvider>);
+}
+
+function tooltipKeys(tooltip: HTMLElement): string[] {
+  return Array.from(tooltip.querySelectorAll('[data-slot="kbd"]')).map(
+    (key) => key.textContent ?? "",
+  );
 }
 
 describe("Composer session drafts", () => {
@@ -181,6 +205,94 @@ describe("Composer growth layout", () => {
       "[&::-webkit-scrollbar]:hidden",
     );
     expect(ta.parentElement).toHaveClass("overflow-hidden");
+  });
+});
+
+describe("Composer send shortcut", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    clearSessionDrafts();
+    useChatStore.setState({
+      conversationId: "conv_shortcut",
+      skills: [{ name: "deslop", description: "Remove AI slop" }],
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    clearSessionDrafts();
+  });
+
+  it("keeps Enter and the legacy Mod+Enter alias in default mode", () => {
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    fireEvent.change(textarea(), { target: { value: "legacy alias" } });
+    fireEvent.keyDown(textarea(), { key: "Enter", metaKey: true });
+    expect(onSend).toHaveBeenCalledWith("legacy alias", undefined);
+
+    fireEvent.change(textarea(), { target: { value: "default shortcut" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(onSend).toHaveBeenLastCalledWith("default shortcut", undefined);
+  });
+
+  it("uses Mod+Enter after the alternate preference is restored", () => {
+    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    fireEvent.change(textarea(), { target: { value: "alternate shortcut" } });
+
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(textarea(), { key: "Enter", metaKey: true });
+    expect(onSend.mock.calls[0]?.[0]).toBe("alternate shortcut");
+  });
+
+  it("shows the alternate Send shortcut in the button tooltip", async () => {
+    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "ready to send" } });
+
+    fireEvent.pointerMove(screen.getByRole("button", { name: "Send" }), {
+      pointerType: "mouse",
+    });
+    const tooltip = await screen.findByRole("tooltip");
+
+    expect(within(tooltip).getByText("Send")).toBeInTheDocument();
+    expect(tooltipKeys(tooltip)).toEqual(["Ctrl", "↵"]);
+  });
+
+  it("keeps Enter native and hides its hint on a desktop-width coarse pointer", () => {
+    const restorePointer = forceDesktopCoarsePointer();
+    const onSend = vi.fn();
+    try {
+      render(<Composer {...composerProps({ onSend })} />);
+      fireEvent.change(textarea(), { target: { value: "/des" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(textarea().value).toBe("/des");
+      expect(onSend).not.toHaveBeenCalled();
+
+      fireEvent.focus(screen.getByRole("button", { name: "Send" }));
+      expect(screen.queryByRole("tooltip")).toBeNull();
+    } finally {
+      restorePointer();
+    }
+  });
+
+  it("keeps plain Enter completion while Mod+Enter bypasses an open slash menu", () => {
+    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    fireEvent.change(textarea(), { target: { value: "/des" } });
+
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(textarea().value).toBe("/deslop ");
+    expect(onSend).not.toHaveBeenCalled();
+
+    fireEvent.change(textarea(), { target: { value: "/des" } });
+    fireEvent.keyDown(textarea(), { key: "Enter", ctrlKey: true });
+    expect(onSend.mock.calls[0]?.[0]).toBe("/des");
   });
 });
 
@@ -1442,7 +1554,7 @@ describe("Composer placeholder", () => {
 
   it("shows the normal placeholder when the runner is live", () => {
     render(<Composer {...composerProps({})} />);
-    expect(textarea().placeholder).toMatch(/ask the agent anything/i);
+    expect(textarea().placeholder).toMatch(/send a message/i);
   });
 
   it("a structural read-only reason wins over the normal placeholder", () => {
@@ -1452,17 +1564,8 @@ describe("Composer placeholder", () => {
     expect(textarea().placeholder).toBe("Mirrored transcript");
   });
 
-  it("runner_asleep (reconnectHint): enabled composer nudges the user to send", () => {
-    // Host online but runner offline — sending relaunches the runner, so the
-    // composer stays writable and the placeholder is the affordance.
-    render(<Composer {...composerProps({ reconnectHint: true })} />);
-    expect(textarea().placeholder).toBe("Send a message to reconnect this session");
-    expect(textarea().disabled).toBe(false);
-  });
-
-  it("streaming wins over the reconnect hint", () => {
-    // A queued follow-up message takes precedence over the asleep nudge.
-    render(<Composer {...composerProps({ reconnectHint: true, status: "streaming" })} />);
+  it("streaming shows the queued follow-up placeholder", () => {
+    render(<Composer {...composerProps({ status: "streaming" })} />);
     expect(textarea().placeholder).toMatch(/send a follow-up/i);
   });
 
@@ -1470,12 +1573,6 @@ describe("Composer placeholder", () => {
     // A message can't wake it, so the textarea is disabled and the banner
     // below is the only affordance.
     render(<Composer {...composerProps({ unreachable: true })} />);
-    expect(textarea().disabled).toBe(true);
-    expect(textarea().placeholder).toMatch(/reconnect below/i);
-  });
-
-  it("unreachable wins over the reconnect hint (both set defensively)", () => {
-    render(<Composer {...composerProps({ unreachable: true, reconnectHint: true })} />);
     expect(textarea().disabled).toBe(true);
     expect(textarea().placeholder).toMatch(/reconnect below/i);
   });
@@ -2799,5 +2896,18 @@ describe("shouldQueueSend", () => {
 
   it("ignores queued messages belonging to a different conversation", () => {
     expect(shouldQueueSend("conv_a", "idle", "idle", [q("conv_b")])).toBe(false);
+  });
+
+  it("sends directly while busy when alwaysSteer is on", () => {
+    // The whole point of the preference: a mid-turn follow-up is POSTed now
+    // (steered) instead of parking in the queue strip.
+    expect(shouldQueueSend("conv_a", "streaming", "idle", [], true)).toBe(false);
+    expect(shouldQueueSend("conv_a", "idle", "running", [], true)).toBe(false);
+  });
+
+  it("still queues under alwaysSteer when this conversation has a queued message", () => {
+    // The ordering guard outranks always-steer: draining must stay in order, so
+    // a direct send can't overtake a still-queued earlier one.
+    expect(shouldQueueSend("conv_a", "streaming", "running", [q("conv_a")], true)).toBe(true);
   });
 });

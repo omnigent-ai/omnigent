@@ -32,6 +32,10 @@ import {
 } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  composerSendShortcutKeys,
+  KeyboardShortcutTooltipContent,
+} from "@/components/KeyboardShortcut";
 import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
 import { useNavigate, useParams } from "@/lib/routing";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
@@ -120,6 +124,8 @@ import {
   nativeCodingAgentForSubagentWrapper,
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
+import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import { isComposerSendKey, readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
   buildMentionPreamble,
   detectMentionAt,
@@ -220,6 +226,7 @@ import { SessionImage } from "@/components/SessionImage";
 import { GoalControl, GoalStatusPill, useGoalState, type Goal } from "@/components/goal";
 import { copyText } from "@/lib/clipboard";
 import { showToast } from "@/components/ui/toast";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import {
   ConnectionIndicator,
@@ -643,16 +650,24 @@ export function shouldShowAuthorBadge(
  * turn immediately instead of stalling behind that background work. (The
  * "Working…" spinner and sidebar dot still treat ``waiting`` as active — those
  * reflect background activity, which is a separate concern from send gating.)
+ *
+ * ``alwaysSteer`` (a per-device preference) drops the busy gate entirely: a
+ * follow-up sent mid-turn is POSTed now — steered into the running turn —
+ * instead of parking in the queue strip. The ``hasQueued`` guard still holds:
+ * once this conversation has a queued message it must drain in order, or a
+ * direct send could overtake a still-queued earlier one on an idle flicker.
  */
 export function shouldQueueSend(
   conversationId: string | null,
   status: "idle" | "streaming",
   sessionStatus: SessionStatus,
   queuedMessages: QueuedMessage[],
+  alwaysSteer = false,
 ): boolean {
   if (conversationId === null) return false;
-  const isBusy = status === "streaming" || sessionStatus === "running";
   const hasQueued = queuedMessages.some((m) => m.conversationId === conversationId);
+  if (alwaysSteer) return hasQueued;
+  const isBusy = status === "streaming" || sessionStatus === "running";
   return isBusy || hasQueued;
 }
 
@@ -1177,6 +1192,7 @@ export function ChatPage() {
   // the hydration early-returns below (hook order).
   const fallbackPickerKind = modelPickerKindForConv({
     labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
+    harness: activeSession?.harness ?? null,
   });
   const hostProbeHarness =
     fallbackPickerKind === "codex"
@@ -1238,10 +1254,18 @@ export function ChatPage() {
       return;
     }
     // Queue instead of POSTing now (see shouldQueueSend). enqueueMessage flushes
-    // FIFO immediately when genuinely idle, so nothing stalls.
+    // FIFO immediately when genuinely idle, so nothing stalls. With the
+    // always-steer preference on, a mid-turn follow-up skips the queue and is
+    // POSTed now instead.
     const chat = useChatStore.getState();
     if (
-      shouldQueueSend(chat.conversationId, chat.status, chat.sessionStatus, chat.queuedMessages)
+      shouldQueueSend(
+        chat.conversationId,
+        chat.status,
+        chat.sessionStatus,
+        chat.queuedMessages,
+        readAlwaysSteer(),
+      )
     ) {
       chat.enqueueMessage(text, files);
       return;
@@ -1295,6 +1319,7 @@ export function ChatPage() {
   // Once present, the live session snapshot is authoritative.
   const capabilitySource = {
     labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
+    harness: activeSession?.harness ?? null,
   };
   const modelPickerKind = modelPickerKindForConv(capabilitySource);
   // Effort ladders key on the model the session is actually on — the
@@ -2051,7 +2076,6 @@ function MainAgentSurface({
           <ConnectionIndicator
             liveness={liveness}
             onShowReconnectHelp={onShowReconnectHelp}
-            onAttach={isActive && !entry.readOnly ? handleTerminalResume : undefined}
             surfaceFrontmost={surfaceFrontmost}
           />
         )}
@@ -2291,8 +2315,6 @@ function MainAgentSurface({
             showPollyCodexGoalControl={showPollyCodexGoalControl}
             isTerminalFirst={isTerminalFirst}
             isNativeWrapper={isNativeWrapper}
-            reconnectHint={liveness.kind === "runner_asleep" || liveness.kind === "host_asleep"}
-            sandboxAsleepHint={liveness.kind === "host_asleep"}
             unreachable={
               !sandboxLaunching &&
               (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
@@ -2310,7 +2332,6 @@ function MainAgentSurface({
           <ConnectionIndicator
             liveness={liveness}
             onShowReconnectHelp={onShowReconnectHelp}
-            onAttach={terminalReadOnly ? undefined : handleTerminalResume}
             surfaceFrontmost={surfaceFrontmost}
           />
         </>
@@ -3126,16 +3147,22 @@ function isSystemBubble(bubble: Bubble): boolean {
   return isSystemUserContent(bubble.content);
 }
 
-function CompactionLoadingIndicator() {
+function CompactionLoadingIndicator({ createdAtS }: { createdAtS?: number }) {
   const [elapsed, setElapsed] = useState(0);
-  const startRef = useRef(performance.now());
 
   useEffect(() => {
-    const id = window.setInterval(() => {
-      setElapsed(Math.round((performance.now() - startRef.current) / 1000));
-    }, 1000);
+    // Calculate elapsed time from the actual compaction start time (if available)
+    // rather than component mount time, so the timer persists across session switches.
+    const startTimeMs = createdAtS != null ? createdAtS * 1000 : Date.now();
+
+    const updateElapsed = () => {
+      setElapsed(Math.round((Date.now() - startTimeMs) / 1000));
+    };
+
+    updateElapsed();
+    const id = window.setInterval(updateElapsed, 1000);
     return () => window.clearInterval(id);
-  }, []);
+  }, [createdAtS]);
 
   return (
     <Message from="assistant" data-testid="compacting-indicator">
@@ -3192,7 +3219,7 @@ export const BubbleView = memo(
   }) {
     if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
     if (bubble.kind === "compaction_loading") {
-      return <CompactionLoadingIndicator />;
+      return <CompactionLoadingIndicator createdAtS={bubble.createdAtS} />;
     }
     if (bubble.kind === "compaction") return <CompactionMarker />;
     if (bubble.kind === "routing_decision") {
@@ -3702,21 +3729,6 @@ interface ComposerProps {
    * terminal) keep it.
    */
   isNativeWrapper?: boolean;
-  /**
-   * The session's runner is asleep but its host is online (`runner_asleep`):
-   * the composer stays enabled and the placeholder nudges the user to send a
-   * message, which relaunches the runner on the live host. Ignored while a
-   * turn is streaming (the follow-up placeholder wins).
-   */
-  reconnectHint?: boolean;
-  /**
-   * The session is host-bound to a dormant resumable managed host that is
-   * offline (`host_asleep`): the composer stays enabled, and the placeholder
-   * tells the user their next message will resume the sandbox host (which can
-   * take a few minutes) so the wake latency is expected, not surprising.
-   * Ignored once a turn is streaming.
-   */
-  sandboxAsleepHint?: boolean;
   /**
    * The session is unreachable (`host_offline` / `local_stranded`): a message
    * can't wake it. The composer is blocked (disabled) and the reconnect
@@ -4295,8 +4307,6 @@ export function Composer({
   showPollyCodexGoalControl = false,
   isTerminalFirst = false,
   isNativeWrapper = false,
-  reconnectHint = false,
-  sandboxAsleepHint = false,
   unreachable = false,
   onShowReconnectHelp,
   costRoutingEligible = false,
@@ -4305,6 +4315,7 @@ export function Composer({
   wrapperLabel = null,
 }: ComposerProps) {
   const [value, setValue] = useState("");
+  const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   const [files, setFiles] = useState<File[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
@@ -4457,17 +4468,11 @@ export function Composer({
   // On mobile, programmatic focus immediately summons the software keyboard.
   // Keep desktop's fast-type affordance, but let mobile users explicitly tap
   // the composer when switching back from Terminal or changing sessions.
-  const [isMobile, setIsMobile] = useState(
-    () => typeof window !== "undefined" && window.matchMedia("(max-width: 767px)").matches,
-  );
+  const isMobile = useIsMobileViewport();
+  const isCoarsePointer = useIsCoarsePointer();
+  const preventsKeyboardSubmit = isMobile || isCoarsePointer;
   const isMobileRef = useRef(isMobile);
   isMobileRef.current = isMobile;
-  useEffect(() => {
-    const mq = window.matchMedia("(max-width: 767px)");
-    const handler = (e: MediaQueryListEvent) => setIsMobile(e.matches);
-    mq.addEventListener("change", handler);
-    return () => mq.removeEventListener("change", handler);
-  }, []);
 
   useEffect(() => {
     const restored = conversationId ? getSessionDraft(conversationId) : undefined;
@@ -5038,10 +5043,32 @@ export function Composer({
       return;
     }
 
+    // Touch-primary newline behavior outranks autocomplete and desktop submit
+    // preferences. Leave the event untouched so the textarea inserts it.
+    if (preventsKeyboardSubmit && e.key === "Enter") {
+      return;
+    }
+
+    const shouldSubmitFromKeyboard = isComposerSendKey(
+      {
+        key: e.key,
+        shiftKey: e.shiftKey,
+        metaKey: e.metaKey,
+        ctrlKey: e.ctrlKey,
+        altKey: e.altKey,
+        isComposing: e.nativeEvent.isComposing,
+      },
+      submitWithModEnter,
+      preventsKeyboardSubmit,
+    );
+    // Plain Enter still completes an open suggestion. In Mod+Enter mode, the
+    // explicit send chord bypasses suggestions so the modifier has one meaning.
+    const shouldPreferSendOverCompletion = submitWithModEnter && shouldSubmitFromKeyboard;
+
     // "@"-mention menu navigation (shared useMentionBrowser) — mutually
     // exclusive with the slash menu below (a mention token can't also read as a
     // "/"-command). Takes priority over history recall and submission.
-    if (handleMentionKeyDown(e)) return;
+    if (!shouldPreferSendOverCompletion && handleMentionKeyDown(e)) return;
 
     // When the suggestions menu is open, ArrowUp/Down navigate it and
     // Enter/Tab complete the highlighted item. These take priority over
@@ -5057,7 +5084,11 @@ export function Composer({
         setMenuIndex((i) => (i <= 0 ? menuMatches.length - 1 : i - 1));
         return;
       }
-      if ((e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !isMobile)) && menuIndex >= 0) {
+      if (
+        !shouldPreferSendOverCompletion &&
+        (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !isMobile)) &&
+        menuIndex >= 0
+      ) {
         e.preventDefault();
         applyMenuSelection(menuMatches[menuIndex]!);
         return;
@@ -5071,9 +5102,9 @@ export function Composer({
       }
     }
 
-    // Enter sends; Shift+Enter inserts a newline. On mobile, Enter inserts a
-    // newline (no Shift available on-screen) and Send must be tapped instead.
-    if (e.key === "Enter" && !e.shiftKey && !isMobile && !e.nativeEvent.isComposing) {
+    // Mobile Enter behavior takes precedence over this desktop preference:
+    // software-keyboard Enter inserts a newline and Send remains an explicit tap.
+    if (shouldSubmitFromKeyboard) {
       e.preventDefault();
       // The mention menu is briefly closed while its listing loads (see
       // ``mentionListingPending``); swallow Enter so the in-progress "@dir/"
@@ -5348,11 +5379,7 @@ export function Composer({
                         ? "Waiting for agents…"
                         : isStreaming
                           ? "Send a follow-up (queued) — Esc to stop"
-                          : sandboxAsleepHint
-                            ? "Current session's host is offline. Next message will resume the sandbox host which can take minutes"
-                            : reconnectHint
-                              ? "Send a message to reconnect this session"
-                              : "Ask the agent anything…"
+                          : "Send a message…"
             }
             rows={1}
             disabled={disabled || isReadOnly || unreachable || hasPendingElicitation}
@@ -5570,35 +5597,47 @@ export function Composer({
                 openNonce={pickerOpenNonce}
               />
             </div>
-            <Button
-              type="submit"
-              size="icon"
-              variant={showInterruptButton ? "destructive" : "default"}
-              // Send button fades more decisively when there's no draft —
-              // overrides the base 50% disabled-opacity so the affordance
-              // reads as "waiting for input", not "almost active".
-              className={cn(
-                "size-9 shrink-0 rounded-lg md:size-8",
-                !showInterruptButton &&
-                  "hover:bg-primary/90 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
-              )}
-              // Interrupt stays live during a pending elicitation —
-              // cancelling the turn is the other legitimate way out.
-              disabled={
-                showInterruptButton
-                  ? isReadOnly
-                  : !hasDraft || disabled || isReadOnly || hasPendingElicitation
-              }
-              title={showInterruptButton ? "Interrupt" : "Send"}
-              aria-label={showInterruptButton ? "Interrupt" : "Send"}
-            >
-              {showInterruptButton ? (
-                <SquareIcon className="size-4 fill-current" />
-              ) : (
-                <ArrowUpIcon className="size-4" viewBox="4 4 16 16" />
-              )}
-              <span className="sr-only">{showInterruptButton ? "Interrupt" : "Send"}</span>
-            </Button>
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="submit"
+                    size="icon"
+                    variant={showInterruptButton ? "destructive" : "default"}
+                    // Send button fades more decisively when there's no draft —
+                    // overrides the base 50% disabled-opacity so the affordance
+                    // reads as "waiting for input", not "almost active".
+                    className={cn(
+                      "size-9 shrink-0 rounded-lg md:size-8",
+                      !showInterruptButton &&
+                        "hover:bg-primary/90 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
+                    )}
+                    // Interrupt stays live during a pending elicitation —
+                    // cancelling the turn is the other legitimate way out.
+                    disabled={
+                      showInterruptButton
+                        ? isReadOnly
+                        : !hasDraft || disabled || isReadOnly || hasPendingElicitation
+                    }
+                    title={showInterruptButton ? "Interrupt" : undefined}
+                    aria-label={showInterruptButton ? "Interrupt" : "Send"}
+                  >
+                    {showInterruptButton ? (
+                      <SquareIcon className="size-4 fill-current" />
+                    ) : (
+                      <ArrowUpIcon className="size-4" viewBox="4 4 16 16" />
+                    )}
+                    <span className="sr-only">{showInterruptButton ? "Interrupt" : "Send"}</span>
+                  </Button>
+                </TooltipTrigger>
+                {!showInterruptButton && !preventsKeyboardSubmit && (
+                  <KeyboardShortcutTooltipContent
+                    label="Send"
+                    keys={composerSendShortcutKeys(submitWithModEnter)}
+                  />
+                )}
+              </Tooltip>
+            </TooltipProvider>
           </div>
         </div>
       </div>
@@ -5871,8 +5910,25 @@ export function readOnlyReasonForSessionLabels(
   return null;
 }
 
+/**
+ * A custom (label-less) session resolved to the native Codex harness.
+ *
+ * Custom YAML agents get no `omnigent.wrapper` presentation label, so the
+ * resolved harness is the capability evidence. Any wrapper label — including
+ * sub-agent variants like `codex-native-ui-subagent`, which cannot honor
+ * mid-session overrides — keeps the label authoritative and skips the
+ * fallback.
+ */
+function isLabelLessCodexNative(
+  conv:
+    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
+): boolean {
+  return conv?.labels?.["omnigent.wrapper"] == null && conv?.harness === "codex-native";
+}
+
 export function effortLevelsForConv(
-  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  conv:
+    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
   codexModelOptions: readonly NativeModelOption[] = [],
   currentModel: string | null = null,
 ): readonly string[] {
@@ -5884,7 +5940,9 @@ export function effortLevelsForConv(
     case "pi-native-ui":
       return PI_NATIVE_EFFORT_LEVELS;
     default:
-      return EFFORT_LEVELS;
+      return isLabelLessCodexNative(conv)
+        ? codexEffortLevelsForModel(codexModelOptions, currentModel)
+        : EFFORT_LEVELS;
   }
 }
 
@@ -5896,7 +5954,8 @@ export function effortLevelsForConv(
  * `TerminalFirstContext.tsx`).
  */
 export function modelPickerKindForConv(
-  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  conv:
+    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
 ): NativeModelPickerKind | null {
   switch (conv?.labels?.["omnigent.wrapper"]) {
     case "claude-code-native-ui":
@@ -5922,12 +5981,13 @@ export function modelPickerKindForConv(
       // model_select handler, so the picker surfaces that as the live model.
       return "pi";
     default:
-      return null;
+      return isLabelLessCodexNative(conv) ? "codex" : null;
   }
 }
 
 export function shouldShowModelPicker(
-  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  conv:
+    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
 ): boolean {
   return modelPickerKindForConv(conv) !== null;
 }
@@ -5940,7 +6000,8 @@ export function shouldShowModelPicker(
  * :returns: True only when the session supports Web UI effort controls.
  */
 export function shouldShowEffortPicker(
-  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  conv:
+    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
 ): boolean {
   return supportsEffortControl(conv);
 }

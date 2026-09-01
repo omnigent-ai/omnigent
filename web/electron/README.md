@@ -47,8 +47,10 @@ adds native niceties:
   the badge.
 - **The standard native menu** (App / Edit / View / Window / Help) built from
   Electron's menu roles, so the usual text-editing shortcuts — Cmd/Ctrl-A,
-  C, V, X, Z — work inside the webview's text fields. Our custom actions —
-  **New Window**, **New Window on Different Server…**, and
+  C, V, X, Z — work inside the webview's text fields. **Settings…** uses the
+  native `Cmd+,` accelerator on macOS (`Ctrl+,` elsewhere) and routes the
+  focused connected window through the SPA without reloading it. Our other
+  custom actions — **New Window**, **New Window on Different Server…**, and
   **Change Server…** — live in a dedicated **Server** submenu. On macOS a
   **Notifications** submenu turns the notification sound on/off (**Play
   Notification Sound**, **off by default** — the user opts in) and picks which
@@ -272,6 +274,10 @@ against its local Chromium, and the result is posted back.
   conversation's page keeps running when the user switches away; views are
   destroyed only on explicit close or window teardown. Each child view keeps
   `nodeIntegration:false, contextIsolation:true, sandbox:true`.
+  Page-initiated `window.open` / `target=_blank` never spawns a window: an
+  http(s) target navigates the same view in place (still allowlist-checked on
+  an agent-locked view), and right-click offers "Open Link in Browser" /
+  "Copy Link Address".
 - `src/browserViewBounds.js` — converts the placeholder's renderer CSS pixels to
   window device-independent pixels (they diverge after `Cmd+/Cmd-` zoom).
 - `src/main.js` — instantiates one registry **per shell window** and injects it

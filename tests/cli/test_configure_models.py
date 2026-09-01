@@ -585,6 +585,7 @@ def test_add_menu_options_ordering() -> None:
         "Gemini — API key",
         "ChatGPT — subscription",
         "Claude — subscription (Pro/Max)",
+        "Pi — original auth",
         "Gateway — custom base URL + key",
         "OpenRouter — API key",
         "Databricks — workspace",
@@ -998,6 +999,51 @@ def test_render_listing_excludes_configured_subscription_clis(
     # …while an unrelated ambient detection still surfaces as a hint.
     assert "Detected (not configured)" in out
     assert "gemini" in out
+
+
+@pytest.mark.parametrize(
+    ("auth_json", "expected_note", "forbidden_note"),
+    [
+        # An apikey-mode login must name its real auth mode on the row.
+        (
+            '{"auth_mode": "apikey", "OPENAI_API_KEY": "sk-dead-key"}',
+            "API key login",
+            None,
+        ),
+        # A real ChatGPT-plan login stays a plain subscription row.
+        (
+            '{"tokens": {"access_token": "at-real", "refresh_token": "rt-real"}}',
+            "via codex CLI",
+            "API key login",
+        ),
+    ],
+)
+def test_config_list_names_codex_effective_auth_mode(
+    isolated_config,
+    auth_json: str,
+    expected_note: str,
+    forbidden_note: str | None,
+) -> None:
+    """The codex subscription row reflects the login's effective auth mode.
+
+    ``codex`` itself reports ``auth_mode: apikey`` for an API-key-backed
+    ``auth.json``; a listing that says only "subscription" for it sends a
+    quota diagnosis at the wrong credential (the plan looks healthy while the
+    dead API key is the problem). Failure means the row's auth summary no
+    longer discriminates the modes.
+    """
+    codex_dir = os.path.join(isolated_config, ".codex")
+    os.makedirs(codex_dir)
+    with open(os.path.join(codex_dir, "auth.json"), "w") as f:
+        f.write(auth_json)
+    _seed_config(isolated_config, {"codex": {"kind": "subscription", "cli": "codex"}})
+
+    result = CliRunner().invoke(cli, ["config", "list"])
+    assert result.exit_code == 0, result.output
+    assert "subscription" in result.output
+    assert expected_note in result.output, result.output
+    if forbidden_note is not None:
+        assert forbidden_note not in result.output, result.output
 
 
 def _seed_config(config_home, providers: dict[str, object]) -> None:
@@ -2340,8 +2386,12 @@ def test_pi_add_menu_offers_keys_gateway_databricks_but_no_subscription() -> Non
 
     options = add_menu_options_for_family(PI_SURFACE)
     kinds = {o.kind for o in options}
-    # No subscription row — the one credential kind pi can't consume.
-    assert "subscription" not in kinds
+    # The pi subscription ("Pi — original auth") IS offered for pi — it lets
+    # users bypass Omnigent-managed auth and use Pi's own credentials.
+    assert any(o.kind == "subscription" and o.cli == "pi" for o in options)
+    # claude/codex subscriptions must NOT appear — a CLI login is unusable
+    # outside its own CLI, so offering one would configure a broken credential.
+    assert not any(o.kind == "subscription" and o.cli in ("claude", "codex") for o in options)
     # Both vendors' keys are offered (pi spans both families), plus the
     # cross-vendor extras and Databricks.
     assert any(o.label.endswith("Anthropic — API key") for o in options)

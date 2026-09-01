@@ -37,6 +37,11 @@ class _WorkspaceHostLauncherFactory(Protocol):
         pass
 
 
+class _ConfiguredLauncherFactory(Protocol):
+    def __call__(self, *, config: object) -> SandboxHostLauncher:
+        pass
+
+
 @dataclass(frozen=True)
 class SandboxProviderMetadata:
     """Static metadata for one sandbox provider.
@@ -288,15 +293,24 @@ def instantiate(
     name: str,
     *,
     workspace_host: str | None = None,
+    config: Mapping[str, object] | None = None,
 ) -> SandboxHostLauncher:
     """Import and instantiate a registered provider's launcher class.
 
     :param name: Registered provider name.
     :param workspace_host: Optional Databricks workspace host passed
         to the Lakebox launcher constructor.
+    :param config: The provider's ``sandbox.<name>`` block, or ``None``.
+        Only used when the provider declares a
+        :attr:`SandboxProviderMetadata.config_model`: the block is
+        validated through that model and the result is passed to the
+        launcher constructor as ``config=``. Providers that declare no
+        model — which is every built-in — ignore this entirely, so the
+        argument changes nothing for them.
     :returns: A fresh launcher instance.
-    :raises SandboxRegistryError: If the provider is unknown or its
-        class cannot be imported/instantiated.
+    :raises SandboxRegistryError: If the provider is unknown, its class
+        cannot be imported/instantiated, or *config* fails validation
+        against the declared model.
     """
     meta = get_provider_metadata(name)
     if meta is None:
@@ -315,4 +329,16 @@ def instantiate(
     if name == "lakebox" and workspace_host is not None:
         launcher_factory = cast(_WorkspaceHostLauncherFactory, launcher_cls)
         return launcher_factory(workspace_host=workspace_host)
+    if meta.config_model is not None:
+        # The docstring on `config_model` already describes it as validating
+        # "the provider-specific `sandbox.<name>` config block"; this is the
+        # call that makes that true. Kept inside the `is not None` branch so a
+        # provider that declares no model keeps a zero-argument constructor.
+        try:
+            validated = meta.config_model(**dict(config or {}))
+        except Exception as exc:
+            raise SandboxRegistryError(
+                f"invalid 'sandbox.{name}' config for provider '{name}': {exc}"
+            ) from exc
+        return cast(_ConfiguredLauncherFactory, launcher_cls)(config=validated)
     return launcher_cls()

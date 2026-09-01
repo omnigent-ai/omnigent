@@ -25,9 +25,11 @@ import {
   type QueryClient,
 } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import { startTimedInteraction } from "@/lib/analyticsEmit";
 import {
   filtersFromConversationQueryKey,
   mergeItemsIntoPages,
+  overlayArchivedIntoCaches,
   overlayTitleIntoCaches,
   PINNED_LABEL_KEY,
   PROJECT_FOLDER_FILTERS,
@@ -257,6 +259,11 @@ export function markSessionsDeleting(ids: Iterable<string>): void {
   for (const id of ids) deletingSessionIds.add(id);
 }
 
+/** Whether a session has an optimistic delete in flight (tombstoned). */
+export function isSessionDeleting(id: string): boolean {
+  return deletingSessionIds.has(id);
+}
+
 /**
  * Stop hiding sessions — their delete failed, so the rows return.
  * Omit `ids` to release every tombstone at once.
@@ -404,6 +411,13 @@ async function fetchConversationsPage({
  * distinct four-element key that refetches when the picker changes. Used by
  * the Archived settings view's project filter.
  */
+// Latch so the list_sessions CUJ times only the first full-list fetch per app
+// load. `useConversations` is observed by several components sharing one query
+// cache, and it also refetches on a background poll / WS reconcile / pagination —
+// none of which are the user "open the list" action. A module-scoped flag times
+// exactly one fetch regardless of observer count, then stays latched.
+let initialListLoadTimed = false;
+
 export function useConversations(
   searchQuery = "",
   includeArchived = false,
@@ -426,13 +440,29 @@ export function useConversations(
     queryKey: project
       ? ["conversations", searchQuery, includeArchived, project]
       : ["conversations", searchQuery, includeArchived],
-    queryFn: ({ pageParam }) =>
-      fetchConversationsPage({
-        after: pageParam as string | undefined,
-        searchQuery,
-        includeArchived,
-        project,
-      }),
+    queryFn: async ({ pageParam }) => {
+      const fetchPage = () =>
+        fetchConversationsPage({
+          after: pageParam as string | undefined,
+          searchQuery,
+          includeArchived,
+          project,
+        });
+      // Time the first full-list load per app session; skip pagination
+      // (pageParam set) and every later fetch (poll / reconcile / invalidation).
+      if (initialListLoadTimed || pageParam !== undefined) return fetchPage();
+      initialListLoadTimed = true;
+      const interaction = startTimedInteraction("list_sessions");
+      try {
+        const page = await fetchPage();
+        interaction.complete();
+        return page;
+      } catch (error) {
+        interaction.fail();
+        throw error;
+      }
+    },
+
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) =>
       lastPage.has_more ? (lastPage.last_id ?? undefined) : undefined,
@@ -595,23 +625,86 @@ export function useRenameConversation() {
 /**
  * Archive / unarchive a conversation via `PATCH /v1/sessions/{id}`.
  *
- * Invalidates the conversations list on success so the row moves
- * into (or out of) the sidebar's "Archived" section. Mirrors the
- * rename hook's `markConversationSeen` anchoring: the PATCH bumps
- * server `updated_at`, and without this the unseen tracker would
- * flag the user's own archive action as new activity.
+ * Optimistic: `onMutate` overlays the new `archived` flag into every cached
+ * list (see `overlayArchivedIntoCaches`), so the sidebar — which filters
+ * archived rows out client-side — repaints on the next frame instead of after
+ * the PATCH round-trips. `onError` reconciles the flag from the server (the
+ * row returns to its old section) and toasts. `onSuccess` anchors the unseen
+ * tracker (the PATCH bumps server `updated_at`, which would otherwise flag the
+ * user's own archive as new activity) and refreshes the project caches, which
+ * read the DB directly (no search-index lag).
  */
+/**
+ * Snapshot of every cache an optimistic archive overlays — the flat lists,
+ * the project folders, and the pinned backfill — captured before the overlay
+ * so a failed archive rolls back to exactly this state. Mirrors delete's
+ * `DeletedListsSnapshot`: restoring the snapshot rather than refetching keeps
+ * the rollback off the search-indexed list fetch, which lags the write and
+ * would otherwise resurrect a row that DID archive (a bulk partial failure).
+ */
+interface ArchiveListsSnapshot {
+  lists: [readonly unknown[], ConversationsInfiniteData | undefined][];
+  pinned: PinnedConversationsResult | undefined;
+}
+
+function snapshotArchiveLists(queryClient: QueryClient): ArchiveListsSnapshot {
+  return {
+    lists: [
+      ...queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey: ["conversations"] }),
+      ...queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey: ["project-sessions"] }),
+    ],
+    pinned: queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY),
+  };
+}
+
+function restoreArchiveLists(queryClient: QueryClient, snapshot: ArchiveListsSnapshot): void {
+  for (const [key, data] of snapshot.lists) queryClient.setQueryData(key, data);
+  queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, snapshot.pinned);
+}
+
+/**
+ * Drop conversations from the pinned backfill cache — a pinned session outside
+ * the paginated window lives only there, so the list overlay can't hide it.
+ */
+function dropFromPinnedCache(queryClient: QueryClient, ids: Iterable<string>): void {
+  const drop = new Set(ids);
+  queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
+    old ? { ...old, conversations: old.conversations.filter((c) => !drop.has(c.id)) } : old,
+  );
+}
+
 export function useArchiveConversation() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: ({ id, archived }: { id: string; archived: boolean }) =>
       archiveConversation(id, archived),
+    onMutate: async ({ id, archived }) => {
+      // Cancel any in-flight list refetch so it can't resolve after this
+      // overlay and clobber the flag with the stale search-indexed state.
+      await queryClient.cancelQueries({ queryKey: ["conversations"] });
+      const snapshot = snapshotArchiveLists(queryClient);
+      overlayArchivedIntoCaches(queryClient, id, archived);
+      // Drop an archived pin from the backfill cache too (mirrors delete).
+      if (archived) dropFromPinnedCache(queryClient, [id]);
+      return { snapshot };
+    },
+    onError: (_err, { archived }, context) => {
+      // Roll back to exactly the pre-archive caches, synchronously — so the
+      // row (and any dropped pin) returns at once, rather than waiting on a
+      // search-indexed refetch that lags the write.
+      if (context?.snapshot) restoreArchiveLists(queryClient, context.snapshot);
+      showToast(
+        archived
+          ? "Couldn't archive the session — it's back in the sidebar."
+          : "Couldn't unarchive the session.",
+      );
+    },
     onSuccess: (updated) => {
       markConversationSeen(updated.id, updated.updated_at);
-      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       // Archiving/unarchiving the last (or first) non-archived member of a
       // project removes/restores it from the server's project list, and adds
-      // or drops it from that project folder's own paginated list.
+      // or drops it from that project folder's own paginated list. These read
+      // the DB directly, so refetching them can't resurrect the archived row.
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
       // Archive membership just changed, so the archived-view picker's option
@@ -875,10 +968,11 @@ export function useStopSession() {
 /**
  * Archive multiple conversations in parallel via `PATCH /v1/sessions/{id}`.
  *
- * Each session is archived independently — individual failures don't
- * block the rest. The conversations list is invalidated once on
- * completion so the sidebar refreshes. Returns an array of session IDs
- * that failed.
+ * Optimistic like the single-session archive: `onMutate` overlays the new flag
+ * onto every selected row so the sidebar repaints immediately. Each session is
+ * archived independently — individual failures don't block the rest — and
+ * `onError` reconciles the whole selection from the server (rows whose PATCH
+ * failed snap back). Returns the session IDs that failed.
  */
 export function useBulkArchiveConversations() {
   const queryClient = useQueryClient();
@@ -901,8 +995,30 @@ export function useBulkArchiveConversations() {
         .filter((r): r is PromiseFulfilledResult<Conversation> => r.status === "fulfilled")
         .map((r) => r.value);
     },
+    onMutate: async ({ ids, archived }) => {
+      await queryClient.cancelQueries({ queryKey: ["conversations"] });
+      const snapshot = snapshotArchiveLists(queryClient);
+      for (const id of ids) overlayArchivedIntoCaches(queryClient, id, archived);
+      if (archived) dropFromPinnedCache(queryClient, ids);
+      return { snapshot };
+    },
+    onError: (err, { ids, archived }, context) => {
+      // Partial failure: restore the pre-archive caches, then RE-apply the
+      // overlay for the ids that DID archive so they stay hidden — only the
+      // failed ids return. Restoring from the snapshot rather than refetching
+      // ["conversations"] is what stops the search-index lag from resurrecting
+      // the successful archives (the exact regression this reconcile guards).
+      if (!context?.snapshot) return;
+      restoreArchiveLists(queryClient, context.snapshot);
+      const failed = new Set(err instanceof BulkConversationMutationError ? err.failed : ids);
+      const succeeded = ids.filter((id) => !failed.has(id));
+      for (const id of succeeded) overlayArchivedIntoCaches(queryClient, id, archived);
+      if (archived) dropFromPinnedCache(queryClient, succeeded);
+    },
     onSettled: () => {
-      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      // Project caches read the DB directly (no search-index lag), so unlike
+      // ["conversations"] they can be refreshed on every settle without
+      // racing the reindex and resurrecting an archived row.
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });

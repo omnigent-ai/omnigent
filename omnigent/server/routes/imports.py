@@ -23,6 +23,8 @@ from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._host_launch import resolve_host_owner
+from omnigent.server.routes._session_create_validation import resolve_project_session_create
+from omnigent.server.schemas import SessionCreateRequest
 from omnigent.session_import import (
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
     IMPORT_SOURCE_LABEL_KEY,
@@ -33,6 +35,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.conversation_store import ConversationAlreadyExistsError
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.project_store import ProjectStore
 
 # Upper bound on items in one imported session, shared by the CLI-normalized
 # ``/imports`` body and the host-streamed ``/imports/local`` path.
@@ -59,13 +62,19 @@ class ImportItemInput(BaseModel):
 
 
 class ImportSessionRequest(BaseModel):
-    """Request body for importing one local harness session."""
+    """Request body for importing one local harness session.
+
+    ``project_id`` files the imported session into a first-class project the
+    caller owns, with the same ownership, default-fill, and mismatch-warning
+    semantics as ``POST /v1/sessions``.
+    """
 
     source: ImportSource
     external_session_id: str = Field(min_length=1, max_length=128)
     workspace: str | None = Field(default=None, max_length=2048)
     title: str | None = Field(default=None, max_length=512)
     force: bool = False
+    project_id: str | None = None
     items: list[ImportItemInput] = Field(min_length=1, max_length=_MAX_IMPORT_ITEMS)
 
     @field_validator("external_session_id")
@@ -227,6 +236,7 @@ def create_imports_router(
     *,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
+    project_store: ProjectStore | None = None,
     host_registry: HostRegistry | None = None,
     host_store: HostStore | None = None,
 ) -> APIRouter:
@@ -241,14 +251,17 @@ def create_imports_router(
         workspace: str | None,
         user_id: str | None,
         native_title: str | None = None,
+        project_id: str | None = None,
     ) -> tuple[str, str | None]:
         """Create the conversation, append items, stamp import labels, grant owner.
 
         Shared by ``/imports`` (client-normalized items) and ``/imports/local``
         (server-read transcripts). ``native_title`` is the harness's own title
         when the caller has one; otherwise the title is synthesized from the
-        first user message. Caller handles the already-imported / force decision
-        first. Returns ``(conversation id, title)``.
+        first user message. ``project_id`` files the session into a project the
+        caller owns (``/imports/local`` passes none). Caller handles the
+        already-imported / force decision first. Returns
+        ``(conversation id, title)``.
         """
         native_agent = native_coding_agent_for_harness(f"{source}-native")
         if native_agent is None:
@@ -262,6 +275,23 @@ def create_imports_router(
                 f"The {native_agent.display_name} built-in agent is unavailable",
                 code=ErrorCode.INTERNAL_ERROR,
             )
+        # Route the optional target project through the shared create
+        # chokepoint: ownership (unowned/unknown → 404), default-fill of
+        # omitted fields from the project config, and mismatch warnings all
+        # behave exactly as on POST /v1/sessions. Only genuinely-present
+        # fields go into the body so absent ones stay defaultable.
+        create_kwargs: dict[str, Any] = {"agent_id": agent_id}
+        if workspace is not None:
+            create_kwargs["workspace"] = workspace
+        if project_id is not None:
+            create_kwargs["project_id"] = project_id
+        resolved_create = await resolve_project_session_create(
+            body=SessionCreateRequest(**create_kwargs),
+            user_id=user_id,
+            project_store=project_store,
+        )
+        agent_id = resolved_create.body.agent_id
+        workspace = resolved_create.body.workspace
         title = (native_title or "").strip() or title_from_items(items)
         try:
             conversation = await asyncio.to_thread(
@@ -270,6 +300,7 @@ def create_imports_router(
                 agent_id=agent_id,
                 workspace=workspace,
                 conversation_id=_import_conversation_id(source, external_session_id),
+                project_id=resolved_create.project_id,
             )
         except ConversationAlreadyExistsError as exc:
             raise OmnigentError(
@@ -347,6 +378,7 @@ def create_imports_router(
             workspace=body.workspace,
             user_id=user_id,
             native_title=body.title,
+            project_id=body.project_id,
         )
 
         response.status_code = 201

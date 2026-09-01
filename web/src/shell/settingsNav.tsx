@@ -14,6 +14,7 @@ import {
   GitBranchIcon,
   KeyboardIcon,
   PaletteIcon,
+  SettingsIcon,
   Share2Icon,
   ShieldCheckIcon,
   TerminalIcon,
@@ -31,6 +32,7 @@ import { SIDEBAR_ROW } from "./sidebarStyles";
 
 export type SettingsSectionId =
   | "appearance"
+  | "general"
   | "git"
   | "shortcuts"
   | "import"
@@ -44,6 +46,7 @@ export type SettingsSectionId =
 
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
+  "general",
   "git",
   "shortcuts",
   "import",
@@ -85,6 +88,7 @@ export function settingsNavGroups(
   isSingleUser = false,
 ): SettingsNavGroup[] {
   const general: SettingsNavItem[] = [
+    { id: "general", label: "General", icon: SettingsIcon },
     { id: "appearance", label: "Appearance", icon: PaletteIcon },
     { id: "git", label: "Git", icon: GitBranchIcon },
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },
@@ -136,19 +140,13 @@ export function settingsNavGroups(
 /**
  * Parse the active route into a settings descriptor. `inSettings` gates the
  * sidebar body swap; `section` drives the content. Bare `/settings` (no
- * section segment) defaults to Account when accounts auth is on — the most
- * relevant landing there — and Appearance otherwise. Basename-agnostic —
- * matches the `settings` segment wherever it lands, same approach as the
+ * section segment) and unknown sections default to General. Basename-agnostic
+ * — matches the `settings` segment wherever it lands, same approach as the
  * sidebar's top-level nav detection.
  */
 export function useSettingsRoute(): { inSettings: boolean; section: SettingsSectionId } {
   const info = useServerInfo();
-  // A login session exists (accounts OR OIDC) when the server advertises a
-  // login_url; header single-user mode reports null. The Account section —
-  // and the bare-/settings default landing on it — follows that, not
-  // accounts specifically.
-  const hasAuthSession = info !== "loading" && info.login_url !== null;
-  const defaultSection: SettingsSectionId = hasAuthSession ? "account" : "appearance";
+  const defaultSection: SettingsSectionId = "general";
 
   const segments = useLocation().pathname.split("/").filter(Boolean);
   const idx = segments.lastIndexOf("settings");

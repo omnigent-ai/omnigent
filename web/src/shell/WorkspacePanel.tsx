@@ -12,7 +12,14 @@ import {
   TerminalIcon,
   XIcon,
 } from "lucide-react";
-import { type ReactElement, useCallback, useEffect, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  type ReactElement,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { cn } from "@/lib/utils";
 import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
@@ -699,6 +706,10 @@ export function WorkspacePanel({
     <aside
       aria-label="Workspace"
       inert={inert}
+      // The resize hook can starve the rail to width 0 while it stays mounted;
+      // marking it collapsed keeps index.css's safe-area padding off it so a
+      // zero-width rail can't paint a ghost bg-card strip on native shells.
+      data-collapsed={width === 0 || undefined}
       // Full-height desktop surface flush to the window edge, separated from
       // the main content by a left divider — no outer margin, rounding, or
       // shadow (mirrors the left sidebar). AppShell reserves the panel width
@@ -719,8 +730,13 @@ export function WorkspacePanel({
         maximized ? "md:absolute md:inset-0" : "md:shrink-0",
       )}
       // Width is fixed by the resize handle normally; maximized ignores it and
-      // stretches to the absolute inset instead.
-      style={maximized ? undefined : { width }}
+      // stretches to the absolute inset instead. The width doubles as the
+      // reservation index.css caps the rail's lateral safe-area insets to.
+      style={
+        maximized
+          ? undefined
+          : ({ width, "--omnigent-reserved-width": `${width}px` } as CSSProperties)
+      }
     >
       {/* Left-edge horizontal resize handle — suppressed while maximized. */}
       {!maximized && (

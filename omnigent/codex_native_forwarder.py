@@ -2014,6 +2014,12 @@ async def _maybe_rotate_session_on_thread_started(
     # its own Omnigent child session by ``_handle_event``.
     if _thread_started_is_subagent(event):
         return False
+    # Codex CLI 0.150.1 emits a second ``thread/started`` mid-turn for an
+    # internal system/housekeeping thread (``ephemeral=true``, ``path=null``).
+    # That thread is never persistable and cannot host goals; rotating onto it
+    # strands the real turn's output as stale. Ignore all ephemeral threads.
+    if _thread_started_is_ephemeral(event):
+        return False
     old_delta_coalescer = target.delta_coalescer
     await old_delta_coalescer.flush()
     old_usage_coalescer = target.usage_coalescer
@@ -2134,6 +2140,9 @@ async def _create_thread_replacement_session(
                 if state is not None
                 else str(codex_home_for_bridge_dir(bridge_dir))
             ),
+            # Carry the workspace across the rotation, or the executor
+            # falls back to the harness process's own cwd for new turns.
+            cwd=state.cwd if state is not None else None,
         ),
     )
 
@@ -6973,10 +6982,33 @@ def _thread_started_is_subagent(event: CodexMessage) -> bool:
     return _thread_spawn_source(thread) is not None
 
 
+def _thread_started_is_ephemeral(event: CodexMessage) -> bool:
+    """
+    Return whether a ``thread/started`` event announces an ephemeral thread.
+
+    Codex CLI 0.150.1 emits a second ``thread/started`` mid-turn for an
+    internal system/housekeeping thread marked ``ephemeral=true``. These
+    threads cannot host goals or persist history; rotating onto one strands
+    the real turn's output and breaks goal reads.
+
+    :param event: Codex app-server notification envelope.
+    :returns: ``True`` when the started thread carries ``ephemeral=true``.
+    """
+    if event.get("method") != "thread/started":
+        return False
+    params = event.get("params")
+    if not isinstance(params, dict):
+        return False
+    thread = params.get("thread")
+    if not isinstance(thread, dict):
+        return False
+    return thread.get("ephemeral") is True
+
+
 async def wait_for_thread_started(
     client: CodexAppServerClient,
     *,
-    timeout: float = _THREAD_START_TIMEOUT_SECONDS,
+    timeout: float | None = _THREAD_START_TIMEOUT_SECONDS,
 ) -> str:
     """
     Wait for a freshly launched Codex TUI to create its app-server thread.
@@ -6992,7 +7024,10 @@ async def wait_for_thread_started(
 
     :param client: A connected :class:`CodexAppServerClient` listening for
         app-server notifications.
-    :param timeout: Seconds to wait for ``thread/started`` before failing.
+    :param timeout: Seconds to wait for ``thread/started`` before failing,
+        or ``None`` to wait without a deadline (used when startup failure
+        was already recorded up front and the wait only serves a possible
+        interactive sign-in).
     :returns: The Codex thread id, e.g.
         ``"019e8720-98d7-7b23-ac0a-bfb0eb02e0c9"``.
     :raises TimeoutError: If no ``thread/started`` arrives within *timeout*.

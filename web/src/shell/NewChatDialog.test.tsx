@@ -44,6 +44,7 @@ import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import type { Conversation } from "@/hooks/useConversations";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import {
   controlHost,
   getHostIdentity,
@@ -800,6 +801,12 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
   );
 }
 
+function tooltipKeys(tooltip: HTMLElement): string[] {
+  return Array.from(tooltip.querySelectorAll('[data-slot="kbd"]')).map(
+    (key) => key.textContent ?? "",
+  );
+}
+
 /** Open the picker and commit (select + close) an agent by clicking its row. */
 /** Drop the mounted landing screen + its in-memory draft, keeping localStorage. */
 function remountLanding(infoOverrides: Partial<ServerInfo> = {}): void {
@@ -1131,6 +1138,35 @@ describe("NewChatLandingScreen", () => {
     // (e.g. dropped the workspace gate), the blank cases above would have
     // enabled too.
     expect(submit.disabled).toBe(false);
+  });
+
+  it("keeps the disabled reason tooltip on the new-chat submit button", async () => {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    const submit = screen.getByTestId("new-chat-landing-submit");
+
+    fireEvent.pointerMove(submit.parentElement!, { pointerType: "mouse" });
+
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Enter a message to get started");
+  });
+
+  it("shows the default shortcut in the new-chat submit tooltip", async () => {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "inspect the repo" },
+    });
+    const submit = screen.getByTestId("new-chat-landing-submit");
+
+    fireEvent.pointerMove(submit.parentElement!, { pointerType: "mouse" });
+    const tooltip = await screen.findByRole("tooltip");
+
+    expect(within(tooltip).getByText("Start session")).toBeInTheDocument();
+    expect(tooltipKeys(tooltip)).toEqual(["↵"]);
   });
 
   it("keeps submit disabled when no agents exist", () => {
@@ -1598,7 +1634,7 @@ describe("NewChatLandingScreen", () => {
     expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "codex-native", true);
   });
 
-  it("reports start-session telemetry when a create is triggered with the Enter key", async () => {
+  it("keeps legacy Mod+Enter as a default-mode send alias", async () => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
       json: async () => ({ id: "conv_new" }),
@@ -1609,15 +1645,33 @@ describe("NewChatLandingScreen", () => {
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "run the build" },
     });
-    // Enter creates the session without going through the Start button, so the
-    // telemetry has to fire from handleCreate — not the Button's componentId.
-    fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Enter" });
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), {
+      key: "Enter",
+      ctrlKey: true,
+    });
     await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
     expect(analytics).toHaveBeenCalledWith({
       type: "click",
       componentId: "new_chat.start_session",
       componentKind: "button",
     });
+  });
+
+  it("uses Mod+Enter to start a session when the alternate composer behavior is enabled", async () => {
+    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    const input = screen.getByTestId("new-chat-landing-input");
+    fireEvent.change(input, { target: { value: "run the build" } });
+
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(input, { key: "Enter", metaKey: true });
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
   });
 
   it("arms codex full bypass as a plain Approval option, with no warning banner", () => {
@@ -2547,6 +2601,46 @@ describe("NewChatLandingScreen", () => {
     expect("git" in body).toBe(false);
   });
 
+  it("clears a drafted sandbox repository when remounting under another project", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    // Project Alpha's composer: stage a sandbox repo + branch, then navigate
+    // away (unmount parks them in the module-scoped landing draft).
+    renderLanding({ managed_sandboxes_enabled: true }, "/?project=Alpha");
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
+      target: { value: "https://github.com/org/alpha-repo" },
+    });
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-branch-input"), {
+      target: { value: "alpha-main" },
+    });
+    // Unmount WITHOUT resetting the draft — the leak under test rides in it.
+    cleanup();
+
+    // Project Beta's composer: the repo inputs compose the managed create's
+    // workspace string, so Alpha's repo/branch must not survive — otherwise
+    // Beta's sandbox silently clones another project's repository.
+    renderLanding({ managed_sandboxes_enabled: true }, "/?project=Beta");
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-repo-chip")).toHaveTextContent("Repository"),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "start fresh" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.host_type).toBe("managed");
+    // Blank repo inputs compose to an omitted workspace (empty server-created
+    // one) — not Alpha's repo#branch.
+    expect(body.workspace).toBeUndefined();
+  });
+
   it("carries the picked provider in the managed create when several are offered", async () => {
     // A multi-provider server renders one row per provider. Picking the
     // second (non-default) row must ride into the POST as sandbox_provider,
@@ -2737,6 +2831,24 @@ describe("NewChatLandingScreen skills menu", () => {
     expect((screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement).value).toBe(
       "/review-pr ",
     );
+  });
+
+  it("does not accept a highlighted skill when Enter is pressed on mobile", () => {
+    const restoreViewport = forceMobileViewport();
+    try {
+      mockAgents([skilledAgent()]);
+      renderLanding();
+      typeMessage("/rev");
+
+      fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Enter" });
+
+      expect((screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement).value).toBe(
+        "/rev",
+      );
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    } finally {
+      restoreViewport();
+    }
   });
 
   it("Tab completes a match found only mid-name (exercises slashMenuMatches, not just the render filter)", () => {
@@ -3066,6 +3178,27 @@ describe("NewChatLandingScreen @-file-mention", () => {
     // Host absolute paths are shown as workspace-relative rows (folders first).
     expect(screen.getByTitle("Open omnigent")).toBeInTheDocument();
     expect(screen.getByTitle("Attach README.md")).toBeInTheDocument();
+  });
+
+  it("does not accept the highlighted mention when Enter is pressed on mobile", async () => {
+    const restoreViewport = forceMobileViewport();
+    try {
+      renderLanding();
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+      );
+      fireEvent.change(input(), {
+        target: { value: "@README", selectionStart: 7 },
+      });
+
+      fireEvent.keyDown(input(), { key: "Enter" });
+
+      expect((input() as HTMLTextAreaElement).value).toBe("@README");
+      expect(screen.queryByText("@README.md")).not.toBeInTheDocument();
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    } finally {
+      restoreViewport();
+    }
   });
 
   it("does NOT open the menu for a non-native (SDK) agent", () => {
