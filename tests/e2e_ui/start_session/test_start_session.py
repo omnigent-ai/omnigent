@@ -521,6 +521,77 @@ async def _save_config(page) -> None:
     await page.get_by_test_id("new-chat-landing-config-save").click()
 
 
+def test_start_session_without_initial_prompt(seeded_session: tuple[str, str]) -> None:
+    """A valid launch can open an idle session without inventing a first turn."""
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_without_initial_prompt(base_url, session_id))
+
+
+async def _drive_without_initial_prompt(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            event_posts: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            async def handle_events(route: Route) -> None:
+                event_posts.append(route.request.post_data_json)
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"queued": True, "item_id": "ci_e2e"}),
+                )
+
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route("**/v1/sessions/*/events", handle_events)
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            landing_input = page.get_by_test_id("new-chat-landing-input")
+            await landing_input.wait_for(state="visible", timeout=30_000)
+            await expect(landing_input).to_have_value("")
+
+            submit = page.get_by_test_id("new-chat-landing-submit")
+            await expect(submit).to_be_enabled()
+            await submit.click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["agent_id"] == "ag_claude_e2e", body
+            assert body["host_id"] == _HOST_ID, body
+            assert body["workspace"] == "/work/repo", body
+            assert "initial_items" not in body, body
+            assert "initialPrompt" not in body, body
+
+            await page.wait_for_url(re.compile(rf"/c/{re.escape(session_id)}$"), timeout=30_000)
+            await expect(page.get_by_placeholder("Ask the agent anything…")).to_be_visible()
+            # Let ChatPage mount effects run; a pending initial prompt dispatches
+            # from that effect, so two paint turns are the observable boundary.
+            await page.evaluate(
+                "() => new Promise(resolve => requestAnimationFrame(() => "
+                "requestAnimationFrame(resolve)))"
+            )
+            assert event_posts == [], event_posts
+        finally:
+            await browser.close()
+
+
 def test_start_session_select_permission_mode(seeded_session: tuple[str, str]) -> None:
     """A launched permission mode reaches create and seeds the next session.
 
