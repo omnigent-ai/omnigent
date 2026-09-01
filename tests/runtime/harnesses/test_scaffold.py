@@ -870,6 +870,13 @@ async def test_turn_stalling_past_absolute_ceiling_fails_via_idle_watchdog(
         f"Turn was failed after {elapsed:.2f}s — at/under the 0.5s absolute "
         f"ceiling, meaning progress did not extend it."
     )
+    # ...and the failure landed promptly: ~one idle window (1s) after the
+    # last emit at ~0.8s, with slack for a slow CI box. A stalled turn must
+    # not linger well past its extended deadline.
+    assert elapsed < 3.5, (
+        f"Stalled turn lingered {elapsed:.2f}s — the watchdog should fire "
+        f"within ~one idle window (1s) of the last progress event."
+    )
     emitted = [
         e
         for e in iter(event_queue.get_nowait, None)
