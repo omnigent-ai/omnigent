@@ -114,12 +114,8 @@ import { absoluteTime } from "@/lib/relativeTime";
 import { useNavigate } from "@/lib/routing";
 import { useSettingsRoute } from "@/shell/settingsNav";
 import { ImportSessionsPanel } from "@/shell/ImportSessionsPanel";
-import {
-  isThemeMode,
-  normalizeResolvedTheme,
-  normalizeThemeMode,
-  type ThemeMode,
-} from "@/components/theme/themeMode";
+import { isThemeMode, normalizeThemeMode, type ThemeMode } from "@/components/theme/themeMode";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import {
   applyDesktopUiFontSize,
   applyUiFontFamily,
@@ -539,9 +535,9 @@ function WorkspacePanelDefaultControl() {
 }
 
 function ColorThemeControl() {
-  // Render each chip in the currently-resolved mode so it matches the app now.
-  const { resolvedTheme } = useTheme();
-  const isDark = normalizeResolvedTheme(resolvedTheme) === "dark";
+  // Render each chip in the currently-resolved mode so it matches the app now
+  // (honoring the embed's forced theme, not just next-themes' resolvedTheme).
+  const isDark = useResolvedThemeMode() === "dark";
   const [selection, setSelection] = useState<ThemeSelection>(() => readThemePalette());
   const [customTheme, setCustomTheme] = useState<CustomTheme>(() => readCustomTheme());
   const labelId = useId();
