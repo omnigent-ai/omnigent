@@ -7189,6 +7189,46 @@ def test_compute_transcript_cumulative_cost_none_when_nothing_priceable(
     )
 
 
+def test_compute_transcript_cost_by_model_keys_each_response_by_its_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    Per-model costs aggregate by each response's own ``message.model``.
+
+    Same pricing walk as the flat total (requestId dedup included), split
+    per model — this split is what surfaces a Task sub-agent that ran on
+    a different model in the per-model cost breakdown. The buckets must
+    sum to the flat total.
+    """
+    from omnigent.llms.context_window import ModelPricing
+
+    pricing = ModelPricing(input_per_token=10.0, output_per_token=20.0)
+    monkeypatch.setattr("omnigent.llms.context_window.fetch_model_pricing", lambda model: pricing)
+    claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()
+    path = tmp_path / "transcript.jsonl"
+    _write_transcript_jsonl(
+        path,
+        [
+            # sonnet: 2*10 + 3*20 = 80; duplicate requestId billed once.
+            _assistant_entry(model="sonnet", input_tokens=2, output_tokens=3, request_id="req_A"),
+            _assistant_entry(model="sonnet", input_tokens=2, output_tokens=3, request_id="req_A"),
+            # opus: 1*10 + 1*20 = 30.
+            _assistant_entry(model="opus", input_tokens=1, output_tokens=1, request_id="req_B"),
+        ],
+    )
+    by_model = claude_native_bridge.compute_transcript_cost_by_model(path, include_sidechains=True)
+    assert by_model == {"sonnet": pytest.approx(80.0), "opus": pytest.approx(30.0)}
+    flat = claude_native_bridge.compute_transcript_cumulative_cost(path, include_sidechains=True)
+    assert sum(by_model.values()) == pytest.approx(flat)
+    # Nothing priceable → empty dict (missing file included).
+    assert (
+        claude_native_bridge.compute_transcript_cost_by_model(
+            tmp_path / "missing.jsonl", include_sidechains=True
+        )
+        == {}
+    )
+
+
 def test_format_terminal_failure_tail_returns_empty_for_blank_pane() -> None:
     """
     A pane with no visible text yields no tail block.

@@ -2115,6 +2115,51 @@ def _usage_by_model_for_display(usage: dict[str, Any]) -> dict[str, ModelUsage] 
     return result or None
 
 
+def _coerce_cost_by_model(data: dict[str, Any]) -> dict[str, float] | None:
+    """
+    Read and validate the optional ``cost_by_model`` attribution weights.
+
+    claude-native sends these alongside a ``cumulative_cost_usd`` advance
+    when a turn ran Task sub-agents: per-model transcript-estimated growth,
+    used by :func:`_persist_native_cumulative_usage` to split the flat cost
+    delta across the models that actually produced it (instead of folding
+    everything into the statusLine's single active model).
+
+    :param data: The ``external_session_usage`` event ``data`` dict.
+    :returns: ``{model_id: usd_weight}`` with only positive finite entries,
+        or ``None`` when absent / empty after filtering.
+    :raises OmnigentError: When present but not a dict of model-id strings
+        to finite non-negative numbers.
+    """
+    value = data.get("cost_by_model")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise OmnigentError(
+            "external_session_usage data.cost_by_model must be a dict of "
+            "model ids to finite non-negative numbers",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    weights: dict[str, float] = {}
+    for model, weight in value.items():
+        if (
+            not isinstance(model, str)
+            or not model
+            or isinstance(weight, bool)
+            or not isinstance(weight, (int, float))
+            or not math.isfinite(weight)
+            or weight < 0
+        ):
+            raise OmnigentError(
+                "external_session_usage data.cost_by_model must be a dict of "
+                "model ids to finite non-negative numbers",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if weight > 0:
+            weights[model] = float(weight)
+    return weights or None
+
+
 def _coerce_cumulative_field(
     data: dict[str, Any],
     key: str,
@@ -10057,6 +10102,7 @@ __all__ = [
     "_codex_plan_mode_enabled",
     "_codex_subagent_display_tool",
     "_codex_subagent_labels_from_body",
+    "_coerce_cost_by_model",
     "_coerce_cumulative_field",
     "_collect_descendant_conversation_ids",
     "_consume_pre_resolved_harness_elicitation",

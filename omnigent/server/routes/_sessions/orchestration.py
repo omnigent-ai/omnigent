@@ -206,6 +206,7 @@ from omnigent.server.routes._sessions.helpers import (
     _build_policy_engine_from_spec,
     _child_session_summary_from_conversation,
     _codex_subagent_labels_from_body,
+    _coerce_cost_by_model,
     _coerce_cumulative_field,
     _collect_descendant_conversation_ids,
     _consume_pre_resolved_harness_elicitation,
@@ -1402,6 +1403,14 @@ def _persist_native_cumulative_usage(
       than the full input rate. Absent for harnesses that don't report it.
     - ``model`` — LLM model id to price with (e.g. ``"databricks-gpt-5-5"``);
       falls back to the agent spec's model when absent.
+    - ``cost_by_model`` — optional per-model attribution weights for a
+      ``cumulative_cost_usd`` advance, e.g. ``{"claude-opus-4-8": 0.0135}``
+      (claude-native's transcript-estimated growth per model when a turn
+      ran Task sub-agents). When present, the cost delta is split across
+      these models proportionally instead of landing on the single active
+      model — a Task sub-agent pinned to a different model then gets its
+      own bucket in the per-model breakdown rather than being folded into
+      the orchestrator's.
 
     The ``total_cost_usd`` key is written only on the priced branches
     below (exact billing, or token-priced when the model is in the
@@ -1421,6 +1430,7 @@ def _persist_native_cumulative_usage(
     :raises OmnigentError: When a cumulative field is the wrong type.
     """
     cost = _coerce_cumulative_field(data, "cumulative_cost_usd", numeric=True)
+    cost_by_model_weights = _coerce_cost_by_model(data)
     policy_cost = _coerce_cumulative_field(data, "policy_cost_usd", numeric=True)
     cin = _coerce_cumulative_field(data, "cumulative_input_tokens", numeric=False)
     cout = _coerce_cumulative_field(data, "cumulative_output_tokens", numeric=False)
@@ -1533,10 +1543,29 @@ def _persist_native_cumulative_usage(
         for key in _MODEL_TOKEN_KEYS:
             if key in current:
                 bucket[key] = int(bucket.get(key, 0)) + max(0, int(current[key]) - old_tokens[key])
-        if "total_cost_usd" in current:
-            bucket["total_cost_usd"] = float(bucket.get("total_cost_usd", 0.0)) + max(
-                0.0, float(current["total_cost_usd"]) - old_cost
-            )
+    cost_growth = (
+        max(0.0, float(current["total_cost_usd"]) - old_cost)
+        if "total_cost_usd" in current
+        else 0.0
+    )
+    if cost_growth > 0.0:
+        # Split the growth across the reported per-model weights when present
+        # (a claude-native turn that ran Task sub-agents on other models);
+        # otherwise the whole growth belongs to the single active model. The
+        # weights are proportions, not absolute figures: the persisted growth
+        # stays the authoritative (monotonic-clamped) flat delta, so per-model
+        # buckets keep summing to the flat total.
+        if cost_by_model_weights:
+            weight_total = sum(cost_by_model_weights.values())
+            for weight_model, weight in cost_by_model_weights.items():
+                share = cost_growth * (weight / weight_total)
+                weight_bucket = _model_usage_bucket(current, weight_model)
+                weight_bucket["total_cost_usd"] = (
+                    float(weight_bucket.get("total_cost_usd", 0.0)) + share
+                )
+        elif isinstance(model_name, str) and model_name:
+            bucket = _model_usage_bucket(current, model_name)
+            bucket["total_cost_usd"] = float(bucket.get("total_cost_usd", 0.0)) + cost_growth
 
     # Enforcement value (claude-native display/policy split). Stored
     # separately from the displayed ``total_cost_usd`` so the gate can read

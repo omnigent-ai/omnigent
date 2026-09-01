@@ -28,7 +28,7 @@ from omnigent.claude_native_bridge import (
     ClaudeTranscriptItem,
     HookReadResult,
     TranscriptReadResult,
-    compute_transcript_cumulative_cost,
+    compute_transcript_cost_by_model,
     read_active_session_id,
     read_bridge_id,
     read_claude_context_state,
@@ -557,6 +557,13 @@ class _ForwardDedupeState:
     # sub-agent spend so the gate can block mid-turn. Separate baseline
     # because it can advance while ``posted_cost`` (S) is frozen.
     posted_policy_cost: float | None = None
+    # Per-model transcript-cost snapshot (C's split) taken at the last
+    # successful display-cost post. The next display advance sends the
+    # per-model GROWTH since this snapshot as ``cost_by_model`` attribution
+    # weights, so each advance is attributed to the models that produced it
+    # (not the whole session's historical mix). ``None`` until the first
+    # display post with sub-agents tracked.
+    posted_cost_by_model: dict[str, float] | None = None
     # Last permission mode POSTed as ``external_permission_mode_change`` —
     # mirrors the launch mode and any in-pane shift+tab switch, neither of
     # which the web UI can observe on its own.
@@ -590,14 +597,16 @@ class _TranscriptCostCacheEntry:
     forwarder doesn't re-parse an unchanged transcript on every (0.25s)
     poll. Append-only JSONL makes byte size a sound cache key.
 
-    :param size: File size in bytes when ``cost_usd`` was computed,
+    :param size: File size in bytes when ``cost_by_model`` was computed,
         e.g. ``81920``.
-    :param cost_usd: Cumulative USD cost computed from the transcript at
-        that size, or ``None`` when nothing could be priced.
+    :param cost_by_model: Cumulative USD cost per API model computed from
+        the transcript at that size, e.g. ``{"claude-opus-4-8": 0.0135}``.
+        Empty when nothing could be priced. The flat cumulative cost is
+        the sum of the values.
     """
 
     size: int
-    cost_usd: float | None
+    cost_by_model: dict[str, float]
 
 
 @dataclass
@@ -1713,11 +1722,11 @@ def _transcript_cost_size_cached(
     *,
     include_sidechains: bool,
     cache: dict[Path, _TranscriptCostCacheEntry],
-) -> float | None:
+) -> dict[str, float] | None:
     """
-    Cumulative transcript cost, recomputed only when the file grows.
+    Per-model transcript cost, recomputed only when the file grows.
 
-    Wraps :func:`compute_transcript_cumulative_cost` with a per-process
+    Wraps :func:`compute_transcript_cost_by_model` with a per-process
     size-keyed cache so an unchanged transcript isn't re-parsed every
     poll. On a forwarder restart the cache starts empty and the first
     call recomputes from the full file, so the estimate is correct across
@@ -1726,13 +1735,14 @@ def _transcript_cost_size_cached(
 
     :param transcript_path: Transcript JSONL path.
     :param include_sidechains: Forwarded to
-        :func:`compute_transcript_cumulative_cost` — ``False`` for a
+        :func:`compute_transcript_cost_by_model` — ``False`` for a
         parent transcript (sub-agent records are sidechains counted
         elsewhere), ``True`` for a sub-agent's own transcript.
     :param cache: Per-session cache mapping transcript path to its last
         computed :class:`_TranscriptCostCacheEntry`. Mutated in place.
-    :returns: Cumulative USD cost, or ``None`` when nothing is priceable
-        (missing file included).
+    :returns: Per-model USD cost (e.g. ``{"claude-opus-4-8": 0.0135}``;
+        the flat cumulative cost is the sum of the values), or ``None``
+        when nothing is priceable (missing file included).
     """
     try:
         size = transcript_path.stat().st_size
@@ -1740,63 +1750,62 @@ def _transcript_cost_size_cached(
         return None
     cached = cache.get(transcript_path)
     if cached is not None and cached.size == size:
-        return cached.cost_usd
-    cost = compute_transcript_cumulative_cost(
+        return cached.cost_by_model or None
+    cost_by_model = compute_transcript_cost_by_model(
         transcript_path, include_sidechains=include_sidechains
     )
-    cache[transcript_path] = _TranscriptCostCacheEntry(size=size, cost_usd=cost)
-    return cost
+    cache[transcript_path] = _TranscriptCostCacheEntry(size=size, cost_by_model=cost_by_model)
+    return cost_by_model or None
 
 
-def _session_cost_estimate(
+def _session_cost_by_model_estimate(
     *,
     parent_transcript_path: Path,
     active_subagents: list[SubagentEntry],
-    status_cost: float | None,
     cost_cache: dict[Path, _TranscriptCostCacheEntry],
-) -> float | None:
+) -> dict[str, float]:
     """
-    Compute ``max(S, C)`` for the parent session's POLICY/budget cost.
+    Compute ``C`` — the per-model real-time transcript cost estimate.
 
-    This is the value the cost-budget gate reads (``policy_cost_usd``),
-    NOT the displayed cost — display uses ``S`` alone so the badge matches
-    the Claude TUI ``/cost``. Synchronous (does transcript file I/O) —
-    call via :func:`asyncio.to_thread`. ``C`` is the forwarder's real-time
-    estimate: the parent transcript's own cost (sidechains excluded) plus
-    the sum of each tracked sub-agent's own transcript cost (each priced
-    once per ``requestId`` — see
-    :func:`compute_transcript_cumulative_cost`). ``S`` is the statusLine
-    total. See :func:`_forward_session_cost` for why the two are combined
-    with ``max`` rather than added.
+    ``C`` (the sum of the returned values) is the forwarder's real-time
+    estimate of the whole session's cost: the parent transcript's own cost
+    (sidechains excluded) plus each tracked sub-agent's own transcript
+    cost, each response priced once per ``requestId`` by its own
+    ``message.model`` (see :func:`compute_transcript_cost_by_model`).
+    Keeping the per-model split is what lets a Task sub-agent pinned to a
+    different model surface in the cost panel's per-model breakdown — the
+    statusLine total the display uses carries no split. Synchronous (does
+    transcript file I/O) — call via :func:`asyncio.to_thread`.
 
     :param parent_transcript_path: Parent transcript JSONL path; its
         sibling ``subagents/`` directory holds the sub-agent transcripts.
     :param active_subagents: Sub-agents with a minted child conversation
         (only these have an ``agent-<id>.jsonl`` on disk to price).
-    :param status_cost: ``S`` — the statusLine total, or ``None`` when
-        not captured yet.
     :param cost_cache: Per-session size-keyed transcript cost cache,
         mutated in place.
-    :returns: ``max(S, C)`` in USD, or ``None`` when neither source
-        yields a priceable cost.
+    :returns: ``{model_id: usd}`` summed across the parent's own messages
+        and every tracked sub-agent transcript, e.g.
+        ``{"claude-sonnet-4-6": 0.021, "claude-opus-4-8": 0.0135}``.
+        Empty when nothing is priceable.
     """
     subagents_dir = _subagents_dir_for_transcript(parent_transcript_path)
-    estimate: float | None = _transcript_cost_size_cached(
-        parent_transcript_path, include_sidechains=False, cache=cost_cache
-    )
+    combined: dict[str, float] = {}
+    sources = [
+        _transcript_cost_size_cached(
+            parent_transcript_path, include_sidechains=False, cache=cost_cache
+        )
+    ]
     for entry in active_subagents:
         jsonl_path = subagents_dir / f"agent-{entry.subagent_id}.jsonl"
-        sub_cost = _transcript_cost_size_cached(
-            jsonl_path, include_sidechains=True, cache=cost_cache
+        sources.append(
+            _transcript_cost_size_cached(jsonl_path, include_sidechains=True, cache=cost_cache)
         )
-        if sub_cost is not None:
-            # Seed the accumulator from the parent cost, or 0.0 when the parent
-            # had nothing priceable — so sub-agent cost still contributes to C.
-            estimate = (estimate or 0.0) + sub_cost
-    candidates = [cost for cost in (status_cost, estimate) if cost is not None]
-    if not candidates:
-        return None
-    return max(candidates)
+    for by_model in sources:
+        if not by_model:
+            continue
+        for model, cost in by_model.items():
+            combined[model] = combined.get(model, 0.0) + cost
+    return combined
 
 
 async def _forward_session_cost(
@@ -1841,6 +1850,14 @@ async def _forward_session_cost(
     gate uses the higher live ``C``) is intentional and reconciles at the
     turn boundary when ``S`` jumps; ``max`` keeps both monotonic.
 
+    When sub-agents are tracked, a display-cost advance also carries
+    ``cost_by_model`` — ``C``'s per-model split — so the server can
+    attribute the advance to the models that actually produced it. ``S``
+    alone is a flat total tagged with the statusLine's ACTIVE model, which
+    would fold a Task sub-agent's spend on a different model into the
+    orchestrator's bucket and leave the sub-agent's model missing from the
+    per-model cost breakdown.
+
     Best-effort, like the other forwarder posts: a failed POST is retried
     on the next poll (the ``dedupe`` baselines advance only on success).
 
@@ -1870,24 +1887,28 @@ async def _forward_session_cost(
     # Display cost: the statusLine total S verbatim (matches /cost).
     display_cost = status_cost
     # Policy/budget cost: with no sub-agent it equals S; with a sub-agent
-    # running it is max(S, real-time transcript estimate) so the gate sees
-    # in-flight spend while S is frozen.
+    # running it is max(S, real-time transcript estimate C) so the gate sees
+    # in-flight spend while S is frozen. The estimate is computed per-model
+    # so a display advance can also carry the model split (below).
+    cost_by_model: dict[str, float] = {}
     if not active_subagents:
         policy_cost = status_cost
     else:
-        policy_cost = await asyncio.to_thread(
-            _session_cost_estimate,
+        cost_by_model = await asyncio.to_thread(
+            _session_cost_by_model_estimate,
             parent_transcript_path=parent_transcript_path,
             active_subagents=active_subagents,
-            status_cost=status_cost,
             cost_cache=cost_cache,
         )
+        estimate = sum(cost_by_model.values()) if cost_by_model else None
+        candidates = [cost for cost in (status_cost, estimate) if cost is not None]
+        policy_cost = max(candidates) if candidates else None
     # Build the payload from whichever values are present AND have advanced.
     # Monotonic per field: never walk a total backwards — guards a transient
     # lower transcript read (e.g. just after a rotation) and suppresses
     # steady-state churn. The two fields advance independently (policy_cost
     # moves mid-turn while display_cost/S is frozen).
-    payload: dict[str, float | str] = {}
+    payload: dict[str, float | str | dict[str, float]] = {}
     if display_cost is not None and (
         dedupe.posted_cost is None or display_cost > dedupe.posted_cost
     ):
@@ -1898,17 +1919,41 @@ async def _forward_session_cost(
         payload["policy_cost_usd"] = policy_cost
     if not payload:
         return
-    # Tag a display-cost (S) advance with the active model captured by the
-    # statusLine wrapper (``{"model": "claude-opus-4-8", ...}`` in context.json).
-    # claude-native sends no token counts with its cost, so the server has
-    # nothing to attribute the cost to per-model without this — leaving it out
-    # of the TOKEN USAGE breakdown while the session total still counts it. Sent
-    # only when the display cost moves: that is the value being attributed
-    # (``policy_cost_usd``-only mid-turn posts carry no new display cost).
-    if "cumulative_cost_usd" in payload and isinstance(status_state, dict):
-        model = status_state.get("model")
-        if isinstance(model, str) and model:
-            payload["model"] = model
+    # Attribute a display-cost (S) advance per-model. claude-native sends no
+    # token counts with its cost, so the server has nothing to attribute the
+    # cost to per-model on its own — leaving it out of the TOKEN USAGE
+    # breakdown while the session total still counts it. Attribution data is
+    # sent only when the display cost moves: that is the value being
+    # attributed (``policy_cost_usd``-only mid-turn posts carry no new
+    # display cost).
+    #
+    # - With sub-agents tracked, send ``cost_by_model`` — each model's
+    #   transcript-estimate GROWTH since the last display post. The server
+    #   splits the S delta across these weights, so each model gets its own
+    #   share. S is a flat total tagged with the statusLine's ACTIVE model
+    #   only, and a Task sub-agent pinned to a different model runs with the
+    #   statusLine frozen on the orchestrator's model: tagging the settled S
+    #   with that one model would fold the sub-agent's spend into the
+    #   orchestrator's bucket (and drop its model from the per-model cost
+    #   breakdown entirely).
+    # - Without sub-agents (or when nothing in the transcripts could be
+    #   priced), keep the single ``model`` tag from the statusLine
+    #   (``{"model": "claude-opus-4-8", ...}`` in context.json) — everything
+    #   in the advance belongs to the active model, no transcript walk needed.
+    if "cumulative_cost_usd" in payload:
+        cost_growth_by_model: dict[str, float] = {}
+        if cost_by_model:
+            baseline = dedupe.posted_cost_by_model or {}
+            for model_id, model_cost in cost_by_model.items():
+                growth = model_cost - baseline.get(model_id, 0.0)
+                if growth > 0.0:
+                    cost_growth_by_model[model_id] = growth
+        if cost_growth_by_model:
+            payload["cost_by_model"] = cost_growth_by_model
+        elif isinstance(status_state, dict):
+            model = status_state.get("model")
+            if isinstance(model, str) and model:
+                payload["model"] = model
     try:
         await _post_external_session_usage(
             client,
@@ -1938,6 +1983,15 @@ async def _forward_session_cost(
     dedupe.cost_retry_not_before = 0.0
     if "cumulative_cost_usd" in payload:
         dedupe.posted_cost = display_cost
+        if cost_by_model:
+            # Snapshot C's split at this display post, so the next advance
+            # attributes only its own growth (merge over the prior snapshot:
+            # a transcript that was rotated away must not resurrect as
+            # negative growth).
+            merged = dict(dedupe.posted_cost_by_model or {})
+            for model_id, model_cost in cost_by_model.items():
+                merged[model_id] = max(merged.get(model_id, 0.0), model_cost)
+            dedupe.posted_cost_by_model = merged
     if "policy_cost_usd" in payload:
         dedupe.posted_policy_cost = policy_cost
 
@@ -4159,7 +4213,7 @@ async def _post_external_session_usage(
     client: httpx.AsyncClient,
     *,
     session_id: str,
-    usage: Mapping[str, float | str] | None,
+    usage: Mapping[str, float | str | dict[str, float]] | None,
     context_window: int | None = None,
     token_usage: dict[str, int] | None = None,
 ) -> None:
@@ -4172,8 +4226,9 @@ async def _post_external_session_usage(
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
     :param usage: ``message.usage`` snapshot, or ``None`` to skip. Values are
-        numeric counters/costs, plus an optional ``model`` string tagging the
-        cost with the active model for per-model attribution.
+        numeric counters/costs, plus optional per-model attribution for the
+        cost: a ``model`` string tagging the whole advance with the active
+        model, or a ``cost_by_model`` dict of per-model weights.
     :param context_window: Resolved window in tokens, or ``None`` to
         leave the server's persisted value untouched.
     :param token_usage: One API call's final token counters to record on the
@@ -4222,7 +4277,9 @@ _GEN_AI_TOKEN_KEYS = (
 )
 
 
-def _gen_ai_usage_tokens(usage: Mapping[str, float | str] | None) -> dict[str, int] | None:
+def _gen_ai_usage_tokens(
+    usage: Mapping[str, float | str | dict[str, float]] | None,
+) -> dict[str, int] | None:
     """
     Extract the token counters from a usage payload for OTel recording.
 

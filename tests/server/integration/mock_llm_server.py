@@ -892,10 +892,16 @@ async def create_message(
         _state.pending_gates.append(qr)
         await qr._gate.wait()
 
+    # Echo the request's model in the response, like the real Messages API.
+    # Clients that price responses by ``message.model`` (e.g. the
+    # claude-native transcript cost walk) need the real id, not a literal
+    # ``mock-model``.
+    requested_model = parsed.get("model") if isinstance(parsed, dict) else None
+    response_model = requested_model if isinstance(requested_model, str) else "mock-model"
     if qr.tool_calls:
-        sse_body = anthropic_sse_tool_call_response(qr.tool_calls)
+        sse_body = anthropic_sse_tool_call_response(qr.tool_calls, model=response_model)
     else:
-        sse_body = anthropic_sse_text_response(qr.text)
+        sse_body = anthropic_sse_text_response(qr.text, model=response_model)
 
     # Mid-stream fault: emit only a prefix and end, dropping message_stop.
     if qr.truncate_after is not None:

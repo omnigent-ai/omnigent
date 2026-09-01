@@ -2671,6 +2671,10 @@ def _temp_omnigent_mock_config(
     original = config_path.read_text() if config_path.exists() else None
 
     if harness == "claude":
+        # Explicit pricing: the spawned runner inherits
+        # OMNIGENT_DISABLE_CATALOG_LOOKUP=1 from the pytest env, so the
+        # transcript cost walk (per-model cost attribution) can only price
+        # responses from configured provider pricing, never the catalog.
         mock_config = textwrap.dedent(f"""\
             providers:
               mock-claude:
@@ -2681,6 +2685,9 @@ def _temp_omnigent_mock_config(
                   api_key: "mock-key"
                   models:
                     default: {_CLAUDE_MOCK_MODEL}
+                  pricing:
+                    input_per_million: 3.0
+                    output_per_million: 15.0
             """)
     else:  # codex
         mock_config = textwrap.dedent(f"""\

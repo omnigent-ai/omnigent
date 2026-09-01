@@ -2597,6 +2597,63 @@ def compute_transcript_cumulative_cost(
         for every model present) — distinct from ``0.0``, which means
         priced messages summed to zero.
     """
+    cost_by_request = _transcript_costs_by_request(
+        transcript_path, include_sidechains=include_sidechains
+    )
+    if not cost_by_request:
+        return None
+    return sum(cost for _model, cost in cost_by_request.values())
+
+
+def compute_transcript_cost_by_model(
+    transcript_path: Path,
+    *,
+    include_sidechains: bool,
+) -> dict[str, float]:
+    """
+    Per-model USD cost of every assistant message in a Claude transcript.
+
+    Same pricing walk as :func:`compute_transcript_cumulative_cost` (each
+    billed response counted once per ``requestId``, priced by its own
+    ``message.model``), but aggregated per model instead of summed flat.
+    This is what lets a Task sub-agent pinned to a different model surface
+    in the per-model cost breakdown: the parent's authoritative statusLine
+    total carries no model split, while the transcripts know exactly which
+    model produced each response.
+
+    :param transcript_path: Path to a Claude transcript JSONL.
+    :param include_sidechains: Same contract as
+        :func:`compute_transcript_cumulative_cost`.
+    :returns: ``{model_id: total_usd}`` across priced assistant messages,
+        e.g. ``{"claude-opus-4-8": 0.0135}``. Empty when nothing could be
+        priced (missing/empty file, no usage, or pricing unavailable).
+    """
+    cost_by_request = _transcript_costs_by_request(
+        transcript_path, include_sidechains=include_sidechains
+    )
+    totals: dict[str, float] = {}
+    for model, cost in cost_by_request.values():
+        totals[model] = totals.get(model, 0.0) + cost
+    return totals
+
+
+def _transcript_costs_by_request(
+    transcript_path: Path,
+    *,
+    include_sidechains: bool,
+) -> dict[str, tuple[str, float]]:
+    """
+    Price each billed API response in a transcript, keyed by ``requestId``.
+
+    Shared walk behind :func:`compute_transcript_cumulative_cost` and
+    :func:`compute_transcript_cost_by_model` — see their docstrings for the
+    dedup and sidechain contracts.
+
+    :param transcript_path: Path to a Claude transcript JSONL.
+    :param include_sidechains: ``False`` skips ``isSidechain: true`` records.
+    :returns: ``{request_key: (model, usd)}`` with one entry per billed
+        response (last priceable record per ``requestId`` wins).
+    """
     read_result = _read_complete_jsonl_records(
         transcript_path,
         byte_offset=0,
@@ -2608,9 +2665,9 @@ def compute_transcript_cumulative_cost(
     provider_config = load_config()
     provider_config_fingerprint = hashlib.sha256(repr(provider_config).encode("utf-8")).digest()
 
-    # Per-``requestId`` cost (USD); last priceable record per id wins so a
+    # Per-``requestId`` (model, cost); last priceable record per id wins so a
     # response written across multiple transcript records is counted once.
-    cost_by_request: dict[str, float] = {}
+    cost_by_request: dict[str, tuple[str, float]] = {}
     # Counter minting unique keys for records lacking a ``requestId`` so
     # they each count once instead of collapsing onto a shared key.
     no_request_id_index = 0
@@ -2642,10 +2699,8 @@ def compute_transcript_cumulative_cost(
         if not isinstance(request_id, str) or not request_id:
             request_id = f"__no_request_id_{no_request_id_index}"
             no_request_id_index += 1
-        cost_by_request[request_id] = compute_llm_cost(usage, pricing)
-    if not cost_by_request:
-        return None
-    return sum(cost_by_request.values())
+        cost_by_request[request_id] = (model, compute_llm_cost(usage, pricing))
+    return cost_by_request
 
 
 def count_hook_events(bridge_dir: Path) -> int:

@@ -6302,27 +6302,27 @@ def test_transcript_cost_size_cached_recomputes_only_on_growth(
     """
     calls: list[Path] = []
 
-    def fake_compute(path: Path, *, include_sidechains: bool) -> float | None:
+    def fake_compute(path: Path, *, include_sidechains: bool) -> dict[str, float]:
         calls.append(path)
-        return float(path.stat().st_size)
+        return {"claude-sonnet-4-6": float(path.stat().st_size)}
 
-    monkeypatch.setattr(forwarder, "compute_transcript_cumulative_cost", fake_compute)
+    monkeypatch.setattr(forwarder, "compute_transcript_cost_by_model", fake_compute)
     cache: dict[Path, forwarder._TranscriptCostCacheEntry] = {}
     path = tmp_path / "t.jsonl"
     path.write_text("abc", encoding="utf-8")  # 3 bytes
-    assert forwarder._transcript_cost_size_cached(
-        path, include_sidechains=True, cache=cache
-    ) == pytest.approx(3.0)
+    assert forwarder._transcript_cost_size_cached(path, include_sidechains=True, cache=cache) == {
+        "claude-sonnet-4-6": pytest.approx(3.0)
+    }
     # Second call at the same size → served from cache, no recompute.
-    assert forwarder._transcript_cost_size_cached(
-        path, include_sidechains=True, cache=cache
-    ) == pytest.approx(3.0)
+    assert forwarder._transcript_cost_size_cached(path, include_sidechains=True, cache=cache) == {
+        "claude-sonnet-4-6": pytest.approx(3.0)
+    }
     assert len(calls) == 1
     # File grows → recompute.
     path.write_text("abcdef", encoding="utf-8")  # 6 bytes
-    assert forwarder._transcript_cost_size_cached(
-        path, include_sidechains=True, cache=cache
-    ) == pytest.approx(6.0)
+    assert forwarder._transcript_cost_size_cached(path, include_sidechains=True, cache=cache) == {
+        "claude-sonnet-4-6": pytest.approx(6.0)
+    }
     assert len(calls) == 2
     # Missing file → None, no recompute attempt recorded as a priced call.
     assert (
@@ -6333,16 +6333,16 @@ def test_transcript_cost_size_cached_recomputes_only_on_growth(
     )
 
 
-def test_session_cost_estimate_takes_max_of_status_and_transcript_sum(
+def test_session_cost_by_model_estimate_sums_parent_and_subagents(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """
-    ``C`` sums parent + sub-agent transcript cost; the result is max(S, C).
+    ``C`` sums parent + sub-agent transcript cost, keyed per model.
 
-    During a sub-agent run the real-time transcript sum (C) exceeds the
-    lagging statusLine total (S), so C is used — this is what lets the
-    parent budget see the sub-agent's spend mid-turn. Once S settles
-    higher than C, S is used.
+    The per-model split is what lets a Task sub-agent pinned to a
+    different model surface in the cost panel's breakdown; the flat ``C``
+    used for the budget gate is the sum of the values. Models shared by
+    parent and sub-agent accumulate into one bucket.
     """
     parent = tmp_path / "sess.jsonl"
     parent.write_text("parent", encoding="utf-8")
@@ -6351,29 +6351,28 @@ def test_session_cost_estimate_takes_max_of_status_and_transcript_sum(
     sub_path = subagents_dir / "agent-aaa.jsonl"
     sub_path.write_text("sub", encoding="utf-8")
 
-    per_path_cost = {parent: 0.10, sub_path: 0.55}
+    per_path_cost = {
+        parent: {"claude-sonnet-4-6": 0.10},
+        sub_path: {"claude-opus-4-8": 0.50, "claude-sonnet-4-6": 0.05},
+    }
 
-    def fake_compute(path: Path, *, include_sidechains: bool) -> float | None:
-        return per_path_cost.get(path)
+    def fake_compute(path: Path, *, include_sidechains: bool) -> dict[str, float]:
+        return per_path_cost.get(path, {})
 
-    monkeypatch.setattr(forwarder, "compute_transcript_cumulative_cost", fake_compute)
+    monkeypatch.setattr(forwarder, "compute_transcript_cost_by_model", fake_compute)
     entries = [forwarder.SubagentEntry(subagent_id="aaa", child_conversation_id="conv_child")]
 
-    # S stale ($0.005) < C (0.10 + 0.55 = 0.65) → C wins (mid-run).
-    assert forwarder._session_cost_estimate(
+    estimate = forwarder._session_cost_by_model_estimate(
         parent_transcript_path=parent,
         active_subagents=entries,
-        status_cost=0.005,
         cost_cache={},
-    ) == pytest.approx(0.65)
-
-    # S settled ($2.00) > C → S wins (no double-count after settle).
-    assert forwarder._session_cost_estimate(
-        parent_transcript_path=parent,
-        active_subagents=entries,
-        status_cost=2.0,
-        cost_cache={},
-    ) == pytest.approx(2.0)
+    )
+    # Parent sonnet + sub-agent sonnet merge; opus keeps its own bucket.
+    assert estimate == {
+        "claude-sonnet-4-6": pytest.approx(0.15),
+        "claude-opus-4-8": pytest.approx(0.50),
+    }
+    assert sum(estimate.values()) == pytest.approx(0.65)
 
 
 @pytest.mark.asyncio
@@ -6408,8 +6407,8 @@ async def test_forward_session_cost_splits_display_and_policy(
     estimate_box = {"value": 0.65}
     monkeypatch.setattr(
         forwarder,
-        "_session_cost_estimate",
-        lambda **_kwargs: estimate_box["value"],
+        "_session_cost_by_model_estimate",
+        lambda **_kwargs: {"claude-opus-4-8": estimate_box["value"]},
     )
     subagent_state = forwarder.SubagentForwardState(
         subagents={
@@ -6442,12 +6441,14 @@ async def test_forward_session_cost_splits_display_and_policy(
 
         # First poll: display = S (0.01) verbatim, policy = max(0.01, 0.65).
         # If display showed 0.65 here, the badge would diverge from /cost —
-        # the exact bug this split fixes.
+        # the exact bug this split fixes. The display advance carries the
+        # per-model attribution weights.
         await run()
         assert posted == [
             {
                 "cumulative_cost_usd": pytest.approx(0.01),
                 "policy_cost_usd": pytest.approx(0.65),
+                "cost_by_model": {"claude-opus-4-8": pytest.approx(0.65)},
             }
         ]
         assert dedupe.posted_cost == pytest.approx(0.01)
@@ -6476,12 +6477,15 @@ async def test_forward_session_cost_splits_display_and_policy(
 
         # Turn settles: S jumps to the sub-agent-inclusive total. Display
         # advances; policy advances to the same settled value. Both post.
+        # The attribution weights carry only the growth since the last
+        # display post (0.95 - 0.65), so an advance is never re-attributed.
         status_box["value"] = 0.95
         estimate_box["value"] = 0.95
         await run()
         assert posted[-1] == {
             "cumulative_cost_usd": pytest.approx(0.95),
             "policy_cost_usd": pytest.approx(0.95),
+            "cost_by_model": {"claude-opus-4-8": pytest.approx(0.30)},
         }
         assert dedupe.posted_cost == pytest.approx(0.95)
         assert dedupe.posted_policy_cost == pytest.approx(0.95)
@@ -6507,10 +6511,10 @@ async def test_forward_session_cost_posts_status_when_no_subagents(
         forwarder, "read_claude_context_state", lambda _bridge: {"total_cost_usd": 0.25}
     )
 
-    def _fail_estimate(**_kwargs: Any) -> float | None:
+    def _fail_estimate(**_kwargs: Any) -> dict[str, float]:
         raise AssertionError("estimator must not run without sub-agents")
 
-    monkeypatch.setattr(forwarder, "_session_cost_estimate", _fail_estimate)
+    monkeypatch.setattr(forwarder, "_session_cost_by_model_estimate", _fail_estimate)
     dedupe = forwarder._ForwardDedupeState()
     posted: list[dict[str, Any]] = []
 
@@ -6661,15 +6665,17 @@ async def test_fetch_session_snapshot_raises_diagnosable_error_on_html_body() ->
 async def test_forward_session_cost_tags_display_advance_with_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A display-cost (S) advance is tagged with the statusLine's active model.
+    """A display-cost (S) advance carries per-model attribution.
 
     claude-native sends no token counts with its cost, so the server has
-    nothing to attribute the cost to in the per-model TOKEN USAGE view without
-    a ``model`` tag — it would drop the cost from that view. The forwarder
-    rides the statusLine model (captured in context.json) on the payload
-    whenever the display cost advances. A policy-only mid-turn re-post (S
-    frozen, only the gate estimate C advancing) carries NO model: there is no
-    new display cost to attribute, so tagging it would be meaningless churn.
+    nothing to attribute the cost to in the per-model TOKEN USAGE view on its
+    own — it would drop the cost from that view. With no sub-agents the
+    forwarder rides the statusLine model (captured in context.json) on the
+    payload whenever the display cost advances; with sub-agents tracked the
+    per-model transcript split rides instead (see the display/policy split
+    test). A policy-only mid-turn re-post (S frozen, only the gate estimate C
+    advancing) carries NO attribution: there is no new display cost to
+    attribute, so tagging it would be meaningless churn.
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -6682,11 +6688,12 @@ async def test_forward_session_cost_tags_display_advance_with_model(
         "read_claude_context_state",
         lambda _bridge: {"total_cost_usd": status_box["value"], "model": "claude-opus-4-8"},
     )
-    estimate_box = {"value": 0.65}
+    # Sub-agents tracked, but nothing in the transcripts is priceable yet —
+    # the fallback single-model statusLine tag must still be sent.
     monkeypatch.setattr(
         forwarder,
-        "_session_cost_estimate",
-        lambda **_kwargs: estimate_box["value"],
+        "_session_cost_by_model_estimate",
+        lambda **_kwargs: {},
     )
     subagent_state = forwarder.SubagentForwardState(
         subagents={
@@ -6716,21 +6723,22 @@ async def test_forward_session_cost_tags_display_advance_with_model(
                 cost_cache={},
             )
 
-        # Display cost advances → the model rides along for per-model attribution.
+        # Display cost advances with an unpriceable estimate → the statusLine
+        # model rides along as the single-model attribution fallback (no
+        # policy post: the estimate is empty, so policy = S = display).
         await run()
         assert posted == [
             {
                 "cumulative_cost_usd": pytest.approx(0.01),
-                "policy_cost_usd": pytest.approx(0.65),
+                "policy_cost_usd": pytest.approx(0.01),
                 "model": "claude-opus-4-8",
             }
         ]
 
-        # Mid-turn: S frozen, only C (policy) advances → policy-only re-post
-        # carries NO model (no new display cost to attribute).
-        estimate_box["value"] = 0.90
+        # Mid-turn: S frozen → no display advance, nothing to post at all
+        # (the empty estimate can't advance policy either).
         await run()
-        assert posted[-1] == {"policy_cost_usd": pytest.approx(0.90)}
+        assert len(posted) == 1
 
 
 # ---------------------------------------------------------------------------
