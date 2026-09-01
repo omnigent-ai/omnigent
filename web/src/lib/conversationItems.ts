@@ -26,7 +26,8 @@ export interface BaseItem {
 
 export interface MessageItem extends BaseItem {
   type: "message";
-  role: "user" | "assistant";
+  /** `system` marks framework-originated notices (sub-agent wakes). */
+  role: "user" | "assistant" | "system";
   content: MessageContentBlock[];
   /** Agent name; assistant-only. Server alias for `agent`. */
   model?: string;

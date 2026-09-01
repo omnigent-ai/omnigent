@@ -217,7 +217,7 @@ function itemToBlock(item: ConversationItem): AnyBlock | null {
   if (isMessageItem(item) && item.is_meta === true) {
     return null;
   }
-  if (isMessageItem(item) && item.role === "user") {
+  if (isMessageItem(item) && (item.role === "user" || item.role === "system")) {
     // Hide the compaction summary message injected by Claude Code
     // after /compact. It starts with a distinctive prefix and is
     // part of the model's context (needed for resume) but should

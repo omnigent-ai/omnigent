@@ -148,7 +148,9 @@ def _bridge_dir_from_env() -> Path:
 def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
     """Return the latest user message's text (attachments materialized to disk)."""
     for message in reversed(messages):
-        if message.get("role") == "user":
+        # System-role framework notices (sub-agent wakes) are deliverable
+        # input — skipping them would leave the wake turn with no prompt.
+        if message.get("role") in ("user", "system"):
             return _content_to_text(message.get("content"), bridge_dir)
     return ""
 

@@ -1289,7 +1289,9 @@ def _extract_latest_user_content(
     :returns: A string prompt or a list of content block dicts.
     """
     for msg in reversed(messages):
-        if msg.get("role") == "user":
+        # System-role framework notices (sub-agent wakes) are deliverable
+        # input — skipping them would leave the wake turn with no prompt.
+        if msg.get("role") in ("user", "system"):
             content = msg.get("content")
             if content is None:
                 return ""
@@ -1395,7 +1397,7 @@ def _build_pi_prompt(messages: list[Message], *, is_first_turn: bool) -> str | l
         history needs to be serialized into the prompt.
     :returns: A string prompt or a list of content block dicts.
     """
-    user_messages = [m for m in messages if m.get("role") == "user"]
+    user_messages = [m for m in messages if m.get("role") in ("user", "system")]
 
     if is_first_turn and len(messages) > 1 and len(user_messages) > 1:
         lines = ["Conversation so far:"]

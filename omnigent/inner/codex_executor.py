@@ -1882,7 +1882,9 @@ def _extract_latest_user_content(
     :returns: A string prompt or a list of content block dicts.
     """
     for msg in reversed(messages):
-        if msg.get("role") == "user":
+        # System-role framework notices (sub-agent wakes) are deliverable
+        # input — skipping them would resend the previous user message.
+        if msg.get("role") in ("user", "system"):
             content = msg.get("content")
             if content is None:
                 return ""
@@ -1908,7 +1910,7 @@ def _build_initial_prompt(
     :param messages: Conversation history.
     :returns: A string prompt or a list of content block dicts.
     """
-    user_messages = [msg for msg in messages if msg.get("role") == "user"]
+    user_messages = [msg for msg in messages if msg.get("role") in ("user", "system")]
     if len(messages) <= 1 or len(user_messages) <= 1:
         return _extract_latest_user_content(messages)
 

@@ -1870,7 +1870,10 @@ async def _deliver_subagent_wake_post(
                 json={
                     "type": "message",
                     "data": {
-                        "role": "user",
+                        # System role, not user: a safety-tuned model treats a
+                        # user-turn "[System: ...]" as prompt injection and
+                        # refuses to collect the inbox, stranding orchestration.
+                        "role": "system",
                         "content": [{"type": "input_text", "text": notice}],
                     },
                     **(
@@ -3687,7 +3690,9 @@ def create_runner_app(
             last_type = last.get("type")
             last_role = last.get("role")
             needs_turn = (
-                (last_type == "message" and last_role == "user")
+                # System-role framework notices (sub-agent wakes) need a
+                # turn just like user input — the model must act on them.
+                (last_type == "message" and last_role in ("user", "system"))
                 or last_type == "function_call"
                 or last_type == "function_call_output"
             )
@@ -10580,7 +10585,9 @@ def create_runner_app(
                 if (
                     session_id not in _active_turns
                     and new_items
-                    and new_items[-1].get("role") == "user"
+                    # System-role framework notices (sub-agent wakes) start a
+                    # catch-up turn just like user input.
+                    and new_items[-1].get("role") in ("user", "system")
                 ):
                     _begin_turn_slot(session_id)
                     _publish_turn_status(session_id, "running")
@@ -10710,9 +10717,19 @@ def create_runner_app_from_env() -> FastAPI:
         raise RuntimeError("RUNNER_SERVER_URL is required for the runner subprocess factory")
     from omnigent_client._http import is_loopback_url
 
+    from omnigent.runner.identity import (
+        RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    # Carry the runner's tunnel-binding token when the launcher provided one:
+    # the server's system-role authority gate keys off this header, and a
+    # tokenless client's wake notices are downgraded to untrusted user input.
+    binding_token = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, "").strip()
     server_client = httpx.AsyncClient(
         base_url=server_url,
         timeout=httpx.Timeout(5.0, read=None),
+        headers=({RUNNER_TUNNEL_TOKEN_HEADER: binding_token} if binding_token else None),
         # A proxy cannot reach a loopback server, so local targets bypass it.
         trust_env=not is_loopback_url(server_url),
     )

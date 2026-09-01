@@ -233,6 +233,17 @@ def _convert_messages_to_responses(
                 }
             )
 
+        elif role == "system":
+            # Framework-originated notices (sub-agent wakes) ride the system
+            # channel so the model treats them as trusted instructions.
+            result.append(
+                {
+                    "type": "message",
+                    "role": "system",
+                    "content": _normalize_message_content(content, empty_placeholder="(empty)"),
+                }
+            )
+
         elif role == "assistant":
             result.append(
                 {

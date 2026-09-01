@@ -1479,7 +1479,9 @@ class AcpExecutor(Executor):
         for idx in range(len(messages) - 1, -1, -1):
             msg = messages[idx]
             role = msg.get("role", "") if isinstance(msg, dict) else ""
-            if role == "user":
+            # System-role framework notices (sub-agent wakes) are deliverable
+            # input — skipping them would leave the wake turn with no prompt.
+            if role in ("user", "system"):
                 latest_user_idx = idx
                 content = msg.get("content", "") if isinstance(msg, dict) else ""
                 if isinstance(content, str):
@@ -1498,7 +1500,14 @@ class AcpExecutor(Executor):
         # live session (see ``_apply_model_override``) — so it never reaches here.
         if fresh_session and latest_user_idx is not None and latest_user_idx > 0:
             history_prefix = self._history_prefix(messages[:latest_user_idx])
-            user_text = f"{history_prefix}\n\nuser: {user_text}" if user_text else history_prefix
+            # Label the tail by its real role: a system wake rendered as
+            # "user: [System: …]" reads as prompt injection to the model.
+            latest_role = messages[latest_user_idx].get("role", "user")
+            user_text = (
+                f"{history_prefix}\n\n{latest_role}: {user_text}"
+                if user_text
+                else history_prefix
+            )
 
         # ACP has no system-prompt field. When inject_system_prompt is enabled
         # (the default), fold the Omnigent system prompt into the first turn so

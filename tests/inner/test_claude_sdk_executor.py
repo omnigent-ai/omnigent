@@ -81,6 +81,41 @@ class TestPromptExtraction(unittest.TestCase):
         # Prior turns are SDK-cached on resume — not replayed.
         self.assertNotIn("First question", prompt)
 
+    def test_resumed_session_delivers_trailing_system_wake_notice(self):
+        """A system-role framework notice (sub-agent wake) must reach the SDK.
+
+        Wake notices arrive with role="system" so the model treats them as
+        framework-originated. On a resumed session the trailing-run extractor
+        must include them, or the wake turn sends an empty prompt.
+        """
+        executor = self._make_executor()
+        notice = "[System: sub-agent researcher/auth finished (completed) — 1 result waiting]"
+        messages = [
+            {"role": "user", "content": "Dispatch the researcher."},
+            {"role": "assistant", "content": "Dispatching."},
+            {"role": "system", "content": notice},
+        ]
+        prompt = executor._build_prompt(messages, resume_session=True)
+        self.assertIn("sub-agent researcher/auth finished", prompt)
+
+    def test_fresh_session_delivers_trailing_system_wake_notice_with_history(self):
+        """On a fresh session a trailing system wake replays prior history."""
+        executor = self._make_executor()
+        notice = "[System: sub-agent researcher/auth finished (completed) — 1 result waiting]"
+        messages = [
+            {"role": "user", "content": "Dispatch the researcher."},
+            {"role": "assistant", "content": "Dispatching."},
+            {"role": "system", "content": notice},
+        ]
+        prompt = executor._build_prompt(messages, resume_session=False)
+        self.assertIn("sub-agent researcher/auth finished", str(prompt))
+        # Prior context replays so the model knows what was dispatched.
+        self.assertIn("Dispatch the researcher.", str(prompt))
+        # The wake must NOT be labelled as a user turn: "user: [System: …]"
+        # is exactly the shape a safety-tuned model flags as injection.
+        self.assertNotIn("user: [System:", str(prompt))
+        self.assertIn("system: [System:", str(prompt))
+
     def test_resumed_session_trailing_run_stops_at_assistant(self):
         """Only the trailing run of user messages (after the last non-user) is sent."""
         executor = self._make_executor()
@@ -212,7 +247,7 @@ class TestPromptExtraction(unittest.TestCase):
         # Framing and ordering survive around the replayed image.
         self.assertIn("Conversation so far:", text)
         self.assertIn("What is shown here?", text)
-        self.assertIn("Respond to the latest user message", text)
+        self.assertIn("Respond to the latest message", text)
         self.assertIn("Summarize our conversation.", text)
 
     def test_cold_reload_replays_historical_file_as_structured_document(self):

@@ -505,6 +505,32 @@ def register_events_routes(
                 pass
             else:
                 created_by = body_created_by
+        # System-role messages mark framework-originated notices (sub-agent
+        # wakes) that harnesses deliver on a model-trusted channel, so a
+        # plain client must not be able to forge them. Downgrade rather than
+        # reject: the text still lands as ordinary (untrusted) user input,
+        # and a legitimate wake from a tokenless transport degrades to the
+        # pre-fix behavior instead of being dropped.
+        if not _has_runner_created_by_authority(request, conv):
+            if body.type == "message" and body.data.get("role") == "system":
+                body = body.model_copy(update={"data": {**body.data, "role": "user"}})
+            # The external-item path persists a nested message verbatim, so a
+            # forged system role there would replay as trusted framework input
+            # on the next turn — downgrade it the same way.
+            elif (
+                body.type == _EXTERNAL_CONVERSATION_ITEM_TYPE
+                and body.data.get("item_type") == "message"
+                and isinstance(body.data.get("item_data"), dict)
+                and body.data["item_data"].get("role") == "system"
+            ):
+                body = body.model_copy(
+                    update={
+                        "data": {
+                            **body.data,
+                            "item_data": {**body.data["item_data"], "role": "user"},
+                        }
+                    }
+                )
         # Validate event type at the route boundary. Anything not in
         # ``_ALLOWED_EVENT_TYPES`` is a client mistake — failing here
         # is far better than silently persisting an item the agent
@@ -589,16 +615,20 @@ def register_events_routes(
         # input — the orchestrator must spawn a fresh session to continue.
         if (
             body.type == "message"
-            and body.data.get("role") == "user"
+            and body.data.get("role") in ("user", "system")
             and is_session_closed(conv.labels, conv.title)
         ):
             raise OmnigentError(
                 "Session is closed. Start a new sub-agent session to continue.",
                 code=ErrorCode.CONFLICT,
             )
+        # System-role framework notices (sub-agent wakes) start turns like
+        # user input does, so they must pass the same INPUT policy gate
+        # (e.g. the session cost-budget ASK) — excluding them would let a
+        # wake-driven turn bypass budget enforcement.
         if (
             body.type == "message"
-            and body.data.get("role") == "user"
+            and body.data.get("role") in ("user", "system")
             and conv.agent_id is not None
         ):
             try:

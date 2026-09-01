@@ -137,7 +137,9 @@ def _latest_user_text(messages: list[Message]) -> str:
     """
     dropped_blocks = 0
     for message in reversed(messages):
-        if message.get("role") != "user":
+        # System-role framework notices (sub-agent wakes) are deliverable
+        # input — skipping them would resend a stale user prompt instead.
+        if message.get("role") not in ("user", "system"):
             continue
         content = message.get("content")
         if isinstance(content, str):

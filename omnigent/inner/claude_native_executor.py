@@ -391,7 +391,9 @@ def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
         no user text is present.
     """
     for message in reversed(messages):
-        if message.get("role") == "user":
+        # System-role framework notices (sub-agent wakes) are deliverable
+        # input — skipping them would leave the wake turn with no prompt.
+        if message.get("role") in ("user", "system"):
             return _content_to_text(message.get("content"), bridge_dir)
     return ""
 

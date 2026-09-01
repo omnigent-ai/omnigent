@@ -261,9 +261,12 @@ class Conversation:
 
 class MessageData(BaseModel):
     """
-    Data for a message item (user or assistant).
+    Data for a message item (user, assistant, or system).
 
-    :param role: ``"user"`` or ``"assistant"``.
+    :param role: ``"user"``, ``"assistant"``, or ``"system"``. The
+        ``"system"`` role marks framework-originated notices (e.g.
+        sub-agent wake notices) so downstream harnesses can deliver
+        them on a channel the model trusts instead of a user turn.
     :param content: Heterogeneous content blocks, e.g.
         ``[{"type": "input_text", "text": "Hello"}]``.
     :param agent: Agent name (required for assistant messages,
@@ -279,7 +282,7 @@ class MessageData(BaseModel):
         serialized payloads in that case.
     """
 
-    role: Literal["user", "assistant"]
+    role: Literal["user", "assistant", "system"]
     # Heterogeneous content blocks (input_text, output_text, input_image, etc.)
     content: list[dict[str, Any]]
     agent: str | None = Field(default=None, serialization_alias="model")

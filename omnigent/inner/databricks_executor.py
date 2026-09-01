@@ -964,6 +964,12 @@ def _convert_messages(
             text = str(content) if content else "(empty)"
             result.append({"role": "user", "content": text})
 
+        elif role == "system":
+            # Framework-originated notices (sub-agent wakes) ride the system
+            # channel so the model treats them as trusted instructions.
+            text = str(content) if content else "(empty)"
+            result.append({"role": "system", "content": text})
+
         elif role == "assistant":
             text = str(content) if content else "(empty)"
             result.append({"role": "assistant", "content": text})

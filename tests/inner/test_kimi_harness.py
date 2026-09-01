@@ -276,6 +276,21 @@ def test_latest_user_text_returns_empty_when_no_user_message() -> None:
     assert _latest_user_text([{"role": "assistant", "content": "hi"}]) == ""
 
 
+def test_latest_user_text_delivers_trailing_system_wake_notice() -> None:
+    """A system-role framework notice (sub-agent wake) is deliverable input.
+
+    Skipping it would resend the stale user prompt — repeating the
+    delegation instead of collecting the inbox.
+    """
+    notice = "[System: sub-agent researcher/auth finished (completed) — 1 result waiting]"
+    messages = [
+        {"role": "user", "content": "Dispatch the researcher."},
+        {"role": "assistant", "content": "Dispatching."},
+        {"role": "system", "content": notice},
+    ]
+    assert _latest_user_text(messages) == notice
+
+
 def test_resolve_skills_dirs_valid() -> None:
     payload = json.dumps(["/x/skills", "/y/skills"])
     assert _resolve_skills_dirs(payload) == ["/x/skills", "/y/skills"]

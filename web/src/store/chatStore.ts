@@ -4907,7 +4907,9 @@ export async function pumpStreamEvents(
 function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentBlock[] | null {
   if (event.isMeta === true) return null;
   if (event.itemType !== "message") return null;
-  if (event.data.role !== "user") return null;
+  // `system` marks framework notices (sub-agent wakes) — rendered like the
+  // user-role `[System: …]` markers they used to arrive as.
+  if (event.data.role !== "user" && event.data.role !== "system") return null;
   const raw = event.data.content;
   if (!Array.isArray(raw)) return null;
   return raw.filter(

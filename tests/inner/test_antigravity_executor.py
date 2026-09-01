@@ -324,6 +324,21 @@ def test_latest_user_text_prefers_last_user_message() -> None:
     assert _latest_user_text(messages) == "second"
 
 
+def test_latest_user_text_delivers_trailing_system_wake_notice() -> None:
+    """A system-role framework notice (sub-agent wake) is deliverable input.
+
+    Skipping it would resend the stale user prompt — repeating the
+    delegation instead of collecting the inbox.
+    """
+    notice = "[System: sub-agent researcher/auth finished (completed) — 1 result waiting]"
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": "Dispatch the researcher."},
+        {"role": "assistant", "content": "Dispatching."},
+        {"role": "system", "content": notice},
+    ]
+    assert _latest_user_text(messages) == notice
+
+
 @pytest.mark.asyncio
 async def test_streaming_maps_text_reasoning_and_usage(monkeypatch: pytest.MonkeyPatch) -> None:
     """Text/reasoning stream as separate deltas; usage + final text land on TurnComplete."""

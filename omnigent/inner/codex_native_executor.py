@@ -530,7 +530,9 @@ def _latest_user_content(messages: list[Message]) -> object:
     :returns: The latest user content, or ``None`` when absent.
     """
     for message in reversed(messages):
-        if message.get("role") == "user":
+        # System-role framework notices (sub-agent wakes) are deliverable
+        # input — skipping them would leave the wake turn with no prompt.
+        if message.get("role") in ("user", "system"):
             return message.get("content")
     return None
 

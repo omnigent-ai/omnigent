@@ -142,7 +142,9 @@ def _extract_last_user_message(messages: list[Message]) -> str:
     :returns: The user message text, or ``""`` if none found.
     """
     for msg in reversed(messages):
-        if msg.get("role") == "user":
+        # System-role framework notices (sub-agent wakes) are deliverable
+        # input — skipping them would leave the wake turn with no prompt.
+        if msg.get("role") in ("user", "system"):
             content = msg.get("content", "")
             if isinstance(content, list):
                 parts: list[str] = []

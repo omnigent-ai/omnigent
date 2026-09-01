@@ -4158,7 +4158,9 @@ def _build_native_terminal_message_event(
     """
     display_name, model, harness = _native_terminal_runtime(conv)
     data = parse_item_data(body.type, {"type": body.type, **body.data})
-    if not isinstance(data, MessageData) or data.role != "user":
+    # System-role framework notices (sub-agent wakes) are delivered like user
+    # input here: a native TUI's only inbound channel is typed text.
+    if not isinstance(data, MessageData) or data.role not in ("user", "system"):
         raise OmnigentError(
             f"{display_name} terminal sessions accept only user message events",
             code=ErrorCode.INVALID_INPUT,
@@ -7047,7 +7049,9 @@ async def _wake_parent_for_blocked_child(
     body = SessionEventInput(
         type="message",
         data={
-            "role": "user",
+            # System role, not user: a "[System: ...]" notice arriving on a
+            # user turn reads as prompt injection to a safety-tuned model.
+            "role": "system",
             "content": [{"type": "input_text", "text": notice}],
         },
     )

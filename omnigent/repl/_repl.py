@@ -3544,7 +3544,12 @@ async def run_repl(
                 if tape_entry is not None:
                     _maybe_log_tape_entry(tape_entry)
                 return
-            if event.data.type == "message" and event.data.data.get("role") == "user":
+            # System-role framework notices (sub-agent wakes) render the
+            # same way the user-role "[System: ...]" markers used to.
+            if event.data.type == "message" and event.data.data.get("role") in (
+                "user",
+                "system",
+            ):
                 if session._pending_local_user_sends > 0:
                     session._pending_local_user_sends -= 1
                 else:
@@ -8080,7 +8085,9 @@ def _render_message_history_item(
         return
     role = item.get("role", "")
     text = _extract_message_text(item)
-    if role == "user":
+    # System-role framework notices (sub-agent wakes) render like the
+    # user-role "[System: ...]" markers they replaced.
+    if role in ("user", "system"):
         host.output(fmt.user_message(text))
         return
     if role == "assistant":

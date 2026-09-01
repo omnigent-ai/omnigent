@@ -98,7 +98,12 @@ def test_serialization_alias() -> None:
 
 def test_invalid_role() -> None:
     with pytest.raises(ValidationError):
-        MessageData(role="system", content=[])
+        MessageData(role="tool", content=[])
+
+
+def test_system_message_role_valid() -> None:
+    msg = MessageData(role="system", content=[{"type": "input_text", "text": "[System: ...]"}])
+    assert msg.role == "system"
 
 
 # ── FunctionCallData ───────────────────────────────────

@@ -3194,7 +3194,10 @@ class ClaudeSDKExecutor(Executor):
         if resume_session:
             return ClaudeSDKExecutor._extract_trailing_user_content(messages)
 
-        user_messages = [msg for msg in messages if msg.get("role") == "user"]
+        # System-role framework notices (sub-agent wake notices) count as
+        # deliverable input: a wake arriving after prior turns must trigger
+        # the history replay below, not collapse to a context-free prompt.
+        user_messages = [msg for msg in messages if msg.get("role") in ("user", "system")]
         if len(messages) <= 1 or len(user_messages) <= 1:
             return ClaudeSDKExecutor._extract_latest_user_content(messages)
 
@@ -3204,6 +3207,11 @@ class ClaudeSDKExecutor(Executor):
         # delivery to the Anthropic API.
         latest_content = ClaudeSDKExecutor._extract_latest_user_content(messages)
         prior = messages[:-1] if messages else []
+        # Label the tail by its real role: a system-role wake notice rendered
+        # as "user: [System: …]" reads as prompt injection to the model. Only
+        # a trailing system message earns the system label; anything else
+        # keeps the user label the extractor's fallbacks assume.
+        latest_role = "system" if messages and messages[-1].get("role") == "system" else "user"
 
         prior_blocks: list[_JsonObject] = [_text_block("Conversation so far:")]
         for msg in prior:
@@ -3222,7 +3230,7 @@ class ClaudeSDKExecutor(Executor):
         prior_blocks.append(_text_block(""))
         prior_blocks.append(
             _text_block(
-                "Respond to the latest user message, using the conversation above as context."
+                "Respond to the latest message, using the conversation above as context."
             )
         )
         prior_blocks = _coalesce_text_blocks(prior_blocks)
@@ -3233,8 +3241,8 @@ class ClaudeSDKExecutor(Executor):
         # more than one block means an attachment survived and the prompt has
         # to stay structured for its bytes to reach the model.
         if len(prior_blocks) > 1:
-            return [*prior_blocks, _text_block(f"\nuser: {latest_content}")]
-        return f"{prior_blocks[0]['text']}\n\nuser: {latest_content}"
+            return [*prior_blocks, _text_block(f"\n{latest_role}: {latest_content}")]
+        return f"{prior_blocks[0]['text']}\n\n{latest_role}: {latest_content}"
 
     @staticmethod
     def _extract_latest_user_content(
@@ -3254,7 +3262,9 @@ class ClaudeSDKExecutor(Executor):
             block dicts.
         """
         for msg in reversed(messages):
-            if msg.get("role") == "user":
+            # System-role framework notices (sub-agent wakes) are deliverable
+            # input — without this the wake turn would send an empty prompt.
+            if msg.get("role") in ("user", "system"):
                 content = msg.get("content")
                 if content is None:
                     return ""
@@ -3294,7 +3304,9 @@ class ClaudeSDKExecutor(Executor):
         """
         trailing: list[Message] = []
         for msg in reversed(messages):
-            if msg.get("role") == "user":
+            # System-role framework notices (sub-agent wakes) belong to the
+            # trailing new-input run just like buffered user messages.
+            if msg.get("role") in ("user", "system"):
                 trailing.append(msg)
             else:
                 break

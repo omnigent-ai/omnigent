@@ -148,7 +148,9 @@ def _latest_user_text(messages: list[Message]) -> str:
     :returns: The user input text for this turn, or ``""`` when none.
     """
     for message in reversed(messages):
-        if message.get("role") != "user":
+        # System-role framework notices (sub-agent wakes) are deliverable
+        # input — skipping them would resend a stale user prompt instead.
+        if message.get("role") not in ("user", "system"):
             continue
         return _content_to_text(message.get("content"))
     if messages:
@@ -220,7 +222,11 @@ def _render_prior_history(prior: list[Message]) -> str:
     return "Conversation so far:\n" + "\n".join(lines)
 
 
-def _seed_prompt(prior: list[Message], latest_user_text: str) -> str:
+def _seed_prompt(
+    prior: list[Message],
+    latest_user_text: str,
+    latest_role: str = "user",
+) -> str:
     """Combine a prior-history prefix with the latest user text for one ``send``.
 
     On a fresh SDK conversation the prior turns and the latest user input are
@@ -229,14 +235,17 @@ def _seed_prompt(prior: list[Message], latest_user_text: str) -> str:
 
     :param prior: Messages preceding the latest user turn (``messages[:-1]``).
     :param latest_user_text: The newest user input for this turn (may be ``""``).
+    :param latest_role: The tail message's role. A system-role wake notice
+        must not be labelled ``user:`` — that exact shape reads as prompt
+        injection to a safety-tuned model.
     :returns: ``latest_user_text`` unchanged when there is no replayable prior
         history; otherwise the transcript prefix followed by the latest input
-        under a ``user:`` label so the model can tell them apart.
+        under a role label so the model can tell them apart.
     """
     prefix = _render_prior_history(prior)
     if not prefix:
         return latest_user_text
-    return f"{prefix}\n\nRespond to the latest user message:\nuser: {latest_user_text}"
+    return f"{prefix}\n\nRespond to the latest message:\n{latest_role}: {latest_user_text}"
 
 
 def _tool_name(raw_name: Any) -> str:  # type: ignore[explicit-any]
@@ -515,7 +524,13 @@ class AntigravityExecutor(Executor):
         # already holds this history in its live conversation; re-seeding would
         # duplicate it, so we leave its prompt as the latest user text alone.
         if created:
-            prompt = _seed_prompt(messages[:-1], prompt)
+            # The prompt extractor scans backwards for user/system text, so
+            # only a trailing system message actually supplied a system-role
+            # prompt; anything else keeps the user label.
+            latest_role = (
+                "system" if messages and messages[-1].get("role") == "system" else "user"
+            )
+            prompt = _seed_prompt(messages[:-1], prompt, latest_role=latest_role)
 
         event_queue: _EventQueue = asyncio.Queue()
         state.active_queue = event_queue

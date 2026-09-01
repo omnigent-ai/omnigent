@@ -62,3 +62,16 @@ what to look for, and why it's wrong.
   never force-delete the pre-existing thing (e.g. `git branch -D` on a branch the
   user owned before the call, losing unpushed commits). Check every failure path
   that shares a cleanup helper with the create-from-scratch flow.
+
+## Cross-cutting sweeps
+
+- **A role/enum widening must sweep EVERY consumer.** When a fix widens a
+  role/status/kind vocabulary (e.g. message role gaining `"system"`), grep for
+  every comparison against the old literals across ALL executors, transports,
+  and render paths — a missed extractor silently drops the new value (an empty
+  or stale prompt), and a missed label re-introduces the very shape the fix
+  removes (e.g. rendering a system notice as `user: [System: …]`).
+- **An authority gate must cover every persistence path.** A gate added on the
+  direct write route must also cover alternate routes that persist the same
+  shape verbatim (e.g. `external_conversation_item` nesting a message), or the
+  gate is forgeable around.

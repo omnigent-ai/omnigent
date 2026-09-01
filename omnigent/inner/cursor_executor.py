@@ -254,7 +254,9 @@ def _extract_text(msg: Message) -> str:
 def _latest_user_text(messages: list[Message]) -> str:
     """Return the text of the latest user message (multimodal parts joined)."""
     for msg in reversed(messages):
-        if msg.get("role") == "user":
+        # System-role framework notices (sub-agent wakes) are deliverable
+        # input — skipping them would resend the previous user message.
+        if msg.get("role") in ("user", "system"):
             return _extract_text(msg)
     return ""
 

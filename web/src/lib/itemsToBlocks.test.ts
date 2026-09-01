@@ -171,6 +171,33 @@ describe("itemsToBlocks — flat shape", () => {
     expect(asst.fullText).toBe("Hi there!");
   });
 
+  it("system-role wake notices render as user-message blocks (marker styling downstream)", () => {
+    // Sub-agent wake notices arrive with role="system" so the model
+    // trusts them; the transcript still renders them (muted marker
+    // styling comes from the [System: …] text) instead of dropping them.
+    const items: ConversationItem[] = [
+      {
+        id: "msg_wake1",
+        response_id: "resp_wake",
+        type: "message",
+        role: "system",
+        status: "completed",
+        content: [
+          {
+            type: "input_text",
+            text: "[System: sub-agent researcher/auth finished (completed) — 1 result waiting in inbox.]",
+          },
+        ],
+      },
+    ];
+    const blocks = itemsToBlocks(items);
+    expect(blocks.length).toBe(1);
+    expect(blocks[0]!.type).toBe("user_message");
+    const wake = blocks[0] as UserMessageBlock;
+    expect(wake.ctx.itemId).toBe("msg_wake1");
+    expect((wake.content[0] as { text: string }).text).toContain("sub-agent researcher/auth");
+  });
+
   it("text containing code fences → hasCodeBlocks=true", () => {
     const items: ConversationItem[] = [
       userMessage("resp_1", "Show me code"),
