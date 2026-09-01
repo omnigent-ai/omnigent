@@ -252,12 +252,11 @@ def read_session_status(path: Path) -> SessionStatus | None:
     )
 
 
-# Attempts to resolve the file before giving up and leaving the PTY
-# watcher authoritative for the session's lifetime. At the claude-native
-# poll cadence (~0.2s) this is a few seconds — long enough for a booting
-# Claude to write its file and for the first hook to report the session
-# id, short enough that an old Claude (pre-v2.1.139, no file) or a broken
-# config dir falls back promptly without scanning forever.
+# Ticks spent resolving the file before leaving the PTY watcher authoritative
+# for the session's lifetime. Forty ticks are ~8s at the 0.2s base cadence and
+# up to ~66s once a quiet pre-resolution pane backs off. That gives booting
+# Claude time to publish its session id while still bounding scans for old
+# Claude versions (pre-v2.1.139) or a broken config directory.
 _MAX_RESOLVE_ATTEMPTS = 40
 
 
@@ -416,6 +415,21 @@ class SessionStatusPoller:
         )
         self._last_mtime = None
         self._last_edge = None
+
+    @property
+    def reports_idle(self) -> bool:
+        """Whether the file's last readable status mapped to runner ``idle``.
+
+        The watcher uses this to decide when its tmux polling may back off
+        while the file owns the session's status: an idle file means Claude
+        itself says nothing is running, so the pane capture can slow down
+        without delaying a status edge — a turn start reaches the watcher
+        through an explicit wake, not through this file's cadence. ``False``
+        while running/waiting, before the first read, and after an
+        unrecognized status (when we are blind, stay at base rate).
+        """
+        status = self._last_status
+        return status is not None and status.runner_status == IDLE
 
     @property
     def blocked_on(self) -> str | None:

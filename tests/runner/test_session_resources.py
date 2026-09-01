@@ -35,6 +35,7 @@ from omnigent.runner.resource_registry import (
     _CLAUDE_NATIVE_STATUS_POLL_INTERVAL_SECONDS,
     _TERMINAL_ACTIVITY_EMIT_MIN_INTERVAL_SECONDS,
     CLAUDE_NATIVE_TERMINAL_ROLE,
+    PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
@@ -153,7 +154,7 @@ class _CapturingResourceRegistry:
 
     def set_session_status_publisher(
         self,
-        publisher: Callable[[str, str], None],
+        publisher: Callable[[str, str, str | None], None],
     ) -> None:
         """
         Accept the session-status publisher installed by the runner app.
@@ -161,7 +162,7 @@ class _CapturingResourceRegistry:
         The stub never launches a real terminal, so it just retains the
         callback (unused) to satisfy ``create_runner_app``'s wiring.
 
-        :param publisher: Callable ``(session_id, status) -> None``.
+        :param publisher: Callable ``(session_id, status, blocked_on) -> None``.
         :returns: None.
         """
         self._session_status_publisher = publisher
@@ -1491,6 +1492,8 @@ class _WatcherCapture:
         was wired.
     :param on_tick: The per-tick callback the registry passed (drives the
         claude-native status-file poller), or ``None`` if none was wired.
+    :param idle_poll_backoff_allowed: Dynamic backoff policy passed to the
+        watcher, or ``None`` when no caller policy was wired.
     :param idle_threshold_s: The per-watcher idle threshold the registry
         passed, or ``None`` for the module default.
     :param poll_interval_s: The per-watcher poll interval the registry
@@ -1502,6 +1505,7 @@ class _WatcherCapture:
     on_idle: Callable[[], None] | None = None
     on_exit: Callable[[], None] | None = None
     on_tick: Callable[[], None] | None = None
+    idle_poll_backoff_allowed: Callable[[], bool] | None = None
     idle_threshold_s: float | None = None
     poll_interval_s: float | None = None
     replace: bool = False
@@ -1537,6 +1541,7 @@ def _make_capturing_instance(
         on_activity: Callable[[], None] | None = None,
         on_exit: Callable[[], None] | None = None,
         on_tick: Callable[[], None] | None = None,
+        idle_poll_backoff_allowed: Callable[[], bool] | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         replace: bool = False,
@@ -1546,6 +1551,7 @@ def _make_capturing_instance(
         capture.on_activity = on_activity
         capture.on_exit = on_exit
         capture.on_tick = on_tick
+        capture.idle_poll_backoff_allowed = idle_poll_backoff_allowed
         capture.idle_threshold_s = idle_threshold_s
         capture.poll_interval_s = poll_interval_s
         capture.replace = replace
@@ -1690,6 +1696,26 @@ async def test_claude_native_terminal_drives_session_status_from_pane_activity(
 
 
 @pytest.mark.asyncio
+async def test_pty_only_status_role_allows_idle_poll_backoff(tmp_path: Path) -> None:
+    """A status-owning role without a file poller retains adaptive backoff."""
+    capture = _WatcherCapture()
+    instance = _make_capturing_instance(tmp_path, capture, name="pi", session_key="main")
+    registry = SessionResourceRegistry(terminal_registry=_LaunchReturningRegistry(instance))
+    registry.set_session_status_publisher(lambda _sid, _status, _reason=None: None)
+
+    await registry.launch_required_terminal(
+        session_id="conv_pi",
+        terminal_name="pi",
+        session_key="main",
+        spec=_claude_terminal_spec(tmp_path),
+        resource_role=PI_NATIVE_TERMINAL_ROLE,
+    )
+
+    allowed = capture.idle_poll_backoff_allowed
+    assert allowed is None or allowed()
+
+
+@pytest.mark.asyncio
 async def test_generic_terminal_does_not_drive_session_status(
     tmp_path: Path,
 ) -> None:
@@ -1707,7 +1733,9 @@ async def test_generic_terminal_does_not_drive_session_status(
     activity_pulses: list[str] = []
     registry.set_terminal_activity_publisher(lambda _sid, tid: activity_pulses.append(tid))
     registry.set_session_status_publisher(
-        lambda sid, status: status_edges.append(_StatusEdge(session_id=sid, status=status))
+        lambda sid, status, _reason=None: status_edges.append(
+            _StatusEdge(session_id=sid, status=status)
+        )
     )
 
     await registry.launch_auxiliary_terminal(

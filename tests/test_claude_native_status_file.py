@@ -459,3 +459,39 @@ def test_parked_session_stays_running_indefinitely(tmp_path: Path) -> None:
     poller.tick()
     assert published == [(RUNNING, "input needed")]
     assert poller.blocked_on == "input needed"
+
+
+def test_poller_reports_idle_tracks_the_file_verdict(tmp_path: Path) -> None:
+    """``reports_idle`` mirrors the file: idle only when Claude says idle.
+
+    The watcher keys its tmux-poll backoff off this while the file owns the
+    session's status, so it must be False before the first read, while a
+    turn runs or a dialog parks the session, and after an unrecognized
+    status blinds the poller — and True only on a readable ``idle``.
+    """
+    sessions = tmp_path / "sessions"
+    _write_session_file(sessions, pid=1, session_id="s", status="busy")
+    poller = SessionStatusPoller(
+        on_status=lambda _status, _reason: None,
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+    )
+    assert poller.reports_idle is False  # nothing read yet
+
+    poller.tick()
+    assert poller.reports_idle is False  # busy → running
+
+    _write_session_file(sessions, pid=1, session_id="s", status="idle")
+    poller.tick()
+    assert poller.reports_idle is True  # the file itself says idle
+
+    _write_session_file(
+        sessions, pid=1, session_id="s", status="waiting", blocked_on="input needed"
+    )
+    poller.tick()
+    assert poller.reports_idle is False  # parked on a dialog is not idle
+
+    _write_session_file(sessions, pid=1, session_id="s", status="daydreaming")
+    poller.tick()
+    assert poller.reports_idle is False  # unknown vocabulary: stay at base rate
