@@ -53,22 +53,10 @@ _BANNER_TIMEOUT_S = HEALTH_TIMEOUT_S * 2
 # cannot false-positive on anything else the server prints.
 _DB_PASSWORD = "s3cretpw-hunter2"  # noqa: S105 - deliberately fake test credential
 
-# Env vars that would leak the harness's own config into the server under
-# test or break HOME isolation (mirrors test_local_server_lifecycle_e2e).
-_ENV_TO_CLEAR = (
-    "DATABRICKS_TOKEN",
-    "DATABRICKS_CONFIG_PROFILE",
-    "ANTHROPIC_API_KEY",
-    "OPENAI_API_KEY",
-    "OMNIGENT_DATA_DIR",
-    "OMNIGENT_CONFIG_HOME",
-    "OMNIGENT_AUTH_ENABLED",
-    "OMNIGENT_OIDC_ISSUER",
-    "OMNIGENT_AUTH_PROVIDER",
-    "OMNIGENT_DATABASE_URI",
-    "OMNIGENT_RUNNER_TUNNEL_TOKEN",
-    "OMNIGENT_RUNNER_ID",
-)
+# Ambient config/credential vars would leak the harness's own setup into the
+# server under test or break HOME isolation; clearing whole prefixes keeps the
+# subprocess hermetic even for vars this file doesn't know about.
+_ENV_PREFIXES_TO_CLEAR = ("DATABRICKS_", "ANTHROPIC_", "OPENAI_", "OMNIGENT_")
 
 _TXN_KEYWORDS = {"BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE"}
 
@@ -174,9 +162,9 @@ def _server_env(home: Path, shim_dir: Path, d1_port: int) -> dict[str, str]:
     :param d1_port: Loopback port of the in-process D1 emulator.
     :returns: The environment mapping for :class:`subprocess.Popen`.
     """
-    env = dict(os.environ)
-    for key in _ENV_TO_CLEAR:
-        env.pop(key, None)
+    env = os.environ.copy()
+    for key in [k for k in env if k.startswith(_ENV_PREFIXES_TO_CLEAR)]:
+        env.pop(key)
     env["HOME"] = str(home)
     env["PYTHONPATH"] = f"{shim_dir}{os.pathsep}{_REPO_ROOT}{os.pathsep}{env.get('PYTHONPATH', '')}"
     env["CF_D1_BASE_URL"] = f"http://127.0.0.1:{d1_port}"
