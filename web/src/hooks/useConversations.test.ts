@@ -30,6 +30,8 @@ import {
   useTogglePinnedConversation,
   fetchPinnedConversations,
   unmarkSessionsDeleting,
+  markRecentlyCreated,
+  clearRecentlyCreated,
   PINNED_CONVERSATIONS_KEY,
   type Conversation,
   type PinnedConversationsResult,
@@ -62,6 +64,8 @@ afterEach(() => {
   // settles, in module-level state that would otherwise leak into the next
   // test (which reuses the same ids against a fresh cache).
   unmarkSessionsDeleting();
+  // Same for the recently-created keep-alive.
+  clearRecentlyCreated();
 });
 
 describe("renameConversation", () => {
@@ -747,6 +751,71 @@ describe("useStopAndDeleteConversation cache eviction", () => {
     // The project list IS refreshed (DB-direct, no reindex race) so a project
     // emptied by the delete drops its now-empty folder without a reload.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
+  });
+});
+
+describe("recently-created keep-alive", () => {
+  const listResponse = (ids: string[]) =>
+    mockResponse({
+      object: "list",
+      data: ids.map((id) => ({
+        id,
+        object: "conversation",
+        title: id,
+        created_at: 0,
+        updated_at: 1,
+      })),
+      first_id: ids[0] ?? null,
+      last_id: ids.at(-1) ?? null,
+      has_more: false,
+    });
+
+  it("keeps a just-created session in the first-page fetch until the index catches up", async () => {
+    // The session was just created and eagerly inserted, but the search-indexed
+    // list fetch lags and comes back without it.
+    markRecentlyCreated({
+      id: "conv_new",
+      object: "conversation",
+      title: "New",
+      created_at: 0,
+      updated_at: 9,
+      labels: {},
+      permission_level: null,
+    });
+    fetchMock.mockResolvedValueOnce(listResponse(["conv_old"]));
+
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useConversations("", true, {}), { wrapper });
+
+    // The lagging fetch omits conv_new, but the keep-alive prepends it so the
+    // row doesn't flash out of the sidebar.
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    expect(result.current.data!.pages[0].data.map((c) => c.id)).toEqual(["conv_new", "conv_old"]);
+  });
+
+  it("drops the keep-alive (no duplicate) once the fetch returns the row", async () => {
+    markRecentlyCreated({
+      id: "conv_new",
+      object: "conversation",
+      title: "New",
+      created_at: 0,
+      updated_at: 9,
+      labels: {},
+      permission_level: null,
+    });
+    // The index has caught up: the fetch now includes conv_new itself.
+    fetchMock.mockResolvedValueOnce(listResponse(["conv_new", "conv_old"]));
+
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useConversations("", true, {}), { wrapper });
+
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    // No duplicate: the row appears once, from the server response.
+    expect(result.current.data!.pages[0].data.map((c) => c.id)).toEqual(["conv_new", "conv_old"]);
   });
 });
 
