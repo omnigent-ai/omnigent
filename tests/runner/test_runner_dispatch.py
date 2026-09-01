@@ -10543,3 +10543,33 @@ async def test_cross_path_resolution_contract(
             f"because their transports report differently, not because they "
             f"answer the same question differently."
         )
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _response_failed_event source propagation
+# ---------------------------------------------------------------------------
+
+
+def test_response_failed_event_default_source_is_execution() -> None:
+    """``_response_failed_event`` without explicit source encodes ``"execution"``."""
+    import json as _json
+
+    from omnigent.runner.app import _response_failed_event
+
+    raw = _response_failed_event({"code": "connection_error", "message": "dropped"})
+    payload = _json.loads(raw.decode().split("data: ", 1)[1])
+    assert payload["source"] == "execution"
+
+
+def test_response_failed_event_llm_source_is_preserved() -> None:
+    """``_response_failed_event(source="llm")`` encodes ``"llm"`` for inference faults."""
+    import json as _json
+
+    from omnigent.runner.app import _response_failed_event
+
+    raw = _response_failed_event(
+        {"code": "context_length_exceeded", "message": "too long"},
+        source="llm",
+    )
+    payload = _json.loads(raw.decode().split("data: ", 1)[1])
+    assert payload["source"] == "llm"

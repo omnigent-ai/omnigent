@@ -3870,7 +3870,7 @@ async def run_repl(
                 fmt.format_error(
                     ErrorBlock(
                         message=msg,
-                        source="llm",
+                        source=sdk_ev.source,
                         ctx=BlockContext(agent=None, depth=0, turn=0),
                     ),
                 )

@@ -6940,7 +6940,7 @@ def _error_item_from_sse(
         raw_error = raw_response.get("error") if isinstance(raw_response, dict) else None
         if raw_error is None:
             raw_error = event.get("error")
-        source = "execution"
+        source = event.get("source") or "execution"
         if response_id is None and isinstance(raw_response, dict):
             raw_response_id = raw_response.get("id")
             if isinstance(raw_response_id, str) and raw_response_id:

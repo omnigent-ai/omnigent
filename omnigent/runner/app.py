@@ -1244,7 +1244,10 @@ def _is_context_overflow_error(event: _JsonObject) -> tuple[int, int] | None:
     return 128000, 128001
 
 
-def _response_failed_event(error: Mapping[str, object]) -> bytes:
+def _response_failed_event(
+    error: Mapping[str, object],
+    source: str = "execution",
+) -> bytes:
     """
     Encode one ``response.failed`` SSE frame.
 
@@ -1253,10 +1256,16 @@ def _response_failed_event(error: Mapping[str, object]) -> bytes:
 
     :param error: Error payload to place under ``response.error``,
         e.g. ``{"code": "connection_error", "message": "dropped"}``.
+    :param source: Where the fault originated — ``"llm"`` for
+        inference/context errors, ``"execution"`` for runner or
+        harness failures.  Forwarded as-is to the AP server so it
+        can persist the right ``ErrorData.source``.
     :returns: UTF-8 encoded SSE frame bytes.
     """
     response = {"status": "failed", "error": error}
-    payload = json.dumps({"type": "response.failed", "response": response, "error": error})
+    payload = json.dumps(
+        {"type": "response.failed", "source": source, "response": response, "error": error}
+    )
     return f"event: response.failed\ndata: {payload}\n\n".encode()
 
 
@@ -7569,12 +7578,13 @@ def create_runner_app(
                 }
                 _overflow_fail = {
                     "type": "response.failed",
+                    "source": "llm",
                     "response": {"status": "failed", "error": _error},
                     "error": _error,
                 }
                 _publish_event(conv_id, _overflow_fail)
                 _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
-                yield _response_failed_event(_error)
+                yield _response_failed_event(_error, source="llm")
 
             except (httpx.HTTPError, RuntimeError) as exc:
                 _logger.exception(
