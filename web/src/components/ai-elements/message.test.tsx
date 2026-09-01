@@ -191,7 +191,7 @@ describe("MessageResponse code-block copy", () => {
     vi.unstubAllGlobals();
   });
 
-  it("falls back to a .txt extension for languages with unsafe ids", async () => {
+  it("maps punctuated language ids through the vendored extension map", async () => {
     vi.stubGlobal("URL", {
       ...URL,
       createObjectURL: vi.fn(() => "blob:mock"),
@@ -200,6 +200,35 @@ describe("MessageResponse code-block copy", () => {
     vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
 
     render(<MessageResponse>{"```c++\nint main() {}\n```"}</MessageResponse>);
+
+    const download = await screen.findByRole("button", { name: "Download file" });
+    let downloadedName = "";
+    const appendSpy = vi
+      .spyOn(document.body, "append")
+      .mockImplementation((...nodes: (Node | string)[]) => {
+        const node = nodes[0];
+        if (node instanceof HTMLAnchorElement) {
+          downloadedName = node.download;
+        }
+      });
+
+    fireEvent.click(download);
+
+    expect(downloadedName).toBe("file.cpp");
+
+    appendSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("falls back to .txt for an unmapped id with unsafe characters", async () => {
+    vi.stubGlobal("URL", {
+      ...URL,
+      createObjectURL: vi.fn(() => "blob:mock"),
+      revokeObjectURL: vi.fn(),
+    });
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+
+    render(<MessageResponse>{"```not/a/lang\nx\n```"}</MessageResponse>);
 
     const download = await screen.findByRole("button", { name: "Download file" });
     let downloadedName = "";

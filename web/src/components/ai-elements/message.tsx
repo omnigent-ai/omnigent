@@ -30,6 +30,7 @@ import {
 } from "react";
 import { Streamdown, type StreamdownProps } from "streamdown";
 
+import { CODE_LANGUAGE_EXTENSIONS } from "./codeDownloadExtensions";
 import { MarkdownErrorBoundary } from "./MarkdownErrorBoundary";
 
 import {
@@ -348,28 +349,15 @@ function extractCodeLanguage(children: ReactNode): string | undefined {
   return /language-([^\s]+)/.exec(className)?.[1];
 }
 
-// Common language ids whose file extension differs from the id itself.
-const CODE_LANGUAGE_EXTENSIONS: Record<string, string> = {
-  javascript: "js",
-  typescript: "ts",
-  markdown: "md",
-  python: "py",
-  shell: "sh",
-  bash: "sh",
-  yaml: "yaml",
-  yml: "yaml",
-  text: "txt",
-  plaintext: "txt",
-};
-
 function codeDownloadFilename(language: string | undefined): string {
   if (!language) {
     return "file.txt";
   }
   const mapped = CODE_LANGUAGE_EXTENSIONS[language.toLowerCase()];
-  // Only trust a language id as its own extension when it's a plain
-  // alphanumeric token; ids like `c++` or `vue-html` would make a broken
-  // extension, so fall back to `.txt`.
+  // The vendored map covers ids with punctuation (`c++`, `c#`, `vue-html`).
+  // For anything unmapped, only reuse the id as its own extension when it's a
+  // plain alphanumeric token; otherwise fall back to `.txt` so the filename
+  // never gets a broken extension.
   const ext = mapped ?? (/^[a-z0-9]+$/i.test(language) ? language.toLowerCase() : "txt");
   return `file.${ext}`;
 }
