@@ -44,7 +44,11 @@ jobs:
     name: Pytest (${{ matrix.group }})
     needs: gate
     if: ${{ !github.event.pull_request.draft }}
-    runs-on: ubuntu-latest
+    # Larger runner: this 16-shard matrix is the biggest single consumer of
+    # standard-runner slots, so moving it to the separate larger-runner pool
+    # frees the saturated standard pool for every other workflow. The shards
+    # run `pytest -n 8`, which is CPU-parallel, so more vCPUs also cut wall time.
+    runs-on: ubuntu-latest-m
     timeout-minutes: 30
     strategy:
       fail-fast: false
