@@ -126,7 +126,9 @@ _TURN_IDLE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_TIMEOUT_S", "600"))
 # the idle watchdog is enabled: every real progress event extends the
 # ceiling to at least one idle window past now, so a turn that keeps
 # emitting is never killed mid-work merely for running long — a stalled
-# turn past the ceiling dies via the idle watchdog instead. Only when
+# turn past the ceiling dies via the idle watchdog instead. Deliberate
+# tradeoff: under the default config a steadily-emitting turn has NO
+# wall-clock cap (this constant does not bound active turns); only when
 # the idle watchdog is disabled (``HARNESS_TURN_TIMEOUT_S <= 0``) does
 # this act as a strict wall-clock cap. ``<= 0`` disables.
 _TURN_ABSOLUTE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_ABSOLUTE_TIMEOUT_S", "10800"))
