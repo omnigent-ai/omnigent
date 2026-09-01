@@ -189,6 +189,19 @@ def use_parking_elicit_fast_heartbeat_normal_idle(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setenv("HARNESS_TURN_TIMEOUT_S", "10")
 
 
+@pytest.fixture
+def use_parking_elicit_fast_heartbeat_short_absolute(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Abandoned-approval fixture: a 2s idle window and a 3s absolute
+    ceiling. Heartbeats hold the idle window open past 2s while parked on
+    the elicitation, but the turn must still terminate at the absolute
+    cap (~3s) when nobody ever answers — heartbeats must never extend it.
+    """
+    monkeypatch.setenv("HARNESS_TEST_FIXTURE", "parking_elicit_fast_heartbeat")
+    monkeypatch.setenv("HARNESS_TURN_TIMEOUT_S", "2")
+    monkeypatch.setenv("HARNESS_TURN_ABSOLUTE_TIMEOUT_S", "3")
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -383,4 +396,50 @@ async def test_elicit_counter_brackets_the_pending_wait(
     assert any("action:accept" in e.data.get("delta", "") for e in text_deltas), (
         f"Expected delta containing 'action:accept'; "
         f"got {[e.data.get('delta') for e in text_deltas]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_abandoned_elicitation_still_dies_at_the_absolute_cap(
+    use_parking_elicit_fast_heartbeat_short_absolute: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """
+    Hard-cap rule: an elicitation that is NEVER answered must still fail at
+    the absolute per-turn ceiling, even though heartbeats hold the idle
+    window open while the wait is pending.
+
+    Idle window 2s, absolute cap 3s, heartbeats every 0.2s, no reply ever
+    sent. The heartbeats carry the turn past the 2s idle window (the fix),
+    but must not extend the 3s absolute ceiling — the stream has to close
+    with response.failed at ~3s. If heartbeats wrongly pushed the absolute
+    deadline too, the stream would never terminate and the outer timeout
+    would trip instead.
+    """
+    conv_id = "conv_hw_abandoned"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    body = {"type": "message", "role": "user", "model": "test-agent", "content": []}
+    events: list[_ParsedSSEEvent] = []
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    async with asyncio.timeout(20):
+        async with client.stream("POST", f"/v1/sessions/{conv_id}/events", json=body) as response:
+            async for event in _stream_iter(response):
+                events.append(event)
+    elapsed = loop.time() - started
+
+    event_types = [e.event for e in events]
+    assert "response.elicitation_request" in event_types, (
+        f"The turn never parked on the elicitation; got {event_types!r}"
+    )
+    assert event_types[-1] == "response.failed", (
+        f"An abandoned approval must terminate at the absolute cap; "
+        f"got terminal={event_types[-1]!r}. Full types: {event_types!r}"
+    )
+    # It survived the 2s idle window on heartbeats (the fix) but was cut at
+    # the 3s absolute cap — well before the 20s outer guard.
+    assert 2.0 < elapsed < 15.0, (
+        f"Expected termination at the ~3s absolute cap (after outliving the "
+        f"2s idle window); stream closed after {elapsed:.1f}s"
     )
