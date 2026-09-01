@@ -28,6 +28,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import type { ConnectResult } from "@/pages/onboarding/ServerSelectorV2";
 import { cn } from "@/lib/utils";
 
 const DEFAULT_LOCAL = "http://localhost:6767";
@@ -67,9 +68,11 @@ function serverTitle(url: string): string {
  * isn't a usable URL. A bare host ("localhost:6767", "example.com") gets an
  * http:// scheme; a non-http scheme (javascript:, file:) or garbage is
  * rejected — the shell still probes reachability on navigate, this just stops
- * obviously-wrong input from being connected. Mirrors electron/src/url.js.
+ * obviously-wrong input from being connected. Mirrors electron/src/url.js;
+ * the main process re-normalizes on connect, so this is only a client-side
+ * pre-filter. Exported for its test (ServerSelectStep.test.ts).
  */
-function normalizeServerUrl(raw: string): string | null {
+export function normalizeServerUrl(raw: string): string | null {
   const trimmed = raw.trim();
   if (trimmed === "") return null;
   // A scheme is anything before "://". If present it must be http(s); if absent
@@ -103,9 +106,9 @@ export function ServerSelectStep({
   recentServers: string[];
   managedServers: string[];
   onBack: () => void;
-  /** Connect to a URL; resolves true when it doesn't look like an Omnigent
-   *  server and needs an explicit confirm (call again with force). */
-  onConnect: (url: string, force?: boolean) => Promise<boolean> | boolean;
+  /** Connect to a URL; resolves `{needsConfirm}` (call again with force) or
+   *  `{error}` to show, else navigation is underway. */
+  onConnect: (url: string, force?: boolean) => Promise<ConnectResult>;
   /** Remove a recent server from the list, if the shell supports it. */
   onRemove?: (url: string) => void;
   /** Copy text to the clipboard (native shell bridge — file:// blocks navigator.clipboard). */
@@ -121,6 +124,9 @@ export function ServerSelectStep({
   // The URL the shell flagged as "doesn't look like Omnigent" — a second
   // connect on the same URL proceeds (force); editing the input clears it.
   const [unconfirmedUrl, setUnconfirmedUrl] = useState<string | null>(null);
+  // Message from a rejected connect (e.g. main-side normalizeUrl rejected an
+  // input the renderer accepted), so a failed Join shows something.
+  const [connectError, setConnectError] = useState<string | null>(null);
   // The server whose info dialog is open, or null.
   const [infoUrl, setInfoUrl] = useState<string | null>(null);
 
@@ -140,10 +146,12 @@ export function ServerSelectStep({
       setInvalid(true);
       return;
     }
+    setConnectError(null);
     // A second click on the already-warned URL forces through.
     const force = unconfirmedUrl === url;
-    const needsConfirm = await onConnect(url, force);
-    setUnconfirmedUrl(needsConfirm ? url : null);
+    const result = await onConnect(url, force);
+    setUnconfirmedUrl(result.needsConfirm ? url : null);
+    setConnectError(result.error ?? null);
   };
 
   const removeServer = (url: string) => {
@@ -157,13 +165,15 @@ export function ServerSelectStep({
         Join an existing server or add a new one
       </h1>
 
-      {(error || invalid || unconfirmedUrl) && (
+      {(error || invalid || unconfirmedUrl || connectError) && (
         <div role="alert" className="mb-2 text-base text-destructive">
           {invalid
             ? "Enter a valid http(s) server URL."
-            : unconfirmedUrl
-              ? "This doesn't look like an Omnigent server. Click Join again to connect anyway."
-              : error}
+            : connectError
+              ? connectError
+              : unconfirmedUrl
+                ? "This doesn't look like an Omnigent server. Click Join again to connect anyway."
+                : error}
         </div>
       )}
 
@@ -193,6 +203,7 @@ export function ServerSelectStep({
             setSelected(null);
             setInvalid(false);
             setUnconfirmedUrl(null);
+            setConnectError(null);
           }}
           onKeyDown={(e) => {
             if (e.key === "Enter") connect(typedNormalized);
@@ -253,6 +264,7 @@ export function ServerSelectStep({
                     setTypedUrl("");
                     setInvalid(false);
                     setUnconfirmedUrl(null);
+                    setConnectError(null);
                   }}
                   className="flex min-w-0 flex-1 items-center gap-3 text-left"
                   aria-pressed={isSelected}

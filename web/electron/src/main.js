@@ -2249,16 +2249,27 @@ function buildMenu() {
  */
 function isSetupPageSender(event) {
   const frameUrl = event.senderFrame?.url ?? "";
-  // Dev only: the wizard served over http by its Vite dev server (see
-  // loadSetupPage / serverSelectorV2DevUrl). The helper is null in a packaged
-  // build, so this can never trust an http origin in prod.
-  const devUrl = serverSelectorV2DevUrl();
-  if (devUrl && frameUrl === devUrl) return true;
   let url;
   try {
     url = new URL(frameUrl);
   } catch {
     return false;
+  }
+  // Compare by origin+pathname, ignoring the query — the setup page is loaded
+  // with ?error=…/?url=…/?ephemeral=1 variants, so a full-string match would
+  // reject those frames.
+  //
+  // Dev only: the wizard served over http by its Vite dev server (see
+  // loadSetupPage / serverSelectorV2DevUrl). The helper is null in a packaged
+  // build, so this can never trust an http origin in prod.
+  const devUrl = serverSelectorV2DevUrl();
+  if (devUrl) {
+    try {
+      const dev = new URL(devUrl);
+      if (url.origin === dev.origin && url.pathname === dev.pathname) return true;
+    } catch {
+      // Malformed dev URL — fall through to the file:// check.
+    }
   }
   return (
     url.protocol === "file:" &&

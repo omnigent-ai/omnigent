@@ -12,6 +12,16 @@ import { ModeSelectStep } from "@/pages/onboarding/ModeSelectStep";
 import { ServerSelectStep } from "@/pages/onboarding/ServerSelectStep";
 import { SetupTerminalStep } from "@/pages/onboarding/SetupTerminalStep";
 
+/**
+ * Outcome of a connect attempt. `needsConfirm` → the URL doesn't look like an
+ * Omnigent server (re-try with force); `error` → the connect was rejected and
+ * the message should be shown; neither → navigation is underway.
+ */
+export interface ConnectResult {
+  needsConfirm?: boolean;
+  error?: string;
+}
+
 /** Actions + data the Electron shell supplies to the flow. */
 export interface ServerSelectorV2Setup {
   /** Initial server URL to prefill (saved / failed / default). */
@@ -22,10 +32,11 @@ export interface ServerSelectorV2Setup {
   recentServers: string[];
   /** Organization-provided server URLs. */
   managedServers: string[];
-  /** Persist + navigate to a server URL. Resolves true when the URL doesn't
-   *  look like an Omnigent server and needs an explicit confirm (call again
-   *  with force). */
-  onConnect: (url: string, force?: boolean) => Promise<boolean> | boolean;
+  /** Persist + navigate to a server URL. Resolves `{needsConfirm}` when the URL
+   *  doesn't look like an Omnigent server (call again with force), or `{error}`
+   *  when the connect was rejected — so the step can show it rather than
+   *  silently doing nothing. Navigation on success replaces this page. */
+  onConnect: (url: string, force?: boolean) => Promise<ConnectResult>;
   /** Start (or reuse) the local server, then connect to it. Resolves the
    *  outcome so the terminal step can show ready/failed (on success the window
    *  navigates away, so it resolves only on failure in practice). */

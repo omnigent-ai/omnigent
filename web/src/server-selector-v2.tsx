@@ -73,15 +73,18 @@ function SetupApp() {
       // setServerUrl persists the URL and navigates the window to it; on success
       // the server's SPA takes over and this page goes away. It resolves
       // {needsConfirm} when a remote URL doesn't look like an Omnigent server —
-      // pass that back so the step can warn and let the user proceed anyway.
+      // pass that back so the step can warn and let the user proceed anyway. A
+      // rejection (e.g. main-side normalizeUrl rejects an input the renderer
+      // accepted) is surfaced as {error} so the step can show it, rather than
+      // a click that silently does nothing.
       const bridge = setupBridge();
-      if (!bridge) return false;
+      if (!bridge) return { error: "The desktop shell is unavailable." };
       try {
         const result = (await bridge.setServerUrl(url, force ? { force: true } : undefined)) as
           { needsConfirm?: boolean } | undefined;
-        return result?.needsConfirm === true;
-      } catch {
-        return false;
+        return { needsConfirm: result?.needsConfirm === true };
+      } catch (e) {
+        return { error: e instanceof Error ? e.message : "Could not connect to that server." };
       }
     },
     onStartLocal: async () => {
