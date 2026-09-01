@@ -855,31 +855,36 @@ async def _wait_for_discovery_listener(
     raise TimeoutError("Timed out waiting for Codex model discovery app-server")
 
 
-def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
+def _probe_codex_home(
+    config_overrides: Sequence[str],
+    config_source_home: Path | None = None,
+) -> Path:
     """
     Persistent probe ``CODEX_HOME`` for one provider configuration.
 
     Persistent (unlike the hermetic discovery's temp dir) so Codex's own
     ``models_cache.json`` ETag handling makes repeat probes cheap; keyed by
-    the override set so a provider change never replays another provider's
-    cache. The account's real ``auth.json`` is symlinked in, the same way
-    a session launch links it: the credential decides which models the
-    account's catalog lists (login-gated entries, the account default), so
-    a credential-less probe answers for a catalog no session will see.
+    the override set and source home so one account never replays another
+    account's cache. Auth and provider config are bridged from the same source
+    a session launch uses.
 
     :param config_overrides: The probe's ``-c`` overrides.
+    :param config_source_home: The selected provider's Codex home, or ``None``
+        for the process-wide home.
     :returns: The created ``CODEX_HOME`` directory.
     """
-    key = hashlib.sha256("\n".join(config_overrides).encode("utf-8")).hexdigest()[:12]
+    source_home = config_source_home or _codex_home_config_source_from_env()
+    key_material = "\0".join((str(source_home), *config_overrides))
+    key = hashlib.sha256(key_material.encode("utf-8")).hexdigest()[:12]
     home = Path.home() / ".omnigent" / "cache" / "codex-model-probe" / key
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
-    real_auth = _codex_home_config_source_from_env() / "auth.json"
-    probe_auth = home / "auth.json"
-    if real_auth.exists():
+    # Refresh just the bridged inputs; keep Codex's models cache persistent.
+    for filename in ("auth.json", "config.toml"):
+        destination = home / filename
         with contextlib.suppress(OSError):
-            if probe_auth.is_symlink() or probe_auth.exists():
-                probe_auth.unlink()
-            probe_auth.symlink_to(real_auth)
+            if destination.is_symlink() or destination.exists():
+                destination.unlink()
+    _populate_codex_home_config(home, source_home, minimal_config=True)
     return home
 
 
@@ -920,7 +925,11 @@ def mark_launch_default(rows: list[_JsonObject], pinned_model: str | None) -> li
     return marked
 
 
-async def probe_codex_model_options(*, codex_path: str | None = None) -> list[_JsonObject]:
+async def probe_codex_model_options(
+    *,
+    codex_path: str | None = None,
+    launch: NativeCodexLaunch | None = None,
+) -> list[_JsonObject]:
     """
     Ask a session-configured Codex app-server for its own model list.
 
@@ -937,13 +946,15 @@ async def probe_codex_model_options(*, codex_path: str | None = None) -> list[_J
     a live session will offer.
 
     :param codex_path: Optional Codex executable override.
+    :param launch: Pre-resolved launch shape. Supplying it keeps the catalog
+        fingerprint and probe on one immutable account selection.
     :returns: The probe rows with a single default marked.
     :raises ImportError: When the Codex CLI is unavailable.
     :raises OSError: When a Databricks profile resolves no workspace host.
     :raises RuntimeError: When the probe app-server exits before connecting.
     :raises TimeoutError: When the probe app-server does not become ready.
     """
-    launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
+    launch = launch or await asyncio.to_thread(resolve_native_codex_launch, model=None)
     resolved_codex = codex_path or _find_codex_cli()
     if not resolved_codex:
         raise ImportError("Native Codex model probing requires the 'codex' CLI on PATH.")
@@ -957,7 +968,7 @@ async def probe_codex_model_options(*, codex_path: str | None = None) -> list[_J
         config_overrides.extend(databricks.config_overrides)
         env["DATABRICKS_HOST"] = databricks.host
         pinned_model = databricks.model
-    codex_home = await asyncio.to_thread(_probe_codex_home, config_overrides)
+    codex_home = await asyncio.to_thread(_probe_codex_home, config_overrides, launch.cli_home)
     env["CODEX_HOME"] = str(codex_home)
     port = _allocate_loopback_port()
     listen_url = f"ws://127.0.0.1:{port}"
@@ -1015,11 +1026,16 @@ def codex_catalog_fingerprint(launch: NativeCodexLaunch, *, codex_path: str | No
         launch.profile,
         launch.model,
         tuple(launch.config_overrides),
+        str(launch.cli_home) if launch.cli_home is not None else None,
         binary_identity(codex_path or _find_codex_cli()),
     )
 
 
-async def codex_launch_catalog(*, codex_path: str | None = None) -> list[_JsonObject] | None:
+async def codex_launch_catalog(
+    *,
+    codex_path: str | None = None,
+    launch: NativeCodexLaunch | None = None,
+) -> list[_JsonObject] | None:
     """
     The shared codex catalog for this host's default shape: store, then probe.
 
@@ -1028,20 +1044,25 @@ async def codex_launch_catalog(*, codex_path: str | None = None) -> list[_JsonOb
     answer for every later consumer.
 
     :param codex_path: Optional Codex executable override.
+    :param launch: Pre-resolved launch shape for a spec/account-specific
+        session. ``None`` resolves the host default.
     :returns: Catalog rows, or ``None`` when no catalog could be obtained.
     """
     from omnigent import model_catalog_store
 
-    try:
-        launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
-    except Exception:  # noqa: BLE001 — a broken provider config means no catalog
-        _logger.warning("codex catalog: launch shape resolution failed", exc_info=True)
-        return None
+    if launch is None:
+        try:
+            launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
+        except Exception:  # noqa: BLE001 — a broken provider config means no catalog
+            _logger.warning("codex catalog: launch shape resolution failed", exc_info=True)
+            return None
     fingerprint = codex_catalog_fingerprint(launch, codex_path=codex_path)
 
     async def _probe() -> list[_JsonObject] | None:
         try:
-            return await probe_codex_model_options(codex_path=codex_path)
+            if launch.cli_home is None:
+                return await probe_codex_model_options(codex_path=codex_path)
+            return await probe_codex_model_options(codex_path=codex_path, launch=launch)
         except Exception:  # noqa: BLE001 — probe failure means "no catalog", never a crash
             # Best-effort probe re-run on every catalog fetch; log once so a
             # persistently failing probe doesn't flood the logs.
@@ -1051,21 +1072,28 @@ async def codex_launch_catalog(*, codex_path: str | None = None) -> list[_JsonOb
     return await model_catalog_store.ensure_catalog("codex-native", fingerprint, _probe)
 
 
-async def codex_launch_catalog_is_stale(*, codex_path: str | None = None) -> bool:
+async def codex_launch_catalog_is_stale(
+    *,
+    codex_path: str | None = None,
+    launch: NativeCodexLaunch | None = None,
+) -> bool:
     """
     Whether the default launch shape's stored catalog is past the TTL.
 
     :param codex_path: Optional Codex executable override, matching the
         one :func:`codex_launch_catalog` would probe with.
+    :param launch: Pre-resolved launch shape. ``None`` resolves the host
+        default.
     :returns: ``True`` when the store holds only a stale entry; ``False``
         when it is fresh, absent, or the launch shape cannot resolve.
     """
     from omnigent import model_catalog_store
 
-    try:
-        launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
-    except Exception:  # noqa: BLE001 — a broken provider config means no catalog
-        return False
+    if launch is None:
+        try:
+            launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
+        except Exception:  # noqa: BLE001 — a broken provider config means no catalog
+            return False
     return model_catalog_store.catalog_is_stale(
         "codex-native", codex_catalog_fingerprint(launch, codex_path=codex_path)
     )
@@ -1158,6 +1186,7 @@ class CodexNativeAppServer:
     codex_cli_version: tuple[int, int, int] | None = None
     trust_project: bool = False
     router_hooks_registered: bool = False
+    config_source_home: Path | None = None
 
     async def start(self) -> None:
         """
@@ -1202,7 +1231,7 @@ class CodexNativeAppServer:
                 router_bridge_dir = None
         self.router_hooks_registered = router_bridge_dir is not None and policy_hooks_supported
         routed_spawns = router_bridge_dir is not None
-        config_source = _codex_home_config_source_from_env()
+        config_source = self.config_source_home or _codex_home_config_source_from_env()
         model_migration_target: str | None = None
         if self.trust_project and self.pinned_model:
             catalog = await asyncio.to_thread(
@@ -2160,6 +2189,7 @@ def build_codex_native_server(
     developer_instructions: str | None = None,
     bypass_sandbox: bool = False,
     trust_project: bool = False,
+    config_source_home: Path | None = None,
 ) -> CodexNativeAppServer:
     """
     Build a configured native Codex app-server process wrapper.
@@ -2181,6 +2211,8 @@ def build_codex_native_server(
         runs. ``None`` uses :data:`sys.executable`.
     :param codex_path: Optional executable override. ``None`` searches
         ``PATH``.
+    :param config_source_home: Codex home to bridge auth and config from.
+        ``None`` keeps process-wide resolution.
     :param extra_config_overrides: Additional ``-c`` config overrides
         appended after Databricks routing overrides, e.g. MCP server
         registration for the Omnigent tool relay.
@@ -2260,6 +2292,7 @@ def build_codex_native_server(
         python_executable=python_executable,
         pinned_model=pinned_model,
         trust_project=trust_project,
+        config_source_home=config_source_home,
     )
 
 
@@ -2286,6 +2319,8 @@ class NativeCodexLaunch:
         on the sign-in screen and never start a thread on its own. Lets a
         headless caller fail the turn fast with an actionable error instead
         of burning the thread-start timeout.
+    :param cli_home: Selected provider's normalized Codex home. ``None`` keeps
+        the process-wide home. Only native Codex launch paths honor this field.
     """
 
     config_overrides: list[str]
@@ -2293,6 +2328,7 @@ class NativeCodexLaunch:
     profile: str | None
     summary: str = ""
     login_required: bool = False
+    cli_home: Path | None = None
 
 
 _MODEL_PROVIDER_OVERRIDE_PREFIX = "model_provider="
@@ -2522,6 +2558,7 @@ def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCod
             summary=(
                 f"provider {entry.name!r} via cli-config (model_provider={entry.model_provider!r})"
             ),
+            cli_home=_provider_codex_home(entry),
         )
     if entry.kind not in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
         return None
@@ -2611,7 +2648,16 @@ def _first_routable_codex_provider(
     return None
 
 
-def _codex_login_usable() -> bool:
+def _provider_codex_home(entry: ProviderEntry) -> Path | None:
+    """Return the normalized Codex home selected by *entry*, if any."""
+    from omnigent.onboarding.provider_config import provider_cli_home
+
+    if entry.cli != "codex":
+        return None
+    return provider_cli_home(entry)
+
+
+def _codex_login_usable(codex_home: Path | None = None) -> bool:
     """Whether Codex's own stored login can carry a launch that defers to it.
 
     Reads the same ``auth.json`` the launched Codex process will use (the
@@ -2623,7 +2669,8 @@ def _codex_login_usable() -> bool:
     """
     from omnigent.onboarding.ambient import codex_auth_has_credential
 
-    return codex_auth_has_credential(_codex_home_config_source_from_env() / "auth.json")
+    source_home = codex_home or _codex_home_config_source_from_env()
+    return codex_auth_has_credential(source_home / "auth.json")
 
 
 def _resolve_subscription_launch(
@@ -2652,7 +2699,9 @@ def _resolve_subscription_launch(
     # Gateway), which would silently hijack a Subscription selection. A
     # no-op when the user's config sets no custom default.
     subscription_overrides = ['model_provider="openai"']
-    if _codex_login_usable():
+    cli_home = _provider_codex_home(entry)
+    codex_logged_in = _codex_login_usable(cli_home)
+    if codex_logged_in:
         log_info_once(
             _logger,
             "native-codex routing: Codex CLI login (subscription provider %r; Codex is logged in)",
@@ -2663,6 +2712,7 @@ def _resolve_subscription_launch(
             model=model,
             profile=None,
             summary=f"Codex CLI login (subscription provider {entry.name!r}; Codex is logged in)",
+            cli_home=cli_home,
         )
     fallback = _first_routable_codex_provider(explicit, exclude=entry.name, model=model)
     if fallback is not None:
@@ -2683,6 +2733,7 @@ def _resolve_subscription_launch(
             "the sign-in screen and never starts a thread"
         ),
         login_required=True,
+        cli_home=cli_home,
     )
 
 
@@ -2782,7 +2833,8 @@ def resolve_native_codex_launch(
                 # (:func:`_resolve_subscription_launch`) — never do that for
                 # an explicit spec declaration: silently running a credential
                 # the spec did not name is worse than the login screen.
-                spec_codex_logged_in = _codex_login_usable()
+                spec_cli_home = _provider_codex_home(spec_entry)
+                spec_codex_logged_in = _codex_login_usable(spec_cli_home)
                 if spec_codex_logged_in:
                     state = "Codex is logged in"
                 else:
@@ -2796,6 +2848,7 @@ def resolve_native_codex_launch(
                     profile=None,
                     summary=f"Codex CLI login (spec provider {spec_entry.name!r}; {state})",
                     login_required=not spec_codex_logged_in,
+                    cli_home=spec_cli_home,
                 )
             launch = _codex_provider_launch(spec_entry, model)
             if launch is not None:

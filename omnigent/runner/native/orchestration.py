@@ -3832,10 +3832,18 @@ async def _auto_create_codex_terminal(
         )
         from omnigent.model_catalog_store import catalog_contains, default_row
 
+        _catalog_launch = _dataclass_replace(_codex_launch, model=None)
+
         # Read staleness BEFORE the fetch — the fetch kicks the background
         # re-probe, which could land between the two reads.
-        _codex_catalog_was_stale = await codex_launch_catalog_is_stale(codex_path=_codex_cli_path)
-        _codex_catalog = await codex_launch_catalog(codex_path=_codex_cli_path)
+        _codex_catalog_was_stale = await codex_launch_catalog_is_stale(
+            codex_path=_codex_cli_path,
+            launch=_catalog_launch,
+        )
+        _codex_catalog = await codex_launch_catalog(
+            codex_path=_codex_cli_path,
+            launch=_catalog_launch,
+        )
         if launch_config.model_override and _codex_catalog:
             if not catalog_contains(_codex_catalog, launch_config.model_override):
                 raise click.ClickException(
@@ -4122,6 +4130,7 @@ async def _auto_create_codex_terminal(
         # creating a thread. This TUI runs detached for the web UI, so persist
         # the runner-owned acknowledgements in the private session config.
         trust_project=True,
+        config_source_home=_codex_launch.cli_home,
     )
     # Generate routing hooks.json (and bypass codex's hook-trust prompt): the
     # app-server reads the endpoint out of its own process env at start, and

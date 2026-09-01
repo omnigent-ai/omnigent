@@ -33,6 +33,7 @@ from omnigent.onboarding.provider_config import (
     default_provider_for_harness,
     load_config,
     load_providers,
+    provider_cli_home,
     provider_families,
 )
 from omnigent.spec.parser import check_unresolved_env_vars
@@ -94,6 +95,35 @@ _CLI_READINESS_HARNESS: dict[str, str] = {
 }
 
 
+def _selected_codex_home_connection(provider: ProviderEntry) -> ProviderConnection | None:
+    """Return conservative readiness for a provider-selected Codex home."""
+    if provider.cli != "codex" or provider.cli_home is None:
+        return None
+    try:
+        codex_home = provider_cli_home(provider)
+    except OmnigentError:
+        return _connection(
+            ConnectionState.MISCONFIGURED,
+            "The selected Codex home does not resolve to an absolute local path.",
+        )
+    if codex_home is None:
+        return None
+    if provider.kind == SUBSCRIPTION_KIND:
+        from omnigent.onboarding.ambient import codex_auth_has_credential
+
+        if codex_auth_has_credential(codex_home / "auth.json"):
+            return _connection(
+                ConnectionState.CONNECTED,
+                "A usable credential exists in the selected Codex home; "
+                "the vendor was not contacted.",
+            )
+    return _connection(
+        ConnectionState.UNKNOWN,
+        "The selected Codex home is configured, but status reads cannot prove "
+        "this profile without opening a protected credential store.",
+    )
+
+
 def _cli_connection(
     provider: ProviderEntry,
     readiness: Mapping[str, HarnessAvailability] | None,
@@ -126,6 +156,9 @@ def _cli_connection(
             ConnectionState.UNAVAILABLE,
             f"The {cli} CLI is not installed on this host.",
         )
+    selected_home_connection = _selected_codex_home_connection(provider)
+    if selected_home_connection is not None:
+        return selected_home_connection
     if provider_detected:
         return _connection(
             ConnectionState.CONNECTED,

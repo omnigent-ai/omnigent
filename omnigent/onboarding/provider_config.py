@@ -47,6 +47,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Literal
 
 from omnigent.cli_invocation import cli_invocation
@@ -395,6 +396,10 @@ class ProviderEntry:
         human display name (the table's ``name`` field, snapshotted at
         adoption), e.g. ``"Databricks AI Gateway"``. ``None`` otherwise and
         when the table named none.
+    :param cli_home: For Codex-backed ``subscription`` / ``cli-config``
+        providers, the Codex home whose auth and config a native launch uses.
+        ``None`` keeps the process-wide Codex home. The raw string is retained
+        so ``~`` and environment references resolve in the launch process.
     :param default_families: The set of model families this provider is
         the **default** for. Sourced from the entry's ``default:`` flag:
         ``true`` → every family it serves (:func:`provider_families`); a
@@ -414,6 +419,7 @@ class ProviderEntry:
     profile: str | None = None
     model_provider: str | None = None
     display_name: str | None = None
+    cli_home: str | None = None
     default_families: frozenset[str] = frozenset()
 
     @property
@@ -895,6 +901,44 @@ def _default_raw_value(default_families: frozenset[str], served: set[str]) -> ob
     return sorted(default_families)
 
 
+def _parse_cli_home(name: str, cli: str, raw: dict[str, object]) -> str | None:
+    """Return a CLI-backed provider's non-empty, unexpanded home value."""
+    value = raw.get("cli_home")
+    if value is None:
+        return None
+    if cli != "codex":
+        raise OmnigentError(
+            f"provider {name!r}: 'cli_home' is supported only for cli: 'codex'.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if not isinstance(value, str) or not value.strip():
+        raise OmnigentError(
+            f"provider {name!r}: 'cli_home' must be a non-empty path, got {value!r}.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return value.strip()
+
+
+def provider_cli_home(entry: ProviderEntry) -> Path | None:
+    """Resolve a provider's declared CLI home to a normalized absolute path.
+
+    Relative homes are rejected. Their meaning would depend on whether the
+    host daemon, runner, or local CLI resolved them, which can select the wrong
+    account. Missing paths are allowed so a logged-out profile can still open
+    Codex's sign-in flow in its intended home.
+    """
+    if entry.cli_home is None:
+        return None
+    expanded = Path(_expand(f"providers.{entry.name}.cli_home", entry.cli_home)).expanduser()
+    if not expanded.is_absolute():
+        raise OmnigentError(
+            f"provider {entry.name!r}: 'cli_home' must resolve to an absolute path, "
+            f"got {entry.cli_home!r}.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return expanded.resolve(strict=False)
+
+
 def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
     """Parse one entry under ``providers:`` into a :class:`ProviderEntry`.
 
@@ -953,6 +997,7 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
             name=name,
             kind=kind,
             cli=cli_raw,
+            cli_home=_parse_cli_home(name, cli_raw, raw),
             default_families=_parse_default_families(
                 name, default_raw, served, pi_capable=(cli_raw == "pi")
             ),
@@ -984,6 +1029,7 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
             cli=cli_raw,
             model_provider=model_provider_raw,
             display_name=display_name_raw if isinstance(display_name_raw, str) else None,
+            cli_home=_parse_cli_home(name, cli_raw, raw),
             # A codex cli-config provider serves the openai surface, like a codex
             # subscription. It may ALSO claim the pi scope (``default: [openai,
             # pi]``) because a Databricks AI Gateway is pi-consumable (Pi speaks
@@ -1131,6 +1177,8 @@ def provider_credential_env_vars(config: dict[str, object]) -> frozenset[str]:
     - ``api_key_ref: env:<VAR>`` — the explicit env-ref form.
     - ``api_key: $VAR`` / ``api_key: ${VAR}`` — an inline ``$VAR`` reference
       stored in the raw ``api_key`` field before lazy expansion.
+    - ``cli_home: $VAR/...`` — a Codex credential root. The runner must see
+      the same path variable as the host or it could select another account.
 
     This is used by the runner-spawn layer to automatically forward custom
     credential env vars into the runner subprocess without requiring the user
@@ -1148,6 +1196,11 @@ def provider_credential_env_vars(config: dict[str, object]) -> frozenset[str]:
     """
     names: set[str] = set()
     for entry in load_providers(config).values():
+        if entry.cli_home is not None:
+            for match in _ENV_REF_RE.finditer(entry.cli_home):
+                var = match.group(1) or match.group(2)
+                for n in env_names_with_omnigent_prefix(var):
+                    names.add(n)
         for family in entry.families.values():
             # api_key_ref: env:VAR — explicit env reference.
             if family.api_key_ref is not None and family.api_key_ref.startswith("env:"):

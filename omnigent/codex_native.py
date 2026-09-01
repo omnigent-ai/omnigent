@@ -137,7 +137,7 @@ class _CodexAuthSource:
     config_path: Path
 
 
-def _resolve_codex_auth_source() -> _CodexAuthSource:
+def _resolve_codex_auth_source(codex_home: Path | None = None) -> _CodexAuthSource:
     """
     Resolve the local Codex auth source used for availability checks.
 
@@ -151,7 +151,7 @@ def _resolve_codex_auth_source() -> _CodexAuthSource:
     """
     from omnigent.inner.codex_executor import _codex_home_config_source_from_env
 
-    codex_home = _codex_home_config_source_from_env()
+    codex_home = codex_home or _codex_home_config_source_from_env()
     return _CodexAuthSource(
         auth_path=codex_home / "auth.json",
         config_path=codex_home / "config.toml",
@@ -277,6 +277,7 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
     # On a host with no configured provider this may run ambient detection.
     # configured_harness_map shares one probe across all Codex aliases.
     defers_to_codex_config = False
+    launch = None
     try:
         launch = resolve_native_codex_launch(model=None)
         routes_through_provider = (
@@ -291,7 +292,13 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
     if routes_through_provider and not defers_to_codex_config:
         return None
     try:
-        source = _resolve_codex_auth_source()
+        # A configured native-Codex provider may select another account home.
+        # Inspect only that account's local files; no keychain or CLI login
+        # command is involved.
+        if launch is not None and launch.cli_home is not None:
+            source = _resolve_codex_auth_source(launch.cli_home)
+        else:
+            source = _resolve_codex_auth_source()
         if defers_to_codex_config:
             from omnigent.inner.codex_executor import _clean_codex_env
             from omnigent.onboarding.codex_auth_readiness import codex_config_effective_auth
@@ -1253,6 +1260,7 @@ async def _prepare_codex_terminal(
             ap_server_url=base_url,
             ap_auth_headers=headers,
             developer_instructions=developer_instructions,
+            config_source_home=_codex_launch.cli_home,
         )
         app_server.listen_url = codex_ws_url
         event_client: CodexAppServerClient | None = None
