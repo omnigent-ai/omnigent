@@ -60,7 +60,6 @@ def _cli_fallback_dirs() -> tuple[Path, ...]:
 # kernel. A file wearing one of these on the wrong OS is guaranteed ENOEXEC,
 # so the resolver can skip it and keep walking its fallback ladder.
 _ELF_MAGIC = b"\x7fELF"
-_PE_MAGIC = b"MZ"
 _MACHO_MAGICS = (
     b"\xfe\xed\xfa\xce",  # 32-bit big-endian
     b"\xce\xfa\xed\xfe",  # 32-bit little-endian
@@ -82,8 +81,10 @@ def _confidently_unrunnable(path: str | Path) -> bool:
 
     Deliberately conservative: shebang scripts always pass, unknown formats
     pass (the kernel gets the final say), same-OS binaries of another CPU
-    arch pass (Rosetta/binfmt emulation may run them), and any read error
-    passes. Only a wrong-OS executable container is rejected.
+    arch pass (Rosetta/binfmt emulation may run them), PE/Windows binaries
+    pass (WSL interop can exec them on Linux), and any read error passes.
+    Only Mach-O-on-Linux and ELF-on-macOS — pairs no mainstream setup can
+    exec — are rejected.
     """
     if IS_WINDOWS:
         # Windows resolves interpreters via PATHEXT associations, not magic.
@@ -96,9 +97,9 @@ def _confidently_unrunnable(path: str | Path) -> bool:
     if head.startswith(b"#!"):
         return False
     if IS_LINUX:
-        return head in _MACHO_MAGICS or head.startswith(_PE_MAGIC)
+        return head in _MACHO_MAGICS
     if IS_DARWIN:
-        return head.startswith((_ELF_MAGIC, _PE_MAGIC))
+        return head.startswith(_ELF_MAGIC)
     return False
 
 
@@ -146,27 +147,30 @@ def resolve_cli_binary(
             if resolved is None and os.access(override, os.X_OK) and os.path.isfile(override):
                 resolved = override
             if resolved is not None:
-                if not _confidently_unrunnable(resolved):
-                    return resolved
-                _logger.warning(
-                    "%s=%r resolves to %r, which is not runnable on this platform "
-                    "(wrong executable format); falling back to PATH for %r.",
-                    env_var,
-                    override,
-                    resolved,
-                    name,
-                )
-            else:
-                # A set-but-unresolvable override (typo, moved/non-executable
-                # binary) silently falling through to PATH would launch a
-                # *different* binary than intended — warn so the misconfig
-                # surfaces.
-                _logger.warning(
-                    "%s=%r does not resolve to an executable file; falling back to PATH for %r.",
-                    env_var,
-                    override,
-                    name,
-                )
+                # An explicit override is authoritative — the operator pinned
+                # this binary, so never substitute a different one. When it
+                # looks unrunnable, warn (naming the coming ENOEXEC) but still
+                # return it; the spawn failure then points at the pinned path.
+                if _confidently_unrunnable(resolved):
+                    _logger.warning(
+                        "%s=%r resolves to %r, which does not look runnable on this "
+                        "platform (wrong executable format); using it anyway because "
+                        "the override is explicit — expect an Exec format error.",
+                        env_var,
+                        override,
+                        resolved,
+                    )
+                return resolved
+            # A set-but-unresolvable override (typo, moved/non-executable
+            # binary) silently falling through to PATH would launch a
+            # *different* binary than intended — warn so the misconfig
+            # surfaces.
+            _logger.warning(
+                "%s=%r does not resolve to an executable file; falling back to PATH for %r.",
+                env_var,
+                override,
+                name,
+            )
     candidates: list[str] = []
     on_path = which(name)
     if on_path is not None:

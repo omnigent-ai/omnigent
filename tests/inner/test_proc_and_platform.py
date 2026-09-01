@@ -478,10 +478,10 @@ def _write_executable(path, payload: bytes | str) -> None:
 def test_resolve_cli_binary_skips_unrunnable_ladder_rung(monkeypatch, tmp_path):
     """A wrong-format install on an early rung must not shadow a runnable one.
 
-    The reported startup death: a stale wrong-architecture ``claude`` in
-    ``~/.local/bin`` resolves first, then dies at ``execve`` with
-    ``[Errno 8] Exec format error`` while the working install further down
-    the ladder is never tried. The resolver must fall through to it.
+    The reported startup death: a stale wrong-format ``claude`` (a container
+    this kernel cannot exec) in ``~/.local/bin`` resolves first, then dies at
+    ``execve`` with ``[Errno 8] Exec format error`` while the working install
+    further down the ladder is never tried. The resolver must fall through.
     """
     broken_dir = tmp_path / "broken-bin"
     good_dir = tmp_path / "good-bin"
@@ -529,21 +529,26 @@ def test_resolve_cli_binary_returns_none_when_only_unrunnable(monkeypatch, tmp_p
 
 
 @pytest.mark.skipif(_platform.IS_WINDOWS, reason="POSIX exec-format probing")
-def test_resolve_cli_binary_unrunnable_env_override_falls_back(monkeypatch, tmp_path, caplog):
-    """An explicit override pointing at a wrong-format file warns and falls back."""
+def test_resolve_cli_binary_env_override_stays_authoritative(monkeypatch, tmp_path, caplog):
+    """An explicit override is returned even when it looks unrunnable.
+
+    The operator pinned this exact binary; substituting a different one from
+    PATH/the ladder would silently launch something else. The resolver warns
+    (naming the coming exec failure) but honors the pin.
+    """
     broken = tmp_path / "tool"
     _write_executable(broken, _WRONG_OS_BINARY)
     monkeypatch.setenv("OMNIGENT_TESTCLI_PATH", str(broken))
     monkeypatch.setattr(
         _platform.shutil,
         "which",
-        lambda name: "/usr/bin/tool" if name == "tool" else None,
+        lambda name: str(broken) if name == str(broken) else None,
     )
     monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
     with caplog.at_level("WARNING"):
         resolved = _platform.resolve_cli_binary("tool", env_var="OMNIGENT_TESTCLI_PATH")
-    assert resolved == "/usr/bin/tool"
-    assert "not runnable" in caplog.text
+    assert resolved == str(broken)
+    assert "using it anyway" in caplog.text
 
 
 @pytest.mark.skipif(_platform.IS_WINDOWS, reason="POSIX exec-format probing")
@@ -572,13 +577,15 @@ def test_confidently_unrunnable_is_conservative(tmp_path):
     # The running interpreter is a same-OS native binary: must pass.
     assert not _platform._confidently_unrunnable(sys.executable)
 
+    # PE/Windows binaries pass: WSL interop can exec them on Linux, and
+    # rejecting them buys nothing on macOS either.
+    pe = tmp_path / "windows.exe"
+    _write_executable(pe, b"MZ" + b"\x00" * 64)
+    assert not _platform._confidently_unrunnable(pe)
+
     wrong_os = tmp_path / "wrong-os"
     _write_executable(wrong_os, _WRONG_OS_BINARY)
     assert _platform._confidently_unrunnable(wrong_os)
-
-    pe = tmp_path / "windows.exe"
-    _write_executable(pe, b"MZ" + b"\x00" * 64)
-    assert _platform._confidently_unrunnable(pe)
 
 
 def test_malloc_tuning_env_empty_off_linux(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -91,10 +91,18 @@ _WRONG_FORMAT_BINARY = (
 # that must not intercept loopback requests to the spawned server.
 _client = httpx.Client(trust_env=False, timeout=15.0)
 
-# Shared helpers use ambient ``httpx`` calls that DO trust env, so also
-# exclude loopback from any forced proxy at import time.
-for _var in ("NO_PROXY", "no_proxy"):
-    os.environ[_var] = ",".join(filter(None, [os.environ.get(_var, ""), "127.0.0.1,localhost"]))
+
+@pytest.fixture(autouse=True)
+def _loopback_off_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exclude loopback from any forced HTTP(S) proxy, restored after the test.
+
+    Shared helpers (``configure_mock_llm``) use ambient ``httpx`` calls that
+    DO trust env; scoping the mutation to the test keeps other modules'
+    proxy view untouched.
+    """
+    for var in ("NO_PROXY", "no_proxy"):
+        merged = ",".join(filter(None, [os.environ.get(var, ""), "127.0.0.1,localhost"]))
+        monkeypatch.setenv(var, merged)
 
 
 def _free_port() -> int:
@@ -234,6 +242,9 @@ def broken_cli_claude_sdk_session(
         "HOME": str(home_dir),
         "PATH": clean_path,
         "OMNIGENT_CLAUDE_SDK_NO_SANDBOX": "1",
+        # An ambient explicit-override pin would bypass the staged resolver
+        # ladder entirely; the rig needs the runner to walk the ladder.
+        "OMNIGENT_CLAUDE_PATH": "",
         "OMNIGENT_RUNNER_ID": runner_id,
         "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
         "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
