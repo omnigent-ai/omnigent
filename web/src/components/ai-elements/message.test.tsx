@@ -190,4 +190,33 @@ describe("MessageResponse code-block copy", () => {
     appendSpy.mockRestore();
     vi.unstubAllGlobals();
   });
+
+  it("falls back to a .txt extension for languages with unsafe ids", async () => {
+    vi.stubGlobal("URL", {
+      ...URL,
+      createObjectURL: vi.fn(() => "blob:mock"),
+      revokeObjectURL: vi.fn(),
+    });
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+
+    render(<MessageResponse>{"```c++\nint main() {}\n```"}</MessageResponse>);
+
+    const download = await screen.findByRole("button", { name: "Download file" });
+    let downloadedName = "";
+    const appendSpy = vi
+      .spyOn(document.body, "append")
+      .mockImplementation((...nodes: (Node | string)[]) => {
+        const node = nodes[0];
+        if (node instanceof HTMLAnchorElement) {
+          downloadedName = node.download;
+        }
+      });
+
+    fireEvent.click(download);
+
+    expect(downloadedName).toBe("file.txt");
+
+    appendSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
 });

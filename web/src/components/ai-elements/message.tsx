@@ -366,7 +366,11 @@ function codeDownloadFilename(language: string | undefined): string {
   if (!language) {
     return "file.txt";
   }
-  const ext = CODE_LANGUAGE_EXTENSIONS[language] ?? language;
+  const mapped = CODE_LANGUAGE_EXTENSIONS[language.toLowerCase()];
+  // Only trust a language id as its own extension when it's a plain
+  // alphanumeric token; ids like `c++` or `vue-html` would make a broken
+  // extension, so fall back to `.txt`.
+  const ext = mapped ?? (/^[a-z0-9]+$/i.test(language) ? language.toLowerCase() : "txt");
   return `file.${ext}`;
 }
 
