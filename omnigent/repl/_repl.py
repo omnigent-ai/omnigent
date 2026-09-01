@@ -1197,7 +1197,7 @@ def _server_event_to_sdk_event(event: object) -> object | None:
     if isinstance(event, CompletedEvent):
         return ResponseCompleted(response=_resp(event))
     if isinstance(event, FailedEvent):
-        return ResponseFailed(response=_resp(event))
+        return ResponseFailed(response=_resp(event), source=event.source)
     if isinstance(event, CancelledEvent):
         return ResponseCancelled(response=_resp(event))
     if isinstance(event, IncompleteEvent):

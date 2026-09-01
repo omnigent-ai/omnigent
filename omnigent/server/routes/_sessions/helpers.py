@@ -6958,7 +6958,7 @@ def _error_item_from_sse(
     if not isinstance(raw_message, str) or not raw_message.strip():
         return None
     if source not in ("llm", "execution", "tool"):
-        return None
+        source = "execution"
     return NewConversationItem(
         type="error",
         response_id=response_id,
