@@ -220,9 +220,9 @@ def keychain_host(
             kb_dir,
         )
     )
-    desktop_env = _loopback_no_proxy(
+    desktop_env = os.environ.copy()
+    desktop_env.update(
         {
-            **os.environ,
             "HOME": str(home),
             "OMNIGENT_CONFIG_HOME": str(cfg_home),
             "PYTHONPATH": pythonpath,
@@ -231,9 +231,18 @@ def keychain_host(
             "OMNIGENT_NO_UPDATE_CHECK": "1",
         }
     )
+    _loopback_no_proxy(desktop_env)
     # Strip ambient credentials so the configured provider is the only
-    # route — exactly the reporter's machine, which had no exported keys.
-    for var in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "ANTHROPIC_API_KEY"):
+    # route — exactly the reporter's machine, which had no exported keys —
+    # and ambient keyring toggles (a truthy OMNIGENT_DISABLE_KEYRING would
+    # force the file backend past the selected fake OS keyring, breaking
+    # the keyring-stored precondition this journey depends on).
+    for var in (
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "ANTHROPIC_API_KEY",
+        "OMNIGENT_DISABLE_KEYRING",
+    ):
         desktop_env.pop(var, None)
 
     # Journey step 1: setup stores the key. Same code path `omnigent setup`
