@@ -69,9 +69,13 @@ _MAX_PERSISTED_COMPACTION_SEQS = 16
 # — BEFORE deciding there's nothing to do, then aborts without ever writing
 # an ``isCompactSummary`` record or firing the ``SessionStart source=compact``
 # completion hook. Without an explicit dismissal the spinner is stranded.
-# Matched case-insensitively against the slash-command ``output``.
+# Matched case-insensitively against the slash-command ``output``; brittle to
+# upstream wording, so it's a substring match over the observed refusal plus a
+# defensive variant. Widen this list if Claude Code rephrases the refusal.
 _COMPACTION_NOOP_OUTPUT_MARKERS: tuple[str, ...] = (
+    # Observed refusal text.
     "not enough messages to compact",
+    # Defensive variant against wording drift.
     "nothing to compact",
 )
 
