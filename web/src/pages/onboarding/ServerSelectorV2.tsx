@@ -14,6 +14,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { LandingFooter } from "@/pages/onboarding/LandingFooter";
 import { LandingStep } from "@/pages/onboarding/LandingStep";
 import { ModeSelectStep } from "@/pages/onboarding/ModeSelectStep";
 import { ServerSelectStep } from "@/pages/onboarding/ServerSelectStep";
@@ -132,6 +133,8 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
           />
         )}
       </AnimatedOmnigentPanel>
+
+      {step === "landing" && <LandingFooter />}
     </div>
   );
 }

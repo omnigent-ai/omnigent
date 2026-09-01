@@ -129,7 +129,7 @@ export function ModeSelectStep({
                   refs.current.get(next)?.focus();
                 }}
                 className={cn(
-                  "flex flex-col cursor-pointer px-3 py-2.5 text-left transition-[border-color,background-color]",
+                  "flex flex-col rounded-lg cursor-pointer px-3 py-2.5 text-left transition-[border-color,background-color]",
                   selected ? "" : "hover:bg-muted",
                 )}
               >
