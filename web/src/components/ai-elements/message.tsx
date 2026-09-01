@@ -3,10 +3,18 @@
 import { Button } from "@/components/ui/button";
 import { ButtonGroup, ButtonGroupText } from "@/components/ui/button-group";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { triggerBrowserDownload } from "@/hooks/useFileContent";
 import { copyText } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
 import type { UIMessage } from "ai";
-import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, CopyIcon, WrapTextIcon } from "lucide-react";
+import {
+  CheckIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  CopyIcon,
+  DownloadIcon,
+  WrapTextIcon,
+} from "lucide-react";
 import type { ComponentProps, HTMLAttributes, ReactElement, ReactNode } from "react";
 import {
   cloneElement,
@@ -306,6 +314,10 @@ export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins"> & {
   markFileLinks?: boolean;
 };
 
+// Turn off Streamdown's own copy/download chrome. Both actions are rendered as
+// custom overlay buttons in ChatCodeBlockPre so all three (wrap, copy,
+// download) share one flex row and stay vertically aligned — Streamdown's
+// built-in buttons live in a separate header container that never lines up.
 function getChatCodeControls(controls: StreamdownProps["controls"]): StreamdownProps["controls"] {
   if (typeof controls === "object" && controls !== null) {
     const codeControls = controls.code;
@@ -314,12 +326,48 @@ function getChatCodeControls(controls: StreamdownProps["controls"]): StreamdownP
       code: {
         ...(typeof codeControls === "object" && codeControls !== null ? codeControls : {}),
         copy: false,
-        download: true,
+        download: false,
       },
     };
   }
 
-  return { code: { copy: false, download: true } };
+  return { code: { copy: false, download: false } };
+}
+
+// Pull the fenced language off the `<code class="language-…">` element that
+// Streamdown hands the `pre` slot, so the downloaded file gets a sensible
+// extension.
+function extractCodeLanguage(children: ReactNode): string | undefined {
+  if (!isValidElement(children)) {
+    return undefined;
+  }
+  const className = (children.props as { className?: unknown }).className;
+  if (typeof className !== "string") {
+    return undefined;
+  }
+  return /language-([^\s]+)/.exec(className)?.[1];
+}
+
+// Common language ids whose file extension differs from the id itself.
+const CODE_LANGUAGE_EXTENSIONS: Record<string, string> = {
+  javascript: "js",
+  typescript: "ts",
+  markdown: "md",
+  python: "py",
+  shell: "sh",
+  bash: "sh",
+  yaml: "yaml",
+  yml: "yaml",
+  text: "txt",
+  plaintext: "txt",
+};
+
+function codeDownloadFilename(language: string | undefined): string {
+  if (!language) {
+    return "file.txt";
+  }
+  const ext = CODE_LANGUAGE_EXTENSIONS[language] ?? language;
+  return `file.${ext}`;
 }
 
 function extractCodeText(children: ReactNode): string {
@@ -414,9 +462,43 @@ function ChatCodeBlockWrapToggle({ wrap, onToggle }: { wrap: boolean; onToggle: 
   );
 }
 
+function ChatCodeBlockDownloadButton({
+  getCode,
+  filename,
+}: {
+  getCode: () => string;
+  filename: string;
+}) {
+  const handleClick = useCallback(() => {
+    try {
+      triggerBrowserDownload(new Blob([getCode()], { type: "text/plain" }), filename);
+    } catch (error) {
+      console.warn("Failed to download code block", error);
+    }
+  }, [getCode, filename]);
+
+  return (
+    <Button
+      aria-label="Download file"
+      className={CODE_BLOCK_OVERLAY_BUTTON_CLASS}
+      onClick={handleClick}
+      size="icon-sm"
+      title="Download file"
+      type="button"
+      variant="ghost"
+    >
+      <DownloadIcon size={14} />
+    </Button>
+  );
+}
+
 function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
   const code = extractCodeText(children);
   const getCode = useCallback(() => code, [code]);
+  const downloadFilename = useMemo(
+    () => codeDownloadFilename(extractCodeLanguage(children)),
+    [children],
+  );
   // Soft-wrap long lines by default so users don't have to scroll horizontally
   // to read code blocks. The toggle restores Streamdown's native
   // horizontal-scroll view for when column alignment matters.
@@ -429,12 +511,13 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
   return (
     <div className={cn("relative", wrap && "chat-code-wrap")}>
       {block}
-      {/* Overlay actions, anchored left of Streamdown's own download button
-          (which sits at the header's right edge). A flex row lets the buttons
-          self-arrange, so neither needs a hardcoded horizontal offset. */}
-      <div className="absolute top-2 right-12 z-10 flex items-center gap-1">
+      {/* All three actions share one flex row so they stay vertically aligned;
+          Streamdown's own copy/download chrome is disabled in
+          getChatCodeControls. */}
+      <div className="absolute top-2 right-2 z-10 flex items-center gap-1">
         <ChatCodeBlockWrapToggle onToggle={toggleWrap} wrap={wrap} />
         <ChatCodeBlockCopyButton getCode={getCode} />
+        <ChatCodeBlockDownloadButton filename={downloadFilename} getCode={getCode} />
       </div>
     </div>
   );

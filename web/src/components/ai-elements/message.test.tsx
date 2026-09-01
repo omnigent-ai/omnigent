@@ -147,4 +147,47 @@ describe("MessageResponse code-block copy", () => {
     });
     expect(screen.getByRole("button", { name: "Download file" })).toBeInTheDocument();
   });
+
+  it("renders the wrap, copy, and download buttons as siblings so they align", async () => {
+    render(<MessageResponse>{"```ts\nconst value = 1;\n```"}</MessageResponse>);
+
+    const wrap = await screen.findByRole("button", { name: "Toggle word wrap" });
+    const copy = screen.getByRole("button", { name: "Copy Code" });
+    const download = screen.getByRole("button", { name: "Download file" });
+
+    // All three share one flex row; a common parent is what keeps them
+    // vertically centered on the same baseline.
+    expect(wrap.parentElement).toBe(copy.parentElement);
+    expect(copy.parentElement).toBe(download.parentElement);
+  });
+
+  it("downloads the fenced code with a language-derived filename", async () => {
+    const createUrl = vi.fn(() => "blob:mock");
+    const revokeUrl = vi.fn();
+    vi.stubGlobal("URL", { ...URL, createObjectURL: createUrl, revokeObjectURL: revokeUrl });
+    const clickSpy = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => undefined);
+
+    render(<MessageResponse>{"```python\nprint(1)\n```"}</MessageResponse>);
+
+    const download = await screen.findByRole("button", { name: "Download file" });
+    let downloadedName = "";
+    const appendSpy = vi
+      .spyOn(document.body, "append")
+      .mockImplementation((...nodes: (Node | string)[]) => {
+        const node = nodes[0];
+        if (node instanceof HTMLAnchorElement) {
+          downloadedName = node.download;
+        }
+      });
+
+    fireEvent.click(download);
+
+    expect(clickSpy).toHaveBeenCalledTimes(1);
+    expect(downloadedName).toBe("file.py");
+
+    appendSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
 });

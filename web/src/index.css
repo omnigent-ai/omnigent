@@ -1886,15 +1886,3 @@ aside[aria-label="Workspace"][data-maximized] {
   height: var(--emoji-picker-height, 420px) !important;
   min-height: 0 !important;
 }
-
-/* Align Streamdown's code block download button with custom overlay buttons
- * (wrap toggle, copy). Streamdown renders its download button as a direct child
- * of the code-block container; ensure it shares the same vertical center as the
- * custom buttons by matching their size-8 (32px) height. */
-[data-streamdown="code-block"] > button {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  height: 2rem; /* size-8, matching custom buttons */
-  width: 2rem;
-}
