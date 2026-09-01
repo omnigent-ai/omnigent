@@ -17,7 +17,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, TypeAlias, cast
+from typing import IO, TYPE_CHECKING, TypeAlias, cast
 
 import tomlkit
 import websockets
@@ -62,6 +62,7 @@ from omnigent.inner.codex_executor import (
     materialize_codex_provider_config,
     read_codex_model_catalog,
     write_codex_hooks_file,
+    write_codex_provider_routing_config,
 )
 from omnigent.inner.databricks_executor import _databricks_gateway_host
 from omnigent.process_logging import log_info_once, log_once
@@ -807,24 +808,55 @@ async def _start_codex_model_discovery_process(
     env: dict[str, str],
     cwd: Path,
     config_overrides: Sequence[str] = (),
+    stderr_log: Path | None = None,
 ) -> asyncio.subprocess.Process:
-    """Start the isolated Codex process used only for model discovery."""
+    """Start the isolated Codex process used only for model discovery.
+
+    :param stderr_log: File capturing codex's stderr so a startup failure's
+        reason (e.g. an unresolvable provider table) survives for the
+        caller's diagnostics. ``None`` discards stderr.
+    """
     override_args: list[str] = []
     for override in config_overrides:
         override_args.extend(("-c", override))
-    return await asyncio.create_subprocess_exec(
-        codex_path,
-        "app-server",
-        "--listen",
-        listen_url,
-        *override_args,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-        env=env,
-        cwd=str(cwd),
-        **_proc.spawn_kwargs(),
-    )
+    with contextlib.ExitStack() as stack:
+        stderr_target: int | IO[bytes] = asyncio.subprocess.DEVNULL
+        if stderr_log is not None:
+            stderr_target = stack.enter_context(open(stderr_log, "wb"))
+        return await asyncio.create_subprocess_exec(
+            codex_path,
+            "app-server",
+            "--listen",
+            listen_url,
+            *override_args,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=stderr_target,
+            env=env,
+            cwd=str(cwd),
+            **_proc.spawn_kwargs(),
+        )
+
+
+def _codex_discovery_stderr_tail(stderr_log: Path | None, limit: int = 500) -> str:
+    """The last stderr line of a discovery/probe codex process, or ``""``.
+
+    Only the final line (codex's ``Error: ...`` diagnostic) rides the raised
+    error — the full stderr can echo config content, so it stays in the
+    0700-protected probe home and the message names where to find it.
+    """
+    if stderr_log is None:
+        return ""
+    try:
+        text = stderr_log.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    if not text:
+        return ""
+    last_line = text.splitlines()[-1].strip()[:limit]
+    if not last_line:
+        return ""
+    return f"{last_line} (full stderr: {stderr_log})"
 
 
 def _allocate_loopback_port() -> int:
@@ -837,12 +869,22 @@ def _allocate_loopback_port() -> int:
 async def _wait_for_discovery_listener(
     process: asyncio.subprocess.Process,
     port: int,
+    stderr_log: Path | None = None,
 ) -> None:
-    """Wait until a discovery app-server accepts loopback connections."""
+    """Wait until a discovery app-server accepts loopback connections.
+
+    :param stderr_log: The process's captured stderr file; an early exit's
+        error includes its tail so the failure names codex's real reason
+        instead of only an exit code.
+    """
     deadline = asyncio.get_running_loop().time() + _CONNECT_TIMEOUT_SECONDS
     while asyncio.get_running_loop().time() < deadline:
         if process.returncode is not None:
-            raise RuntimeError(f"Codex model discovery exited early ({process.returncode})")
+            message = f"Codex model discovery exited early ({process.returncode})"
+            detail = _codex_discovery_stderr_tail(stderr_log)
+            if detail:
+                message = f"{message}: {detail}"
+            raise RuntimeError(message)
         try:
             reader, writer = await asyncio.open_connection("127.0.0.1", port)
         except OSError:
@@ -873,13 +915,37 @@ def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
     key = hashlib.sha256("\n".join(config_overrides).encode("utf-8")).hexdigest()[:12]
     home = Path.home() / ".omnigent" / "cache" / "codex-model-probe" / key
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
-    real_auth = _codex_home_config_source_from_env() / "auth.json"
+    config_source = _codex_home_config_source_from_env()
+    real_auth = config_source / "auth.json"
     probe_auth = home / "auth.json"
     if real_auth.exists():
         with contextlib.suppress(OSError):
             if probe_auth.is_symlink() or probe_auth.exists():
                 probe_auth.unlink()
             probe_auth.symlink_to(real_auth)
+    # The probe's overrides can pin a provider by NAME (a cli-config launch's
+    # -c model_provider="X"); the [model_providers.X] table giving that name
+    # meaning lives only in the user's config.toml. Bridge the routing slice
+    # in (refreshed every probe) or codex exits 1 at startup: `Model provider
+    # `X` not found`, and the host serves no codex catalog.
+    real_config = config_source / "config.toml"
+    probe_config = home / "config.toml"
+    bridged = False
+    if real_config.is_file():
+        try:
+            write_codex_provider_routing_config(real_config, probe_config)
+            bridged = True
+        except Exception:  # noqa: BLE001 — a malformed user config must not crash the probe
+            _logger.warning(
+                "could not bridge provider routing config into the codex probe home",
+                exc_info=True,
+            )
+    if not bridged:
+        # The probe home persists across probes; a previously bridged config
+        # (and any credential-bearing auth command in it) must not outlive
+        # its source being removed or becoming unparseable.
+        with contextlib.suppress(OSError):
+            probe_config.unlink(missing_ok=True)
     return home
 
 
@@ -959,6 +1025,9 @@ async def probe_codex_model_options(*, codex_path: str | None = None) -> list[_J
         pinned_model = databricks.model
     codex_home = await asyncio.to_thread(_probe_codex_home, config_overrides)
     env["CODEX_HOME"] = str(codex_home)
+    # Captured (not discarded): a probe that dies at startup must surface
+    # codex's own reason, not just an exit code.
+    stderr_log = codex_home / "probe-stderr.log"
     port = _allocate_loopback_port()
     listen_url = f"ws://127.0.0.1:{port}"
     process = await _start_codex_model_discovery_process(
@@ -967,10 +1036,11 @@ async def probe_codex_model_options(*, codex_path: str | None = None) -> list[_J
         env=env,
         cwd=codex_home,
         config_overrides=config_overrides,
+        stderr_log=stderr_log,
     )
     client: CodexAppServerClient | None = None
     try:
-        await _wait_for_discovery_listener(process, port)
+        await _wait_for_discovery_listener(process, port, stderr_log=stderr_log)
         client = CodexAppServerClient(
             ws_url=listen_url,
             client_name="omnigent-codex-model-probe",

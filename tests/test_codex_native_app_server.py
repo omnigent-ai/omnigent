@@ -2121,15 +2121,17 @@ async def test_probe_codex_model_options_uses_launch_config_and_marks_default(
         env: dict[str, str],
         cwd: Path,
         config_overrides: tuple[str, ...] = (),
+        stderr_log: Path | None = None,
     ) -> _FakeProcess:
         captured["codex_path"] = codex_path
         captured["env"] = dict(env)
         captured["cwd"] = cwd
         captured["config_overrides"] = list(config_overrides)
+        captured["stderr_log"] = stderr_log
         return _FakeProcess()
 
-    async def _fake_wait(process: object, port: int) -> None:
-        del process, port
+    async def _fake_wait(process: object, port: int, stderr_log: Path | None = None) -> None:
+        del process, port, stderr_log
 
     class _FakeClient:
         def __init__(self, *, ws_url: str, client_name: str) -> None:
@@ -2226,13 +2228,15 @@ async def test_probe_codex_model_options_probes_every_launch_shape(
         env: dict[str, str],
         cwd: Path,
         config_overrides: tuple[str, ...] = (),
+        stderr_log: Path | None = None,
     ) -> _FakeProcess:
+        del stderr_log
         captured["env"] = dict(env)
         captured["config_overrides"] = list(config_overrides)
         return _FakeProcess()
 
-    async def _fake_wait(process: object, port: int) -> None:
-        del process, port
+    async def _fake_wait(process: object, port: int, stderr_log: Path | None = None) -> None:
+        del process, port, stderr_log
 
     class _FakeClient:
         def __init__(self, *, ws_url: str, client_name: str) -> None:
@@ -2266,6 +2270,194 @@ async def test_probe_codex_model_options_probes_every_launch_shape(
     env = captured["env"]
     assert isinstance(env, dict)
     assert "DATABRICKS_HOST" not in env
+
+
+def test_probe_codex_home_bridges_provider_routing_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The probe home carries the user's provider tables, not just auth.
+
+    A cli-config launch pins a provider by NAME (``-c model_provider="X"``);
+    without the ``[model_providers.X]`` table from the user's ``config.toml``
+    codex exits 1 at startup and the host serves no catalog. Only the routing
+    slice is bridged — plugins/MCP servers must not start in the probe.
+    """
+    from omnigent import codex_native_app_server
+
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    real_codex = tmp_path / ".codex"
+    real_codex.mkdir()
+    (real_codex / "auth.json").write_text('{"auth_mode": "chatgpt"}')
+    (real_codex / "config.toml").write_text(
+        'model = "gpt-5.2"\n'
+        'model_provider = "Databricks"\n'
+        '[model_providers.Databricks]\nname = "Databricks"\nbase_url = "https://example"\n'
+        "[plugins.example]\nenabled = true\n"
+        '[mcp_servers.github]\nenabled = true\ncommand = "github-mcp"\n'
+    )
+
+    home = codex_native_app_server._probe_codex_home(['model_provider="Databricks"'])
+
+    probe_config = home / "config.toml"
+    assert probe_config.is_file(), (
+        "the probe CODEX_HOME must carry the provider-routing config; without "
+        "it codex cannot resolve a config.toml-defined model_provider"
+    )
+    config_text = probe_config.read_text()
+    assert "[model_providers.Databricks]" in config_text
+    assert 'model_provider = "Databricks"' in config_text
+    assert "plugins" not in config_text
+    assert "mcp_servers" not in config_text
+    assert (home / "auth.json").is_symlink()
+
+
+def test_probe_codex_home_refreshes_provider_routing_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A provider edit in the user's config reaches the persistent probe home.
+
+    The probe home persists across probes for cache reuse, so a stale bridged
+    config would keep answering with the OLD provider's routing.
+    """
+    from omnigent import codex_native_app_server
+
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    real_codex = tmp_path / ".codex"
+    real_codex.mkdir()
+    (real_codex / "config.toml").write_text(
+        '[model_providers.First]\nbase_url = "https://first.example"\n'
+    )
+
+    overrides = ['model_provider="First"']
+    codex_native_app_server._probe_codex_home(overrides)
+    (real_codex / "config.toml").write_text(
+        '[model_providers.First]\nbase_url = "https://updated.example"\n'
+    )
+    home = codex_native_app_server._probe_codex_home(overrides)
+
+    assert "https://updated.example" in (home / "config.toml").read_text()
+
+
+def test_probe_codex_home_survives_malformed_user_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A config.toml that cannot be parsed degrades to the no-config probe."""
+    from omnigent import codex_native_app_server
+
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    real_codex = tmp_path / ".codex"
+    real_codex.mkdir()
+    (real_codex / "config.toml").write_text("[model_providers\nnot toml")
+
+    home = codex_native_app_server._probe_codex_home([])
+
+    assert home.is_dir()
+    assert not (home / "config.toml").exists()
+
+
+def test_probe_codex_home_removes_stale_bridged_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A bridged config never outlives its source.
+
+    The probe home persists across probes, so a provider table (with a
+    potentially credential-bearing auth command) bridged on an earlier probe
+    must be dropped once the user's config.toml is deleted or turns
+    unparseable — not silently kept routing probes through removed state.
+    """
+    from omnigent import codex_native_app_server
+
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    real_codex = tmp_path / ".codex"
+    real_codex.mkdir()
+    real_config = real_codex / "config.toml"
+    real_config.write_text('[model_providers.First]\nbase_url = "https://first.example"\n')
+
+    overrides = ['model_provider="First"']
+    home = codex_native_app_server._probe_codex_home(overrides)
+    assert (home / "config.toml").is_file()
+
+    # valid -> deleted: the bridged copy goes away with the source.
+    real_config.unlink()
+    home = codex_native_app_server._probe_codex_home(overrides)
+    assert not (home / "config.toml").exists()
+
+    # valid -> malformed: the stale bridged copy is dropped, not kept.
+    real_config.write_text('[model_providers.First]\nbase_url = "https://first.example"\n')
+    codex_native_app_server._probe_codex_home(overrides)
+    real_config.write_text("[model_providers\nnot toml")
+    home = codex_native_app_server._probe_codex_home(overrides)
+    assert not (home / "config.toml").exists()
+
+
+async def test_discovery_early_exit_error_carries_codex_stderr(tmp_path: Path) -> None:
+    """An early probe exit surfaces codex's own failure reason.
+
+    With stderr discarded the caller saw only ``exited early (1)`` while
+    codex's actual diagnostic (e.g. ``Model provider `X` not found``) was
+    lost; the captured log's tail must ride the raised error.
+    """
+    from omnigent import codex_native_app_server
+
+    stderr_log = tmp_path / "probe-stderr.log"
+    stderr_log.write_text(
+        "WARNING: noisy startup line that may echo config content\n"
+        "Error: error loading default config after config error: "
+        "Model provider `Databricks` not found\n"
+    )
+
+    class _DeadProcess:
+        returncode = 1
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await codex_native_app_server._wait_for_discovery_listener(
+            _DeadProcess(),  # type: ignore[arg-type]
+            port=1,
+            stderr_log=stderr_log,
+        )
+
+    message = str(excinfo.value)
+    assert "exited early (1)" in message
+    assert "Model provider `Databricks` not found" in message
+    # Only the final diagnostic line rides the error — the rest of the
+    # stderr (which can echo config content) stays in the protected log.
+    assert "noisy startup line" not in message
+    assert str(stderr_log) in message
+
+
+async def test_discovery_early_exit_without_stderr_log_keeps_plain_error(
+    tmp_path: Path,
+) -> None:
+    """No captured stderr (or an empty one) leaves the plain early-exit error."""
+    from omnigent import codex_native_app_server
+
+    class _DeadProcess:
+        returncode = 1
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await codex_native_app_server._wait_for_discovery_listener(
+            _DeadProcess(),  # type: ignore[arg-type]
+            port=1,
+        )
+    assert str(excinfo.value) == "Codex model discovery exited early (1)"
+
+    empty_log = tmp_path / "empty.log"
+    empty_log.write_text("")
+    with pytest.raises(RuntimeError) as excinfo:
+        await codex_native_app_server._wait_for_discovery_listener(
+            _DeadProcess(),  # type: ignore[arg-type]
+            port=1,
+            stderr_log=empty_log,
+        )
+    assert str(excinfo.value) == "Codex model discovery exited early (1)"
 
 
 def test_resolve_databricks_codex_model_matches_servable_ids() -> None:

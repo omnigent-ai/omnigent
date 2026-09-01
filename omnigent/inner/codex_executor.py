@@ -901,17 +901,10 @@ def _populate_codex_home_config(
         if dest_path.exists() or dest_path.is_symlink():
             continue
         if minimal_config and filename == "config.toml":
-            import tomlkit
-
             # The title worker needs custom-provider routing, but copying the
             # full user config also starts unrelated MCPs/plugins and can exceed
             # its timeout. auth.json alone cannot supply these provider tables.
-            source_config = tomlkit.parse(source_file.read_text())
-            minimal_document = tomlkit.document()
-            for key in ("model_provider", "model_providers", "profiles"):
-                if key in source_config:
-                    minimal_document[key] = source_config[key]
-            dest_path.write_text(tomlkit.dumps(minimal_document))
+            write_codex_provider_routing_config(source_file, dest_path)
             continue
         shutil.copy2(source_file, dest_path)
         if filename == "config.toml":
@@ -924,6 +917,29 @@ def _populate_codex_home_config(
                 )
                 if catalog_path is not None:
                     set_codex_model_catalog_path(dest_path, catalog_path)
+
+
+def write_codex_provider_routing_config(source_file: Path, dest_path: Path) -> None:
+    """Write only the provider-routing slice of a codex config to *dest_path*.
+
+    Keeps ``model_provider``/``model_providers``/``profiles`` — the tables a
+    ``-c model_provider=\"X\"`` override needs to resolve — while dropping
+    plugins, MCP servers, and everything else that would start unrelated
+    machinery in a sidecar/probe codex process.
+
+    :param source_file: The user's ``config.toml``.
+    :param dest_path: Destination config path; overwritten when present.
+    """
+    import tomlkit
+
+    source_config = tomlkit.parse(source_file.read_text())
+    minimal_document = tomlkit.document()
+    for key in ("model_provider", "model_providers", "profiles"):
+        if key in source_config:
+            minimal_document[key] = source_config[key]
+    dest_path.write_text(tomlkit.dumps(minimal_document))
+    # Provider tables can carry credential-bearing auth commands.
+    os.chmod(dest_path, 0o600)
 
 
 def materialize_codex_provider_config(

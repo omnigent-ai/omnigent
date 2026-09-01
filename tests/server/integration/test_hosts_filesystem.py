@@ -290,6 +290,44 @@ async def test_host_model_options_returns_prelaunch_catalog(
     }
 
 
+async def test_host_model_options_empty_catalog_with_reason_is_not_a_500(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """An honest empty answer (status ok, string error) reaches the picker.
+
+    The host reports a failed model probe as ``status="ok"`` with
+    ``models=[]`` and a string ``error`` naming the reason. The route must
+    pass that through as a 200 payload — a response annotation that rejects
+    the string field turned it into an opaque HTTP 500 and the picker lost
+    both the empty catalog and its reason.
+    """
+    app, _reg, _comm, replies, _drain = fs_setup
+    replies["model:codex-native"] = {
+        "status": "ok",
+        "models": [],
+        "routable_models": [],
+        "error": "the codex model probe failed — see the host log",
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            f"/v1/hosts/{_HOST_ID}/harnesses/codex-native/model-options",
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "models": [],
+        "routable_models": [],
+        "error": "the codex model probe failed — see the host log",
+    }
+
+
 async def test_list_filesystem_returns_paginated_entries(
     fs_setup: tuple[
         FastAPI,
