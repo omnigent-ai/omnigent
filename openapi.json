@@ -1879,7 +1879,7 @@
           },
           "source": {
             "default": "execution",
-            "description": "Where the fault originated \u2014 `\"llm\"` for inference/context errors, `\"execution\"` for runner or harness failures. Mirrors `ErrorEvent.source`.",
+            "description": "Where the fault originated -- `\"llm\"` for inference/context errors, `\"execution\"` for runner or harness failures. Mirrors `ErrorEvent.source`.",
             "enum": [
               "llm",
               "execution",
