@@ -146,6 +146,11 @@ def test_failed_event_source_is_forwarded() -> None:
         source="llm",
         response=_resp_obj("failed"),
     )
+    failed_harness = FailedEvent(
+        type="response.failed",
+        source="harness",
+        response=_resp_obj("failed"),
+    )
     failed_exec = FailedEvent(
         type="response.failed",
         source="execution",
@@ -154,11 +159,14 @@ def test_failed_event_source_is_forwarded() -> None:
     failed_default = FailedEvent(type="response.failed", response=_resp_obj("failed"))
 
     out_llm = _server_event_to_sdk_event(failed_llm)
+    out_harness = _server_event_to_sdk_event(failed_harness)
     out_exec = _server_event_to_sdk_event(failed_exec)
     out_default = _server_event_to_sdk_event(failed_default)
 
     assert isinstance(out_llm, ResponseFailed)
     assert out_llm.source == "llm"
+    assert isinstance(out_harness, ResponseFailed)
+    assert out_harness.source == "harness"
     assert isinstance(out_exec, ResponseFailed)
     assert out_exec.source == "execution"
     assert isinstance(out_default, ResponseFailed)

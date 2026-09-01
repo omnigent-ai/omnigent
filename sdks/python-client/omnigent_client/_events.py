@@ -67,7 +67,7 @@ class ResponseFailed:
     """``response.failed`` — unrecoverable error."""
 
     response: Response
-    source: str = "execution"  # "llm" or "execution"
+    source: str = "execution"  # "llm", "execution", "harness", or "tool"
 
 
 @dataclass

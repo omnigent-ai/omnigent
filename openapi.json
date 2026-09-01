@@ -1717,7 +1717,8 @@
             "enum": [
               "llm",
               "execution",
-              "tool"
+              "tool",
+              "harness"
             ],
             "title": "Source",
             "type": "string"
@@ -1879,11 +1880,12 @@
           },
           "source": {
             "default": "execution",
-            "description": "Where the fault originated -- `\"llm\"` for inference/context errors, `\"execution\"` for runner or harness failures. Mirrors `ErrorEvent.source`.",
+            "description": "Where the fault originated -- `\"llm\"` for inference/context errors, `\"harness\"` for Claude Code/harness process failures, `\"execution\"` for runner configuration or infrastructure failures.",
             "enum": [
               "llm",
               "execution",
-              "tool"
+              "tool",
+              "harness"
             ],
             "title": "Source",
             "type": "string"

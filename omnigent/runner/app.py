@@ -1264,10 +1264,11 @@ def _response_failed_event(
 
     :param error: Error payload to place under ``response.error``,
         e.g. ``{"code": "connection_error", "message": "dropped"}``.
-    :param source: Where the fault originated — ``"llm"`` for
-        inference/context errors, ``"execution"`` for runner or
-        harness failures.  Forwarded as-is to the AP server so it
-        can persist the right ``ErrorData.source``.
+    :param source: Where the fault originated -- ``"llm"`` for
+        inference/context errors, ``"harness"`` for Claude Code/harness
+        process failures, ``"execution"`` for runner configuration
+        or infrastructure failures.  Forwarded as-is to the AP server
+        so it can persist the right ``ErrorData.source``.
     :returns: UTF-8 encoded SSE frame bytes.
     """
     response = {"status": "failed", "error": error}
@@ -7305,6 +7306,7 @@ def create_runner_app(
                         )
                         _fail_status = {
                             "type": "response.failed",
+                            "source": "harness",
                             "error": {
                                 "status": harness_resp.status_code,
                             },
@@ -7317,7 +7319,9 @@ def create_runner_app(
                             conv_id,
                             error={"status": harness_resp.status_code},
                         )
-                        yield _response_failed_event({"status": harness_resp.status_code})
+                        yield _response_failed_event(
+                            {"status": harness_resp.status_code}, source="harness"
+                        )
                         return
 
                     _omnigent_task_id = cast(str | None, body.get("task_id"))
@@ -7711,12 +7715,13 @@ def create_runner_app(
                 }
                 _http_fail = {
                     "type": "response.failed",
+                    "source": "harness",
                     "response": {"status": "failed", "error": _error},
                     "error": _error,
                 }
                 _publish_event(conv_id, _http_fail)
                 _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
-                yield _response_failed_event(_error)
+                yield _response_failed_event(_error, source="harness")
 
         return StreamingResponse(
             proxy_stream(),

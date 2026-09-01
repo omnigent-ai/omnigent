@@ -64,6 +64,18 @@ def test_response_failed_propagates_llm_source() -> None:
     assert item.data.source == "llm"
 
 
+def test_response_failed_propagates_harness_source() -> None:
+    """A ``response.failed`` with ``source="harness"`` (Claude Code crash) is stored
+    as ``source="harness"`` so users can see it's a harness fault, not Omnigent."""
+    item = _error_item_from_sse(
+        _failed_event(source="harness", code="connection_error", message="harness died"),
+        response_id="resp_1",
+    )
+    assert item is not None
+    assert isinstance(item.data, ErrorData)
+    assert item.data.source == "harness"
+
+
 def test_response_failed_propagates_execution_source_explicitly() -> None:
     """Explicit ``source="execution"`` is preserved (same as default but asserted)."""
     item = _error_item_from_sse(

@@ -4112,14 +4112,15 @@ class FailedEvent(_SSEEventBase):
 
     :param type: Always ``"response.failed"``.
     :param source: Where the fault originated -- ``"llm"`` for
-        inference/context errors, ``"execution"`` for runner or
-        harness failures.  Mirrors :attr:`ErrorEvent.source`.
+        inference/context errors, ``"harness"`` for Claude Code/harness
+        process failures, ``"execution"`` for runner configuration
+        or infrastructure failures.
     :param response: The failure response object with ``status="failed"``
         and ``error`` populated.
     """
 
     type: Literal["response.failed"]
-    source: Literal["llm", "execution", "tool"] = "execution"
+    source: Literal["llm", "execution", "tool", "harness"] = "execution"
     response: ResponseObject | FailedResponseObject
 
 

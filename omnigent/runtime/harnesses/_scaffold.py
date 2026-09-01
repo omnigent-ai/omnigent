@@ -1702,7 +1702,10 @@ class HarnessApp:
             )
         elif status_value == "failed":
             terminal = FailedEvent(
-                type="response.failed", response=response, sequence_number=sequence
+                type="response.failed",
+                source="harness",
+                response=response,
+                sequence_number=sequence,
             )
         else:
             from omnigent.server.schemas import CancelledEvent
