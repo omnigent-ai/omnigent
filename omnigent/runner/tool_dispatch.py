@@ -5813,7 +5813,7 @@ async def execute_tool(
                 args,
                 session_inbox=session_inbox,
                 session_async_tasks=session_async_tasks,
-                harness_client=harness_client or httpx.AsyncClient(),
+                harness_client=harness_client,
                 server_client=server_client,
                 terminal_registry=terminal_registry,
                 resource_registry=resource_registry,

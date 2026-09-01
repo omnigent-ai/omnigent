@@ -557,7 +557,10 @@ export async function importLocalSessions(
  *
  * @param bundle - The agent bundle as a `File` (`.tar.gz`).
  * @param metadata - Session-level metadata (host_id, workspace, labels, etc.).
- * @returns The created session's id.
+ *   A `project_id` files the session into that project atomically at create
+ *   and lets the server default-fill absent fields from the project config.
+ * @returns The created session's id, plus any non-fatal project-consistency
+ *   `warnings` the server attached to a `project_id` create.
  */
 export async function createBundledSession(
   bundle: File,
@@ -565,11 +568,12 @@ export async function createBundledSession(
     host_id?: string;
     host_type?: string;
     workspace?: string;
+    project_id?: string;
     labels?: Record<string, string>;
     terminal_launch_args?: string[];
     git?: { branch_name: string; base_branch?: string };
   } = {},
-): Promise<{ id: string }> {
+): Promise<{ id: string; warnings?: { code?: string; message?: string }[] }> {
   const form = new FormData();
   form.append("metadata", JSON.stringify(metadata));
   form.append("bundle", bundle);
@@ -585,8 +589,11 @@ export async function createBundledSession(
   // The multipart response uses `session_id` (CreatedSessionResponse),
   // while the JSON path uses `id` (SessionResponse). Normalize to `id`
   // so callers don't need to care which path was taken.
-  const body = (await res.json()) as { session_id: string };
-  return { id: body.session_id };
+  const body = (await res.json()) as {
+    session_id: string;
+    warnings?: { code?: string; message?: string }[];
+  };
+  return { id: body.session_id, warnings: body.warnings };
 }
 
 /**

@@ -268,8 +268,13 @@ describe("NewChatLandingScreen project prefill", () => {
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("beta"),
     );
     const body = await submitAndReadBody();
-    expect(body.agent_id).toBe("ag_hello");
-    expect(body.workspace).toBe(BETA_REPO);
+    // Beta's seeded slots are still config-values, so the create omits them
+    // for server default-fill under Beta's project_id. Had Alpha's drafted
+    // agent survived, it would differ from Beta's config and be sent
+    // explicitly — the omission is the assertion.
+    expect(body.project_id).toBe("proj_beta");
+    expect("agent_id" in body).toBe(false);
+    expect("workspace" in body).toBe(false);
   });
 
   it("keeps the draft's picked agent on a same-project remount", async () => {
@@ -286,8 +291,11 @@ describe("NewChatLandingScreen project prefill", () => {
 
     renderLanding();
     const body = await submitAndReadBody();
+    // The explicit pick differs from the config agent, so it rides
+    // explicitly; the untouched config workspace is omitted (default-fill).
     expect(body.agent_id).toBe("ag_other");
-    expect(body.workspace).toBe(REPO);
+    expect("workspace" in body).toBe(false);
+    expect(body.project_id).toBe("proj_alpha");
   });
 
   it("carries a pinned session-scoped config agent into the create body over last-agent-id", async () => {
@@ -313,8 +321,11 @@ describe("NewChatLandingScreen project prefill", () => {
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
     );
     const body = await submitAndReadBody();
-    expect(body.agent_id).toBe("ag_pinned");
-    expect(body.workspace).toBe(REPO);
+    // The configured agent held (untouched → omitted for default-fill). Had
+    // last-agent-id displaced it, the differing agent would be sent explicitly.
+    expect(body.project_id).toBe("proj_alpha");
+    expect("agent_id" in body).toBe(false);
+    expect("workspace" in body).toBe(false);
     // The composer must thread the configured agent into discovery's pins —
     // that's what makes the session-scoped row above resolvable at all.
     expect(
@@ -362,8 +373,10 @@ describe("NewChatLandingScreen project prefill", () => {
     );
     const body = await submitAndReadBody();
     expect(body.host_id).toBe("host_1");
-    expect(body.workspace).toBe(REPO);
-    expect(body.agent_id).toBe("ag_other");
+    // Untouched config-seeded slots are omitted for server default-fill.
+    expect(body.project_id).toBe("proj_alpha");
+    expect("workspace" in body).toBe(false);
+    expect("agent_id" in body).toBe(false);
     // No opt-in worktree → no git block.
     expect(body.git).toBeUndefined();
   });
@@ -374,7 +387,8 @@ describe("NewChatLandingScreen project prefill", () => {
 
     const body = await submitAndReadBody();
     expect(body.host_id).toBe("host_1");
-    expect(body.workspace).toBe(REPO);
+    expect("workspace" in body).toBe(false);
+    // The branch name is generated client-side, so `git` is always explicit.
     expect((body.git as { branch_name: string }).branch_name).toMatch(/^worktree-[0-9a-f]{8}$/);
   });
 
@@ -383,7 +397,7 @@ describe("NewChatLandingScreen project prefill", () => {
     renderLanding();
 
     const body = await submitAndReadBody();
-    expect(body.workspace).toBe(REPO);
+    expect("workspace" in body).toBe(false);
     expect(body.git).toBeUndefined();
   });
 
@@ -420,7 +434,11 @@ describe("NewChatLandingScreen project prefill", () => {
     rerender(<NewChatLandingScreen />);
 
     const body = await submitAndReadBody();
-    expect(body.agent_id).toBe("ag_other");
+    // The config agent seeded (and stayed) → omitted for default-fill. A
+    // premature settle would have picked the generic default, which differs
+    // from the config and would ride explicitly.
+    expect(body.project_id).toBe("proj_alpha");
+    expect("agent_id" in body).toBe(false);
   });
 
   it("reseeds from the new project when another pencil is clicked while mounted", async () => {
@@ -443,8 +461,11 @@ describe("NewChatLandingScreen project prefill", () => {
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("beta"),
     );
     const body = await submitAndReadBody();
-    expect(body.workspace).toBe(BETA_REPO);
-    expect(body.agent_id).toBe("ag_other");
+    // Reseeded to Beta's config (the chip check above proves the UI): both
+    // slots stayed config-values, omitted under Beta's project_id.
+    expect(body.project_id).toBe("proj_beta");
+    expect("workspace" in body).toBe(false);
+    expect("agent_id" in body).toBe(false);
   });
 
   it("clears a drafted sandbox repository on an in-place project switch (screen stays mounted)", async () => {
@@ -478,9 +499,10 @@ describe("NewChatLandingScreen project prefill", () => {
     );
     const body = await submitAndReadBody();
     expect(body.host_type).toBe("managed");
-    // Blank repo inputs compose to an omitted workspace — not Alpha's
-    // repo#branch.
-    expect(body.workspace).toBeUndefined();
+    // Blank repo inputs pin workspace to explicit null under Beta's
+    // project_id (a managed create rejects a default-filled path) — not
+    // Alpha's repo#branch.
+    expect(body.workspace).toBeNull();
   });
 
   it("reseeds the SAME project after its stored defaults change (edited then re-opened)", async () => {
@@ -504,7 +526,10 @@ describe("NewChatLandingScreen project prefill", () => {
       ),
     );
     const body = await submitAndReadBody();
-    expect(body.workspace).toBe(EDITED_REPO);
+    // The chip check above proves the edited workspace reseeded; being a
+    // config-value again, the create omits it for default-fill.
+    expect(body.project_id).toBe("proj_alpha");
+    expect("workspace" in body).toBe(false);
   });
 
   it("keeps the configured workspace when the config host is offline (host falls back)", async () => {
@@ -519,7 +544,9 @@ describe("NewChatLandingScreen project prefill", () => {
     // workspace hint must not be displaced by the host's recent path (which
     // can belong to another project).
     expect(body.host_id).toBe("host_1");
-    expect(body.workspace).toBe("/somewhere");
+    // The workspace hint held (still the config value) → omitted; the server
+    // default-fills it. A displaced hint would ride as an explicit recent path.
+    expect("workspace" in body).toBe(false);
   });
 
   // A repo with a main work tree plus one linked worktree. `git worktree list`
@@ -604,7 +631,8 @@ describe("NewChatLandingScreen project prefill", () => {
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("gamma"),
     );
     const body = await submitAndReadBody();
-    expect(body.workspace).toBe(MAIN_REPO);
+    // Config workspace held (chip check above) → omitted for default-fill.
+    expect("workspace" in body).toBe(false);
     // Plain launch — no worktree fork was manufactured from the config workspace.
     expect(body.git).toBeUndefined();
   });
@@ -631,7 +659,10 @@ describe("NewChatLandingScreen project prefill", () => {
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
     );
     const body = await submitAndReadBody();
-    expect(body.workspace).toBe(REPO);
+    // Config workspace held → omitted under Alpha's project_id for
+    // default-fill; the retracted branch stays retracted.
+    expect(body.project_id).toBe("proj_alpha");
+    expect("workspace" in body).toBe(false);
     expect(body.git).toBeUndefined();
   });
 
@@ -713,7 +744,10 @@ describe("NewChatLandingScreen global always-use-worktree default", () => {
 
     await waitFor(() => expect(branchLabel()).toMatch(/^worktree-[0-9a-f]{8}$/));
     const body = await submitAndReadBody();
-    expect(body.workspace).toBe(REPO);
+    // Untouched config workspace → omitted under the project_id create; the
+    // client-generated branch is always explicit.
+    expect(body.project_id).toBe("proj_alpha");
+    expect("workspace" in body).toBe(false);
     expect((body.git as { branch_name: string }).branch_name).toMatch(/^worktree-[0-9a-f]{8}$/);
   });
 
@@ -728,7 +762,9 @@ describe("NewChatLandingScreen global always-use-worktree default", () => {
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
     );
     const body = await submitAndReadBody();
-    expect(body.workspace).toBe(REPO);
+    // Untouched config workspace → omitted under the project_id create.
+    expect(body.project_id).toBe("proj_alpha");
+    expect("workspace" in body).toBe(false);
     expect(body.git).toBeUndefined();
   });
 
@@ -741,7 +777,10 @@ describe("NewChatLandingScreen global always-use-worktree default", () => {
 
     await waitFor(() => expect(branchLabel()).toMatch(/^worktree-[0-9a-f]{8}$/));
     const body = await submitAndReadBody();
-    expect(body.workspace).toBe(REPO);
+    // Untouched config workspace → omitted under the project_id create; the
+    // client-generated branch is always explicit.
+    expect(body.project_id).toBe("proj_alpha");
+    expect("workspace" in body).toBe(false);
     expect((body.git as { branch_name: string }).branch_name).toMatch(/^worktree-[0-9a-f]{8}$/);
   });
 

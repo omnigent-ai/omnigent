@@ -174,9 +174,17 @@ _INIT_CONTAINER_NAME: str = "workspace-prep"
 # image / clone its repo fails fast with a clear reason instead of as a generic
 # online timeout. Kept tight; a cold image pull is the usual slow case —
 # deployments whose host image regularly takes longer to pull can raise the
-# budget via ``sandbox.kubernetes.pod_ready_timeout_s``.
+# budget via ``sandbox.kubernetes.pod_ready_timeout_s``, or, when that isn't
+# set, via :data:`_POD_READY_TIMEOUT_ENV_VAR`.
 _POD_READY_TIMEOUT_S: int = 90
 _POD_READY_POLL_S: float = 2.0
+
+# Env var fallback for the pod-ready wait budget, mirroring
+# omnigent.onboarding.sandboxes.e2b.MAX_LIFETIME_ENV_VAR. Only consulted when
+# the launcher wasn't constructed with an explicit pod_ready_timeout_s (i.e.
+# sandbox.kubernetes.pod_ready_timeout_s is unset in the bundle) — the
+# explicit config key always wins when both are present.
+_POD_READY_TIMEOUT_ENV_VAR: str = "OMNIGENT_K8S_POD_READY_TIMEOUT_S"
 
 # Per-request client timeout for the blocking calls. Without it a stalled
 # apiserver socket blocks indefinitely and the wait deadline never fires.
@@ -287,6 +295,34 @@ def _ensure_sdk() -> None:
         raise click.ClickException(
             "The Kubernetes client is required for the 'kubernetes' sandbox "
             "provider. Install it with `pip install 'omnigent[kubernetes]'`."
+        ) from exc
+
+
+def _resolve_pod_ready_timeout_s(configured: int | None) -> int:
+    """
+    Resolve the pod-ready wait budget for :meth:`_wait_for_pod_running`.
+
+    Precedence: the explicit ``sandbox.kubernetes.pod_ready_timeout_s``
+    config value (``configured``, already parsed by the caller) wins when
+    set; otherwise :data:`_POD_READY_TIMEOUT_ENV_VAR` overrides the
+    :data:`_POD_READY_TIMEOUT_S` default, mirroring
+    ``omnigent.onboarding.sandboxes.e2b.resolve_max_lifetime_s``.
+
+    :param configured: The launcher's ``pod_ready_timeout_s`` constructor
+        argument, or ``None`` when the bundle didn't set it.
+    :returns: The timeout in seconds to wait for the Pod to reach ``Running``.
+    :raises click.ClickException: When the env override is not a number.
+    """
+    if configured is not None:
+        return configured
+    raw = os.environ.get(_POD_READY_TIMEOUT_ENV_VAR)
+    if raw is None:
+        return _POD_READY_TIMEOUT_S
+    try:
+        return int(float(raw))
+    except ValueError as exc:
+        raise click.ClickException(
+            f"{_POD_READY_TIMEOUT_ENV_VAR} must be a number of seconds"
         ) from exc
 
 
@@ -1448,11 +1484,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         from urllib3.exceptions import HTTPError
 
         core = self._load_core()
-        timeout_s = (
-            self._pod_ready_timeout_s
-            if self._pod_ready_timeout_s is not None
-            else _POD_READY_TIMEOUT_S
-        )
+        timeout_s = _resolve_pod_ready_timeout_s(self._pod_ready_timeout_s)
         deadline = time.monotonic() + timeout_s
         last_reason: str | None = None
         pod_name: str | None = None
