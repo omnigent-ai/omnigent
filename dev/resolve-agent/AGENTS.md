@@ -272,9 +272,10 @@ reproduction test is your objective instrument.
    Use the same lanes as 2B.5 — see [`dev/recording-lanes.md`](../recording-lanes.md)
    (build the SPA first, record via `OMNIGENT_E2E_RECORD_DIR`, per-surface `web` /
    `mobile` / `terminal` / `cli` / `desktop` mechanics) — saving to
-   `recordings/<slug>/after-<facet>.<ext>` with a `caption` for what the clip shows. A passing run's footage is the "after" half (the bug resolved); a
-   failing run's footage shows the PR author exactly what still breaks — either
-   way you record it. When the handoff *does* carry a before clip, carry it
+   `recordings/<slug>/after-<facet>.<ext>` with a `caption` for what the clip
+   shows. The test result determines the verdict separately; the footage must
+   show the product journey and its visible outcome, never the test runner. When
+   the handoff *does* carry a before clip, carry it
    through **and** produce the after; when it carries none, still produce the
    after and note the missing before. Only omit the after clip when it is
    genuinely unobtainable (recorder tooling missing, or the fixture can't come
@@ -495,9 +496,11 @@ per-surface mechanics for `web` / `mobile` / `terminal` / `cli` / `desktop`, plu
 empty-recordings and caption rules. This step states only *which clip resolve
 produces*:
 
-- After the fix, re-run the recovered test on the fixed tree so it **PASSES**; that
-  passing run is the **after-fix clip** (`kind: "after"`) — the human-visible half
-  of your fail→pass proof. Move it to a stable `recordings/<slug>/after-<facet>.<ext>`.
+- After the fix, use the recovered test on the fixed tree to drive and verify the
+  passing journey; the **after-fix clip** (`kind: "after"`) must show only the
+  product surface and corrected user-visible behavior, never pytest, assertions,
+  logs, or test source. Move it to a stable
+  `recordings/<slug>/after-<facet>.<ext>`.
 - If the repro handoff carried a **before** clip (recover it from the repro
   session's `workspace` or the CI artifact bundle), carry it through unchanged
   alongside your after clip; when it carried none, produce the after clip anyway and
@@ -1228,10 +1231,13 @@ the message. Same discipline as repro-agent:
   },
   "recordings": [
     {"surface": "web", "kind": "before", "path": "recordings/1234/before-picker.webm", "format": "webm",
+     "capture_mode": "playwright_ui",
      "caption": "open the model picker → select the catalog → picker shows raw IDs"},
     {"surface": "web", "kind": "after", "path": "recordings/1234/after-picker.webm", "format": "webm",
+     "capture_mode": "playwright_ui",
      "caption": "open the model picker → select the catalog → picker now shows friendly names"}
   ],
+  "recording_unavailable_reason": "",
   "test_audit": "repro e2e was behavioral (failed on raw IDs); no rewrite needed",
   "hermetic_check": "test_picker_label re-run with ambient env vars set — still passes",
   "cross_review": "codex reviewer: no blocking findings; noted a null-guard, addressed",
@@ -1273,7 +1279,8 @@ Field meanings:
   of targeted tests you wrote (empty in review mode).
 - `recordings` — your after-fix footage (`kind: "after"`), plus any before-fix
   footage carried through from the repro handoff, same
-  `{surface, kind, path, format, caption}` shape as repro-agent's field. You
+  `{surface, kind, path, format, capture_mode, caption}` shape as repro-agent's
+  field. You
   produce an `after` clip on **every** author/review run — it is driven off the
   reproduction test, not off an upstream file, so it does not depend on the repro
   handoff carrying footage. When a before clip was recovered, carry its `caption`
@@ -1283,8 +1290,11 @@ Field meanings:
   review mode, the "after" entries are the drivers recorded against the reviewed
   PR head. The list is empty **only** when recording is genuinely blocked — the
   recorder tooling is missing, or the fixture can't come online after the SPA
-  build — never merely because the upstream run left no footage; say which in
-  prose.
+  build — never merely because the upstream run left no footage.
+- `recording_unavailable_reason` — empty when every expected clip is present;
+  otherwise name the concrete blocker. For API-only evidence, say it is textual.
+  Missing or rejected footage never blocks the fix or PR, and must never be
+  replaced with a synthetic fallback or a video of the test runner.
 - `test_audit` — the result of the Step 2B.1 audit (author mode). In review mode,
   note whether the repro test was behavioral as-is.
 - `hermetic_check` — the result of the Step 2B.5 hostile-env re-run when the diff
