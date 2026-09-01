@@ -1847,6 +1847,17 @@
             "default": null,
             "title": "Sequence Number"
           },
+          "source": {
+            "default": "execution",
+            "description": "Where the fault originated \u2014 `\"llm\"` for inference/context errors, `\"execution\"` for runner or harness failures. Mirrors `ErrorEvent.source`.",
+            "enum": [
+              "llm",
+              "execution",
+              "tool"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
           "type": {
             "const": "response.failed",
             "description": "Always `\"response.failed\"`.",
