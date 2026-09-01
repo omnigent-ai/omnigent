@@ -1875,6 +1875,7 @@ export function AppShell() {
                     }
                   }}
                   isChildSession={isChildSession}
+                  subAgentName={activeSession?.subAgentName ?? null}
                   conversationId={conversationId}
                   actionConversation={actionConversation}
                   conversationTitle={headerConversationTitle}
