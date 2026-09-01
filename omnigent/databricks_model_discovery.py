@@ -122,8 +122,9 @@ def preferred_served_claude_model(
     """Choose a served Claude id closest to *preferred_model_id*.
 
     Equivalent ``databricks-`` and ``system.ai.`` spellings identify the same
-    endpoint. Otherwise, the newest served model in the requested family wins,
-    followed by the standard family order.
+    endpoint. Otherwise, the newest served model in the requested family wins.
+    Cross-family fallback is the caller's job (tier precedence lives there),
+    so no same-family match returns ``None``.
 
     :param served_ids: Model ids an authoritative workspace listing returned.
     :param preferred_model_id: The implicit catalog default to match.
@@ -146,11 +147,7 @@ def preferred_served_claude_model(
     )
     if equivalent is not None:
         return equivalent
-    newest_by_family = _models_by_claude_family(claude_ids, marker="claude-")
-    for family in (preferred_family, *CLAUDE_MODEL_FAMILIES):
-        if family in newest_by_family:
-            return newest_by_family[family]
-    return None
+    return _models_by_claude_family(claude_ids, marker="claude-").get(preferred_family)
 
 
 def _list_model_service_ids(

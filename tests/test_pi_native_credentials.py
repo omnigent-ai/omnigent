@@ -1590,6 +1590,26 @@ def test_unserved_catalog_default_prefers_same_claude_family(
     assert provider.model == "system.ai.claude-sonnet-4-6"
 
 
+def test_unserved_family_falls_back_by_tier_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No served model in the default's family picks by opus > sonnet > … tier.
+
+    A newest-first cross-family walk inside the served-model matcher would pick
+    fable here; the established tier precedence must pick opus instead.
+    """
+    _set_catalog_default(monkeypatch, "databricks-claude-sonnet-5")
+    _mock_databricks_model_lists(
+        monkeypatch,
+        claude=["system.ai.claude-fable-6", "system.ai.claude-opus-5"],
+    )
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
+
+    assert provider is not None
+    assert provider.model == "system.ai.claude-opus-5"
+
+
 def test_served_catalog_default_accepts_equivalent_spelling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

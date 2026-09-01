@@ -903,7 +903,8 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
                 )
             except Exception:  # noqa: BLE001 — network failure must not break launch
                 _LOGGER.info(
-                    "pi-native: could not fetch workspace model list; showing default model only"
+                    "pi-native: could not fetch workspace model list; showing default model only",
+                    exc_info=True,
                 )
         else:
             _LOGGER.info(
