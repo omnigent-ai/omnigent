@@ -5,18 +5,12 @@ Corporate license/SCA scanners (FOSSA, Black Duck, ...) block installing
 wheels' core METADATA has no ``License-Expression``, ``License-File``, or
 ``License ::`` classifier — even though the repo root is Apache-2.0.
 
-The wheels are built by hatchling straight from each sub-package's
-``pyproject.toml`` ``[project]`` table, so the reproduction/guard is
-two-layered:
-
-* a static check that each sub-package's ``pyproject.toml`` declares a
-  license (PEP 621/639 ``license`` or an OSI ``License ::`` classifier)
-  plus ``license-files`` globs that resolve to real files — the absence of
-  these declarations is exactly what produces a license-less wheel;
-* an artifact check that actually builds each wheel with ``uv build`` and
-  asserts the METADATA inside it carries the license fields scanners look
-  for. This layer skips (with the concrete reason) when the build backend
-  cannot be fetched in a network-restricted environment.
+This artifact check actually builds each wheel with ``uv build`` and
+asserts the METADATA inside it carries the license fields scanners look
+for. It skips (with the concrete reason) when the build backend cannot be
+fetched in a network-restricted environment. The fast, network-free static
+companion check on each sub-package's ``pyproject.toml`` runs in the
+default unit lane: ``tests/test_sub_package_license_metadata.py``.
 
 Run with::
 
@@ -33,7 +27,6 @@ from email.message import Message
 from pathlib import Path
 
 import pytest
-import tomllib
 
 REPO_ROOT = Path(__file__).parents[2]
 
@@ -66,48 +59,6 @@ def _core_metadata_license_fields(metadata: Message) -> list[tuple[str, str]]:
         if classifier.startswith("License ::"):
             fields.append(("Classifier", classifier))
     return fields
-
-
-@pytest.mark.parametrize(
-    ("dist_name", "pkg_dir"),
-    SUB_PACKAGES,
-    ids=[name for name, _ in SUB_PACKAGES],
-)
-def test_pyproject_declares_license_metadata(dist_name: str, pkg_dir: Path) -> None:
-    """Each sub-package pyproject must declare the license hatchling emits.
-
-    A hatchling wheel's METADATA is generated mechanically from the
-    ``[project]`` table, so a pyproject with no ``license``, no
-    ``license-files``, and no ``License ::`` classifier provably yields a
-    wheel with zero license fields — the exact state SCA scanners reject.
-    """
-    pyproject_path = REPO_ROOT / pkg_dir / "pyproject.toml"
-    project = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))["project"]
-
-    problems: list[str] = []
-
-    has_license_key = "license" in project
-    has_license_classifier = any(
-        c.startswith("License ::") for c in project.get("classifiers", [])
-    )
-    if not has_license_key and not has_license_classifier:
-        problems.append("no `license` (PEP 621/639 expression) and no `License ::` classifier")
-
-    license_files = project.get("license-files")
-    if not license_files:
-        problems.append("no `license-files` — the wheel ships no license text")
-    else:
-        for pattern in license_files:
-            if not list((REPO_ROOT / pkg_dir).glob(pattern)):
-                problems.append(
-                    f"`license-files` glob {pattern!r} matches no file under {pkg_dir}"
-                )
-
-    assert not problems, (
-        f"{dist_name} ({pkg_dir}/pyproject.toml) declares no license metadata, "
-        f"so its wheel METADATA carries no license fields and SCA scanners "
-        f"block the install: " + "; ".join(problems)
-    )
 
 
 @pytest.mark.parametrize(
