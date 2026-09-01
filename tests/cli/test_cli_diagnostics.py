@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import logging
 import sys
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -150,6 +151,604 @@ def test_redirect_stderr_to_log_redacts_direct_stderr_writes(
         f"redirected stderr should not paint into the terminal, got: "
         f"{terminal_stderr.getvalue()!r}"
     )
+
+
+@pytest.mark.parametrize(
+    ("text", "removed", "preserved"),
+    [
+        (
+            "Authorization: Bearer eyJhbGciOiJexposedOPAQUE12345",
+            ("eyJhbGciOiJexposedOPAQUE12345",),
+            ("[REDACTED]",),
+        ),
+        (
+            "Authorization: Basic dXNlcjpodW50ZXIy",
+            ("dXNlcjpodW50ZXIy",),
+            (),
+        ),
+        (
+            "clone failed for https://alice:s3cr3tpassw0rd@registry.internal/repo",
+            ("alice", "s3cr3tpassw0rd"),
+            ("registry.internal",),
+        ),
+    ],
+    ids=["authorization-bearer", "authorization-basic", "url-basic-auth"],
+)
+def test_redact_secrets_scrubs_structured_credentials(
+    text: str, removed: tuple[str, ...], preserved: tuple[str, ...]
+) -> None:
+    """Structured credentials are removed while useful context remains."""
+    scrubbed = cli_diagnostics.redact_secrets(text)
+    for value in removed:
+        assert value not in scrubbed
+    for value in preserved:
+        assert value in scrubbed
+
+
+@pytest.mark.parametrize(
+    ("text", "removed", "preserved"),
+    [
+        (
+            'Authorization: Digest username="alice", response="digest-response-secret"',
+            ("alice", "digest-response-secret"),
+            ("Authorization: [REDACTED]",),
+        ),
+        (
+            "Authorization: AWS4-HMAC-SHA256 Credential="
+            + "AKIA"
+            + "QWERTYUIOP123456"
+            + "/date/region/service/aws4_request, Signature=aws-signature-secret",
+            ("QWERTYUIOP123456", "aws-signature-secret"),
+            ("Authorization: [REDACTED]",),
+        ),
+        (
+            '{"Authorization": "Basic dXNlcjpodW50ZXIy", "status": 401}',
+            ("dXNlcjpodW50ZXIy",),
+            ('"Authorization": "[REDACTED]"', '"status": 401'),
+        ),
+        (
+            "Authorization: Basic\r\n dXNlcjpodW50ZXIy\r\nX-Request: failed",
+            ("dXNlcjpodW50ZXIy",),
+            ("Authorization: [REDACTED]", "X-Request: failed"),
+        ),
+        (
+            "Authorization: Token 0123456789abcdef0123",
+            ("0123456789abcdef0123",),
+            ("Authorization: [REDACTED]",),
+        ),
+        (
+            "Authorization: 0123456789abcdef0123",
+            ("0123456789abcdef0123",),
+            ("Authorization: [REDACTED]",),
+        ),
+        (
+            "Authorization: GNAP+Sig 0123456789abcdef0123",
+            ("0123456789abcdef0123",),
+            ("Authorization: [REDACTED]",),
+        ),
+        (
+            "Authorization='GNAP+Sig 0123456789abcdef0123'; status=401",
+            ("0123456789abcdef0123",),
+            ("Authorization='[REDACTED]'", "status=401"),
+        ),
+    ],
+    ids=[
+        "digest",
+        "aws4",
+        "quoted-json",
+        "folded-basic",
+        "token",
+        "scheme-less",
+        "gnap-sig",
+        "matching-quote",
+    ],
+)
+def test_redact_secrets_scrubs_complete_authorization_values(
+    text: str, removed: tuple[str, ...], preserved: tuple[str, ...]
+) -> None:
+    """Complete structured Authorization values are redacted."""
+    scrubbed = cli_diagnostics.redact_secrets(text)
+    for value in removed:
+        assert value not in scrubbed
+    for value in preserved:
+        assert value in scrubbed
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Authorization: Basic YTo=",
+        "Authorization: Bearer abc",
+    ],
+    ids=["short-basic", "short-bearer"],
+)
+def test_redact_secrets_scrubs_short_authorization_values(text: str) -> None:
+    """Explicit Authorization keys redact even short valid credentials."""
+    assert cli_diagnostics.redact_secrets(text) == "Authorization: [REDACTED]"
+
+
+def test_redact_secrets_scrubs_short_keyless_bearer_value() -> None:
+    """A keyless Bearer redacts any non-empty value — even prose-shaped ones."""
+    assert cli_diagnostics.redact_secrets("bearer of bad news") == "bearer [REDACTED] bad news"
+
+
+def test_redact_secrets_handles_unterminated_quoted_authorization_linearly() -> None:
+    """An unterminated quoted value with backslashes is scanned in linear time."""
+    text = 'Authorization: "' + "\\" * 34
+    started_at = time.perf_counter()
+    scrubbed = cli_diagnostics.redact_secrets(text)
+    elapsed = time.perf_counter() - started_at
+    assert scrubbed == 'Authorization: "[REDACTED]'
+    assert elapsed < 0.5
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_redact_secrets_scrubs_folded_quoted_authorization(newline: str) -> None:
+    """Indented LF and CRLF continuations remain inside a quoted value."""
+    text = f'Authorization: "abc{newline} secretcredential"'
+    assert cli_diagnostics.redact_secrets(text) == 'Authorization: "[REDACTED]"'
+
+
+def test_redact_secrets_limits_unterminated_quoted_authorization_folds() -> None:
+    """A malformed quoted value cannot consume an indented stack trace."""
+    text = 'Authorization: "abc\n secretcredential\n frame one\n frame two'
+    assert cli_diagnostics.redact_secrets(text) == (
+        'Authorization: "[REDACTED]\n frame one\n frame two'
+    )
+
+
+def test_redact_secrets_scrubs_after_planted_authorization_marker() -> None:
+    """A planted marker cannot shield a later Authorization credential."""
+    text = "Authorization: [REDACTED] actualcredential"
+    assert cli_diagnostics.redact_secrets(text) == "Authorization: [REDACTED]"
+
+
+def test_redact_secrets_requires_authorization_key_boundary() -> None:
+    """A longer unrelated key ending in authorization remains unchanged."""
+    text = "preauthorization: successful"
+    assert cli_diagnostics.redact_secrets(text) == text
+
+
+def test_redact_secrets_stops_unquoted_authorization_at_eol() -> None:
+    """An unquoted Authorization value cannot consume the following line."""
+    text = "Authorization: abcdefghijk\nNext-Line: ok"
+    assert cli_diagnostics.redact_secrets(text) == "Authorization: [REDACTED]\nNext-Line: ok"
+
+
+def test_redact_secrets_does_not_fold_bare_newline_after_authorization_colon() -> None:
+    """A following diagnostic line is not an unindented header continuation."""
+    text = "Authorization:\nNext-Line: ok"
+    assert cli_diagnostics.redact_secrets(text) == "Authorization:[REDACTED]\nNext-Line: ok"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Authorization: Bearer abcdefghijk, retrying", "Authorization: [REDACTED]"),
+        ("(bearer abcdefghijk)", "(bearer [REDACTED])"),
+        ('"bearer abcdefghijk"', '"bearer [REDACTED]"'),
+    ],
+    ids=["authorization-comma", "parenthesized", "quoted"],
+)
+def test_redact_secrets_scrubs_punctuation_terminated_bearer(text: str, expected: str) -> None:
+    """Punctuation around bearer credentials cannot prevent redaction."""
+    assert cli_diagnostics.redact_secrets(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("url", "removed"),
+    [
+        ("https://:credential@host.example/path", ("credential",)),
+        ("https://credential:@host.example/path", ("credential",)),
+        ("https://tokenvalue@host.example/path", ("tokenvalue",)),
+        ("https://u:p@ss@host.example/path", ("u:p@ss",)),
+        ("https://u@ss@host.example/path", ("u@ss",)),
+    ],
+    ids=["empty-user", "empty-password", "no-password", "at-in-password", "at-in-username"],
+)
+def test_redact_secrets_scrubs_url_authority_userinfo(url: str, removed: tuple[str, ...]) -> None:
+    """Only userinfo inside the URL authority is redacted."""
+    scrubbed = cli_diagnostics.redact_secrets(url)
+    assert scrubbed == "https://[REDACTED]@host.example/path"
+    for value in removed:
+        assert value not in scrubbed
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        (
+            "https://user:pass@host_name%2Einternal/path",
+            "https://[REDACTED]@host_name%2Einternal/path",
+        ),
+        (
+            "https://user:pass@[fe80::1%25eth0]/path",
+            "https://[REDACTED]@[fe80::1%25eth0]/path",
+        ),
+        (
+            "https://user:pass@münchen.example/path",
+            "https://[REDACTED]@münchen.example/path",
+        ),
+    ],
+    ids=["reg-name", "ipv6-zone", "unicode-iri"],
+)
+def test_redact_secrets_accepts_url_host_characters(url: str, expected: str) -> None:
+    """Valid reg-name, IPv6 zone, and Unicode host characters terminate URL userinfo."""
+    assert cli_diagnostics.redact_secrets(url) == expected
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "xoxb" + "-1234567890-abcdefslacktoken",
+        "ghp_" + "a1b2c3d4e5" * 3 + "abcdef",
+        "AKIA" + "QWERTYUIOP123456",
+    ],
+    ids=["slack", "github", "aws"],
+)
+def test_redact_secrets_scrubs_opaque_shapes(secret: str) -> None:
+    """Supported opaque secret shapes are redacted."""
+    scrubbed = cli_diagnostics.redact_secrets(f"boot failed: {secret} rejected")
+    assert secret not in scrubbed
+    assert "[REDACTED]" in scrubbed
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "g\u2800hp_" + "A" * 20,
+        "dap\u2800i" + "A" * 20,
+        "AK\u2800IA" + "A" * 16,
+        "sk\u2800-" + "A" * 20,
+        "g\u200bhp_" + "A" * 20,
+        "g\u0338hp_" + "A" * 20,
+        "Authori\u2800zation: Basic dXNlcjpodW50ZXIy",
+    ],
+    ids=[
+        "braille-github-anchor",
+        "braille-databricks-anchor",
+        "braille-aws-anchor",
+        "braille-openai-anchor",
+        "zero-width-github-anchor",
+        "combining-github-anchor",
+        "braille-authorization-anchor",
+    ],
+)
+def test_redact_secrets_absorbs_nonspace_splitters_inside_anchors(secret: str) -> None:
+    """Any non-space, non-newline splitter is absorbed throughout an anchor."""
+    assert cli_diagnostics.redact_secrets(secret).endswith("[REDACTED]")
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "g" + "\u2800" * 65 + "hp_" + "A" * 20,
+        "g" + "hp_" + "A" * 10 + "\u2800" * 65 + "A" * 10,
+    ],
+    ids=["anchor", "body"],
+)
+def test_redact_secrets_absorbs_long_nonspace_splitter_runs(secret: str) -> None:
+    """A splitter run longer than the former cap remains inside the credential."""
+    assert cli_diagnostics.redact_secrets(secret) == "[REDACTED]"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "\u03bb" + "g" + "hp_" + "A" * 20,
+        "\u00e9Bearer " + "a" * 11,
+    ],
+    ids=["github", "bearer"],
+)
+def test_redact_secrets_ignores_non_ascii_letter_before_anchor(text: str) -> None:
+    """A non-ASCII letter cannot shield an ASCII credential anchor."""
+    assert cli_diagnostics.redact_secrets(text).endswith("[REDACTED]")
+
+
+def test_redact_secrets_stops_at_splitter_after_length_floor() -> None:
+    """A non-boundary splitter after the body floor preserves the diagnostic tail."""
+    suffix = "\u2800abcdefghijklmnopqrstuvwxyz0123456789"
+    secret = "g" + "hp_" + "A" * 20 + suffix
+    assert cli_diagnostics.redact_secrets(secret) == "[REDACTED]" + suffix
+
+
+def test_redact_secrets_preserves_punctuation_delimited_suffix() -> None:
+    """Diagnostic punctuation and fields after a complete credential remain visible."""
+    suffix = ";status=401;reason=expired"
+    text = "g" + "hp_" + "A" * 20 + suffix
+    assert cli_diagnostics.redact_secrets(text) == "[REDACTED]" + suffix
+
+
+@pytest.mark.parametrize(
+    ("secret", "split_index"),
+    [
+        ("Bearer abcdefghijk", 11),
+        ("".join(("dapi", "FAKE", "TEST", "0123456789")), 7),
+        ("".join(("xoxb", "-", "FAKE", "-", "TEST", "-", "TOKEN")), 9),
+        ("".join(("ghp_", "FAKE", "TEST", "TOKEN", "PLACEHOLDER")), 12),
+        ("".join(("AKIA", "FAKE", "TEST", "ONLY", "0000")), 10),
+        ("".join(("ASIA", "FAKE", "TEST", "ONLY", "0000")), 10),
+    ],
+    ids=["bearer", "dapi", "slack", "github", "aws-akia", "aws-asia"],
+)
+def test_redact_secrets_redacts_one_literal_interior_space(
+    secret: str,
+    split_index: int,
+) -> None:
+    """One genuine word gap cannot split an otherwise credential-shaped token."""
+    spaced = f"{secret[:split_index]} {secret[split_index:]}"
+    scrubbed = cli_diagnostics.redact_secrets(spaced)
+    assert spaced not in scrubbed
+    assert "[REDACTED]" in scrubbed
+
+
+def test_redact_secrets_preserves_prefixed_prose_with_word_gaps() -> None:
+    """A bare fixed-prefix anchor with only prose after it stays readable."""
+    text = "ghp_ is a prefix used in documentation"
+    assert cli_diagnostics.redact_secrets(text) == text
+
+
+def test_redact_secrets_rejects_bearer_repetition_in_linear_time() -> None:
+    """Bearer-like prose cannot trigger super-linear regex backtracking."""
+    text = ("bearer a " * 1600) + "!"
+    started_at = time.perf_counter()
+    scrubbed = cli_diagnostics.redact_secrets(text)
+    elapsed = time.perf_counter() - started_at
+    assert scrubbed == ("bearer [REDACTED] " * 1600) + "!"
+    assert elapsed < 0.1
+
+
+@pytest.mark.parametrize(
+    ("secret", "split_index"),
+    [
+        ("".join(("dapi", "FAKE", "TEST", "0123456789")), 7),
+        ("".join(("xoxb", "-", "FAKE", "-", "TEST", "-", "TOKEN")), 9),
+        ("".join(("ghp_", "FAKE", "TEST", "TOKEN", "PLACEHOLDER")), 12),
+        ("".join(("AKIA", "FAKE", "TEST", "ONLY", "0000")), 10),
+        ("".join(("ASIA", "FAKE", "TEST", "ONLY", "0000")), 10),
+    ],
+    ids=["dapi", "slack", "github", "aws-akia", "aws-asia"],
+)
+def test_redact_secrets_rejects_multiple_interior_spaces(
+    secret: str,
+    split_index: int,
+) -> None:
+    """Tolerance is bounded to one literal interior space (fixed-prefix families).
+
+    ``Bearer`` is keyed and floorless, so it redacts the pre-gap fragment
+    instead; its bounded-gap behavior is covered by the keyed-value tests.
+    """
+    spaced = f"{secret[:split_index]}  {secret[split_index:]}"
+    assert cli_diagnostics.redact_secrets(spaced) == spaced
+
+
+def test_redact_secrets_does_not_join_literal_space_inside_http_scheme() -> None:
+    """The shared redactor does not rewrite non-canonical URL schemes."""
+    text = "ht tps://alice:secret@host.example/path"
+    assert cli_diagnostics.redact_secrets(text) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "GET https://app.example.com:8443?login_hint=alice@example.com failed 302",
+        "GET https://[2001:db8::1]:8443/path#owner@example.com failed 302",
+        "https://example.com:8080 retry user@host.com done",
+        "request to https://api.example.com:443 failed for user alice@corp.com",
+    ],
+    ids=["query-at-sign", "ipv6-fragment-at-sign", "host-port-prose", "host-port-email"],
+)
+def test_redact_secrets_preserves_non_userinfo_urls(text: str) -> None:
+    """Query and fragment ``@`` signs are outside URL userinfo."""
+    assert cli_diagnostics.redact_secrets(text) == text
+
+
+def test_redact_secrets_is_idempotent() -> None:
+    """Repeated formatter and stderr passes preserve the first redaction."""
+    text = '{"Authorization": "GNAP+Sig abcdefghijk", "status": "request failed"}'
+    once = cli_diagnostics.redact_secrets(text)
+    assert cli_diagnostics.redact_secrets(once) == once
+    assert once == '{"Authorization": "[REDACTED]", "status": "request failed"}'
+    assert "request failed" in once
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Bearer abcdefghijkl", "Bearer [REDACTED]"),
+        ("Bearer abc123", "Bearer [REDACTED]"),
+        ("API_TOKEN=abcdefghijkl", "API_TOKEN=[REDACTED]"),
+        ("password=hunter2", "password=[REDACTED]"),
+    ],
+    ids=["bearer", "short-bearer", "env", "short-env"],
+)
+def test_redact_secrets_is_idempotent_for_keyed_values(text: str, expected: str) -> None:
+    """Bearer and env redactions survive the double-redacting stderr path."""
+    once = cli_diagnostics.redact_secrets(text)
+    assert once == expected
+    assert cli_diagnostics.redact_secrets(once) == once
+
+
+def test_redact_secrets_stops_at_existing_marker_on_repeat() -> None:
+    """A completed marker is a boundary, so a second pass keeps later fields."""
+    text = "password=hunter2 status=401"
+    once = cli_diagnostics.redact_secrets(text)
+
+    assert once == "password=[REDACTED] status=401"
+    assert cli_diagnostics.redact_secrets(once) == once
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Bearer [REDACTED]actualsecret", "Bearer [REDACTED]"),
+        ("password=[REDACTED]actualsecret", "password=[REDACTED]"),
+    ],
+    ids=["bearer", "env"],
+)
+def test_redact_secrets_scrubs_marker_glued_values(text: str, expected: str) -> None:
+    """A planted marker glued to a value cannot shield the glued suffix."""
+    once = cli_diagnostics.redact_secrets(text)
+    assert once == expected
+    assert cli_diagnostics.redact_secrets(once) == once
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Bearer [REDACTED]\u2800actualsecret", "Bearer [REDACTED]"),
+        ("password=[REDACTED]\u2800actualsecret", "password=[REDACTED]"),
+    ],
+    ids=["bearer-splitter", "env-splitter"],
+)
+def test_redact_secrets_scrubs_marker_separated_values(text: str, expected: str) -> None:
+    """A planted marker cannot shield a suffix joined by a non-boundary splitter."""
+    once = cli_diagnostics.redact_secrets(text)
+    assert once == expected
+    assert cli_diagnostics.redact_secrets(once) == once
+
+
+@pytest.mark.parametrize("quote", ['"', "'"])
+def test_redact_secrets_scrubs_quoted_multiline_env_value(quote: str) -> None:
+    """A quoted env value runs to its closing quote across a folded newline."""
+    text = f"DATABASE_PASSWORD={quote}line-one\n line-two{quote} status=401"
+    scrubbed = cli_diagnostics.redact_secrets(text)
+    assert scrubbed == f"DATABASE_PASSWORD={quote}[REDACTED]{quote} status=401"
+    assert "line-one" not in scrubbed
+    assert "line-two" not in scrubbed
+    assert cli_diagnostics.redact_secrets(scrubbed) == scrubbed
+
+
+def test_redact_secrets_caps_unquoted_authorization_folds() -> None:
+    """An unquoted Authorization value folds once; the traceback survives."""
+    text = (
+        "Authorization: Bearer abc\n"
+        "  trace-line-one\n"
+        "  trace-line-two\n"
+        "  trace-line-three\n"
+        "X-Next: ok"
+    )
+    assert cli_diagnostics.redact_secrets(text) == (
+        "Authorization: [REDACTED]\n  trace-line-two\n  trace-line-three\nX-Next: ok"
+    )
+
+
+def test_redact_secrets_scans_authorization_fold_flood_linearly() -> None:
+    """Repeated unquoted folded headers cannot trigger suffix rescans."""
+    text = "Authorization: x\n" + " Authorization: x\n" * 4000
+    started_at = time.perf_counter()
+    scrubbed = cli_diagnostics.redact_secrets(text)
+    elapsed = time.perf_counter() - started_at
+
+    assert "Authorization: x" not in scrubbed
+    assert elapsed < 0.5
+
+
+def test_redact_secrets_preserves_gapless_bearer_prose() -> None:
+    """Prose continuing the anchor word ("bearers") is not widened into a value."""
+    text = "the bearers of these tokens"
+    assert cli_diagnostics.redact_secrets(text) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "the bearers submitted the tokens",
+        "bearers received",
+        "bearerform filed",
+    ],
+    ids=["plural-sentence", "plural-short", "compound"],
+)
+def test_redact_secrets_does_not_bridge_gapless_bearer_prose_across_words(text: str) -> None:
+    """The gapless length floor counts only characters glued to the anchor."""
+    assert cli_diagnostics.redact_secrets(text) == text
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("DATABASE_PASSWORD=hunter2", "DATABASE_PASSWORD=[REDACTED]"),
+        ("API_KEY=a1b2c3", "API_KEY=[REDACTED]"),
+        ("Bearer abc123", "Bearer [REDACTED]"),
+        ("password=x", "password=[REDACTED]"),
+    ],
+    ids=["password", "api-key", "bearer", "single-char"],
+)
+def test_redact_secrets_scrubs_short_keyed_values(text: str, expected: str) -> None:
+    """Keyed anchors redact any non-empty value — no length floor applies."""
+    assert cli_diagnostics.redact_secrets(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("p@ssw0rd!", "[REDACTED]"),
+        ("https://user:pass@host/path", "[REDACTED]"),
+    ],
+    ids=["punctuation", "url-shaped"],
+)
+def test_redact_secrets_scrubs_full_unquoted_env_value(value: str, expected: str) -> None:
+    """An unquoted keyed value spans every non-whitespace character."""
+    text = f"DATABASE_PASSWORD={value} status=401"
+    assert cli_diagnostics.redact_secrets(text) == f"DATABASE_PASSWORD={expected} status=401"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "password\u00a0=supersecretvalue",
+            "password\u00a0=[REDACTED]",
+        ),
+        (
+            "API_KEY\u2009= abcdefghijkl",
+            "API_KEY\u2009= [REDACTED]",
+        ),
+        (
+            "token:\neyJhbGciOiJIUzI1NiJ9.payload.signature",
+            "token:\n[REDACTED]",
+        ),
+        (
+            "password=\nsupersecretvalue",
+            "password=\n[REDACTED]",
+        ),
+        (
+            "password =\n  supersecretvalue",
+            "password =\n  [REDACTED]",
+        ),
+        (
+            "token:\r\nsecretvalue123",
+            "token:\r\n[REDACTED]",
+        ),
+        (
+            "password=\n\nnot the value",
+            "password=\n\nnot the value",
+        ),
+    ],
+    ids=[
+        "nbsp-before-equals",
+        "thin-space-before-equals",
+        "jwt-after-newline",
+        "value-after-newline",
+        "value-after-indented-fold",
+        "value-after-crlf",
+        "blank-line-ends-fold",
+    ],
+)
+def test_redact_secrets_scrubs_env_values_across_gaps_and_folds(text: str, expected: str) -> None:
+    """Unicode word gaps around ``:=`` and one folded newline still match."""
+    assert cli_diagnostics.redact_secrets(text) == expected
+
+
+@pytest.mark.parametrize("prefix", ["AKIA", "ASIA"])
+def test_redact_secrets_scrubs_overlong_aws_key(prefix: str) -> None:
+    """Overlong AWS keys are redacted; short and lowercase runs are preserved."""
+    key = prefix + "A" * 17
+    scrubbed = cli_diagnostics.redact_secrets(f"boot failed with {key} end")
+    assert key not in scrubbed
+    assert "[REDACTED]" in scrubbed
+    assert cli_diagnostics.redact_secrets(prefix + "A" * 15) == prefix + "A" * 15
+    assert cli_diagnostics.redact_secrets(prefix.lower() + "a" * 17) == prefix.lower() + "a" * 17
 
 
 def test_setup_cli_logging_uses_data_dir_cli_destination(

@@ -42,6 +42,14 @@ what to look for, and why it's wrong.
   `subprocess.*` that drops the inherited environment strips `PATH`, auth, and
   proxy vars — extend `os.environ.copy()` instead of replacing it.
 
+## Redaction / sanitization
+
+- **Scanners that stop at a delimiter must be re-checked across it.** A
+  secret-redaction pass whose matchers stop at newlines (or any hard boundary)
+  lets attacker-controlled input split a credential across that boundary and
+  serve each half under the length floor. Re-scan a boundary-collapsed shadow
+  and fail closed when it redacts more than the per-segment pass.
+
 ## Config / data safety
 
 - **A "clear/reset" must not clobber unrelated config.** An edit that rewrites a

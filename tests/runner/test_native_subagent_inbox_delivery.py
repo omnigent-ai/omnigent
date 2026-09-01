@@ -123,20 +123,20 @@ def _child_snapshot(
     }
 
 
-async def _post_native_idle(
+async def _post_native_status(
     *,
     child_body: dict[str, Any],
     seed_parent_inbox: bool,
     register_work: bool,
-    output: str = "review complete: LGTM",
+    status: str = "idle",
+    output: str | None = "review complete: LGTM",
 ) -> tuple[int, list[dict[str, Any]]]:
-    """POST a native ``external_session_status: idle`` and return (http, inbox items).
+    """Post a native status event and return its HTTP status and inbox items.
 
-    Models the forwarder reporting a finished native sub-agent turn.
     ``register_work`` seeds the in-memory work entry (the healthy case); leaving
     it ``False`` models a reconnect-wiped map or a ``sys_session_create`` child
     the dispatch never registered. ``seed_parent_inbox`` controls whether the
-    parent's inbox queue is present on this runner.
+    parent's inbox queue is present. ``output=None`` omits that field.
     """
     if seed_parent_inbox:
         runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
@@ -164,13 +164,13 @@ async def _post_native_idle(
         server_client=_SnapshotServerClient(child_body),  # type: ignore[arg-type]
     )
 
+    data: dict[str, Any] = {"status": status}
+    if output is not None:
+        data["output"] = output
     async with _runner_client(app) as client:
         resp = await client.post(
             f"/v1/sessions/{CHILD_SESSION_ID}/events",
-            json={
-                "type": "external_session_status",
-                "data": {"status": "idle", "output": output},
-            },
+            json={"type": "external_session_status", "data": data},
         )
 
     inbox = runner_app._session_inboxes_ref.get(PARENT_SESSION_ID)
@@ -179,6 +179,35 @@ async def _post_native_idle(
         while not inbox.empty():
             items.append(inbox.get_nowait())
     return resp.status_code, items
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("output", "expected_output"),
+    [
+        (
+            "model_not_found: There's an issue with the selected model (claude-fable-5).",
+            "model_not_found: There's an issue with the selected model (claude-fable-5).",
+        ),
+        (None, "Error: native sub-agent turn failed"),
+    ],
+    ids=["provider-detail", "generic-fallback"],
+)
+async def test_native_failure_delivers_output(
+    _clean_subagent_registry: None,
+    output: str | None,
+    expected_output: str,
+) -> None:
+    """Native failures preserve provider detail or use the generic fallback."""
+    _, items = await _post_native_status(
+        child_body=_child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID),
+        seed_parent_inbox=True,
+        register_work=True,
+        status="failed",
+        output=output,
+    )
+    assert items and items[0]["status"] == "failed"
+    assert items[0]["output"] == expected_output
 
 
 @pytest.mark.asyncio
@@ -191,7 +220,7 @@ async def test_native_completion_recovers_reconnect_wiped_work_entry(
     dropped silently on the old code. The fix rebuilds the entry from the
     snapshot's ``parent_session_id`` + ``sub_agent_name`` and delivers.
     """
-    http, items = await _post_native_idle(
+    http, items = await _post_native_status(
         child_body=_child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID),
         seed_parent_inbox=True,
         register_work=False,
@@ -220,7 +249,7 @@ async def test_sys_session_create_child_without_sub_agent_name_delivers(
     link from the snapshot (keying on ``parent_session_id``) and labels the work
     with the agent name.
     """
-    http, items = await _post_native_idle(
+    http, items = await _post_native_status(
         child_body=_child_snapshot(
             sub_agent_name=None,
             parent_session_id=PARENT_SESSION_ID,
@@ -246,7 +275,7 @@ async def test_healthy_registered_work_entry_still_delivers(
     Guards against the fix regressing the common case where dispatch already
     registered the work entry on this runner.
     """
-    http, items = await _post_native_idle(
+    http, items = await _post_native_status(
         child_body=_child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID),
         seed_parent_inbox=True,
         register_work=True,
@@ -267,7 +296,7 @@ async def test_undeliverable_native_completion_returns_503_not_silent_204(
     The handler must return 503 so the forwarder retries and server-side recovery
     re-routes to the parent's runner — instead of a silent 204 that drops it.
     """
-    http, items = await _post_native_idle(
+    http, items = await _post_native_status(
         child_body=_child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID),
         seed_parent_inbox=False,
         register_work=False,
@@ -294,7 +323,7 @@ async def test_replayed_idle_after_drain_does_not_redeliver(
     """
     child_body = _child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID)
     # First completion delivers normally.
-    http1, items1 = await _post_native_idle(
+    http1, items1 = await _post_native_status(
         child_body=child_body, seed_parent_inbox=True, register_work=True
     )
     assert http1 == 204
@@ -341,7 +370,7 @@ async def test_top_level_session_idle_is_noop(
     Ensures the recovery arm does not mis-classify a non-sub-agent sender as a
     sub-agent and start 503-ing or fabricating inbox deliveries.
     """
-    http, items = await _post_native_idle(
+    http, items = await _post_native_status(
         child_body=_child_snapshot(sub_agent_name=None, parent_session_id=None),
         seed_parent_inbox=True,
         register_work=False,
