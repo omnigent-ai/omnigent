@@ -247,6 +247,9 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
     - **Pi native tools** (``read``, ``bash``, ``write``, ``edit``)
       — surfaced via the pi ``tool_call`` extension hook. Lowercase
       and distinct from the Claude/Codex casing.
+    - **Goose native tools** (``developer__shell`` and the
+      ``developer__*`` file tools) — surfaced via the goose
+      extension hook.
     - **Hermes Agent tools** (``terminal``, ``execute_code``,
       ``read_file``, ``write_file``, ``search_files``) — surfaced
       via the ``pre_tool_call`` shell hook.
