@@ -39,6 +39,8 @@ from omnigent.host.frames import (
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostSkillsFrame,
+    HostSkillsResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -161,6 +163,79 @@ def test_model_options_frames_round_trip() -> None:
         "system.ai.claude-opus-5",
         "system.ai.claude-opus-4-8",
     ]
+
+
+def test_skills_frames_round_trip() -> None:
+    """Pre-launch skill discovery survives both directions of the host tunnel."""
+    request = decode_host_frame(
+        encode_host_frame(
+            HostSkillsFrame(
+                request_id="req_skills",
+                harness="claude-sdk",
+                path="/Users/corey/proj",
+                skills_filter=["deslop", "review-pr"],
+            ),
+        )
+    )
+    assert request == HostSkillsFrame(
+        request_id="req_skills",
+        harness="claude-sdk",
+        path="/Users/corey/proj",
+        skills_filter=["deslop", "review-pr"],
+    )
+
+    # No workspace chosen yet, and the spec's default filter: home/plugin
+    # scope only, everything allowed.
+    home_scope = decode_host_frame(
+        encode_host_frame(HostSkillsFrame(request_id="req_skills", harness="codex"))
+    )
+    assert home_scope == HostSkillsFrame(
+        request_id="req_skills",
+        harness="codex",
+        path=None,
+        skills_filter="all",
+    )
+
+    result = decode_host_frame(
+        encode_host_frame(
+            HostSkillsResultFrame(
+                request_id="req_skills",
+                status="ok",
+                skills=[{"name": "dev-productivity:deslop", "description": "Remove slop"}],
+            )
+        )
+    )
+    assert isinstance(result, HostSkillsResultFrame)
+    assert result.skills == [{"name": "dev-productivity:deslop", "description": "Remove slop"}]
+    assert result.error is None
+
+    failed = decode_host_frame(
+        encode_host_frame(
+            HostSkillsResultFrame(
+                request_id="req_skills",
+                status="failed",
+                error="skill discovery crashed for 'claude-sdk'",
+            )
+        )
+    )
+    assert isinstance(failed, HostSkillsResultFrame)
+    assert failed.status == "failed"
+    assert failed.skills == []
+    assert failed.error == "skill discovery crashed for 'claude-sdk'"
+
+
+def test_skills_frame_rejects_malformed_filter() -> None:
+    """A non-string filter entry is refused rather than silently coerced."""
+    payload = json.dumps(
+        {
+            "kind": "host.skills",
+            "request_id": "req_skills",
+            "harness": "claude-sdk",
+            "skills_filter": ["deslop", 7],
+        }
+    )
+    with pytest.raises(ValueError, match="skills_filter"):
+        decode_host_frame(payload)
 
 
 def test_encode_injects_traceparent_under_active_span() -> None:

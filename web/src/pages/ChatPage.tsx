@@ -136,6 +136,7 @@ import {
   parseMentionToken,
   rankMentionEntries,
 } from "@/lib/composerMentions";
+import { detectSlashTokenAt, spliceSlashToken } from "@/lib/composerSlash";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 // Re-exported so existing tests importing these from "./ChatPage" keep working
@@ -4332,6 +4333,15 @@ export function Composer({
   // opens with matches the reset logic below pre-selects the first item (0)
   // so Tab/Enter complete it immediately.
   const [menuIndex, setMenuIndex] = useState(-1);
+  // Where the user last typed, so the "/" menu can read the token at the caret
+  // rather than only the one that opens the draft. ``null`` means "not known
+  // yet" — a value set from outside the composer (draft restore, history
+  // recall, a queued message pulled back for editing) — and reads at the end
+  // of the draft, which is where the caret lands.
+  const [slashCaret, setSlashCaret] = useState<number | null>(null);
+  // Escape / blur close the menu without touching the draft. Cleared on the
+  // next keystroke, so typing on brings the suggestions back.
+  const [slashDismissed, setSlashDismissed] = useState(false);
   // Active "@"-file-mention being typed, plus its highlighted row and the
   // workspace paths the user has already tagged. ``@``-mention is wired for
   // the native coding-agent sessions (see ``mentionEnabled``): those harnesses
@@ -4545,18 +4555,35 @@ export function Composer({
     [skills, showEffort, showModel],
   );
 
-  // Suggestions menu is open while the user is still typing the command
-  // name — i.e. the value starts with "/" with no spaces yet (once a
-  // space appears the command name is done and args follow) and no second
-  // "/" (guards against file-path-like strings).
-  const trimmedValue = value.trimStart();
-  const menuOpen =
-    trimmedValue.startsWith("/") &&
-    !trimmedValue.slice(1).includes("/") &&
-    !trimmedValue.includes(" ") &&
-    files.length === 0;
-  // Query = what the user typed after the leading "/".
-  const menuQuery = menuOpen ? trimmedValue.slice(1) : "";
+  // Skills only, for a "/" typed mid-draft: built-ins act on the session
+  // (compact it, switch its model), which completing a word inside a sentence
+  // cannot do, so offering them there would promise something selection can't
+  // deliver. A skill name is just text the agent reads, so it completes
+  // anywhere.
+  const skillCommands = useMemo(
+    () => Object.fromEntries(skills.map((s) => [`/${s.name}`, s.description])),
+    [skills],
+  );
+  // Derived from the value (so a submit clear or a recall closes the menu on
+  // its own) but read at the caret. The offset is clamped because a value set
+  // from outside the composer can be shorter than where the user last typed.
+  const slashToken = useMemo(
+    () =>
+      slashDismissed
+        ? null
+        : detectSlashTokenAt(value, Math.min(slashCaret ?? value.length, value.length)),
+    [slashDismissed, slashCaret, value],
+  );
+  // Suggestions menu is open while the user is still typing a command name at
+  // the caret: a "/" at the start of the draft or after whitespace, with no
+  // space (the name is done, args follow) and no second "/" (a file path) —
+  // see ``detectSlashTokenAt``.
+  const menuOpen = slashToken !== null && files.length === 0;
+  // Query = what the user typed after that "/".
+  const menuQuery = slashToken?.query ?? "";
+  // A leading token can invoke (built-ins execute, skills route as a
+  // ``slash_command``); one typed mid-sentence completes as plain text.
+  const menuCommands = slashToken !== null && !slashToken.leading ? skillCommands : slashCommands;
   // Tint the `/skill` token blue while the draft reads as a slash command, so
   // the command shape is signalled as the user types it.
   const composerIsCommand = files.length === 0 && isSlashCommandText(value);
@@ -4575,7 +4602,7 @@ export function Composer({
   };
   // Filtered matches — kept in sync with what SlashCommandMenu renders so
   // keyboard nav indexes into the same list.
-  const menuMatches = menuOpen ? rankedSlashCommandNames(slashCommands, menuQuery) : [];
+  const menuMatches = menuOpen ? rankedSlashCommandNames(menuCommands, menuQuery) : [];
 
   // Pre-select the first match whenever the filtered list changes — both
   // when the menu first opens (matches go [] → non-empty) and as the query
@@ -4833,20 +4860,36 @@ export function Composer({
 
   /**
    * Called when the user selects a suggestion from the menu (keyboard or
-   * click). Commands that need an argument (``SLASH_COMMANDS_WITH_ARGS``)
-   * fill in the text with a trailing space so the user can type the arg.
-   * All other commands execute immediately.
+   * click). Commands that need an argument (``SLASH_COMMANDS_WITH_ARGS``) —
+   * and every token typed mid-draft, which can't invoke anything — complete
+   * into the text with a trailing space so the user can type the arg. All
+   * other commands execute immediately.
    */
   const applyMenuSelection = (cmd: string) => {
     setMenuIndex(-1);
-    if (slashCommandsWithArgs.has(cmd)) {
-      // Fill in "cmd " and let the user type the argument.
-      setValue(cmd + " ");
+    const token = slashToken;
+    const completesAsText = slashCommandsWithArgs.has(cmd) || (token !== null && !token.leading);
+    if (completesAsText) {
+      // Rewrite just the token, so a mid-sentence completion keeps the words
+      // around it and a leading one keeps any args already typed after it.
+      const next =
+        token !== null
+          ? spliceSlashToken(value, token, cmd)
+          : { text: `${cmd} `, caret: cmd.length + 1 };
+      setValue(next.text);
       dirtyRef.current = true;
-      textareaRef.current?.focus();
+      setSlashCaret(next.caret);
+      // Restore the caret after React applies the value; without this the
+      // browser leaves it where the shorter token ended, i.e. mid-word.
+      queueMicrotask(() => {
+        const ta = textareaRef.current;
+        ta?.setSelectionRange(next.caret, next.caret);
+        ta?.focus();
+      });
     } else {
       // Execute immediately — no argument needed.
       setValue("");
+      setSlashCaret(null);
       setCommandError(null);
       executeSlashCommand(cmd, "");
     }
@@ -5102,8 +5145,11 @@ export function Composer({
       }
       if (e.key === "Escape") {
         e.preventDefault();
-        // Dismiss the menu by clearing the input so the user can start fresh.
-        setValue("");
+        // A leading token IS the whole draft, so clearing the input is the
+        // fastest way back to an empty composer. Mid-draft, only the menu
+        // closes — the sentence being written has to survive.
+        if (slashToken === null || slashToken.leading) setValue("");
+        setSlashDismissed(true);
         setMenuIndex(-1);
         return;
       }
@@ -5256,7 +5302,7 @@ export function Composer({
             query={menuQuery}
             activeIndex={menuIndex}
             onSelect={applyMenuSelection}
-            commands={slashCommands}
+            commands={menuCommands}
           />
         )}
         {/* "@"-file-mention browser — native coding-agent sessions only.
@@ -5333,14 +5379,13 @@ export function Composer({
               if (attachmentError !== null) setAttachmentError(null);
               // Recompute the active "@"-mention from the caret on every
               // keystroke (native coding-agent sessions — ``mentionEnabled``).
-              setMention(
-                mentionEnabled
-                  ? detectMentionAt(
-                      e.target.value,
-                      e.target.selectionStart ?? e.target.value.length,
-                    )
-                  : null,
-              );
+              const caret = e.target.selectionStart ?? e.target.value.length;
+              setMention(mentionEnabled ? detectMentionAt(e.target.value, caret) : null);
+              // Same for the "/" token, so the menu follows the caret rather
+              // than only opening on a draft that starts with a slash. Typing
+              // also lifts an earlier Escape.
+              setSlashCaret(caret);
+              setSlashDismissed(false);
               // Treat user-driven changes as exiting recall mode. Recall-
               // driven setValue toggles `recallingRef` first so we skip the
               // reset for that one tick.
@@ -5366,6 +5411,7 @@ export function Composer({
               // keeps focus and does NOT blur — this only fires for genuine
               // focus-out, where the lingering menu would otherwise float.
               dismissMention();
+              setSlashDismissed(true);
             }}
             onPaste={handlePaste}
             onScroll={(e) => {

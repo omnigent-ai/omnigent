@@ -45,6 +45,7 @@ from omnigent.host.frames import (
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
+    HostSkillsResultFrame,
     HostStatResultFrame,
     HostStopRunnerResultFrame,
     HostStoreSecretResultFrame,
@@ -777,6 +778,18 @@ async def _receive_loop(
                         "done",
                         {"status": frame.status, "error": frame.error, "failed": frame.failed},
                     )
+                )
+            continue
+
+        if isinstance(frame, HostSkillsResultFrame):
+            skills_future = conn.pending_skills.pop(frame.request_id, None)
+            if skills_future is not None and not skills_future.done():
+                skills_future.set_result(
+                    {
+                        "status": frame.status,
+                        "skills": frame.skills,
+                        "error": frame.error,
+                    }
                 )
             continue
 

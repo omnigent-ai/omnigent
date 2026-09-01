@@ -103,6 +103,7 @@ import {
   rankedSlashCommandNames,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
+import { detectSlashTokenAt, spliceSlashToken } from "@/lib/composerSlash";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { markSessionCreated } from "@/store/interactionTelemetry";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
@@ -183,7 +184,7 @@ import {
   CURSOR_NATIVE_DEFAULT_EXEC_MODE,
   CURSOR_NATIVE_EXEC_MODES,
 } from "@/lib/nativeHarnessModes";
-import { useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
+import { useHostAgentSkills, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import {
   controlHost,
   getHostIdentity,
@@ -790,22 +791,21 @@ export function deriveRepoName(url: string): string | null {
 }
 
 /**
- * Match a first message against an agent's bundled skills.
+ * Match a first message against the skills the chosen agent can invoke.
  *
  * Uses the in-session composer's shared command-shape guard
  * (:func:`isSlashCommandText`): the first token must read as ``/name``
  * (file paths like ``/etc/hosts`` never match), while the args after it
  * may carry anything — including paths and URLs, e.g.
- * ``"/review-pr https://github.com/..."``. The command name must
- * exactly match a bundled skill. Anything else — including
- * host-discovered skills the server can't know before a runner boots —
- * is sent as plain text, the same fall-through the in-session composer
- * uses for unknown commands.
+ * ``"/review-pr https://github.com/..."``. The command name must exactly
+ * match one of *skills*. Anything else is sent as plain text, the same
+ * fall-through the in-session composer uses for unknown commands.
  *
  * @param text The sanitized first message, e.g. ``"/review-pr 123"``.
- * @param skills The chosen agent's bundled skills from GET /v1/agents.
+ * @param skills Skills the agent can resolve — bundled ones from
+ *   GET /v1/agents plus what the host discovered for it.
  * @returns The skill name and argument string, or ``null`` when the
- *   text is not an invocation of a bundled skill.
+ *   text is not an invocation of a known skill.
  */
 export function matchSkillInvocation(
   text: string,
@@ -3585,25 +3585,57 @@ export function NewChatLandingScreen() {
   // Sandbox creates need no host or path workspace — the server
   // provisions both; only the message, agent, and (optional) repo
   // inputs gate the submit.
-  // Slash-command suggestions for the chosen agent's bundled skills.
-  // Mirrors the in-session composer's menu mechanics (open while the
-  // command name is still being typed: leading "/", no second "/", no
-  // space yet), but lists skills only — built-ins like /model need a
-  // live session. Hidden for native-terminal agents (their CLI owns
-  // slash commands) and for agents without bundled skills.
+  // Slash-command suggestions for the chosen agent's skills. Mirrors the
+  // in-session composer's menu mechanics (open on the "/" token at the caret,
+  // wherever in the draft it sits), but lists skills only — built-ins like
+  // /model need a live session.
+  //
+  // Native terminal agents are included: their host-discovered skills ARE the
+  // vendor CLI's own slash commands (~/.claude/skills and enabled plugins are
+  // exactly what Claude Code registers), and the first message reaches that CLI
+  // as text, so it interprets the completed "/name" itself. The in-session
+  // composer has never gated on the harness either — hiding them here only on
+  // the landing screen made the default agent look like it had no skills.
+  // Completing a name is all this does; `matchSkillInvocation` still declines to
+  // route natives as a `slash_command` (see handleCreate).
   const [slashMenuIndex, setSlashMenuIndex] = useState(-1);
+  // Skills the chosen host would add on top of the bundled ones —
+  // ~/.claude/skills, enabled Claude Code plugins, the workspace's own
+  // .claude/skills. Only the host can see those, so before this a user's own
+  // skill wasn't completable until a runner had bound and pushed a snapshot.
+  // A pending agent (an upload still being described) has no registered spec
+  // for the server to read a harness and filter from; a sandbox has no host to
+  // ask. Both leave the menu on bundled skills alone.
+  const skillsAgentId =
+    selectedAgent !== undefined && selectedAgent.id !== PENDING_AGENT_ID ? selectedAgent.id : null;
+  const { data: hostSkills } = useHostAgentSkills(
+    sandboxSelected ? null : selectedHostId,
+    skillsAgentId,
+    workspaceValid ? workspaceTrimmed : null,
+    skillsAgentId !== null,
+  );
   const skillCommands = useMemo(() => {
-    if (isNativeTerminalAgent) return {};
     const m: Record<string, string> = {};
     for (const s of selectedAgent?.skills ?? []) m[`/${s.name}`] = s.description;
+    // Host skills come after the bundled ones (the endpoint already drops
+    // names the bundle claims), so a bundled skill keeps its own description.
+    for (const s of hostSkills ?? []) m[`/${s.name}`] ??= s.description;
     return m;
-  }, [selectedAgent, isNativeTerminalAgent]);
-  const trimmedMessage = message.trimStart();
-  const slashMenuOpen =
-    trimmedMessage.startsWith("/") &&
-    !trimmedMessage.slice(1).includes("/") &&
-    !trimmedMessage.includes(" ");
-  const slashMenuQuery = slashMenuOpen ? trimmedMessage.slice(1) : "";
+  }, [selectedAgent, hostSkills]);
+  // Caret offset + dismissal, exactly as the in-session composer tracks them:
+  // ``null`` reads the token at the end of the draft (a prefilled message the
+  // user hasn't typed into yet), Escape/blur closes without editing the draft.
+  const [slashCaret, setSlashCaret] = useState<number | null>(null);
+  const [slashDismissed, setSlashDismissed] = useState(false);
+  const slashToken = useMemo(
+    () =>
+      slashDismissed
+        ? null
+        : detectSlashTokenAt(message, Math.min(slashCaret ?? message.length, message.length)),
+    [slashDismissed, slashCaret, message],
+  );
+  const slashMenuOpen = slashToken !== null;
+  const slashMenuQuery = slashToken?.query ?? "";
   // Kept in sync with what SlashCommandMenu renders so keyboard nav
   // indexes into the same list.
   const slashMenuMatches = slashMenuOpen
@@ -3621,12 +3653,22 @@ export function NewChatLandingScreen() {
     setSlashMenuIndex(slashMenuMatches.length > 0 ? 0 : -1);
   }
 
-  // Selecting a skill fills "/name " and leaves the caret ready for the
-  // argument — skills never auto-execute from the menu.
+  // Selecting a skill rewrites just the token to "/name " and leaves the caret
+  // ready for the argument — skills never auto-execute from the menu, and a
+  // completion mid-draft keeps the words around it.
   function applySlashSelection(cmd: string) {
     setSlashMenuIndex(-1);
-    setMessage(cmd + " ");
-    textareaRef.current?.focus();
+    const next =
+      slashToken !== null
+        ? spliceSlashToken(message, slashToken, cmd)
+        : { text: `${cmd} `, caret: cmd.length + 1 };
+    setMessage(next.text);
+    setSlashCaret(next.caret);
+    queueMicrotask(() => {
+      const ta = textareaRef.current;
+      ta?.setSelectionRange(next.caret, next.caret);
+      ta?.focus();
+    });
   }
 
   // Always-visible skill pills for the allowlisted orchestrators, fed by
@@ -4338,16 +4380,17 @@ export function NewChatLandingScreen() {
       // loads from the session id and never reads the sidebar cache.
       void queryClient.refetchQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["directory-sessions"] });
-      // A first message matching one of the agent's bundled skills is
-      // handed off as a structured invocation so ChatPage auto-sends it
-      // as a `slash_command` event (server resolves the skill) instead
-      // of plain text the agent would see as a literal "/name". Native
+      // A first message matching one of the agent's skills is handed off as a
+      // structured invocation so ChatPage auto-sends it as a `slash_command`
+      // event (server resolves the skill) instead of plain text the agent
+      // would see as a literal "/name". Host-discovered skills count too —
+      // the menu offers them, so completing one has to invoke it. Native
       // terminal agents keep plain text — their CLI owns slash commands.
       setPendingInitialPrompt(data.id, {
         text: initialPrompt,
         skill: isNativeTerminalAgent
           ? null
-          : matchSkillInvocation(initialPrompt, agent?.skills ?? []),
+          : matchSkillInvocation(initialPrompt, [...(agent?.skills ?? []), ...(hostSkills ?? [])]),
         files,
       });
       // Scope the recall entry to the new session id so ArrowUp surfaces it in
@@ -4491,14 +4534,13 @@ export function NewChatLandingScreen() {
                   if (attachmentError !== null) setAttachmentError(null);
                   // Recompute the active "@"-mention from the caret each keystroke
                   // (native terminal agents with a workspace — ``mentionEnabled``).
-                  setMention(
-                    mentionEnabled
-                      ? detectMentionAt(
-                          e.target.value,
-                          e.target.selectionStart ?? e.target.value.length,
-                        )
-                      : null,
-                  );
+                  const caret = e.target.selectionStart ?? e.target.value.length;
+                  setMention(mentionEnabled ? detectMentionAt(e.target.value, caret) : null);
+                  // Same for the "/" token, so the menu follows the caret rather
+                  // than only opening on a draft that starts with a slash. Typing
+                  // also lifts an earlier Escape.
+                  setSlashCaret(caret);
+                  setSlashDismissed(false);
                 }}
                 onFocus={() => {
                   // From here the textarea's caret is one the user placed, so
@@ -4509,6 +4551,7 @@ export function NewChatLandingScreen() {
                   // Dismiss the mention menu when focus leaves the textarea; menu
                   // rows preventDefault on mousedown so selecting one doesn't blur.
                   dismissMention();
+                  setSlashDismissed(true);
                 }}
                 onCompositionStart={() => {
                   isComposingRef.current = true;
@@ -4573,9 +4616,11 @@ export function NewChatLandingScreen() {
                     }
                     if (e.key === "Escape") {
                       e.preventDefault();
-                      // Dismiss the menu by clearing the draft so the user can
-                      // start fresh.
-                      setMessage("");
+                      // A leading token IS the whole draft, so clearing it is the
+                      // fastest way back to an empty composer. Mid-draft, only
+                      // the menu closes — the sentence being written survives.
+                      if (slashToken === null || slashToken.leading) setMessage("");
+                      setSlashDismissed(true);
                       setSlashMenuIndex(-1);
                       return;
                     }

@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
 import type { Host } from "@/hooks/useHosts";
-import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
+import { useHostAgentSkills, useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { NewChatLandingScreen, resetLandingDraft, sanitizeInitialPrompt } from "./NewChatDialog";
@@ -83,6 +83,9 @@ vi.mock("@/hooks/useHosts", () => ({
       { id: "haiku", displayName: "Haiku" },
     ],
   })),
+  // The landing composer asks the chosen host for its own skills; these flows
+  // assert routing of the first message, so an empty answer is enough.
+  useHostAgentSkills: vi.fn(() => ({ data: [] })),
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
   useInstallingHarnesses: vi.fn(() => new Set<string>()),
 }));
@@ -276,6 +279,11 @@ beforeEach(() => {
     ],
     isLoading: false,
   } as unknown as ReturnType<typeof useHostModelOptions>);
+  // Reset per-test host-skill overrides: a leaked skill would make a later
+  // test's "/name" route as an invocation instead of plain text.
+  vi.mocked(useHostAgentSkills).mockReturnValue({
+    data: [],
+  } as unknown as ReturnType<typeof useHostAgentSkills>);
   // Seed host_1's recent so the working directory pre-fills deterministically
   // (the create body must carry SEEDED_WORKSPACE through).
   localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [SEEDED_WORKSPACE] }));
@@ -646,9 +654,9 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Not a bundled skill — e.g. a typo or a host-discovered skill the
-    // server can't know pre-session. Falls through to plain text, same as
-    // the in-session composer's unknown-command path.
+    // Matches no skill the agent can resolve — neither bundled nor
+    // host-discovered (a typo). Falls through to plain text, same as the
+    // in-session composer's unknown-command path.
     typeMessage("/typo do something");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -656,6 +664,33 @@ describe("NewChatLandingScreen create flow", () => {
       expect(setPendingInitialPromptMock).toHaveBeenCalledWith("conv_new", {
         text: "/typo do something",
         skill: null,
+        files: [],
+      }),
+    );
+  });
+
+  it("invokes a host-discovered skill as a slash command, not plain text", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    // Not in the bundle — it lives in the user's own ~/.claude/skills, which
+    // only the chosen host can see. The composer offers it in the "/" menu, so
+    // completing one has to actually invoke it rather than send literal text.
+    vi.mocked(useHostAgentSkills).mockReturnValue({
+      data: [{ name: "my-own-skill", description: "Something local" }],
+    } as unknown as ReturnType<typeof useHostAgentSkills>);
+    setAgents([agent({ skills: [] })]);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("/my-own-skill on the auth module");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith("conv_new", {
+        text: "/my-own-skill on the auth module",
+        skill: { name: "my-own-skill", args: "on the auth module" },
         files: [],
       }),
     );

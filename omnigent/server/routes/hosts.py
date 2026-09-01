@@ -70,6 +70,10 @@ _LIST_DIR_MAX_LIMIT = 1000
 # for transient network slowness without making the picker feel hung.
 _CREATE_DIR_TIMEOUT_S = 5.0
 _MODEL_OPTIONS_TIMEOUT_S = 15.0
+# Per-call timeout for host.skills round-trips. Discovery scans a handful of
+# directories and parses each SKILL.md, so it sits above list_dir's 5s — but
+# well inside how long the composer's menu can wait.
+_SKILLS_TIMEOUT_S = 10.0
 # Per-call timeout for host.install_harness round-trips. The host runs
 # `npm install -g <pkg>` — install_harness_cli caps that subprocess at 300s —
 # then recomputes readiness and sends the result back over the tunnel. The
@@ -133,6 +137,41 @@ async def _proxy_model_options(
             detail=(
                 f"host '{host_conn.host_id}' did not resolve model options within "
                 f"{_MODEL_OPTIONS_TIMEOUT_S:.0f}s"
+            ),
+        ) from exc
+
+
+async def _proxy_skills(
+    *,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+    harness: str,
+    path: str | None,
+    skills_filter: str | list[str],
+) -> dict[str, Any]:
+    """Ask a host which skills a harness would expose there."""
+    from omnigent.server.routes._host_skills import request_host_skills
+
+    try:
+        return await request_host_skills(
+            host_registry=host_registry,
+            host_conn=host_conn,
+            harness=harness,
+            path=path,
+            skills_filter=skills_filter,
+            timeout_s=_SKILLS_TIMEOUT_S,
+        )
+    except ConnectionError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"host '{host_conn.host_id}' connection lost",
+        ) from exc
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"host '{host_conn.host_id}' did not resolve skills within "
+                f"{_SKILLS_TIMEOUT_S:.0f}s"
             ),
         ) from exc
 
@@ -725,6 +764,92 @@ def create_hosts_router(
         if isinstance(error, str) and error:
             payload["error"] = error
         return payload
+
+    @router.get("/hosts/{host_id}/agents/{agent_id}/skills")
+    async def get_host_agent_skills(
+        request: Request,
+        host_id: str,
+        agent_id: str,
+        path: str | None = Query(
+            default=None,
+            description="Workspace directory to walk; omit for home-scope skills only.",
+        ),
+    ) -> dict[str, list[dict[str, str]]]:
+        """Return the host-discovered skills an agent would gain on this host.
+
+        The new-session composer's ``/`` menu knows an agent's *bundled* skills
+        from ``GET /v1/agents``, but the ones a user actually reaches for often
+        live on their machine — ``~/.claude/skills``, enabled Claude Code
+        plugins, ``~/.codex/skills``, or the workspace's own ``.claude/skills``.
+        Only the host can see those, so it resolves them under the agent's
+        ``skills:`` filter and the server drops anything already bundled.
+
+        A preview, not a binding snapshot: the session's own merged list
+        arrives on the snapshot once a runner binds.
+        """
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+        conn = host_registry.get(host.host_id)
+        if conn is None:
+            raise _host_absent_error(host)
+
+        # Harness picks the discovery provider and ``skills_filter`` decides
+        # what may surface, so both come from the spec — an agent declaring
+        # ``skills: none`` must not have host skills offered on its behalf. A
+        # spec that won't load leaves the harness unknown, which the host reads
+        # as the generic host walk rather than a vendor's own mechanism.
+        harness: str | None = None
+        skills_filter: str | list[str] = "all"
+        bundled: set[str] = set()
+        if agent_store is not None and agent_cache is not None:
+            agent = await asyncio.to_thread(agent_store.get, agent_id)
+            if agent is None:
+                raise HTTPException(status_code=404, detail="agent not found")
+            if agent.bundle_location is not None:
+                try:
+                    loaded = await asyncio.to_thread(
+                        agent_cache.load, agent.id, agent.bundle_location
+                    )
+                except (OmnigentError, OSError):
+                    _logger.warning(
+                        "host skills: spec load failed for agent=%s", agent_id, exc_info=True
+                    )
+                else:
+                    harness = canonicalize_harness(loaded.spec.executor.harness_kind)
+                    skills_filter = loaded.spec.skills_filter
+                    bundled = {sk.name for sk in loaded.spec.skills}
+
+        result = await _proxy_skills(
+            host_registry=host_registry,
+            host_conn=conn,
+            harness=harness or "",
+            path=path,
+            skills_filter=skills_filter,
+        )
+        if result.get("status") != "ok":
+            raise HTTPException(
+                status_code=502,
+                detail=str(result.get("error") or "host skill discovery failed"),
+            )
+        raw = result.get("skills")
+        skills: list[dict[str, str]] = []
+        seen = set(bundled)
+        for entry in raw if isinstance(raw, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            if not isinstance(name, str) or name in seen:
+                continue
+            seen.add(name)
+            description = entry.get("description")
+            skills.append(
+                {"name": name, "description": description if isinstance(description, str) else ""}
+            )
+        return {"skills": skills}
 
     @router.post("/hosts/{host_id}/runners")
     async def launch_runner(

@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   useDetectedCredentials,
+  useHostAgentSkills,
   useHostModelOptions,
   useHosts,
   useInstallHarness,
@@ -394,6 +395,59 @@ describe("useHostModelOptions", () => {
     renderHook(() => useHostModelOptions(null, "claude-native"), { wrapper });
     await Promise.resolve();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("useHostAgentSkills", () => {
+  it("loads the host-discovered skills for an agent and workspace", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        skills: [{ name: "dev-productivity:deslop", description: "Remove AI slop" }],
+      }),
+    );
+
+    const { result } = renderHook(
+      () => useHostAgentSkills("host_1", "ag_1", "/Users/corey/my repo"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    // The workspace rides as a query param, encoded — a path with a space
+    // would otherwise break the URL.
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/hosts/host_1/agents/ag_1/skills?path=%2FUsers%2Fcorey%2Fmy%20repo",
+    );
+    expect(result.current.data).toEqual([
+      { name: "dev-productivity:deslop", description: "Remove AI slop" },
+    ]);
+  });
+
+  it("omits the path param when no workspace is chosen", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ skills: [] }));
+
+    const { result } = renderHook(() => useHostAgentSkills("host_1", "ag_1", null), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/hosts/host_1/agents/ag_1/skills");
+  });
+
+  it("does not fetch without a host, an agent, or when disabled", async () => {
+    renderHook(() => useHostAgentSkills(null, "ag_1", null), { wrapper });
+    renderHook(() => useHostAgentSkills("host_1", null, null), { wrapper });
+    renderHook(() => useHostAgentSkills("host_1", "ag_1", null, false), { wrapper });
+    await Promise.resolve();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("tolerates a server that omits the field", async () => {
+    // An older server (or one whose host answered nothing) must leave the
+    // menu with the agent's bundled skills, not an undefined crash.
+    fetchMock.mockResolvedValueOnce(mockResponse({}));
+
+    const { result } = renderHook(() => useHostAgentSkills("host_1", "ag_1", null), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toEqual([]);
   });
 });
 

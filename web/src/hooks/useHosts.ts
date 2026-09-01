@@ -119,6 +119,73 @@ export function useHostModelOptions(hostId: string | null, harness: string, enab
   });
 }
 
+/** A skill the host would expose, in the shape the composer menu wants. */
+export interface HostSkill {
+  name: string;
+  description: string;
+}
+
+/** An error carrying the HTTP status, so the retry predicate can read it. */
+interface StatusError extends Error {
+  status?: number;
+}
+
+async function fetchHostAgentSkills(
+  hostId: string,
+  agentId: string,
+  path: string | null,
+): Promise<HostSkill[]> {
+  const query = path === null ? "" : `?path=${encodeURIComponent(path)}`;
+  const res = await authenticatedFetch(
+    `/v1/hosts/${encodeURIComponent(hostId)}/agents/${encodeURIComponent(agentId)}/skills${query}`,
+  );
+  if (!res.ok) {
+    const err: StatusError = new Error(`${res.status} ${res.statusText}`);
+    err.status = res.status;
+    throw err;
+  }
+  const body = (await res.json()) as { skills?: HostSkill[] };
+  return body.skills ?? [];
+}
+
+/**
+ * Skills the chosen host would add to an agent, before any session exists.
+ *
+ * The agent's *bundled* skills come from `GET /v1/agents`; the ones on the
+ * user's machine (`~/.claude/skills`, enabled Claude Code plugins,
+ * `~/.codex/skills`, the workspace's own `.claude/skills`) are only visible to
+ * the host, so the new-chat composer asks it. Bundled names are already
+ * filtered out server-side, so the caller can concatenate.
+ *
+ * @param hostId Host the session will launch on; `null` disables the query.
+ * @param agentId Agent whose spec supplies the harness and `skills:` filter;
+ *   `null` disables the query.
+ * @param path Workspace directory to walk, or `null` for home scope only.
+ * @param enabled Caller-side gate (e.g. the menu is hidden for this agent).
+ */
+export function useHostAgentSkills(
+  hostId: string | null,
+  agentId: string | null,
+  path: string | null,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: ["host-agent-skills", hostId, agentId, path],
+    queryFn: () => fetchHostAgentSkills(hostId as string, agentId as string, path),
+    enabled: enabled && hostId !== null && agentId !== null,
+    // Skills change when the user edits a SKILL.md or toggles a plugin — rare
+    // within one visit to the dialog, so a minute of cache spares the tunnel a
+    // round-trip per agent/workspace switch.
+    staleTime: 60_000,
+    // Any HTTP answer here is final: an offline host (409), a missing agent
+    // (404), and a host that didn't reply (502/504 — including a host too old
+    // to know the frame) all mean "no host skills", and the menu falls back to
+    // the bundled ones. Only a network-level failure (no status) is worth one
+    // retry — retrying the rest would just spend 30s on a settled answer.
+    retry: (failureCount, error) => (error as StatusError).status === undefined && failureCount < 1,
+  });
+}
+
 interface InstallHarnessResult {
   object: "harness_install";
   harness: string;

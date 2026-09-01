@@ -48,6 +48,8 @@ from omnigent.host.frames import (
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostSkillsFrame,
+    HostSkillsResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -103,6 +105,129 @@ def _no_real_zygote(monkeypatch: pytest.MonkeyPatch) -> None:
     from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 
     monkeypatch.setenv(ZYGOTE_ENABLED_ENV_VAR, "0")
+
+
+def _write_host_skill(skills_dir: Path, name: str) -> None:
+    """Write a minimal ``<skills_dir>/<name>/SKILL.md`` with valid frontmatter."""
+    d = skills_dir / name
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(f"---\nname: {name}\ndescription: {name} desc\n---\nbody\n")
+
+
+async def test_handle_skills_discovers_workspace_and_home_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The composer's pre-launch menu sees both scopes only the host can read."""
+    home = tmp_path / "home"
+    _write_host_skill(home / ".claude" / "skills", "home-skill")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    workspace = tmp_path / "ws"
+    _write_host_skill(workspace / ".claude" / "skills", "ws-skill")
+    host = _make_host_process()
+
+    result = await asyncio.to_thread(
+        host._handle_skills,
+        HostSkillsFrame(request_id="req_1", harness="claude-sdk", path=str(workspace)),
+    )
+
+    assert result.request_id == "req_1"
+    assert result.status == "ok"
+    assert {s["name"] for s in result.skills} == {"ws-skill", "home-skill"}
+    assert {s["description"] for s in result.skills} == {"ws-skill desc", "home-skill desc"}
+    _cleanup_host(host)
+
+
+async def test_handle_skills_honors_the_specs_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An agent declaring ``skills: none`` gets no host skills offered for it.
+
+    The filter rides on the frame precisely so a hermetic spec can't have the
+    user's local skill library surfaced on its behalf by the new-chat menu.
+    """
+    home = tmp_path / "home"
+    _write_host_skill(home / ".claude" / "skills", "home-skill")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    workspace = tmp_path / "ws"
+    _write_host_skill(workspace / ".claude" / "skills", "ws-skill")
+    _write_host_skill(workspace / ".claude" / "skills", "other-skill")
+    host = _make_host_process()
+
+    hermetic = await asyncio.to_thread(
+        host._handle_skills,
+        HostSkillsFrame(
+            request_id="req_1",
+            harness="claude-sdk",
+            path=str(workspace),
+            skills_filter="none",
+        ),
+    )
+    assert hermetic.skills == []
+
+    named = await asyncio.to_thread(
+        host._handle_skills,
+        HostSkillsFrame(
+            request_id="req_2",
+            harness="claude-sdk",
+            path=str(workspace),
+            skills_filter=["ws-skill"],
+        ),
+    )
+    assert [s["name"] for s in named.skills] == ["ws-skill"]
+    _cleanup_host(host)
+
+
+async def test_handle_skills_without_a_workspace_reads_home_scope_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No workspace chosen yet still answers with the user's own skills."""
+    home = tmp_path / "home"
+    _write_host_skill(home / ".claude" / "skills", "home-skill")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    host = _make_host_process()
+
+    result = await asyncio.to_thread(
+        host._handle_skills,
+        HostSkillsFrame(request_id="req_1", harness="claude-sdk", path=None),
+    )
+
+    assert [s["name"] for s in result.skills] == ["home-skill"]
+    _cleanup_host(host)
+
+
+async def test_skills_frame_reply_survives_a_discovery_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash becomes a failed frame, so the server's future can't hang.
+
+    The route awaits a future keyed by request_id; without the reply the
+    composer would sit on a 10s timeout instead of falling back to the
+    agent's bundled skills.
+    """
+    host = _make_host_process()
+    monkeypatch.setattr(
+        "omnigent.host.connect.resolve_harness_skills",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    sent: list[str] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            sent.append(text)
+
+    await host._dispatch_host_frame(
+        _FakeWs(),  # type: ignore[arg-type]
+        HostSkillsFrame(request_id="req_1", harness="claude-sdk", path=None),
+    )
+
+    assert len(sent) == 1
+    reply = decode_host_frame(sent[0])
+    assert isinstance(reply, HostSkillsResultFrame)
+    assert reply.request_id == "req_1"
+    assert reply.status == "failed"
+    assert reply.skills == []
+    assert reply.error is not None and "claude-sdk" in reply.error
+    _cleanup_host(host)
 
 
 async def test_handle_model_options_serves_the_claude_catalog(

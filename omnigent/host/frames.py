@@ -77,6 +77,8 @@ class HostFrameKind(str, Enum):
     IMPORT_LOCAL = "host.import_local"
     IMPORT_LOCAL_SESSION = "host.import_local_session"
     IMPORT_LOCAL_DONE = "host.import_local_done"
+    SKILLS = "host.skills"
+    SKILLS_RESULT = "host.skills_result"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -946,6 +948,49 @@ class HostImportLocalDoneFrame:
     failed: int = 0
 
 
+@dataclass
+class HostSkillsFrame:
+    """Server → host: discover the skills a harness would expose here.
+
+    Answers the new-session composer's ``/`` menu before any runner
+    exists. Only the host can see ``~/.claude/skills``, the enabled Claude
+    Code plugins, ``~/.codex/skills`` and the workspace's own
+    ``.claude/skills`` — so the discovery runs there, the same way
+    ``host.model_options`` resolves a catalog on the machine that will run
+    it.
+
+    :param request_id: Unique ID for correlating the result, e.g.
+        ``"req_skills_1"``.
+    :param harness: Harness id (canonical or alias), e.g.
+        ``"claude-sdk"``. Selects the per-vendor discovery provider.
+    :param path: Workspace directory to walk, absolute or
+        tilde-prefixed. ``None`` discovers home/plugin-scope skills only
+        (the user hasn't chosen a workspace yet).
+    :param skills_filter: The agent spec's ``skills:`` filter —
+        ``"all"``, ``"none"``, or a list of names. A spec that opts out
+        must not have host skills offered on its behalf.
+    """
+
+    request_id: str
+    harness: str
+    path: str | None = None
+    skills_filter: str | list[str] = "all"
+
+
+@dataclass
+class HostSkillsResultFrame:
+    """Host → server: skills discovered on that machine.
+
+    :param skills: One entry per skill, ``{"name": …, "description": …}``,
+        namespaced as the harness names it (e.g. ``"plugin:skill"``).
+    """
+
+    request_id: str
+    status: str
+    skills: list[_JsonObject] = field(default_factory=list)
+    error: str | None = None
+
+
 HostFrame = (
     HostHelloFrame
     | HostConnectionErrorFrame
@@ -982,6 +1027,8 @@ HostFrame = (
     | HostImportLocalFrame
     | HostImportLocalSessionFrame
     | HostImportLocalDoneFrame
+    | HostSkillsFrame
+    | HostSkillsResultFrame
 )
 
 
@@ -1379,6 +1426,26 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "failed": frame.failed,
             }
         )
+    if isinstance(frame, HostSkillsFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.SKILLS.value,
+                "request_id": frame.request_id,
+                "harness": frame.harness,
+                "path": frame.path,
+                "skills_filter": frame.skills_filter,
+            }
+        )
+    if isinstance(frame, HostSkillsResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.SKILLS_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "skills": frame.skills,
+                "error": frame.error,
+            }
+        )
     raise TypeError(f"unknown host frame type: {type(frame).__name__}")
 
 
@@ -1513,6 +1580,10 @@ def _decode_known_host_frame(
             return _decode_import_local_session(msg)
         case HostFrameKind.IMPORT_LOCAL_DONE:
             return _decode_import_local_done(msg)
+        case HostFrameKind.SKILLS:
+            return _decode_skills(msg)
+        case HostFrameKind.SKILLS_RESULT:
+            return _decode_skills_result(msg)
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 
@@ -2086,6 +2157,40 @@ def _decode_import_local_done(msg: _JsonObject) -> HostImportLocalDoneFrame:
         error=_optional_nullable_str(msg, "error"),
         # Absent on older hosts; default to 0 so decode stays backward-compatible.
         failed=raw_failed if isinstance(raw_failed := msg.get("failed"), int) else 0,
+    )
+
+
+def _decode_skills(msg: _JsonObject) -> HostSkillsFrame:
+    """Decode a host.skills request frame."""
+    # Absent on an older server: "all" is the filter every spec without an
+    # explicit opt-out carries, and matches discover_host_skills' default.
+    raw_filter = msg.get("skills_filter", "all")
+    if isinstance(raw_filter, list):
+        if not all(isinstance(name, str) for name in raw_filter):
+            raise ValueError("frame field must be a list of strings: 'skills_filter'")
+        skills_filter: str | list[str] = list(raw_filter)
+    elif isinstance(raw_filter, str):
+        skills_filter = raw_filter
+    else:
+        raise ValueError("frame field must be a string or list of strings: 'skills_filter'")
+    return HostSkillsFrame(
+        request_id=_required_str(msg, "request_id"),
+        harness=_required_str(msg, "harness"),
+        path=_optional_nullable_str(msg, "path"),
+        skills_filter=skills_filter,
+    )
+
+
+def _decode_skills_result(msg: _JsonObject) -> HostSkillsResultFrame:
+    """Decode a host.skills_result frame."""
+    skills = msg.get("skills", [])
+    if not isinstance(skills, list) or not all(isinstance(skill, dict) for skill in skills):
+        raise ValueError("frame field must be a list of JSON objects: 'skills'")
+    return HostSkillsResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        skills=skills,
+        error=_optional_nullable_str(msg, "error"),
     )
 
 

@@ -74,6 +74,8 @@ from omnigent.host.frames import (
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostSkillsFrame,
+    HostSkillsResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -144,6 +146,7 @@ from omnigent.runtime.websocket_metrics import (
     record_websocket_connected,
     record_websocket_disconnected,
 )
+from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
 from omnigent.suspend_watch import watch_for_resume
 from omnigent.tls import client_ssl_context
 from omnigent.version import VERSION
@@ -2680,6 +2683,40 @@ class HostProcess:
         routable = list(config.routable_models) if config is not None else []
         return ModelOptionsResult(models=rows, routable_models=routable)
 
+    def _handle_skills(self, frame: HostSkillsFrame) -> HostSkillsResultFrame:
+        """Discover the skills a harness would expose on this machine.
+
+        The pre-launch counterpart to the runner's ``_resolve_session_skills``:
+        only the host can see ``~/.claude/skills``, the enabled Claude Code
+        plugins and the workspace's own ``.claude/skills``, so the new-session
+        composer's ``/`` menu asks the chosen host rather than guessing from
+        the agent's bundled skills alone.
+
+        Bundled skills are deliberately absent — the server already knows
+        those from the spec and merges them with what comes back.
+        """
+        harness = canonicalize_harness(frame.harness) or frame.harness
+        # The workspace is the only root: the bundle isn't materialized here
+        # (no session, so no runner workdir), which is also why bundle_dir is
+        # None — codex/cursor providers then read their home scope alone.
+        # Home stands in when no workspace is chosen yet: the generic walk
+        # discovers per-root, so an empty root tuple would find nothing at all
+        # rather than the user's own ~/.claude/skills.
+        home = Path.home()
+        roots = (Path(frame.path).expanduser().resolve(),) if frame.path else (home,)
+        ctx = SkillSourceContext(
+            roots=roots,
+            home=home,
+            skills_filter=frame.skills_filter,
+            bundle_dir=None,
+        )
+        skills = resolve_harness_skills(ctx, harness)
+        return HostSkillsResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            skills=[{"name": s.name, "description": s.description} for s in skills],
+        )
+
     async def _handle_model_options(
         self,
         frame: HostModelOptionsFrame,
@@ -3848,6 +3885,20 @@ class HostProcess:
             # off the event loop and reply when it completes.
             fs_result = await asyncio.to_thread(self._handle_fs_request, frame)
             await ws.send(encode_host_frame(fs_result))
+        elif isinstance(frame, HostSkillsFrame):
+            # Discovery walks the filesystem (and parses SKILL.md frontmatter),
+            # so keep it off the event loop; a crash becomes an honest failed
+            # frame so the server's request future settles.
+            try:
+                skills_result = await asyncio.to_thread(self._handle_skills, frame)
+            except Exception:
+                _logger.exception("Skill discovery crashed for %r", frame.harness)
+                skills_result = HostSkillsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error=f"skill discovery crashed for {frame.harness!r}",
+                )
+            await ws.send(encode_host_frame(skills_result))
         elif isinstance(frame, HostModelOptionsFrame):
             # Every dispatched frame already runs on its own task (see
             # _start_frame_task), so a cold harness probe here cannot stall

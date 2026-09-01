@@ -8444,6 +8444,86 @@
         ]
       }
     },
+    "/v1/hosts/{host_id}/agents/{agent_id}/skills": {
+      "get": {
+        "description": "Return the host-discovered skills an agent would gain on this host.\n\nThe new-session composer's `/` menu knows an agent's *bundled* skills\nfrom `GET /v1/agents`, but the ones a user actually reaches for often\nlive on their machine \u2014 `~/.claude/skills`, enabled Claude Code\nplugins, `~/.codex/skills`, or the workspace's own `.claude/skills`.\nOnly the host can see those, so it resolves them under the agent's\n`skills:` filter and the server drops anything already bundled.\n\nA preview, not a binding snapshot: the session's own merged list\narrives on the snapshot once a runner binds.",
+        "operationId": "get_host_agent_skills_v1_hosts__host_id__agents__agent_id__skills_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Workspace directory to walk; omit for home-scope skills only.",
+            "in": "query",
+            "name": "path",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Workspace directory to walk; omit for home-scope skills only.",
+              "title": "Path"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "items": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "title": "Response Get Host Agent Skills V1 Hosts  Host Id  Agents  Agent Id  Skills Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Host Agent Skills",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
     "/v1/hosts/{host_id}/credentials/detected": {
       "get": {
         "description": "List adoptable credentials already present on a connected host.\n\nBacks the setup dialog's \"adopt an existing credential\" affordance: the\nhost reports which UI-auth-family credentials it already has as\nNON-secret descriptors (family + source label + env var name), so the UI\ncan offer a one-click \"Use it\". Owner-scoped and flag-gated like the\ncredential-write route (404 when disabled). Never returns a secret value.\n\n**Returns:** `{\"object\": \"detected_credentials\", \"credentials\": [...]}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when disabled or host unknown, 403 when not the owner, 409 when offline, 502/504 on host failure/timeout.",

@@ -498,6 +498,136 @@ describe("Composer slash-command menu", () => {
   });
 });
 
+describe("Composer mid-draft skill completion", () => {
+  beforeEach(() => {
+    useChatStore.setState({
+      conversationId: "conv_test",
+      skills: [
+        { name: "deep-research", description: "Run a deep research sweep" },
+        { name: "deslop", description: "Remove AI slop" },
+      ],
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  /** Type `value` with the caret parked at `caret` (default: end of value). */
+  function type(ta: HTMLTextAreaElement, value: string, caret = value.length) {
+    fireEvent.change(ta, { target: { value, selectionStart: caret } });
+  }
+
+  it("opens the menu for a slash typed mid-sentence", () => {
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    type(ta, "please run /des");
+    expect(activeRow()?.textContent).toContain("/deslop");
+  });
+
+  it("offers skills only mid-draft, since built-ins can't act on a word in a sentence", () => {
+    render(<Composer {...composerProps({ isNativeWrapper: true })} />);
+    const ta = textarea();
+    // Leading "/" lists the built-ins…
+    type(ta, "/");
+    expect(screen.getByTestId("slash-menu-item-compact")).toBeInTheDocument();
+    expect(screen.getByTestId("slash-menu-item-deslop")).toBeInTheDocument();
+    // …the same "/" mid-draft lists the skills alone.
+    type(ta, "use /");
+    expect(screen.queryByTestId("slash-menu-item-compact")).toBeNull();
+    expect(screen.queryByTestId("slash-menu-item-context")).toBeNull();
+    expect(screen.getByTestId("slash-menu-item-deslop")).toBeInTheDocument();
+  });
+
+  it("Tab completes in place, keeping the text around the token", () => {
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    type(ta, "please run /des");
+    fireEvent.keyDown(ta, { key: "Tab" });
+    expect(ta.value).toBe("please run /deslop ");
+  });
+
+  it("completes a token the caret sits on without disturbing the tail", () => {
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    // Caret parked at the end of "/des", with the rest of the sentence after
+    // it — the re-editing case that the whole-draft prefix check never saw.
+    type(ta, "/des this file please", 4);
+    expect(activeRow()?.textContent).toContain("/deslop");
+    fireEvent.keyDown(ta, { key: "Tab" });
+    expect(ta.value).toBe("/deslop  this file please");
+  });
+
+  it("Enter completes mid-draft instead of sending", () => {
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    const ta = textarea();
+    type(ta, "run /des");
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(ta.value).toBe("run /deslop ");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("never executes a built-in from a mid-draft completion", () => {
+    // /compact is a no-arg built-in: selecting it from the leading menu runs
+    // it. It must not be reachable (nor runnable) from inside a sentence.
+    const compact = vi.fn();
+    useChatStore.setState({ compact });
+    render(<Composer {...composerProps({ isNativeWrapper: true })} />);
+    const ta = textarea();
+    type(ta, "now /compact");
+    // No menu at all: /compact isn't a skill, so nothing matches mid-draft.
+    expect(activeRow()).toBeNull();
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(compact).not.toHaveBeenCalled();
+  });
+
+  it("Escape closes the menu but keeps a mid-draft sentence", () => {
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    type(ta, "please run /des");
+    expect(activeRow()).not.toBeNull();
+
+    fireEvent.keyDown(ta, { key: "Escape" });
+    expect(activeRow()).toBeNull();
+    expect(ta.value).toBe("please run /des");
+
+    // Typing on brings the suggestions back.
+    type(ta, "please run /desl");
+    expect(activeRow()?.textContent).toContain("/deslop");
+  });
+
+  it("Escape still clears a draft that is nothing but the command", () => {
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    type(ta, "/des");
+    fireEvent.keyDown(ta, { key: "Escape" });
+    expect(ta.value).toBe("");
+  });
+
+  it("stays closed for slashes that read as paths or prose", () => {
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    type(ta, "look at /etc/hosts");
+    expect(activeRow()).toBeNull();
+    type(ta, "deslop and/or simplify");
+    expect(activeRow()).toBeNull();
+  });
+
+  it("sends a mid-draft skill mention as plain text", () => {
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    const ta = textarea();
+    type(ta, "run /des");
+    fireEvent.keyDown(ta, { key: "Tab" });
+    // The completed draft doesn't read as a command (the "/" isn't leading),
+    // so it goes out as an ordinary message, not a slash_command event.
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSend).toHaveBeenCalledWith("run /deslop", undefined);
+  });
+});
+
 describe("Composer slash-command submit routing", () => {
   // Several tests below swap the store's setModel for a vi.fn(); restore
   // the real action after each test so the mock can't bleed into later
