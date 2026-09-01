@@ -45,3 +45,13 @@ what to look for, and why it's wrong.
   dump-style constructor (dict / json.dumps / str / repr of the whole environ)
   trips the security exfil scan on added lines; the repo idiom
   `os.environ.copy()` is equivalent and passes.
+
+## Rollback / cleanup
+
+- **Cleanup of an adopted resource must not destroy pre-existing user state.**
+  When an operation *recreates or adopts* something that predates the request (an
+  existing branch, an existing directory, an existing config), its
+  rollback/cleanup path must remove only what the operation itself created —
+  never force-delete the pre-existing thing (e.g. `git branch -D` on a branch the
+  user owned before the call, losing unpushed commits). Check every failure path
+  that shares a cleanup helper with the create-from-scratch flow.

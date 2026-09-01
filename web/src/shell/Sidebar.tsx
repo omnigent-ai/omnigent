@@ -2650,7 +2650,11 @@ function ConversationSection({
           {(headerAction || persistentHeaderAction) && (
             <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5">
               {headerAction && (
-                <div className="flex items-center transition-opacity md:opacity-0 md:group-focus-within/header:opacity-100 md:group-hover/header:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 md:has-[[aria-expanded=true]]:opacity-100">
+                // Reveal on :focus-visible (keyboard) — NOT :focus-within — so
+                // clicking the header with the mouse to expand/collapse doesn't
+                // leave the action stuck visible: the toggle keeps focus after
+                // the click, and :focus-within would hold the reveal open.
+                <div className="flex items-center transition-opacity md:opacity-0 md:group-has-[:focus-visible]/header:opacity-100 md:group-hover/header:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 md:has-[[aria-expanded=true]]:opacity-100">
                   {headerAction}
                 </div>
               )}

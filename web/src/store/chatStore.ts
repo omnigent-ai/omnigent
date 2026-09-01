@@ -716,6 +716,7 @@ export interface ChatActions {
     elicitationId: string,
     action: "accept" | "decline" | "cancel",
     content?: Record<string, unknown>,
+    meta?: Record<string, unknown>,
   ) => Promise<void>;
   /**
    * Set sticky effort; PATCH only when the active session supports it.
@@ -2038,7 +2039,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  submitApproval: async (elicitationId, action, content) => {
+  submitApproval: async (elicitationId, action, content, meta) => {
     const sessionId = get().conversationId;
     if (!sessionId) return;
     const targetSessionId =
@@ -2054,8 +2055,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // ``content`` rides through the response field so multi-choice
     // cards (AskUserQuestion) can render the selected label rather
     // than a generic "Approved" pill.
-    const responseValue: ElicitationBlock["response"] =
-      content === undefined ? { action } : { action, content };
+    const responseValue: ElicitationBlock["response"] = {
+      action,
+      ...(content === undefined ? {} : { content }),
+      ...(meta === undefined ? {} : { _meta: meta }),
+    };
     setActive((s) => ({
       blocks: s.blocks.map((b) =>
         b.type === "elicitation" && b.elicitationId === elicitationId
@@ -2072,11 +2076,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       status: action === "accept" ? "success" : action === "decline" ? "failure" : "cancelled",
     });
     try {
-      await approveElicitation(
-        targetSessionId,
-        elicitationId,
-        content === undefined ? { action } : { action, content },
-      );
+      await approveElicitation(targetSessionId, elicitationId, {
+        action,
+        ...(content === undefined ? {} : { content }),
+        ...(meta === undefined ? {} : { _meta: meta }),
+      });
     } catch {
       // Roll back to pending so the user can retry. Surfacing the
       // error is a future affordance — for now, the buttons
@@ -2713,19 +2717,27 @@ conversationRegistry.subscribe((id) => {
 type NativeModelFamily = "claude" | "codex";
 
 /**
- * Resolve the native model family from a session wrapper label.
+ * Resolve the native model family from a session snapshot.
+ *
+ * The wrapper label is authoritative. Custom YAML agents carry no
+ * presentation label, so for label-less sessions the resolved harness is the
+ * fallback — mirroring the composer capability gates, so a custom
+ * codex-native session keeps its reported model in the composer label.
  *
  * :param session: Session snapshot from the API.
- * :returns: ``"claude"`` / ``"codex"`` for native wrappers, else ``null``.
+ * :returns: ``"claude"`` / ``"codex"`` for native sessions, else ``null``.
  */
-function nativeModelFamilyForSession(session: Pick<Session, "labels">): NativeModelFamily | null {
-  switch (session.labels?.["omnigent.wrapper"]) {
+function nativeModelFamilyForSession(
+  session: Pick<Session, "labels" | "harness">,
+): NativeModelFamily | null {
+  const wrapper = session.labels?.["omnigent.wrapper"];
+  switch (wrapper) {
     case "claude-code-native-ui":
       return "claude";
     case "codex-native-ui":
       return "codex";
     default:
-      return null;
+      return wrapper == null && session.harness === "codex-native" ? "codex" : null;
   }
 }
 
@@ -4569,6 +4581,11 @@ export async function pumpStreamEvents(
   const stream = new BlockStream();
   const sseResult: SseStreamResult = { sawDone: false };
   const rawEvents = parseSseStream(body, sseResult);
+  // Blocks awaiting their coalesced flush; `seenItemIds` dedupes against
+  // both committed and still-buffered blocks. Lives for the whole stream
+  // (one SSE connection); bounded by item count like `blocks` itself.
+  const buffer: AnyBlock[] = [];
+  const seenItemIds = new Set<string>();
   // Tap the raw event stream for `session.*` side effects (sessionStatus,
   // pending-message promotion, interrupted decoration) before handing it
   // to the BlockStream reducer. The reducer is intentionally pure
@@ -4577,13 +4594,31 @@ export async function pumpStreamEvents(
   // A scheduled wake can stream before its new turn id arrives. Ignore the
   // rest of that message so it cannot attach to the completed prior turn.
   const ignoredWakeMessages = new Set<string>();
-  const events = tapLiveDeltas(tapSessionEvents(rawEvents, id), id, ignoredWakeMessages, set, get);
-
-  // Blocks awaiting their coalesced flush; `seenItemIds` dedupes against
-  // both committed and still-buffered blocks. Lives for the whole stream
-  // (one SSE connection); bounded by item count like `blocks` itself.
-  const buffer: AnyBlock[] = [];
-  const seenItemIds = new Set<string>();
+  const events = tapLiveDeltas(
+    tapSessionEvents(rawEvents, id, (elicitationId) => {
+      // A fast native approval can resolve in the few milliseconds between
+      // the reducer yielding its card and the next animation-frame flush.
+      // `handleSessionEvent` can only update committed blocks, so settle the
+      // buffered copy here instead of dropping that resolved edge.
+      const at = buffer.findIndex(
+        (block) =>
+          block.type === "elicitation" &&
+          block.elicitationId === elicitationId &&
+          block.status === "pending",
+      );
+      if (at === -1) return;
+      const target = buffer[at] as ElicitationBlock;
+      buffer[at] = {
+        ...target,
+        status: "responded",
+        response: { action: "auto_resolved" },
+      };
+    }),
+    id,
+    ignoredWakeMessages,
+    set,
+    get,
+  );
   // First content block of each response flushes synchronously (snappy
   // first-token paint); the rest batch.
   let paintedFirstContent = false;
@@ -6061,9 +6096,13 @@ function applyChildSessionUpdated(
 async function* tapSessionEvents(
   events: AsyncIterable<StreamEvent>,
   conversationId: string,
+  onElicitationResolved?: (elicitationId: string) => void,
 ): AsyncIterable<StreamEvent> {
   for await (const event of events) {
     handleSessionEvent(event, conversationId);
+    if (event.type === "elicitation_resolved") {
+      onElicitationResolved?.(event.elicitationId);
+    }
     pushSseEvent(conversationId, event);
     yield event;
   }

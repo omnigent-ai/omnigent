@@ -10,7 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ntpath
+import os
+import posixpath
+from dataclasses import dataclass
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any
+
+from pydantic import ValidationError
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.model_override import validate_model_override
@@ -20,8 +27,146 @@ from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, local_single_u
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.host_store import host_is_live
+from omnigent.stores.project_store import ProjectStore
 
 _logger = logging.getLogger(__name__)
+
+_STRICT_PROJECT_CREATE_ENV = "OMNIGENT_STRICT_PROJECT_SESSION_CREATE"
+
+
+@dataclass(frozen=True)
+class ProjectCreateResolution:
+    """Project-aware request values and any non-fatal consistency warnings."""
+
+    body: Any
+    project_id: str | None = None
+    warnings: tuple[dict[str, str], ...] = ()
+
+
+def _strict_project_create_enabled() -> bool:
+    """Return strict mismatch mode for direct creates and inherited fork filing."""
+    return os.environ.get(_STRICT_PROJECT_CREATE_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _workspace_within(candidate: str, root: str) -> bool:
+    """Return whether normalized *candidate* is lexically inside *root*."""
+    try:
+        windows = "\\" in candidate or "\\" in root
+        path_module = ntpath if windows else posixpath
+        path_type = PureWindowsPath if windows else PurePosixPath
+        candidate_path = path_type(path_module.normpath(candidate))
+        root_path = path_type(path_module.normpath(root))
+        return candidate_path.is_relative_to(root_path)
+    except (TypeError, ValueError):
+        return False
+
+
+async def resolve_project_session_create(
+    *,
+    body: Any,
+    user_id: str | None,
+    project_store: ProjectStore | None,
+    warn_on_mismatch: bool = True,
+) -> ProjectCreateResolution:
+    """Apply opt-in project defaults before any create-side validation.
+
+    Field presence, rather than value, controls defaulting.  Consequently an
+    explicit JSON ``null`` remains explicit and is never replaced by a project
+    hint.  Unknown and foreign projects deliberately share one 404 response.
+
+    ``warn_on_mismatch=False`` skips the consistency warnings (and their
+    strict-mode escalation) for callers whose project is inherited rather than
+    requested — e.g. a fork filing into its source's project, where a mismatch
+    belongs to the source session, not this request.
+    """
+    fields_set = set(body.model_fields_set)
+    project_id = getattr(body, "project_id", None)
+    if "project_id" not in fields_set or project_id is None:
+        if getattr(body, "agent_id", None) is None and "agent_id" in body.__class__.model_fields:
+            raise OmnigentError("agent_id is required", code=ErrorCode.INVALID_INPUT)
+        return ProjectCreateResolution(body=body)
+    if project_store is None:
+        raise OmnigentError(
+            "Project not found",
+            code=ErrorCode.NOT_FOUND,
+        )
+    project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
+    if project is None:
+        raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+
+    config = project.config
+    updates: dict[str, Any] = {}
+    for field in ("agent_id", "workspace", "git"):
+        if field not in fields_set and field in config and field in body.__class__.model_fields:
+            updates[field] = config[field]
+    resolved_data = body.model_dump()
+    resolved_data.update(updates)
+    # Re-validate project hints because config is intentionally stored as
+    # opaque JSON and may not match the session-create field types.
+    try:
+        resolved = body.__class__.model_validate(resolved_data)
+    except ValidationError as exc:
+        first = exc.errors(include_context=False)[0]
+        field = ".".join(str(part) for part in first.get("loc", ())) or "configuration"
+        raise OmnigentError(
+            f"Invalid project config field {field!r}: {first['msg']}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+
+    if getattr(resolved, "agent_id", None) is None and "agent_id" in body.__class__.model_fields:
+        raise OmnigentError("agent_id is required", code=ErrorCode.INVALID_INPUT)
+    if getattr(resolved, "git", None) is not None and getattr(resolved, "host_id", None) is None:
+        raise OmnigentError(
+            "git worktree creation requires host_id",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+    if not warn_on_mismatch:
+        return ProjectCreateResolution(body=resolved, project_id=project_id)
+
+    warnings: list[dict[str, str]] = []
+    explicit_agent_id = getattr(body, "agent_id", None) if "agent_id" in fields_set else None
+    pinned_agent_id = config.get("agent_id")
+    if explicit_agent_id and pinned_agent_id and explicit_agent_id != pinned_agent_id:
+        warnings.append(
+            {
+                "code": "project_agent_mismatch",
+                "message": "Explicit agent_id differs from the project's pinned agent",
+            }
+        )
+
+    explicit_workspace = getattr(body, "workspace", None) if "workspace" in fields_set else None
+    configured_workspace = config.get("workspace")
+    if (
+        isinstance(explicit_workspace, str)
+        and isinstance(configured_workspace, str)
+        and not _workspace_within(explicit_workspace, configured_workspace)
+    ):
+        warnings.append(
+            {
+                "code": "project_workspace_mismatch",
+                "message": "Explicit workspace is outside the project's configured workspace root",
+            }
+        )
+
+    for warning in warnings:
+        _logger.warning(
+            "project-aware session create warning project_id=%s code=%s: %s",
+            project_id,
+            warning["code"],
+            warning["message"],
+        )
+    if warnings and _strict_project_create_enabled():
+        raise OmnigentError(
+            "Project session create mismatch: " + "; ".join(w["message"] for w in warnings),
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return ProjectCreateResolution(body=resolved, project_id=project_id, warnings=tuple(warnings))
 
 
 # Claude Code's ``--permission-mode`` launch vocabulary — every value the CLI

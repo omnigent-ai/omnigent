@@ -593,6 +593,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # NAMES, not secrets, so allowlisting it leaks nothing on its own.
         # (Literal, not RUNNER_ENV_PASSTHROUGH_ENV_VAR, which is defined below.)
         "OMNIGENT_RUNNER_ENV_PASSTHROUGH",
+        # Keep host and spawned-runner routing decisions aligned when the
+        # host-slice-key kill switch is explicitly disabled.
+        "OMNIGENT_HOST_SLICE_KEY_ENABLED",
     }
     # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
     # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
@@ -2848,6 +2851,7 @@ class HostProcess:
                     repo_path=frame.repo_path,
                     branch_name=frame.branch_name,
                     base_branch=frame.base_branch,
+                    existing_branch=frame.existing_branch,
                 )
         except WorktreeError as exc:
             return HostCreateWorktreeResultFrame(

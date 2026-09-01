@@ -729,7 +729,7 @@ describe("Sidebar session list", () => {
     expect(selectSessions.parentElement).toHaveClass(
       "md:opacity-0",
       "md:group-hover/header:opacity-100",
-      "md:group-focus-within/header:opacity-100",
+      "md:group-has-[:focus-visible]/header:opacity-100",
       "md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100",
     );
 
