@@ -511,6 +511,32 @@ def test_worktree_guard_gates_native_write_edit(
     assert _result(evaluate(_tool_call(tool, **{path_key: path, "content": ""}), {})) == expected
 
 
+@pytest.mark.parametrize(
+    "tool,args",
+    [
+        # A decoy in-tree ``path`` must not shadow an escaping canonical key:
+        # the tool acts on its own key regardless of what else rides in the
+        # payload, so the guard must check every path-like argument present.
+        ("NotebookEdit", {"notebook_path": "/etc/x.ipynb", "path": "safe.ipynb"}),
+        ("Write", {"file_path": "/etc/passwd", "path": "safe.py", "content": ""}),
+        ("MultiEdit", {"file_path": "../escape.py", "path": "safe.py", "edits": []}),
+    ],
+    ids=["NotebookEdit-decoy-path", "Write-decoy-path", "MultiEdit-decoy-path"],
+)
+def test_worktree_guard_denies_escape_behind_decoy_path(
+    tool: str,
+    args: dict,
+) -> None:
+    """
+    An escaping path must DENY even when a benign in-tree path key is also
+    present. If the guard picked the first truthy key, a crafted payload
+    carrying a decoy relative ``path`` would smuggle an absolute
+    ``notebook_path``/``file_path`` past the confinement.
+    """
+    evaluate = worktree_guard()
+    assert _result(evaluate(_tool_call(tool, **args), {})) == "DENY"
+
+
 def test_worktree_guard_only_guards_writes() -> None:
     """
     Reads and shells pass through — the guard constrains only write/edit

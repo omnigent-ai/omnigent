@@ -573,35 +573,42 @@ def worktree_guard(
         if args is None:
             return _ALLOW
         # Omnigent tools use ``path``; Claude native tools use ``file_path``,
-        # except NotebookEdit which uses ``notebook_path``.
-        path = args.get("path") or args.get("file_path") or args.get("notebook_path")
-        if not isinstance(path, str):
-            return _ALLOW
-        # Backslashes are not valid in POSIX paths and could confuse
-        # downstream processing into treating them as separators, slipping a
-        # ``..\\`` past the split-on-'/' traversal check.
-        if "\\" in path:
-            return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
-        # posixpath, NOT os.path: the tool contract is POSIX-shaped, and
-        # ntpath.normpath rewrites "/" to "\", which makes the leading-"/" test
-        # below inert on a Windows runner (absolute paths would ALLOW there).
-        # normpath collapses ``..``/``.``/repeated slashes and pushes every
-        # upward traversal to the front, so a single startswith catches every
-        # escape form (e.g. "a/../../escape" → "../../escape").
-        normalized = posixpath.normpath(path)
-        if normalized.startswith(("/", "~", "..")):
-            return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
-        # A drive-qualified path ("C:/Windows/x") is absolute on Windows but
-        # reads as an ordinary relative dir named "C:" to posixpath, so the test
-        # above misses it. Checked on the NORMALIZED path, not the raw one:
-        # normpath strips a leading "./" (and collapses "a/../C:/..."), which
-        # would otherwise hide the drive letter from a raw-string check. UNC
-        # ("//server/share") keeps its leading slashes and is caught above.
-        # ASCII-only: Windows drives are [A-Za-z], but str.isalpha() is
-        # Unicode-aware and would also reject a relative dir named e.g. "Ω:".
-        drive = normalized[:1]
-        if drive.isascii() and drive.isalpha() and normalized[1:2] == ":":
-            return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
+        # except NotebookEdit which uses ``notebook_path``. Check EVERY
+        # path-like argument present, not the first truthy one: a decoy
+        # in-tree ``path`` alongside an escaping ``notebook_path`` (or
+        # ``file_path``) must still DENY, since the tool acts on its own
+        # canonical key regardless of what else rides in the payload.
+        paths = [
+            value
+            for key in ("path", "file_path", "notebook_path")
+            if isinstance(value := args.get(key), str)
+        ]
+        for path in paths:
+            # Backslashes are not valid in POSIX paths and could confuse
+            # downstream processing into treating them as separators, slipping a
+            # ``..\\`` past the split-on-'/' traversal check.
+            if "\\" in path:
+                return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
+            # posixpath, NOT os.path: the tool contract is POSIX-shaped, and
+            # ntpath.normpath rewrites "/" to "\", which makes the leading-"/" test
+            # below inert on a Windows runner (absolute paths would ALLOW there).
+            # normpath collapses ``..``/``.``/repeated slashes and pushes every
+            # upward traversal to the front, so a single startswith catches every
+            # escape form (e.g. "a/../../escape" → "../../escape").
+            normalized = posixpath.normpath(path)
+            if normalized.startswith(("/", "~", "..")):
+                return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
+            # A drive-qualified path ("C:/Windows/x") is absolute on Windows but
+            # reads as an ordinary relative dir named "C:" to posixpath, so the test
+            # above misses it. Checked on the NORMALIZED path, not the raw one:
+            # normpath strips a leading "./" (and collapses "a/../C:/..."), which
+            # would otherwise hide the drive letter from a raw-string check. UNC
+            # ("//server/share") keeps its leading slashes and is caught above.
+            # ASCII-only: Windows drives are [A-Za-z], but str.isalpha() is
+            # Unicode-aware and would also reject a relative dir named e.g. "Ω:".
+            drive = normalized[:1]
+            if drive.isascii() and drive.isalpha() and normalized[1:2] == ":":
+                return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
         return _ALLOW
 
     return _evaluate
