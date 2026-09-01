@@ -2125,9 +2125,10 @@ function buildMenu() {
     ],
   });
   // Standard View roles (Reload/zoom/fullscreen). Developer Tools lives in
-  // the opt-in Debug menu, so this menu is identical in normal releases —
-  // except the Experiments submenu, which is always present.
-  const envForced = serverSelectorV2EnvForced();
+  // the opt-in Debug menu, so this menu is identical in normal releases.
+  // (The server-selector-v2 toggle lives in the setup pages themselves — the
+  // classic page's CLI modal and the V2 page's cog menu — via the
+  // omnigent:set-server-selector-v2 IPC, not here.)
   template.push({
     label: "View",
     submenu: [
@@ -2139,35 +2140,6 @@ function buildMenu() {
       { role: "zoomOut" },
       { type: "separator" },
       { role: "togglefullscreen" },
-      { type: "separator" },
-      {
-        label: "Experiments",
-        submenu: [
-          {
-            id: "experiment_server_selector_v2",
-            // When forced by env, show it checked+disabled so the menu never
-            // misreports what's active.
-            label: envForced
-              ? "Server selector (set by OMNIGENT_SERVER_SELECTOR_V2)"
-              : "Server selector",
-            type: "checkbox",
-            checked: serverSelectorV2Enabled(),
-            enabled: !envForced,
-            click: (item) => {
-              const settings = loadSettings();
-              settings.server_selector_v2 = item.checked;
-              saveSettings(settings);
-              // Apply immediately to any window currently on a setup page (an
-              // unpinned window — see pinWindow); a connected window is left
-              // alone and picks up the change next time setup shows.
-              for (const [win, state] of windows) {
-                if (win.isDestroyed() || state.origin != null) continue;
-                void loadSetupPage(win);
-              }
-            },
-          },
-        ],
-      },
     ],
   });
   template.push({ role: "windowMenu" });
@@ -2478,6 +2450,22 @@ function registerIpc() {
     settings.recent_servers = remaining;
     saveSettings(settings);
     return excludingManagedServers(remaining, managed);
+  });
+
+  // Setup page → toggle the revamped server selector (settings.server_selector_v2)
+  // and reload the sending window to the chosen page. Both setup pages drive
+  // this: the classic page's CLI modal switches TO the new one, the V2 page's
+  // cog menu switches back. No-op when the env var forces the choice.
+  ipcMain.handle("omnigent:set-server-selector-v2", (event, enabled) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("set-server-selector-v2 is only available to the setup page");
+    }
+    if (serverSelectorV2EnvForced()) return; // env wins; can't be toggled off
+    const settings = loadSettings();
+    settings.server_selector_v2 = enabled === true;
+    saveSettings(settings);
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (win && !win.isDestroyed()) void loadSetupPage(win);
   });
 
   // Setup page → organization-provided server choices from macOS Managed

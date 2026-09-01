@@ -24,6 +24,7 @@ interface OmnigentSetup {
   getRecentServers: () => Promise<string[]>;
   forgetRecentServer?: (url: string) => Promise<string[]>;
   copyText: (text: string) => Promise<unknown>;
+  setServerSelectorV2?: (enabled: boolean) => Promise<unknown>;
   getCliStatus: () => Promise<{ installed?: boolean }>;
   startLocalServer: () => Promise<{ ok?: boolean; url?: string; error?: string }>;
 }
@@ -126,6 +127,12 @@ function SetupApp() {
     // Cloud deploy docs open in the real browser: window.open on this file://
     // page is routed out by the shell's popup policy, not opened in-window.
     onCloudSetup: () => window.open(CLOUD_DOCS_URL, "_blank", "noopener"),
+    // Revert to the classic setup page; the shell persists it and reloads.
+    onSwitchToLegacy: () => {
+      setupBridge()
+        ?.setServerSelectorV2?.(false)
+        ?.catch(() => {});
+    },
   };
 
   return (

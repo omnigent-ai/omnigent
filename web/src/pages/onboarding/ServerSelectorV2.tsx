@@ -5,8 +5,15 @@
  * `omnigentSetup` bridge via the `setup` prop.
  */
 
-import { useState } from "react";
+import { type CSSProperties, useState } from "react";
+import { Settings } from "lucide-react";
 import { AnimatedOmnigentPanel } from "@/components/onboarding/AnimatedOmnigentPanel";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { LandingStep } from "@/pages/onboarding/LandingStep";
 import { ModeSelectStep } from "@/pages/onboarding/ModeSelectStep";
 import { ServerSelectStep } from "@/pages/onboarding/ServerSelectStep";
@@ -47,6 +54,8 @@ export interface ServerSelectorV2Setup {
   onCopy: (text: string) => void;
   /** Open the Cloud deploy docs in the user's browser. */
   onCloudSetup: () => void;
+  /** Revert to the classic (legacy) setup page. */
+  onSwitchToLegacy: () => void;
 }
 
 type Step = "landing" | "mode" | "server" | "terminal";
@@ -69,6 +78,30 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
 
   return (
     <div className="grid min-h-screen place-items-center p-6">
+      {/* Top-right cog: settings for this setup surface. no-drag so it's
+          clickable over the window's drag strip. */}
+      <div
+        className="fixed right-3 top-2 z-10"
+        style={{ WebkitAppRegion: "no-drag" } as CSSProperties}
+      >
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              className="flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+              aria-label="Server selector settings"
+            >
+              <Settings className="size-4" aria-hidden />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem onSelect={setup.onSwitchToLegacy}>
+              Switch to legacy selector experience
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+
       <AnimatedOmnigentPanel height={height} panelHeight={panelHeight}>
         {step === "landing" && (
           <LandingStep

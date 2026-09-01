@@ -431,6 +431,14 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
   /** Copy text from the bundled setup page to the native clipboard. */
   copyText: (text) => ipcRenderer.invoke("omnigent:copy-setup-text", text),
   /**
+   * Toggle the revamped server selector and reload this window to the chosen
+   * setup page. `true` → new experience, `false` → classic. No-op if the env
+   * var forces the choice.
+   * @param {boolean} enabled
+   */
+  setServerSelectorV2: (enabled) =>
+    ipcRenderer.invoke("omnigent:set-server-selector-v2", enabled),
+  /**
    * Whether the `omnigent` CLI is installed/runnable, e.g.
    * `{installed, path, version, source, installCommand}`.
    */
