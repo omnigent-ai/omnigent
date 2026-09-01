@@ -29,6 +29,11 @@ function createBrowserViewRegistry({
   sendToRenderer, // (channel, payload) => mainWindow.webContents.send(...)
   getHostZoomFactor = () => 1,
   getHostDisplayScaleFactor = () => null,
+  // Desktop affordances for the pane's context menu; injected so the registry
+  // stays Electron-free. No-op defaults keep tests and non-menu hosts simple.
+  openUrlExternal = () => {}, // (url) => shell.openExternal(url)
+  copyTextToClipboard = () => {}, // (text) => clipboard.writeText(text)
+  showContextMenu = () => {}, // (items) => Menu.buildFromTemplate(items).popup(...)
   cap = DEFAULT_CAP,
 } = {}) {
   const entries = new Map(); // conversationId -> BrowserViewEntry
@@ -115,20 +120,82 @@ function createBrowserViewRegistry({
     });
     const entry = makeEntry(conversationId, view);
     entries.set(conversationId, entry);
-    denyChildWindowOpen(entry);
+    installWindowOpenPolicy(entry);
+    attachViewContextMenu(entry);
     attachAgentNavGuard(conversationId, entry);
     return { ok: true, entry, created: true };
   }
 
-  // SECURITY: a visited page must not spawn windows from the desktop shell.
-  // Deny every window.open / target=_blank on the child view (the safe default;
-  // unlike the main shell window we do NOT route to shell.openExternal, since an
-  // agent-visited page popping the user's real browser to an arbitrary URL is
-  // itself an abuse vector).
-  function denyChildWindowOpen(entry) {
+  // SECURITY: a visited page must not spawn windows from the desktop shell, so
+  // window.open / target=_blank still never creates a window here and is never
+  // routed to shell.openExternal (an agent-visited page popping the user's real
+  // browser to an arbitrary URL is itself an abuse vector). Instead an http(s)
+  // target navigates the SAME view in place — nothing the page couldn't already
+  // do with location.href — so a clicked link goes somewhere instead of dying
+  // silently. The agent nav guard cannot see this hop (will-navigate skips
+  // programmatic loadURL), so an agent-locked view is allowlist-checked here.
+  function installWindowOpenPolicy(entry) {
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.setWindowOpenHandler !== "function") return;
-    wc.setWindowOpenHandler(() => ({ action: "deny" }));
+    wc.setWindowOpenHandler(({ url }) => {
+      let parsed;
+      try {
+        parsed = new URL(url);
+      } catch {
+        return { action: "deny" }; // unparseable URL — nothing safe to open
+      }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        return { action: "deny" };
+      }
+      if (entry.agentNavLocked) {
+        const verdict = isAgentNavigationAllowed(url);
+        if (!verdict.ok) {
+          sendToRenderer("browser-nav-blocked", {
+            conversationId: entry.conversationId,
+            url,
+            error: verdict.error,
+          });
+          return { action: "deny" };
+        }
+      }
+      try {
+        wc.loadURL(url);
+      } catch {
+        /* view destroyed mid-click */
+      }
+      return { action: "deny" };
+    });
+  }
+
+  // Right-click menu for the child view — the shell window's own menu covers
+  // only the shell webContents, so without one a pane link can be neither
+  // opened externally nor copied. "Open Link in Browser" is user-chosen, so
+  // shell.openExternal is safe here (unlike the page-initiated path above).
+  // Items are plain data; the host (main.js) builds the actual Electron Menu.
+  function attachViewContextMenu(entry) {
+    const wc = entry.view && entry.view.webContents;
+    if (!wc || typeof wc.on !== "function") return;
+    wc.on("context-menu", (_event, params) => {
+      const items = [];
+      if (params.linkURL) {
+        if (/^https?:\/\//i.test(params.linkURL)) {
+          items.push({
+            label: "Open Link in Browser",
+            click: () => openUrlExternal(params.linkURL),
+          });
+        }
+        items.push({
+          label: "Copy Link Address",
+          click: () => copyTextToClipboard(params.linkURL),
+        });
+      }
+      if (typeof params.selectionText === "string" && params.selectionText.trim() !== "") {
+        if (items.length > 0) items.push({ type: "separator" });
+        items.push({ label: "Copy", click: () => wc.copy() });
+      }
+      if (items.length === 0) return;
+      showContextMenu(items);
+    });
   }
 
   // SECURITY (SSRF): enforce the agent-navigation allowlist on the child view's

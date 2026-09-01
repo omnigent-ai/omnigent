@@ -609,6 +609,12 @@ gh auth setup-git   # route git pushes through gh's credential helper with this 
   the command output. **Never** substitute a guess like "token expired" or "PAT
   is read-only" — those are false and drop the hand-off silently. Only a real,
   quoted failure goes in `maintainer_review`.
+- CI may also configure `omnigent.forkPushTokenFile`. That is a separate
+  maintainer credential for one purpose only: pushing a fix to an existing fork
+  PR whose author enabled maintainer edits. Never export it as `GH_TOKEN` and
+  never pass it to `gh`; PR creation, comments, reviews, labels, and every other
+  visible action must continue using the App token so GitHub attributes them to
+  `omni-resolve-agent[bot]`.
 
 Once the set is genuinely green:
 
@@ -704,12 +710,25 @@ can land a fix depends on where its branch lives:
   → you have write access. Push fixes the same as the author path, then re-check.
   Say in your review comments that you pushed, so the author isn't surprised.
 - **Fork PR** (the head branch is on a contributor's fork, `head.repo.fork ==
-  true`) → you **cannot** push to it. An App installation token is scoped to
-  `omnigent-ai/omnigent` only; GitHub does not honor "allow edits from maintainers"
-  for an App token (that grant is for maintainer *users*), so a push to the fork
-  branch is rejected. **Do not attempt the push** — it will always fail. Instead:
-  - **If the fork PR needs a fix** (repro test fails against it, CI is red from its
-    diff, or Polly flags a real blocking defect) → **take over: open your own PR**
+  true`) → the App token cannot push there, but CI may provide an isolated
+  maintainer credential specifically for that transport. Read
+  `maintainerCanModify`, `headRepositoryOwner`, `headRepository`, and
+  `headRefName` from `gh pr view`.
+  - If `maintainerCanModify` is true and
+    `git config --get omnigent.forkPushTokenFile` names a readable file, preserve
+    the contributor's branch. Keep the App token exported as `GH_TOKEN` for all
+    visible actions. For the push only, use CI's credential-isolating helper:
+    ```bash
+    omnigent-push-fork --repo <owner>/<repo> --branch <head-branch>
+    ```
+    The helper uses `GIT_ASKPASS`, clears the checkout's App-token extraheader
+    only for that push, and keeps the maintainer token out of command arguments,
+    remote URLs, and git's failure output. Never read or copy the token file
+    yourself, and never use it for `gh pr comment`/`review`/`create`; those
+    commands must remain bot-attributed through the App token.
+  - **If the fork PR needs a fix** and maintainer edits are disabled, the token
+    file is absent, or the isolated push returns a real permission error →
+    **take over: open your own PR**
     that includes their work plus your fix. This is the same mechanic as the
     "approach is wrong" escape hatch (Step 2A), but the reason is different — the
     approach is fine, you just can't push the fix to a fork. Build it so the
@@ -727,7 +746,7 @@ can land a fix depends on where its branch lives:
       yours and close it **as the very next commands — before you emit the interim
       handoff (Step 3.5) and before you start driving Step 4**:
       ```
-      gh pr comment <fork-pr> --body 'Superseded by #<your-pr> — I took this over to add a fix I could not push to your fork (App tokens can’t push to forks). Your commits are carried over with credit. Thanks @<author>!'
+      gh pr comment <fork-pr> --body 'Superseded by #<your-pr> — I took this over to add a fix because maintainer fork updates were unavailable. Your commits are carried over with credit. Thanks @<author>!'
       gh pr close <fork-pr>
       ```
       Do **not** defer this to the end of Step 4: the session can drop mid-turn

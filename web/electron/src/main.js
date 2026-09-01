@@ -2231,6 +2231,11 @@ function createBrowserRegistryForWindow(win) {
         return 1;
       }
     },
+    copyTextToClipboard: (text) => clipboard.writeText(text),
+    openUrlExternal: (url) => void shell.openExternal(url),
+    showContextMenu: (items) => {
+      Menu.buildFromTemplate(items).popup({ window: win });
+    },
   });
 }
 

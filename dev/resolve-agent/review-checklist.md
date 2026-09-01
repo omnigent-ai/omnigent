@@ -21,6 +21,13 @@ what to look for, and why it's wrong.
 - **No order-dependence / shared mutable state** across tests — a test that only
   passes after another ran, or mutates a module/global without restoring it.
 
+- **claude-sdk e2e mocks must script for parallel API calls.** The claude CLI
+  opens more than one API call at turn start (main + side calls), and only the
+  main call's stream events reach the executor. A mock queue with a single
+  scripted entry can be consumed by a side call, silently testing a different
+  failure than the journey intends — script enough identical entries that the
+  main call deterministically sees the intended response.
+
 ## UI / affordances
 
 - **Don't offer an action the code can't perform.** Flag a menu/UI option gated on

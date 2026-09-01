@@ -4932,6 +4932,122 @@ def _stdio_jsonrpc_loop(
         )
 
 
+_MCP_PROGRESS_INTERVAL_S: float = 15.0
+
+
+def _extract_progress_token(params: object) -> str | int | None:
+    """
+    Extract a progress token from MCP request params, if present.
+
+    :param params: Decoded MCP request params (usually a dict).
+    :returns: Progress token (str or int) or None.
+    """
+    if not isinstance(params, dict):
+        return None
+    meta = params.get("_meta")
+    if isinstance(meta, dict):
+        token = meta.get("progressToken")
+        if isinstance(token, (str, int)) and not isinstance(token, bool):
+            return token
+    token = params.get("progressToken")
+    if isinstance(token, (str, int)) and not isinstance(token, bool):
+        return token
+    return None
+
+
+def _is_relay_tool_call(params: object, bridge_dir: Path) -> bool:
+    """
+    Whether a ``tools/call`` targets a tool routed through the Omnigent relay.
+
+    :param params: Decoded MCP request params (usually a dict).
+    :param bridge_dir: Bridge directory used to resolve the active relay.
+    :returns: ``True`` when the named tool is served by the relay.
+    """
+    if not isinstance(params, dict):
+        return False
+    name = params.get("name")
+    if not isinstance(name, str) or not name:
+        return False
+    try:
+        return name in _read_relay_tool_names(bridge_dir)
+    except Exception:  # noqa: BLE001 - relay lookup failure means "not relayed"
+        return False
+
+
+class _McpProgressHeartbeat:
+    """Context manager emitting periodic MCP progress notifications to reset client timeouts."""
+
+    def __init__(
+        self,
+        progress_token: str | int | None,
+        stdout_lock: threading.Lock,
+        *,
+        framed: bool = False,
+        interval_s: float = _MCP_PROGRESS_INTERVAL_S,
+    ) -> None:
+        self._progress_token = progress_token
+        self._stdout_lock = stdout_lock
+        self._framed = framed
+        self._interval_s = interval_s
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._progress_token is None or self._interval_s <= 0:
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name="mcp-progress-heartbeat",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+            # Only forget a thread that actually exited; a writer blocked on a
+            # full stdout pipe stays tracked (it exits on its next stop check).
+            if not thread.is_alive():
+                self._thread = None
+
+    def _run(self) -> None:
+        # Emit an immediate first tick so the client learns the call is alive
+        # right away, then keep ticking every interval. MCP requires
+        # ``progress`` to increase on every notification; a constant value may
+        # be ignored (or rejected) by conforming clients.
+        tick = 0
+        while not self._stop_event.is_set():
+            tick += 1
+            notification: _JsonObject = {
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": {
+                    "progressToken": self._progress_token,
+                    "progress": tick,
+                },
+            }
+            try:
+                _write_jsonrpc(notification, self._stdout_lock, framed=self._framed)
+            except Exception:  # noqa: BLE001 - progress failure must not interrupt execution
+                break
+            if self._stop_event.wait(self._interval_s):
+                break
+
+    def __enter__(self) -> _McpProgressHeartbeat:
+        self.start()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: object,
+        exc_val: object,
+        exc_tb: object,
+    ) -> None:
+        self.stop()
+
+
 def _handle_and_write_mcp_request(
     request_id: object,
     method: str,
@@ -4956,8 +5072,19 @@ def _handle_and_write_mcp_request(
     :returns: None after the response is written.
     """
     # A request failure must not tear down the long-lived MCP server.
+    # Heartbeat only relay-routed calls: the relay's own 300 s budget
+    # guarantees they terminate, so keep-alive is safe. A hung LOCAL tool
+    # must stay killable by the client's static timeout, so it gets no
+    # heartbeat that would reset that deadline forever.
+    progress_token = (
+        _extract_progress_token(params)
+        if method == "tools/call" and _is_relay_tool_call(params, bridge_dir)
+        else None
+    )
+    heartbeat = _McpProgressHeartbeat(progress_token, stdout_lock, framed=framed)
     try:
-        result = _handle_mcp_request(method, params, tools, bridge_dir)
+        with heartbeat:
+            result = _handle_mcp_request(method, params, tools, bridge_dir)
         response: _JsonObject = {
             "jsonrpc": "2.0",
             "id": request_id,

@@ -3147,16 +3147,22 @@ function isSystemBubble(bubble: Bubble): boolean {
   return isSystemUserContent(bubble.content);
 }
 
-function CompactionLoadingIndicator() {
+function CompactionLoadingIndicator({ createdAtS }: { createdAtS?: number }) {
   const [elapsed, setElapsed] = useState(0);
-  const startRef = useRef(performance.now());
 
   useEffect(() => {
-    const id = window.setInterval(() => {
-      setElapsed(Math.round((performance.now() - startRef.current) / 1000));
-    }, 1000);
+    // Calculate elapsed time from the actual compaction start time (if available)
+    // rather than component mount time, so the timer persists across session switches.
+    const startTimeMs = createdAtS != null ? createdAtS * 1000 : Date.now();
+
+    const updateElapsed = () => {
+      setElapsed(Math.round((Date.now() - startTimeMs) / 1000));
+    };
+
+    updateElapsed();
+    const id = window.setInterval(updateElapsed, 1000);
     return () => window.clearInterval(id);
-  }, []);
+  }, [createdAtS]);
 
   return (
     <Message from="assistant" data-testid="compacting-indicator">
@@ -3213,7 +3219,7 @@ export const BubbleView = memo(
   }) {
     if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
     if (bubble.kind === "compaction_loading") {
-      return <CompactionLoadingIndicator />;
+      return <CompactionLoadingIndicator createdAtS={bubble.createdAtS} />;
     }
     if (bubble.kind === "compaction") return <CompactionMarker />;
     if (bubble.kind === "routing_decision") {
