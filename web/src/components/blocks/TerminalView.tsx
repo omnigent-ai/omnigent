@@ -10,7 +10,7 @@
 
 import { Loader2Icon } from "lucide-react";
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
-import { useTheme } from "next-themes";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import { copyText } from "@/lib/clipboard";
@@ -186,7 +186,7 @@ export function TerminalView({
   // Lets the close handler tell "stable connection finally dropped"
   // (reset the budget) from "re-dial died straight away" (burn it).
   const connectedAtRef = useRef<number | null>(null);
-  const { resolvedTheme } = useTheme();
+  const resolvedMode = useResolvedThemeMode();
   // Terminal theme is independent of the app theme: "auto" follows the app's
   // resolved appearance, while "light"/"dark" pin the terminal. Reading the
   // pref as state (seeded at mount, updated via the pub/sub) lets a Settings
@@ -195,7 +195,7 @@ export function TerminalView({
     readTerminalThemeMode(),
   );
   useEffect(() => subscribeTerminalTheme(setTerminalMode), []);
-  const isDark = resolveTerminalIsDark(terminalMode, resolvedTheme === "dark");
+  const isDark = resolveTerminalIsDark(terminalMode, resolvedMode === "dark");
   // Stable ref so the theme-update effect can reach the live session
   // without adding isDark to the attachSession deps (which would
   // reconnect the WebSocket on every theme change).
