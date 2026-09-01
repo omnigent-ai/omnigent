@@ -347,6 +347,24 @@ describe("forkSession", () => {
     expect(JSON.parse(init.body as string)).toEqual({});
   });
 
+  it("forwards a user-message response id as the server fork anchor", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_fork",
+        agent_id: "agent_clone",
+        status: "idle",
+        created_at: 1704067200,
+      }),
+    );
+
+    await forkSession("conv_src", undefined, undefined, "turn_user_123");
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      up_to_response_id: "turn_user_123",
+    });
+  });
+
   it("surfaces a non-ok response as a thrown error (e.g. 403 no access)", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 403 }));
     await expect(forkSession("conv_src")).rejects.toThrow(/403/);
