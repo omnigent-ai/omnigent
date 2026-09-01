@@ -8,7 +8,7 @@ import logging
 import os
 import sys
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -413,11 +413,14 @@ def configure_process_logging(
     logger_names: Sequence[str] = ("omnigent",),
     root: bool = True,
     force: bool = False,
+    debug_log_send: Callable[[list[dict[str, object]]], None] | None = None,
 ) -> Path:
     """Configure Python logging for one process destination.
 
     The returned file always receives logs. Stderr receives logs only when
-    requested and an interactive terminal stream is available.
+    requested and an interactive terminal stream is available. When provided,
+    ``debug_log_send`` receives prepared debug-log batches on a daemon thread;
+    otherwise the environment-gated ZeroBus sender remains the default.
     """
     global _current_process_log_path
 
@@ -478,7 +481,12 @@ def configure_process_logging(
     from omnigent.debug_logging import attach_debug_log_sink
 
     sink_targets = _debug_sink_target_loggers(logger_names, root=root)
-    attach_debug_log_sink(sink_targets, source=destination, level=resolved_level)
+    attach_debug_log_sink(
+        sink_targets,
+        source=destination,
+        level=resolved_level,
+        send=debug_log_send,
+    )
 
     logging.captureWarnings(True)
     return path
