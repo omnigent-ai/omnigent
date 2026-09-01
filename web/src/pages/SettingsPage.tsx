@@ -63,6 +63,7 @@ import {
   UploadIcon,
   UserCogIcon,
   XIcon,
+  ClockIcon,
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
@@ -175,6 +176,11 @@ import {
   writeSubmitWithModEnter,
 } from "@/lib/composerSendShortcutPreferences";
 import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
+import {
+  archivedAtSeconds,
+  readRetentionDays,
+  writeRetentionDays,
+} from "@/lib/retentionPreferences";
 import {
   DEFAULT_HIDE_UNCONFIGURED_HARNESSES,
   readHideUnconfiguredHarnesses,
@@ -2081,6 +2087,25 @@ function dateGroupLabel(timestampSec: number, now: Date = new Date()): string {
   return date.toLocaleDateString(undefined, { month: "long", year: "numeric" });
 }
 
+const RETENTION_OPTIONS: { label: string; value: string; days: number | null }[] = [
+  { label: "Never", value: "never", days: null },
+  { label: "After 7 days", value: "7", days: 7 },
+  { label: "After 30 days", value: "30", days: 30 },
+  { label: "After 60 days", value: "60", days: 60 },
+  { label: "After 90 days", value: "90", days: 90 },
+];
+
+function retentionDaysToSelectValue(days: number | null): string {
+  if (days === null) return "never";
+  return String(days);
+}
+
+function selectValueToRetentionDays(value: string): number | null {
+  if (value === "never") return null;
+  const parsed = parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
 function ImportSection() {
   return (
     <Section
@@ -2095,6 +2120,10 @@ function ImportSection() {
 function ArchivedSection() {
   // `undefined` = all projects; a name scopes the list to that project.
   const [project, setProject] = useState<string | undefined>(undefined);
+  const [retentionDays, setRetentionDays] = useState<number | null>(() => readRetentionDays());
+  const [deleteExpiredOpen, setDeleteExpiredOpen] = useState(false);
+  const bulkDelete = useBulkDeleteConversations();
+  const viewerId = useViewerId();
 
   // Picker options: every project that has an archived session. Sourced from a
   // dedicated hook that pages through ALL archived sessions server-side —
@@ -2125,6 +2154,24 @@ function ArchivedSection() {
     () => (listQuery.data?.pages ?? []).flatMap((p) => p.data).filter((c) => c.archived === true),
     [listQuery.data],
   );
+
+  const cutoff = useMemo(() => {
+    if (retentionDays === null) return null;
+    return Math.floor(Date.now() / 1000) - retentionDays * 86400;
+  }, [retentionDays]);
+
+  const expiredSessions = useMemo(() => {
+    if (cutoff === null) return [];
+    return archived.filter((c) => archivedAtSeconds(c) < cutoff);
+  }, [archived, cutoff]);
+
+  // Filter expired sessions to only owned ones (same pattern as ArchivedBulkActionBar)
+  const ownedExpiredSessions = useMemo(() => {
+    return expiredSessions.filter((c) => {
+      const owner = c.owner;
+      return owner === null || owner === viewerId;
+    });
+  }, [expiredSessions, viewerId]);
 
   const groupedArchived = useMemo(() => {
     const now = new Date();
@@ -2187,9 +2234,38 @@ function ArchivedSection() {
       title="Archived sessions"
       description="Sessions you've archived. Restore one to the sidebar, or delete it for good."
     >
-      <div className="mb-4 flex items-center gap-2">
+      <div className="mb-4 flex flex-wrap items-center gap-x-6 gap-y-2">
+        <div className="flex items-center gap-2">
+          <label htmlFor="archived-retention" className="text-ui text-muted-foreground">
+            Mark as expired after
+          </label>
+          <Select
+            value={retentionDaysToSelectValue(retentionDays)}
+            onValueChange={(value) => {
+              const days = selectValueToRetentionDays(value);
+              setRetentionDays(days);
+              writeRetentionDays(days);
+            }}
+          >
+            <SelectTrigger
+              id="archived-retention"
+              aria-label="Mark archived sessions as expired after"
+              data-testid="archived-retention"
+              className="w-40"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent position="popper" align="start">
+              {RETENTION_OPTIONS.map((opt) => (
+                <SelectItem key={opt.value} value={opt.value}>
+                  {opt.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
         {items.length > 0 && (
-          <>
+          <div className="flex items-center gap-2">
             <label htmlFor="archived-project-filter" className="text-ui text-muted-foreground">
               Project
             </label>
@@ -2218,7 +2294,7 @@ function ArchivedSection() {
                 ))}
               </SelectContent>
             </Select>
-          </>
+          </div>
         )}
         {!selectionMode && archived.length > 0 && (
           <Button
@@ -2243,6 +2319,71 @@ function ArchivedSection() {
         />
       )}
 
+      {ownedExpiredSessions.length > 0 && (
+        <div className="mb-4 flex items-center gap-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2">
+          <ClockIcon className="size-4 shrink-0 text-destructive" />
+          <span className="text-ui flex-1">
+            {ownedExpiredSessions.length === 1
+              ? "1 expired session"
+              : `${ownedExpiredSessions.length} expired sessions`}{" "}
+            {listQuery.hasNextPage ? "on loaded pages " : ""}past the {retentionDays}-day retention
+            period.
+          </span>
+          <Button
+            type="button"
+            variant="destructive"
+            size="sm"
+            data-testid="delete-expired"
+            disabled={bulkDelete.isPending}
+            onClick={() => setDeleteExpiredOpen(true)}
+          >
+            Delete expired
+          </Button>
+          <Dialog open={deleteExpiredOpen} onOpenChange={setDeleteExpiredOpen}>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>Delete expired sessions?</DialogTitle>
+                <DialogDescription>
+                  {ownedExpiredSessions.length === 1
+                    ? "1 owned archived session"
+                    : `${ownedExpiredSessions.length} owned archived sessions`}{" "}
+                  older than {retentionDays} days {listQuery.hasNextPage ? "on loaded pages " : ""}
+                  will be permanently deleted. This cannot be undone.
+                  {listQuery.hasNextPage && (
+                    <span className="mt-2 block text-sm">
+                      Note: More archived sessions may exist on unfetched pages. Click "Load more"
+                      to see all expired sessions before deleting.
+                    </span>
+                  )}
+                </DialogDescription>
+              </DialogHeader>
+              <DialogFooter>
+                <Button
+                  variant="ghost"
+                  onClick={() => setDeleteExpiredOpen(false)}
+                  disabled={bulkDelete.isPending}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  variant="destructive"
+                  disabled={bulkDelete.isPending}
+                  onClick={() => {
+                    bulkDelete.mutate({ ids: ownedExpiredSessions.map((c) => c.id) });
+                    setDeleteExpiredOpen(false);
+                  }}
+                >
+                  Delete{" "}
+                  {ownedExpiredSessions.length === 1
+                    ? "1 session"
+                    : `${ownedExpiredSessions.length} sessions`}
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+        </div>
+      )}
+
       {listQuery.isLoading ? (
         <p className="text-ui text-muted-foreground">Loading…</p>
       ) : archived.length === 0 && !listQuery.hasNextPage ? (
@@ -2265,6 +2406,7 @@ function ArchivedSection() {
                       <ArchivedRow
                         key={conv.id}
                         conversation={conv}
+                        cutoff={cutoff}
                         selectionMode={selectionMode}
                         isSelected={selectedIds.has(conv.id)}
                         onToggleSelected={toggleSelected}
@@ -2472,15 +2614,18 @@ function ArchivedBulkActionBar({
  */
 function ArchivedRow({
   conversation,
+  cutoff,
   selectionMode,
   isSelected,
   onToggleSelected,
 }: {
   conversation: Conversation;
+  cutoff: number | null;
   selectionMode: boolean;
   isSelected: boolean;
   onToggleSelected: (id: string) => void;
 }) {
+  const isExpired = cutoff !== null && archivedAtSeconds(conversation) < cutoff;
   const navigate = useNavigate();
   const archive = useArchiveConversation();
   const del = useStopAndDeleteConversation();
@@ -2511,8 +2656,13 @@ function ArchivedRow({
         <div className="truncate text-ui font-medium" title={label}>
           {label}
         </div>
-        <div className="text-sm text-muted-foreground">
-          {absoluteTime(conversation.updated_at * 1000)}
+        <div className="flex items-center gap-1.5 text-sm text-muted-foreground">
+          <span>{absoluteTime(conversation.updated_at * 1000)}</span>
+          {isExpired && (
+            <span className="rounded bg-destructive/10 px-1.5 py-0.5 text-xs font-medium text-destructive">
+              Expired
+            </span>
+          )}
         </div>
       </div>
       {/* Actions reveal on hover (desktop) / always shown on touch.

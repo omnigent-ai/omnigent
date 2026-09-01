@@ -2615,9 +2615,13 @@ def create_app(
 
         :param runner_id: The reconnecting runner's id.
         """
+        from omnigent.server.routes._sessions.common import (
+            _session_sandbox_status_cache,
+        )
         from omnigent.server.routes.sessions import (
             _ensure_runner_relay,
             _publish_runner_recovered_status,
+            _publish_sandbox_status,
             prefetch_session_routing_catalogs,
         )
 
@@ -2712,6 +2716,14 @@ def create_app(
             await _publish_runner_recovered_status(
                 conv.id, conversation_store, require_disconnect_code=True
             )
+            # A managed launch that outlived its connect timeout cached
+            # sandbox_status "failed"; this runner connecting proves the
+            # sandbox is live, so drop the stale banner. Only "failed" is
+            # cleared -- an in-flight launch (provisioning/connecting) must
+            # not be short-circuited by an older runner reconnecting.
+            cached_sandbox = _session_sandbox_status_cache.get(conv.id)
+            if cached_sandbox is not None and cached_sandbox.stage == "failed":
+                _publish_sandbox_status(conv.id, "ready")
 
     def _resolve_managed_runner_owner(runner_id: str) -> str | None:
         """Owner for a delegated runner, by its bound session.

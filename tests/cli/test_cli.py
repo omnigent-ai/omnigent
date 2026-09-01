@@ -981,10 +981,13 @@ def test_antigravity_command_empty_resolved_falls_back_to_none(
 # ---------------------------------------------------------------------------
 
 
-def test_codex_config_args_form_base_cli_args_append(
+def test_codex_cli_persists_raw_args_not_config_merged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Config ``harness.codex-native.args`` is the base; CLI pass-through appends."""
+    """The codex CLI persists RAW pass-through. ``harness.codex-native.args`` is
+    merged by the daemon runner's native-terminal auto-create (the single merge
+    point every launch reaches), not here — merging in both layers wrapped a
+    managed session twice (``isaac codex -- codex -- ...``)."""
     captured: dict[str, object] = {}
     monkeypatch.setattr(
         "omnigent.cli._load_effective_config",
@@ -999,17 +1002,15 @@ def test_codex_config_args_form_base_cli_args_append(
     result = CliRunner().invoke(cli, ["codex", "--dangerously-skip-permissions"])
 
     assert result.exit_code == 0, result.output
-    assert captured["extra_args"] == (
-        "--config",
-        "k=v",
-        "--dangerously-skip-permissions",
-    )
+    # Raw pass-through only — the config base is NOT merged at the CLI layer.
+    assert captured["extra_args"] == ("--dangerously-skip-permissions",)
 
 
-def test_codex_config_args_only_when_no_cli_args(
+def test_codex_cli_no_pass_through_persists_empty_args(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With no CLI pass-through, config args are the whole arg list."""
+    """With no CLI pass-through, the codex CLI persists no args even when config
+    sets ``harness.codex-native.args`` — the runner applies the config base."""
     captured: dict[str, object] = {}
     monkeypatch.setattr(
         "omnigent.cli._load_effective_config",
@@ -1024,7 +1025,7 @@ def test_codex_config_args_only_when_no_cli_args(
     result = CliRunner().invoke(cli, ["codex"])
 
     assert result.exit_code == 0, result.output
-    assert captured["extra_args"] == ("--verbose",)
+    assert captured["extra_args"] == ()
 
 
 def test_codex_args_no_config_is_cli_args_only(
@@ -5508,9 +5509,9 @@ def test_bare_omnigent_non_tty_shows_help(
 ) -> None:
     """Bare ``omnigent`` in a non-interactive shell (no TTY) shows help.
 
-    On a pipe / CI there is no terminal to drive a REPL, so the bare command
-    falls back to ``--help`` rather than launching ``run`` (which would hang
-    waiting on stdin).
+    On a pipe / CI there is no terminal, so the bare command falls back to
+    ``--help`` rather than launching ``start`` (which would block on a
+    sign-in prompt).
     """
     from omnigent.cli import main
 
@@ -5526,13 +5527,14 @@ def test_bare_omnigent_non_tty_shows_help(
     assert "Commands:" in stdout
 
 
-def test_bare_omnigent_tty_dispatches_to_run(
+def test_bare_omnigent_tty_dispatches_to_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Bare ``omnigent`` on an interactive terminal behaves like ``omnigent run``.
+    """Bare ``omnigent`` on an interactive terminal behaves like ``omnigent start``.
 
-    ``run`` then resolves the configured default / first-run plan. We assert
-    only that the bare invocation is rewritten to ``run`` before dispatch.
+    ``start`` brings up the local server / host in the background rather than
+    dropping into an agent REPL. We assert only that the bare invocation is
+    rewritten to ``start`` before dispatch.
     """
     from omnigent import cli as cli_module
 
@@ -5548,7 +5550,7 @@ def test_bare_omnigent_tty_dispatches_to_run(
 
     cli_module.main()
 
-    assert dispatched["args"] == ["run"]
+    assert dispatched["args"] == ["start"]
 
 
 def test_bare_omnigent_rejects_positional_server_url(
@@ -5592,6 +5594,39 @@ def test_unknown_command_reports_no_such_command(
     combined = terminal.out + terminal.err
     assert "No such command 'blah'" in combined
     assert "ad-hoc chat was removed" not in combined
+
+
+def test_setup_invalid_provider_is_a_user_error_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Malformed provider config exits actionably without crash reporting."""
+    from omnigent import cli as cli_module
+    from omnigent import crash_handler
+
+    message = (
+        "provider 'example-proxy' (kind 'gateway') configures no "
+        "'anthropic', 'openai', or 'gemini' family."
+    )
+    config = {"providers": {"example-proxy": {"kind": "gateway"}}}
+    crashes: list[Exception] = []
+    configure_flow = Mock()
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["omnigent", "setup"])
+    monkeypatch.setattr(cli_module, "_load_global_config", lambda: config)
+    monkeypatch.setattr(cli_module, "_run_configure_harnesses_interactive", configure_flow)
+    monkeypatch.setattr(crash_handler, "handle_crash", lambda exc: crashes.append(exc))
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_module.main()
+
+    assert exc_info.value.code == 1
+    terminal = capsys.readouterr()
+    assert f"Invalid provider configuration in {tmp_path / 'config.yaml'}" in terminal.err
+    assert message in terminal.err
+    configure_flow.assert_not_called()
+    assert crashes == []
 
 
 def test_setup_command_replaces_wizard(monkeypatch: pytest.MonkeyPatch) -> None:
