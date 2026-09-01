@@ -3576,7 +3576,7 @@ def _run_configure_harnesses_interactive() -> None:
     _KIRO = "\x00kiro"
     # Sentinel marking the Kimi Code row — like Cursor/Antigravity/Qwen it is
     # not a provider family. Auth lives entirely in the kimi CLI (``kimi login``
-    # / ``kimi provider add`` → ~/.kimi/config.toml), so it dispatches to its
+    # / ``kimi provider add`` → ~/.kimi-code/config.toml), so it dispatches to its
     # own drill-in rather than ``_manage_harness_providers``.
     _KIMI = "\x00kimi"
     # Sentinels for the generic-ACP rows. Each configured agent gets its own row
