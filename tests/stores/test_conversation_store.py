@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Any
+
 import pytest
 from sqlalchemy import event, text
 
@@ -5754,3 +5757,106 @@ def test_item_search_text_seam_redirects_persisted_value(db_uri: str) -> None:
             ).scalars()
         )
     assert stored == ["custom-search-text"]
+
+
+# ── Connection-checkout budget ─────────────────────────
+
+
+def _count_checkouts(*engines: Any) -> tuple[list[int], Callable[[], None]]:
+    """Count pool checkouts across ``engines`` (deduplicated).
+
+    Attach *after* any setup writes so only the read under test is counted.
+
+    :returns: ``(count, detach)`` — a one-element list incremented per
+        checkout, plus a zero-arg callable that removes the listeners.
+    """
+    count = [0]
+
+    def _on_checkout(_dbapi: object, _record: object, _proxy: object) -> None:
+        count[0] += 1
+
+    unique = list(dict.fromkeys(engines))
+    for engine in unique:
+        event.listen(engine, "checkout", _on_checkout)
+
+    def _detach() -> None:
+        for engine in unique:
+            event.remove(engine, "checkout", _on_checkout)
+
+    return count, _detach
+
+
+def test_get_conversation_costs_one_checkout(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """One logical read = one pool checkout, and it still returns every field.
+
+    ``get_conversation`` reads the AP ``conversations`` row plus the Omnigent
+    ``omnigent_conversation_metadata`` row. In single-DB mode both live on one
+    engine, so the whole read must share a single checkout — every extra
+    checkout is a ``pool_pre_ping`` round trip on Lakebase, on the hottest read
+    in the product. Counting checkouts (not milliseconds) keeps this immune to
+    load noise.
+    """
+    created = conversation_store.create_conversation(
+        title="budget",
+        runner_id="runner_budget",
+        host_id="4f64b6ee625f4e8259185c35c6e63f3d",
+        workspace="/tmp/ws",
+        git_branch="feature/x",
+    )
+    conversation_store.set_labels(created.id, {"tag": "value"})
+
+    count, detach = _count_checkouts(conversation_store._conv_engine, conversation_store._engine)
+    try:
+        conv = conversation_store.get_conversation(created.id)
+    finally:
+        detach()
+
+    assert count[0] == 1, f"get_conversation must take one checkout, got {count[0]}"
+    assert conv is not None
+    # AP-table fields.
+    assert conv.title == "budget"
+    # Omnigent-metadata fields — all None if the metadata read were dropped.
+    assert (conv.runner_id, conv.host_id) == (
+        "runner_budget",
+        "4f64b6ee625f4e8259185c35c6e63f3d",
+    )
+    assert (conv.workspace, conv.git_branch) == ("/tmp/ws", "feature/x")
+    assert conv.labels == {"tag": "value"}
+
+
+def test_get_conversation_keeps_distinct_query_names(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Sharing one checkout must not collapse the three reads' semantic names."""
+    from omnigent.db import current_query_name
+
+    created = conversation_store.create_conversation(title="named")
+    conversation_store.set_labels(created.id, {"tag": "value"})
+
+    names: list[str | None] = []
+
+    def _capture(
+        _conn: object,
+        _cursor: object,
+        statement: str,
+        _params: object,
+        _ctx: object,
+        _many: bool,
+    ) -> None:
+        if statement.lstrip().upper().startswith("SELECT"):
+            names.append(current_query_name())
+
+    engine = conversation_store._conv_engine
+    event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        assert conversation_store.get_conversation(created.id) is not None
+    finally:
+        event.remove(engine, "before_cursor_execute", _capture)
+
+    assert names == [
+        "omnigent.conversation_store.select_conversation_by_id",
+        "omnigent.conversation_store.select_conversation_metadata_by_id",
+        "omnigent.conversation_store.select_conversation_labels",
+    ], names

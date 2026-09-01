@@ -10187,3 +10187,67 @@ async def test_create_child_session_duplicate_title_returns_409(
     assert resp2.status_code == 409, (
         f"expected 409 on duplicate child title, got {resp2.status_code}: {resp2.text}"
     )
+
+
+async def test_create_session_notifies_runner_with_init_envelope(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The create route notifies the runner with the session-init envelope.
+
+    Cross-component regression: the create route must send the full
+    ``session_init`` envelope — carrying the persisted ``/model`` override —
+    not the legacy id-only body. Otherwise the runner falls back to a
+    best-effort reverse GET and, on any failure, silently spawns the default
+    model and respawns on the first turn. Asserts the captured runner-init POST
+    is the envelope and that it carries the override.
+    """
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PAYLOAD_KEY,
+        parse_runner_session_init_envelope,
+    )
+    from omnigent.server.routes import sessions as sessions_module
+
+    agent = await create_test_agent(client)
+
+    captured_inits: list[dict[str, Any]] = []
+
+    def forward_to_runner(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            captured_inits.append(json.loads(request.content))
+        return httpx.Response(201, json={"status": "initialized"})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(forward_to_runner),
+        base_url="http://runner",
+    )
+
+    async def _fake_get_runner_client(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    try:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"agent_id": agent["id"], "model_override": "model-x"},
+        )
+        assert resp.status_code == 201, f"create failed: {resp.status_code} {resp.text}"
+    finally:
+        await fake_runner.aclose()
+
+    assert captured_inits, "create route did not notify the runner of the new session"
+    body = captured_inits[-1]
+    assert SESSION_INIT_PAYLOAD_KEY in body, (
+        "create route sent the legacy id-only body, not the init envelope; the "
+        f"runner would fall back to a reverse GET. Body keys: {sorted(body)}"
+    )
+    envelope = parse_runner_session_init_envelope(body)
+    assert envelope is not None
+    assert envelope.snapshot.model_override == "model-x", (
+        "the init envelope must carry the persisted /model override so the "
+        "runner seeds it into the first spawn; got "
+        f"{envelope.snapshot.model_override!r}"
+    )
