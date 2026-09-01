@@ -46,6 +46,9 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
+          # Trusted-CI-bot allowlist in should-scan.sh; GitHub-set, not
+          # PR-controlled. Lets the gate skip polling for bot PRs with no token.
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
           # Before the scanner lands on main the scripts are absent there --
           # proceed (fail-open) so the introducing PR is not bricked.
