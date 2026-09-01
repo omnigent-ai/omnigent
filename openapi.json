@@ -7966,6 +7966,7 @@
           },
           "harness_breakdown": {
             "additionalProperties": {
+              "format": "double",
               "type": "number"
             },
             "description": "**All-time** cost aggregated by harness across all user sessions (pre-computed, not date-filtered), for the breakdown chart. Keys are harness names (e.g. `\"claude-sdk\"`); values are total USD cost. Sessions without a resolved harness are omitted. Shows the user's overall cost distribution regardless of `since`/`until` filters.",
@@ -7974,6 +7975,7 @@
           },
           "model_breakdown": {
             "additionalProperties": {
+              "format": "double",
               "type": "number"
             },
             "description": "**All-time** cost aggregated by model across all user sessions (pre-computed, not date-filtered), for the breakdown chart. Keys are model IDs (e.g. `\"claude-opus-4-8\"`); values are total USD cost. Shows the user's overall cost distribution regardless of `since`/`until` filters.",
