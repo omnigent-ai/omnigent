@@ -28,6 +28,7 @@ from omnigent.cli import (
     WRAPPER_BYPASS_ENV,
     WRAPPER_COMMAND_ENV,
     _bundle,
+    _bundled_brain_fallback_applies,
     _bundled_example_path,
     _dispatch_native_terminal_harness,
     _dispatch_run,
@@ -1708,6 +1709,329 @@ def test_bundled_agent_ambiguous_default_config_degrades_to_launch(
     assert result.exit_code == 0, result.output
     assert result.exception is None, result.exception
     dispatch.assert_called_once()
+
+
+def test_bundled_agent_codex_only_credential_reroutes_brain_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A Codex-only user's polly launch reroutes the brain to codex.
+
+    With a Codex subscription as the ONLY configured provider, polly's
+    claude-sdk brain has no credential at all — the session used to start
+    anyway and every turn died with Claude Code's ``Not logged in · Please
+    run /login``. The shorthand must instead fall back to the credentialed
+    harness (mirroring bare ``omnigent``'s first-run pick) and announce the
+    reroute.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    _write_isolated_provider_config(
+        tmp_path,
+        {"codex-sub": {"kind": "subscription", "cli": "codex", "default": True}},
+    )
+    dispatch = Mock()
+    monkeypatch.setattr("omnigent.cli._dispatch_run", dispatch)
+
+    result = CliRunner().invoke(cli, ["polly", "-p", "hi"])
+
+    assert result.exit_code == 0, result.output
+    dispatch.assert_called_once()
+    kwargs = dispatch.call_args.kwargs
+    assert kwargs["target"] == _bundled_example_path("polly")
+    assert kwargs["harness"] == "codex"
+    # The reroute is announced so the user knows which credential runs the brain.
+    assert "No Claude credential is configured" in result.output
+    assert "codex harness" in result.output
+
+
+def test_bundled_agent_brain_family_credential_keeps_declared_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Any Claude-family credential keeps polly's declared claude-sdk brain.
+
+    The reroute is strictly a no-credential fallback: when a credential
+    serves the brain's own family — even alongside a Codex one — the brain
+    stays on its declared harness and no ``--harness`` is injected.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    _write_isolated_provider_config(
+        tmp_path,
+        {
+            "codex-sub": {"kind": "subscription", "cli": "codex", "default": True},
+            "anthropic_key": {
+                "kind": "key",
+                "anthropic": {
+                    "base_url": "https://api.anthropic.invalid/v1",
+                    "api_key_ref": "env:ANTHROPIC_KEY",
+                },
+            },
+        },
+    )
+    dispatch = Mock()
+    monkeypatch.setattr("omnigent.cli._dispatch_run", dispatch)
+
+    result = CliRunner().invoke(cli, ["polly"])
+
+    assert result.exit_code == 0, result.output
+    dispatch.assert_called_once()
+    assert dispatch.call_args.kwargs["harness"] is None
+    assert "codex harness" not in result.output
+
+
+def test_bundled_agent_no_credential_anywhere_skips_brain_reroute(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """With no credential for ANY harness, the launch proceeds un-rerouted.
+
+    There is nothing to fall back to, so the shorthand must not inject a
+    harness — the downstream launch surfaces its own credential error.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    _write_isolated_provider_config(tmp_path, {})
+    dispatch = Mock()
+    monkeypatch.setattr("omnigent.cli._dispatch_run", dispatch)
+
+    result = CliRunner().invoke(cli, ["polly"])
+
+    assert result.exit_code == 0, result.output
+    dispatch.assert_called_once()
+    assert dispatch.call_args.kwargs["harness"] is None
+
+
+def test_bundled_agent_explicit_harness_wins_over_brain_reroute(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An explicit ``--harness`` is the user's pick — the fallback stays out.
+
+    Even on a Codex-only config, a forwarded ``--harness`` must reach ``run``
+    unchanged (never doubled or overridden by the fallback's injection).
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    _write_isolated_provider_config(
+        tmp_path,
+        {"codex-sub": {"kind": "subscription", "cli": "codex", "default": True}},
+    )
+    dispatch = Mock()
+    monkeypatch.setattr("omnigent.cli._dispatch_run", dispatch)
+
+    result = CliRunner().invoke(cli, ["polly", "--harness", "pi"])
+
+    assert result.exit_code == 0, result.output
+    dispatch.assert_called_once()
+    assert dispatch.call_args.kwargs["harness"] == "pi"
+    assert "codex harness" not in result.output
+
+
+def test_bundled_agent_flag_lookalike_prompt_value_keeps_brain_reroute(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A prompt VALUE that looks like a flag doesn't suppress the reroute.
+
+    ``polly -p --harness`` makes ``--harness`` the prompt text, not a harness
+    pin — the applicability check must parse flag shapes exactly like the
+    forwarded ``run`` does, so the fallback still fires.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    _write_isolated_provider_config(
+        tmp_path,
+        {"codex-sub": {"kind": "subscription", "cli": "codex", "default": True}},
+    )
+    dispatch = Mock()
+    monkeypatch.setattr("omnigent.cli._dispatch_run", dispatch)
+
+    result = CliRunner().invoke(cli, ["polly", "-p", "--harness"])
+
+    assert result.exit_code == 0, result.output
+    dispatch.assert_called_once()
+    kwargs = dispatch.call_args.kwargs
+    assert kwargs["prompt"] == "--harness"
+    assert kwargs["harness"] == "codex"
+
+
+def test_bundled_brain_fallback_applies_distinguishes_help_forms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The applicability check tells a real ``--help`` from a help-shaped value.
+
+    Through the CLI a bare ``--help`` is intercepted by the shorthand's own
+    eager help and never reaches the fallback; this pins the helper's
+    defensive behavior directly — a genuine help request suppresses the
+    reroute (no misleading notice before help renders), while the same token
+    consumed as ``-p``'s VALUE is prompt text and keeps it.
+    """
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+
+    assert _bundled_brain_fallback_applies(("--help",)) is False
+    assert _bundled_brain_fallback_applies(("-p", "--help")) is True
+
+
+@pytest.mark.parametrize(
+    "pinning_args",
+    [["--resume", "abc123"], ["-rabc123"], ["-c"], ["--fork", "abc123"]],
+)
+def test_bundled_agent_resume_flags_skip_brain_reroute(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    pinning_args: list[str],
+) -> None:
+    """Re-entering an existing conversation never reroutes its brain.
+
+    A resume/continue/fork picks up a conversation whose brain harness is
+    already decided; injecting ``--harness`` there would silently change it.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    _write_isolated_provider_config(
+        tmp_path,
+        {"codex-sub": {"kind": "subscription", "cli": "codex", "default": True}},
+    )
+    dispatch = Mock()
+    monkeypatch.setattr("omnigent.cli._dispatch_run", dispatch)
+
+    result = CliRunner().invoke(cli, ["polly", *pinning_args])
+
+    assert result.exit_code == 0, result.output
+    dispatch.assert_called_once()
+    assert dispatch.call_args.kwargs["harness"] is None
+
+
+def test_bundled_agent_remote_server_flag_skips_brain_reroute(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A remote ``--server`` launch keeps the declared brain harness.
+
+    A remote server can supply the brain's routing server-side (e.g. a
+    managed gateway), so a missing local credential is not evidence the
+    brain can't run there.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    _write_isolated_provider_config(
+        tmp_path,
+        {"codex-sub": {"kind": "subscription", "cli": "codex", "default": True}},
+    )
+    dispatch = Mock()
+    monkeypatch.setattr("omnigent.cli._dispatch_run", dispatch)
+
+    result = CliRunner().invoke(cli, ["polly", "--server", "https://example.databricksapps.com"])
+
+    assert result.exit_code == 0, result.output
+    dispatch.assert_called_once()
+    assert dispatch.call_args.kwargs["harness"] is None
+
+
+def test_bundled_agent_configured_remote_server_skips_brain_reroute(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A configured remote server default also keeps the declared brain.
+
+    Same reasoning as the explicit flag: with ``server:`` in the effective
+    config pointing at a remote app, the launch targets that server and its
+    routing — the local-credential fallback must stay out.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    monkeypatch.setattr(
+        "omnigent.cli._load_effective_config",
+        lambda: {"server": "https://example.databricksapps.com"},
+    )
+    _write_isolated_provider_config(
+        tmp_path,
+        {"codex-sub": {"kind": "subscription", "cli": "codex", "default": True}},
+    )
+    dispatch = Mock()
+    monkeypatch.setattr("omnigent.cli._dispatch_run", dispatch)
+
+    result = CliRunner().invoke(cli, ["polly"])
+
+    assert result.exit_code == 0, result.output
+    dispatch.assert_called_once()
+    assert dispatch.call_args.kwargs["harness"] is None
+
+
+def test_bundled_agent_local_server_alias_keeps_brain_reroute(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``--server local`` still runs locally, so the reroute applies.
+
+    The local-server aliases (``local`` / ``""``) explicitly ask for a local
+    launch — exactly the topology whose brain credential must resolve from
+    the local config, so the fallback fires the same as with no flag.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    _write_isolated_provider_config(
+        tmp_path,
+        {"codex-sub": {"kind": "subscription", "cli": "codex", "default": True}},
+    )
+    dispatch = Mock()
+    monkeypatch.setattr("omnigent.cli._dispatch_run", dispatch)
+
+    result = CliRunner().invoke(cli, ["polly", "--server", "local"])
+
+    assert result.exit_code == 0, result.output
+    dispatch.assert_called_once()
+    assert dispatch.call_args.kwargs["harness"] == "codex"
+
+
+def test_bundled_agent_brain_reroute_config_error_degrades_to_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A config read error inside the fallback degrades to a plain launch.
+
+    Like the credential-promotion path, the reroute is best-effort: any
+    malformed config must not crash the launch — the harness surfaces its
+    own error downstream.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    # Two defaults for the openai family — load_providers/get_default_provider
+    # raise OmnigentError when the fallback resolves the codex candidate.
+    _write_isolated_provider_config(
+        tmp_path,
+        {
+            "codex-a": {"kind": "subscription", "cli": "codex", "default": True},
+            "codex-b": {
+                "kind": "key",
+                "default": True,
+                "openai": {
+                    "base_url": "https://api.openai.invalid/v1",
+                    "api_key_ref": "env:OPENAI_B",
+                },
+            },
+        },
+    )
+    dispatch = Mock()
+    monkeypatch.setattr("omnigent.cli._dispatch_run", dispatch)
+
+    result = CliRunner().invoke(cli, ["polly"])
+
+    assert result.exit_code == 0, result.output
+    assert result.exception is None, result.exception
+    dispatch.assert_called_once()
+    assert dispatch.call_args.kwargs["harness"] is None
 
 
 def test_start_cli_runner_process_uses_token_bound_runner_id(
