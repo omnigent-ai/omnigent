@@ -930,6 +930,56 @@ def test_managed_mint_factory_snapshot_pairs_token_with_declined(
     assert factory.call_with_declined() == ("jwt-snap", False)
 
 
+def test_declined_latch_from_definitive_refusal_is_not_reset_on_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuine 400/404 decline stays latched when a bare request is rejected.
+
+    Only a 5xx-latched decline (``declined_by_server_error``) is a guess
+    worth retracting. A no-auth/header-mode server that answered 400/404
+    definitively refused to mint; a later rejected bare request (e.g. an
+    unrelated 403) must not make ``auth_flow`` re-probe the mint endpoint
+    on every callback.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _refuse(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Answer every mint with the definitive 400 of a no-auth server."""
+        calls.append(1)
+        request = httpx.Request("POST", mint_url)
+        raise httpx.HTTPStatusError(
+            "no auth provider", request=request, response=httpx.Response(400, request=request)
+        )
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _refuse)
+
+    factory = _ManagedMintTokenFactory(
+        "https://s.example.com/v1/runners/r/token",
+        "https://s.example.com",
+        "btok",
+    )
+    assert factory() is None
+    assert factory.declined is True
+    assert factory.declined_by_server_error is False
+
+    auth = _RunnerDatabricksAuth(factory)
+    request = httpx.Request("GET", "http://server/v1/sessions/conv_1/agent/contents")
+    gen = auth.auth_flow(request)
+    bare = next(gen)
+    assert "Authorization" not in bare.headers
+
+    # A rejected bare request must NOT clear the definitive latch or re-mint.
+    with pytest.raises(StopIteration):
+        gen.send(httpx.Response(401))
+    assert factory.declined is True
+    assert len(calls) == 1
+
+
 def test_managed_mint_factory_proxy_auth_failure_falls_through_to_sdk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -333,6 +333,11 @@ class _RunnerDatabricksAuth(httpx.Auth):
                     # intermediary 5xx latched it while the server was
                     # briefly down). Clear the latch and try a fresh mint
                     # so a recovered server re-authenticates the runner.
+                    # Only a 5xx-latched decline is recoverable; a genuine
+                    # no-auth refusal (400/404) must not re-probe the mint
+                    # endpoint on every rejected callback.
+                    if not getattr(self._factory, "declined_by_server_error", False):
+                        return
                     reset = getattr(self._factory, "reset_decline", None)
                     if not callable(reset):
                         return
@@ -403,7 +408,7 @@ def _call_factory_with_declined(
     """
     snapshot = getattr(factory, "call_with_declined", None)
     if callable(snapshot):
-        return snapshot()
+        return cast("tuple[str | None, bool]", snapshot())
     return factory(), getattr(factory, "declined", False)
 
 
@@ -505,6 +510,12 @@ class _InitialAuthTokenFactory:
         """
         with self._lock:
             return self._call_locked(), self._declined_locked()
+
+    @property
+    def declined_by_server_error(self) -> bool:
+        """True when the inner fallback factory's decline came from a 5xx."""
+        with self._lock:
+            return bool(getattr(self._fallback_factory, "declined_by_server_error", False))
 
     def reset_decline(self) -> None:
         """Clear the inner fallback factory's ``declined`` latch, if any."""

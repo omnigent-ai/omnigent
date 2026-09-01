@@ -411,6 +411,7 @@ async def serve_tunnel(
             redirect_url = _websocket_auth_redirect_url(exc)
             if redirect_url is not None:
                 login_redirect_streak += 1
+                _reset_server_error_decline(auth_token_factory)
                 if _invalidate_auth_token_factory(auth_token_factory):
                     auth_token = await _handle_refreshable_auth_failure(
                         auth_token_factory, 302, exc
@@ -478,7 +479,10 @@ async def serve_tunnel(
                     # Invalidate the cached token so the loop-top _refresh_auth_token
                     # fetches a fresh one on the next attempt. The loop-top call is
                     # already guarded against transient factory errors (OSError etc.),
-                    # so we don't call the factory directly here.
+                    # so we don't call the factory directly here. Also clear a
+                    # 5xx-latched mint decline: the rejection proves the server
+                    # requires auth, so the next refresh must re-mint.
+                    _reset_server_error_decline(auth_token_factory)
                     _invalidate_auth_token_factory(auth_token_factory)
                     retry_reason = f"HTTP {http_status}; retrying with refreshed token"
                     if ever_connected:
@@ -563,6 +567,24 @@ def _invalidate_auth_token_factory(factory: Callable[[], str | None] | None) -> 
     if not callable(invalidate):
         return False
     return bool(invalidate())
+
+
+def _reset_server_error_decline(factory: Callable[[], str | None] | None) -> None:
+    """Clear a mint decline latched by an intermediary 5xx.
+
+    The tunnel upgrade was rejected with a re-auth signal, so the server
+    DOES require auth and a decline latched while it was unreachable (a
+    5xx answered for the mint endpoint) is wrong. Clearing it lets the
+    loop-top refresh re-mint on the next attempt. A genuine no-auth
+    refusal (HTTP 400/404) stays latched.
+
+    :param factory: Runner token factory, or ``None``.
+    """
+    if not getattr(factory, "declined_by_server_error", False):
+        return
+    reset = getattr(factory, "reset_decline", None)
+    if callable(reset):
+        reset()
 
 
 async def _refresh_auth_token(
