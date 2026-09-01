@@ -87,14 +87,24 @@ def _base_env(home: Path, bin_dir: Path) -> dict[str, str]:
     resolve the worktree under test even when the ambient interpreter's
     site-packages carries a different build.
     """
-    env = dict(os.environ)
+    env = os.environ.copy()
     env["HOME"] = str(home)
     env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
     env["NO_COLOR"] = "1"
     env["TERM"] = "xterm"
-    # An ambient KIMI_CODE_HOME would redirect kimi-auth detection away from
-    # the isolated $HOME/.kimi-code this test seeds.
-    env.pop("KIMI_CODE_HOME", None)
+    # Isolate every ambient override that could redirect the journey away
+    # from this test's fixture: KIMI_CODE_HOME moves kimi-auth detection off
+    # the seeded $HOME/.kimi-code; OMNIGENT_CONFIG_HOME / OMNIGENT_DATA_DIR
+    # bypass the isolated $HOME's config; the kimi binary-path overrides
+    # would shadow the stub placed first on PATH.
+    for var in (
+        "KIMI_CODE_HOME",
+        "OMNIGENT_DATA_DIR",
+        "OMNIGENT_KIMI_PATH",
+        "HARNESS_KIMI_PATH",
+    ):
+        env.pop(var, None)
+    env["OMNIGENT_CONFIG_HOME"] = str(home / ".omnigent")
     pythonpath = [
         str(_REPO_ROOT),
         str(_REPO_ROOT / "sdks" / "python-client"),

@@ -716,6 +716,7 @@ def test_sandbox_launch_path_wraps_when_sandbox_requested(
         sandbox_mod, "create_exec_launcher", lambda target, _policy: f"LAUNCHER::{target}"
     )
 
+    monkeypatch.delenv("KIMI_CODE_HOME", raising=False)
     os_env = OSEnvSpec(
         type="caller_process",
         cwd=None,
@@ -728,6 +729,15 @@ def test_sandbox_launch_path_wraps_when_sandbox_requested(
     assert launch.startswith("LAUNCHER::")
     assert Path.home() / ".kimi-code" in captured_write_roots
     assert Path.home() / ".kimi" not in captured_write_roots
+
+    # A custom $KIMI_CODE_HOME moves kimi's config dir; the jail's write
+    # grant must follow it or the CLI can't persist config when overridden.
+    captured_write_roots.clear()
+    monkeypatch.setenv("KIMI_CODE_HOME", "/srv/custom-kimi-home")
+    launch = ex._sandbox_launch_path(("PATH",))
+    assert launch.startswith("LAUNCHER::")
+    assert Path("/srv/custom-kimi-home") in captured_write_roots
+    assert Path.home() / ".kimi-code" not in captured_write_roots
 
 
 def test_run_turn_emits_error_when_kimi_binary_missing(monkeypatch: pytest.MonkeyPatch) -> None:

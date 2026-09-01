@@ -289,13 +289,15 @@ class KimiExecutor(Executor):
             if not sandbox.active:
                 return self._binary_path
             # kimi is a curl-installed single binary: it must read its own
-            # install dir and write its config dir (~/.kimi-code) and /tmp, or it
-            # can't start inside the jail.
+            # install dir and write its config dir ($KIMI_CODE_HOME, default
+            # ~/.kimi-code) and /tmp, or it can't start inside the jail.
+            from omnigent.kimi_native_credentials import resolve_user_kimi_home
+
             resolved_bin = shutil.which(self._binary_path) or self._binary_path
             bin_dir = Path(resolved_bin).resolve(strict=False).parent
             sandbox = with_additional_read_roots(sandbox, [bin_dir])
             sandbox = with_additional_write_roots(
-                sandbox, [Path.home() / ".kimi-code", Path("/tmp")]
+                sandbox, [resolve_user_kimi_home(), Path("/tmp")]
             )
             sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
             return create_exec_launcher(resolved_bin, sandbox)
