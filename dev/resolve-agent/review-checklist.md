@@ -13,6 +13,15 @@ what to look for, and why it's wrong.
 
 ## Tests / hermeticity
 
+- **A "does not crash/fail" e2e must also assert a positive milestone.** A test
+  that only rejects failure markers passes when the journey dies early for an
+  unrelated reason and never reaches the repaired code — assert output/state
+  that can only appear *past* the fixed point.
+- **Guard construction-time exceptions outside the library's base hierarchy.**
+  When widening an `except` around a client library call, check for errors
+  raised at *client construction* that don't subclass the request-error base
+  (e.g. `httpx.InvalidURL` is not an `httpx.HTTPError`) — and check every
+  sibling call site on the same journey, not just the one in the traceback.
 - **Env-absent tests must clear *every* relevant ambient variable.** A test
   asserting an environment-derived value is absent/None/default must clear **all**
   of the variables the code-under-test reads in its fixture — not just the obvious
