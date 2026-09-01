@@ -318,6 +318,11 @@ export interface ProviderInventoryEntry {
   profile: string | null;
   model_provider: string | null;
   capabilities: ProviderCapabilities;
+  /**
+   * Harnesses this provider would serve by default, resolved host-side by the
+   * same canonical function a launch uses. Optional for older hosts.
+   */
+  default_for_harnesses?: string[];
   /** Conservative status derived from silent, provider-specific local evidence. */
   connection_state: ProviderConnectionState;
   /** Non-secret explanation; never implies a live vendor check occurred. */

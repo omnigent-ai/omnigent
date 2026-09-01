@@ -73,6 +73,7 @@ _PROVIDER: dict[str, object] = {
     },
     "connection_state": "connected",
     "connection_detail": "A usable claude credential is configured locally.",
+    "default_for_harnesses": ["claude-native", "claude-sdk"],
 }
 
 

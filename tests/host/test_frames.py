@@ -1533,6 +1533,7 @@ def test_detect_credentials_round_trip() -> None:
                 },
                 "connection_state": "authentication_required",
                 "connection_detail": "The claude CLI has no locally detected credential.",
+                "default_for_harnesses": ["claude-native"],
             }
         ],
     )
@@ -1657,6 +1658,15 @@ def test_provider_row_from_older_host_defaults_connection_state_to_unknown() -> 
 
     assert row["connection_state"] == "unknown"
     assert row["connection_detail"] == "This host does not report provider connection state."
+    assert row["default_for_harnesses"] == []
+
+
+def test_provider_row_keeps_only_string_harness_mappings() -> None:
+    [row] = _decode_providers(
+        _provider_row(default_for_harnesses=["codex-native", 7, None, "openai-agents"])
+    )
+
+    assert row["default_for_harnesses"] == ["codex-native", "openai-agents"]
 
 
 def test_provider_row_rejects_unknown_connection_state_without_dropping_row() -> None:

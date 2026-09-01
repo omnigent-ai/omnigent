@@ -30,6 +30,7 @@ from omnigent.onboarding.provider_config import (
     SUBSCRIPTION_KIND,
     FamilyConfig,
     ProviderEntry,
+    default_provider_for_harness,
     load_config,
     load_providers,
     provider_families,
@@ -315,6 +316,7 @@ class ProviderInventoryEntry:
     capabilities: ProviderCapabilities
     connection_state: ConnectionState
     connection_detail: str
+    default_for_harnesses: tuple[str, ...] = ()
 
     def as_dict(self) -> JsonObject:
         """Return the public API representation."""
@@ -336,6 +338,7 @@ class ProviderInventoryEntry:
             "capabilities": self.capabilities.as_dict(),
             "connection_state": self.connection_state.value,
             "connection_detail": self.connection_detail,
+            "default_for_harnesses": list(self.default_for_harnesses),
         }
 
 
@@ -382,6 +385,60 @@ def provider_capabilities(provider: ProviderEntry) -> ProviderCapabilities:
     )
 
 
+# Harnesses a pre-session picker asks about. Resolving each one host-side keeps
+# the harness→provider rule in the one function that owns it, instead of
+# re-deriving it from families in the web app.
+_PICKER_HARNESSES: tuple[str, ...] = (
+    "claude-native",
+    "claude-sdk",
+    "codex-native",
+    "codex",
+    "openai-agents",
+    "pi-native",
+    "pi",
+)
+
+
+def _default_harnesses_by_provider(config: dict[str, object]) -> dict[str, tuple[str, ...]]:
+    """Map each provider name to the harnesses it would serve by default.
+
+    Uses :func:`default_provider_for_harness`, the same resolver a launch uses,
+    so a status surface can name the provider that will actually run a session
+    rather than guessing from families.
+
+    :param config: The effective config, ambient detections included.
+    :returns: Provider name → harness ids, e.g. ``{"codex": ("codex-native",)}``.
+    """
+    raw_providers = config.get("providers")
+    if not isinstance(raw_providers, dict):
+        return {}
+
+    # The canonical resolver parses the whole provider table. Give it only the
+    # individually valid rows so one unrelated typo cannot hide every valid
+    # harness mapping from this read-only status surface.
+    valid_providers: dict[str, object] = {}
+    for raw_name, raw_provider in raw_providers.items():
+        name = str(raw_name)
+        try:
+            parsed = load_providers({"providers": {name: raw_provider}})
+        except Exception:
+            continue
+        if name in parsed:
+            valid_providers[name] = raw_provider
+
+    resolver_config = dict(config)
+    resolver_config["providers"] = valid_providers
+    by_provider: dict[str, list[str]] = {}
+    for harness in _PICKER_HARNESSES:
+        try:
+            provider = default_provider_for_harness(resolver_config, harness)
+        except Exception:  # a malformed default must not erase the whole map
+            continue
+        if provider is not None:
+            by_provider.setdefault(provider.name, []).append(harness)
+    return {name: tuple(harnesses) for name, harnesses in by_provider.items()}
+
+
 def build_provider_inventory(
     config: dict[str, object] | None = None,
     *,
@@ -405,6 +462,7 @@ def build_provider_inventory(
     if not isinstance(raw_providers, dict):
         return []
 
+    default_harnesses = _default_harnesses_by_provider(effective)
     inventory: list[ProviderInventoryEntry] = []
     for raw_name, raw_provider in raw_providers.items():
         name = str(raw_name)
@@ -493,6 +551,7 @@ def build_provider_inventory(
                 capabilities=provider_capabilities(provider),
                 connection_state=connection.state,
                 connection_detail=connection.detail,
+                default_for_harnesses=default_harnesses.get(provider.name, ()),
             )
         )
     return inventory

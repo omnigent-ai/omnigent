@@ -65,6 +65,7 @@ def test_inventory_combines_configured_and_detected_providers_without_secrets() 
             "connection_detail": (
                 "A usable claude credential is configured locally; the vendor was not contacted."
             ),
+            "default_for_harnesses": ["claude-native", "claude-sdk"],
         },
         {
             "id": "work",
@@ -91,6 +92,7 @@ def test_inventory_combines_configured_and_detected_providers_without_secrets() 
             "connection_detail": (
                 "The openai credential is configured locally; the vendor was not contacted."
             ),
+            "default_for_harnesses": ["codex-native", "codex", "openai-agents", "pi-native", "pi"],
         },
     ]
     serialized = repr(rows)
@@ -282,3 +284,61 @@ def test_databricks_profile_presence_does_not_claim_authenticated(
 
     assert connection.state is ConnectionState.UNKNOWN
     assert "do not authenticate" in connection.detail
+
+
+def test_rows_name_the_harnesses_they_would_serve() -> None:
+    # The picker must not re-derive harness→provider from families itself.
+    config: dict[str, object] = {
+        "providers": {
+            "claude": {"kind": "subscription", "cli": "claude", "default": "anthropic"},
+            "work": {
+                "kind": "gateway",
+                "default": "openai",
+                "openai": {"base_url": "https://gateway.example/v1", "api_key": "k"},
+            },
+        }
+    }
+
+    rows = {row.provider_id: row for row in build_provider_inventory(config, detected=[])}
+
+    assert rows["claude"].default_for_harnesses == ("claude-native", "claude-sdk")
+    assert "codex-native" in rows["work"].default_for_harnesses
+    assert "claude-native" not in rows["work"].default_for_harnesses
+
+
+def test_a_provider_that_is_nobodys_default_names_no_harness() -> None:
+    config: dict[str, object] = {
+        "providers": {
+            "spare": {
+                "kind": "gateway",
+                "openai": {"base_url": "https://spare.example/v1", "api_key": "k"},
+            }
+        }
+    }
+
+    [row] = build_provider_inventory(config, detected=[])
+
+    assert row.default_for_harnesses == ()
+
+
+def test_malformed_unrelated_provider_does_not_erase_valid_harness_mapping() -> None:
+    config: dict[str, object] = {
+        "providers": {
+            "broken": {
+                "kind": "gateway",
+                "default": "anthropic",
+                "anthropic": "not a provider family configuration",
+            },
+            "work": {
+                "kind": "gateway",
+                "default": "openai",
+                "openai": {"base_url": "https://gateway.example/v1", "api_key": "k"},
+            },
+        }
+    }
+
+    rows = {row.provider_id: row for row in build_provider_inventory(config, detected=[])}
+
+    assert rows["broken"].configuration_state == "invalid"
+    assert "codex-native" in rows["work"].default_for_harnesses
+    assert "openai-agents" in rows["work"].default_for_harnesses

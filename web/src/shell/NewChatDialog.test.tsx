@@ -35,7 +35,9 @@ import {
   useHosts,
   useInstallHarness,
   useInstallingHarnesses,
+  useProviderInventory,
   type Host,
+  type ProviderInventoryEntry,
 } from "@/hooks/useHosts";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
@@ -80,6 +82,9 @@ vi.mock("@/hooks/useHosts", () => ({
   useInstallingHarnesses: vi.fn(() => new Set<string>()),
   useStoreCredential: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
   useDetectedCredentials: vi.fn(() => ({ data: [] })),
+  // The config modal names the provider that will serve the agent; inert by
+  // default so tests that don't exercise it need no wiring.
+  useProviderInventory: vi.fn(() => ({ data: [], isLoading: false, isError: false })),
 }));
 // The setup dialog's copyable command rows call copyText; stub it so a click
 // can be asserted without touching the real clipboard.
@@ -168,6 +173,7 @@ vi.mock("@/store/chatStore", async (importOriginal) => ({
 
 const authenticatedFetchMock = vi.mocked(authenticatedFetch);
 const useHostsMock = vi.mocked(useHosts);
+const useProviderInventoryMock = vi.mocked(useProviderInventory);
 /** Stable per-harness model-catalog results (identity matters: effects key on them). */
 const CLAUDE_MODEL_OPTIONS_RESULT = {
   data: [
@@ -680,6 +686,37 @@ function host(status: "online" | "offline", i = 1): Host {
   return { host_id: `host_${i}`, name: `machine-${i}`, owner: "me", status };
 }
 
+function providerInventoryEntry(
+  partial: Partial<ProviderInventoryEntry> = {},
+): ProviderInventoryEntry {
+  return {
+    id: "claude",
+    display_name: "Claude",
+    kind: "subscription",
+    origin: "configured",
+    source: "config",
+    configuration_state: "valid",
+    error: null,
+    families: ["anthropic"],
+    surfaces: ["anthropic"],
+    default_for: ["anthropic"],
+    default_models: {},
+    cli: "claude",
+    profile: null,
+    model_provider: null,
+    capabilities: {
+      model_discovery: "supported",
+      usage_status: "unsupported",
+      multiple_profiles: "unsupported",
+      interactive_cli: "supported",
+    },
+    default_for_harnesses: ["claude-native"],
+    connection_state: "unknown",
+    connection_detail: "No provider-specific local credential proof is available.",
+    ...partial,
+  };
+}
+
 function mockHosts(hosts: Host[], queryState: Partial<ReturnType<typeof useHosts>> = {}) {
   useHostsMock.mockReturnValue({
     data: hosts,
@@ -700,6 +737,12 @@ function mockAgents(agents: AvailableAgent[]) {
 function setupLandingMocks() {
   authenticatedFetchMock.mockReset();
   useHostsMock.mockReset();
+  useProviderInventoryMock.mockReset();
+  useProviderInventoryMock.mockReturnValue({
+    data: [],
+    isLoading: false,
+    isError: false,
+  } as unknown as ReturnType<typeof useProviderInventory>);
   useHostModelOptionsMock.mockReset();
   useAvailableAgentsMock.mockReset();
   useHostFilesystemMock.mockReset();
@@ -3357,6 +3400,21 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
     expect(screen.getByTestId("new-chat-landing-config-modal")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-config-permission")).toBeTruthy();
+  });
+
+  it("routes the selected host and harness to the read-only provider row", () => {
+    useProviderInventoryMock.mockReturnValue({
+      data: [providerInventoryEntry()],
+      isLoading: false,
+      isError: false,
+    } as unknown as ReturnType<typeof useProviderInventory>);
+    renderLanding();
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+
+    expect(useProviderInventoryMock).toHaveBeenLastCalledWith("host_1", true);
+    expect(screen.getByTestId("new-chat-provider-status")).toHaveTextContent("Claude");
+    expect(screen.getByTestId("new-chat-provider-status")).toHaveTextContent("Status unknown");
   });
 
   it("summarizes the current settings in the gear tooltip on hover", async () => {

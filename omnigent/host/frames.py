@@ -2051,6 +2051,14 @@ def _decode_provider_inventory(raw: object) -> list[_JsonObject]:
             optional_strings[key] = value
         if not valid:
             continue
+        # Absent from hosts predating the pre-session picker: an empty list
+        # means "this host does not say", never "serves no harness".
+        raw_harnesses = item.get("default_for_harnesses")
+        default_for_harnesses = (
+            [name for name in raw_harnesses if isinstance(name, str)]
+            if isinstance(raw_harnesses, list)
+            else []
+        )
         raw_state = item.get("connection_state")
         state = raw_state if raw_state in _PROVIDER_CONNECTION_STATES else "unknown"
         raw_detail = item.get("connection_detail")
@@ -2068,6 +2076,7 @@ def _decode_provider_inventory(raw: object) -> list[_JsonObject]:
                 "capabilities": capabilities,
                 "connection_state": state,
                 "connection_detail": detail,
+                "default_for_harnesses": default_for_harnesses,
             }
         )
     return providers
