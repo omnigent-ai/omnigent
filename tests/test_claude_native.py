@@ -2781,6 +2781,260 @@ async def test_ensure_local_claude_resume_transcript_returns_none_when_no_record
     assert not expected.exists()
 
 
+@pytest.mark.asyncio
+async def test_fetch_resume_items_retries_smaller_pages_on_5xx() -> None:
+    """
+    A 5xx on a large item page retries at smaller page sizes.
+
+    A deployed backend can fail reading one oversized page of a big
+    conversation while serving the same rows fine at smaller page sizes.
+    The history is recoverable, so the fetch must shrink the page and keep
+    going instead of raising (which would silently cold-start a blank
+    Claude session).
+    """
+    requested_limits: list[int] = []
+    total = 600
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        limit = int(request.url.params["limit"])
+        requested_limits.append(limit)
+        if limit > 400:
+            return httpx.Response(500, json={"error": {"code": "internal_error"}})
+        after = request.url.params.get("after")
+        start = int(after) + 1 if after is not None else 0
+        page = [
+            {"type": "message", "id": str(i), "role": "user", "content": []}
+            for i in range(start, min(start + limit, total))
+        ]
+        last = page[-1]["id"] if page else None
+        return httpx.Response(
+            200,
+            json={"data": page, "has_more": start + limit < total, "last_id": last},
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        items = await claude_native._fetch_all_session_items_for_claude_resume(client, "conv_abc")
+
+    # Every item arrives exactly once, in order — the degrade must not
+    # drop or duplicate rows across the retried page boundary.
+    assert [item["id"] for item in items] == [str(i) for i in range(total)]
+    # The first request went out at the full page size, 500'd, and the
+    # fetch degraded (halving through the still-failing 500) until pages
+    # served, instead of raising.
+    assert requested_limits[0] == 1000
+    assert requested_limits == sorted(requested_limits, reverse=True)
+    assert requested_limits[-1] <= 400
+
+
+@pytest.mark.asyncio
+async def test_fetch_resume_items_retries_smaller_pages_on_dropped_connection() -> None:
+    """
+    A connection dropped mid-response on a large page degrades like a 5xx.
+
+    A backend choking on an oversized page may sever the connection instead
+    of returning a clean 500; the fetch must retry the page smaller rather
+    than abandoning the resume.
+    """
+    requested_limits: list[int] = []
+    total = 300
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        limit = int(request.url.params["limit"])
+        requested_limits.append(limit)
+        if limit > 400:
+            raise httpx.ReadError("connection dropped", request=request)
+        after = request.url.params.get("after")
+        start = int(after) + 1 if after is not None else 0
+        page = [
+            {"type": "message", "id": str(i), "role": "user", "content": []}
+            for i in range(start, min(start + limit, total))
+        ]
+        last = page[-1]["id"] if page else None
+        return httpx.Response(
+            200,
+            json={"data": page, "has_more": start + limit < total, "last_id": last},
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        items = await claude_native._fetch_all_session_items_for_claude_resume(client, "conv_abc")
+
+    assert [item["id"] for item in items] == [str(i) for i in range(total)]
+    assert requested_limits[0] == 1000
+    assert requested_limits[-1] <= 400
+
+
+@pytest.mark.asyncio
+async def test_fetch_resume_items_raises_on_4xx_without_retry() -> None:
+    """A 4xx is a contract error: raise immediately, no page-size retry."""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        del request
+        calls += 1
+        return httpx.Response(404, json={"error": {"code": "not_found"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException):
+            await claude_native._fetch_all_session_items_for_claude_resume(client, "conv_abc")
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_resume_items_raises_when_5xx_persists_at_floor() -> None:
+    """A backend that 500s even at the smallest page size still raises."""
+    requested_limits: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_limits.append(int(request.url.params["limit"]))
+        return httpx.Response(500, json={"error": {"code": "internal_error"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException):
+            await claude_native._fetch_all_session_items_for_claude_resume(client, "conv_abc")
+
+    # Degraded down to the floor, then gave up — bounded, no infinite loop.
+    assert requested_limits[-1] == claude_native._CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR
+    assert requested_limits == sorted(requested_limits, reverse=True)
+
+
+@pytest.mark.asyncio
+async def test_resume_transcript_falls_back_to_local_file_when_history_unfetchable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Server history unreachable + intact local transcript → resume from it.
+
+    When every page size fails, a previous run's local
+    ``~/.claude/projects/<ws>/<sid>.jsonl`` still holds the conversation;
+    resuming from it beats silently launching a blank session.
+    """
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    workspace = Path("/work/some-repo")
+    target_dir = projects / claude_native._sanitize_claude_project_name(str(workspace))
+    target_dir.mkdir(parents=True)
+    local = target_dir / "sid123.jsonl"
+    local.write_text('{"type":"user"}\n', encoding="utf-8")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(500, json={"error": {"code": "internal_error"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        written = await claude_native._ensure_local_claude_resume_transcript(
+            client,
+            session_id="conv_abc",
+            external_session_id="sid123",
+            workspace=workspace,
+        )
+
+    assert written == local
+    # The untouched local transcript is used as-is, never overwritten with
+    # partial server state.
+    assert local.read_text(encoding="utf-8") == '{"type":"user"}\n'
+
+
+@pytest.mark.asyncio
+async def test_resume_transcript_ignores_corrupt_local_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A non-JSONL local file is not a resumable fallback.
+
+    ``claude --resume`` against a corrupt transcript exits fatally instead
+    of starting, so the fallback must reject it and surface the fetch
+    failure.
+    """
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    workspace = Path("/work/some-repo")
+    target_dir = projects / claude_native._sanitize_claude_project_name(str(workspace))
+    target_dir.mkdir(parents=True)
+    (target_dir / "sid123.jsonl").write_text("not json at all\n", encoding="utf-8")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(500, json={"error": {"code": "internal_error"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException):
+            await claude_native._ensure_local_claude_resume_transcript(
+                client,
+                session_id="conv_abc",
+                external_session_id="sid123",
+                workspace=workspace,
+            )
+
+
+@pytest.mark.asyncio
+async def test_resume_transcript_ignores_local_file_on_4xx(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A 4xx contract error never falls back to a local transcript.
+
+    A 404/401/403 means the server explicitly rejected the conversation;
+    reviving local history could resume the wrong (e.g. deleted or
+    reassigned) session, so the failure must surface even when an intact
+    local transcript exists.
+    """
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    workspace = Path("/work/some-repo")
+    target_dir = projects / claude_native._sanitize_claude_project_name(str(workspace))
+    target_dir.mkdir(parents=True)
+    (target_dir / "sid123.jsonl").write_text('{"type":"user"}\n', encoding="utf-8")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(404, json={"error": {"code": "not_found"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException):
+            await claude_native._ensure_local_claude_resume_transcript(
+                client,
+                session_id="conv_abc",
+                external_session_id="sid123",
+                workspace=workspace,
+            )
+
+
+@pytest.mark.asyncio
+async def test_resume_transcript_raises_when_history_unfetchable_and_no_local_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No server history and no local transcript → the failure surfaces."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(500, json={"error": {"code": "internal_error"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException):
+            await claude_native._ensure_local_claude_resume_transcript(
+                client,
+                session_id="conv_abc",
+                external_session_id="sid123",
+                workspace=Path("/work/some-repo"),
+            )
+
+
 def _resume_rebuild_handler(
     *,
     fail_file_fetch: bool = False,

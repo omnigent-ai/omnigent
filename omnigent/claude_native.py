@@ -199,6 +199,12 @@ _CLAUDE_CODE_USE_GATEWAY_ENV = "CLAUDE_CODE_USE_GATEWAY"
 #: Kill-switch Claude Code treats as covering nonessential startup traffic;
 #: the probe strips it so speed knobs never mask harness output.
 _CLAUDE_NONESSENTIAL_TRAFFIC_ENV = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+#: Starting page size for the cold-resume history fetch. On a 5xx the fetch
+#: halves the page size down to the floor before giving up — a deployed
+#: backend can choke on one oversized page of a big conversation while the
+#: same rows page fine at smaller sizes.
+_CLAUDE_RESUME_ITEMS_PAGE_LIMIT = 1000
+_CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR = 100
 _CLAUDE_MODEL_PROBE_TIMEOUT_S = 20.0
 #: Wall-clock cap for the per-alias resolution fan-out as a whole; aliases
 #: still unresolved when it expires keep their bare rows (the cache's
@@ -4756,7 +4762,25 @@ async def _ensure_local_claude_resume_transcript(
     target_dir = _claude_project_dir_for_cwd(current)
     target = target_dir / f"{external_session_id}.jsonl"
 
-    items = await _fetch_all_session_items_for_claude_resume(client, session_id)
+    try:
+        items = await _fetch_all_session_items_for_claude_resume(client, session_id)
+    except _ResumeHistoryUnavailableError:
+        # Server history is unreachable (5xx / dropped connections at every
+        # page size), but an intact local transcript from a previous run on
+        # this machine can still resume the conversation — far better than
+        # silently starting blank. It may be somewhat stale relative to the
+        # server, which the resumed session tolerates. 4xx contract errors
+        # (plain ClickException) still propagate: the server explicitly
+        # rejected the conversation, so reviving local history is unsafe.
+        if _is_resumable_claude_transcript(target):
+            _logger.warning(
+                "Could not fetch server history for %r; resuming from the "
+                "existing local transcript %s",
+                session_id,
+                target,
+            )
+            return target
+        raise
     # Items are persisted with unresolved file_id attachment blocks;
     # fetch the bytes back so the rebuilt transcript can reference a
     # live local file instead of silently dropping the attachment.
@@ -4790,6 +4814,45 @@ async def _ensure_local_claude_resume_transcript(
     return target
 
 
+def _is_resumable_claude_transcript(path: Path) -> bool:
+    """
+    Whether *path* holds a transcript ``claude --resume`` can start from.
+
+    ``--resume`` against an empty or non-JSONL file exits fatally instead of
+    starting, which for claude-native (terminal == agent) kills the session.
+    A transcript qualifies when at least one line parses as a JSON object —
+    the minimum Claude Code accepts as a conversation record.
+
+    :param path: Candidate ``<sid>.jsonl`` transcript path.
+    :returns: ``True`` when the file exists and holds a JSON-object line.
+    """
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    return False
+                return isinstance(record, dict)
+    except OSError:
+        return False
+    return False
+
+
+class _ResumeHistoryUnavailableError(click.ClickException):
+    """Server history stayed unreachable after every page-size retry.
+
+    Distinct from a plain :class:`click.ClickException` so callers can tell
+    "the backend cannot serve the rows right now" (a local-transcript
+    fallback is safe) apart from 4xx contract errors (the server explicitly
+    rejected the conversation — resuming local history could revive the
+    wrong session).
+    """
+
+
 async def _fetch_all_session_items_for_claude_resume(
     client: httpx.AsyncClient,
     session_id: str,
@@ -4807,14 +4870,52 @@ async def _fetch_all_session_items_for_claude_resume(
     """
     items: list[_JsonObject] = []
     after: str | None = None
+    limit = _CLAUDE_RESUME_ITEMS_PAGE_LIMIT
     while True:
-        params: dict[str, str | int] = {"limit": 1000, "order": "asc"}
+        params: dict[str, str | int] = {"limit": limit, "order": "asc"}
         if after is not None:
             params["after"] = after
-        resp = await client.get(
-            f"/v1/sessions/{url_component(session_id)}/items",
-            params=params,
-        )
+        try:
+            resp = await client.get(
+                f"/v1/sessions/{url_component(session_id)}/items",
+                params=params,
+            )
+        except httpx.TransportError as exc:
+            # A backend choking on one oversized page can also drop the
+            # connection mid-response instead of returning a clean 5xx;
+            # treat it the same way and retry the page smaller.
+            if limit > _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR:
+                limit = max(limit // 2, _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR)
+                _logger.warning(
+                    "History page fetch for %r failed (%s); retrying at smaller limit=%d",
+                    session_id,
+                    type(exc).__name__,
+                    limit,
+                )
+                continue
+            raise _ResumeHistoryUnavailableError(
+                f"Failed to fetch history for {session_id!r}: {exc}"
+            ) from exc
+        if resp.status_code >= 500 and limit > _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR:
+            # A deployed backend can fail reading one LARGE page of a big
+            # conversation while serving the same rows fine at smaller page
+            # sizes. The history is recoverable, so retry this page smaller
+            # instead of abandoning the resume (which silently launches a
+            # blank session). 4xx responses are contract errors and still
+            # raise immediately below.
+            limit = max(limit // 2, _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR)
+            _logger.warning(
+                "History page fetch for %r failed (%s); retrying at smaller limit=%d",
+                session_id,
+                resp.status_code,
+                limit,
+            )
+            continue
+        if resp.status_code >= 500:
+            raise _ResumeHistoryUnavailableError(
+                f"Failed to fetch history for {session_id!r} "
+                f"({resp.status_code}): {error_text(resp)}"
+            )
         if resp.status_code >= 400:
             raise click.ClickException(
                 f"Failed to fetch history for {session_id!r} "
