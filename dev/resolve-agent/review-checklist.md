@@ -20,6 +20,12 @@ what to look for, and why it's wrong.
   machine and flakes in CI where that var is exported.
 - **No order-dependence / shared mutable state** across tests — a test that only
   passes after another ran, or mutates a module/global without restoring it.
+- **Re-importing a module that registers global event listeners leaks them.** A
+  test that re-executes module-level code (deleting it from `sys.modules` and
+  importing again) re-runs every class-level registration in it — e.g. a
+  SQLAlchemy `@event.listens_for(Engine, "do_connect")` hook — piling up global
+  listeners that outlive the test and interfere with later engine tests. The
+  fixture must capture and remove every listener the import registered.
 
 - **claude-sdk e2e mocks must script for parallel API calls.** The claude CLI
   opens more than one API call at turn start (main + side calls), and only the
