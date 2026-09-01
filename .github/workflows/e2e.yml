@@ -103,7 +103,10 @@ jobs:
     # Draft PRs resolve to an EMPTY matrix in `setup`, so no shard runs for
     # them. Fork PRs DO run (mock LLM, no secrets) -- same as ci.yml.
     needs: setup
-    runs-on: ubuntu-latest
+    # Larger runner: this 4-shard suite is a top consumer of standard-runner
+    # slots; moving it to the separate larger-runner pool cuts its queue wait
+    # and frees standard slots for other workflows.
+    runs-on: ubuntu-latest-m
     # Job-level cap (composite-action run steps can't set timeout-minutes):
     # ~30 min of tests + setup, replacing the old per-step 30-min backstop.
     timeout-minutes: 35

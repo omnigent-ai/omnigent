@@ -147,7 +147,12 @@ jobs:
     # them. Fork PRs DO run (mock LLM, no secrets) -- same as ci.yml.
     # `ready_for_review` re-fires when a draft is converted.
     needs: [setup, build-sidecar]
-    runs-on: ubuntu-latest
+    # Larger runner: this 4-shard suite is a top consumer of standard-runner
+    # slots, so moving it to the separate larger-runner pool cuts its queue
+    # wait and frees standard slots for other workflows. The 16 GB RAM also
+    # eases the native-CLI render-parity tests (browser + Claude/Codex CLIs +
+    # tmux panes + mock server) that press hard on the 7 GB standard runner.
+    runs-on: ubuntu-latest-m
     timeout-minutes: 25
     strategy:
       # One red shard shouldn't cancel siblings -- we want every shard's signal.
