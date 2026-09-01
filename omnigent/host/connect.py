@@ -407,6 +407,8 @@ _AUTH_REJECT_ESCALATE_ATTEMPTS = 30
 # endpoint that accepts and never speaks is functionally down.
 _SILENT_CONNECT_ESCALATE_ATTEMPTS = 10
 
+DEDICATED_HARNESS_ENV_VAR = "OMNIGENT_HOST_DEDICATED_HARNESS"
+
 # Capability discovery is advisory and must not delay the host channel forever.
 _HOST_CAPABILITY_INIT_TIMEOUT_S = 15.0
 
@@ -910,6 +912,7 @@ class HostProcess:
         identity: HostIdentity,
         server_url: str,
         lifecycle_lock: DaemonLifecycleLock | None = None,
+        dedicated_harness: str | None = None,
     ) -> None:
         """Initialize the host process.
 
@@ -918,9 +921,14 @@ class HostProcess:
         :param lifecycle_lock: Optional guard binding this daemon's lifetime
             to its registry record. When present, the daemon holds the lock
             and self-terminates once the record is deleted or reassigned.
+        :param dedicated_harness: Harness this managed host was prepared to
+            run. When set, the host advertises and accepts only that harness.
         """
         self._identity = identity
         self._server_url = server_url.rstrip("/")
+        self._dedicated_harness = dedicated_harness or (
+            os.environ.get(DEDICATED_HARNESS_ENV_VAR, "").strip() or None
+        )
         self._runners: dict[str, _RunnerHandle] = {}
         # Retain the host's refreshable auth context after the first tunnel
         # handshake so runner launches can reuse its warm bearer. Failed or
@@ -957,7 +965,9 @@ class HostProcess:
         # Capability discovery belongs to daemon initialization, not the
         # connection handshake. Reconnects reuse this snapshot while the live
         # refresh task keeps it current.
-        self._configured_harnesses: dict[str, HarnessAvailability] | None = None
+        self._configured_harnesses: dict[str, HarnessAvailability] | None = (
+            {self._dedicated_harness: True} if self._dedicated_harness else None
+        )
         self._gateway_inference: dict[str, bool] | None = None
         self._capabilities_initialized = False
         # Consecutive login-page redirects; reset by a successful upgrade.
@@ -1522,6 +1532,22 @@ class HostProcess:
             ``"harness_not_configured"`` when the harness check
             refuses the launch.
         """
+        if (
+            frame.harness is not None
+            and self._dedicated_harness is not None
+            and canonicalize_harness(frame.harness)
+            != canonicalize_harness(self._dedicated_harness)
+        ):
+            return HostLaunchRunnerResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=(
+                    f"host {self._identity.name!r} is dedicated to harness "
+                    f"{self._dedicated_harness!r}, not {frame.harness!r}"
+                ),
+                error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE,
+            )
+
         # Refuse to spawn for a harness this machine can't actually run —
         # otherwise the runner starts, the session looks alive, and the
         # first turn dies confusingly inside the executor. ``None`` (an
@@ -2968,6 +2994,9 @@ class HostProcess:
     ) -> dict[str, HarnessAvailability] | None:
         """Collect harness readiness without letting a probe break the channel."""
         try:
+            if self._dedicated_harness is not None:
+                available = await asyncio.to_thread(harness_is_configured, self._dedicated_harness)
+                return {self._dedicated_harness: available}
             return await asyncio.to_thread(configured_harness_map)
         except Exception as exc:
             _logger.exception("Host harness readiness probe failed")

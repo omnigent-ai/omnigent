@@ -332,7 +332,7 @@ async def test_handle_model_options_reports_the_endpoints_wider_catalog(
     _cleanup_host(host)
 
 
-def _make_host_process() -> HostProcess:
+def _make_host_process(*, dedicated_harness: str | None = None) -> HostProcess:
     """Create a HostProcess with a test identity.
 
     :returns: A :class:`HostProcess` for testing.
@@ -344,6 +344,7 @@ def _make_host_process() -> HostProcess:
     return HostProcess(
         identity=identity,
         server_url="http://localhost:8000",
+        dedicated_harness=dedicated_harness,
     )
 
 
@@ -445,6 +446,24 @@ async def test_handle_launch_spawns_subprocess(
     )
 
     # Clean up the spawned sleep process (and its exit watcher).
+    _cleanup_host(host)
+
+
+async def test_dedicated_host_rejects_a_different_harness() -> None:
+    host = _make_host_process(dedicated_harness="codex")
+
+    result = await host._handle_launch(
+        HostLaunchRunnerFrame(
+            request_id="req_wrong_harness",
+            binding_token="test_token_abc",
+            workspace="/not-reached",
+            harness="claude-sdk",
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
+    assert "dedicated to harness 'codex'" in (result.error or "")
     _cleanup_host(host)
 
 
@@ -1319,6 +1338,32 @@ async def test_capability_probe_failure_does_not_block_registration(
     assert hello.configured_harnesses is None
     assert hello.gateway_inference == {"codex": False}
     assert "Permission denied: '/usr/local/bin/codex'" in capsys.readouterr().err
+
+
+async def test_dedicated_host_probes_only_its_prevalidated_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checked: list[str] = []
+
+    def _configured(harness: str) -> bool:
+        checked.append(harness)
+        return True
+
+    def _unexpected_full_map() -> dict[str, bool]:
+        raise AssertionError("dedicated host must not inspect unrelated harnesses")
+
+    monkeypatch.setattr("omnigent.host.connect.harness_is_configured", _configured)
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", _unexpected_full_map)
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", lambda: {"codex": False})
+    monkeypatch.setenv("OMNIGENT_HOST_DEDICATED_HARNESS", "codex")
+    host = _make_host_process()
+
+    await host._initialize_capabilities()
+
+    assert checked == ["codex"]
+    assert host._configured_harnesses == {"codex": True}
+    assert host._gateway_inference == {"codex": False}
+    _cleanup_host(host)
 
 
 async def test_hello_advertises_installed_version() -> None:
