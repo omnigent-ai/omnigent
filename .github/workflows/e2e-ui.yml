@@ -62,6 +62,10 @@ jobs:
   # (security-gate.yml); trusted authors and non-PR events pass instantly.
   gate:
     uses: ./.github/workflows/security-gate.yml
+    # Larger runner: the gate blocks setup, build-sidecar, and the shards below
+    # it, so keeping it on the saturated standard pool throttled the workflow.
+    with:
+      runner: ubuntu-latest-m
 
   # Compute the shard matrix once. A skipped run (draft / fork pull_request)
   # yields an EMPTY matrix -> zero shard jobs -> no skipped placeholder check.
@@ -69,7 +73,9 @@ jobs:
   setup:
     name: setup
     needs: gate
-    runs-on: ubuntu-latest
+    # Larger runner: setup + build-sidecar sit upstream of the e2e-ui shards, so
+    # on the saturated standard pool they throttled the shards before they began.
+    runs-on: ubuntu-latest-m
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -101,7 +107,9 @@ jobs:
     name: build codex-parity sidecar
     needs: setup
     if: needs.setup.outputs.matrix != '{"include":[]}'
-    runs-on: ubuntu-latest
+    # Larger runner: on the critical path to the e2e-ui shards (they `needs`
+    # this), and the cold Rust build is CPU-parallel, so more cores help too.
+    runs-on: ubuntu-latest-m
     timeout-minutes: 20
     steps:
       - name: Checkout

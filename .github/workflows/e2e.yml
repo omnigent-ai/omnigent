@@ -67,13 +67,19 @@ jobs:
       (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
       github.event.label.name == 'skip-security-scan'
     uses: ./.github/workflows/security-gate.yml
+    # Larger runner: the gate blocks setup + the shards below it, so keeping it
+    # on the saturated standard pool throttled the whole workflow.
+    with:
+      runner: ubuntu-latest-m
 
   # Shard matrix (e2e-shard-matrix.sh, shared with e2e-ui.yml). Fork PRs run by
   # default; draft PRs resolve to an empty matrix.
   setup:
     name: setup
     needs: gate
-    runs-on: ubuntu-latest
+    # Larger runner: setup sits upstream of the e2e shards (which `needs: setup`),
+    # so on the saturated standard pool it throttled them before they could start.
+    runs-on: ubuntu-latest-m
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
