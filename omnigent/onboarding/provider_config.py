@@ -59,7 +59,6 @@ from omnigent.env_credentials import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
-from omnigent.spec.parser import check_unresolved_env_vars
 
 _logger = logging.getLogger(__name__)
 
@@ -552,6 +551,11 @@ def resolve_secret(ref: str) -> str:
         # verbatim to a harness/SDK, where the padding fails auth.
         return value.strip()
     # Bare inline reference, e.g. "$ANTHROPIC_API_KEY" or a literal value.
+    # Imported here, not at module scope: the spec parser is a heavy import and
+    # only the credential-resolution paths need it, while this module is on the
+    # host/CLI startup import graph.
+    from omnigent.spec.parser import check_unresolved_env_vars
+
     expanded = expand_envvars_with_omnigent_prefix(ref)
     check_unresolved_env_vars(ref, expanded)
     return expanded
@@ -601,6 +605,8 @@ def _expand(key: str, value: str) -> str:
     :returns: The expanded value, e.g. ``"sk-or-..."``.
     :raises OmnigentError: If a referenced variable is unset.
     """
+    from omnigent.spec.parser import check_unresolved_env_vars
+
     expanded = expand_envvars_with_omnigent_prefix(value)
     check_unresolved_env_vars(key, expanded)
     return expanded
