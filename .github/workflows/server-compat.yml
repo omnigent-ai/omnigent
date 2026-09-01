@@ -65,7 +65,7 @@ jobs:
   resolve-latest:
     name: Resolve latest stable tag
     # PRs: always. Schedule/dispatch: always.
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       latest_tag: ${{ steps.tag.outputs.latest_tag }}
@@ -93,7 +93,7 @@ jobs:
   compat-smoke-config1:
     name: "Compat smoke – Config 1 (new server / old runner ${{ needs.resolve-latest.outputs.latest_tag }})"
     needs: resolve-latest
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -110,7 +110,7 @@ jobs:
   compat-smoke-config2:
     name: "Compat smoke – Config 2 (new runner / old server ${{ needs.resolve-latest.outputs.latest_tag }})"
     needs: resolve-latest
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -127,7 +127,7 @@ jobs:
   compat-smoke-ui-config-a:
     name: "Compat smoke – UI Config A (new SPA / old server ${{ needs.resolve-latest.outputs.latest_tag }})"
     needs: resolve-latest
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
       - name: Checkout
@@ -144,7 +144,7 @@ jobs:
   compat-smoke-ui-config-b:
     name: "Compat smoke – UI Config B (old SPA ${{ needs.resolve-latest.outputs.latest_tag }} / new server)"
     needs: resolve-latest
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
       - name: Checkout
@@ -168,7 +168,7 @@ jobs:
     # The full pairwise matrix is expensive — skip it on PR triggers (the
     # fast smoke jobs above cover the PR case).
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       e2e_matrix: ${{ steps.matrix.outputs.e2e_matrix }}
@@ -192,7 +192,7 @@ jobs:
   backcompat-e2e:
     name: Backcompat e2e (server ${{ matrix.server }} / runner ${{ matrix.runner }}, shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
     needs: setup
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
     # Job-level cap (composite run steps can't set timeout-minutes); mirrors
     # e2e.yml's ~30-min test budget + setup + up to two old-build installs.
     timeout-minutes: 45
@@ -231,7 +231,7 @@ jobs:
   backcompat-integration:
     name: Backcompat integration (server ${{ matrix.server }} / runner ${{ matrix.runner }}, ${{ matrix.harness }})
     needs: setup
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
     timeout-minutes: 40
     strategy:
       fail-fast: false
@@ -261,7 +261,7 @@ jobs:
   setup-ui:
     name: setup-ui
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       ui_matrix: ${{ steps.matrix.outputs.ui_matrix }}
@@ -282,7 +282,7 @@ jobs:
   backcompat-e2e-ui:
     name: "Backcompat e2e-ui (Config ${{ matrix.config }}: ${{ matrix.config == 'A' && matrix.server || matrix.ui }}, shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})"
     needs: setup-ui
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
