@@ -13,8 +13,8 @@ name: Issue Triage
 # exfiltrate secrets. All GitHub mutations happen in steps the LLM
 # cannot influence.
 #
-# Runs legacy intake on issue open. V2 handles issue edits and author follow-up
-# through the reusable issue-prioritization-v2 workflow.
+# V2 owns new-issue intake and issue edits while its rollout switch is enabled.
+# The legacy job remains unchanged behind the disabled switch for rollback.
 #
 # What the bot does:
 #   1. Removes `needs-triage`, adds `triaged`
@@ -40,6 +40,7 @@ on:
       issue_number:
         description: Issue to triage
         required: true
+        type: number
       apply_labels:
         description: >-
           Apply labels, assignment, and duplicate closure (otherwise log only)
@@ -58,7 +59,7 @@ permissions:
 # (e.g. a re-label right after open won't race with the initial run).
 concurrency:
   group: issue-triage-${{ github.event.issue.number || inputs.issue_number }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   OMNIGENT_SKIP_WEB_UI: "true"
@@ -72,16 +73,20 @@ env:
 
 jobs:
   triage:
+    name: Legacy intake fallback
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Legacy intake runs once for new non-bot issues. Edited issues proceed only
-    # to the V2 job below.
+    # Deprecated: remove in 0.12.0 after the seven-day V2 intake canary.
+    # This fallback runs only while V2 is disabled.
     if: >-
-      github.event_name == 'workflow_dispatch' ||
+      vars.ISSUE_PRIORITIZATION_V2_ENABLED != 'true' &&
       (
-        github.event_name == 'issues' &&
-        github.event.action == 'opened' &&
-        !endsWith(github.event.issue.user.login, '[bot]')
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event_name == 'issues' &&
+          github.event.action == 'opened' &&
+          !endsWith(github.event.issue.user.login, '[bot]')
+        )
       )
     steps:
       - name: Check LLM credentials available
@@ -775,14 +780,21 @@ jobs:
       always() &&
       vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true' &&
       (
-        github.event_name == 'issues' &&
-        !endsWith(github.event.issue.user.login, '[bot]') &&
+        github.event_name == 'workflow_dispatch' ||
         (
-          github.event.action == 'opened' ||
-          github.event.action == 'edited'
+          github.event_name == 'issues' &&
+          !endsWith(github.event.issue.user.login, '[bot]') &&
+          (
+            github.event.action == 'opened' ||
+            github.event.action == 'edited'
+          )
         )
       )
     uses: ./.github/workflows/issue-prioritization-v2.yml
     with:
-      issue_number: ${{ github.event.issue.number }}
+      issue_number: ${{ github.event.issue.number || inputs.issue_number }}
+      intake: ${{ github.event_name == 'workflow_dispatch' || github.event.action == 'opened' }}
+      apply: ${{ github.event_name != 'workflow_dispatch' || inputs.apply_labels }}
+      manual_dispatch: ${{ github.event_name == 'workflow_dispatch' }}
+      post_duplicate_comments: ${{ inputs.post_comment }}
     secrets: inherit
