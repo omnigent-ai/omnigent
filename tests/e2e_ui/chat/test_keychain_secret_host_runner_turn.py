@@ -26,8 +26,8 @@ whose allowlist strips the environment the OS keyring needs — on a real
 desktop ``DBUS_SESSION_BUS_ADDRESS`` / ``XDG_RUNTIME_DIR``, here stood in by
 ``PYTHON_KEYRING_BACKEND``, which is likewise not allowlisted. The runner then
 resolves the ``keychain:`` ref against ``keyring.backends.fail.Keyring``,
-falls back to the (empty) ``secrets.json`` file store, and
-``resolve_secret`` fails loud. ``env:`` refs are covered by the
+falls back to the (empty) ``secrets.json`` file store, and the provider-config
+secret resolution fails loud. ``env:`` refs are covered by the
 ``provider_credential_env_vars`` forwarding; ``keychain:`` refs
 were excluded from it. Direct CLI runs are unaffected because
 ``_start_cli_runner_process`` inherits the full environment — matching the
@@ -37,8 +37,8 @@ The OS keyring is stood in by a file-backed ``keyring`` backend selected via
 ``PYTHON_KEYRING_BACKEND`` in the daemon's environment. Both the real desktop
 keyring and the stand-in share the property under test: reachable from the
 daemon's environment, unreachable once the runner-spawn env strip drops the
-selector. The secret is stored through the real
-``omnigent.onboarding.secrets.store_secret`` code path (what setup calls).
+selector. The secret is stored through the real setup storage code path
+(``keychain_desktop_store.py``, which calls the same helper setup calls).
 
 On a buggy build this test FAILS at the ``secret_error is None`` assertion
 (the reproduction); after a fix the same journey completes and the test
@@ -173,7 +173,7 @@ def keychain_host(
 
     - a fake desktop OS keyring importable via PYTHONPATH and selected via
       ``PYTHON_KEYRING_BACKEND``,
-    - the provider secret stored through the real ``store_secret`` path
+    - the provider secret stored through the real setup storage path
       (asserting it landed in the keyring, NOT the file fallback),
     - ``config.yaml`` with a default openai-family gateway provider whose
       ``api_key_ref`` is ``keychain:quickrouter``, pointed at the mock LLM,
@@ -237,14 +237,14 @@ def keychain_host(
         desktop_env.pop(var, None)
 
     # Journey step 1: setup stores the key. Same code path `omnigent setup`
-    # calls; run in a subprocess so the keyring-backend selector applies.
+    # calls (see keychain_desktop_store.py); run in a subprocess so the
+    # keyring-backend selector applies.
     store = subprocess.run(
         [
             sys.executable,
-            "-c",
-            "from omnigent.onboarding import secrets;"
-            f"secrets.store_secret({_SECRET_NAME!r}, {_SECRET_VALUE!r});"
-            f"print('LOADED:' + str(secrets.load_secret({_SECRET_NAME!r})))",
+            str(Path(__file__).with_name("keychain_desktop_store.py")),
+            _SECRET_NAME,
+            _SECRET_VALUE,
         ],
         env=desktop_env,
         capture_output=True,
@@ -252,7 +252,7 @@ def keychain_host(
         timeout=60,
     )
     assert f"LOADED:{_SECRET_VALUE}" in store.stdout, (
-        f"desktop-side store_secret failed: stdout={store.stdout!r} stderr={store.stderr!r}"
+        f"desktop-side secret storage failed: stdout={store.stdout!r} stderr={store.stderr!r}"
     )
     # The secret went to the OS keyring, not the file fallback — the
     # precondition that makes the runner's env-stripped resolution fail.
