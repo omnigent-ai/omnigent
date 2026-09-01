@@ -19,6 +19,11 @@ export interface AvailableAgent {
   // the agent's spec. Lets the picker recognise Codex vs Claude agents
   // by kind rather than by name slug.
   harness: string | null;
+  // Resolved default LLM model from GET /v1/agents (spec's llm.model).
+  // null when the server couldn't load the spec or no model is declared.
+  // Pre-fills the Add Agent model input and is forwarded as
+  // model_override on session create. Absent on older servers.
+  model: string | null;
   // Skills bundled in the agent spec (name + one-line description).
   // Feeds the landing composer's "/" menu before a session exists;
   // host-discovered skills only resolve once a runner is bound, so
@@ -98,6 +103,7 @@ interface BuiltinAgentWire {
   name: string;
   description?: string | null;
   harness?: string | null;
+  model?: string | null;
   skills?: { name: string; description: string }[];
   // True only for server-seeded built-ins (deterministic id). Absent on
   // older servers, where every catalog row degrades to a protected entry.
@@ -146,6 +152,7 @@ async function fetchBuiltinAgents(): Promise<AvailableAgent[]> {
     display_name: displayNameForAgent(a.name, a.harness),
     description: a.description ?? null,
     harness: a.harness ?? null,
+    model: a.model ?? null,
     skills: a.skills ?? [],
     // Omit rather than set to undefined so toEqual comparisons aren't
     // sensitive to absent-vs-undefined. Logic that reads builtin treats
@@ -235,6 +242,7 @@ interface AgentObjectWire {
   name: string;
   description?: string | null;
   harness?: string | null;
+  model?: string | null;
   skills?: { name: string; description: string }[];
 }
 
@@ -250,6 +258,7 @@ function sessionAgentFromScan(scanned: ScannedSessionAgent): AvailableAgent {
     display_name: displayNameForAgent(scanned.agentName),
     description: null,
     harness: null,
+    model: null,
     skills: [],
     sessionId: scanned.sessionId,
     // builtin/created_at intentionally omitted: session-derived agents never
@@ -285,6 +294,7 @@ export async function prefetchAvailableAgentDetails(
               display_name: displayNameForAgent(json.name, json.harness),
               description: json.description ?? null,
               harness: json.harness ?? null,
+              model: json.model ?? null,
               skills: json.skills ?? [],
             },
       );
