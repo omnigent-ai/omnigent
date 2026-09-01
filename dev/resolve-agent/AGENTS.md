@@ -717,18 +717,15 @@ can land a fix depends on where its branch lives:
   - If `maintainerCanModify` is true and
     `git config --get omnigent.forkPushTokenFile` names a readable file, preserve
     the contributor's branch. Keep the App token exported as `GH_TOKEN` for all
-    visible actions. For the push only, read the fork token inside a non-traced
-    shell command, push directly to the exact fork repo/branch, then unset it:
+    visible actions. For the push only, use CI's credential-isolating helper:
     ```bash
-    token_file="$(git config --get omnigent.forkPushTokenFile)"
-    fork_token="$(cat "$token_file")"
-    git push "https://x-access-token:${fork_token}@github.com/<owner>/<repo>.git" \
-      "HEAD:refs/heads/<head-branch>"
-    unset fork_token
+    omnigent-push-fork --repo <owner>/<repo> --branch <head-branch>
     ```
-    Never print the URL, enable shell tracing, persist this URL as a remote, or
-    use the fork token for `gh pr comment`/`review`/`create`; those commands must
-    remain bot-attributed through the App token.
+    The helper uses `GIT_ASKPASS`, clears the checkout's App-token extraheader
+    only for that push, and keeps the maintainer token out of command arguments,
+    remote URLs, and git's failure output. Never read or copy the token file
+    yourself, and never use it for `gh pr comment`/`review`/`create`; those
+    commands must remain bot-attributed through the App token.
   - **If the fork PR needs a fix** and maintainer edits are disabled, the token
     file is absent, or the isolated push returns a real permission error →
     **take over: open your own PR**
