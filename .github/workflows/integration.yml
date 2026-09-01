@@ -43,17 +43,13 @@ jobs:
   # (see security-gate.yml); trusted authors / non-PR events pass instantly.
   gate:
     uses: ./.github/workflows/security-gate.yml
-    # Larger runner: keep the gate off the saturated standard pool so it can't
-    # throttle the integration jobs below it (matches ci/e2e/e2e-ui).
-    with:
-      runner: ubuntu-latest-m
 
   # Harness matrix (integration-matrix.sh). Fork PRs run by default; draft PRs
   # resolve to an empty matrix.
   setup:
     name: setup
     needs: gate
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -80,7 +76,7 @@ jobs:
     # leg runs (and thus no skipped placeholder check). Fork PRs DO run (mock
     # LLM, no secrets) -- same as ci.yml.
     needs: setup
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
     # Per-leg ceiling; inner test step caps at 25 min, rest covers install +
     # junit upload. Legs run in parallel; longest gates wall-time.
     timeout-minutes: 30

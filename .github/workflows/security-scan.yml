@@ -40,12 +40,7 @@ concurrency:
 jobs:
   scan:
     name: Security Scan
-    # Larger runner: the per-workflow security gates poll THIS check and cannot
-    # proceed until it completes, so when it queued behind a saturated standard
-    # pool it stalled every gated CI workflow. Its own pool lets it start
-    # promptly -- it's fast once running (p90 ~0.4 min), so this is
-    # pool-separation, not a compute upgrade.
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
       # Route uv at PyPI for the semgrep fetch.
