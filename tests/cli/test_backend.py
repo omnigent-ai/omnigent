@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import re
 import sys
 import threading
@@ -629,6 +630,33 @@ def test_concurrent_ensure_host_daemon_elects_one_daemon(
     record = cli._find_daemon_record("https://server.example.com")
     assert record is not None
     assert record.pid == 4242
+
+
+def test_ensure_host_daemon_warns_when_spawned_daemon_never_claims(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A spawned daemon that never writes its record is surfaced, not silent."""
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_build_host_daemon_env", lambda **_kw: {})
+    monkeypatch.setattr(cli, "server_config_signature", lambda **_kw: "sig")
+    log_path = tmp_path / "host.log"
+    monkeypatch.setattr(
+        cli,
+        "_spawn_host_daemon_process",
+        lambda **_kw: cli._SpawnedDaemonProcess(pid=4242, log_path=str(log_path)),
+    )
+    # The daemon crashes before claiming: no record ever appears.
+    monkeypatch.setattr(cli, "_wait_for_daemon_claim", lambda *_a, **_kw: None)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.cli"):
+        _ensure_host_daemon("https://server.example.com")
+
+    assert any(
+        "did not claim its registry record" in message and str(log_path) in message
+        for message in caplog.messages
+    )
 
 
 def _online_record() -> cli._HostDaemonRecord:

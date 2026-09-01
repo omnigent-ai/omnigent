@@ -173,9 +173,7 @@ def test_concurrent_ensure_host_daemon_does_not_leave_orphaned_record(
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         f1 = pool.submit(_ensure_host_daemon, server_url)
 
-        assert first_entered.wait(timeout=5), (
-            "thread-1 never entered _spawn_host_daemon_process"
-        )
+        assert first_entered.wait(timeout=5), "thread-1 never entered _spawn_host_daemon_process"
         f2 = pool.submit(_ensure_host_daemon, server_url)
 
         assert both_entered.wait(timeout=5), (

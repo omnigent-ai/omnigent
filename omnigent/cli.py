@@ -3187,7 +3187,17 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
     spawned = _spawn_host_daemon_process(args=args, env=daemon_env)
     if spawned is None:
         return False
-    _wait_for_daemon_claim(target, spawned)
+    if _wait_for_daemon_claim(target, spawned) is None:
+        # The spawned daemon (or a concurrent winner) never wrote its record:
+        # it likely crashed during startup. Point at its log so the failure is
+        # diagnosable instead of silently absent from `host status`.
+        logging.getLogger(__name__).warning(
+            "host daemon for %s did not claim its registry record within %.0fs; "
+            "see %s for the daemon's own log",
+            target,
+            _DAEMON_CLAIM_TIMEOUT_S,
+            spawned.log_path,
+        )
     return decision.config_changed
 
 
