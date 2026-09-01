@@ -5967,6 +5967,31 @@ async def test_accumulate_session_usage_unpriced_model_has_tokens_no_cost(
     assert "total_cost_usd" not in usage["by_model"]["free-model"]
 
 
+async def test_accumulate_session_usage_deleted_session_returns_none(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A session deleted mid-stream is dropped, not raised, from the relay loop.
+
+    ``increment_session_usage`` raises ``ConversationNotFoundError`` once the
+    row is gone; ``_accumulate_session_usage`` must swallow it and return
+    ``None`` rather than let it propagate and fail the in-flight turn.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    assert await store.delete_conversation(session["id"]) is True
+
+    result = sessions_routes._accumulate_session_usage(
+        {"usage": {"input_tokens": 1000, "output_tokens": 500, "model": "harness-model"}},
+        session["id"],
+        store,
+    )
+    assert result is None
+
+
 async def test_accumulate_session_usage_concurrent_calls_accumulate_both_deltas(
     client: httpx.AsyncClient,
     db_uri: str,

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import event, text
+from sqlalchemy import event, select, text
 
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import (
@@ -5754,3 +5754,99 @@ def test_item_search_text_seam_redirects_persisted_value(db_uri: str) -> None:
             ).scalars()
         )
     assert stored == ["custom-search-text"]
+
+
+def test_read_modify_write_primitives_report_a_missing_row(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """No metadata row means no phantom write — for EVERY such primitive.
+
+    Both used to treat the absent row as ``{}``, apply the change, run an
+    UPDATE that matched nothing, and return the mutated dict as if
+    persisted. Fixing one and leaving the other is how the second kept
+    reporting writes that never happened, under a comment describing the
+    bug as fixed. Driven off the shared primitive so a third caller is
+    covered by construction.
+    """
+    from omnigent.stores.conversation_store import ConversationNotFoundError
+
+    missing = "0" * 32
+    writers = {
+        "session state": lambda: conversation_store.mutate_session_state(
+            missing, lambda state: state.__setitem__("counter", 1)
+        ),
+        "session usage": lambda: conversation_store.increment_session_usage(
+            missing, {"total_tokens": 10}
+        ),
+        # Labels are not foreign-keyed, so an unchecked insert here leaves
+        # orphan rows rather than failing — the same phantom write, on the
+        # write path that was missed the first time.
+        "labels": lambda: conversation_store.seed_labels_if_absent(missing, {"risk": "seed"}),
+    }
+    for what, write in writers.items():
+        with pytest.raises(ConversationNotFoundError, match=r"no .* row exists"):
+            write()
+        assert conversation_store.get_conversation(missing) is None, what
+    # Nothing was written on the way out, by any of them.
+    with conversation_store._conv_session("check_orphan_labels") as session:
+        from omnigent.db.db_models import SqlConversationLabel
+
+        orphans = session.execute(
+            select(SqlConversationLabel.key).where(SqlConversationLabel.conversation_id == missing)
+        ).all()
+    assert orphans == [], f"orphan label rows left behind: {orphans}"
+
+
+def test_two_real_writers_race_on_one_metadata_row(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Two threads, two connections, overlapping read windows — a real race.
+
+    Tests that merge two snapshots sequentially prove the merge but never
+    construct the race, so they stay green with the row lock removed. This
+    one holds each writer inside its own locked transaction (the mutate
+    callback runs there) and only releases when both have arrived, so the
+    writers' read windows overlap unless the store serialises them.
+
+    Without the lock both writers read the same pre-state and the second
+    overwrites the first: ``risk`` ends at 1. With it, the second blocks at
+    the lock — never reaching the barrier, which is why the barrier has a
+    timeout rather than deadlocking — reads 1 and persists 2.
+
+    Locking is dialect-complementary, so this is meaningful on both:
+    ``SELECT … FOR UPDATE`` on PostgreSQL, ``BEGIN IMMEDIATE`` on SQLite.
+    """
+    import contextlib as _contextlib
+    import threading
+
+    conv = conversation_store.create_conversation(title="real-race")
+    # Both threads try to meet here from inside their transactions. When the
+    # store serialises correctly only one can arrive, so the wait must expire
+    # rather than block forever.
+    barrier = threading.Barrier(2, timeout=0.5)
+    errors: list[BaseException] = []
+
+    def _increment() -> None:
+        def _mutate(state: dict) -> None:
+            with _contextlib.suppress(threading.BrokenBarrierError):
+                barrier.wait()
+            state["risk"] = state.get("risk", 0) + 1
+
+        try:
+            conversation_store.mutate_session_state(conv.id, _mutate)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_increment) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not errors, errors
+    persisted = dict(conversation_store.get_conversation(conv.id).session_state)
+    assert persisted["risk"] == 2, (
+        f"one writer's increment was lost: {persisted} — the two transactions "
+        f"were not serialised on the metadata row"
+    )

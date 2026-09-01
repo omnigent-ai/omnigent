@@ -40,14 +40,15 @@ class _StubConversationStore:
     Minimal conversation store that records label and state mutations.
 
     Only implements the methods :class:`PolicyEngine` actually calls
-    during ``evaluate``: ``set_labels``, ``set_session_state``, and
+    during ``evaluate``: ``set_labels``, ``mutate_session_state``, and
     ``list_items``. Other methods raise if called, to surface
     unexpected interactions.
 
     :param label_writes: Accumulated ``set_labels`` calls as
         ``(conversation_id, labels)`` tuples.
-    :param state_writes: Accumulated ``set_session_state`` calls as
-        ``(conversation_id, state)`` tuples.
+    :param state_writes: Accumulated state writes as
+        ``(conversation_id, state)`` tuples, recording the merged state
+        each ``mutate_session_state`` call persisted.
     """
 
     label_writes: list[tuple[str, dict[str, str]]] = field(default_factory=list)
@@ -62,14 +63,25 @@ class _StubConversationStore:
         """
         self.label_writes.append((conversation_id, dict(labels)))
 
-    def set_session_state(self, conversation_id: str, state: dict[str, Any]) -> None:
+    def mutate_session_state(self, conversation_id: str, mutate: Any) -> dict[str, Any]:
         """
-        Record a session-state write.
+        Apply *mutate* to the last-recorded state and record the result.
+
+        Mirrors the real store's read-merge-write contract closely enough
+        for these tests: the state read is whatever the previous write for
+        this conversation persisted (empty when none).
 
         :param conversation_id: The conversation being written to.
-        :param state: The full state snapshot being persisted.
+        :param mutate: Callable applied in place to the current state dict.
+        :returns: The merged state, as "persisted".
         """
-        self.state_writes.append((conversation_id, dict(state)))
+        current: dict[str, Any] = {}
+        for written_id, state in self.state_writes:
+            if written_id == conversation_id:
+                current = dict(state)
+        mutate(current)
+        self.state_writes.append((conversation_id, dict(current)))
+        return current
 
     def list_items(
         self,
