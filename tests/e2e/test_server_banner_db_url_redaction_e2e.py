@@ -51,7 +51,7 @@ _BANNER_TIMEOUT_S = HEALTH_TIMEOUT_S * 2
 
 # The secret that must never reach stdout. Distinctive so a substring match
 # cannot false-positive on anything else the server prints.
-_DB_PASSWORD = "s3cretpw-hunter2"  # noqa: S105 - deliberately fake test credential
+_DB_PASSWORD = "s3cretpw-hunter2"
 
 # Ambient config/credential vars would leak the harness's own setup into the
 # server under test or break HOME isolation; clearing whole prefixes keeps the
@@ -85,7 +85,7 @@ def _make_d1_emulator(db_path: Path) -> ThreadingHTTPServer:
     lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
-        def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        def do_POST(self) -> None:
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length) or b"{}")
             sql = body.get("sql", "")
@@ -166,7 +166,9 @@ def _server_env(home: Path, shim_dir: Path, d1_port: int) -> dict[str, str]:
     for key in [k for k in env if k.startswith(_ENV_PREFIXES_TO_CLEAR)]:
         env.pop(key)
     env["HOME"] = str(home)
-    env["PYTHONPATH"] = f"{shim_dir}{os.pathsep}{_REPO_ROOT}{os.pathsep}{env.get('PYTHONPATH', '')}"
+    env["PYTHONPATH"] = (
+        f"{shim_dir}{os.pathsep}{_REPO_ROOT}{os.pathsep}{env.get('PYTHONPATH', '')}"
+    )
     env["CF_D1_BASE_URL"] = f"http://127.0.0.1:{d1_port}"
     # The dialect reaches the loopback emulator over HTTP; keep any ambient
     # corporate proxy out of that hop.
@@ -271,7 +273,7 @@ def test_server_startup_banner_does_not_print_db_password(tmp_path: Path) -> Non
         # exact text a container ships to `docker logs` and log aggregators.
         assert _DB_PASSWORD not in output, (
             "database password leaked into the server startup banner "
-            f"(stdout would land in `docker logs`):\n"
+            "(stdout would land in `docker logs`):\n"
             + "\n".join(line for line in output.splitlines() if _DB_PASSWORD in line)
         )
     finally:
