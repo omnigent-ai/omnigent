@@ -1103,17 +1103,26 @@ def test_ensure_default_acp_agents_seeds_configured_agent(
     assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
 
 
-def test_ensure_default_acp_agents_seeds_installed_builtin_cli(
+def test_ensure_default_acp_agents_seeds_builtin_cli_rows_without_a_local_binary(
     seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A builtin ACP CLI harness whose binary is on PATH seeds a picker built-in."""
+    """Every builtin ACP CLI row seeds even when no vendor CLI is on this host.
+
+    The vendor CLI runs on the *executing* host (the attached runner), not on the
+    server, so the server's own PATH says nothing about launchability. The picker
+    hides a row the selected host can't run via that host's ``configured_harnesses``
+    readiness map — the same way natives are seeded unconditionally and filtered.
+
+    **What breaks if this fails**: on a remote server (no vendor CLI in its
+    container) Devin and Grok vanish from the New Chat picker even though the Mac
+    runner attached to it has them installed — the row is never seeded, so no
+    per-host filter can bring it back.
+    """
     from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 
     monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [])
-    # Every builtin ACP CLI resolves on PATH in this test.
-    monkeypatch.setattr(
-        "omnigent._platform.resolve_cli_binary", lambda _b, **k: "/usr/local/bin/x"
-    )
+    # No vendor CLI resolves here — the remote-server / app-container shape.
+    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _b, **k: None)
 
     server_app._ensure_default_acp_agents(
         seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
@@ -1121,7 +1130,7 @@ def test_ensure_default_acp_agents_seeds_installed_builtin_cli(
     # Keyed by the catalog id (a valid slug), not the display label.
     for key in ACP_CLI_HARNESSES:
         assert seed_stores.agent_store.get_by_name(key) is not None, (
-            f"installed builtin ACP CLI {key!r} was not seeded"
+            f"builtin ACP CLI {key!r} was not seeded"
         )
 
 
@@ -1174,13 +1183,17 @@ def test_ensure_default_acp_agents_configured_agent_beats_same_slug_builtin(
     assert load(dest).executor.config["harness"] == "acp:devin"
 
 
-def test_ensure_default_acp_agents_noop_when_nothing_set_up(
+def test_ensure_default_acp_agents_seeds_no_slug_rows_without_acp_config(
     seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No configured agents + no installed builtin CLI → nothing seeded.
+    """An empty ``acp:`` block seeds no ``acp:<slug>`` row — only catalog rows.
 
-    **What breaks if this fails**: a remote server (no ``acp:`` config, ACP CLIs
-    absent) shows phantom ACP picker rows that can't launch there.
+    Unlike a builtin row, a configured agent's launch command is resolved from the
+    host's own ``acp:`` block at spawn time, so a slug this host never defined could
+    not launch anywhere. Only the fixed catalog rows are host-independent.
+
+    **What breaks if this fails**: the picker grows a row for a slug no config
+    defines, and choosing it fails at spawn with an unresolvable ACP command.
     """
     from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 
@@ -1190,9 +1203,13 @@ def test_ensure_default_acp_agents_noop_when_nothing_set_up(
     server_app._ensure_default_acp_agents(
         seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
     )
-    assert seed_stores.agent_store.get_by_name("devin") is None
-    for key in ACP_CLI_HARNESSES:
-        assert seed_stores.agent_store.get_by_name(key) is None
+    assert seed_stores.agent_store.get_by_name("kilocode") is None, (
+        "a slug absent from config must not be seeded"
+    )
+    seeded = {
+        key for key in ACP_CLI_HARNESSES if seed_stores.agent_store.get_by_name(key) is not None
+    }
+    assert seeded == set(ACP_CLI_HARNESSES), "catalog rows are host-independent and always seed"
 
 
 def test_ensure_default_acp_agents_survives_unreadable_config(
