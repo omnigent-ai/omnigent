@@ -378,13 +378,45 @@ def block_skills(blocked: list[str]) -> PolicyCallable:
        phase as synthetic ``"/<name> <args>"`` text via
        ``_build_skill_slash_command_policy_body``.
 
-    Matching is case-insensitive.
+    Matching is case-insensitive and namespace-insensitive: the same
+    installed plugin skill can be spelled ``<plugin>:<skill>`` (claude-family
+    surfaces) or bare ``<skill>`` (codex-family surfaces), and the skill
+    resolver accepts either alias — so a block on one spelling denies the
+    other too (deny-biased: an alias never bypasses the blocklist).
 
     :param blocked: Skill names to block, e.g.
         ``["code-review", "deploy"]``.
     :returns: A policy callable that DENYs blocked skill loads.
     """
     blocked_lower = frozenset(name.lower() for name in blocked)
+    # Bare forms of namespaced block entries: blocking "plugin:deploy" also
+    # denies a request for the bare "deploy", because on codex-family
+    # surfaces the blocked plugin skill is exposed under exactly that bare
+    # name (deny-biased — the bare spelling can't prove it is a different
+    # skill).
+    blocked_bare_lower = frozenset(name.split(":", 1)[1] for name in blocked_lower if ":" in name)
+
+    def _is_blocked(skill_name: str) -> bool:
+        """Whether *skill_name* (any alias spelling) hits the blocklist.
+
+        Deny when the raw name is blocked; when a bare request matches a
+        namespaced block entry's bare form; or when a namespaced request's
+        bare form is blocked outright (a bare block entry denies every
+        namespace). A namespaced block entry does NOT deny a *different*
+        exact namespace — ``otherplugin:deploy`` stays allowed when only
+        ``myplugin:deploy`` is blocked, since those are distinct skills.
+
+        :param skill_name: The requested skill name, raw.
+        :returns: True when any alias spelling of the request is blocked.
+        """
+        lowered = skill_name.lower()
+        if lowered in blocked_lower:
+            return True
+        if ":" in lowered:
+            # A bare block entry blocks the skill under every namespace.
+            return lowered.split(":", 1)[1] in blocked_lower
+        # A namespaced block entry blocks the bare alias of its skill.
+        return lowered in blocked_bare_lower
 
     def evaluate(event: PolicyEvent) -> PolicyResponse:
         """Evaluate whether the skill load should be blocked.
@@ -408,7 +440,7 @@ def block_skills(blocked: list[str]) -> PolicyCallable:
             if tool in _SKILL_TOOLS:
                 # load_skill uses "name"; read_skill_file uses "skill_name"
                 skill_name = args.get("name") if tool == "load_skill" else args.get("skill_name")
-                if skill_name and skill_name.lower() in blocked_lower:
+                if skill_name and _is_blocked(skill_name):
                     return {
                         "result": "DENY",
                         "reason": f"Skill '{skill_name}' is blocked by policy",
@@ -419,7 +451,7 @@ def block_skills(blocked: list[str]) -> PolicyCallable:
             # Fired via PreToolUse hook → Omnigent /policies/evaluate.
             if tool == _NATIVE_SKILL_TOOL:
                 skill_name = args.get("skill")
-                if skill_name and skill_name.lower() in blocked_lower:
+                if skill_name and _is_blocked(skill_name):
                     return {
                         "result": "DENY",
                         "reason": f"Skill '{skill_name}' is blocked by policy",
@@ -441,7 +473,7 @@ def block_skills(blocked: list[str]) -> PolicyCallable:
                 # an empty list — guard against IndexError.
                 tokens = text[1:].split(None, 1)
                 command = tokens[0] if tokens else ""
-                if command.lower() in blocked_lower:
+                if command and _is_blocked(command):
                     return {
                         "result": "DENY",
                         "reason": f"Skill '{command}' is blocked by policy",

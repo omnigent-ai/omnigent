@@ -31,6 +31,7 @@ from omnigent.cli import (
     _bundled_example_path,
     _dispatch_native_terminal_harness,
     _dispatch_run,
+    _display_db_uri,
     _ensure_sqlite_parent_dir,
     _expand_config_env_vars,
     _extract_global_logging_flags,
@@ -6202,6 +6203,35 @@ def test_ensure_sqlite_parent_dir_noop_for_memory_and_non_sqlite(tmp_path: Path)
     _ensure_sqlite_parent_dir("postgresql://user:pw@db.example.com:5432/omnigent")
 
     assert list(tmp_path.iterdir()) == []
+
+
+def test_display_db_uri_masks_password() -> None:
+    """A password-bearing URL renders with the credential replaced by ``***``.
+
+    The server banner lands in container logs and log shippers; the raw
+    password must not survive display formatting.
+    """
+    masked = _display_db_uri("postgresql+psycopg://omnigent:s3cret@db.example.com:5432/omnigent")
+    assert masked == "postgresql+psycopg://omnigent:***@db.example.com:5432/omnigent"
+
+
+def test_display_db_uri_passthrough_without_password() -> None:
+    """SQLite paths and passwordless URLs display unchanged."""
+    assert _display_db_uri("sqlite:////home/alice/.omnigent/chat.db") == (
+        "sqlite:////home/alice/.omnigent/chat.db"
+    )
+    assert _display_db_uri("postgresql://db.example.com:5432/omnigent") == (
+        "postgresql://db.example.com:5432/omnigent"
+    )
+
+
+def test_display_db_uri_returns_unparseable_input_unchanged() -> None:
+    """A string SQLAlchemy cannot parse is shown as-is.
+
+    Display must not turn an already-broken URI into a startup crash; the
+    engine reports the real problem on connect.
+    """
+    assert _display_db_uri("not a uri") == "not a uri"
 
 
 def _native_dispatch_kwargs(**overrides: object) -> dict[str, object]:

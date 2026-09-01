@@ -344,7 +344,44 @@ describe("fetchAllArchivedProjectNames", () => {
     const names = await fetchAllArchivedProjectNames();
 
     expect(names).toEqual([]);
+    // No first-class memberships collected → no projects list call either.
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("dual-reads first-class project_id membership for sessions born without the label", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [
+            // Born filed via project_id at create — carries no omni_project label.
+            { id: "a", archived: true, labels: {}, project_id: "p_alpha" },
+            // Legacy label-only membership still counts alongside it.
+            { id: "b", archived: true, labels: { omni_project: "Beta" } },
+            // Active first-class member — not filterable on the Archived page.
+            { id: "c", archived: false, labels: {}, project_id: "p_other" },
+            // Archived member of a since-deleted project — dropped silently.
+            { id: "d", archived: true, labels: {}, project_id: "p_deleted" },
+          ],
+          first_id: "a",
+          last_id: "d",
+          has_more: false,
+        }),
+      )
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [
+            { id: "p_alpha", name: "Alpha" },
+            { id: "p_other", name: "Other" },
+          ],
+        }),
+      );
+
+    const names = await fetchAllArchivedProjectNames();
+
+    expect(names).toEqual(["Alpha", "Beta"]);
+    // The id→name resolution is one projects list call after the scan.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][0]).toBe("/v1/projects");
   });
 });
 

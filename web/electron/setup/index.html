@@ -285,6 +285,18 @@
         font-size: 15px;
         margin: 0 0 4px;
       }
+      .modal-switch-to-new-experience {
+        margin-top: 14px;
+        padding: 9px 12px;
+        font-weight: 500;
+        border: none;
+        border: 1px solid var(--border);
+        background: var(--background);
+        color: var(--foreground);
+      }
+      .modal-switch-to-new-experienc:hover {
+        border: 1px solid color-mix(in srgb, var(--border) 90%, transparent);
+      }
       .modal-close {
         margin-top: 14px;
         padding: 9px 12px;
@@ -441,6 +453,9 @@
           <button type="button" id="cli-browse">Browse…</button>
         </div>
         <p class="cli-note" id="cli-path-note"></p>
+        <button type="button" id="cli-modal-new-ux" class="modal-switch-to-new-experience">
+          Switch to new experience (experimental)
+        </button>
         <button type="button" id="cli-modal-close" class="modal-close">Done</button>
       </div>
     </div>
@@ -605,6 +620,7 @@
       const cliGear = document.getElementById("cli-gear");
       const cliModal = document.getElementById("cli-modal");
       const cliModalClose = document.getElementById("cli-modal-close");
+      const cliModalNewUX = document.getElementById("cli-modal-new-ux");
       const cliStatus = document.getElementById("cli-status");
       const cliInstall = document.getElementById("cli-install");
       const cliRedetect = document.getElementById("cli-redetect");
@@ -686,6 +702,11 @@
         // On an invalid path, keep the modal open so the error stays visible.
         cliModalClose.addEventListener("click", async () => {
           if (await applyCliPath(cliPathInput.value)) closeCliModal();
+        });
+        cliModalNewUX.addEventListener("click", () => {
+          // Switch to the revamped server selector; the shell persists the
+          // setting and reloads this window to the new page.
+          setup.setServerSelectorV2?.(true);
         });
         cliModal.addEventListener("click", (e) => {
           if (e.target === cliModal) closeCliModal(); // backdrop click

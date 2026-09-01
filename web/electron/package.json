@@ -23,7 +23,7 @@
     "build:mac:release": "OMNIGENT_NOTARIZE_DMG=true electron-builder --mac -c.mac.notarize=true -c.dmg.sign=true",
     "build:linux": "electron-builder --linux",
     "build:win": "electron-builder --win",
-    "build:overlay": "pnpm --filter web run build:overlay",
+    "build:overlay": "pnpm --filter web run build:overlay && pnpm --filter web run build:server-selector-v2",
     "predev": "pnpm run build:overlay",
     "prestart": "pnpm run build:overlay",
     "prebuild": "pnpm run build:overlay",
@@ -62,6 +62,7 @@
     "files": [
       "src/**/*",
       "setup/**/*",
+      "server-selector-v2/**/*",
       "find/**/*",
       "return-banner/**/*",
       "icons/**/*",

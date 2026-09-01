@@ -419,6 +419,11 @@ class TurnContext:
         # Future[ElicitationResult]. Populated by ``elicit``;
         # resolved by the ``approval`` /events handler.
         self._pending_elicitations: dict[str, asyncio.Future[ElicitationResult]] = {}
+        # Human-approval waits in flight (elicitation replies, policy
+        # verdicts). While > 0 heartbeats hold the idle window open so an
+        # unanswered approval isn't failed as a wedged turn; the absolute
+        # ceiling still applies.
+        self._pending_human_waits = 0
         # Layer 3 per-policy-evaluation state:
         # ``evaluation_id`` → Future[PolicyVerdictPayload].
         # Populated by ``evaluate_policy``; resolved by the
@@ -440,6 +445,10 @@ class TurnContext:
         # event so a long-but-active turn isn't killed mid-turn.
         # ``None`` disables it (watchdog off, or outside a guarded run).
         self._reset_idle_watchdog: Callable[[], None] | None = None
+        # Idle-only keep-alive hook. Unlike ``_reset_idle_watchdog`` it
+        # never extends the absolute ceiling; used by heartbeats while a
+        # human wait is pending so the hard cap still bounds the turn.
+        self._hold_idle_watchdog: Callable[[], None] | None = None
 
     def emit(self, event: HarnessStreamEvent) -> None:
         """
@@ -460,9 +469,16 @@ class TurnContext:
         # watchdog deadline forward. Heartbeats are keep-alive, NOT
         # progress — letting them reset the deadline would defeat the
         # watchdog (a wedged turn's 15s heartbeats would keep it alive
-        # forever).
-        if self._reset_idle_watchdog is not None and not isinstance(event, HeartbeatEvent):
-            self._reset_idle_watchdog()
+        # forever). Exception: while a human approval (elicitation reply,
+        # policy verdict) is pending, the turn can legitimately emit nothing
+        # but heartbeats for as long as the human takes, so heartbeats hold
+        # the idle window open then — via the idle-only hook, so the
+        # absolute ceiling stays the hard cap even for an ignored approval.
+        if not isinstance(event, HeartbeatEvent):
+            if self._reset_idle_watchdog is not None:
+                self._reset_idle_watchdog()
+        elif self._pending_human_waits > 0 and self._hold_idle_watchdog is not None:
+            self._hold_idle_watchdog()
         self._event_queue.put_nowait(event)
 
     async def dispatch_tool(self, call_id: str, name: str, arguments: str, agent: str) -> str:
@@ -555,6 +571,7 @@ class TurnContext:
         """
         future: asyncio.Future[ElicitationResult] = asyncio.get_running_loop().create_future()
         self._pending_elicitations[elicitation_id] = future
+        self._pending_human_waits += 1
         self.emit(
             ElicitationRequestEvent(
                 type="response.elicitation_request",
@@ -566,6 +583,7 @@ class TurnContext:
             return await future
         finally:
             self._pending_elicitations.pop(elicitation_id, None)
+            self._pending_human_waits -= 1
 
     async def next_injection(self, timeout: float | None = None) -> CreateResponseRequest | None:
         """
@@ -652,6 +670,9 @@ class TurnContext:
         """
         future: asyncio.Future[PolicyVerdictPayload] = asyncio.get_running_loop().create_future()
         self._pending_policy_evaluations[evaluation_id] = future
+        # Unlike elicit's unbounded park, this wait is already bounded by
+        # the wait_for below; the counter only holds the idle window open.
+        self._pending_human_waits += 1
         self.emit(
             PolicyEvaluationRequestEvent(
                 type="policy_evaluation.requested",
@@ -685,6 +706,7 @@ class TurnContext:
             )
         finally:
             self._pending_policy_evaluations.pop(evaluation_id, None)
+            self._pending_human_waits -= 1
 
     def _complete_policy_evaluation(
         self, evaluation_id: str, verdict: PolicyVerdictPayload
@@ -1528,7 +1550,15 @@ class HarnessApp:
                 ):
                     absolute_wd.reschedule(now + idle_timeout)
 
+            def _hold_idle() -> None:
+                # Keep-alive during a pending human wait: push ONLY the idle
+                # deadline, never the absolute ceiling — an approval that is
+                # never answered must still terminate at the hard cap.
+                if not idle_wd.expired():
+                    idle_wd.reschedule(loop.time() + idle_timeout)
+
             ctx._reset_idle_watchdog = _reset
+            ctx._hold_idle_watchdog = _hold_idle
         try:
             # Absolute outer, idle inner: ``.expired()`` on each tells which
             # ceiling tripped so the error message is accurate.
@@ -1587,6 +1617,7 @@ class HarnessApp:
             # Detach the reset hook before the timeout context unwinds so
             # a stray late ``emit`` can't reschedule a finished timeout.
             ctx._reset_idle_watchdog = None
+            ctx._hold_idle_watchdog = None
             # Sentinel that tells ``_stream_turn`` to stop reading
             # the queue and emit the terminal event.
             ctx._event_queue.put_nowait(None)
@@ -1702,7 +1733,10 @@ class HarnessApp:
             )
         elif status_value == "failed":
             terminal = FailedEvent(
-                type="response.failed", response=response, sequence_number=sequence
+                type="response.failed",
+                source="harness",
+                response=response,
+                sequence_number=sequence,
             )
         else:
             from omnigent.server.schemas import CancelledEvent

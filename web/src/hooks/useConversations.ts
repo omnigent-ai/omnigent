@@ -1556,6 +1556,8 @@ export function useProjects() {
  */
 export async function fetchAllArchivedProjectNames(): Promise<string[]> {
   const names = new Set<string>();
+  // First-class memberships to resolve to names once the scan is done.
+  const memberProjectIds = new Set<string>();
   let after: string | undefined;
   for (;;) {
     const params = new URLSearchParams({
@@ -1578,9 +1580,20 @@ export async function fetchAllArchivedProjectNames(): Promise<string[]> {
       if (conv.archived !== true) continue;
       const name = conv.labels?.[PROJECT_LABEL_KEY];
       if (name) names.add(name);
+      // Dual-read, like the sidebar's grouping: a session born filed (or
+      // moved) carries first-class `project_id` and no legacy label.
+      if (conv.project_id) memberProjectIds.add(conv.project_id);
     }
     if (!page.has_more || !page.last_id) break;
     after = page.last_id;
+  }
+  if (memberProjectIds.size > 0) {
+    // One list call resolves every collected id; an id with no surviving
+    // project row (deleted project) is silently dropped.
+    const projects = await apiListProjects();
+    for (const project of projects) {
+      if (memberProjectIds.has(project.id)) names.add(project.name);
+    }
   }
   return [...names].sort((a, b) => a.localeCompare(b));
 }

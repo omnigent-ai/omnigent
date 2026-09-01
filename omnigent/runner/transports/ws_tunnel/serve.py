@@ -55,6 +55,10 @@ from omnigent.runner.transports.ws_tunnel.limits import (
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
 )
+from omnigent.runtime.websocket_metrics import (
+    record_websocket_connected,
+    record_websocket_disconnected,
+)
 from omnigent.suspend_watch import watch_for_resume
 from omnigent.tls import client_ssl_context
 
@@ -350,9 +354,15 @@ async def serve_tunnel(
     login_redirect_streak = 0
     # Consecutive HTTP 401/403 rejections; reset by a successful upgrade.
     http_auth_rejection_streak = 0
+    connected_this_attempt = False
 
     def _mark_connected() -> None:
-        nonlocal ever_connected, login_redirect_streak, http_auth_rejection_streak
+        nonlocal connected_this_attempt
+        nonlocal ever_connected
+        nonlocal login_redirect_streak
+        nonlocal http_auth_rejection_streak
+        record_websocket_connected("runner", reconnect=ever_connected)
+        connected_this_attempt = True
         ever_connected = True
         login_redirect_streak = 0
         http_auth_rejection_streak = 0
@@ -371,6 +381,8 @@ async def serve_tunnel(
             # A shutdown requested between reconnect attempts (no live
             # connection to drain): nothing to flush, just stop looping.
             return
+        connected_this_attempt = False
+        disconnect_error: BaseException | None = None
         auth_token = await _refresh_auth_token(auth_token, auth_token_factory)
         if ever_connected and on_reconnect is not None:
             try:
@@ -405,9 +417,11 @@ async def serve_tunnel(
             if shutdown_event is not None and shutdown_event.is_set():
                 return
             delay_s = _INITIAL_RECONNECT_DELAY_S
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
+            disconnect_error = exc
             raise
         except WebSocketException as exc:
+            disconnect_error = exc
             redirect_url = _websocket_auth_redirect_url(exc)
             if redirect_url is not None:
                 login_redirect_streak += 1
@@ -525,7 +539,24 @@ async def serve_tunnel(
                     else:
                         retry_reason = str(exc)
         except (ConnectionError, OSError, ValueError) as exc:
+            disconnect_error = exc
             retry_reason = str(exc)
+        except BaseException as exc:
+            # Unexpected post-connect failures (e.g. a raising callback) must
+            # not be recorded as clean peer closes.
+            disconnect_error = exc
+            raise
+        finally:
+            if connected_this_attempt:
+                record_websocket_disconnected(
+                    "runner",
+                    disconnect_error,
+                    local_shutdown=(
+                        (shutdown_event is not None and shutdown_event.is_set())
+                        or isinstance(disconnect_error, asyncio.CancelledError)
+                    ),
+                    resumed_from_suspend=woke_from_suspend,
+                )
         if woke_from_suspend:
             # A wake from system suspend already aborted the live tunnel (see
             # _serve_tunnel_once's watcher). The abrupt close would otherwise

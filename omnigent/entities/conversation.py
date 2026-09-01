@@ -385,7 +385,7 @@ class ErrorData(BaseModel):
         ``"Native Codex requires the 'codex' CLI on PATH."``.
     """
 
-    source: Literal["llm", "execution", "tool"]
+    source: Literal["llm", "execution", "tool", "harness"]
     code: str
     message: str
 
