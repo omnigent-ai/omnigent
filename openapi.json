@@ -1813,11 +1813,12 @@
             "title": "Sequence Number"
           },
           "source": {
-            "description": "Origin of the error \u2014 `\"llm\"` for LLM-call failures, `\"execution\"` for timeouts, `\"tool\"` for tool failures (currently emitted by retry exhaustion paths).",
+            "description": "Origin of the error -- `\"llm\"` for LLM-call failures, `\"execution\"` for timeouts, `\"tool\"` for tool failures, `\"harness\"` for harness process failures.",
             "enum": [
               "llm",
               "execution",
-              "tool"
+              "tool",
+              "harness"
             ],
             "title": "Source",
             "type": "string"

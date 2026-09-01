@@ -4221,16 +4221,16 @@ class ErrorEvent(_SSEEventBase):
     (``except Exception``). Wire shape matches those emits.
 
     :param type: Always ``"response.error"``.
-    :param source: Origin of the error — ``"llm"`` for LLM-call
+    :param source: Origin of the error -- ``"llm"`` for LLM-call
         failures, ``"execution"`` for timeouts, ``"tool"`` for
-        tool failures (currently emitted by retry exhaustion paths).
+        tool failures, ``"harness"`` for harness process failures.
     :param tool_name: Tool identifier when ``source == "tool"``;
         ``None`` for the other sources.
     :param error: Classified error description.
     """
 
     type: Literal["response.error"]
-    source: Literal["llm", "execution", "tool"]
+    source: Literal["llm", "execution", "tool", "harness"]
     tool_name: str | None = None
     error: RetryErrorDetail
 
