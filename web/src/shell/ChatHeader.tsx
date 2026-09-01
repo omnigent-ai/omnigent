@@ -416,14 +416,14 @@ export function ChatHeader({
                 // copy of it. Kept everywhere else, where it is the ONLY way to
                 // reopen a collapsed sidebar.
                 className={cn(
-                  "chat-header-sidebar-toggle text-muted-foreground hover:text-foreground md:size-6",
+                  "chat-header-sidebar-toggle text-muted-foreground hover:text-foreground max-md:size-11 md:size-6",
                   MOBILE_GLASS_PILL,
                 )}
                 onPointerEnter={onPeekSidebar}
                 onPointerDown={cancelPeek}
                 onPointerLeave={cancelPeek}
               >
-                <PanelLeftIcon className="size-4" />
+                <PanelLeftIcon className="size-4 max-md:size-5" />
               </Button>
             </TooltipTrigger>
             {/* Bottom placement keeps the tooltip clear of the macOS
@@ -487,9 +487,9 @@ export function ChatHeader({
                 size="icon"
                 aria-label="Session actions"
                 data-testid="session-actions-menu"
-                className="text-muted-foreground hover:text-foreground md:hidden max-md:rounded-full"
+                className="text-muted-foreground hover:text-foreground md:hidden max-md:size-11 max-md:rounded-full"
               >
-                <EllipsisVerticalIcon className="size-4" />
+                <EllipsisVerticalIcon className="size-4 max-md:size-5" />
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className={cn("min-w-44", MOBILE_GLASS_SURFACE)}>

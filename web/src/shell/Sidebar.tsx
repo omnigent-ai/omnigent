@@ -1044,7 +1044,7 @@ export function Sidebar({
                 // chip is a non-scrolling sibling pinned bottom-right, so
                 // without a gutter the last row's always-visible kebab parks
                 // underneath it and can't be tapped.
-                className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] max-md:pb-14 [&::-webkit-scrollbar]:hidden"
+                className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] max-md:pb-16 [&::-webkit-scrollbar]:hidden"
               >
                 <ConversationList
                   conversationsQuery={conversationsQuery}
