@@ -90,6 +90,7 @@ import type { NativeModelOption, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
+import { useComposerFocusRequests } from "@/lib/composerFocus";
 import type { MessageContentBlock } from "@/lib/blocks";
 import { ELICITATION_RESPONSE_PREFIX } from "@/lib/blocks";
 import {
@@ -4495,6 +4496,11 @@ export function Composer({
     if (!conversationId || settledConversationId !== conversationId || !dirtyRef.current) return;
     setSessionDraft(conversationId, { text: value, files });
   }, [conversationId, settledConversationId, value, files]);
+
+  // Switching sessions from the command palette lands here the same way, but
+  // the palette's focus trap outlives the navigation and undoes the focus
+  // above — so take it again once the palette hands it back (see composerFocus).
+  useComposerFocusRequests(textareaRef, !isMobile);
 
   // Adding a reply quote (via the floating "Reply" button) should drop the
   // caret straight into the composer so the user can type immediately. Only

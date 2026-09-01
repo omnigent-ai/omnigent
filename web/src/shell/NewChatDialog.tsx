@@ -200,6 +200,7 @@ import {
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useRecentHarnesses } from "@/hooks/useRecentHarnesses";
+import { useComposerFocusRequests } from "@/lib/composerFocus";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
@@ -2412,6 +2413,15 @@ export function NewChatLandingScreen() {
   useEffect(() => {
     setSelectedProject(projectParam);
   }, [projectParam]);
+  // This screen exists to be typed into, so take the caret whenever it becomes
+  // the page — including a `?project=` switch that leaves it mounted, which the
+  // textarea's `autoFocus` (mount-only) can't see.
+  useEffect(() => {
+    if (!isMobileViewport) textareaRef.current?.focus();
+  }, [projectParam, isMobileViewport]);
+  // …and again when an overlay hands focus back after navigating here (see
+  // composerFocus: its focus trap outlives the navigation).
+  useComposerFocusRequests(textareaRef, !isMobileViewport);
   // Permission mode for Claude Code (claude --permission-mode). Only
   // meaningful for the claude-native wrapper; ignored otherwise. Lives in
   // the footer tray's Advanced settings menu.
