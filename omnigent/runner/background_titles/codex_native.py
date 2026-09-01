@@ -32,7 +32,11 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
     )
     from omnigent.runner.native.orchestration import _codex_native_model_from_spec
 
-    model = context.model_override or _codex_native_model_from_spec(context.session_spec)
+    model = (
+        context.title_model
+        or context.model_override
+        or _codex_native_model_from_spec(context.session_spec)
+    )
     # Thread the spec so a title exec honors spec-level auth too (#2744).
     launch = resolve_native_codex_launch(model=model, spec=context.session_spec)
     with tempfile.TemporaryDirectory(prefix="omnigent-codex-title-") as temp_dir:
