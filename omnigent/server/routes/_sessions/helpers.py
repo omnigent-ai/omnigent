@@ -1012,6 +1012,7 @@ def _client_supplied_hook_elicitation_id(
 def _consume_pre_resolved_harness_elicitation(
     session_id: str,
     elicitation_id: str,
+    request_fingerprint: str | None = None,
 ) -> _PreResolvedHarnessElicitation | None:
     """
     Consume a resolution that arrived before the hook wait registered.
@@ -1019,6 +1020,12 @@ def _consume_pre_resolved_harness_elicitation(
     :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
     :param elicitation_id: Harness elicitation id, e.g.
         ``"elicit_codex_abc123"``.
+    :param request_fingerprint: Digest of the consuming re-park's request
+        params, or ``None`` to skip fingerprint matching. A tombstone
+        written against a possibly-zombie waiter carries the answered
+        question's digest; when both sides carry one and they differ,
+        the tombstone belongs to a DIFFERENT question that reused this
+        id, so it is dropped rather than replayed.
     :returns: The consumed tombstone when one matched this session
         (its ``result`` carries the web verdict to honor, or ``None``
         for a terminal-side resolution), or ``None`` when nothing was
@@ -1028,10 +1035,19 @@ def _consume_pre_resolved_harness_elicitation(
     tombstone = _harness_pre_resolved_elicitations.pop(elicitation_id, None)
     if tombstone is None:
         return None
-    if tombstone.session_id == session_id:
-        return tombstone
-    _harness_pre_resolved_elicitations[elicitation_id] = tombstone
-    return None
+    if tombstone.session_id != session_id:
+        _harness_pre_resolved_elicitations[elicitation_id] = tombstone
+        return None
+    if (
+        tombstone.request_fingerprint is not None
+        and request_fingerprint is not None
+        and tombstone.request_fingerprint != request_fingerprint
+    ):
+        # Same id, different question: the id was reused after the
+        # answered request finished. The stale verdict must not gate the
+        # new question — drop it so the new prompt is published.
+        return None
+    return tombstone
 
 
 def _prune_pre_resolved_harness_elicitations(now: float | None = None) -> None:

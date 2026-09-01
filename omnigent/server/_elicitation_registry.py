@@ -48,12 +48,19 @@ class _ParkedHarnessElicitation:
         application-level signal is needed because
         ``request.is_disconnected()`` does not fire promptly behind the
         Databricks Apps proxy's idle-connection heartbeats.
+    :param request_fingerprint: Digest of the elicitation's request
+        params, e.g. a sha256 hex string. Copied onto a verdict
+        tombstone written while this waiter may be a zombie, so a
+        re-park only adopts the verdict for the SAME logical question
+        (harness ids can be reused across distinct requests). ``None``
+        when the caller supplied no params to fingerprint.
     """
 
     session_id: str
     tool_name: str | None
     tool_input: dict[str, Any] | None
     resolved_elsewhere: asyncio.Event
+    request_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -73,11 +80,20 @@ class _PreResolvedHarnessElicitation:
     :param result: Web verdict to hand a re-parking hook, e.g.
         ``ElicitationResult(action="accept")``, or ``None`` for a
         terminal-side resolution.
+    :param request_fingerprint: Digest of the request params the verdict
+        answered, copied from the parked waiter when the resolve found
+        one still registered. A re-park adopts the verdict only when its
+        own params produce the same digest, so a LATER, different
+        question that reuses the same harness id (harness request ids
+        recur) can never inherit a stale approval. ``None`` when the
+        producer had no params to fingerprint (nothing was parked);
+        those tombstones keep the legacy adopt-by-id semantics.
     """
 
     session_id: str
     created_at: float
     result: ElicitationResult | None = None
+    request_fingerprint: str | None = None
 
 
 # Maps ``elicitation_id`` to its parked-elicitation state. Populated

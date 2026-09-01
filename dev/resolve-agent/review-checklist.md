@@ -53,6 +53,15 @@ what to look for, and why it's wrong.
   trips the security exfil scan on added lines; the repo idiom
   `os.environ.copy()` is equivalent and passes.
 
+## Caching / replay
+
+- **A cached or tombstoned verdict keyed by a reusable id must be scoped to the
+  logical request.** Harness/JSON-RPC request ids recur; any "remember the
+  answer for id X" mechanism (tombstones, pre-resolved caches, retry adoption)
+  must also match the request's content (fingerprint) or generation, or a
+  later, different request reusing the id silently inherits a stale
+  approval/verdict.
+
 ## Rollback / cleanup
 
 - **Cleanup of an adopted resource must not destroy pre-existing user state.**
