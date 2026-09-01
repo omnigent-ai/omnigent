@@ -138,6 +138,9 @@ class Conversation:
         Mutable via ``PATCH /v1/sessions/{id}`` at any time; read per
         spawn by the route-subagent relay, so a change takes effect on
         the next spawn.
+    :param provider_override: Exact configured provider name pinned to this
+        session's native Codex launch. ``None`` uses the host default. This
+        value is data only and is never interpreted as an argument or path.
     :param harness_override: Per-session harness override for the
         bound agent's brain, e.g. ``"pi"`` or ``"openai-agents"``.
         ``None`` means use the harness declared in the agent spec
@@ -235,6 +238,7 @@ class Conversation:
     reported_model: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
+    provider_override: str | None = None
     harness_override: str | None = None
     sub_agent_name: str | None = None
     task_summary: str | None = None

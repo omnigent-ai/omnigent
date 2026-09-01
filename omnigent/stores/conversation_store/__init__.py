@@ -813,6 +813,8 @@ class ConversationStore(ABC):
         _unset_subagent_routing_override: bool = False,
         harness_override: str | None = None,
         _unset_harness_override: bool = False,
+        provider_override: str | None = None,
+        _unset_provider_override: bool = False,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
@@ -822,7 +824,7 @@ class ConversationStore(ABC):
 
         For ``reasoning_effort``, ``model_override``,
         ``cost_control_mode_override``, ``subagent_routing_override``,
-        and ``harness_override``,
+        ``harness_override``, and ``provider_override``,
         ``None`` means "leave unchanged". To explicitly clear them
         back to ``None``, pass
         the matching ``_unset_*`` flag. ``reported_model`` (the model
@@ -1680,6 +1682,7 @@ class ConversationStore(ABC):
         carry_history_into_native: bool,
         presentation_labels: dict[str, str],
         previous_builtin_id: str | None,
+        preserve_provider_override: bool = False,
     ) -> Conversation:
         """
         Rebind a session in place to a different (cloned) agent.
@@ -1726,6 +1729,9 @@ class ConversationStore(ABC):
             switching away from, stamped as
             :data:`SWITCH_PREVIOUS_BUILTIN_LABEL_KEY` for a one-click
             "Switch back". ``None`` leaves it unset.
+        :param preserve_provider_override: Keep the Codex-native provider pin
+            when the target also uses Codex native. ``False`` clears it as
+            incompatible with the new agent.
         :returns: The updated :class:`Conversation`.
         :raises LookupError: If no conversation with *conversation_id*
             exists.

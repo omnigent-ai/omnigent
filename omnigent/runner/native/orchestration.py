@@ -437,6 +437,8 @@ class _CodexNativeLaunchConfig:
         ``--dangerously-bypass-approvals-and-sandbox`` and aligns the
         app-server threads (no approval prompts, no command sandbox). Default
         ``False``. See issue #657.
+    :param provider_override: Exact configured provider name pinned to this
+        Codex-native session. ``None`` uses the host default.
     :param auto_harness: ``True`` when the session started in Smart Routing's
         auto-harness mode (``omnigent.routing.auto_harness`` label or a
         ``harness_override`` of ``"auto"``), so the router may re-route its
@@ -465,6 +467,7 @@ class _CodexNativeLaunchConfig:
     fork_source_external_id: str | None
     fork_carry_history: bool
     bypass_sandbox: bool
+    provider_override: str | None = None
     auto_harness: bool = False
     routing_enabled: bool = False
     turn_routing: bool = False
@@ -1046,6 +1049,11 @@ async def _codex_native_launch_config(
         harness_override=_harness_override if isinstance(_harness_override, str) else None,
         labels=labels if isinstance(labels, dict) else None,
     )
+    provider_override = snapshot.get("provider_override")
+    if provider_override is not None and (
+        not isinstance(provider_override, str) or not provider_override
+    ):
+        raise RuntimeError(f"Invalid provider_override for Codex session {session_id!r}.")
     return _CodexNativeLaunchConfig(
         workspace=_codex_session_workspace(session_workspace),
         policy_server_url=_required_runner_env("RUNNER_SERVER_URL"),
@@ -1056,6 +1064,7 @@ async def _codex_native_launch_config(
         fork_source_external_id=fork_source_external_id,
         fork_carry_history=fork_carry_history,
         bypass_sandbox=bypass_sandbox,
+        provider_override=provider_override,
         auto_harness=routing_class.auto_harness,
         routing_enabled=routing_class.routing_enabled,
         turn_routing=routing_class.turn_routing,
@@ -3810,7 +3819,14 @@ async def _auto_create_codex_terminal(
     # Thread the spec so its executor.auth / legacy profile win over
     # machine-level config, parity with the in-process harness (#2744).
     _launch_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
-    _codex_launch = resolve_native_codex_launch(model=default_model, spec=_launch_spec)
+    if launch_config.provider_override is None:
+        _codex_launch = resolve_native_codex_launch(model=default_model, spec=_launch_spec)
+    else:
+        _codex_launch = resolve_native_codex_launch(
+            model=default_model,
+            spec=_launch_spec,
+            provider_name=launch_config.provider_override,
+        )
     _session_meta_provider = codex_session_meta_model_provider(_codex_launch)
     from omnigent.inner.codex_executor import _find_codex_cli
 

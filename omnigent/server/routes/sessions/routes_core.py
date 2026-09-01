@@ -39,6 +39,7 @@ from omnigent.entities import (
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.model_override import validate_model_override
+from omnigent.native_coding_agents import native_coding_agent_for_agent_name
 from omnigent.reasoning_effort import (
     EFFORT_CLEAR_VALUES,
     EFFORT_VALUES,
@@ -2661,6 +2662,15 @@ def register_core_routes(
             _agent_carries_native_fork_history, target_agent
         )
         presentation_labels = await asyncio.to_thread(_presentation_labels_for_agent, target_agent)
+        target_native_agent = native_coding_agent_for_agent_name(target_agent.name)
+        if target_native_agent is None:
+            target_native_agent = await asyncio.to_thread(
+                _native_coding_agent_for_agent,
+                target_agent,
+            )
+        preserve_provider_override = (
+            target_native_agent is not None and target_native_agent.harness == "codex-native"
+        )
 
         # Resolve the built-in the session is leaving so the UI can offer a
         # one-click "Switch back". The current agent is a session-scoped clone
@@ -2695,6 +2705,7 @@ def register_core_routes(
                 carry_history_into_native=carry_history_into_native,
                 presentation_labels=presentation_labels,
                 previous_builtin_id=previous_builtin_id,
+                preserve_provider_override=preserve_provider_override,
             )
         except LookupError as exc:
             raise OmnigentError(

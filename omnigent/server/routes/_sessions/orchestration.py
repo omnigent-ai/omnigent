@@ -1103,6 +1103,7 @@ def _build_session_response(
         model_override=conv.model_override,
         cost_control_mode_override=conv.cost_control_mode_override,
         subagent_routing_override=conv.subagent_routing_override,
+        provider_override=conv.provider_override,
         context_window=context_window,
         last_total_tokens=last_total_tokens,
         # Seed the client's cost indicator on resume. Uses the SUBTREE
@@ -8185,6 +8186,25 @@ async def _create_session_from_existing_agent(
             _validated_harness_override, body.harness_override, agent
         )
 
+    provider_override = body.provider_override
+    if provider_override is not None:
+        if not provider_override:
+            raise OmnigentError(
+                "provider_override must not be empty.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        resolved_harness = await asyncio.to_thread(
+            _create_resolved_harness,
+            agent,
+            harness_override,
+            agent_cache,
+        )
+        if resolved_harness != "codex-native":
+            raise OmnigentError(
+                "provider_override currently applies only to codex-native sessions.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
     # Inherit runner affinity from the parent session so the child
     # is assigned to the same runner (sub-agent co-location).
     inherited_runner_id: str | None = None
@@ -8395,6 +8415,7 @@ async def _create_session_from_existing_agent(
         or cost_control_mode_override is not None
         or subagent_routing_override is not None
         or harness_override is not None
+        or provider_override is not None
     ):
         # ``create_conversation`` has no override params; reuse the
         # PATCH path's store write before the runner reads the snapshot
@@ -8408,6 +8429,7 @@ async def _create_session_from_existing_agent(
             cost_control_mode_override=cost_control_mode_override,
             subagent_routing_override=subagent_routing_override,
             harness_override=harness_override,
+            provider_override=provider_override,
         )
         if updated_conv is None:
             raise OmnigentError(

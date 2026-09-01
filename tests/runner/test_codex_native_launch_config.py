@@ -98,6 +98,8 @@ async def test_non_dict_snapshot_raises() -> None:
         ("model_override", 5, "model_override"),
         ("external_session_id", "", "external_session_id"),
         ("workspace", "", "workspace"),
+        ("provider_override", "", "provider_override"),
+        ("provider_override", 5, "provider_override"),
     ],
 )
 async def test_invalid_field_raises(field: str, value: Any, match: str) -> None:
@@ -116,6 +118,7 @@ async def test_happy_path_parses_full_config(monkeypatch: pytest.MonkeyPatch) ->
         "terminal_launch_args": ["--config", "approval_policy=on-request"],
         "model_override": "gpt-5.4-mini",
         "external_session_id": "thread_abc",
+        "provider_override": "Work account / 東京 --model",
         "labels": {
             "omnigent.fork.source_id": "conv_source",
             "omnigent.fork.source_external_session_id": "thread_src",
@@ -128,6 +131,7 @@ async def test_happy_path_parses_full_config(monkeypatch: pytest.MonkeyPatch) ->
     assert cfg.terminal_launch_args == ["--config", "approval_policy=on-request"]
     assert cfg.model_override == "gpt-5.4-mini"
     assert cfg.external_session_id == "thread_abc"
+    assert cfg.provider_override == "Work account / 東京 --model"
     assert cfg.fork_source_id == "conv_source", "Fork source id should be read from labels."
     assert cfg.fork_source_external_id == "thread_src"
     assert cfg.fork_carry_history is True, "carry_history label '1' should parse to True."

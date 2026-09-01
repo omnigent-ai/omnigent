@@ -87,6 +87,7 @@ class _ConversationStore:
         carry_history_into_native: bool,
         presentation_labels: dict[str, str],
         previous_builtin_id: str | None,
+        preserve_provider_override: bool = False,
     ) -> Conversation:
         """Record the call and return the updated conversation.
 
@@ -99,6 +100,7 @@ class _ConversationStore:
         :param carry_history_into_native: Native-rebuild flag.
         :param presentation_labels: Target-harness ui/wrapper labels.
         :param previous_builtin_id: Built-in switched away from.
+        :param preserve_provider_override: Whether the target remains Codex native.
         :returns: The conversation rebound to ``new_agent_id``.
         :raises LookupError: If the conversation is unknown.
         """
@@ -113,6 +115,7 @@ class _ConversationStore:
                 "carry_history_into_native": carry_history_into_native,
                 "presentation_labels": presentation_labels,
                 "previous_builtin_id": previous_builtin_id,
+                "preserve_provider_override": preserve_provider_override,
             }
         )
         src = self._convs.get(conversation_id)
@@ -392,6 +395,7 @@ async def test_switch_same_family_native_carries_history(
     assert call["copy_model_settings"] is True
     assert call["carry_history_into_native"] is True
     assert call["presentation_labels"] == labels
+    assert call["preserve_provider_override"] is False
     # The origin built-in shares the current agent's bundle → that's the
     # built-in to offer for "Switch back" (NOT the switched-to target).
     assert call["previous_builtin_id"] == "c1030c25bd9d756e4aef6c4e96a7e126"
@@ -433,6 +437,7 @@ async def test_switch_cross_family_resets_model_but_carries_history(
     # rebuilds the transcript from Omnigent items. False here would mean
     # the cross-family gate regressed and the session resumes blank.
     assert call["carry_history_into_native"] is True
+    assert call["preserve_provider_override"] is True
 
 
 @pytest.mark.parametrize(

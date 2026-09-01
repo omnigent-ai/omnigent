@@ -130,6 +130,7 @@ _SESSION_OVERRIDE_KEYS = (
     "cost_control_mode_override",
     "subagent_routing_override",
     "harness_override",
+    "provider_override",
 )
 
 
@@ -222,6 +223,7 @@ def _to_conversation(
         cost_control_mode_override=overrides["cost_control_mode_override"],
         subagent_routing_override=overrides["subagent_routing_override"],
         harness_override=overrides["harness_override"],
+        provider_override=overrides["provider_override"],
         sub_agent_name=meta.sub_agent_name if meta else None,
         task_summary=meta.task_summary if meta else None,
         external_session_id=meta.external_session_id if meta else None,
@@ -2720,6 +2722,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         _unset_subagent_routing_override: bool = False,
         harness_override: str | None = None,
         _unset_harness_override: bool = False,
+        provider_override: str | None = None,
+        _unset_provider_override: bool = False,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
@@ -2757,6 +2761,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param _unset_harness_override: When ``True``, clear
             ``harness_override`` to ``None`` (used to replace the
             ``"auto"`` sentinel after first-message routing resolves).
+        :param provider_override: Exact configured provider name to pin to a
+            Codex-native session. ``None`` leaves it unchanged.
+        :param _unset_provider_override: Clear the provider pin when ``True``.
         :param terminal_launch_args: Per-session native-terminal
             pass-through args, e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves
@@ -2815,6 +2822,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 overrides_changed = True
             elif harness_override is not None:
                 overrides["harness_override"] = harness_override
+                overrides_changed = True
+            if _unset_provider_override:
+                overrides["provider_override"] = None
+                overrides_changed = True
+            elif provider_override is not None:
+                overrides["provider_override"] = provider_override
                 overrides_changed = True
             if overrides_changed:
                 row.session_overrides = _encode_session_overrides(overrides)
@@ -3963,6 +3976,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         carry_history_into_native: bool,
         presentation_labels: dict[str, str],
         previous_builtin_id: str | None,
+        preserve_provider_override: bool = False,
     ) -> Conversation:
         """
         Rebind a session in place to a different (cloned) agent.
@@ -3986,6 +4000,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param presentation_labels: Target-harness ui/wrapper labels.
         :param previous_builtin_id: Built-in switched away from, or
             ``None``.
+        :param preserve_provider_override: Keep a provider pin only when the
+            target remains Codex native.
         :returns: The updated :class:`Conversation`.
         :raises LookupError: If *conversation_id* does not exist.
         """
@@ -4022,6 +4038,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 overrides["reasoning_effort"] = None
             # The brain-harness override never survives a rebind.
             overrides["harness_override"] = None
+            if not preserve_provider_override:
+                overrides["provider_override"] = None
             row.session_overrides = _encode_session_overrides(overrides)
             row.updated_at = now
 

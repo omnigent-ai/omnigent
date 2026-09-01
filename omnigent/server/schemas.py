@@ -1463,6 +1463,10 @@ class _SessionCreateRequestBase(BaseModel):
         the spec's declared harness. Create-time only — there is no
         PATCH path, since the harness process spawns on the first
         turn.
+    :param provider_override: Exact configured provider name for a
+        Codex-native session. ``None`` uses the host default. The host performs
+        an exact config-key lookup at launch and fails if the pin is stale,
+        unavailable, or incompatible.
     :param smart_routing_message: The user's first-message text, used to
         route the harness at create time. Only read on the top-level
         Smart Routing path (``harness_override: "auto"`` on a native
@@ -1494,6 +1498,7 @@ class _SessionCreateRequestBase(BaseModel):
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     harness_override: str | None = None
+    provider_override: str | None = None
     smart_routing_message: str | None = None
 
     @model_validator(mode="after")
@@ -1962,6 +1967,8 @@ class SessionResponse(BaseModel):
         a row created before this became explicit inherits nothing.
         Stamped ``"on"`` at create for Smart Routing sessions; also set
         via ``PATCH /v1/sessions/{id}``.
+    :param provider_override: Exact configured provider name pinned to this
+        Codex-native session, or ``None`` for the host default.
     :param context_window: The model's context window size in tokens
         as looked up server-side from litellm's registry (or from the
         ``AP_CONTEXT_WINDOW_OVERRIDE`` env var), e.g. ``200_000``.
@@ -2118,6 +2125,7 @@ class SessionResponse(BaseModel):
     model_override: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
+    provider_override: str | None = None
     context_window: int | None = None
     last_total_tokens: int | None = None
     total_cost_usd: float | None = None
