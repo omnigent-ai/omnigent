@@ -44,6 +44,14 @@ what to look for, and why it's wrong.
 
 ## Config / data safety
 
+- **Never thread a request-start row into a read-modify-write baseline.** A
+  perf fix that reuses an already-read row must not hand it to code whose
+  correctness depends on a *fresh* read — e.g. a monotonic/anti-forgery clamp or
+  a delta computation (`new - old`) that then rewrites the whole record. The
+  stale baseline widens the lost-update race: a concurrent write's growth gets
+  clobbered and the delta double-counts. Reuse rows only for read-only
+  derivations (an immutable field, a verified tree-root hint).
+
 - **A "clear/reset" must not clobber unrelated config.** An edit that rewrites a
   config file to remove one key must preserve every other key — no full-file
   overwrite that drops the user's other settings.

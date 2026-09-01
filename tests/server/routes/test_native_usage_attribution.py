@@ -216,3 +216,105 @@ def test_token_priced_bucket_matches_flat_cost(
     # total_tokens = 200 (input) + 0 (cache) + 50 (output) = 250; cost = 2.50.
     assert usage["total_cost_usd"] == pytest.approx(2.50)
     assert usage["by_model"]["gpt-5.6"]["total_cost_usd"] == pytest.approx(2.50)
+
+
+def _conversation_point_reads(statements: list[str]) -> list[str]:
+    """Filter captured SQL to point reads of a single conversation row."""
+    matches: list[str] = []
+    for raw in statements:
+        normalized = " ".join(raw.split())
+        if "FROM conversations" not in normalized or " WHERE " not in normalized:
+            continue
+        where = normalized.split(" WHERE ", 1)[1]
+        if "conversations.id = " in where and "root_conversation_id" not in where:
+            matches.append(normalized)
+    return matches
+
+
+@pytest.mark.asyncio
+async def test_flush_with_stale_row_keeps_monotonic_clamp(db_uri: str) -> None:
+    """A stale caller-held row must not weaken the forged-low-report clamp.
+
+    The events route reads the conversation at request start (authorization)
+    and hands that row to the usage flush for the read-only tree walks. If a
+    concurrent report persists a higher cost AFTER that read, a forged low
+    report on the stale-row request must still be a no-op: the own-usage
+    persist baselines its monotonic clamp on its own FRESH read, never on the
+    caller's row (otherwise the replay could roll the persisted/enforced cost
+    back and double-count the daily rollup delta).
+    """
+    from omnigent.server.routes._sessions.orchestration import (
+        _persist_external_session_usage,
+    )
+    from omnigent.server.schemas import SessionEventInput
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="stale-clamp", agent_id=_AGENT_ID)
+    # The route's access-check row, read while the persisted cost was $0.
+    stale_row = store.get_conversation(conv.id)
+    assert stale_row is not None
+
+    # A concurrent legitimate report lands after the access check.
+    _persist_native_cumulative_usage(conv.id, {"cumulative_cost_usd": 10.0, "model": "m1"}, store)
+
+    # The stale-row request then delivers a (forged or delayed) lower report.
+    await _persist_external_session_usage(
+        conv.id,
+        SessionEventInput(
+            type="external_session_usage",
+            data={"cumulative_cost_usd": 2.0, "model": "m1"},
+        ),
+        store,
+        stale_row,
+    )
+
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(10.0)
+
+
+@pytest.mark.asyncio
+async def test_flush_with_supplied_row_skips_tree_root_rereads(db_uri: str) -> None:
+    """The flush's read-only tree walks must reuse the supplied row's root.
+
+    With the route's row in hand, the only conversation point read a flush
+    may issue is the own-usage persist's fresh clamp baseline — the subtree
+    roll-up and the ancestor publish take the root from the supplied row.
+    """
+    from sqlalchemy import event as sa_event
+
+    from omnigent.db.utils import _engine_cache
+    from omnigent.server.routes._sessions.orchestration import (
+        _persist_external_session_usage,
+    )
+    from omnigent.server.schemas import SessionEventInput
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="flush-reads", agent_id=_AGENT_ID)
+    row = store.get_conversation(conv.id)
+    assert row is not None
+
+    engine = _engine_cache[db_uri]
+    statements: list[str] = []
+
+    def _on_exec(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    sa_event.listen(engine, "before_cursor_execute", _on_exec)
+    try:
+        await _persist_external_session_usage(
+            conv.id,
+            SessionEventInput(
+                type="external_session_usage",
+                data={"cumulative_cost_usd": 3.0, "model": "m1"},
+            ),
+            store,
+            row,
+        )
+    finally:
+        sa_event.remove(engine, "before_cursor_execute", _on_exec)
+
+    point_reads = _conversation_point_reads(statements)
+    assert len(point_reads) == 1, (
+        f"flush issued {len(point_reads)} conversation point reads (expected "
+        f"1: the persist's fresh clamp baseline); statements={point_reads}"
+    )
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(3.0)

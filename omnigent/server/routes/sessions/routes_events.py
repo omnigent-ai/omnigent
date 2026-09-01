@@ -1368,6 +1368,7 @@ def register_events_routes(
                 session_id,
                 body,
                 conversation_store,
+                conv,
             )
             return {"queued": False}
         if body.type == _EXTERNAL_MODEL_CHANGE_TYPE:
