@@ -1487,10 +1487,13 @@ def test_build_runner_env_propagates_disable_keyring() -> None:
     assert env["OMNIGENT_DISABLE_KEYRING"] == "1"
 
 
-def test_build_runner_env_propagates_dbus_session_bus_vars() -> None:
-    """``DBUS_SESSION_BUS_ADDRESS`` / ``XDG_RUNTIME_DIR`` propagate so the
-    runner's OS-keychain lookup can reach the same Secret Service session
-    the host owner's ``keyring``/``secret-tool`` calls use.
+def test_build_runner_env_propagates_os_keyring_vars() -> None:
+    """The env the OS-keyring lookup needs propagates to spawned runners.
+
+    ``DBUS_SESSION_BUS_ADDRESS`` / ``XDG_RUNTIME_DIR`` let the runner reach
+    the same Secret Service session the host owner's ``keyring`` /
+    ``secret-tool`` calls use, and ``PYTHON_KEYRING_BACKEND`` pins the same
+    backend the host owner selected.
 
     Regression guard: without these, ``keyring.get_password`` raises
     ``NoKeyringError`` (a ``KeyringError`` subclass) inside the runner, which
@@ -1502,6 +1505,7 @@ def test_build_runner_env_propagates_dbus_session_bus_vars() -> None:
         "PATH": "/usr/bin:/bin",
         "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
         "XDG_RUNTIME_DIR": "/run/user/1000",
+        "PYTHON_KEYRING_BACKEND": "keyring.backends.SecretService.Keyring",
     }
     env = _build_runner_env(
         base,
@@ -1513,6 +1517,7 @@ def test_build_runner_env_propagates_dbus_session_bus_vars() -> None:
     )
     assert env["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/1000/bus"
     assert env["XDG_RUNTIME_DIR"] == "/run/user/1000"
+    assert env["PYTHON_KEYRING_BACKEND"] == "keyring.backends.SecretService.Keyring"
 
 
 # ── host.list_dir handler ───────────────────────────────

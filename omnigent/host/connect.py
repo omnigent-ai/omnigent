@@ -347,6 +347,13 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # ``DBUS_SESSION_BUS_ADDRESS`` itself is unset. Same rationale as
         # above; not a secret, safe to propagate.
         "XDG_RUNTIME_DIR",
+        # ``keyring``'s documented backend selector (a ``module.Class``
+        # path). A host owner who pins a specific backend this way stores
+        # secrets THERE; the runner resolves ``keychain:`` refs, so it must
+        # pick the SAME backend or the lookup silently lands on a different
+        # (empty) store and fails with "no stored secret named …". Not a
+        # secret (a class path), safe to propagate.
+        "PYTHON_KEYRING_BACKEND",
         # claude-sdk sandbox bypass flag. A diagnostic knob (not a
         # secret — a plain boolean) read inside the harness to decide
         # whether to wrap the brain CLI in sandbox-exec. Without it in
