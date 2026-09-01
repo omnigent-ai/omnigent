@@ -960,9 +960,11 @@ def create_exec_launcher(target_path: str, sandbox: SandboxPolicy) -> str:
         )
 
     if os.name == "nt":
-        # No shebang support; Windows resolves ``.py`` through PATHEXT.
+        # Windows resolves ``.py`` through PATHEXT; keep the ``#!`` line so
+        # the ``py`` launcher (a common .py association) picks the *current*
+        # interpreter rather than the machine default.
         fd, path = tempfile.mkstemp(prefix="omnigent-sandbox-", suffix=".py")
-        script = f"{inline}\n"
+        script = f"#!{interpreter}\n{inline}\n"
     else:
         # ``/bin/sh`` is the only interpreter guaranteed to be a native
         # executable. Naming ``sys.executable`` in a shebang instead

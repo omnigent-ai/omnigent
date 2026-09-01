@@ -65,6 +65,7 @@ _MACHO_MAGICS = (
     b"\xce\xfa\xed\xfe",  # 32-bit little-endian
     b"\xfe\xed\xfa\xcf",  # 64-bit big-endian
     b"\xcf\xfa\xed\xfe",  # 64-bit little-endian
+    # Also the Java .class magic; a CLI-named .class file is not runnable either.
     b"\xca\xfe\xba\xbe",  # fat/universal
     b"\xbe\xba\xfe\xca",  # fat/universal, swapped
 )
