@@ -6,6 +6,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+import httpx
+
 from omnigent_slack.approvals import (
     ClickTarget,
     ElicitationCoordinator,
@@ -61,6 +63,19 @@ _ACK_TEXT = "_Working on it…_"
 # fires once the stream actually goes quiet. Small enough to feel live, large
 # enough not to fragment a steady token stream into one API call per token.
 _IDLE_FLUSH_SECONDS = 2.0
+
+# Cap on a single inbound Slack attachment the bot will relay. The server
+# enforces its own per-type limits (images/PDF/text only) once the bytes land;
+# this guard keeps the bot from buffering a multi-hundred-MB upload Slack
+# permits before the server can reject it. Matches the server's global
+# attachment ceiling (MAX_ATTACHMENT_UPLOAD_BYTES).
+_MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+
+_ATTACHMENT_DOWNLOAD_TIMEOUT = httpx.Timeout(60.0)
+
+# Text submitted with a file-only message, so the turn carries an input_text
+# block alongside the attachment blocks.
+_FILE_ONLY_TEXT = "(file attached)"
 
 _SERVER_UNREACHABLE_TEXT = (
     ":warning: I couldn't reach your Omnigent server. If it moved or is "
@@ -231,7 +246,8 @@ class SlackOmnigentService:
             team_id = _team_id(body, event)
             key = ThreadKey.from_event(team_id, event)
             text = strip_bot_mention(str(event.get("text") or ""), bot_user_id)
-            if not text:
+            files = _event_files(event)
+            if not text and not files:
                 self._logger.info(
                     "Slack app_mention had no text after mention thread=%s",
                     key.display(),
@@ -244,7 +260,10 @@ class SlackOmnigentService:
                 return
 
             self._logger.info(
-                "Accepted Slack app_mention thread=%s chars=%s", key.display(), len(text)
+                "Accepted Slack app_mention thread=%s chars=%s files=%s",
+                key.display(),
+                len(text),
+                len(files),
             )
             await self._route_turn(
                 key=key,
@@ -252,6 +271,7 @@ class SlackOmnigentService:
                 text=text,
                 client=client,
                 in_channel=not event_is_dm(event),
+                files=files,
             )
         except Exception:
             await self._unclaim_event(body, event)
@@ -302,16 +322,18 @@ class SlackOmnigentService:
             # get — strip the mention (if any) and treat it like any other DM rather
             # than dropping it as a duplicate.
             text = strip_bot_mention(str(event.get("text") or ""), bot_user_id)
-            if not text:
+            files = _event_files(event)
+            if not text and not files:
                 self._logger.info("Ignoring empty Slack direct message thread=%s", key.display())
                 return
 
             # A DM maps one session per thread (like a channel): a top-level message
             # starts a new session, a threaded reply continues it.
             self._logger.info(
-                "Accepted Slack direct message thread=%s chars=%s",
+                "Accepted Slack direct message thread=%s chars=%s files=%s",
                 key.display(),
                 len(text),
+                len(files),
             )
             await self._route_turn(
                 key=key,
@@ -319,6 +341,7 @@ class SlackOmnigentService:
                 text=text,
                 client=client,
                 in_channel=False,
+                files=files,
             )
         except Exception:
             await self._unclaim_event(body, event)
@@ -332,6 +355,7 @@ class SlackOmnigentService:
         text: str,
         client: SlackClientProtocol,
         in_channel: bool,
+        files: tuple[dict[str, Any], ...] = (),
     ) -> None:
         requester = str(event.get("user") or "")
         if not requester:
@@ -461,6 +485,7 @@ class SlackOmnigentService:
                         owner_user_id=record.owner_user_id or requester,
                         workspace=record.workspace,
                         host_id=record.host_id,
+                        files=files,
                     )
                 )
                 spawned = True
@@ -494,6 +519,7 @@ class SlackOmnigentService:
                     owner_user_id=requester,
                     workspace=config.workspace,
                     host_id=config.host_id,
+                    files=files,
                 )
             )
             spawned = True
@@ -561,8 +587,22 @@ class SlackOmnigentService:
         # no-delta fallback below can tell this turn's answer from a prior one.
         baseline = await omnigent.latest_assistant_message(session_id)
 
+        # Relay inbound attachments before the turn starts: download each from
+        # Slack (bot-token-authenticated CDN fetch), upload it into the
+        # session's file namespace, and reference it from the submitted
+        # message's content blocks. Failures become a visible note in the turn
+        # text rather than a silent drop.
+        attachments, failed_names = await self._prepare_attachments(turn, omnigent, session_id)
+        text = turn.text
+        if not text and attachments:
+            text = _FILE_ONLY_TEXT
+        if failed_names:
+            text += "\n\n:warning: I couldn't attach: " + ", ".join(sorted(failed_names))
+
         try:
-            errored = await self._stream_turn(turn, omnigent, session_id, reply)
+            errored = await self._stream_turn(
+                turn, omnigent, session_id, reply, text=text, attachments=attachments
+            )
         except _TurnAborted:
             # A known mid-stream error already delivered its message and stopped
             # the reply; nothing left to finalize.
@@ -720,12 +760,90 @@ class SlackOmnigentService:
             )
         return session_id
 
+    async def _prepare_attachments(
+        self,
+        turn: SlackTurn,
+        omnigent: OmnigentClient,
+        session_id: str,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Turn the turn's Slack ``files`` into session attachment blocks.
+
+        Each file is downloaded from Slack's CDN (the bot token authorizes the
+        fetch) and uploaded to the session's file namespace; the returned
+        blocks reference the stored file ids so the model receives the content.
+
+        :returns: ``(attachment_blocks, failed_names)`` — the content blocks to
+            append to the submitted message, and the display names of files
+            that could not be relayed (too large, undownloadable, or rejected
+            by the server). A failure never aborts the turn.
+        """
+        if not turn.files:
+            return [], []
+        blocks: list[dict[str, Any]] = []
+        failed: list[str] = []
+        # Bolt's AsyncClient carries the bot token; the CDN fetch below needs
+        # it. A client without one (tests, custom wiring) can still relay
+        # public file URLs.
+        token = getattr(turn.slack_client, "token", None)
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        async with httpx.AsyncClient(timeout=_ATTACHMENT_DOWNLOAD_TIMEOUT) as http:
+            for file in turn.files:
+                name = str(file.get("name") or file.get("id") or "attachment")
+                url = file.get("url_private_download") or file.get("url_private")
+                if not url:
+                    self._logger.info(
+                        "Attachment has no download URL thread=%s name=%s",
+                        turn.key.display(),
+                        name,
+                    )
+                    failed.append(name)
+                    continue
+                size = int(file.get("size") or 0)
+                if size > _MAX_ATTACHMENT_BYTES:
+                    self._logger.info(
+                        "Attachment over size cap thread=%s name=%s size=%s",
+                        turn.key.display(),
+                        name,
+                        size,
+                    )
+                    failed.append(f"{name} (too large)")
+                    continue
+                try:
+                    download = await http.get(str(url), headers=headers, follow_redirects=True)
+                    download.raise_for_status()
+                    resource = await omnigent.upload_session_file(
+                        session_id,
+                        filename=name,
+                        content_type=str(file.get("mimetype") or "") or None,
+                        data=download.content,
+                    )
+                except Exception as exc:
+                    self._logger.info(
+                        "Attachment relay failed thread=%s name=%s: %s",
+                        turn.key.display(),
+                        name,
+                        exc,
+                    )
+                    failed.append(name)
+                    continue
+                file_id = resource.get("id")
+                if not file_id:
+                    failed.append(name)
+                    continue
+                mimetype = str(file.get("mimetype") or "")
+                block_type = "input_image" if mimetype.startswith("image/") else "input_file"
+                blocks.append({"type": block_type, "file_id": file_id, "filename": name})
+        return blocks, failed
+
     async def _stream_turn(
         self,
         turn: SlackTurn,
         omnigent: OmnigentClient,
         session_id: str,
         reply: _AnswerReply,
+        *,
+        text: str | None = None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> bool:
         """Stream the turn's events into ``reply``. Returns whether it errored.
 
@@ -748,8 +866,15 @@ class SlackOmnigentService:
             # ends. A single in-flight "next event" task is kept alive across
             # idle windows (a timeout must NOT cancel it — that would end the
             # generator); we re-await it next window.
+            # ``attachments`` is only forwarded when present so client
+            # implementations that predate it keep working unchanged.
+            extra: dict[str, Any] = {"attachments": attachments} if attachments else {}
             events = omnigent.run_turn(
-                session_id, turn.text, workspace=turn.workspace, host_id=turn.host_id
+                session_id,
+                turn.text if text is None else text,
+                workspace=turn.workspace,
+                host_id=turn.host_id,
+                **extra,
             ).__aiter__()
             pending: asyncio.Task[dict[str, Any]] | None = None
             try:
@@ -982,6 +1107,20 @@ def _event_id(body: dict[str, Any], event: dict[str, Any]) -> str | None:
     """The dedup key for a Slack event (``event_id``, else ``client_msg_id``)."""
     event_id = body.get("event_id") or event.get("client_msg_id")
     return str(event_id) if event_id else None
+
+
+def _event_files(event: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    """The downloadable file objects Slack stamped on a message event.
+
+    Slack delivers uploads as a ``files`` array on the event; entries without
+    a ``url_private_download`` (and no ``url_private`` fallback) — e.g. native
+    canvases or snippets only addressable through Slack's API — can't be
+    fetched by the bot and are surfaced as relay failures by the caller.
+    """
+    files = event.get("files")
+    if not isinstance(files, list):
+        return ()
+    return tuple(f for f in files if isinstance(f, dict))
 
 
 async def _session_title(
