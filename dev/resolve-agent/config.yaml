@@ -63,6 +63,7 @@ description: >-
 executor:
   type: omnigent
   context_window: 1000000
+  reasoning_effort: xhigh
   config:
     harness: claude-sdk
 
