@@ -8,7 +8,7 @@
 
 import { useSyncExternalStore } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -53,6 +53,7 @@ const mocks = vi.hoisted(() => {
     // Projects surfaced by the picker + the move-to-project mutation, so the
     // mobile in-place project view test can assert both the list and the pick.
     projects: [] as string[],
+    projectIcons: {} as Record<string, string | null | undefined>,
     moveToProject: { mutate: vi.fn() },
     leave: { mutate: vi.fn(), isPending: false },
     // The signed-in viewer. Rows with no `owner` read as owned by them; a row
@@ -107,7 +108,13 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({ data: mocks.projects.map((name: string) => ({ id: `p_${name}`, name })) }),
+  useProjects: () => ({
+    data: mocks.projects.map((name: string) => ({
+      id: `p_${name}`,
+      name,
+      icon: mocks.projectIcons[name],
+    })),
+  }),
   // A non-empty `useProjects` renders a project folder, which queries its
   // sessions — return the collapsed (disabled) shape so the folder is inert
   // (this suite keeps its test row unfiled; the picker only needs the name).
@@ -258,6 +265,7 @@ beforeEach(() => {
   mocks.moveToProject.mutate.mockReset();
   mocks.leave.mutate.mockReset();
   mocks.projects = [];
+  mocks.projectIcons = {};
   // Default every test to the desktop viewport; the mobile flyout test opts in.
   mocks.isMobile = false;
   useConvMock.mockReset();
@@ -368,9 +376,9 @@ describe("quick pin/unpin hover button", () => {
     // Hover-capable desktop: fades out until the header is hovered / focused /
     // a menu opens.
     expect(wrapper).toHaveClass(
-      "[@media(hover:hover)]:md:opacity-0",
-      "[@media(hover:hover)]:md:group-hover/header:opacity-100",
-      "[@media(hover:hover)]:md:has-[:focus-visible]:opacity-100",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100",
     );
   });
 
@@ -910,6 +918,71 @@ describe("mobile in-place project picker", () => {
       target: { value: "sprint 42" },
     });
     expect(screen.queryByRole("menuitem", { name: /Create/ })).toBeNull();
+  });
+
+  it("orders decorative project icons and a folder fallback before their names", () => {
+    mocks.isMobile = true;
+    mocks.projects = ["Sprint 42", "Legacy project"];
+    mocks.projectIcons = { "Sprint 42": "🚀" };
+    mockConversations([{ ...CONV, labels: { omni_project: "Sprint 42" } }]);
+    mocks.pinnedStore.set([CONV.id]);
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("move-to-project"));
+
+    const iconRow = screen.getByRole("menuitem", { name: "Sprint 42" });
+    const emoji = iconRow.firstElementChild;
+    expect(emoji).toHaveAttribute("data-testid", "project-icon");
+    expect(emoji).toHaveAttribute("aria-hidden", "true");
+    expect(emoji).toHaveTextContent("🚀");
+    expect(emoji?.nextElementSibling).toHaveTextContent("Sprint 42");
+
+    const fallback = screen.getByRole("menuitem", { name: "Legacy project" }).firstElementChild;
+    expect(fallback?.tagName.toLowerCase()).toBe("svg");
+    expect(fallback).toHaveAttribute("aria-hidden", "true");
+    expect(fallback?.nextElementSibling).toHaveTextContent("Legacy project");
+
+    const removeItem = screen.getByRole("menuitem", { name: "Remove from Sprint 42" });
+    expect(removeItem.firstElementChild).toHaveAttribute("data-testid", "project-icon");
+    expect(removeItem.firstElementChild).toHaveTextContent("🚀");
+  });
+
+  it("uses project names and the Remove label for desktop picker typeahead", async () => {
+    mocks.projects = ["Alpha", "Sprint 42"];
+    mocks.projectIcons = { "Sprint 42": "🚀" };
+    mockConversations([{ ...CONV, labels: { omni_project: "Sprint 42" } }]);
+    mocks.pinnedStore.set([CONV.id]);
+    const view = renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    const moveTrigger = screen.getByTestId("move-to-project");
+    moveTrigger.focus();
+    fireEvent.keyDown(moveTrigger, { key: "ArrowRight" });
+
+    const alphaRow = await screen.findByRole("menuitem", { name: "Alpha" });
+    const sprintRow = screen.getByRole("menuitem", { name: "Sprint 42" });
+    expect(alphaRow.firstElementChild?.tagName.toLowerCase()).toBe("svg");
+    expect(alphaRow.firstElementChild).toHaveAttribute("aria-hidden", "true");
+    expect(alphaRow.firstElementChild?.nextElementSibling).toHaveTextContent("Alpha");
+    expect(sprintRow.firstElementChild).toHaveAttribute("data-testid", "project-icon");
+    expect(sprintRow.firstElementChild?.nextElementSibling).toHaveTextContent("Sprint 42");
+    await waitFor(() => expect(alphaRow).toHaveFocus());
+    fireEvent.keyDown(alphaRow, { key: "s" });
+    await waitFor(() => expect(sprintRow).toHaveFocus());
+
+    view.unmount();
+    renderSidebar();
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    const freshMoveTrigger = screen.getByTestId("move-to-project");
+    freshMoveTrigger.focus();
+    fireEvent.keyDown(freshMoveTrigger, { key: "ArrowRight" });
+
+    const freshAlphaRow = await screen.findByRole("menuitem", { name: "Alpha" });
+    const removeItem = screen.getByRole("menuitem", { name: "Remove from Sprint 42" });
+    await waitFor(() => expect(freshAlphaRow).toHaveFocus());
+    fireEvent.keyDown(freshAlphaRow, { key: "r" });
+    await waitFor(() => expect(removeItem).toHaveFocus());
   });
 
   it("keeps the desktop side-flyout submenu (no in-place swap)", () => {

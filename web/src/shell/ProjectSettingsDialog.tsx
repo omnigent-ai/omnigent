@@ -184,27 +184,31 @@ export function ProjectSettingsDialog({
     // Guard against submitting a blank draft seeded from a failed load, which
     // the server would read as "clear the stored defaults".
     if (loadFailed) return;
-    // Build the config from set fields only — an unset slot is an absent key,
-    // so the whole object is `{}` when nothing is configured (the server treats
-    // that as "clear the stored defaults").
-    const config: ProjectConfig = {};
+    // Preserve config keys owned by other dialogs, then replace only the fields
+    // this form edits.
+    const config: ProjectConfig = { ...(stored ?? {}) };
     if (hostId !== NONE) config.host_id = hostId;
+    else delete config.host_id;
     // A workspace is host-relative and only meaningful with a concrete host —
     // don't persist a stale path from a since-cleared host, and drop it for the
     // sandbox (a sandbox create provisions its own workspace and ignores this).
     const ws =
       hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE ? trimOrUndef(workspace) : undefined;
     if (ws) config.workspace = ws;
+    else delete config.workspace;
     if (agentId) config.agent_id = agentId;
+    else delete config.agent_id;
     // Store the worktree choice only when it overrides the user-global default;
     // while it matches, leave the key unset so the project keeps inheriting
     // (and an all-default dialog still clears to {}).
     if (useWorktree !== readAlwaysUseWorktree()) config.use_worktree = useWorktree;
+    else delete config.use_worktree;
     // A base branch only forks a worktree, so it's only meaningful when the
     // worktree default is on — drop it otherwise so it can't linger as a stale,
     // invisible default after the toggle is turned off.
     const base = useWorktree ? trimOrUndef(baseBranch) : undefined;
     if (base) config.base_branch = base;
+    else delete config.base_branch;
 
     updateConfig.mutate(
       { id: projectId, name: projectName, config },

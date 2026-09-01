@@ -38,7 +38,8 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         )
         claude_config = None
     effective_model = (
-        context.spawn_env.get("HARNESS_CLAUDE_SDK_MODEL")
+        context.title_model
+        or context.spawn_env.get("HARNESS_CLAUDE_SDK_MODEL")
         or context.model_override
         or (claude_config.model if claude_config is not None else None)
     )

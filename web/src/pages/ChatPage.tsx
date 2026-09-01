@@ -1192,6 +1192,7 @@ export function ChatPage() {
   // the hydration early-returns below (hook order).
   const fallbackPickerKind = modelPickerKindForConv({
     labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
+    harness: activeSession?.harness ?? null,
   });
   const hostProbeHarness =
     fallbackPickerKind === "codex"
@@ -1318,6 +1319,7 @@ export function ChatPage() {
   // Once present, the live session snapshot is authoritative.
   const capabilitySource = {
     labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
+    harness: activeSession?.harness ?? null,
   };
   const modelPickerKind = modelPickerKindForConv(capabilitySource);
   // Effort ladders key on the model the session is actually on — the
@@ -3145,16 +3147,22 @@ function isSystemBubble(bubble: Bubble): boolean {
   return isSystemUserContent(bubble.content);
 }
 
-function CompactionLoadingIndicator() {
+function CompactionLoadingIndicator({ createdAtS }: { createdAtS?: number }) {
   const [elapsed, setElapsed] = useState(0);
-  const startRef = useRef(performance.now());
 
   useEffect(() => {
-    const id = window.setInterval(() => {
-      setElapsed(Math.round((performance.now() - startRef.current) / 1000));
-    }, 1000);
+    // Calculate elapsed time from the actual compaction start time (if available)
+    // rather than component mount time, so the timer persists across session switches.
+    const startTimeMs = createdAtS != null ? createdAtS * 1000 : Date.now();
+
+    const updateElapsed = () => {
+      setElapsed(Math.round((Date.now() - startTimeMs) / 1000));
+    };
+
+    updateElapsed();
+    const id = window.setInterval(updateElapsed, 1000);
     return () => window.clearInterval(id);
-  }, []);
+  }, [createdAtS]);
 
   return (
     <Message from="assistant" data-testid="compacting-indicator">
@@ -3211,7 +3219,7 @@ export const BubbleView = memo(
   }) {
     if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
     if (bubble.kind === "compaction_loading") {
-      return <CompactionLoadingIndicator />;
+      return <CompactionLoadingIndicator createdAtS={bubble.createdAtS} />;
     }
     if (bubble.kind === "compaction") return <CompactionMarker />;
     if (bubble.kind === "routing_decision") {
@@ -5902,8 +5910,25 @@ export function readOnlyReasonForSessionLabels(
   return null;
 }
 
+/**
+ * A custom (label-less) session resolved to the native Codex harness.
+ *
+ * Custom YAML agents get no `omnigent.wrapper` presentation label, so the
+ * resolved harness is the capability evidence. Any wrapper label — including
+ * sub-agent variants like `codex-native-ui-subagent`, which cannot honor
+ * mid-session overrides — keeps the label authoritative and skips the
+ * fallback.
+ */
+function isLabelLessCodexNative(
+  conv:
+    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
+): boolean {
+  return conv?.labels?.["omnigent.wrapper"] == null && conv?.harness === "codex-native";
+}
+
 export function effortLevelsForConv(
-  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  conv:
+    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
   codexModelOptions: readonly NativeModelOption[] = [],
   currentModel: string | null = null,
 ): readonly string[] {
@@ -5915,7 +5940,9 @@ export function effortLevelsForConv(
     case "pi-native-ui":
       return PI_NATIVE_EFFORT_LEVELS;
     default:
-      return EFFORT_LEVELS;
+      return isLabelLessCodexNative(conv)
+        ? codexEffortLevelsForModel(codexModelOptions, currentModel)
+        : EFFORT_LEVELS;
   }
 }
 
@@ -5927,7 +5954,8 @@ export function effortLevelsForConv(
  * `TerminalFirstContext.tsx`).
  */
 export function modelPickerKindForConv(
-  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  conv:
+    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
 ): NativeModelPickerKind | null {
   switch (conv?.labels?.["omnigent.wrapper"]) {
     case "claude-code-native-ui":
@@ -5953,12 +5981,13 @@ export function modelPickerKindForConv(
       // model_select handler, so the picker surfaces that as the live model.
       return "pi";
     default:
-      return null;
+      return isLabelLessCodexNative(conv) ? "codex" : null;
   }
 }
 
 export function shouldShowModelPicker(
-  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  conv:
+    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
 ): boolean {
   return modelPickerKindForConv(conv) !== null;
 }
@@ -5971,7 +6000,8 @@ export function shouldShowModelPicker(
  * :returns: True only when the session supports Web UI effort controls.
  */
 export function shouldShowEffortPicker(
-  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  conv:
+    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
 ): boolean {
   return supportsEffortControl(conv);
 }

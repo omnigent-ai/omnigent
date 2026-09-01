@@ -274,6 +274,10 @@ against its local Chromium, and the result is posted back.
   conversation's page keeps running when the user switches away; views are
   destroyed only on explicit close or window teardown. Each child view keeps
   `nodeIntegration:false, contextIsolation:true, sandbox:true`.
+  Page-initiated `window.open` / `target=_blank` never spawns a window: an
+  http(s) target navigates the same view in place (still allowlist-checked on
+  an agent-locked view), and right-click offers "Open Link in Browser" /
+  "Copy Link Address".
 - `src/browserViewBounds.js` — converts the placeholder's renderer CSS pixels to
   window device-independent pixels (they diverge after `Cmd+/Cmd-` zoom).
 - `src/main.js` — instantiates one registry **per shell window** and injects it

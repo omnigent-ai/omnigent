@@ -92,3 +92,4 @@ web/storybook-static/
 # DAB local state directory (created by `databricks bundle deploy`).
 deploy/databricks/.databricks/
 web/package-lock.json
+recordings/

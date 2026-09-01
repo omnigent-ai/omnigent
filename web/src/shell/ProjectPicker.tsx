@@ -1,7 +1,25 @@
 import { useState } from "react";
-import { CheckIcon, PlusIcon, SearchIcon } from "lucide-react";
+import { CheckIcon, FolderIcon, PlusIcon, SearchIcon } from "lucide-react";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { useProjects } from "@/hooks/useConversations";
+
+/**
+ * Leading visual for a project row: the project's emoji icon when set,
+ * otherwise a folder glyph. Decorative only — row names carry the semantics.
+ */
+export function ProjectRowIcon({ icon }: { icon?: string | null }) {
+  return icon ? (
+    <span
+      aria-hidden="true"
+      className="shrink-0 text-[14px] leading-none"
+      data-testid="project-icon"
+    >
+      {icon}
+    </span>
+  ) : (
+    <FolderIcon aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
+  );
+}
 
 /**
  * Searchable list of projects to file a session into, rendered inside a
@@ -30,6 +48,7 @@ export function ProjectPicker({
   const canCreate =
     trimmed.length > 0 &&
     !projects.some((project) => project.name.toLowerCase() === trimmed.toLowerCase());
+  const currentProjectIcon = projects.find((project) => project.name === currentProject)?.icon;
 
   return (
     <>
@@ -49,8 +68,10 @@ export function ProjectPicker({
           <DropdownMenuItem
             key={project.name}
             className="px-2 py-1"
+            textValue={project.name}
             onSelect={() => onSelect(project.name)}
           >
+            <ProjectRowIcon icon={project.icon} />
             <span className="flex-1 truncate text-left">{project.name}</span>
             {currentProject === project.name && (
               <CheckIcon className="size-3.5 shrink-0 text-primary" />
@@ -74,7 +95,12 @@ export function ProjectPicker({
       )}
       {currentProject && (
         <div className="border-t pt-1">
-          <DropdownMenuItem className="px-2 py-1" onSelect={() => onSelect("")}>
+          <DropdownMenuItem
+            className="px-2 py-1"
+            textValue={`Remove from ${currentProject}`}
+            onSelect={() => onSelect("")}
+          >
+            <ProjectRowIcon icon={currentProjectIcon} />
             Remove from{" "}
             <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
               {currentProject}

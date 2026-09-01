@@ -122,11 +122,15 @@ _TURN_CONTEXT_DESYNC_CODE = "runner_turn_context_desync"
 # Env var name kept for the ops knob; ``<= 0`` disables.
 _TURN_IDLE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_TIMEOUT_S", "600"))
 
-# Absolute per-turn ceiling: a hard cap on TOTAL turn duration, backstop
-# to the idle watchdog above. The idle watchdog never trips a turn that
-# keeps emitting, so a runaway-but-active loop (e.g. an infinite tool
-# loop emitting steadily) needs this. Generous so it never clips a real
-# long turn. ``<= 0`` disables. Whichever of (idle, absolute) trips first.
+# Absolute per-turn ceiling on TOTAL turn duration. Progress-aware when
+# the idle watchdog is enabled: every real progress event extends the
+# ceiling to at least one idle window past now, so a turn that keeps
+# emitting is never killed mid-work merely for running long — a stalled
+# turn past the ceiling dies via the idle watchdog instead. Deliberate
+# tradeoff: under the default config a steadily-emitting turn has NO
+# wall-clock cap (this constant does not bound active turns); only when
+# the idle watchdog is disabled (``HARNESS_TURN_TIMEOUT_S <= 0``) does
+# this act as a strict wall-clock cap. ``<= 0`` disables.
 _TURN_ABSOLUTE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_ABSOLUTE_TIMEOUT_S", "10800"))
 
 
@@ -1480,10 +1484,13 @@ class HarnessApp:
           calls) is never killed — only one that emits nothing for the
           whole window. This replaces the prior fixed *cumulative* cap,
           which guillotined long-but-healthy turns mid-stream.
-        - ABSOLUTE (:data:`_TURN_ABSOLUTE_TIMEOUT_S`): a hard ceiling on
-          total duration, never rescheduled. Backstops the idle watchdog
-          against a runaway-but-active loop the idle one never sees as
-          stuck.
+        - ABSOLUTE (:data:`_TURN_ABSOLUTE_TIMEOUT_S`): a ceiling on total
+          duration that real progress extends: each non-heartbeat emit
+          pushes the deadline to at least one idle window past now, so an
+          actively-progressing turn is never killed merely for running
+          long. A turn that outlives the ceiling and then stalls dies via
+          the idle watchdog; only with the idle watchdog disabled does
+          this act as a strict wall-clock cap.
 
         Either expiry surfaces a wedged/runaway ``run_turn`` as
         ``response.failed``.
@@ -1500,11 +1507,26 @@ class HarnessApp:
             loop = asyncio.get_running_loop()
 
             def _reset() -> None:
-                # Push ONLY the idle deadline ``idle_timeout`` s past now
-                # (the absolute ceiling is never rescheduled). Called from
-                # ``ctx.emit`` during ``run_turn`` (inside the active
-                # context), so the reschedule is always valid.
-                idle_wd.reschedule(loop.time() + idle_timeout)
+                # Push the idle deadline ``idle_timeout`` s past now. Called
+                # from ``ctx.emit`` during ``run_turn`` (inside the active
+                # context). ``expired()`` guards a late emit racing a
+                # just-fired timeout: rescheduling an expiring/expired
+                # ``asyncio.Timeout`` raises RuntimeError out of ``emit``.
+                now = loop.time()
+                if not idle_wd.expired():
+                    idle_wd.reschedule(now + idle_timeout)
+                # Real progress also extends the absolute ceiling to at
+                # least one idle window past now, so an actively-emitting
+                # turn is never guillotined mid-work for total duration
+                # alone. A turn that outlives the original ceiling and then
+                # stalls is failed by the idle watchdog one window later.
+                absolute_deadline = absolute_wd.when()
+                if (
+                    not absolute_wd.expired()
+                    and absolute_deadline is not None
+                    and absolute_deadline < now + idle_timeout
+                ):
+                    absolute_wd.reschedule(now + idle_timeout)
 
             ctx._reset_idle_watchdog = _reset
         try:
@@ -1550,7 +1572,7 @@ class HarnessApp:
                 )
                 raise RuntimeError(
                     f"turn exceeded the {absolute_timeout:.0f}s harness absolute watchdog "
-                    f"(total turn duration cap; the turn kept emitting but never finished)"
+                    f"(total turn duration cap)"
                 ) from exc
             # Neither ceiling tripped — an inner ``run_turn`` TimeoutError;
             # pass it through unchanged.

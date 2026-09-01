@@ -96,6 +96,30 @@ def test_runner_env_explicit_proxy_passthrough_remains_available() -> None:
     assert (set(_PROXY_ENV) - explicit_names).isdisjoint(env)
 
 
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+@pytest.mark.parametrize("enabled", ["0", "1"])
+def test_host_slice_key_gate_reaches_daemon_and_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+    enabled: str,
+) -> None:
+    """The host and its spawned runner make the same slice-key decision."""
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", enabled)
+
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=_REMOTE_SERVER_URL,
+        runner_id="runner_slice_key",
+        binding_token="binding-slice-key",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    assert daemon_env["OMNIGENT_HOST_SLICE_KEY_ENABLED"] == enabled
+    assert runner_env["OMNIGENT_HOST_SLICE_KEY_ENABLED"] == enabled
+
+
 _CLAUDE_TOOL_SEARCH_ENV: Final = {
     "CLAUDE_CODE_USE_GATEWAY": "1",
     "ENABLE_TOOL_SEARCH": "true",
