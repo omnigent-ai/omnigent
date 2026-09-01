@@ -1,0 +1,93 @@
+/**
+ * The Electron server-selector-v2 flow: landing → deployment mode → server
+ * select, inside one card that resizes between steps. Mounted only by
+ * `server-selector-v2.tsx` (the gated Electron setup page), wired to the native
+ * `omnigentSetup` bridge via the `setup` prop.
+ */
+
+import { useState } from "react";
+import { AnimatedOmnigentPanel } from "@/components/onboarding/AnimatedOmnigentPanel";
+import { LandingStep } from "@/pages/onboarding/LandingStep";
+import { ModeSelectStep } from "@/pages/onboarding/ModeSelectStep";
+import { ServerSelectStep } from "@/pages/onboarding/ServerSelectStep";
+import { SetupTerminalStep } from "@/pages/onboarding/SetupTerminalStep";
+
+/** Actions + data the Electron shell supplies to the flow. */
+export interface ServerSelectorV2Setup {
+  /** Initial server URL to prefill (saved / failed / default). */
+  initialUrl: string;
+  /** Optional error banner (from the shell's ?error=&url= params). */
+  error?: string;
+  /** Recently-connected server URLs (most recent first). */
+  recentServers: string[];
+  /** Organization-provided server URLs. */
+  managedServers: string[];
+  /** Persist + navigate to a server URL. Resolves true when the URL doesn't
+   *  look like an Omnigent server and needs an explicit confirm (call again
+   *  with force). */
+  onConnect: (url: string, force?: boolean) => Promise<boolean> | boolean;
+  /** Start (or reuse) the local server, then connect to it. Resolves the
+   *  outcome so the terminal step can show ready/failed (on success the window
+   *  navigates away, so it resolves only on failure in practice). */
+  onStartLocal: () => Promise<{ ok: boolean; error?: string }>;
+  /** Remove a recent server from the saved list, if the shell supports it. */
+  onRemoveServer?: (url: string) => void;
+  /** Copy text to the clipboard via the shell's native bridge. */
+  onCopy: (text: string) => void;
+  /** Open the Cloud deploy docs in the user's browser. */
+  onCloudSetup: () => void;
+}
+
+type Step = "landing" | "mode" | "server" | "terminal";
+
+// Per-step card dimensions (px). The panel shrinks as steps gain content; the
+// card grows for the scrollable server list. Drives the CSS-transition resize.
+const CARD: Record<Step, { height: number; panelHeight: number }> = {
+  landing: { height: 560, panelHeight: 308 },
+  mode: { height: 560, panelHeight: 96 },
+  server: { height: 600, panelHeight: 64 },
+  terminal: { height: 560, panelHeight: 96 },
+};
+
+export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
+  // A failed connect reloads the wizard with an error (from ?error=&url=). That
+  // only ever comes from the server-select flow, so open there — otherwise the
+  // error banner renders on a step that isn't mounted and stays invisible.
+  const [step, setStep] = useState<Step>(setup.error ? "server" : "landing");
+  const { height, panelHeight } = CARD[step];
+
+  return (
+    <div className="grid min-h-screen place-items-center p-6">
+      <AnimatedOmnigentPanel height={height} panelHeight={panelHeight}>
+        {step === "landing" && (
+          <LandingStep
+            onGetStarted={() => setStep("mode")}
+            onJoinServer={() => setStep("server")}
+          />
+        )}
+        {step === "mode" && (
+          <ModeSelectStep
+            onBack={() => setStep("landing")}
+            onBegin={() => setStep("terminal")}
+            onCloudSetup={setup.onCloudSetup}
+          />
+        )}
+        {step === "terminal" && (
+          <SetupTerminalStep onStartLocal={setup.onStartLocal} onBack={() => setStep("mode")} />
+        )}
+        {step === "server" && (
+          <ServerSelectStep
+            initialUrl={setup.initialUrl}
+            error={setup.error}
+            recentServers={setup.recentServers}
+            managedServers={setup.managedServers}
+            onBack={() => setStep("landing")}
+            onConnect={setup.onConnect}
+            onRemove={setup.onRemoveServer}
+            onCopy={setup.onCopy}
+          />
+        )}
+      </AnimatedOmnigentPanel>
+    </div>
+  );
+}

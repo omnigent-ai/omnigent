@@ -416,13 +416,18 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
   /**
    * Persist + navigate to a server URL. Connecting this machine as a runner is
    * a separate, explicit action from the host menu — not a connect-time choice.
+   * Resolves `{needsConfirm:true, url}` when a remote URL doesn't look like an
+   * Omnigent server; re-call with `{force:true}` to proceed anyway.
    * @param {string} url
+   * @param {{force?: boolean}} [opts]
    */
-  setServerUrl: (url) => ipcRenderer.invoke("omnigent:set-server-url", url),
+  setServerUrl: (url, opts) => ipcRenderer.invoke("omnigent:set-server-url", url, opts),
   /** Organization-provided server URLs from macOS Managed Preferences. */
   getManagedServers: () => ipcRenderer.invoke("omnigent:get-managed-servers"),
   /** Recently-connected server URLs, most recent first. */
   getRecentServers: () => ipcRenderer.invoke("omnigent:get-recent-servers"),
+  /** Drop one recent server from the saved list; resolves the remaining ones. */
+  forgetRecentServer: (url) => ipcRenderer.invoke("omnigent:forget-recent-server", url),
   /** Copy text from the bundled setup page to the native clipboard. */
   copyText: (text) => ipcRenderer.invoke("omnigent:copy-setup-text", text),
   /**
