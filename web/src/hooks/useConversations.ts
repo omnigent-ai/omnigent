@@ -339,19 +339,24 @@ function withRecentlyCreated(
   searchQuery: string,
   project: string | undefined,
   includeArchived: boolean,
+  queryClient: QueryClient,
 ): ConversationsPage {
   if (after !== undefined || searchQuery || project || recentlyCreatedSessions.size === 0) {
     return page;
   }
   const present = new Set(page.data.map((c) => c.id));
   const inject: Conversation[] = [];
-  for (const [id, conv] of recentlyCreatedSessions) {
-    if (present.has(id)) {
-      recentlyCreatedSessions.delete(id);
-      continue;
-    }
-    if (conv.archived && !includeArchived) continue;
-    inject.push(conv);
+  for (const [id, snapshot] of recentlyCreatedSessions) {
+    // Already listed — skip (no duplicate). Don't drop the entry: a sibling
+    // list catching up first must not disarm the keep-alive for a still-lagging
+    // list; the 60s timer is the sole cleanup.
+    if (present.has(id)) continue;
+    // Inject the freshest copy: the cache row (kept current by WS overlays)
+    // beats the frozen snapshot, so a WS-confirmed title — or archive flag —
+    // isn't reverted by re-injecting stale data.
+    const row = findCachedConversationRow(queryClient, id) ?? snapshot;
+    if (row.archived && !includeArchived) continue;
+    inject.push(row);
   }
   if (inject.length === 0) return page;
   return { ...page, data: [...inject, ...page.data], first_id: inject[0].id };
@@ -403,11 +408,13 @@ async function fetchConversationsPage({
   searchQuery,
   includeArchived,
   project,
+  queryClient,
 }: {
   after?: string;
   searchQuery: string;
   includeArchived: boolean;
   project?: string;
+  queryClient: QueryClient;
 }): Promise<ConversationsPage> {
   // `updated_at` matches the sidebar's sort, which keeps server
   // pagination consistent with the visible order as the user scrolls.
@@ -447,7 +454,7 @@ async function fetchConversationsPage({
   // can't seed a stale value; a hostless row clears any prior mapping.
   for (const row of page.data) setSessionHost(row.id, row.host_id);
   return withoutDeletingSessions(
-    withRecentlyCreated(page, after, searchQuery, project, includeArchived),
+    withRecentlyCreated(page, after, searchQuery, project, includeArchived, queryClient),
   );
 }
 
@@ -489,6 +496,7 @@ export function useConversations(
   // enter the sidebar without making every consumer poll `/v1/sessions`.
   // If the socket is down, all consumers use a safety poll.
   const streamConnected = useSessionUpdatesConnected();
+  const queryClient = useQueryClient();
   return useInfiniteQuery({
     // Keep the base three-element key for the unfiltered callers (byte-for-byte
     // unchanged, so the sidebar / rename / push-delta paths are untouched); only
@@ -504,6 +512,7 @@ export function useConversations(
           searchQuery,
           includeArchived,
           project,
+          queryClient,
         });
       // Time the first full-list load per app session; skip pagination
       // (pageParam set) and every later fetch (poll / reconcile / invalidation).
