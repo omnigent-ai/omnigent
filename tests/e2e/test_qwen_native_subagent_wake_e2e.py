@@ -98,7 +98,14 @@ def _ambient_free_environ() -> dict[str, str]:
         k: v
         for k, v in os.environ.items()
         if not k.startswith(("OMNIGENT_RUNNER_", "OMNIGENT_HOST_"))
-        and k not in ("RUNNER_SERVER_URL", "OMNIGENT_REMOTE_AUTH_TOKEN")
+        and k
+        not in (
+            "RUNNER_SERVER_URL",
+            "OMNIGENT_REMOTE_AUTH_TOKEN",
+            # An inherited process-log path may point at another process's
+            # (possibly unwritable) log dir and crash the spawned runner.
+            "OMNIGENT_PROCESS_LOG_FILE",
+        )
     }
 
 
