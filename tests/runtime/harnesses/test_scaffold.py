@@ -1481,6 +1481,248 @@ async def test_session_approval_event_404s_on_conversation_id_mismatch(
         await side_client.aclose()
 
 
+
+@pytest.mark.asyncio
+async def test_complete_elicitation_duplicate_after_pop_is_idempotent() -> None:
+    """Duplicate approval for a completed elicitation must not look unknown.
+
+    After the first accept, ``elicit``'s finally pops the Future. A second
+    delivery of the same id must still count as complete (no 404 path) via
+    tombstone. Never-seen ids stay False so real misroutes 404.
+    """
+    from omnigent.server.schemas import ElicitationResult
+
+    ctx = TurnContext("resp_elicit_dup", asyncio.Queue(), asyncio.Event())
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future = loop.create_future()
+    eid = "elicit_once"
+    ctx._pending_elicitations[eid] = future
+
+    first = ElicitationResult(action="accept", content=None)
+    assert ctx._complete_elicitation(eid, first) is True
+    assert future.done()
+    assert future.result().action == "accept"
+    # Simulate elicit() finally cleanup after the parked wait returns.
+    ctx._pending_elicitations.pop(eid, None)
+
+    second = ElicitationResult(action="accept", content=None)
+    assert ctx._complete_elicitation(eid, second) is True, (
+        "completed elicitation must stay idempotent after Future is popped"
+    )
+    assert ctx._complete_elicitation("elicit_never_seen", second) is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_elicitation_duplicate_returns_204_not_404() -> None:
+    """HarnessApp approval resolve: first accept 204, duplicate 204, unknown 404."""
+    from omnigent.server.schemas import ElicitationResult
+
+    class _Stub(HarnessApp):
+        async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
+            del request, ctx
+
+    app = _Stub()
+    ctx = TurnContext("resp_resolve_dup", asyncio.Queue(), asyncio.Event())
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future = loop.create_future()
+    eid = "elicit_resolve_once"
+    ctx._pending_elicitations[eid] = future
+    app._in_flight[ctx.response_id] = ctx
+
+    first = await app._resolve_elicitation(eid, ElicitationResult(action="accept"))
+    assert first.status_code == 204
+    assert future.done()
+    ctx._pending_elicitations.pop(eid, None)
+
+    dup = await app._resolve_elicitation(eid, ElicitationResult(action="accept"))
+    assert dup.status_code == 204
+
+    # After turn teardown drops the context, redelivery still 204.
+    app._in_flight.clear()
+    after_teardown = await app._resolve_elicitation(
+        eid, ElicitationResult(action="accept")
+    )
+    assert after_teardown.status_code == 204
+
+    with pytest.raises(OmnigentError) as exc_info:
+        await app._resolve_elicitation(
+            "elicit_never_seen", ElicitationResult(action="accept")
+        )
+    assert exc_info.value.code == ErrorCode.NOT_FOUND
+
+
+
+@pytest.mark.asyncio
+async def test_complete_elicitation_after_cancel_is_not_idempotent() -> None:
+    """Cancelled Future (interrupt) must not get completed-approval treatment.
+
+    Interrupt cancels parked elicitations without delivering a verdict.
+    A later stale approval for that id must not return True / tombstone the
+    way a real duplicate-after-complete does — only successful set_result
+    deliveries are idempotent.
+    """
+    from omnigent.server.schemas import ElicitationResult
+
+    ctx = TurnContext("resp_elicit_cancel", asyncio.Queue(), asyncio.Event())
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future = loop.create_future()
+    eid = "elicit_cancelled_before_verdict"
+    ctx._pending_elicitations[eid] = future
+    future.cancel()
+    assert future.done() and future.cancelled()
+
+    stale = ElicitationResult(action="accept", content=None)
+    assert ctx._complete_elicitation(eid, stale) is False, (
+        "stale approval after cancel must not count as successful delivery"
+    )
+    assert eid not in ctx._completed_elicitations, (
+        "cancel must not tombstone an id as completed approval"
+    )
+    # elicit() finally cleanup after cancelled wait unwinds
+    ctx._pending_elicitations.pop(eid, None)
+    assert ctx._complete_elicitation(eid, stale) is False
+    assert eid not in ctx._completed_elicitations
+
+
+@pytest.mark.asyncio
+async def test_resolve_elicitation_after_cancel_returns_404_not_204() -> None:
+    """HarnessApp: approval after interrupt-cancel is 404, not idempotent 204."""
+    from omnigent.server.schemas import ElicitationResult
+
+    class _Stub(HarnessApp):
+        async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
+            del request, ctx
+
+    app = _Stub()
+    ctx = TurnContext("resp_resolve_cancel", asyncio.Queue(), asyncio.Event())
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future = loop.create_future()
+    eid = "elicit_resolve_cancelled"
+    ctx._pending_elicitations[eid] = future
+    app._in_flight[ctx.response_id] = ctx
+
+    # Same path interrupt uses: cancel parked futures without set_result.
+    ctx._cancel_pending()
+    assert future.cancelled()
+
+    with pytest.raises(OmnigentError) as exc_info:
+        await app._resolve_elicitation(eid, ElicitationResult(action="accept"))
+    assert exc_info.value.code == ErrorCode.NOT_FOUND
+    assert eid not in app._completed_elicitations
+    assert eid not in ctx._completed_elicitations
+
+    # After pop/teardown, still never-completed → 404 (not 204).
+    ctx._pending_elicitations.pop(eid, None)
+    app._in_flight.clear()
+    with pytest.raises(OmnigentError) as exc_info2:
+        await app._resolve_elicitation(eid, ElicitationResult(action="accept"))
+    assert exc_info2.value.code == ErrorCode.NOT_FOUND
+
+
+async def test_session_approval_accept_once_duplicate_idempotent(
+    use_elicitation: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """One accept completes the turn once; duplicate delivery is 204 not 404.
+
+    Contract: accept runs once and completes; redelivery of the same
+    elicitation_id is idempotent. Question-style elicitations share
+    ``ctx.elicit`` / ``_resolve_elicitation`` so the same guarantee applies.
+    """
+    conv_id = "conv_session_elicit_dup_accept"
+    stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    side_client = _make_side_client(str(manager.socket_path(conv_id)))
+    events: list[_ParsedSSEEvent] = []
+    start_body = {
+        "type": "message",
+        "role": "user",
+        "model": "test-agent",
+        "content": [],
+    }
+    try:
+        async with stream_client.stream(
+            "POST",
+            f"/v1/sessions/{conv_id}/events",
+            json=start_body,
+        ) as response:
+            replied = False
+            async for event in _stream_iter(response):
+                events.append(event)
+                if not replied and event.event == "response.elicitation_request":
+                    body = {
+                        "type": "approval",
+                        "elicitation_id": "elicit_test_1",
+                        "action": "accept",
+                    }
+                    first = await side_client.post(
+                        f"/v1/sessions/{conv_id}/events", json=body
+                    )
+                    assert first.status_code == 204
+                    # Immediate redelivery (retry / double click).
+                    second = await side_client.post(
+                        f"/v1/sessions/{conv_id}/events", json=body
+                    )
+                    assert second.status_code == 204, (
+                        f"duplicate accept must not 404; got {second.status_code}"
+                    )
+                    replied = True
+        text_deltas = [e for e in events if e.event == "response.output_text.delta"]
+        assert len(text_deltas) == 1
+        assert text_deltas[0].data["delta"] == "action:accept"
+        completed = [e for e in events if e.event == "response.completed"]
+        assert len(completed) == 1
+    finally:
+        await side_client.aclose()
+
+
+async def test_session_approval_decline_cancels_and_duplicate_idempotent(
+    use_elicitation: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """First decline resolves as cancel/refuse; duplicate delivery stays 204."""
+    conv_id = "conv_session_elicit_dup_decline"
+    stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    side_client = _make_side_client(str(manager.socket_path(conv_id)))
+    events: list[_ParsedSSEEvent] = []
+    start_body = {
+        "type": "message",
+        "role": "user",
+        "model": "test-agent",
+        "content": [],
+    }
+    try:
+        async with stream_client.stream(
+            "POST",
+            f"/v1/sessions/{conv_id}/events",
+            json=start_body,
+        ) as response:
+            replied = False
+            async for event in _stream_iter(response):
+                events.append(event)
+                if not replied and event.event == "response.elicitation_request":
+                    body = {
+                        "type": "approval",
+                        "elicitation_id": "elicit_test_1",
+                        "action": "decline",
+                    }
+                    first = await side_client.post(
+                        f"/v1/sessions/{conv_id}/events", json=body
+                    )
+                    assert first.status_code == 204
+                    second = await side_client.post(
+                        f"/v1/sessions/{conv_id}/events", json=body
+                    )
+                    assert second.status_code == 204, (
+                        f"duplicate decline must not 404; got {second.status_code}"
+                    )
+                    replied = True
+        text_deltas = [e for e in events if e.event == "response.output_text.delta"]
+        assert len(text_deltas) == 1
+        assert text_deltas[0].data["delta"] == "action:decline"
+    finally:
+        await side_client.aclose()
+
+
 async def test_session_message_event_without_previous_response_id_injects_active_turn(
     use_injection: None,
     manager: HarnessProcessManager,
