@@ -57,6 +57,12 @@ from omnigent.config import (
 )
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.daemon_lifecycle import (
+    DAEMON_CONFIG_SIG_ENV_VAR,
+)
+from omnigent.host.daemon_lifecycle import (
+    HostDaemonRecord as _HostDaemonRecord,
+)
+from omnigent.host.daemon_lifecycle import (
     daemon_record_path as _daemon_record_path_for,
 )
 from omnigent.host.daemon_lifecycle import (
@@ -68,6 +74,7 @@ from omnigent.host.daemon_lifecycle import (
 from omnigent.host.daemon_lifecycle import (
     record_flock_is_held as _record_flock_is_held,
 )
+from omnigent.host.daemon_lifecycle import write_daemon_record as _write_daemon_record_impl
 from omnigent.host.local_server import (
     _DEFAULT_LOCAL_PORT,
     _pid_alive,
@@ -2423,46 +2430,6 @@ def _is_local_server_request(server: str | None) -> bool:
 
 
 @dataclass(frozen=True)
-class _HostDaemonRecord:
-    """
-    Local registry record for one background host daemon.
-
-    :param pid: Process id of the background daemon, e.g. ``4242``.
-    :param target: Normalized daemon target, e.g.
-        ``"https://example.databricksapps.com"`` or ``"local"``.
-    :param mode: Launch mode, either ``"server"`` or ``"local"``.
-    :param server_url: Normalized requested server URL for ``"server"``
-        mode, e.g. ``"https://example.databricksapps.com"``. ``None``
-        for local mode.
-    :param log_path: Daemon log file path, e.g.
-        ``"/Users/me/.omnigent/logs/host/host-abc.log"``.
-    :param started_at: Unix epoch seconds when the daemon was spawned,
-        e.g. ``1710000000``.
-    :param host_id: Local host id advertised to Omnigent servers, e.g.
-        ``"host_abc123"``. ``None`` for legacy records.
-    :param resolved_server_url: Concrete local server URL discovered for
-        local mode, e.g. ``"http://127.0.0.1:8123"``. ``None`` until
-        discovery succeeds or for remote mode.
-    :param config_sig: Signature of the server-affecting config (resolved
-        auth source) the daemon was spawned under, e.g.
-        ``"3f9a1c2b4d5e6f70"`` (see :func:`_server_config_signature`).
-        ``None`` for legacy records written before config-signature
-        tracking existed; a ``None`` signature is never treated as a
-        config mismatch (we can't know what it was started with).
-    """
-
-    pid: int
-    target: str
-    mode: str
-    server_url: str | None
-    log_path: str | None
-    started_at: int
-    host_id: str | None = None
-    resolved_server_url: str | None = None
-    config_sig: str | None = None
-
-
-@dataclass(frozen=True)
 class _HostHttpResult:
     """
     Decoded Omnigent management HTTP response.
@@ -2701,9 +2668,7 @@ def _write_daemon_record(record: _HostDaemonRecord) -> None:
     :param record: Record to write, e.g. a local daemon record with
         ``target == "local"``.
     """
-    path = _daemon_record_path(record.target)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(asdict(record), indent=2, sort_keys=True) + "\n")
+    _write_daemon_record_impl(record, base_dir=_HOST_PID_PATH.parent)
 
 
 def _delete_daemon_record(record: _HostDaemonRecord) -> None:
@@ -3061,34 +3026,26 @@ def _spawn_host_daemon_process(
     return _SpawnedDaemonProcess(pid=proc.pid, log_path=str(log_path))
 
 
-def _persist_spawned_daemon(
-    *,
+_DAEMON_CLAIM_TIMEOUT_S = 10.0
+
+
+def _wait_for_daemon_claim(
     target: str,
     spawned: _SpawnedDaemonProcess,
-    config_sig: str,
-) -> None:
-    """
-    Persist registry and legacy pidfile entries for a spawned daemon.
-
-    :param target: Normalized daemon target, e.g. ``"local"``.
-    :param spawned: Spawned process metadata.
-    :param config_sig: Config signature this daemon was spawned under,
-        e.g. ``"3f9a1c2b4d5e6f70"`` (see :func:`server_config_signature`).
-    """
-    mode = "local" if target == _LOCAL_DAEMON_MARKER else "server"
-    _write_daemon_record(
-        _HostDaemonRecord(
-            pid=spawned.pid,
-            target=target,
-            mode=mode,
-            server_url=None if mode == "local" else target,
-            log_path=spawned.log_path,
-            started_at=int(time.time()),
-            host_id=_load_existing_host_id(),
-            config_sig=config_sig,
-        )
-    )
-    _HOST_PID_PATH.write_text(f"{spawned.pid}\n{target}\n")
+    *,
+    timeout_s: float = _DAEMON_CLAIM_TIMEOUT_S,
+) -> _HostDaemonRecord | None:
+    """Wait for a spawned daemon (or its concurrent winner) to claim *target*."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        record = _find_daemon_record(target)
+        if record is not None and _daemon_owner_is_live(record, target):
+            return record
+        if time.monotonic() >= deadline:
+            return None
+        # A losing child exits promptly, but the winner's process may still be
+        # importing and writing the shared record from a concurrent launcher.
+        time.sleep(0.02 if _pid_alive(spawned.pid) else 0.05)
 
 
 def _foreground_daemon_record(
@@ -3248,17 +3205,23 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
     _HOST_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
     mode_args = ["--local"] if not server_url else ["--server", server_url]
     args = [sys.executable, "-m", "omnigent.host._daemon_entry", *mode_args]
-    spawned = _spawn_host_daemon_process(
-        args=args,
-        env=_build_host_daemon_env(server_url=server_url),
-    )
+    config_sig = server_config_signature(include_features=not server_url)
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    daemon_env[DAEMON_CONFIG_SIG_ENV_VAR] = config_sig
+    spawned = _spawn_host_daemon_process(args=args, env=daemon_env)
     if spawned is None:
         return False
-    _persist_spawned_daemon(
-        target=target,
-        spawned=spawned,
-        config_sig=server_config_signature(include_features=not server_url),
-    )
+    if _wait_for_daemon_claim(target, spawned) is None:
+        # The spawned daemon (or a concurrent winner) never wrote its record:
+        # it likely crashed during startup. Point at its log so the failure is
+        # diagnosable instead of silently absent from `host status`.
+        logging.getLogger(__name__).warning(
+            "host daemon for %s did not claim its registry record within %.0fs; "
+            "see %s for the daemon's own log",
+            target,
+            _DAEMON_CLAIM_TIMEOUT_S,
+            spawned.log_path,
+        )
     return decision.config_changed
 
 
