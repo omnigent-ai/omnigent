@@ -34,7 +34,12 @@ def _downgrade(uri: str, engine: sa.Engine, revision: str) -> None:
 def test_single_alembic_head() -> None:
     script = ScriptDirectory.from_config(_build_alembic_config("sqlite://"))
     heads = script.get_heads()
-    assert heads == ["ga1b2c3d4e5f"], f"expected a single head, got {heads!r}"
+    # Single-head invariant: any migration added after the connections one
+    # must chain onto it (or its descendants), never fork a second head.
+    assert len(heads) == 1, f"expected a single head, got {heads!r}"
+    assert "ga1b2c3d4e5f" in {s.revision for s in script.walk_revisions()}, (
+        "the connections migration must remain part of the single chain"
+    )
 
 
 def test_upgrade_creates_table_downgrade_drops_it(tmp_path: Path) -> None:
