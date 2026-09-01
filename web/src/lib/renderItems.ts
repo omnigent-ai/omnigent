@@ -196,7 +196,7 @@ export type Bubble =
        *  Display-only. */
       createdAtS?: number;
     }
-  | { kind: "compaction_loading"; itemId: string }
+  | { kind: "compaction_loading"; itemId: string; createdAtS?: number }
   | { kind: "compaction"; itemId: string }
   | {
       kind: "routing_decision";
@@ -816,6 +816,7 @@ function walkBubbles(
       bubbles.push({
         kind: "compaction_loading",
         itemId: b.ctx.itemId ?? `compaction_loading_${i}`,
+        createdAtS: b.ctx.clientCreatedAtS,
       });
       i += 1;
       continue;
