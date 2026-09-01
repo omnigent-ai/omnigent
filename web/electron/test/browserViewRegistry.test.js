@@ -226,6 +226,11 @@ describe("browserViewRegistry — agent-navigation allowlist", () => {
 // can fire a redirect and assert whether it was cancelled (preventDefault).
 function makeEventCapturingRegistry() {
   const sent = []; // { channel, payload }
+  const loaded = []; // loadURL targets on the created view
+  const clipboardWrites = []; // copyTextToClipboard payloads
+  const externalOpens = []; // openUrlExternal payloads
+  const menus = []; // showContextMenu item lists
+  let copyCalls = 0; // webContents.copy() invocations
   let handlers; // { [event]: fn } for the single created view
   let windowOpenHandler;
   const registry = createBrowserViewRegistry({
@@ -234,8 +239,13 @@ function makeEventCapturingRegistry() {
       return {
         setBounds() {},
         webContents: {
-          loadURL() {},
+          loadURL(url) {
+            loaded.push(url);
+          },
           close() {},
+          copy() {
+            copyCalls += 1;
+          },
           removeListener() {},
           on(event, fn) {
             handlers[event] = fn;
@@ -251,10 +261,18 @@ function makeEventCapturingRegistry() {
     detachFromHost() {},
     sendToRenderer: (channel, payload) => sent.push({ channel, payload }),
     getHostZoomFactor: () => 1,
+    openUrlExternal: (url) => externalOpens.push(url),
+    copyTextToClipboard: (text) => clipboardWrites.push(text),
+    showContextMenu: (items) => menus.push(items),
   });
   return {
     registry,
     sent,
+    loaded,
+    clipboardWrites,
+    externalOpens,
+    menus,
+    copyCalls: () => copyCalls,
     fire: (event, targetUrl) => {
       const ev = {
         url: targetUrl,
@@ -266,6 +284,7 @@ function makeEventCapturingRegistry() {
       handlers[event](ev, targetUrl);
       return ev;
     },
+    fireContextMenu: (params) => handlers["context-menu"]({}, params),
     windowOpen: (url) => windowOpenHandler({ url }),
   };
 }
@@ -329,11 +348,87 @@ describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every h
 });
 
 describe("browserViewRegistry — child window.open is denied (S3)", () => {
-  it("installs a window-open handler that denies every popup", () => {
+  it("never opens a window: every window.open target is answered with deny", () => {
     const { registry, windowOpen } = makeEventCapturingRegistry();
     registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
     assert.deepEqual(windowOpen("https://evil.example.com/popup"), { action: "deny" });
     assert.deepEqual(windowOpen("https://example.com/ok"), { action: "deny" });
+  });
+
+  it("navigates the SAME view in place for an http(s) link target", () => {
+    const { registry, windowOpen, loaded } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    loaded.length = 0; // ignore the initial openOrNavigate load
+    assert.deepEqual(windowOpen("https://example.com/linked-page"), { action: "deny" });
+    assert.deepEqual(loaded, ["https://example.com/linked-page"]);
+  });
+
+  it("blocks an agent-locked window.open to an internal host (no in-place nav)", () => {
+    const { registry, windowOpen, loaded, sent } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    loaded.length = 0;
+    assert.deepEqual(windowOpen("http://169.254.169.254/latest/meta-data/"), {
+      action: "deny",
+    });
+    assert.deepEqual(loaded, [], "no in-place navigation to a blocked host");
+    const blocked = sent.filter((s) => s.channel === "browser-nav-blocked");
+    assert.equal(blocked.length, 1, "the SSRF block surfaces to the renderer");
+  });
+
+  it("still denies non-web schemes with no in-place nav", () => {
+    const { registry, windowOpen, loaded } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    loaded.length = 0;
+    assert.deepEqual(windowOpen("file:///etc/passwd"), { action: "deny" });
+    assert.deepEqual(windowOpen("javascript:alert(1)"), { action: "deny" });
+    assert.deepEqual(loaded, []);
+  });
+});
+
+describe("browserViewRegistry — pane context menu", () => {
+  it("offers Open Link in Browser + Copy Link Address over a link", () => {
+    const { registry, fireContextMenu, menus, externalOpens, clipboardWrites } =
+      makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    fireContextMenu({ linkURL: "https://example.com/page", selectionText: "" });
+    assert.equal(menus.length, 1);
+    assert.deepEqual(
+      menus[0].map((item) => item.label),
+      ["Open Link in Browser", "Copy Link Address"],
+    );
+    menus[0][0].click();
+    menus[0][1].click();
+    assert.deepEqual(externalOpens, ["https://example.com/page"]);
+    assert.deepEqual(clipboardWrites, ["https://example.com/page"]);
+  });
+
+  it("omits Open Link in Browser for a non-web link but still offers Copy Link Address", () => {
+    const { registry, fireContextMenu, menus } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    fireContextMenu({ linkURL: "javascript:alert(1)", selectionText: "" });
+    assert.deepEqual(
+      menus[0].map((item) => item.label),
+      ["Copy Link Address"],
+    );
+  });
+
+  it("offers Copy over selected text and routes it to webContents.copy()", () => {
+    const { registry, fireContextMenu, menus, copyCalls } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    fireContextMenu({ linkURL: "", selectionText: "hello" });
+    assert.deepEqual(
+      menus[0].map((item) => item.label),
+      ["Copy"],
+    );
+    menus[0][0].click();
+    assert.equal(copyCalls(), 1);
+  });
+
+  it("shows nothing over dead space", () => {
+    const { registry, fireContextMenu, menus } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    fireContextMenu({ linkURL: "", selectionText: "   " });
+    assert.equal(menus.length, 0);
   });
 });
 
