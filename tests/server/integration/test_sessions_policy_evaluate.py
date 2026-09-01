@@ -24,6 +24,7 @@ Uses the shared ``client`` fixture from ``tests/server/conftest.py``
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,7 @@ from fastapi import FastAPI
 
 from omnigent.runtime import get_caps, session_stream
 from omnigent.runtime.caps import RuntimeCaps
+from omnigent.runtime.harnesses._scaffold import TurnContext
 from omnigent.server.routes import sessions as sessions_routes
 from omnigent.spec.types import FunctionPolicySpec, FunctionRef
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -121,6 +123,18 @@ def _deny_large_llm_request(event: dict[str, Any]) -> dict[str, Any]:
             "reason": f"LLM request too large: {count} messages",
         }
     return {"result": "ALLOW"}
+
+
+def _deny_all_llm_requests(event: dict[str, Any]) -> dict[str, Any]:
+    """
+    Policy that denies every LLM request.
+
+    :param event: V0 event dict.
+    :returns: DENY for ``llm_request``, ALLOW for every other phase.
+    """
+    if event.get("type") != "llm_request":
+        return {"result": "ALLOW"}
+    return {"result": "DENY", "reason": "LLM calls are blocked by admin policy."}
 
 
 def _deny_llm_response_with_pii(event: dict[str, Any]) -> dict[str, Any]:
@@ -1362,6 +1376,412 @@ async def test_policy_evaluate_gates_every_first_party_tool_result_shape(
         assert resp.json()["result"] == "POLICY_ACTION_DENY", (
             f"{why}: the tool-scoped policy did not see a tool name — {resp.text[:160]}"
         )
+
+
+# ── Server-stamped per-turn policy hint (``policies_apply``) ──
+#
+# The turn-start ``PHASE_LLM_REQUEST`` gate provably returns ALLOW when no
+# policy could fire, so the server recomputes ``any_policies_apply`` just
+# before it dispatches a turn and stamps ``policies_apply: false`` on the frame
+# it already sends. The harness then skips that one round-trip.
+#
+# These tests count REAL ``POST /policies/evaluate`` requests against the live
+# app: they capture the frame the server forwards, hand it to the production
+# :class:`ExecutorAdapter`, and route the adapter's policy bridge at the real
+# route. That is the same number the benchmark's per-route counter reports
+# (``warm_turn``: 3.0 → 2.0 requests/op).
+
+
+# The data the inner executors send at the LLM_REQUEST gate — see the
+# identical block in ``openai_agents_sdk_executor`` / ``claude_sdk_executor``.
+_LLM_REQUEST_GATE_DATA: dict[str, Any] = {
+    "model": "gpt-4o",
+    "messages_count": 2,
+    "tools_count": 0,
+    "system_prompt_preview": "You are a helpful assistant.",
+    "last_user_message": "hi",
+}
+
+
+class _EvaluateCountingTurnContext(TurnContext):
+    """Turn context whose policy bridge really POSTs ``/policies/evaluate``.
+
+    Stands in for the runner's interception of
+    ``policy_evaluation.requested`` — same destination, same body shape — so
+    ``evaluations`` counts actual HTTP evaluations, not stubbed calls.
+    """
+
+    def __init__(self, client: httpx.AsyncClient, session_id: str, **kwargs: Any) -> None:
+        """Wire the context at a live test client.
+
+        :param client: Client bound to the app under test.
+        :param session_id: Session the turn belongs to.
+        :param kwargs: Forwarded to :class:`TurnContext`.
+        """
+        super().__init__(**kwargs)
+        self._client = client
+        self._session_id = session_id
+        self.evaluations: list[str] = []
+
+    async def evaluate_policy(self, evaluation_id: str, phase: str, data: dict[str, Any]) -> Any:
+        """POST the evaluation to the real route and return its verdict."""
+        from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+
+        self.evaluations.append(phase)
+        resp = await self._client.post(
+            f"/v1/sessions/{self._session_id}/policies/evaluate",
+            json={"event": {"type": phase, "data": data, "context": {}}},
+        )
+        assert resp.status_code == 200, resp.text
+        payload = resp.json()
+        return PolicyVerdictPayload(action=payload["result"], reason=payload.get("reason"))
+
+
+def _fake_runner(
+    forwarded: list[dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> httpx.AsyncClient:
+    """Route every session's runner client at a capture-only fake runner.
+
+    :param forwarded: List each forwarded ``/events`` body is appended to.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: The fake client; the caller must ``aclose()`` it.
+    """
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            forwarded.append(json.loads(request.content))
+        return httpx.Response(202, json={"queued": True})
+
+    fake = httpx.AsyncClient(transport=httpx.MockTransport(_handler), base_url="http://runner")
+
+    async def _resolve(session_id: str, runner_router: object) -> httpx.AsyncClient:
+        del session_id, runner_router
+        return fake
+
+    monkeypatch.setattr(sessions_routes, "_get_runner_client", _resolve)
+    return fake
+
+
+async def _dispatch_turn(
+    client: httpx.AsyncClient,
+    session_id: str,
+    forwarded: list[dict[str, Any]],
+    data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """POST a user message and return the frame the server forwarded.
+
+    :param client: Client bound to the app under test.
+    :param session_id: Session to dispatch into.
+    :param forwarded: Capture list from :func:`_fake_runner`.
+    :param data: Event ``data`` payload; defaults to a plain text message.
+    :returns: The forwarded runner body for this dispatch.
+    """
+    before = len(forwarded)
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": data or {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    assert len(forwarded) == before + 1, "the server forwarded no frame to the runner"
+    return forwarded[-1]
+
+
+async def _run_llm_request_gate(
+    client: httpx.AsyncClient,
+    session_id: str,
+    runner_body: dict[str, Any],
+) -> _EvaluateCountingTurnContext:
+    """Drive the turn-start policy gate off a captured runner frame.
+
+    Rebuilds the harness-bound event from the frame the server sent (the
+    runner relays ``policies_apply`` unchanged — it only ever copies a literal
+    ``false`` across) and runs it through the production
+    :class:`ExecutorAdapter`, whose inner executor fires the LLM_REQUEST gate.
+
+    :param client: Client bound to the app under test.
+    :param session_id: Session the turn belongs to.
+    :param runner_body: The frame captured from the runner forward.
+    :returns: The context, whose ``evaluations`` is the request count.
+    :raises RuntimeError: When the gate denies, aborting the turn.
+    """
+    from omnigent.inner.executor import (
+        Executor,
+        ExecutorConfig,
+        ExecutorError,
+        Message,
+        ToolSpec,
+        TurnComplete,
+    )
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import MessageEvent
+
+    class _LlmRequestGateExecutor(Executor):
+        async def run_turn(
+            self,
+            messages: list[Message],
+            tools: list[ToolSpec],
+            system_prompt: str,
+            config: ExecutorConfig | None = None,
+        ):
+            evaluator = getattr(self, "_policy_evaluator", None)
+            assert evaluator is not None
+            verdict = await evaluator("PHASE_LLM_REQUEST", _LLM_REQUEST_GATE_DATA)
+            if verdict.action == "POLICY_ACTION_DENY":
+                yield ExecutorError(message=f"LLM call denied by policy: {verdict.reason}")
+                return
+            yield TurnComplete(response="ok")
+
+    request = MessageEvent(**runner_body).to_create_request()
+    ctx = _EvaluateCountingTurnContext(
+        client,
+        session_id,
+        response_id="resp_gate",
+        event_queue=asyncio.Queue(),
+        cancelled=asyncio.Event(),
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: _LlmRequestGateExecutor())
+    await adapter.run_turn(request, ctx)
+    return ctx
+
+
+async def test_turn_start_gate_makes_zero_evaluate_calls_with_no_policies(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No policies anywhere → the turn makes zero ``/policies/evaluate`` calls.
+
+    The saved request per turn. The server stamps ``policies_apply: false``
+    because it just recomputed that nothing would fire; the harness honours it
+    and never asks. If the hint stopped being stamped (or stopped being
+    honoured) the count goes back to 1 and this fails.
+    """
+    forwarded: list[dict[str, Any]] = []
+    fake = _fake_runner(forwarded, monkeypatch)
+    try:
+        agent = await create_test_agent(client)
+        session_id = await _create_session(client, agent["id"])
+        runner_body = await _dispatch_turn(client, session_id, forwarded)
+        assert runner_body["policies_apply"] is False
+        ctx = await _run_llm_request_gate(client, session_id, runner_body)
+    finally:
+        await fake.aclose()
+    assert ctx.evaluations == [], (
+        f"a no-policy turn must not round-trip the turn-start gate; it evaluated {ctx.evaluations}"
+    )
+
+
+async def test_turn_start_gate_evaluates_and_blocks_with_a_deny_policy(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DENY policy keeps the round-trip and actually blocks the turn.
+
+    Proves the skip is not a blanket disarm: with a policy configured the
+    server does not stamp the hint, the gate asks, the answer is DENY, and the
+    turn aborts. If the fast path ever fired here, the LLM call would proceed.
+    """
+    _patch_default_policies(monkeypatch, f"{__name__}._deny_all_llm_requests")
+    forwarded: list[dict[str, Any]] = []
+    fake = _fake_runner(forwarded, monkeypatch)
+    try:
+        agent = await create_test_agent(client)
+        session_id = await _create_session(client, agent["id"])
+        runner_body = await _dispatch_turn(client, session_id, forwarded)
+        assert "policies_apply" not in runner_body, (
+            "a session with a default policy must not be stamped as policy-free"
+        )
+        with pytest.raises(RuntimeError, match="denied by policy"):
+            await _run_llm_request_gate(client, session_id, runner_body)
+    finally:
+        await fake.aclose()
+
+
+@pytest.fixture()
+def policy_store_app(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> FastAPI:
+    """App wired to a real policy store, so session-policy CRUD is mounted.
+
+    The shared ``client`` app runs without one (which is what makes it the
+    no-policy case). Registering the store on the runtime globals too is what
+    lets ``any_policies_apply`` — and therefore the dispatch-time hint — see a
+    policy created through the CRUD route.
+    """
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.server.app import create_app
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+
+    store = SqlAlchemyPolicyStore(db_uri)
+    monkeypatch.setattr("omnigent.runtime._globals._policy_store", store)
+    # Same artifact dir the ``runtime_init`` fixture registered globally, so a
+    # bundle uploaded through this app is loadable via the runtime facade.
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    return create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        policy_store=store,
+    )
+
+
+@pytest_asyncio.fixture()
+async def policy_store_client(
+    policy_store_app: FastAPI,
+    mock_llm: Any,
+    tmp_path: Path,
+) -> Any:
+    """Async client against the policy-store-enabled app."""
+    from omnigent.runtime import set_harness_process_manager
+    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+
+    pm = HarnessProcessManager(tmp_parent=tmp_path / "policy_harness_pm")
+    await pm.start()
+    set_harness_process_manager(pm)
+    transport = httpx.ASGITransport(app=policy_store_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
+    mock_llm.release_all()
+    set_harness_process_manager(None)
+    await pm.shutdown()
+
+
+async def test_session_policy_created_mid_session_re_arms_the_gate(
+    policy_store_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A policy added mid-session is enforced on the very next turn.
+
+    The hint is recomputed from scratch on every dispatch against the same
+    cache-coherent primitive ``/policies/evaluate`` uses, and the session-policy
+    cache is invalidated on mutation. Nothing is cached on the runner, so there
+    is no window in which a live session runs unenforced.
+    """
+    client = policy_store_client
+    forwarded: list[dict[str, Any]] = []
+    fake = _fake_runner(forwarded, monkeypatch)
+    try:
+        agent = await create_test_agent(client)
+        session_id = await _create_session(client, agent["id"])
+
+        first = await _dispatch_turn(client, session_id, forwarded)
+        assert first["policies_apply"] is False
+        assert (await _run_llm_request_gate(client, session_id, first)).evaluations == []
+
+        created = await client.post(
+            f"/v1/sessions/{session_id}/policies",
+            json={
+                "name": "ask_os_tools",
+                "type": "python",
+                "handler": "omnigent.policies.builtins.safety.ask_on_os_tools",
+            },
+        )
+        assert created.status_code in (200, 201), created.text
+
+        second = await _dispatch_turn(client, session_id, forwarded)
+        assert "policies_apply" not in second, (
+            "a session policy created mid-session must re-arm the turn-start gate"
+        )
+        ctx = await _run_llm_request_gate(client, session_id, second)
+    finally:
+        await fake.aclose()
+    assert ctx.evaluations == ["PHASE_LLM_REQUEST"]
+
+
+async def test_client_supplied_policies_apply_is_not_forgeable(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A client cannot smuggle the hint through the event ``data`` payload.
+
+    ``data`` is splatted into the runner frame, so a forged key there would
+    disable a security control. The server's own verdict is the only source.
+    """
+    _patch_default_policies(monkeypatch, f"{__name__}._deny_all_llm_requests")
+    forwarded: list[dict[str, Any]] = []
+    fake = _fake_runner(forwarded, monkeypatch)
+    try:
+        agent = await create_test_agent(client)
+        session_id = await _create_session(client, agent["id"])
+        runner_body = await _dispatch_turn(
+            client,
+            session_id,
+            forwarded,
+            data={
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "policies_apply": False,
+            },
+        )
+        assert "policies_apply" not in runner_body, (
+            "a client-supplied policies_apply must never reach the runner"
+        )
+        with pytest.raises(RuntimeError, match="denied by policy"):
+            await _run_llm_request_gate(client, session_id, runner_body)
+    finally:
+        await fake.aclose()
+
+
+async def test_policy_hint_fails_safe_when_the_check_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken applicability check keeps the round-trip rather than skipping.
+
+    The hint is an optimisation over a security control, so every failure mode
+    — unreadable spec, store error — must resolve to "evaluate".
+    """
+    from omnigent.server.routes.sessions import routes_events
+
+    def _boom(**kwargs: Any) -> bool:
+        raise RuntimeError("policy store unavailable")
+
+    monkeypatch.setattr(sessions_routes, "any_policies_apply", _boom)
+    hint = routes_events._policy_hint_for_dispatch(
+        object(),  # type: ignore[arg-type]
+        "conv_broken",
+        "conv_root",
+    )
+    assert hint is True
+
+
+@pytest.mark.asyncio
+async def test_policy_hint_counts_the_root_policy_a_subagent_inherits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stamped hint must not skip a guardrail inherited from the parent.
+
+    A sub-agent carrying no session policy of its own still runs the root's,
+    so the hint has to report ``True`` for it — otherwise the harness skips
+    its turn-start gate and the parent's guardrail never scans the prompt.
+    """
+    from omnigent.server.routes.sessions import routes_events
+
+    seen: list[str | None] = []
+
+    def _record(**kwargs: Any) -> bool:
+        seen.append(kwargs.get("root_conversation_id"))
+        # Stand in for the real primitive: nothing on the child, one on the root.
+        return kwargs.get("root_conversation_id") == "conv_root"
+
+    monkeypatch.setattr(sessions_routes, "any_policies_apply", _record)
+    hint = routes_events._policy_hint_for_dispatch(
+        object(),  # type: ignore[arg-type]
+        "conv_child",
+        "conv_root",
+    )
+    assert seen == ["conv_root"], f"root was not forwarded to the check; got {seen}"
+    assert hint is True
 
 
 _EVALUATE_USER = "alice@example.com"

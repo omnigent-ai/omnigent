@@ -27,6 +27,7 @@ import pytest
 
 from omnigent.inner.executor import Executor
 from omnigent.runtime.harnesses import _HARNESS_MODULES
+from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload, TurnContext
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 
 _TEST_HARNESS_NAME = "executor_adapter_fixture"
@@ -2255,6 +2256,215 @@ async def test_policy_evaluator_no_active_turn_context_is_phase_aware() -> None:
         verdict = await adapter._stable_policy_evaluator(advisory_phase, {})
         assert verdict.action == "POLICY_ACTION_ALLOW", advisory_phase
         assert verdict.reason is None, advisory_phase
+
+
+# ── Server-stamped per-turn policy hint (``policies_apply``) ──
+#
+# The server recomputes ``any_policies_apply`` microseconds before it dispatches
+# a turn and stamps ``policies_apply: false`` on the frame only when nothing
+# could fire. These tests count the round-trips the adapter's policy bridge
+# makes so a regression that skipped an enforced gate — or stopped skipping the
+# provably-ALLOW one — fails here.
+
+
+class _CountingPolicyTurnContext(TurnContext):
+    """Real :class:`TurnContext` whose ``evaluate_policy`` counts and scripts.
+
+    Subclasses the production context (rather than stubbing it) so the adapter
+    exercises the same object it uses in a live turn; only the server round-trip
+    is replaced by a counter and a scripted verdict.
+    """
+
+    def __init__(self, action: str = "POLICY_ACTION_ALLOW", **kwargs: Any) -> None:
+        """Initialize the counting context.
+
+        :param action: Verdict every scripted evaluation returns, e.g.
+            ``"POLICY_ACTION_DENY"``.
+        :param kwargs: Forwarded to :class:`TurnContext`.
+        """
+        super().__init__(**kwargs)
+        self._scripted_action = action
+        self.evaluated_phases: list[str] = []
+
+    async def evaluate_policy(
+        self, evaluation_id: str, phase: str, data: dict[str, Any]
+    ) -> PolicyVerdictPayload:
+        """Record the round-trip and return the scripted verdict."""
+        self.evaluated_phases.append(phase)
+        return PolicyVerdictPayload(
+            action=self._scripted_action,
+            reason="scripted" if self._scripted_action == "POLICY_ACTION_DENY" else None,
+        )
+
+
+def _counting_ctx(action: str = "POLICY_ACTION_ALLOW") -> _CountingPolicyTurnContext:
+    """Build a counting turn context with fresh asyncio primitives."""
+    import asyncio as _aio
+
+    return _CountingPolicyTurnContext(
+        action=action,
+        response_id="resp_policy",
+        event_queue=_aio.Queue(),
+        cancelled=_aio.Event(),
+    )
+
+
+def _policy_gate_executor(phases: tuple[str, ...]) -> Any:
+    """Return an :class:`Executor` that fires the adapter's bridge at *phases*.
+
+    Stands in for the inner SDK executors, which call the adapter-installed
+    ``_policy_evaluator`` at each enforcement phase and abort the turn on DENY.
+
+    :param phases: Phases to evaluate, in order.
+    :returns: An executor class ready for ``executor_factory``.
+    """
+    from omnigent.inner.executor import (
+        Executor,
+        ExecutorConfig,
+        ExecutorError,
+        Message,
+        ToolSpec,
+        TurnComplete,
+    )
+
+    class _PolicyGateExecutor(Executor):
+        async def run_turn(
+            self,
+            messages: list[Message],
+            tools: list[ToolSpec],
+            system_prompt: str,
+            config: ExecutorConfig | None = None,
+        ):
+            evaluator = getattr(self, "_policy_evaluator", None)
+            assert evaluator is not None, "adapter did not install the policy bridge"
+            for phase in phases:
+                verdict = await evaluator(phase, {"model": "mock"})
+                if verdict.action == "POLICY_ACTION_DENY":
+                    yield ExecutorError(message=f"{phase} denied by policy: {verdict.reason}")
+                    return
+            yield TurnComplete(response="ok")
+
+    return _PolicyGateExecutor
+
+
+@pytest.mark.asyncio
+async def test_llm_request_gate_skips_round_trip_when_server_stamps_no_policies() -> None:
+    """``policies_apply: false`` drops the turn-start LLM_REQUEST round-trip.
+
+    This is the whole point of the hint: the server already computed, with the
+    same primitive its ``/policies/evaluate`` handler uses, that the answer for
+    this turn is ALLOW. Counting zero evaluations for LLM_REQUEST is the
+    regression guard for the saved request per turn.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import CreateResponseRequest
+
+    adapter = ExecutorAdapter(executor_factory=_policy_gate_executor(("PHASE_LLM_REQUEST",)))
+    ctx = _counting_ctx()
+    await adapter.run_turn(
+        CreateResponseRequest(model="agent", input="hi", policies_apply=False),
+        ctx,
+    )
+    assert ctx.evaluated_phases == [], (
+        "the server stamped policies_apply=false, so the turn-start gate must "
+        f"not round-trip; it evaluated {ctx.evaluated_phases}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_later_gates_still_round_trip_when_llm_request_is_skipped() -> None:
+    """Only LLM_REQUEST is skipped; every later gate still asks the server.
+
+    LLM_RESPONSE, TOOL_CALL and TOOL_RESULT fire seconds to minutes after
+    dispatch, so a dispatch-time snapshot is not good enough for them — a
+    policy added mid-turn (including the engine's always-injected
+    ``sys_add_policy`` ASK) must still be enforced.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import CreateResponseRequest
+
+    later = ("PHASE_LLM_RESPONSE", "PHASE_TOOL_CALL", "PHASE_TOOL_RESULT")
+    adapter = ExecutorAdapter(
+        executor_factory=_policy_gate_executor(("PHASE_LLM_REQUEST", *later))
+    )
+    ctx = _counting_ctx()
+    await adapter.run_turn(
+        CreateResponseRequest(model="agent", input="hi", policies_apply=False),
+        ctx,
+    )
+    assert ctx.evaluated_phases == list(later)
+
+
+@pytest.mark.parametrize(
+    "hint",
+    [
+        pytest.param({}, id="absent"),
+        pytest.param({"policies_apply": True}, id="true"),
+        pytest.param({"policies_apply": "banana"}, id="malformed-string"),
+        pytest.param({"policies_apply": 0}, id="malformed-int"),
+        pytest.param({"policies_apply": {"nested": 1}}, id="malformed-object"),
+        pytest.param({"policies_apply": None}, id="explicit-null"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_absent_or_malformed_hint_still_evaluates(hint: dict[str, Any]) -> None:
+    """Anything but a literal ``false`` keeps the round-trip — fail-safe.
+
+    A hint the server never sent (non-web dispatch paths such as scheduled
+    fires) or one that arrived garbled must never disable a control, and must
+    not fail the turn either.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import CreateResponseRequest
+
+    adapter = ExecutorAdapter(executor_factory=_policy_gate_executor(("PHASE_LLM_REQUEST",)))
+    ctx = _counting_ctx()
+    await adapter.run_turn(CreateResponseRequest(model="agent", input="hi", **hint), ctx)
+    assert ctx.evaluated_phases == ["PHASE_LLM_REQUEST"]
+
+
+@pytest.mark.asyncio
+async def test_deny_verdict_blocks_the_turn_when_policies_apply() -> None:
+    """With policies in play the gate round-trips and a DENY blocks the turn.
+
+    Pairs with the skip tests: proves the round-trip the hint preserves is the
+    one that actually stops a turn, so "0 evaluations" can only ever mean "the
+    server said nothing would fire".
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import CreateResponseRequest
+
+    adapter = ExecutorAdapter(executor_factory=_policy_gate_executor(("PHASE_LLM_REQUEST",)))
+    ctx = _counting_ctx(action="POLICY_ACTION_DENY")
+    with pytest.raises(RuntimeError, match="PHASE_LLM_REQUEST denied by policy"):
+        await adapter.run_turn(CreateResponseRequest(model="agent", input="hi"), ctx)
+    assert ctx.evaluated_phases == ["PHASE_LLM_REQUEST"]
+
+
+@pytest.mark.asyncio
+async def test_policy_hint_does_not_leak_into_the_next_turn() -> None:
+    """The hint is per-turn: a skipped turn must not disarm the next one.
+
+    The policy bridge is installed once and closure-captured by the inner SDK,
+    so the flag is read off the adapter at call time. If it were captured
+    per-turn instead, a session whose first turn had no policies would keep
+    skipping the gate after a policy was added.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import CreateResponseRequest
+
+    adapter = ExecutorAdapter(executor_factory=_policy_gate_executor(("PHASE_LLM_REQUEST",)))
+    skipped = _counting_ctx()
+    await adapter.run_turn(
+        CreateResponseRequest(model="agent", input="hi", policies_apply=False),
+        skipped,
+    )
+    assert skipped.evaluated_phases == []
+
+    # Next turn: a policy now exists, so the server stops stamping the hint.
+    enforced = _counting_ctx()
+    await adapter.run_turn(CreateResponseRequest(model="agent", input="hi"), enforced)
+    assert enforced.evaluated_phases == ["PHASE_LLM_REQUEST"]
 
 
 class _CancelFlag:

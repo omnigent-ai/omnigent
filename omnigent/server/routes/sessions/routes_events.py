@@ -6,7 +6,7 @@ import asyncio
 import secrets
 import weakref
 from collections.abc import Callable
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import httpx
 from fastapi import (
@@ -220,10 +220,54 @@ from omnigent.telemetry.events import TurnEndEvent as _TelTurnEndEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.tools.client_specified import parse_client_side_tool_specs
 
+if TYPE_CHECKING:
+    from omnigent.spec.types import AgentSpec
+
 _retry_recovery_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
 _retry_recovery_tasks: dict[str, asyncio.Task[dict[str, bool | str]]] = {}
+
+
+def _policy_hint_for_dispatch(
+    spec: AgentSpec, session_id: str, root_conversation_id: str | None
+) -> bool:
+    """Return the per-turn ``policies_apply`` hint stamped on a runner forward.
+
+    The server stays the sole decider: this asks the same
+    :func:`omnigent.runtime.policies.builder.any_policies_apply` primitive that
+    ``POST /policies/evaluate`` consults, microseconds before dispatch, and the
+    runner only relays the answer. Fails safe — any error returns ``True``, so
+    the turn keeps its round-trip and the gate is enforced as before.
+
+    :param spec: The loaded agent spec for this session.
+    :param session_id: Conversation id, e.g. ``"conv_abc123"``.
+    :param root_conversation_id: Root of this session's tree, so a sub-agent
+        still reports ``True`` for a guardrail its parent session configured.
+    :returns: ``False`` only when no policy could fire for this turn.
+    """
+    from omnigent.server.routes import sessions as _sf
+
+    try:
+        return bool(
+            _sf.any_policies_apply(
+                spec=spec,
+                conversation_id=session_id,
+                default_policies=_sf.get_caps().default_policies,
+                policy_store=_sf.get_policy_store(),
+                root_conversation_id=root_conversation_id,
+                phase=None,
+                tool_name=None,
+            )
+        )
+    except Exception:
+        _logger.warning(
+            "policies_apply hint computation failed for session=%s; "
+            "keeping the per-turn policy round-trip",
+            session_id,
+            exc_info=True,
+        )
+        return True
 
 
 def _retry_recovery_lock(session_id: str) -> asyncio.Lock:
@@ -1851,6 +1895,13 @@ def register_events_routes(
         # asyncio.to_thread wrapper covers the rare cold-cache path
         # where the bundle is extracted from disk for the first time.
         _has_mcp_servers = False
+        # Per-turn policy verdict for the runner's turn-start LLM_REQUEST
+        # gate. Recomputed from scratch on every dispatch with the same
+        # primitive POST /policies/evaluate uses, so a policy added
+        # mid-session is picked up on the next turn. True unless the
+        # server positively established that nothing would fire — an
+        # unreadable spec or any failure keeps the round-trip.
+        _policies_apply = True
         if _agent is not None and agent_cache is not None and _agent.bundle_location:
             try:
                 _loaded_agent = await asyncio.to_thread(
@@ -1859,6 +1910,11 @@ def register_events_routes(
                     _agent.bundle_location,
                 )
                 _has_mcp_servers = bool(_loaded_agent.spec.mcp_servers)
+                _policies_apply = _policy_hint_for_dispatch(
+                    _loaded_agent.spec,
+                    session_id,
+                    conv.root_conversation_id,
+                )
             except Exception:
                 _logger.warning(
                     "Failed to load agent spec for MCP hint for session=%s",
@@ -1916,6 +1972,7 @@ def register_events_routes(
             file_store=file_store,
             artifact_store=artifact_store,
             has_mcp_servers=_has_mcp_servers,
+            policies_apply=_policies_apply,
             created_by=created_by,
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,

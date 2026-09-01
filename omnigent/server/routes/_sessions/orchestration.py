@@ -4758,6 +4758,7 @@ async def _forward_event_to_runner(
     file_store: FileStore | None = None,
     artifact_store: ArtifactStore | None = None,
     has_mcp_servers: bool = False,
+    policies_apply: bool = True,
     created_by: str | None = None,
     host_store: HostStore | None = None,
 ) -> str:
@@ -4786,6 +4787,11 @@ async def _forward_event_to_runner(
         ``has_mcp_servers`` hint so ``proxy_stream`` knows to load
         the agent spec and initialise :class:`ProxyMcpManager` for
         this turn. ``False`` by default (agents without MCP servers).
+    :param policies_apply: The server's per-turn policy verdict. ``False``
+        means it recomputed, just now, that no policy could fire for this
+        turn, letting the harness skip the turn-start LLM_REQUEST
+        round-trip. Stamped on the runner body only when ``False``;
+        absent means evaluate. ``True`` by default.
     :param created_by: Authenticated identity of the posting actor,
         recorded on the persisted item for attribution.
     :param host_store: Host registrations, read only to learn whether this
@@ -4818,6 +4824,10 @@ async def _forward_event_to_runner(
     # harness don't have access to the server's file store — the
     # LLM endpoint needs the actual content, not an internal ID.
     forwarded_data = dict(body.data)
+    # ``body.data`` is client-supplied and is splatted into the runner body
+    # below, so a forged key here would disable a security control. The
+    # server's own verdict is the only source of this hint.
+    forwarded_data.pop("policies_apply", None)
     if (
         file_store is not None
         and artifact_store is not None
@@ -4879,6 +4889,12 @@ async def _forward_event_to_runner(
         # resolved copy — id-based dedup, not a role/content guess.
         "persisted_item_id": persisted_items[0].id,
     }
+    # Per-turn policy verdict for the harness's turn-start LLM_REQUEST gate.
+    # Stamped only when the server established that nothing would fire —
+    # absent means evaluate, so every other dispatch path (scheduled fires,
+    # sub-agent forwards) keeps the round-trip without opting in.
+    if policies_apply is False:
+        runner_body["policies_apply"] = False
     # Persist the turn-initiating actor so /policies/evaluate and MCP
     # tools/call can read it back on any server replica.  Skip system-driven
     # forwards (sub-agent results, parent-wake carry created_by=None) — they
@@ -5468,6 +5484,7 @@ async def _dispatch_session_event_to_runner_impl(
     file_store: FileStore | None,
     artifact_store: ArtifactStore | None,
     has_mcp_servers: bool = False,
+    policies_apply: bool = True,
     created_by: str | None = None,
     runner_router: RunnerRouter | None = None,
     native_terminal_ready: bool = False,
@@ -5525,6 +5542,10 @@ async def _dispatch_session_event_to_runner_impl(
     :param has_mcp_servers: ``True`` when the agent spec declares at
         least one MCP server. Forwarded to the runner as the
         ``has_mcp_servers`` hint. ``False`` by default.
+    :param policies_apply: The server's per-turn policy verdict, forwarded
+        to the runner as the ``policies_apply`` hint. ``False`` lets the
+        harness skip the turn-start LLM_REQUEST round-trip. ``True`` by
+        default (evaluate).
     :param created_by: Authenticated identity of the posting actor,
         e.g. ``"alice@example.com"``. On the non-native path it is
         recorded directly on the persisted item. On the claude-native
@@ -5769,6 +5790,7 @@ async def _dispatch_session_event_to_runner_impl(
         file_store=file_store,
         artifact_store=artifact_store,
         has_mcp_servers=has_mcp_servers,
+        policies_apply=policies_apply,
         created_by=created_by,
         host_store=host_store,
     )

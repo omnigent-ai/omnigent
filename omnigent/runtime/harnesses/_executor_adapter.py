@@ -131,6 +131,12 @@ class ExecutorAdapter(HarnessApp):
         # current turn's ctx, not turn 1's dead ctx.
         self._current_ctx: TurnContext | None = None
         self._current_agent: str | None = None
+        # Per-turn policy verdict the server stamped on this turn's dispatch.
+        # False only when the server established that no policy could fire,
+        # which lets the turn-start LLM_REQUEST gate skip its round-trip.
+        # Read off self (not closure-captured) because the policy bridge is
+        # installed once and must see the current turn's value.
+        self._policies_apply = True
         # FIFO queue of inner-SDK tool-use ids from ToolCallRequest events. Drained by
         # _stable_tool_executor so each dispatch reuses the same call_id as the inline
         # observed event, letting BlockStream dedupe the two renders into one.
@@ -198,6 +204,8 @@ class ExecutorAdapter(HarnessApp):
             executor._policy_evaluator = self._stable_policy_evaluator  # type: ignore[attr-defined]
         self._current_ctx = ctx
         self._current_agent = request.model
+        # Only a literal False skips a gate; absent/True/malformed evaluate.
+        self._policies_apply = request.policies_apply is not False
         # Clear per-turn state so stale entries from an errored prior turn don't bleed through.
         self._pending_mcp_call_ids.clear()
         # Reset orphan counter: measures only post-bind orphans (no intervening clean turn).
@@ -667,6 +675,14 @@ class ExecutorAdapter(HarnessApp):
         """Stable bridge for policy evaluation; routes through ``ctx.evaluate_policy``.
 
         Fails closed (DENY) for tool-call phases when no turn context is active.
+
+        Skips the round-trip for the turn-start ``PHASE_LLM_REQUEST`` gate when
+        the server stamped ``policies_apply: false`` on this turn — it already
+        computed that the answer is ALLOW, microseconds earlier, with the same
+        primitive its ``/policies/evaluate`` handler uses. Every later gate
+        (``PHASE_LLM_RESPONSE``, ``PHASE_TOOL_CALL``, ``PHASE_TOOL_RESULT``)
+        fires seconds to minutes after dispatch and still round-trips, so a
+        policy added mid-turn is enforced.
         """
         ctx = self._current_ctx
         if ctx is None:
@@ -688,6 +704,8 @@ class ExecutorAdapter(HarnessApp):
                     f"No active turn context; failing closed for {phase}." if fail_closed else None
                 ),
             )
+        if phase == "PHASE_LLM_REQUEST" and not self._policies_apply:
+            return PolicyVerdictPayload(action="POLICY_ACTION_ALLOW")
         evaluation_id = f"poleval_{secrets.token_hex(16)}"
         return await ctx.evaluate_policy(evaluation_id, phase, data)
 

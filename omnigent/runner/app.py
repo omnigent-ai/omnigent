@@ -6727,6 +6727,12 @@ def create_runner_app(
                 _model_override,
                 extra={"session_id": conv},
             )
+        # Per-turn policy verdict from the server. Relayed, never decided here:
+        # only a literal ``False`` (the server established that no policy could
+        # fire for this turn) is forwarded, so an absent or malformed hint
+        # leaves the harness evaluating as before.
+        if msg_body.get("policies_apply") is False:
+            harness_body["policies_apply"] = False
         # Resolve the effort for this turn — an explicit per-event value, else
         # the session's remembered one — then deliver only what this harness can
         # accept. The persisted effort is validated at create against the union

@@ -980,6 +980,10 @@ class CreateResponseRequest(BaseModel):
         e.g. ``"openai/gpt-5.4-mini"``. Distinct from ``model``
         (agent name). Substitutes for the spec's ``llm.model`` for
         this single request. Drives the REPL's ``/model`` command.
+    :param policies_apply: Server-stamped per-turn policy verdict.
+        ``False`` means no policy could fire for this turn, so the
+        turn-start ``PHASE_LLM_REQUEST`` gate skips its round-trip to
+        the server. Absent, ``True``, or malformed all mean evaluate.
     :param context_management: Compaction strategy objects,
         e.g. ``[{"type": "compaction", ...}]``.
     :param temperature: Ignored — agent controls this. Silently
@@ -1035,6 +1039,12 @@ class CreateResponseRequest(BaseModel):
     # Per-request LLM model override (distinct from ``model``, which
     # carries the agent name). See class docstring for semantics.
     model_override: str | None = None
+    # Per-turn policy verdict stamped by the server: ``False`` means the
+    # server recomputed, just before dispatch, that no policy could fire
+    # for this turn, so the turn-start LLM_REQUEST gate can skip its
+    # round-trip. Anything else — absent, ``True``, or a malformed value
+    # the validator below flattens to ``None`` — means evaluate.
+    policies_apply: bool | None = None
     # Compaction strategy objects, e.g. [{"type": "compaction", ...}]
     context_management: list[dict[str, Any]] | None = None
     # Ignored fields — agent controls these; silently dropped.
@@ -1049,6 +1059,20 @@ class CreateResponseRequest(BaseModel):
     parallel_tool_calls: bool | None = None
     max_tool_calls: int | None = None
     top_logprobs: int | None = None
+
+    @field_validator("policies_apply", mode="before")
+    @classmethod
+    def _only_literal_false_skips_policies(cls, value: object) -> bool | None:
+        """Normalize the policy hint so only a literal ``False`` can skip a gate.
+
+        A malformed hint must never disable a security control, and it must
+        not 422 the turn either. Everything that is not exactly ``False``
+        becomes ``None``, which the harness reads as "evaluate".
+
+        :param value: The raw hint as it arrived on the wire.
+        :returns: ``False`` for a literal ``False``, else ``None``.
+        """
+        return False if value is False else None
 
     @model_validator(mode="after")
     def _require_model_for_new_conversations(self) -> CreateResponseRequest:
