@@ -56,7 +56,7 @@ import logging
 import os
 import re
 import time
-from collections.abc import Container, Iterable
+from collections.abc import Collection, Container, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -360,7 +360,7 @@ def _read_new_events(
 def _read_new_forward_events(
     events_file: Path,
     offset: int,
-    seen: Container[str],
+    seen: Collection[str],
     agent_name: str,
     last_assistant_text: str,
     last_assistant_stop_reason: str | None = None,
