@@ -182,9 +182,9 @@ export const CMD_RIGHT_LINE_END = "\x05"; // Ctrl-E: cursor to line end
  *   xterm encodes Alt-modified keys as ESC-prefixed sequences that
  *   readline/zsh read as word operations; Cmd (metaKey) combos get no
  *   encoding at all — the browser eats them and nothing reaches the PTY.
- *   Each maps to the Ctrl control character a native terminal sends
- *   (#5029). Only bare Cmd combos are mapped: Cmd+C/V/K/R and friends keep
- *   their browser/xterm meaning (copy/paste/clear/reload).
+ *   Each maps to the Ctrl control character a native terminal sends. Only
+ *   bare Cmd combos are mapped: Cmd+C/V/K/R and friends keep their
+ *   browser/xterm meaning (copy/paste/clear/reload).
  *
  * :param event: Browser keyboard event from xterm's custom key handler.
  * :returns: Bytes to send instead of xterm's default handling, or ``null``

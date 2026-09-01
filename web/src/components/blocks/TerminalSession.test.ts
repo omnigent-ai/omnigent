@@ -214,16 +214,10 @@ describe("terminalKeyEventPayload", () => {
   it("maps macOS Cmd line shortcuts to their readline control bytes", () => {
     // WHY: Option+key works because xterm encodes Alt as ESC-prefixes, but
     // Cmd (metaKey) combos reach neither xterm nor the PTY — native-terminal
-    // line editing (delete to start / home / end) silently did nothing (#5029).
-    expect(
-      terminalKeyEventPayload(keyEvent({ key: "Backspace", metaKey: true })),
-    ).toBe("\x15");
-    expect(
-      terminalKeyEventPayload(keyEvent({ key: "ArrowLeft", metaKey: true })),
-    ).toBe("\x01");
-    expect(
-      terminalKeyEventPayload(keyEvent({ key: "ArrowRight", metaKey: true })),
-    ).toBe("\x05");
+    // line editing (delete to start / home / end) silently did nothing.
+    expect(terminalKeyEventPayload(keyEvent({ key: "Backspace", metaKey: true }))).toBe("\x15");
+    expect(terminalKeyEventPayload(keyEvent({ key: "ArrowLeft", metaKey: true }))).toBe("\x01");
+    expect(terminalKeyEventPayload(keyEvent({ key: "ArrowRight", metaKey: true }))).toBe("\x05");
   });
 
   it("keeps browser-owned Cmd combos off the mapping", () => {
