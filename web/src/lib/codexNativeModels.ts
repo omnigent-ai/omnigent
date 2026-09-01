@@ -4,6 +4,23 @@ import type { NativeModelOption } from "./types";
 const CATALOG_PREFIXES = ["databricks-", "system.ai."] as const;
 
 /**
+ * Strip markdown backticks from a harness model label before it is shown.
+ *
+ * Some Claude Code releases print the active model name as markdown code
+ * (``Current model: `Opus 4.8 (1M context)```), and no real model name holds
+ * a backtick. The server-side probe already strips these, but a catalog
+ * persisted by an older probe (or binary) is served verbatim until it
+ * refreshes, so the picker would render the literal backticks. Sanitize at the
+ * render boundary so no stale label ever leaks them.
+ *
+ * @param label - The catalog's advertised label.
+ * @returns The label with any backticks removed.
+ */
+export function plainModelLabel(label: string): string {
+  return label.includes("`") ? label.replaceAll("`", "") : label;
+}
+
+/**
  * Fold a model id to the spelling Codex row ids compare in.
  *
  * Comparison only, never a value to send anywhere: Codex spells versions with

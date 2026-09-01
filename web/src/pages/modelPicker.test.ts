@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 
+import { nativeModelLabel } from "@/components/HarnessConfigControls";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import {
   codexEffortLevelsForModel,
   findNativeModelOption,
   isCodexNativeModel,
+  plainModelLabel,
 } from "@/lib/codexNativeModels";
 import type { NativeModelOption } from "@/lib/types";
 
@@ -155,5 +157,27 @@ describe("Codex model-list helpers", () => {
     // Both an unresolved model and an id Codex never advertised get nothing.
     expect(codexEffortLevelsForModel(CODEX_MODEL_OPTIONS, null)).toEqual([]);
     expect(codexEffortLevelsForModel(CODEX_MODEL_OPTIONS, "gpt-5.4")).toEqual([]);
+  });
+});
+
+describe("model label backtick sanitizing", () => {
+  it("strips the markdown backticks some Claude releases wrap the name in", () => {
+    // The CLI prints `Current model: `Opus 4.8 (1M context)`` as markdown code;
+    // a catalog persisted before the server started stripping them still serves
+    // the raw label, so the render boundary must not leak the backticks.
+    expect(plainModelLabel("`Opus 4.8 (1M context)`")).toBe("Opus 4.8 (1M context)");
+    expect(plainModelLabel("`Sonnet 5`")).toBe("Sonnet 5");
+  });
+
+  it("leaves a clean label untouched", () => {
+    expect(plainModelLabel("Opus 4.8 (1M context)")).toBe("Opus 4.8 (1M context)");
+  });
+
+  it("sanitizes the catalog display name through nativeModelLabel", () => {
+    expect(nativeModelLabel({ id: "opus[1m]", displayName: "`Opus 4.8 (1M context)`" })).toBe(
+      "Opus 4.8 (1M context)",
+    );
+    // No display name → the id shows verbatim.
+    expect(nativeModelLabel({ id: "claude-opus-4-8" })).toBe("claude-opus-4-8");
   });
 });

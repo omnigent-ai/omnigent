@@ -9,6 +9,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { SMART_ROUTING_LABEL } from "@/lib/agentLabels";
+import { plainModelLabel } from "@/lib/codexNativeModels";
 import { cn } from "@/lib/utils";
 
 // Sentinel Select values for the Model row. Radix requires a non-empty value,
@@ -38,7 +39,7 @@ interface NativeModelLabelFields {
 
 /** A catalog row's user-facing name: what the harness advertises, else its id. */
 export function nativeModelLabel(option: NativeModelLabelFields): string {
-  return option.displayName ?? option.id;
+  return option.displayName ? plainModelLabel(option.displayName) : option.id;
 }
 
 /**

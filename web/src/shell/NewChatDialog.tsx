@@ -148,6 +148,7 @@ import {
   type SmartRoutingUnavailableCause,
 } from "@/lib/smartRoutingAvailability";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
+import { plainModelLabel } from "@/lib/codexNativeModels";
 import {
   isAcpHarnessAgent,
   partitionAgentsByKind,
@@ -2331,7 +2332,7 @@ export function NewChatLandingScreen() {
           }))
         : (hostClaudeModelOptions ?? []).map((option) => ({
             id: option.id,
-            displayName: option.displayName ?? option.id,
+            displayName: option.displayName ? plainModelLabel(option.displayName) : option.id,
             // Keep the catalog's default marker: the Default row names the
             // model a bare launch truly runs, for claude exactly as codex.
             isDefault: option.isDefault,
@@ -2348,7 +2349,7 @@ export function NewChatLandingScreen() {
         ? []
         : (hostPiModelOptions ?? []).map((option) => ({
             id: option.id,
-            displayName: option.displayName ?? option.id,
+            displayName: option.displayName ? plainModelLabel(option.displayName) : option.id,
           })),
     [hostPiModelOptions, sandboxSelected],
   );

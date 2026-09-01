@@ -31,6 +31,7 @@ import {
   MODEL_SELECT_DEFAULT,
 } from "@/components/HarnessConfigControls";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
+import { plainModelLabel } from "@/lib/codexNativeModels";
 import { CLAUDE_NATIVE_PERMISSION_MODES } from "@/lib/claudePermissionMode";
 import { useHostModelOptions } from "@/hooks/useHosts";
 
@@ -75,7 +76,10 @@ export function ModelEffortFields({
   );
   const modelOptions =
     hostModelOptions && hostModelOptions.length > 0
-      ? hostModelOptions.map((o) => ({ id: o.id, label: o.displayName ?? o.id }))
+      ? hostModelOptions.map((o) => ({
+          id: o.id,
+          label: o.displayName ? plainModelLabel(o.displayName) : o.id,
+        }))
       : CLAUDE_NATIVE_MODELS.map((m) => ({ id: m.id, label: m.label }));
 
   return (

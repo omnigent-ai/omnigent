@@ -108,7 +108,11 @@ import {
 } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { retrySession } from "@/lib/sessionsApi";
-import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
+import {
+  codexEffortLevelsForModel,
+  findNativeModelOption,
+  plainModelLabel,
+} from "@/lib/codexNativeModels";
 import {
   composerAttachmentKey,
   consumePendingInitialPrompt,
@@ -3894,7 +3898,8 @@ export function formatStatusModelLabel(
   if (!raw) return null;
   const lower = raw.toLowerCase();
   const codexOption = findNativeModelOption(codexModelOptions, raw);
-  if (codexOption) return codexOption.displayName ?? codexOption.id;
+  if (codexOption)
+    return codexOption.displayName ? plainModelLabel(codexOption.displayName) : codexOption.id;
   // An alias-shaped id the session's catalog doesn't list (e.g. during
   // the pre-catalog window): render it friendly mechanically — "sonnet"
   // → "Sonnet", "sonnet_5" → "Sonnet 5", "sonnet[1m]" → "Sonnet
