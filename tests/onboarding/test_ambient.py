@@ -1,10 +1,11 @@
 """Tests for omnigent.onboarding.ambient — machine credential detection.
 
-Detection reads the environment, two CLI-login files under ``$HOME``, a single
-localhost TCP probe for Ollama, and — on macOS only — a ``claude auth status``
+Detection reads the environment, two CLI-login files under ``$HOME``, one
+localhost TCP probe per local server, and — on macOS only — a ``claude auth status``
 fallback for the Keychain-stored Claude credential. These tests redirect
 ``$HOME`` to a tmp dir, control the environment explicitly, and monkeypatch
-both :func:`omnigent.onboarding.ambient._ollama_reachable` and
+the local-server probes (:func:`omnigent.onboarding.ambient._ollama_reachable`,
+:func:`omnigent.onboarding.ambient._llmman_reachable`) and
 :func:`omnigent.onboarding.harness_install.harness_cli_logged_in` so no real
 network or subprocess I/O occurs. Each test asserts the exact
 :class:`DetectedProvider` fields (name / kind / family / source), not just the
@@ -62,6 +63,7 @@ def clean_env(tmp_path, monkeypatch: pytest.MonkeyPatch):
     for var in _PROVIDER_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(ambient, "_ollama_reachable", lambda: False)
+    monkeypatch.setattr(ambient, "_llmman_reachable", lambda: False)
     # Neutralize the macOS Keychain fallback by default (the file check already
     # sees no creds under the tmp HOME). The detected/absent tests override this.
     monkeypatch.setattr(harness_install, "harness_cli_logged_in", lambda key: False)
@@ -447,8 +449,26 @@ def test_ollama_detected_when_reachable(clean_env, monkeypatch: pytest.MonkeyPat
     ]
 
 
+def test_llmman_detected_when_reachable(clean_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reachable local llmman is detected as a local openai provider.
+
+    Uses the monkeypatched ``_llmman_reachable`` so no real socket is opened.
+    Failure means a running local model server would not be offered.
+    """
+    monkeypatch.setattr(ambient, "_llmman_reachable", lambda: True)
+    detected = detect_providers()
+    assert detected == [
+        DetectedProvider(
+            name="llmman",
+            kind="local",
+            family="openai",
+            source="http://localhost:17434",
+        )
+    ]
+
+
 def test_detection_priority_order(clean_env, monkeypatch: pytest.MonkeyPatch) -> None:
-    """All signals together are returned in env → claude → codex → ollama order.
+    """All signals together are returned in env → claude → codex → local order.
 
     Failure means the stable ordering broke, so the setup UI would present
     detected providers in a non-deterministic / surprising order.
@@ -469,11 +489,19 @@ def test_detection_priority_order(clean_env, monkeypatch: pytest.MonkeyPatch) ->
         '{"auth_mode": "apikey", "OPENAI_API_KEY": "sk-codex-real"}', encoding="utf-8"
     )
     monkeypatch.setattr(ambient, "_ollama_reachable", lambda: True)
+    monkeypatch.setattr(ambient, "_llmman_reachable", lambda: True)
 
     detected = detect_providers()
     # Env keys first, in PROVIDER_ENV_VARS iteration order (openai precedes
-    # anthropic in that dict), then claude login, codex login, ollama.
-    assert [d.name for d in detected] == ["openai", "anthropic", "claude", "codex", "ollama"]
+    # anthropic in that dict), then claude login, codex login, local servers.
+    assert [d.name for d in detected] == [
+        "openai",
+        "anthropic",
+        "claude",
+        "codex",
+        "ollama",
+        "llmman",
+    ]
 
 
 # ── Codex config.toml custom provider (cli-config) detection ───────────────

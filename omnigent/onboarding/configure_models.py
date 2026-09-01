@@ -254,6 +254,7 @@ _PROVIDER_DISPLAY_NAME: dict[str, str] = {
     "google": "Google Gemini",
     "databricks": "Databricks",
     "ollama": "Ollama",
+    "llmman": "llmman",
 }
 
 
@@ -465,7 +466,7 @@ def add_menu_options() -> list[AddOption]:
         # Cross-vendor extras, alphabetical (Gateway before OpenRouter).
         _opt(
             "Gateway — custom base URL + key",
-            "An OpenAI/Anthropic-compatible proxy: LiteLLM, Ollama, vLLM, …",
+            "An OpenAI/Anthropic-compatible proxy: llmman, LiteLLM, vLLM, …",
             GATEWAY_KIND,
         ),
         _opt(

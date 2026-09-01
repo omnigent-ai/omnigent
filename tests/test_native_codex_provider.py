@@ -252,6 +252,7 @@ def test_resolve_native_codex_launch_subscription_no_login_falls_through_to_key(
     # No ambient providers, so the fall-through target is unambiguously the
     # explicitly-configured key (not a detected env key / Ollama).
     monkeypatch.setattr("omnigent.onboarding.ambient._ollama_reachable", lambda: False)
+    monkeypatch.setattr("omnigent.onboarding.ambient._llmman_reachable", lambda: False)
     _seed(
         _isolated,
         {
@@ -289,6 +290,7 @@ def test_resolve_native_codex_launch_subscription_no_login_no_alternative_uses_l
     with base_url/auth overrides would mean we fabricated a route from nothing.
     """
     monkeypatch.setattr("omnigent.onboarding.ambient._ollama_reachable", lambda: False)
+    monkeypatch.setattr("omnigent.onboarding.ambient._llmman_reachable", lambda: False)
     _seed(
         _isolated,
         {"codex-subscription": {"kind": "subscription", "cli": "codex", "default": True}},
@@ -405,6 +407,7 @@ def test_resolve_native_codex_launch_dismissed_config_provider_pins_openai(
     pin codex's built-in ``openai`` provider instead.
     """
     monkeypatch.setattr("omnigent.onboarding.ambient._ollama_reachable", lambda: False)
+    monkeypatch.setattr("omnigent.onboarding.ambient._llmman_reachable", lambda: False)
     codex_dir = _isolated / ".codex"
     codex_dir.mkdir()
     (codex_dir / "config.toml").write_text(_DISMISSIBLE_CODEX_CONFIG)
@@ -430,6 +433,7 @@ def test_resolve_native_codex_launch_undismissed_config_provider_routes_via_pin(
     broadly and breaks the feature's golden path.
     """
     monkeypatch.setattr("omnigent.onboarding.ambient._ollama_reachable", lambda: False)
+    monkeypatch.setattr("omnigent.onboarding.ambient._llmman_reachable", lambda: False)
     codex_dir = _isolated / ".codex"
     codex_dir.mkdir()
     (codex_dir / "config.toml").write_text(_DISMISSIBLE_CODEX_CONFIG)
@@ -450,6 +454,7 @@ def test_config_provider_shadowed_by_nondefault_explicit_entry_still_pins(
     synthesized resume rollout record OpenAI and lose this provider's auth.
     """
     monkeypatch.setattr("omnigent.onboarding.ambient._ollama_reachable", lambda: False)
+    monkeypatch.setattr("omnigent.onboarding.ambient._llmman_reachable", lambda: False)
     codex_dir = _isolated / ".codex"
     codex_dir.mkdir()
     (codex_dir / "config.toml").write_text(_DISMISSIBLE_CODEX_CONFIG)
@@ -477,6 +482,7 @@ def test_shadowed_config_detection_uses_active_profile_provider(
 ) -> None:
     """The fallback pins the provider selected by Codex's active profile."""
     monkeypatch.setattr("omnigent.onboarding.ambient._ollama_reachable", lambda: False)
+    monkeypatch.setattr("omnigent.onboarding.ambient._llmman_reachable", lambda: False)
     codex_dir = _isolated / ".codex"
     codex_dir.mkdir()
     (codex_dir / "config.toml").write_text(
