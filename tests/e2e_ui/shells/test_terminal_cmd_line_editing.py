@@ -114,9 +114,7 @@ def _connected_shell_textarea(page: Page) -> Locator:
         terminal_view = rail.get_by_test_id("terminal-view").last
         expect(terminal_view).to_be_visible(timeout=60_000)
         try:
-            expect(terminal_view).to_have_attribute(
-                "data-state", "connected", timeout=30_000
-            )
+            expect(terminal_view).to_have_attribute("data-state", "connected", timeout=30_000)
         except AssertionError as exc:
             last_error = exc
             # Close the stuck tab (confirming the kill) and retry fresh.
