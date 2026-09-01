@@ -1658,6 +1658,55 @@ def test_seed_isolated_agy_home_prefers_real_onboarding_marker(
     assert json.loads(iso_marker.read_text(encoding="utf-8")) == real_state
 
 
+def test_seed_isolated_agy_home_tolerates_absent_real_settings_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user with no settings.json seeds cleanly — no spurious gcp block appears.
+
+    Non-GCP (consumer subscription) users have no settings.json; seeding must
+    not fail or inject a gcp key the user never configured.
+    """
+    fake_home = tmp_path / "real-home"
+    (fake_home / ".gemini" / "antigravity-cli").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    # Absent, or created by the trust/survey seeders without a gcp key.
+    if iso_settings.exists():
+        assert "gcp" not in json.loads(iso_settings.read_text(encoding="utf-8"))
+
+
+def test_seed_isolated_agy_home_synthetic_onboarding_does_not_downgrade_enterprise_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The synthetic onboarding marker never hard-wires enterpriseOnboardingComplete=false.
+
+    When the real onboarding.json is absent (e.g. a cleared agy cache on a
+    GCP-authenticated host), a synthetic marker with
+    ``enterpriseOnboardingComplete: false`` re-triggers the first-run wizard
+    for enterprise accounts, which blocks TUI injection. If the seeder writes
+    the key at all, it must be True.
+    """
+    fake_home = tmp_path / "real-home"
+    (fake_home / ".gemini" / "antigravity-cli").mkdir(parents=True)
+    # No real onboarding.json.
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    onboarding_path = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "cache" / "onboarding.json"
+    onboarding = json.loads(onboarding_path.read_text(encoding="utf-8"))
+    assert onboarding.get("onboardingComplete") is True
+    if "enterpriseOnboardingComplete" in onboarding:
+        assert onboarding["enterpriseOnboardingComplete"] is True
+
+
 def test_seed_isolated_agy_home_tolerates_missing_credential(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
