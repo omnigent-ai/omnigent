@@ -388,12 +388,18 @@ def sse_text_with_native_items(
 def anthropic_sse_text_response(
     text: str,
     model: str = "mock-model",
+    usage: dict | None = None,
 ) -> str:
     """Build Anthropic Messages API SSE stream for a text response.
 
     Emits: ``message_start``, ``content_block_start``,
     ``content_block_delta`` (text), ``content_block_stop``,
     ``message_delta``, ``message_stop``.
+
+    :param usage: Optional prompt-usage overrides merged into the
+        ``message_start`` event's ``message.usage`` (e.g.
+        ``{"input_tokens": 50000}``), so tests can script the observed
+        context size. Defaults keep the historical fixed values.
     """
     msg_id = f"msg_{_uuid_mod.uuid4().hex[:12]}"
     output_tokens = max(5, len(text.split()))
@@ -415,7 +421,7 @@ def anthropic_sse_text_response(
                 "model": model,
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {"input_tokens": 10, "output_tokens": 0},
+                "usage": {"input_tokens": 10, "output_tokens": 0, **(usage or {})},
             },
         },
     )
@@ -567,6 +573,10 @@ class QueuedResponse:
     status_code: int = 500
     delay: float = 0.0
     truncate_after: int | None = None
+    # Prompt-usage overrides for the Anthropic ``message_start`` event
+    # (``/v1/messages`` only), e.g. {"input_tokens": 50000} — lets a test
+    # script the context size a claude harness observes mid-turn.
+    usage: dict | None = None
     _gate: asyncio.Event = field(default_factory=asyncio.Event)
     _pending: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -895,7 +905,7 @@ async def create_message(
     if qr.tool_calls:
         sse_body = anthropic_sse_tool_call_response(qr.tool_calls)
     else:
-        sse_body = anthropic_sse_text_response(qr.text)
+        sse_body = anthropic_sse_text_response(qr.text, usage=qr.usage)
 
     # Mid-stream fault: emit only a prefix and end, dropping message_stop.
     if qr.truncate_after is not None:
@@ -1067,6 +1077,7 @@ async def configure(request: Request) -> dict[str, object]:
                     status_code=entry.get("status_code", 500),
                     delay=entry.get("delay", 0.0),
                     truncate_after=entry.get("truncate_after"),
+                    usage=entry.get("usage"),
                 )
             )
         count = len(queue.responses)

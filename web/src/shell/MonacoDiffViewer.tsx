@@ -8,8 +8,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DiffEditor, type DiffEditorProps, type DiffOnMount } from "@monaco-editor/react";
-import { useTheme } from "next-themes";
-import { normalizeResolvedTheme } from "@/components/theme/themeMode";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import {
   codeFontFamilyForEditor,
   readCodeFont,
@@ -73,8 +72,7 @@ export function MonacoDiffViewer({
 }: MonacoDiffViewerProps) {
   const canEdit = useCanEdit(conversationId);
   const lang = detectLang(path);
-  const { resolvedTheme } = useTheme();
-  const monacoTheme = resolvedThemeToMonaco(normalizeResolvedTheme(resolvedTheme));
+  const monacoTheme = resolvedThemeToMonaco(useResolvedThemeMode());
 
   // Gate rendering until Shiki has registered the github themes + this file's
   // grammar (so the diff never flashes Monaco's default 'vs' theme); surface an

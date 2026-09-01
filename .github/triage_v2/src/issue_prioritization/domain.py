@@ -135,6 +135,7 @@ class Issue:
     area_keys: tuple[str, ...] = ()
     component_labels: tuple[str, ...] = ()
     classification_reasoning: str = ""
+    classification_content_hash: str = ""
     reported_type: IssueType | None = None
     evidence_kind: EvidenceKind = EvidenceKind.NONE
     information_status: InformationStatus = InformationStatus.NOT_APPLICABLE
@@ -160,6 +161,7 @@ class Issue:
             classification_reasoning=str(
                 value.get("classification_reasoning", value.get("reasoning", ""))
             ),
+            classification_content_hash=str(value.get("classification_content_hash", "")),
             reported_type=(
                 IssueType.parse(value["reported_type"]) if value.get("reported_type") else None
             ),

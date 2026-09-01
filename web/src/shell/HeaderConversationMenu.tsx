@@ -173,15 +173,16 @@ export function HeaderConversationMenu({
 
   const archiveConversation = () => {
     closeMenu();
-    archive.mutate(
-      { id: conversation.id, archived: true },
-      {
-        onSuccess: () => {
-          navigate("/", { replace: true });
-          showArchivedToast();
-        },
-      },
-    );
+    // The row leaves the sidebar optimistically (useArchiveConversation flips
+    // the cached `archived` flag in onMutate), and we're viewing the session
+    // being archived, so leave its chat surface now — synchronously, like
+    // confirmDelete — rather than in an onSuccess callback that fires a
+    // round-trip later with a stale active session.
+    navigate("/", { replace: true });
+    archive.mutate({ id: conversation.id, archived: true });
+    // Fire NOW, not in a mutate onSuccess: navigating away unmounts this menu,
+    // and per-call mutate callbacks don't fire once their observer unmounts.
+    showArchivedToast();
   };
 
   const mainItems = (

@@ -378,10 +378,20 @@ def use_wedged_fast_heartbeat(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def use_busy_absolute_cap(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Busy harness, 2s absolute ceiling below its ~3s runtime; idle high so only the cap fires."""
+    """Busy harness, 2s absolute ceiling below its ~3s runtime; idle high so it never trips."""
     monkeypatch.setenv("HARNESS_TEST_FIXTURE", "busy_progress")
-    # Idle high + reset on every emit → never trips; only the absolute cap can fire.
+    # Idle high + reset on every emit → never trips; progress extends the
+    # absolute ceiling, so the busy turn must outlive the 2s cap.
     monkeypatch.setenv("HARNESS_TURN_TIMEOUT_S", "10")
+    monkeypatch.setenv("HARNESS_TURN_ABSOLUTE_TIMEOUT_S", "2")
+
+
+@pytest.fixture
+def use_busy_strict_absolute_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Busy harness, idle watchdog disabled: the 2s absolute ceiling is a strict cap."""
+    monkeypatch.setenv("HARNESS_TEST_FIXTURE", "busy_progress")
+    # Idle disabled → no progress-driven extension; only the absolute cap fires.
+    monkeypatch.setenv("HARNESS_TURN_TIMEOUT_S", "0")
     monkeypatch.setenv("HARNESS_TURN_ABSOLUTE_TIMEOUT_S", "2")
 
 
@@ -738,50 +748,145 @@ async def test_per_turn_watchdog_ignores_heartbeats(
     )
 
 
-async def test_per_turn_absolute_watchdog_caps_runaway_active_turn(
+async def test_actively_progressing_turn_outlives_absolute_ceiling(
     use_busy_absolute_cap: None,
     manager: HarnessProcessManager,
 ) -> None:
     """
-    The absolute ceiling fails a turn that keeps emitting but never ends.
+    Real progress extends the absolute ceiling: an active turn completes.
 
-    The idle watchdog never trips an actively-streaming turn (each emit
-    resets it), so a runaway-but-active loop needs the absolute backstop.
     The ``busy_progress`` harness emits every 0.1s for ~3s; with idle=10s
-    (reset on every emit → never trips) and absolute=2s, the absolute cap
-    must fire ~1s before the harness's natural completion.
+    and absolute=2s, every emit pushes the absolute deadline at least one
+    idle window past now, so the turn must run past the 2s cap and reach
+    ``response.completed`` — never be guillotined mid-stream for total
+    duration alone.
     """
     conv_id = "conv_busy_absolute_cap"
     client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
     body = {"type": "message", "role": "user", "model": "test-agent", "content": []}
     events: list[_ParsedSSEEvent] = []
-    # Above the 2s cap, below the ~3s natural completion's headroom and the
-    # suite timeout; 20s only guards an unrelated hang.
+    # Well above the harness's ~3s natural completion; guards only a hang.
     async with asyncio.timeout(20):
         async with client.stream("POST", f"/v1/sessions/{conv_id}/events", json=body) as response:
             async for event in _stream_iter(response):
                 events.append(event)
 
     event_types = [e.event for e in events]
-    # response.failed (not completed) proves the absolute ceiling fired
-    # before the harness's ~3s natural completion. response.completed would
-    # mean the cap didn't engage.
+    # response.completed (not failed) proves progress extended the ceiling
+    # past the turn's ~3s natural completion despite the 2s absolute cap.
+    assert event_types[-1] == "response.completed", (
+        f"An actively-emitting turn must outlive the absolute ceiling and "
+        f"complete; got {event_types[-1]!r} (full: {event_types!r})."
+    )
+    # Deltas streamed throughout — the turn was active the whole time.
+    assert "response.output_text.delta" in event_types, (
+        f"Expected progress deltas from the busy turn; got {event_types!r}."
+    )
+
+
+async def test_absolute_ceiling_is_strict_when_idle_watchdog_disabled(
+    use_busy_strict_absolute_cap: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """
+    With the idle watchdog disabled, the absolute ceiling is a hard cap.
+
+    No idle watchdog means no progress-driven extension, so the busy turn
+    (~3s runtime) must be failed at the 2s absolute ceiling — the ceiling
+    still backstops a runaway turn when it is the only watchdog left.
+    """
+    conv_id = "conv_busy_strict_absolute_cap"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    body = {"type": "message", "role": "user", "model": "test-agent", "content": []}
+    events: list[_ParsedSSEEvent] = []
+    async with asyncio.timeout(20):
+        async with client.stream("POST", f"/v1/sessions/{conv_id}/events", json=body) as response:
+            async for event in _stream_iter(response):
+                events.append(event)
+
+    event_types = [e.event for e in events]
     assert event_types[-1] == "response.failed", (
-        f"Absolute ceiling must fail a runaway-but-active turn; got "
+        f"With idle disabled the absolute ceiling must cap the turn; got "
         f"{event_types[-1]!r} (full: {event_types!r})."
     )
-    # The error must name the ABSOLUTE watchdog, not the idle one — proves
-    # the right ceiling tripped (idle was set high and reset by every emit).
+    # The error names the ABSOLUTE watchdog — the only one enabled.
     error = events[-1].data["response"]["error"]
     assert error is not None and "absolute" in error["message"], (
-        f"Failure must come from the absolute ceiling; got {error!r}. An "
-        f"'idle'-only message would mean the idle watchdog fired instead."
+        f"Failure must come from the absolute ceiling; got {error!r}."
     )
-    # Deltas streamed before the cap fired (it was actively emitting, not
-    # wedged) — distinguishes this from the idle/wedged path.
     assert "response.output_text.delta" in event_types, (
         f"Expected progress deltas before the absolute cap; got {event_types!r}."
     )
+
+
+async def test_turn_stalling_past_absolute_ceiling_fails_via_idle_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A turn that outlives the ceiling and then stalls still dies promptly.
+
+    Progress extends the absolute deadline only to one idle window past the
+    last emit, so once the turn goes quiet the idle watchdog (or the pushed
+    ceiling — whichever first) fails it within ~idle_timeout, preserving the
+    runaway backstop for a loop that stops making real progress.
+    """
+    from omnigent.runtime.harnesses import _scaffold
+
+    class _StallsAfterProgressApp(HarnessApp):
+        async def run_turn(self, request: Any, ctx: TurnContext) -> None:
+            """Emit past the absolute ceiling, then wedge forever."""
+            del request
+            from omnigent.server.schemas import OutputTextDeltaEvent
+
+            for i in range(8):  # 0.8s of steady progress > 0.5s ceiling
+                ctx.emit(
+                    OutputTextDeltaEvent(type="response.output_text.delta", delta=f"tick-{i} ")
+                )
+                await asyncio.sleep(0.1)
+            await asyncio.Event().wait()  # stall: no further progress
+
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(_scaffold, "_TURN_ABSOLUTE_TIMEOUT_S", 0.5)
+
+    app = _StallsAfterProgressApp()
+    event_queue: asyncio.Queue[Any] = asyncio.Queue()
+    ctx = TurnContext(
+        response_id="resp_stall_after_progress",
+        event_queue=event_queue,
+        cancelled=asyncio.Event(),
+    )
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    # The stalled turn must fail within ~idle_timeout of its last emit —
+    # 5s guards only an unrelated hang.
+    async with asyncio.timeout(5):
+        with pytest.raises(RuntimeError) as excinfo:
+            await app._guarded_run_turn(None, ctx)  # type: ignore[arg-type]
+    elapsed = loop.time() - started
+    # The turn genuinely OUTLIVED the 0.5s absolute ceiling before it was
+    # failed — the old never-rescheduled ceiling would have killed it at
+    # ~0.5s with only ~5 of the 8 progress events emitted.
+    assert elapsed > 0.8, (
+        f"Turn was failed after {elapsed:.2f}s — at/under the 0.5s absolute "
+        f"ceiling, meaning progress did not extend it."
+    )
+    # ...and the failure landed promptly: ~one idle window (1s) after the
+    # last emit at ~0.8s, with slack for a slow CI box. A stalled turn must
+    # not linger well past its extended deadline.
+    assert elapsed < 3.5, (
+        f"Stalled turn lingered {elapsed:.2f}s — the watchdog should fire "
+        f"within ~one idle window (1s) of the last progress event."
+    )
+    emitted = [
+        e
+        for e in iter(event_queue.get_nowait, None)
+        if getattr(e, "type", "") == "response.output_text.delta"
+    ]
+    assert len(emitted) == 8, (
+        f"All 8 progress events must land before the failure; got {len(emitted)}."
+    )
+    # The failure comes from the idle watchdog (the stall), not the ceiling.
+    assert "idle watchdog" in str(excinfo.value), str(excinfo.value)
 
 
 # ── Health probe ──────────────────────────────────────────────

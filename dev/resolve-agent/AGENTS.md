@@ -99,26 +99,32 @@ The repro worktree is gone, so recover from the run's artifacts and logs with th
 `gh` CLI. Be **tolerant** — the exact artifact layout may vary, so try in order
 and fall back rather than assuming a fixed structure:
 
-1. `gh run view <ci_link> --log` (and `--json` for metadata) to read the job
-   output. repro-agent's final message is echoed in its step log **untruncated**,
-   so the log carries two things you need: the final ```json handoff block (parse
-   `verdict`/`facets`/`test_path`/`journey`/`bug_url`/`session_id` from it) and,
-   immediately before it, the **complete verbatim source of the e2e test** pasted
-   as a path-labelled code block (repro-agent's contract). Prefer reading the test
-   body from that inline block in the log — unlike a live session transcript, the
-   CI log is not truncated, so the pasted test is complete here.
+1. Download this run's `repro-bundle-<run-id>` artifact first. If it contains
+   top-level `repro-handoff.json`, parse and validate that checkpoint before
+   reading the full job log: it is the smallest, most direct structured source
+   for `verdict`/`facets`/`test_path`/`journey`/`bug_url`/`session_id`. Copy each
+   test named by `test_path` from the artifact's `files/` tree into your checkout.
+   Also retain `patch.diff`, recordings, and `run.log` as supporting evidence.
+
+   The checkpoint is intentionally raw: a producing workflow may have classified
+   a forward-compatible schema as unknown while your newer consumer understands
+   it. Validate it yourself against the authoritative input `bug_url`; do not
+   reject it merely because the old run reported an unknown handoff.
+
+2. Only when the artifact checkpoint is absent or invalid, inspect `run.log` from
+   the downloaded bundle, then fall back to `gh run view <ci_link> --log`. The
+   final repro message is echoed in the job log **untruncated**, so its last
+   ```json block can recover the handoff. The log may also carry the complete
+   verbatim source of the e2e test as a path-labelled code block; use that only
+   when the artifact's `files/` tree did not preserve the test.
 
    **This run's handoff is authoritative.** The `ci_link` you were given names
    exactly one repro run, and its `bug_url` is the bug you resolve — no other.
    You are running on a **shared server that hosts many other repro sessions**;
    do **not** call `sys_session_list` and pick "a" repro session, and do not
    resolve a different bug because its session looks handy on this server. If you
-   cannot find the handoff block in this run's log, stop with `needs_more_info` —
-   never fall back to a bug you found by browsing the server.
-2. `gh run download <run-id>` to pull artifacts as a fallback for the test's
-   content — an authored test file or a diff/patch artifact — if the log's inline
-   block is unavailable or was clipped. Either way, materialize the full test into
-   your checkout at `test_path`.
+   cannot find a handoff in this run's artifact or logs, stop with
+   `needs_more_info` — never fall back to a bug you found by browsing the server.
 3. If the run also recorded a shareable `session_id` you can reach, read it with
    `sys_session_get_history` for richer context — but **only** the exact
    `session_id` this run's handoff named. Before trusting it, confirm that
@@ -603,6 +609,12 @@ gh auth setup-git   # route git pushes through gh's credential helper with this 
   the command output. **Never** substitute a guess like "token expired" or "PAT
   is read-only" — those are false and drop the hand-off silently. Only a real,
   quoted failure goes in `maintainer_review`.
+- CI may also configure `omnigent.forkPushTokenFile`. That is a separate
+  maintainer credential for one purpose only: pushing a fix to an existing fork
+  PR whose author enabled maintainer edits. Never export it as `GH_TOKEN` and
+  never pass it to `gh`; PR creation, comments, reviews, labels, and every other
+  visible action must continue using the App token so GitHub attributes them to
+  `omni-resolve-agent[bot]`.
 
 Once the set is genuinely green:
 
@@ -698,12 +710,25 @@ can land a fix depends on where its branch lives:
   → you have write access. Push fixes the same as the author path, then re-check.
   Say in your review comments that you pushed, so the author isn't surprised.
 - **Fork PR** (the head branch is on a contributor's fork, `head.repo.fork ==
-  true`) → you **cannot** push to it. An App installation token is scoped to
-  `omnigent-ai/omnigent` only; GitHub does not honor "allow edits from maintainers"
-  for an App token (that grant is for maintainer *users*), so a push to the fork
-  branch is rejected. **Do not attempt the push** — it will always fail. Instead:
-  - **If the fork PR needs a fix** (repro test fails against it, CI is red from its
-    diff, or Polly flags a real blocking defect) → **take over: open your own PR**
+  true`) → the App token cannot push there, but CI may provide an isolated
+  maintainer credential specifically for that transport. Read
+  `maintainerCanModify`, `headRepositoryOwner`, `headRepository`, and
+  `headRefName` from `gh pr view`.
+  - If `maintainerCanModify` is true and
+    `git config --get omnigent.forkPushTokenFile` names a readable file, preserve
+    the contributor's branch. Keep the App token exported as `GH_TOKEN` for all
+    visible actions. For the push only, use CI's credential-isolating helper:
+    ```bash
+    omnigent-push-fork --repo <owner>/<repo> --branch <head-branch>
+    ```
+    The helper uses `GIT_ASKPASS`, clears the checkout's App-token extraheader
+    only for that push, and keeps the maintainer token out of command arguments,
+    remote URLs, and git's failure output. Never read or copy the token file
+    yourself, and never use it for `gh pr comment`/`review`/`create`; those
+    commands must remain bot-attributed through the App token.
+  - **If the fork PR needs a fix** and maintainer edits are disabled, the token
+    file is absent, or the isolated push returns a real permission error →
+    **take over: open your own PR**
     that includes their work plus your fix. This is the same mechanic as the
     "approach is wrong" escape hatch (Step 2A), but the reason is different — the
     approach is fine, you just can't push the fix to a fork. Build it so the
@@ -721,7 +746,7 @@ can land a fix depends on where its branch lives:
       yours and close it **as the very next commands — before you emit the interim
       handoff (Step 3.5) and before you start driving Step 4**:
       ```
-      gh pr comment <fork-pr> --body 'Superseded by #<your-pr> — I took this over to add a fix I could not push to your fork (App tokens can’t push to forks). Your commits are carried over with credit. Thanks @<author>!'
+      gh pr comment <fork-pr> --body 'Superseded by #<your-pr> — I took this over to add a fix because maintainer fork updates were unavailable. Your commits are carried over with credit. Thanks @<author>!'
       gh pr close <fork-pr>
       ```
       Do **not** defer this to the end of Step 4: the session can drop mid-turn

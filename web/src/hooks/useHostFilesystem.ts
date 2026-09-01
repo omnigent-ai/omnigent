@@ -278,6 +278,25 @@ export async function checkHostDirectory(hostId: string, path: string): Promise<
   return detail ?? `Couldn't verify the working directory (HTTP ${res.status}).`;
 }
 
+/**
+ * Whether a host path is 404-missing, as opposed to every other pre-flight
+ * problem (exists-but-unlistable, host offline, network error).
+ *
+ * The fork dialog uses this to distinguish "the source's worktree directory
+ * was deleted — recreatable at the same path/branch" from problems where
+ * falling back to worktree creation would be wrong.
+ */
+export async function hostDirectoryMissing(hostId: string, path: string): Promise<boolean> {
+  const baseUrl = buildHostFilesystemUrl(hostId, path);
+  const sep = baseUrl.includes("?") ? "&" : "?";
+  try {
+    const res = await authenticatedFetch(`${baseUrl}${sep}limit=1`);
+    return res.status === 404;
+  } catch {
+    return false;
+  }
+}
+
 /** Shape returned by ``POST /v1/hosts/{id}/directories``. */
 interface CreateHostDirectoryResponse {
   object: string;

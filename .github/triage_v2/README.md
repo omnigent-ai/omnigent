@@ -86,6 +86,29 @@ a reproduction heading when it contains an intermittent observation, controlled
 test, diagnostics, or concrete code-path analysis. These fields are diagnostic;
 by themselves they do not add `needs-info` or close an issue.
 
+On the event path, V2 uses the assessment to keep the Bug, Feature, or Docs
+label aligned with the classified content. An incomplete bug receives
+`needs-info` and the bot-owned triage comment becomes a request for the specific
+missing categories with a seven-day deadline. Author comments and issue-body
+edits run the classifier again; sufficient evidence removes `needs-info` and
+restores the normal assessment comment. Security issues are excluded from this
+lifecycle. V2 does not close issues; expiry is a separate rollout gate.
+
+The same reusable V2 workflow handles new issues, body edits, and author
+comments. Legacy intake still owns duplicate detection, contributor routing,
+and initial assignment, but no longer writes type or `needs-info` when V2 is
+enabled. Author comments are evaluated with the label still attached, so a V2
+failure cannot strand an issue by removing `needs-info` too early.
+
+A daily expiry workflow previews bot-managed `needs-info` deadlines. Set
+`ISSUE_TRIAGE_CLOSE_NEEDS_INFO=true` only after reviewing those previews to let
+scheduled runs close eligible reports. It closes on the day after the displayed
+deadline, requires both Bug and `needs-info`, and excludes security/pinned
+issues, untrusted marker comments, and reports with a newer author response. A
+later author comment reopens the issue and, while V2 is enabled, runs it again.
+Reopening remains available during a V2 rollback so closed reports are not
+trapped behind the classifier switch.
+
 ## Databricks dry-run
 
 The bundle defines a paused trigger on updates to `github_issues_bronze`. It

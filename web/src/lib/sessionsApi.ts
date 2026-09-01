@@ -47,6 +47,7 @@ function getClientSurface(): string {
 export interface ElicitResult {
   action: "accept" | "decline" | "cancel";
   content?: Record<string, unknown>;
+  _meta?: Record<string, unknown>;
 }
 
 /** Response body of `POST /v1/sessions/{id}/events` (202 Accepted). */
@@ -721,24 +722,38 @@ export async function launchRunner(
   hostId: string,
   sessionId: string,
   workspace: string,
-  git?: { branchName: string; baseBranch?: string; existingWorktree?: boolean },
+  git?: {
+    branchName: string;
+    baseBranch?: string;
+    existingWorktree?: boolean;
+    existingBranch?: boolean;
+  },
 ): Promise<{ runnerId: string }> {
   const body: {
     session_id: string;
     workspace: string;
-    git?: { branch_name: string; base_branch?: string; existing_worktree?: boolean };
+    git?: {
+      branch_name: string;
+      base_branch?: string;
+      existing_worktree?: boolean;
+      existing_branch?: boolean;
+    };
   } = { session_id: sessionId, workspace };
   if (git !== undefined) {
     // `existing_worktree` binds a pre-existing worktree (no worktree is
-    // created; the branch is recorded for the sidebar + delete flow), so it
-    // never carries a base_branch.
+    // created; the branch is recorded for the sidebar + delete flow) and
+    // `existing_branch` recreates a worktree for a branch that already
+    // exists (the deleted-worktree recreate path) — neither carries a
+    // base_branch (nothing new is forked).
     body.git = {
       branch_name: git.branchName,
       ...(git.existingWorktree
         ? { existing_worktree: true }
-        : git.baseBranch !== undefined
-          ? { base_branch: git.baseBranch }
-          : {}),
+        : git.existingBranch
+          ? { existing_branch: true }
+          : git.baseBranch !== undefined
+            ? { base_branch: git.baseBranch }
+            : {}),
     };
   }
   const res = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/runners`, {

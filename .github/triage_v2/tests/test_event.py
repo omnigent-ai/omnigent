@@ -70,6 +70,7 @@ def test_event_grades_and_plans_labels_for_one_issue() -> None:
     assert classification.impact == Impact.HIGH
     assert run.ranked[0].result.score == Decimal("72.00")
     assert set(run.mutations[0].labels_add) == {
+        "Bug",
         "P1-high",
         "comp:db",
     }
@@ -88,7 +89,7 @@ def test_event_preserves_human_priority_and_retires_severity_label() -> None:
 
     assert run.ranked[0].issue.impact == Impact.HIGH
     assert run.ranked[0].result.priority.value == "P1-high"
-    assert run.mutations[0].labels_add == ("comp:db",)
+    assert run.mutations[0].labels_add == ("Bug", "comp:db")
     assert run.mutations[0].labels_remove == ("severity:S3",)
     assert run.mutations[0].blocked == ("priority_human_override",)
 
@@ -127,6 +128,8 @@ def test_event_artifact_contains_classification_and_mutation(tmp_path) -> None:
     assert payload["classification"]["missing_information"] == []
     assert payload["score"]["score"] == 72.0
     assert payload["mutation"]["target"]["priority"] == "P1-high"
+    assert payload["mutation"]["target"]["issue_type"] == "Bug"
+    assert payload["mutation"]["target"]["needs_info"] is False
     assert payload["model_endpoint"] == "test-endpoint"
     assert payload["source_revision"] == "abc123"
     assert "<!-- omnigent-issue-prioritization-v2" in payload["comment"]["body"]

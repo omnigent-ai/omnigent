@@ -1953,6 +1953,7 @@ function buildMenu() {
     {
       id: "new_window",
       label: "New Window",
+      accelerator: "CmdOrCtrl+Shift+N",
       click: () => newWindow(),
     },
     {
@@ -2229,6 +2230,11 @@ function createBrowserRegistryForWindow(win) {
       } catch {
         return 1;
       }
+    },
+    copyTextToClipboard: (text) => clipboard.writeText(text),
+    openUrlExternal: (url) => void shell.openExternal(url),
+    showContextMenu: (items) => {
+      Menu.buildFromTemplate(items).popup({ window: win });
     },
   });
 }
