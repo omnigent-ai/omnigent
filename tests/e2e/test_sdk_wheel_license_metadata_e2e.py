@@ -27,13 +27,13 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-import tomllib
 import zipfile
 from email import message_from_string
 from email.message import Message
 from pathlib import Path
 
 import pytest
+import tomllib
 
 REPO_ROOT = Path(__file__).parents[2]
 
@@ -91,9 +91,7 @@ def test_pyproject_declares_license_metadata(dist_name: str, pkg_dir: Path) -> N
         c.startswith("License ::") for c in project.get("classifiers", [])
     )
     if not has_license_key and not has_license_classifier:
-        problems.append(
-            "no `license` (PEP 621/639 expression) and no `License ::` classifier"
-        )
+        problems.append("no `license` (PEP 621/639 expression) and no `License ::` classifier")
 
     license_files = project.get("license-files")
     if not license_files:
@@ -102,8 +100,7 @@ def test_pyproject_declares_license_metadata(dist_name: str, pkg_dir: Path) -> N
         for pattern in license_files:
             if not list((REPO_ROOT / pkg_dir).glob(pattern)):
                 problems.append(
-                    f"`license-files` glob {pattern!r} matches no file "
-                    f"under {pkg_dir}"
+                    f"`license-files` glob {pattern!r} matches no file under {pkg_dir}"
                 )
 
     assert not problems, (
@@ -149,14 +146,10 @@ def test_built_wheel_carries_license_metadata(
 
     with zipfile.ZipFile(wheel_path) as wheel:
         metadata_names = [
-            n
-            for n in wheel.namelist()
-            if n.count("/") == 1 and n.endswith(".dist-info/METADATA")
+            n for n in wheel.namelist() if n.count("/") == 1 and n.endswith(".dist-info/METADATA")
         ]
         assert metadata_names, f"{wheel_path.name} contains no dist-info METADATA"
-        metadata = message_from_string(
-            wheel.read(metadata_names[0]).decode("utf-8")
-        )
+        metadata = message_from_string(wheel.read(metadata_names[0]).decode("utf-8"))
         license_fields = _core_metadata_license_fields(metadata)
         assert license_fields, (
             f"{wheel_path.name} METADATA carries no license fields "
@@ -171,6 +164,5 @@ def test_built_wheel_carries_license_metadata(
         for entry in license_file_entries:
             shipped = f"{dist_info_dir}/licenses/{entry}"
             assert shipped in wheel.namelist(), (
-                f"{wheel_path.name} declares License-File {entry!r} but does "
-                f"not ship {shipped}"
+                f"{wheel_path.name} declares License-File {entry!r} but does not ship {shipped}"
             )
