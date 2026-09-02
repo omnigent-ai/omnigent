@@ -1064,13 +1064,14 @@ def test_read_transcript_items_since_flags_compact_summary(tmp_path: Path) -> No
 )
 def test_read_transcript_items_since_flags_compact_noop(tmp_path: Path, stdout: str) -> None:
     """
-    A ``/compact`` refusal stdout record is flagged, not rendered as a bubble.
+    A ``/compact`` refusal stdout record is surfaced with its text.
 
     When Claude declines ``/compact`` (context too small), it writes the
     refusal to a standalone ``local_command`` stdout record — separate from
-    the ``/compact`` command echo. The bridge must surface it as a single
-    non-rendering ``slash_command`` item with ``is_compact_noop=True`` so the
-    forwarder can dismiss the stranded "Compacting…" spinner.
+    the ``/compact`` command echo. The bridge must surface it as a
+    ``slash_command`` item flagged ``is_compact_noop=True`` (so the forwarder
+    dismisses the stranded "Compacting…" spinner) carrying the refusal text as
+    ``output`` (so the web shows the same message Claude did).
     """
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text(
@@ -1111,10 +1112,16 @@ def test_read_transcript_items_since_flags_compact_noop(tmp_path: Path, stdout: 
         agent_name="claude-native-ui",
     )
 
-    noop = [item for item in items if item.is_compact_noop]
-    assert len(noop) == 1, f"expected one compact-noop item, got {items!r}"
-    assert noop[0].item_type == "slash_command"
-    assert noop[0].data["name"] == "compact"
+    # Exactly one bubble: the bare ``/compact`` echo is deduped away so the
+    # web shows a single "Command compact" row (like the terminal), and it
+    # carries the refusal text as ``output``.
+    compact_items = [item for item in items if item.data.get("name") == "compact"]
+    assert len(compact_items) == 1, f"expected one /compact bubble, got {items!r}"
+    noop = compact_items[0]
+    assert noop.is_compact_noop is True
+    assert noop.item_type == "slash_command"
+    assert noop.data["kind"] == "command"
+    assert noop.data["output"] == stdout.strip()
 
 
 def test_read_transcript_items_since_keeps_real_bash_local_command(tmp_path: Path) -> None:

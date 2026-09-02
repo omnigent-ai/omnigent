@@ -2411,7 +2411,7 @@ def read_transcript_items_since_with_position(
         line_cursor=read_result.line_cursor,
         byte_offset=read_result.byte_offset,
         current_response_id=active_response_id,
-        items=items,
+        items=_dedupe_compact_noop_echo(items),
         latest_usage=latest_usage,
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
@@ -2505,7 +2505,7 @@ def read_transcript_items_from_offset(
         line_cursor=read_result.line_cursor,
         byte_offset=read_result.byte_offset,
         current_response_id=active_response_id,
-        items=items,
+        items=_dedupe_compact_noop_echo(items),
         latest_usage=latest_usage,
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
@@ -5765,6 +5765,7 @@ def _transcript_items_from_entry(
             entry,
             line_number=line_number,
             record_offset=record_offset,
+            agent_name=agent_name,
             current_response_id=current_response_id,
         )
     message = entry.get("message")
@@ -5877,19 +5878,53 @@ _COMPACT_NOOP_STDOUT_MARKERS: tuple[str, ...] = (
 )
 
 
-def _is_compact_noop_stdout(content: str) -> bool:
+def _dedupe_compact_noop_echo(
+    items: list[ClaudeTranscriptItem],
+) -> list[ClaudeTranscriptItem]:
     """
-    Whether a ``local_command`` record is a ``/compact`` "nothing to compact" refusal.
+    Drop the bare ``/compact`` echo when its refusal item is in the same batch.
+
+    Claude records a declined ``/compact`` as two records: the command echo
+    (a ``slash_command`` item with no output) and a standalone stdout record
+    (surfaced as the ``is_compact_noop`` item carrying the refusal text). They
+    are written together and normally read in one poll, so rendering both
+    yields two "Command compact" bubbles. Keep only the refusal item — it
+    carries the message — so the web shows a single bubble like the terminal.
+
+    :param items: Items parsed from one read batch, in order.
+    :returns: The items with any redundant bare ``/compact`` echo removed;
+        unchanged when the batch holds no ``is_compact_noop`` item.
+    """
+    if not any(item.is_compact_noop for item in items):
+        return items
+    return [
+        item
+        for item in items
+        if not (
+            not item.is_compact_noop
+            and item.item_type == "slash_command"
+            and item.data.get("name") == "compact"
+            and not item.data.get("output")
+        )
+    ]
+
+
+def _compact_noop_stdout(content: str) -> str | None:
+    """
+    Return the ``/compact`` "nothing to compact" refusal text, if this is one.
 
     :param content: Raw ``local_command`` record ``content``, expected to hold a
         ``<local-command-stdout>`` block.
-    :returns: ``True`` when the stdout matches a known compact-refusal marker.
+    :returns: The stdout text (e.g. "Not enough messages to compact.") when it
+        matches a known compact-refusal marker, else ``None``.
     """
     stdout_match = _COMMAND_STDOUT_RE.search(content)
     if stdout_match is None:
-        return False
-    lowered = stdout_match.group(1).lower()
-    return any(marker in lowered for marker in _COMPACT_NOOP_STDOUT_MARKERS)
+        return None
+    stdout = stdout_match.group(1)
+    if any(marker in stdout.lower() for marker in _COMPACT_NOOP_STDOUT_MARKERS):
+        return stdout.strip()
+    return None
 
 
 # Markers that prefix a ``role=user`` record produced by Claude
@@ -6080,6 +6115,7 @@ def _local_command_transcript_items_from_entry(
     *,
     line_number: int,
     record_offset: int | None,
+    agent_name: str,
     current_response_id: str | None,
 ) -> tuple[str | None, list[ClaudeTranscriptItem]]:
     """
@@ -6096,6 +6132,7 @@ def _local_command_transcript_items_from_entry(
     :param line_number: One-based transcript line number.
     :param record_offset: Byte offset where the transcript record
         starts, or ``None`` for legacy line-cursor reads.
+    :param agent_name: Agent/model name stamped on surfaced items.
     :param current_response_id: Response id for an in-progress shell
         command group, if the input record was parsed in an earlier
         line.
@@ -6108,14 +6145,23 @@ def _local_command_transcript_items_from_entry(
     source_key = _transcript_source_key(entry, line_number, record_offset)
     # A ``/compact`` refusal ("Not enough messages to compact.") lands as a
     # standalone ``local_command`` stdout record, separate from the
-    # ``/compact`` command echo. Surface it as a flagged, non-rendering item
-    # so the forwarder can dismiss the stranded "Compacting…" spinner.
-    if _is_compact_noop_stdout(content):
+    # ``/compact`` command echo. Surface it as a ``slash_command`` item
+    # carrying the refusal as ``output`` — so the web shows the same message
+    # Claude did — and flag it so the forwarder also dismisses the stranded
+    # "Compacting…" spinner.
+    compact_noop = _compact_noop_stdout(content)
+    if compact_noop is not None:
         return current_response_id, [
             ClaudeTranscriptItem(
                 source_id=_source_id(source_key, 0, "compact_noop"),
                 item_type="slash_command",
-                data={"kind": "command", "name": "compact"},
+                data={
+                    "agent": agent_name,
+                    "kind": "command",
+                    "name": "compact",
+                    "arguments": "",
+                    "output": compact_noop,
+                },
                 response_id=current_response_id or _response_id_from_source(source_key),
                 is_compact_noop=True,
             )

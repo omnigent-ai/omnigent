@@ -3424,27 +3424,14 @@ async def _forward_available_items(
         # ``/compact`` refusal ("Not enough messages to compact."). Claude
         # fired ``PreCompact`` (raising the spinner) but declined to compact,
         # so no completion signal follows and the spinner is stranded. Dismiss
-        # it and never render this marker as a bubble. Best-effort — a failed
-        # dismissal POST is logged, not retried (unlike a compaction boundary,
-        # there is nothing durable to persist).
+        # it here; the item itself still forwards below as a normal
+        # ``slash_command`` bubble carrying the refusal text, so the web shows
+        # the same message Claude did. Best-effort — a failed dismissal POST
+        # is logged, not retried (there is nothing durable to persist).
         if item.is_compact_noop:
             await _maybe_dismiss_stranded_compaction_spinner(
                 client, session_id=session_id, bridge_dir=bridge_dir
             )
-            seen.add(item.source_id)
-            seen_source_ids.append(item.source_id)
-            updated = TranscriptForwardState(
-                transcript_path=state.transcript_path,
-                line_cursor=state.line_cursor,
-                byte_offset=state.byte_offset,
-                current_response_id=current_response_id,
-                seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
-                cursor_fingerprint=state.cursor_fingerprint,
-                settled_response_id=dedupe.settled_response_id,
-                pending_settled_response_id=dedupe.pending_settled_response_id,
-            )
-            await _write_forward_state_async(bridge_dir, updated)
-            continue
         if skip_user_messages and item.item_type == "message" and item.data.get("role") == "user":
             seen_source_ids.append(item.source_id)
             seen.add(item.source_id)
