@@ -274,18 +274,15 @@ KUBERNETES_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # errors so an operator knows where to look inside the sandbox.
 _HOST_LOG_PATH = "/tmp/omnigent-host.log"
 
-# How long a message POST waits for an in-flight managed launch to
-# settle before giving up (see ManagedLaunchTracker). Covers the full
-# launch/wake pipeline ON TOP OF the host-registration wait
-# (resolve_managed_host_online_timeout_s): the provider's provision/resume call
-# (StartSandbox has no fixed upper bound), the host-tunnel reconnect on
-# this replica, and the runner spawn/connect. The 120s slack must cover
-# all of those so a slow cold launch/wake doesn't time the parked message
-# out before the background launch settles — otherwise the first
-# post-dormancy turn is lost even though the wake later succeeds. The wait
-# resolves as soon as the launch settles, so this bound only bites a
-# genuinely slow launch.
-MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S = DEFAULT_MANAGED_HOST_ONLINE_TIMEOUT_S + 120
+# Slack a message POST allows an in-flight managed launch ON TOP OF the
+# host-registration wait (see ManagedLaunchTracker and
+# managed_launch_rendezvous_timeout_s): the provider's provision/resume
+# call (StartSandbox has no fixed upper bound), the host-tunnel reconnect
+# on this replica, and the runner spawn/connect. It must cover all of
+# those so a slow cold launch/wake doesn't time the parked message out
+# before the background launch settles — otherwise the first
+# post-dormancy turn is lost even though the wake later succeeds.
+_RENDEZVOUS_SLACK_S = 120
 
 # Server-internal sandbox lifecycle labels — currently the repository a relaunch
 # re-clones. A client seed would forge that reconstruction, so session
@@ -326,6 +323,21 @@ def resolve_managed_host_online_timeout_s() -> float:
         # could ever register; refuse it here rather than at launch.
         raise click.ClickException(f"{ONLINE_TIMEOUT_ENV_VAR} must be greater than zero")
     return timeout
+
+
+def managed_launch_rendezvous_timeout_s() -> float:
+    """
+    Resolve how long a message POST waits for an in-flight launch.
+
+    Derived from (and always above) the host-registration budget so the
+    rendezvous outlives the wait it covers — a raised registration budget
+    must not leave a parked message expiring first.
+
+    :returns: The rendezvous budget in seconds.
+    :raises click.ClickException: When the env override is not a
+        positive number.
+    """
+    return resolve_managed_host_online_timeout_s() + _RENDEZVOUS_SLACK_S
 
 
 def resolve_managed_agent_label(
