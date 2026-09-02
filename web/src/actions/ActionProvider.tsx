@@ -196,10 +196,18 @@ export function usePaletteActions(enabled = true) {
   };
 }
 
-export interface ActionScopeProps {
+export interface ActionScopeOptions {
   mode: KeybindingMode;
   active?: boolean;
   context?: ContextPatch;
+}
+
+export interface ActionScopeHandle {
+  id: string;
+  rootProps: ScopeElementProps;
+}
+
+export interface ActionScopeProps extends ActionScopeOptions {
   children: ReactElement;
 }
 
@@ -211,21 +219,18 @@ interface ScopeElementProps {
   onBlurCapture?: (event: ReactFocusEvent) => void;
 }
 
-/**
- * Stamp action scope state onto one intrinsic DOM child without changing layout.
- * Wrap custom components or fragments in their existing root DOM element.
- */
-export function ActionScope({
+/** Register a scope while letting an existing large root spread the marker props. */
+export function useActionScopeRegistration({
   mode,
   active = true,
   context = EMPTY_CONTEXT_PATCH,
-  children,
-}: ActionScopeProps) {
+}: ActionScopeOptions): ActionScopeHandle {
   const actions = useActionRuntime();
   const parentId = useContext(ScopeContext);
   const reactId = useId();
   const id = `action-scope-${reactId}`;
   const latest = useRef({ mode, active, context });
+  const focusGeneration = useRef(0);
   latest.current = { mode, active, context };
 
   useLayoutEffect(() => {
@@ -236,29 +241,63 @@ export function ActionScope({
     actions.registry.updateScope(id, { mode, active, context, parentId });
   }, [actions.registry, active, context, id, mode, parentId]);
 
+  return {
+    id,
+    rootProps: {
+      "data-action-scope": id,
+      onFocusCapture: (event) => {
+        if (event.target instanceof Element) {
+          focusGeneration.current = actions.registry.markFocusedScope(id, event.target);
+        }
+      },
+      onBlurCapture: () => {
+        const generation = focusGeneration.current;
+        queueMicrotask(() => actions.registry.clearFocusedScope(generation));
+      },
+    },
+  };
+}
+
+export function ActionScopeProvider({
+  scope,
+  children,
+}: {
+  scope: ActionScopeHandle;
+  children: ReactNode;
+}) {
+  useLayoutEffect(() => {
+    if (!import.meta.env.DEV) return;
+    const markerExists = document.querySelector(`[${ACTION_SCOPE_ATTRIBUTE}="${scope.id}"]`);
+    if (!markerExists) console.error(`Action scope ${scope.id} did not spread rootProps`);
+  }, [scope.id]);
+  return <ScopeContext.Provider value={scope.id}>{children}</ScopeContext.Provider>;
+}
+
+/**
+ * Stamp action scope state onto one intrinsic DOM child without changing layout.
+ * Wrap custom components or fragments in their existing root DOM element.
+ */
+export function ActionScope({ children, ...options }: ActionScopeProps) {
+  const scope = useActionScopeRegistration(options);
   const child = children;
   if (!isValidElement<ScopeElementProps>(child) || typeof child.type !== "string") {
     throw new Error("ActionScope requires one intrinsic DOM element child");
   }
   const originalFocus = child.props.onFocusCapture;
   const originalBlur = child.props.onBlurCapture;
-  const focusGeneration = useRef(0);
   const scopedChild = cloneElement(child, {
-    "data-action-scope": id,
+    ...scope.rootProps,
     onFocusCapture: (event: ReactFocusEvent) => {
       originalFocus?.(event);
-      if (event.target instanceof Element) {
-        focusGeneration.current = actions.registry.markFocusedScope(id, event.target);
-      }
+      scope.rootProps.onFocusCapture?.(event);
     },
     onBlurCapture: (event: ReactFocusEvent) => {
       originalBlur?.(event);
-      const generation = focusGeneration.current;
-      queueMicrotask(() => actions.registry.clearFocusedScope(generation));
+      scope.rootProps.onBlurCapture?.(event);
     },
   });
 
-  return <ScopeContext.Provider value={id}>{scopedChild}</ScopeContext.Provider>;
+  return <ActionScopeProvider scope={scope}>{scopedChild}</ActionScopeProvider>;
 }
 
 export function useCurrentActionScopeId(): string | null {

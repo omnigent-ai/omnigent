@@ -113,13 +113,13 @@ const definitions = [
     id: "composer.action.send",
     title: "Send message",
     category: "Composer",
-    palette: true,
+    palette: false,
   },
   {
     id: "composer.action.stop",
     title: "Stop response",
     category: "Composer",
-    palette: true,
+    palette: false,
   },
   {
     id: "composer.action.recallPrevious",

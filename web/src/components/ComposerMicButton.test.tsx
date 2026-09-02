@@ -17,8 +17,9 @@
 // e2e test against the server's fake engine).
 
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
-import { ActionsProvider, KeybindingDispatcher } from "@/actions";
+import { ActionScope, ActionsProvider, KeybindingDispatcher } from "@/actions";
 import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import type { DictationSessionEvents } from "@/lib/dictation";
@@ -132,6 +133,17 @@ afterEach(() => {
     delete (navigator as { language?: unknown }).language;
   }
 });
+
+function renderComposerActions(ui: ReactElement) {
+  return render(
+    <ActionsProvider>
+      <KeybindingDispatcher />
+      <ActionScope mode="composer">
+        <div>{ui}</div>
+      </ActionScope>
+    </ActionsProvider>,
+  );
+}
 
 describe("ComposerMicButton", () => {
   it("toggles through the centralized physical-key action", () => {
@@ -325,8 +337,11 @@ describe("ComposerMicButton", () => {
 
   it("Enter while listening stops dictation and keeps the text (no discard)", () => {
     const onVoiceDiscard = vi.fn();
-    render(<ComposerMicButton onTranscript={vi.fn()} onVoiceDiscard={onVoiceDiscard} />);
-    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    renderComposerActions(
+      <ComposerMicButton onTranscript={vi.fn()} onVoiceDiscard={onVoiceDiscard} />,
+    );
+    const button = screen.getByRole("button", { name: "Voice dictation" });
+    fireEvent.click(button);
     act(() => handlers.start?.({}));
 
     const e = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
@@ -341,8 +356,11 @@ describe("ComposerMicButton", () => {
 
   it("Esc while listening stops dictation and discards the text", () => {
     const onVoiceDiscard = vi.fn();
-    render(<ComposerMicButton onTranscript={vi.fn()} onVoiceDiscard={onVoiceDiscard} />);
-    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    renderComposerActions(
+      <ComposerMicButton onTranscript={vi.fn()} onVoiceDiscard={onVoiceDiscard} />,
+    );
+    const button = screen.getByRole("button", { name: "Voice dictation" });
+    fireEvent.click(button);
     act(() => handlers.start?.({}));
 
     const e = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
@@ -357,12 +375,15 @@ describe("ComposerMicButton", () => {
 
   it("drops a late transcript that arrives after an Esc discard", () => {
     const onTranscript = vi.fn();
-    render(<ComposerMicButton onTranscript={onTranscript} onVoiceDiscard={vi.fn()} />);
-    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    renderComposerActions(
+      <ComposerMicButton onTranscript={onTranscript} onVoiceDiscard={vi.fn()} />,
+    );
+    const button = screen.getByRole("button", { name: "Voice dictation" });
+    fireEvent.click(button);
     act(() => handlers.start?.({}));
 
     act(() => {
-      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      button.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
     });
     // A trailing final result races in before the recognizer's end event.
     act(() => handlers.result?.(resultEvent("trailing words")));
@@ -372,7 +393,9 @@ describe("ComposerMicButton", () => {
 
   it("does not intercept Enter/Esc when not listening", () => {
     const onVoiceDiscard = vi.fn();
-    render(<ComposerMicButton onTranscript={vi.fn()} onVoiceDiscard={onVoiceDiscard} />);
+    renderComposerActions(
+      <ComposerMicButton onTranscript={vi.fn()} onVoiceDiscard={onVoiceDiscard} />,
+    );
     // Never started listening.
     const enter = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
     const esc = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
@@ -420,7 +443,7 @@ function renderServerMode(
   // No SpeechRecognition constructor → the component must pick server mode.
   vi.stubGlobal("SpeechRecognition", undefined);
   vi.stubGlobal("webkitSpeechRecognition", undefined);
-  return render(
+  return renderComposerActions(
     <CapabilitiesContext.Provider value={info}>
       <ComposerMicButton onTranscript={vi.fn()} {...props} />
     </CapabilitiesContext.Provider>,
@@ -441,8 +464,8 @@ describe("ComposerMicButton (server dictation)", () => {
   });
 
   it("renders nothing when neither Web Speech nor the server can help", () => {
-    const { container } = renderServerMode({}, NO_DICTATION_INFO);
-    expect(container).toBeEmptyDOMElement();
+    renderServerMode({}, NO_DICTATION_INFO);
+    expect(screen.queryByRole("button", { name: "Voice dictation" })).toBeNull();
   });
 
   it("starts a session on click and reflects the recording state", async () => {

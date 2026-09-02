@@ -15,7 +15,8 @@ export function useRegisterAction<A extends ActionId>(
   invalidationKey?: ActionInvalidationKey,
 ): void {
   const actions = useInternalActionRuntime();
-  const scopeId = useCurrentActionScopeId();
+  const currentScopeId = useCurrentActionScopeId();
+  const scopeId = registration.scope === "global" ? null : currentScopeId;
   const latest = useRef(registration);
   latest.current = registration;
 

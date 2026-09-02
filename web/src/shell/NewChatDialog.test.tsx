@@ -27,6 +27,7 @@ import {
   NewChatLandingScreen,
   resetLandingDraft,
 } from "./NewChatDialog";
+import { ActionsProvider, KeybindingDispatcher } from "@/actions";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
@@ -793,7 +794,10 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
       <CapabilitiesProvider info={info}>
         <TooltipProvider>
           <MemoryRouter initialEntries={[route]}>
-            <NewChatLandingScreen />
+            <ActionsProvider>
+              <KeybindingDispatcher />
+              <NewChatLandingScreen />
+            </ActionsProvider>
           </MemoryRouter>
         </TooltipProvider>
       </CapabilitiesProvider>

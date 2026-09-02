@@ -1,7 +1,6 @@
 import {
   type DragEvent,
   type FormEvent,
-  type KeyboardEvent,
   createContext,
   memo,
   useCallback,
@@ -31,6 +30,14 @@ import {
   XIcon,
 } from "lucide-react";
 import { useMessageNavigationActions } from "@/hooks/useMessageNavigationActions";
+import {
+  ActionScopeProvider,
+  HANDLED,
+  NOT_HANDLED,
+  useActionScopeRegistration,
+  type ActionSource,
+} from "@/actions";
+import { ComposerActionBindings } from "@/components/ComposerActionBindings";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
@@ -39,7 +46,6 @@ import {
 } from "@/components/KeyboardShortcut";
 import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
 import { useNavigate, useParams } from "@/lib/routing";
-import { isImeCompositionKeyEvent } from "@/lib/ime";
 import {
   Conversation,
   ConversationContent,
@@ -126,7 +132,7 @@ import {
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
-import { isComposerSendKey, readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
+import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
   buildMentionPreamble,
   detectMentionAt,
@@ -4622,7 +4628,9 @@ export function Composer({
     attachMention,
     openMentionDir,
     removeMentionedItem,
-    handleKeyDown: handleMentionKeyDown,
+    selectPrevious: selectPreviousMention,
+    selectNext: selectNextMention,
+    accept: acceptMention,
     dismiss: dismissMention,
   } = useMentionBrowser({
     mention,
@@ -4634,7 +4642,6 @@ export function Composer({
       dirtyRef.current = true;
     },
     textareaRef,
-    isMobile,
   });
 
   // Depends on mentionedItems (from the hook above), so it's computed here.
@@ -5030,118 +5037,74 @@ export function Composer({
     });
   };
 
-  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (isImeCompositionKeyEvent(e, isComposingRef.current)) {
-      return;
-    }
-
-    // Touch-primary newline behavior outranks autocomplete and desktop submit
-    // preferences. Leave the event untouched so the textarea inserts it.
-    if (preventsKeyboardSubmit && e.key === "Enter") {
-      return;
-    }
-
-    const shouldSubmitFromKeyboard = isComposerSendKey(
-      {
-        key: e.key,
-        shiftKey: e.shiftKey,
-        metaKey: e.metaKey,
-        ctrlKey: e.ctrlKey,
-        altKey: e.altKey,
-        isComposing: e.nativeEvent.isComposing,
-      },
-      submitWithModEnter,
-      preventsKeyboardSubmit,
-    );
-    // Plain Enter still completes an open suggestion. In Mod+Enter mode, the
-    // explicit send chord bypasses suggestions so the modifier has one meaning.
-    const shouldPreferSendOverCompletion = submitWithModEnter && shouldSubmitFromKeyboard;
-
-    // "@"-mention menu navigation (shared useMentionBrowser) — mutually
-    // exclusive with the slash menu below (a mention token can't also read as a
-    // "/"-command). Takes priority over history recall and submission.
-    if (!shouldPreferSendOverCompletion && handleMentionKeyDown(e)) return;
-
-    // When the suggestions menu is open, ArrowUp/Down navigate it and
-    // Enter/Tab complete the highlighted item. These take priority over
-    // history recall and normal submission.
-    if (menuOpen && menuMatches.length > 0) {
-      if (e.key === "ArrowDown") {
-        e.preventDefault();
-        setMenuIndex((i) => (i + 1) % menuMatches.length);
-        return;
-      }
-      if (e.key === "ArrowUp") {
-        e.preventDefault();
-        setMenuIndex((i) => (i <= 0 ? menuMatches.length - 1 : i - 1));
-        return;
-      }
-      if (
-        !shouldPreferSendOverCompletion &&
-        (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !isMobile)) &&
-        menuIndex >= 0
-      ) {
-        e.preventDefault();
-        applyMenuSelection(menuMatches[menuIndex]!);
-        return;
-      }
-      if (e.key === "Escape") {
-        e.preventDefault();
-        // Dismiss the menu by clearing the input so the user can start fresh.
-        setValue("");
-        setMenuIndex(-1);
-        return;
-      }
-    }
-
-    // Mobile Enter behavior takes precedence over this desktop preference:
-    // software-keyboard Enter inserts a newline and Send remains an explicit tap.
-    if (shouldSubmitFromKeyboard) {
-      e.preventDefault();
-      // The mention menu is briefly closed while its listing loads (see
-      // ``mentionListingPending``); swallow Enter so the in-progress "@dir/"
-      // token isn't sent as a chat message. The menu reopens when entries land.
-      if (mentionListingPending) return;
-      submit();
-      return;
-    }
-    // Esc cancels an in-flight turn. When idle it's a no-op — clearing on
-    // Esc destroys typed prompts with no undo (common muscle memory after
-    // dismissing autocomplete suggestions).
-    if (e.key === "Escape" && isStreaming) {
-      e.preventDefault();
-      onStop();
-      return;
-    }
-    // ArrowUp/Down recall — only when the caret is already at the very
-    // start (ArrowUp) or end (ArrowDown) of the text.  Checking for the
-    // absence of "\n" before/after the cursor is not sufficient: long
-    // single-line text that wraps visually contains no newlines, so that
-    // check always fires and history recall intercepts cursor movement
-    // within the wrapped line.  Gating on position 0 / length ensures the
-    // browser gets to move the caret through wrapped lines first; only the
-    // final ArrowUp-at-start / ArrowDown-at-end triggers recall.
-    // Recall is for UNmodified arrows only. Cmd/Ctrl+↑/↓ (switch session) and
-    // Cmd/Alt+↑/↓ (jump between messages) are global window hotkeys meant to
-    // fire even mid-compose; without this guard the recall below intercepts
-    // them (replacing the draft) and the hotkeys appear broken in the composer.
-    if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.metaKey && !e.ctrlKey && !e.altKey) {
-      const ta = e.currentTarget;
-      if (e.key === "ArrowUp" && ta.selectionStart === 0) {
-        const recalled = recallPrevious(value);
-        if (recalled !== null) {
-          e.preventDefault();
-          applyRecall(ta, recalled);
-        }
-      } else if (e.key === "ArrowDown" && ta.selectionEnd === ta.value.length) {
-        const recalled = recallNext();
-        if (recalled !== null) {
-          e.preventDefault();
-          applyRecall(ta, recalled);
-        }
-      }
-    }
+  const selectPreviousSuggestion = () => {
+    if (selectPreviousMention()) return HANDLED;
+    if (!menuOpen || menuMatches.length === 0) return NOT_HANDLED;
+    setMenuIndex((index) => (index <= 0 ? menuMatches.length - 1 : index - 1));
+    return HANDLED;
   };
+  const selectNextSuggestion = () => {
+    if (selectNextMention()) return HANDLED;
+    if (!menuOpen || menuMatches.length === 0) return NOT_HANDLED;
+    setMenuIndex((index) => (index + 1) % menuMatches.length);
+    return HANDLED;
+  };
+  const acceptSuggestion = (behavior: "openOrAttach" | "attach") => {
+    if (behavior === "openOrAttach" && preventsKeyboardSubmit) return NOT_HANDLED;
+    if (acceptMention(behavior)) return HANDLED;
+    if (!menuOpen || menuIndex < 0) return NOT_HANDLED;
+    const match = menuMatches[menuIndex];
+    if (!match) return NOT_HANDLED;
+    applyMenuSelection(match);
+    return HANDLED;
+  };
+  const dismissSuggestions = () => {
+    if (dismissMention()) return HANDLED;
+    if (!menuOpen || menuMatches.length === 0) return NOT_HANDLED;
+    setValue("");
+    setMenuIndex(-1);
+    return HANDLED;
+  };
+  const sendAction = (source: ActionSource) => {
+    // Mobile hardware/software Enter remains a newline; buttons/API may send.
+    if (source === "keyboard" && preventsKeyboardSubmit) return NOT_HANDLED;
+    // Never send a half-resolved @directory token.
+    if (mentionListingPending) return HANDLED;
+    submit();
+    return HANDLED;
+  };
+  const stopAction = () => {
+    // Idle Escape is native/no-op so it never destroys a typed draft.
+    if (!isStreaming) return NOT_HANDLED;
+    onStop();
+    return HANDLED;
+  };
+  // Absolute boundaries avoid hijacking arrows within visually wrapped lines.
+  const recallPreviousAction = () => {
+    const textarea = textareaRef.current;
+    if (!textarea || textarea.selectionStart !== 0) return NOT_HANDLED;
+    const recalled = recallPrevious(value);
+    if (recalled === null) return NOT_HANDLED;
+    applyRecall(textarea, recalled);
+    return HANDLED;
+  };
+  const recallNextAction = () => {
+    const textarea = textareaRef.current;
+    if (!textarea || textarea.selectionEnd !== textarea.value.length) return NOT_HANDLED;
+    const recalled = recallNext();
+    if (recalled === null) return NOT_HANDLED;
+    applyRecall(textarea, recalled);
+    return HANDLED;
+  };
+  const composerScope = useActionScopeRegistration({
+    mode: "composer",
+    context: {
+      composerStreaming: isStreaming,
+      composerSuggestionsOpen: mentionOpen || (menuOpen && menuMatches.length > 0),
+      composerEnterInserts: preventsKeyboardSubmit,
+      composerSubmitWithModEnter: submitWithModEnter,
+    },
+  });
 
   const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const items = e.clipboardData?.items;
@@ -5161,12 +5124,27 @@ export function Composer({
 
   return (
     <form
+      {...composerScope.rootProps}
       onSubmit={handleSubmit}
       className={cn(
         "chat-composer-form px-4 md:px-6",
         isTerminalFirst ? "terminal-first-composer-form pb-1.5" : "pb-3",
       )}
     >
+      <ActionScopeProvider scope={composerScope}>
+        <ComposerActionBindings
+          textareaRef={textareaRef}
+          isComposing={() => isComposingRef.current}
+          onSend={sendAction}
+          onStop={stopAction}
+          onRecallPrevious={recallPreviousAction}
+          onRecallNext={recallNextAction}
+          onSelectPreviousSuggestion={selectPreviousSuggestion}
+          onSelectNextSuggestion={selectNextSuggestion}
+          onAcceptSuggestion={acceptSuggestion}
+          onDismissSuggestions={dismissSuggestions}
+        />
+      </ActionScopeProvider>
       {/* Hidden file input for the attach button */}
       <input
         ref={fileInputRef}
@@ -5343,7 +5321,6 @@ export function Composer({
             onCompositionEnd={() => {
               isComposingRef.current = false;
             }}
-            onKeyDown={handleKeyDown}
             onBlur={() => {
               // Dismiss the "@"-mention menu when focus leaves the textarea
               // (clicking a chip's ✕, the Send button, or another field).

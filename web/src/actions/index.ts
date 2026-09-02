@@ -1,13 +1,15 @@
 export { ACTION_CATALOG, ACTIONS_BY_ID, getActionDefinition } from "./catalog";
 export {
   ActionScope,
+  ActionScopeProvider,
   ActionsProvider,
   useActionAvailable,
+  useActionScopeRegistration,
   useActions,
   useAvailableActions,
   usePaletteActions,
 } from "./ActionProvider";
-export type { ActionsApi } from "./ActionProvider";
+export type { ActionScopeHandle, ActionScopeOptions, ActionsApi } from "./ActionProvider";
 export { KeybindingDispatcher } from "./KeybindingDispatcher";
 export { useRegisterAction } from "./useRegisterAction";
 export type { ActionInvalidationKey } from "./useRegisterAction";

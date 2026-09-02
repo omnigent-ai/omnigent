@@ -432,6 +432,7 @@ export const ComposerMicButton = ({
   useRegisterAction(
     "composer.action.toggleDictation",
     {
+      scope: "global",
       acceptsKeybindings: true,
       isEnabled: () => hotkeyEnabled,
       run: () => {
@@ -442,46 +443,51 @@ export const ComposerMicButton = ({
     hotkeyEnabled, // refresh action availability when capability/disabled state flips
   );
 
-  // While listening, Enter commits (end the take, keep the text) and Esc
-  // cancels (end the take, discard back to the pre-dictation snapshot). Bound in
-  // the capture phase so it preempts the composer's own Enter-sends / Esc-stops.
-  // Path-aware: a live server take is torn down via the DictationSession, a Web
-  // Speech take via the recognizer.
-  useEffect(() => {
-    if (!isListening) return;
-    const handler = (e: globalThis.KeyboardEvent): void => {
-      if (e.repeat || e.metaKey || e.ctrlKey || e.altKey) return;
-      if (e.key === "Enter" && !e.shiftKey) {
-        // Commit: end the take and keep the text. toggle() routes to the right
-        // path — Web Speech stop, or a server stop that flushes the tail.
-        e.preventDefault();
-        e.stopPropagation();
+  const cancelDictation = useCallback(() => {
+    discardingRef.current = true;
+    onVoiceDiscardRef.current?.();
+    const session = sessionRef.current;
+    if (session) {
+      sessionRef.current = null;
+      serverBusyRef.current = false;
+      session.cancel();
+      setIsListening(false);
+      return;
+    }
+    try {
+      recognitionRef.current?.stop();
+    } catch {
+      // Already stopping — the end event will reconcile state.
+    }
+  }, []);
+
+  // Capture-phase defaults make these actions preempt composer send/stop.
+  useRegisterAction(
+    "composer.action.commitDictation",
+    {
+      scope: "global",
+      acceptsKeybindings: true,
+      isEnabled: () => isListening,
+      run: () => {
         toggle();
-      } else if (e.key === "Escape") {
-        // Cancel: flag the discard so trailing results are dropped, revert the
-        // composer, then tear the take down immediately (no tail flush).
-        e.preventDefault();
-        e.stopPropagation();
-        discardingRef.current = true;
-        onVoiceDiscardRef.current?.();
-        const session = sessionRef.current;
-        if (session) {
-          sessionRef.current = null;
-          serverBusyRef.current = false;
-          session.cancel();
-          setIsListening(false);
-        } else {
-          try {
-            recognitionRef.current?.stop();
-          } catch {
-            // Already stopping — the end event will reconcile state.
-          }
-        }
-      }
-    };
-    window.addEventListener("keydown", handler, true);
-    return () => window.removeEventListener("keydown", handler, true);
-  }, [isListening, toggle]);
+        return HANDLED;
+      },
+    },
+    isListening,
+  );
+  useRegisterAction(
+    "composer.action.cancelDictation",
+    {
+      scope: "global",
+      acceptsKeybindings: true,
+      isEnabled: () => isListening,
+      run: () => {
+        cancelDictation();
+        return HANDLED;
+      },
+    },
+    isListening,
+  );
 
   if (!Ctor && !serverAvailable) return null;
 

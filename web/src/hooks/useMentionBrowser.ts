@@ -1,4 +1,4 @@
-import { type KeyboardEvent, type RefObject, useRef, useState } from "react";
+import { type RefObject, useRef, useState } from "react";
 
 import type { MentionItem, MentionState } from "@/lib/composerMentions";
 import { composerAttachmentKey } from "@/store/chatStore";
@@ -7,8 +7,8 @@ import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 /**
  * Inputs the host composer supplies. The data source (workspace API vs. host
  * filesystem) and the mention-token state live in the composer — only the
- * stateful glue (selection index, tagged chips, attach/drill/remove handlers,
- * keyboard navigation, top-row preselect) is shared here, so the two composers
+ * stateful glue (selection index, tagged chips, semantic selection handlers,
+ * and top-row preselect) is shared here, so the two composers
  * can't drift.
  */
 export interface MentionBrowserParams {
@@ -22,8 +22,6 @@ export interface MentionBrowserParams {
   text: string;
   setText: (next: string) => void;
   textareaRef: RefObject<HTMLTextAreaElement | null>;
-  /** On mobile, Enter inserts a newline rather than acting on the menu. */
-  isMobile?: boolean;
 }
 
 export interface MentionBrowser {
@@ -36,28 +34,22 @@ export interface MentionBrowser {
   /** Drill into a folder: rewrite the token to ``@<dir>/`` and keep browsing. */
   openMentionDir: (path: string) => void;
   removeMentionedItem: (index: number) => void;
-  /** Handle a key event for the open menu; returns true when it consumed it. */
-  handleKeyDown: (e: KeyboardEvent<HTMLTextAreaElement>) => boolean;
-  /** Dismiss the menu (e.g. on blur). */
-  dismiss: () => void;
+  selectPrevious: () => boolean;
+  selectNext: () => boolean;
+  /** Enter drills into folders; Tab attaches folders whole. */
+  accept: (behavior: "openOrAttach" | "attach") => boolean;
+  /** Dismiss the menu (e.g. on blur); reports whether it was open. */
+  dismiss: () => boolean;
 }
 
 /**
  * Shared ``@``-file-mention controller for the in-session composer and the
  * new-session launcher. Owns the selection index, the tagged-chip list, and
- * the attach/drill/remove + keyboard behaviour; the composer owns the token
+ * the attach/drill/remove + selection behaviour; the composer owns the token
  * state and supplies the directory listing (its data source differs).
  */
 export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser {
-  const {
-    mention,
-    setMention,
-    mentionEntries,
-    text,
-    setText,
-    textareaRef,
-    isMobile = false,
-  } = params;
+  const { mention, setMention, mentionEntries, text, setText, textareaRef } = params;
   const [mentionIndex, setMentionIndex] = useState(-1);
   const [mentionedItems, setMentionedItems] = useState<MentionItem[]>([]);
   const mentionOpen = mentionEntries.length > 0;
@@ -115,44 +107,35 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   const removeMentionedItem = (index: number) =>
     setMentionedItems((prev) => prev.filter((_, i) => i !== index));
 
-  const dismiss = () => {
-    if (!mention) return;
+  const dismiss = (): boolean => {
+    if (!mention) return false;
     setMention(null);
     setMentionIndex(-1);
+    return true;
   };
 
-  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): boolean => {
+  const selectPrevious = (): boolean => {
+    if (!mentionOpen) return false;
+    setMentionIndex((index) => (index <= 0 ? mentionEntries.length - 1 : index - 1));
+    return true;
+  };
+
+  const selectNext = (): boolean => {
+    if (!mentionOpen) return false;
+    setMentionIndex((index) => (index + 1) % mentionEntries.length);
+    return true;
+  };
+
+  const accept = (behavior: "openOrAttach" | "attach"): boolean => {
     if (!mentionOpen) return false;
     const active = mentionIndex >= 0 ? mentionEntries[mentionIndex] : undefined;
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      setMentionIndex((i) => (i + 1) % mentionEntries.length);
-      return true;
+    if (!active) return false;
+    if (behavior === "openOrAttach" && active.type === "directory") {
+      openMentionDir(active.path);
+    } else {
+      attachMention(active.path, behavior === "attach" && active.type === "directory");
     }
-    if (e.key === "ArrowUp") {
-      e.preventDefault();
-      setMentionIndex((i) => (i <= 0 ? mentionEntries.length - 1 : i - 1));
-      return true;
-    }
-    // Enter: open a folder (drill in) or attach a file. Tab: attach the
-    // highlighted row as a unit — whole folder or file — without drilling.
-    if (e.key === "Enter" && !e.shiftKey && !isMobile && active) {
-      e.preventDefault();
-      if (active.type === "directory") openMentionDir(active.path);
-      else attachMention(active.path, false);
-      return true;
-    }
-    if (e.key === "Tab" && active) {
-      e.preventDefault();
-      attachMention(active.path, active.type === "directory");
-      return true;
-    }
-    if (e.key === "Escape") {
-      e.preventDefault();
-      dismiss();
-      return true;
-    }
-    return false;
+    return true;
   };
 
   return {
@@ -163,7 +146,9 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     attachMention,
     openMentionDir,
     removeMentionedItem,
-    handleKeyDown,
+    selectPrevious,
+    selectNext,
+    accept,
     dismiss,
   };
 }

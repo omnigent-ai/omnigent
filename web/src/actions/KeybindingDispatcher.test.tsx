@@ -19,6 +19,8 @@ function Handler({
     | "workbench.action.showCommands"
     | "chat.action.acceptApproval"
     | "composer.action.send"
+    | "composer.action.acceptSuggestion"
+    | "composer.action.commitDictation"
     | "panel.action.closeFiles"
     | "session.action.new"
     | "workbench.action.toggleConversationsSidebar"
@@ -197,6 +199,44 @@ describe("KeybindingDispatcher", () => {
       altKey: true,
     });
     expect(left).toHaveBeenCalledOnce();
+  });
+
+  it("prioritizes dictation capture and suggestions over composer send", () => {
+    const commit = vi.fn(() => HANDLED);
+    const accept = vi.fn(() => HANDLED);
+    const send = vi.fn(() => HANDLED);
+    const first = renderActions(
+      <>
+        <Handler action="composer.action.commitDictation" run={commit} />
+        <ActionScope mode="composer">
+          <div>
+            <Handler action="composer.action.send" run={send} />
+            <textarea aria-label="dictating composer" />
+          </div>
+        </ActionScope>
+      </>,
+    );
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "dictating composer" }), {
+      key: "Enter",
+    });
+    expect(commit).toHaveBeenCalledOnce();
+    expect(send).not.toHaveBeenCalled();
+    first.unmount();
+
+    renderActions(
+      <ActionScope mode="composer" context={{ composerSuggestionsOpen: true }}>
+        <div>
+          <Handler action="composer.action.acceptSuggestion" run={accept} />
+          <Handler action="composer.action.send" run={send} />
+          <textarea aria-label="suggesting composer" />
+        </div>
+      </ActionScope>,
+    );
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "suggesting composer" }), {
+      key: "Enter",
+    });
+    expect(accept).toHaveBeenCalledOnce();
+    expect(send).not.toHaveBeenCalled();
   });
 
   it("falls through a notHandled capture action to a composer bubble action", () => {
