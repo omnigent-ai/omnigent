@@ -5327,7 +5327,7 @@
         "type": "object"
       },
       "SessionModelEvent": {
-        "description": "Active-model report from a terminal-backed integration.\n\nEmitted after an `external_model_change` POST from a native\nforwarder \u2014 the launch's own model report, or a switch made inside\nthe pane (a `/model` command or the in-TUI picker). Every surface\nre-renders its model display from this.",
+        "description": "Active-model report from a harness integration.\n\nEmitted after an `external_model_change` POST from a native\nforwarder or when an SDK relay reports its concrete model in terminal\nresponse usage. Every surface re-renders its model display from this.",
         "properties": {
           "conversation_id": {
             "description": "Session identifier, e.g. `\"conv_abc123\"`.",
