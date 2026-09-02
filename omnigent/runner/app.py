@@ -404,6 +404,7 @@ _SUBAGENT_DELIVERY_ALREADY_DELIVERED = "already_delivered"
 _SUBAGENT_DELIVERY_UNTRACKED = "untracked"
 _SUBAGENT_DELIVERY_MISSING_WORK_ENTRY = "missing_work_entry"
 _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX = "missing_parent_inbox"
+_SUBAGENT_DELIVERY_CONSUMED_INLINE = "consumed_inline"
 # Read budget for runner→server POSTs that can PARK behind a human-approval
 # ASK gate: policy evaluation (``_evaluate_policy_via_omnigent``) and sub-agent
 # wake-notice delivery (``_deliver_subagent_wake_post``). Both are gated at the
@@ -1471,6 +1472,11 @@ class _SubagentWorkEntry:
         terminal status, or ``None`` while running.
     :param delivered: Whether the terminal payload has been pushed to
         the parent's inbox.
+    :param deliver_to_inbox: Whether the terminal payload belongs in the
+        parent's inbox. ``False`` for a dispatch whose caller waits for
+        the result inline (``web_fetch``): the tool call returns the
+        findings itself, so an inbox item would wake the parent a second
+        time for work it already has.
     """
 
     parent_session_id: str
@@ -1485,6 +1491,7 @@ class _SubagentWorkEntry:
     created_at: float = dataclasses.field(default_factory=time.time)
     completed_at: float | None = None
     delivered: bool = False
+    deliver_to_inbox: bool = True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1556,6 +1563,7 @@ def register_subagent_work(
     title: str,
     wrapper_label: str | None = None,
     created_by: str | None = None,
+    deliver_to_inbox: bool = True,
 ) -> _SubagentWorkEntry:
     """
     Register one running sub-agent dispatch.
@@ -1573,6 +1581,9 @@ def register_subagent_work(
         label, e.g. ``"claude-code-native-ui"``.
     :param created_by: Human actor that dispatched this child turn, if
         known from the parent turn context.
+    :param deliver_to_inbox: Whether the terminal payload should reach the
+        parent through its inbox. ``False`` when the dispatching tool call
+        waits for the result and returns it itself.
     :returns: The registered work entry.
     """
     prior = _subagent_work_by_child.get(child_session_id)
@@ -1591,6 +1602,7 @@ def register_subagent_work(
         title=title,
         wrapper_label=wrapper_label,
         created_by=created_by,
+        deliver_to_inbox=deliver_to_inbox,
     )
     _drained_delivered_subagent_children.discard(child_session_id)
     _subagent_work_by_child[child_session_id] = entry
@@ -1606,6 +1618,25 @@ def get_subagent_work(child_session_id: str) -> _SubagentWorkEntry | None:
     :returns: The work entry, or ``None`` if the child is not tracked.
     """
     return _subagent_work_by_child.get(child_session_id)
+
+
+def restore_subagent_inbox_delivery(child_session_id: str) -> _SubagentWorkEntry | None:
+    """
+    Send a child's result back to the parent inbox after an inline wait ends.
+
+    A tool that waits for its child inline suppresses inbox delivery, because
+    it returns the payload itself. When that wait gives up (the child outran
+    the tool's budget), the child is still running and its eventual result
+    would have nowhere to go — so the inbox route is re-armed here.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: The updated work entry, or ``None`` if the child is untracked.
+    """
+    entry = _subagent_work_by_child.get(child_session_id)
+    if entry is None:
+        return None
+    entry.deliver_to_inbox = True
+    return entry
 
 
 def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | None:
@@ -1776,6 +1807,17 @@ def _deliver_subagent_completion(entry: _SubagentWorkEntry) -> _SubagentDelivery
             delivered=True,
             delivered_now=False,
             reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
+        )
+    if not entry.deliver_to_inbox:
+        # The dispatching tool call is waiting on this entry and returns the
+        # payload as its own result. Confirmed without an inbox item: a
+        # second copy there would wake the parent for finished work.
+        entry.delivered = True
+        return _SubagentDeliveryAck(
+            entry=entry,
+            delivered=True,
+            delivered_now=False,
+            reason=_SUBAGENT_DELIVERY_CONSUMED_INLINE,
         )
     inbox = _session_inboxes_ref.get(entry.parent_session_id)
     if inbox is None:
