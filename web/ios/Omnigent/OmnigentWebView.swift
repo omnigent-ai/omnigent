@@ -8,6 +8,13 @@ struct OmnigentWebView: UIViewRepresentable {
   @ObservedObject var settings: SettingsStore
   let loadFailed: (URL, String) -> Void
   let loadSucceeded: () -> Void
+  /// Compose and push the current server-picker payload to the SPA.
+  let pushServerPicker: () -> Void
+  /// Switch the shell to a picker-listed server. The owner validates the
+  /// target against the managed/recent allow list before acting.
+  let requestSwitchServer: (String) -> Void
+  /// Return the shell to its "connect to server" setup page.
+  let openServerSetup: () -> Void
 
   func makeCoordinator() -> Coordinator {
     Coordinator(self)
@@ -179,6 +186,22 @@ struct OmnigentWebView: UIViewRepresentable {
           try { callback(mode); } catch {}
         }
       });
+      const serverPickerWaiters = new Set();
+      defineEmit("__omnigentNativeEmitServerPicker", (payload) => {
+        if (!payload || typeof payload !== "object") return;
+        if (typeof payload.currentOrigin !== "string" || !payload.currentOrigin) return;
+        const cleanList = (value) =>
+          Array.isArray(value) ? value.filter((entry) => typeof entry === "string") : [];
+        const info = {
+          currentOrigin: payload.currentOrigin,
+          managedServers: cleanList(payload.managedServers),
+          recentServers: cleanList(payload.recentServers),
+        };
+        for (const resolve of serverPickerWaiters) {
+          try { resolve(info); } catch {}
+        }
+        serverPickerWaiters.clear();
+      });
       const insetCallbacks = new Set();
       // Cache the last footprint so a subscriber that registers AFTER native
       // first emitted (the React app mounts later than document-start) still
@@ -284,6 +307,31 @@ struct OmnigentWebView: UIViewRepresentable {
           insetCallbacks.add(callback);
           if (lastInsets) { try { callback(lastInsets); } catch {} }
           return () => insetCallbacks.delete(callback);
+        },
+        getServerPicker() {
+          // Always fetch fresh rather than caching: the picker re-reads on
+          // every menu open so a runtime MDM profile change appears without a
+          // reload, matching the Electron shell's per-call read. Native
+          // answers each request with an emit, resolving every waiter.
+          const pending = new Promise((resolve) => { serverPickerWaiters.add(resolve); });
+          window.webkit.messageHandlers.omnigentNative.postMessage({
+            method: "requestServerPicker",
+          });
+          return pending;
+        },
+        switchServer(url) {
+          if (typeof url === "string") {
+            window.webkit.messageHandlers.omnigentNative.postMessage({
+              method: "switchServer",
+              url,
+            });
+          }
+          return Promise.resolve();
+        },
+        openServerSetup() {
+          window.webkit.messageHandlers.omnigentNative.postMessage({
+            method: "openServerSetup",
+          });
         },
       });
     })();
@@ -450,6 +498,13 @@ struct OmnigentWebView: UIViewRepresentable {
         parent.model.serverSwitcherHidden = (body["hidden"] as? NSNumber)?.boolValue ?? true
       case "setSidebarOpen":
         parent.model.serverSwitcherHidden = (body["open"] as? NSNumber)?.boolValue ?? true
+      case "requestServerPicker":
+        parent.pushServerPicker()
+      case "switchServer":
+        guard let urlString = body["url"] as? String else { return }
+        parent.requestSwitchServer(urlString)
+      case "openServerSetup":
+        parent.openServerSetup()
       case "setViewMode":
         let mode: WebViewMode = (body["mode"] as? String) == "terminal" ? .terminal : .chat
         parent.model.viewMode = mode

@@ -1077,10 +1077,10 @@ export function Sidebar({
               />
             </div>
 
-            {/* Desktop server picker, pinned below the scrolling session list.
-          Self-hiding: renders nothing outside the Electron shell (see
-          SidebarServerPicker), so browsers keep an unchanged sidebar that ends
-          with the list. */}
+            {/* Native-shell server picker, pinned below the scrolling session
+          list. Self-hiding: renders nothing outside a shell with the picker
+          bridge (see SidebarServerPicker), so browsers keep an unchanged
+          sidebar that ends with the list. */}
             <SidebarServerPicker />
           </>
         )}
