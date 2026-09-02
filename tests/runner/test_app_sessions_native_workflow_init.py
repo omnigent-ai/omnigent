@@ -2071,7 +2071,23 @@ async def test_create_session_envelope_is_single_flight_and_skips_metadata_callb
                 return type(
                     "Response",
                     (),
-                    {"status_code": 200, "json": lambda self: {"data": []}},
+                    {
+                        "status_code": 200,
+                        "json": lambda self: {"data": []},
+                        "raise_for_status": lambda self: None,
+                    },
+                )()
+            if path.endswith("/child_sessions"):
+                # Restart recovery lists the session's children; an empty
+                # list ends the scan after this single read.
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "status_code": 200,
+                        "json": lambda self: {"data": [], "has_more": False},
+                        "raise_for_status": lambda self: None,
+                    },
                 )()
             raise AssertionError(f"unexpected metadata callback: {path}")
 
@@ -2130,7 +2146,13 @@ async def test_create_session_envelope_is_single_flight_and_skips_metadata_callb
     assert first_response.json()["session_init_protocol_version"] == 2
     assert resolver_calls == 1
     assert len(pm.get_client_calls) == 1
-    assert server_client.get_paths == [f"/v1/sessions/{session_id}/items"]
+    # The envelope supplies session metadata, so the only snapshot-style
+    # callback is the history read; restart recovery adds one read of the
+    # durable child-session list, which is empty here.
+    assert server_client.get_paths == [
+        f"/v1/sessions/{session_id}/child_sessions",
+        f"/v1/sessions/{session_id}/items",
+    ]
 
 
 @pytest.mark.asyncio

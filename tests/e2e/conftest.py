@@ -33,9 +33,9 @@ import subprocess
 import sys
 import tarfile
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import IO, Any, cast
 
 import httpx
 import pytest
@@ -541,7 +541,7 @@ def openai_judge_api_key(
     )
 
 
-_live_runner_state: dict[str, str] = {}
+_live_runner_state: dict[str, Any] = {}
 
 
 @pytest.fixture(scope="session")
@@ -762,6 +762,13 @@ def live_server(
         stdout=runner_log_handle,
         stderr=subprocess.STDOUT,
     )
+    # Keep the mutable process handle visible to restart E2E tests. The server
+    # fixture still owns final cleanup, including whichever generation is live.
+    _live_runner_state["process"] = runner_proc
+    _live_runner_state["args"] = [runner_executable(), "-m", "omnigent.runner._entry"]
+    _live_runner_state["env"] = runner_env
+    _live_runner_state["cwd"] = compat_runner_cwd()
+    _live_runner_state["log_handle"] = runner_log_handle
 
     health_iters = int(HEALTH_TIMEOUT_S / POLL_INTERVAL_S)
     for _ in range(health_iters):
@@ -809,6 +816,7 @@ def live_server(
     try:
         yield base_url
     finally:
+        runner_proc = _live_runner_state.get("process", runner_proc)
         if runner_proc.poll() is None:
             runner_proc.send_signal(signal.SIGTERM)
             try:
@@ -824,6 +832,71 @@ def live_server(
             proc.kill()
             proc.wait(timeout=5)
         log_handle.close()
+
+
+@pytest.fixture
+def restart_live_runner(live_server: str, live_runner_id: str) -> Callable[[], None]:
+    """
+    Return a callback that kills and replaces the live runner subprocess.
+
+    The replacement uses the same runner id, tunnel binding, environment, and
+    server. This models a process crash/restart without resetting durable server
+    state, which is the lifecycle boundary restart recovery must survive.
+
+    :param live_server: Base URL of the live server kept across the restart.
+    :param live_runner_id: Stable runner identity reused by the replacement.
+    :returns: Callback that completes after the replacement tunnel is online.
+    """
+
+    def restart() -> None:
+        old_proc = cast(subprocess.Popen[bytes], _live_runner_state["process"])
+        old_proc.kill()
+        old_proc.wait(timeout=10)
+
+        # Do not mistake the dead tunnel's briefly stale registry entry for the
+        # replacement connection; observe the disconnect before starting it.
+        disconnect_deadline = time.monotonic() + HEALTH_TIMEOUT_S
+        while time.monotonic() < disconnect_deadline:
+            response = httpx.get(
+                f"{live_server}/v1/runners/{live_runner_id}/status",
+                timeout=2,
+            )
+            if response.status_code == 200 and response.json().get("online") is False:
+                break
+            time.sleep(POLL_INTERVAL_S)
+        else:
+            raise AssertionError("killed runner tunnel remained online before restart")
+
+        replacement = subprocess.Popen(
+            cast(list[str], _live_runner_state["args"]),
+            env=cast(dict[str, str], _live_runner_state["env"]),
+            cwd=cast(str | None, _live_runner_state["cwd"]),
+            stdout=cast(IO[bytes], _live_runner_state["log_handle"]),
+            stderr=subprocess.STDOUT,
+        )
+        _live_runner_state["process"] = replacement
+
+        deadline = time.monotonic() + HEALTH_TIMEOUT_S
+        while time.monotonic() < deadline:
+            if replacement.poll() is not None:
+                raise AssertionError(
+                    f"replacement runner exited early with code {replacement.returncode}"
+                )
+            try:
+                response = httpx.get(
+                    f"{live_server}/v1/runners/{live_runner_id}/status",
+                    timeout=2,
+                )
+                if response.status_code == 200 and response.json().get("online") is True:
+                    return
+            except httpx.HTTPError:
+                # The server may briefly refuse connections while the tunnel
+                # re-registers; keep polling until the deadline.
+                pass
+            time.sleep(POLL_INTERVAL_S)
+        raise AssertionError("replacement runner did not reconnect before timeout")
+
+    return restart
 
 
 @pytest.fixture(scope="session")

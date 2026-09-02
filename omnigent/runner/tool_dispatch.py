@@ -1360,6 +1360,39 @@ async def _session_turn_actor(
     return actor if isinstance(actor, str) and actor else None
 
 
+async def _stamp_subagent_dispatch(
+    server_client: httpx.AsyncClient, child_session_id: str, work_id: str
+) -> str | None:
+    """
+    Record a continued child turn's dispatch id on the child session.
+
+    A new child carries the id in its create body; a continued child keeps
+    its session, so the new turn's id is written before the message is
+    posted. The parent's ``sys_read_inbox`` drain writes the matching
+    delivered-id receipt, which is how a runner restart tells a drained
+    turn from a lost one. Failing here aborts the send: a missing stamp
+    would let the previous turn's receipt mask this turn's result.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param child_session_id: Child session id, e.g. ``"conv_abc123"``.
+    :param work_id: Dispatch id, e.g. ``"subagent_a1b2c3d4e5f6"``.
+    :returns: A parent-visible error string, or ``None`` on success.
+    """
+    from omnigent.runner import app as _runner_app
+
+    try:
+        resp = await server_client.patch(
+            f"/v1/sessions/{child_session_id}",
+            json={"labels": {_runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: work_id}},
+            timeout=30.0,
+        )
+    except httpx.HTTPError as exc:
+        return f"Error: failed to record sub-agent dispatch: {type(exc).__name__}: {exc}"
+    if resp.status_code >= 400:
+        return f"Error: failed to record sub-agent dispatch: {resp.status_code} {resp.text[:200]}"
+    return None
+
+
 async def _post_child_message_event(
     server_client: httpx.AsyncClient,
     session_id: str,
@@ -2174,6 +2207,7 @@ async def _execute_subagent_tool(
     assert not isinstance(existing, str)
     created_child = False
     child_wrapper_label: str | None = None
+    work_id = _runner_app.new_subagent_work_id()
     if existing is not None:
         child_session_id = existing.get("id")
         if not isinstance(child_session_id, str) or not child_session_id:
@@ -2337,6 +2371,7 @@ async def _execute_subagent_tool(
             "parent_session_id": conversation_id,
             "title": f"{sub_agent_name}:{session_name}",
             "sub_agent_name": sub_agent_name,
+            "labels": {_runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: work_id},
         }
         if harness_override_canonical is not None:
             create_body["harness_override"] = harness_override_canonical
@@ -2565,7 +2600,13 @@ async def _execute_subagent_tool(
         title=session_name,
         wrapper_label=child_wrapper_label,
         created_by=dispatch_created_by,
+        work_id=work_id,
     )
+    if not created_child:
+        stamp_error = await _stamp_subagent_dispatch(server_client, child_session_id, work_id)
+        if stamp_error is not None:
+            await _teardown_failed_child(server_client, child_session_id, created_child=False)
+            return stamp_error
     _publish_child_launching_update(
         parent_session_id=conversation_id,
         child_session_id=child_session_id,
@@ -2736,7 +2777,7 @@ async def _send_to_existing_session(
         tool=agent_label,
         session_name=parsed.title or "",
     )
-    _runner_app.register_subagent_work(
+    entry = _runner_app.register_subagent_work(
         parent_session_id=conversation_id,
         child_session_id=target_session_id,
         agent=agent_label,
@@ -2744,6 +2785,11 @@ async def _send_to_existing_session(
         wrapper_label=_session_wrapper_label(snap_data),
         created_by=created_by,
     )
+    stamp_error = await _stamp_subagent_dispatch(server_client, target_session_id, entry.work_id)
+    if stamp_error is not None:
+        _runner_app.unregister_child_session(target_session_id)
+        _runner_app.unregister_subagent_work(target_session_id)
+        return stamp_error
     _publish_child_launching_update(
         parent_session_id=conversation_id,
         child_session_id=target_session_id,
@@ -7389,11 +7435,20 @@ async def _evaluate_subagent_inbox_output(
     return _apply_subagent_policy_verdict(payload, verdict)
 
 
-def _cleanup_drained_subagent_work(payload: _JsonObject) -> None:
+async def _cleanup_drained_subagent_work(
+    payload: _JsonObject, *, server_client: httpx.AsyncClient | None
+) -> None:
     """
     Remove terminal sub-agent work after its inbox item is drained.
 
+    Also writes the delivered-id receipt on the child session so a runner
+    restart does not re-queue this turn's result. The write is best effort:
+    a lost receipt costs one duplicate delivery after a restart, whereas a
+    lost result would never reach the parent.
+
     :param payload: Drained inbox payload.
+    :param server_client: HTTP client pointed at the Omnigent server, or
+        ``None`` when the drain runs without server access.
     :returns: None.
     """
     if payload.get("type") != "sub_agent":
@@ -7413,6 +7468,27 @@ def _cleanup_drained_subagent_work(payload: _JsonObject) -> None:
         work_id=work_id,
         remember_drained_delivery=True,
     )
+    if server_client is None:
+        return
+    try:
+        resp = await server_client.patch(
+            f"/v1/sessions/{child_id}",
+            json={"labels": {_runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY: work_id}},
+            timeout=30.0,
+        )
+    except httpx.HTTPError:
+        _logger.warning(
+            "Failed to record sub-agent delivery receipt for child=%s",
+            child_id,
+            exc_info=True,
+        )
+        return
+    if resp.status_code >= 400:
+        _logger.warning(
+            "Sub-agent delivery receipt for child=%s returned %d",
+            child_id,
+            resp.status_code,
+        )
 
 
 async def _drain_inbox(
@@ -7463,7 +7539,7 @@ async def _drain_inbox(
         if evaluation.retry_original:
             retry_payloads.append(payload)
         else:
-            _cleanup_drained_subagent_work(evaluation.payload)
+            await _cleanup_drained_subagent_work(evaluation.payload, server_client=server_client)
     for payload in retry_payloads:
         inbox.put_nowait(payload)
     return "\n\n".join(items) if items else "Inbox is empty — no completed tasks."
