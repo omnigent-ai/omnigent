@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import {
   ActionScope,
@@ -8,6 +8,8 @@ import {
   useActionAvailable,
   useActions,
   useAvailableActions,
+  useInternalActionRuntime,
+  usePaletteActions,
 } from "./ActionProvider";
 import { useRegisterAction } from "./useRegisterAction";
 import { HANDLED, NOT_HANDLED } from "./types";
@@ -107,6 +109,85 @@ describe("ActionsProvider", () => {
     await waitFor(() => expect(screen.getByText("enabled")).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: "enabled" }));
     await waitFor(() => expect(screen.getByText("disabled")).toBeInTheDocument());
+  });
+
+  it("does not subscribe a closed palette and refreshes when it opens", () => {
+    function PaletteProbe({ open }: { open: boolean }) {
+      const { actions } = usePaletteActions(open);
+      return (
+        <output>
+          {actions.some((action) => action.id === "session.action.new") ? "listed" : "empty"}
+        </output>
+      );
+    }
+    let register = () => {};
+    function RegistryProbe() {
+      const runtime = useInternalActionRuntime();
+      register = () => {
+        runtime.registry.registerAction({
+          action: "session.action.new",
+          scopeId: null,
+          run: () => HANDLED,
+        });
+      };
+      return null;
+    }
+    const tree = (open: boolean) => (
+      <ActionsProvider>
+        <PaletteProbe open={open} />
+        <RegistryProbe />
+      </ActionsProvider>
+    );
+    const view = render(tree(false));
+    expect(screen.getByText("empty")).toBeInTheDocument();
+    act(() => register());
+    expect(screen.getByText("empty")).toBeInTheDocument();
+    view.rerender(tree(true));
+    expect(screen.getByText("listed")).toBeInTheDocument();
+  });
+
+  it("keeps palette listing and execution on the pre-open focus", () => {
+    const run = vi.fn();
+    function PaletteProbe({ open }: { open: boolean }) {
+      const palette = usePaletteActions(open);
+      return (
+        <button
+          type="button"
+          onClick={() => palette.executeAction("session.action.new")}
+          disabled={!palette.actions.some((action) => action.id === "session.action.new")}
+        >
+          Palette action
+        </button>
+      );
+    }
+    function Registration() {
+      useRegisterAction("session.action.new", {
+        isVisible: ({ context }) => context.inputFocus,
+        isEnabled: ({ context }) => context.inputFocus,
+        run: () => {
+          run();
+          return HANDLED;
+        },
+      });
+      return null;
+    }
+    const tree = (open: boolean) => (
+      <ActionsProvider>
+        <input aria-label="pre-open focus" />
+        <PaletteProbe open={open} />
+        <Registration />
+      </ActionsProvider>
+    );
+    const view = render(tree(false));
+    screen.getByRole("textbox", { name: "pre-open focus" }).focus();
+    view.rerender(tree(true));
+    const action = screen.getByRole("button", { name: "Palette action" });
+    expect(action).toBeEnabled();
+    action.focus();
+    fireEvent.focusIn(action);
+    expect(action).toBeEnabled();
+    fireEvent.click(action);
+    expect(run).toHaveBeenCalledOnce();
   });
 
   it("merges nested scope context and records scope ancestry on the DOM", () => {

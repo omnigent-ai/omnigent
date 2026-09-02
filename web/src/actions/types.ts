@@ -52,6 +52,22 @@ export type ActionArgs<A extends ActionId> = A extends "session.action.openPinne
       ? { data: string }
       : undefined;
 
+export type ArglessActionId = {
+  [A in ActionId]: undefined extends ActionArgs<A> ? A : never;
+}[ActionId];
+
+export const ACTION_ICON_NAMES = [
+  "CalendarClock",
+  "Inbox",
+  "Keyboard",
+  "PanelLeft",
+  "PanelRight",
+  "Search",
+  "Settings",
+  "SquarePen",
+] as const;
+export type ActionIconName = (typeof ACTION_ICON_NAMES)[number];
+
 type ActionArgsField<A extends ActionId> =
   undefined extends ActionArgs<A> ? { args?: undefined } : { args: ActionArgs<A> };
 
@@ -65,9 +81,11 @@ export interface ActionDefinition {
   description?: string;
   keywords?: readonly string[];
   /** Icon identifier interpreted by the UI; the catalog stays React-free. */
-  icon?: string;
+  icon?: ActionIconName;
   /** Whether the action is eligible for the command palette. */
   palette?: boolean;
+  /** Stable command-palette order; lower values render first. */
+  paletteOrder?: number;
 }
 
 export type ActionSource = "api" | "button" | "keyboard" | "menu" | "native" | "palette";
