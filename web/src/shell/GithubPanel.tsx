@@ -17,22 +17,33 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ChevronDownIcon,
+  ChevronRightIcon,
+  ChevronsDownUpIcon,
+  ChevronsUpDownIcon,
   CircleCheckIcon,
   CircleDotIcon,
   CircleXIcon,
+  Columns2Icon,
   ExternalLinkIcon,
+  FolderIcon,
   Loader2Icon,
+  PanelLeftCloseIcon,
+  PanelLeftOpenIcon,
   RefreshCwIcon,
+  Rows2Icon,
 } from "lucide-react";
 import { FileDiff } from "@pierre/diffs/react";
 import { parsePatchFiles, type FileDiffMetadata } from "@pierre/diffs";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useQueryClient } from "@tanstack/react-query";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
-import { readFileViewPreferences } from "@/lib/fileViewPreferences";
+import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import {
   fetchGithubFileContents,
   useGithubChangedFiles,
@@ -52,6 +63,37 @@ function PanelMessage({ children }: { children: React.ReactNode }) {
     <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center text-ui text-muted-foreground">
       {children}
     </div>
+  );
+}
+
+/** A ghost icon button with a tooltip; the toolbar's shared control element.
+ *  No-delay is set by the surrounding TooltipProvider. */
+function IconButton({
+  label,
+  onClick,
+  className,
+  children,
+}: {
+  label: string;
+  onClick: () => void;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          aria-label={label}
+          onClick={onClick}
+          className={cn("shrink-0", className)}
+        >
+          {children}
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
   );
 }
 
@@ -92,21 +134,27 @@ function splitPath(path: string): { dir: string; name: string } {
 type DiffOptions = React.ComponentProps<typeof FileDiff>["options"];
 
 /**
- * One file's section in the stacked diff: a sticky header (status + path +
- * diffstat) and the file's rendered diff. The diff mounts lazily once the
- * section nears the viewport (a big PR doesn't build every diff at once).
+ * One file's section in the stacked diff: a sticky grey header (chevron + status
+ * + path + diffstat) and the file's rendered diff. Clicking the header toggles
+ * the diff open/closed. The diff mounts lazily once the section nears the
+ * viewport (a big PR doesn't build every diff at once).
  */
 function GithubFileSection({
   file,
   fileDiff,
   options,
   registerRef,
+  collapsed,
+  onToggleCollapsed,
 }: {
   file: GithubChangedFile;
   /** Parsed per-file diff from the whole-PR patch; absent for binary/unparsed. */
   fileDiff: FileDiffMetadata | undefined;
   options: DiffOptions;
   registerRef: (path: string, el: HTMLElement | null) => void;
+  /** Whether this file's diff is hidden. Lifted so the toolbar can drive all. */
+  collapsed: boolean;
+  onToggleCollapsed: () => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [seen, setSeen] = useState(false);
@@ -131,23 +179,34 @@ function GithubFileSection({
 
   const meta = STATUS_META[file.status];
   const { dir, name } = splitPath(file.path);
+  const ToggleIcon = collapsed ? ChevronRightIcon : ChevronDownIcon;
 
   return (
     <div ref={ref} data-github-file={file.path}>
-      <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-border bg-card px-3 py-1.5">
+      <button
+        type="button"
+        onClick={onToggleCollapsed}
+        aria-expanded={!collapsed}
+        title={file.path}
+        className="group sticky top-0 z-10 flex w-full cursor-pointer items-center gap-2 border-b border-border bg-secondary px-3 py-1.5 text-left dark:bg-muted"
+      >
+        <ToggleIcon
+          aria-hidden="true"
+          className="size-3.5 shrink-0 text-muted-foreground transition-colors group-hover:text-foreground"
+        />
         <span
           className={cn("w-3 shrink-0 text-center font-mono text-xs", meta.className)}
           title={meta.label}
         >
           {meta.letter}
         </span>
-        <span className="min-w-0 flex-1 truncate text-ui" title={file.path}>
+        <span className="min-w-0 flex-1 truncate text-ui">
           {dir && <span className="text-muted-foreground">{dir}</span>}
           <span className="font-medium">{name}</span>
         </span>
         <DiffStat file={file} />
-      </div>
-      {!seen ? (
+      </button>
+      {collapsed ? null : !seen ? (
         <div className="flex items-center justify-center gap-2 p-6 text-ui text-muted-foreground">
           <Loader2Icon className="size-4 animate-spin" />
           Loading diff…
@@ -192,7 +251,7 @@ function CheckPill({
         <button
           type="button"
           className={cn(
-            "inline-flex cursor-pointer items-center gap-1 rounded-full border px-2 py-0.5 text-xs tabular-nums",
+            "inline-flex cursor-pointer items-center gap-0.5 rounded-full border px-1.5 py-px text-xs tabular-nums",
             className,
           )}
         >
@@ -224,37 +283,163 @@ function CheckPill({
   );
 }
 
-/** One row in the jump-to-file sidebar. */
-function FileRow({
-  file,
-  selected,
-  onSelect,
-}: {
+// ── Sidebar file tree ────────────────────────────────────────────────────
+// The changed files group into a folder tree. A single-child directory chain
+// collapses into one row (VS Code "compact folders"): a lone change under
+// omnigent/runner/x.py shows an "omnigent/runner" row, not two nested folders.
+// Files are leaves that jump the diff scroll to their section; folders toggle.
+
+interface TreeFileNode {
+  type: "file";
+  name: string;
   file: GithubChangedFile;
-  selected: boolean;
-  onSelect: () => void;
+}
+interface TreeDirNode {
+  type: "dir";
+  /** Display name, possibly a compacted chain like "a/b/c". */
+  name: string;
+  /** Full path of the deepest folder in the chain — the collapse key. */
+  path: string;
+  children: SidebarTree[];
+}
+type SidebarTree = TreeFileNode | TreeDirNode;
+
+/** Directories before files, each group kept in first-encounter order. */
+function dirsFirst(nodes: SidebarTree[]): SidebarTree[] {
+  return [...nodes.filter((n) => n.type === "dir"), ...nodes.filter((n) => n.type === "file")];
+}
+
+/** Fold single-dir-child chains into one node (children are compacted first,
+ *  so one merge per level suffices). */
+function compactNode(node: SidebarTree): SidebarTree {
+  if (node.type === "file") return node;
+  const children = node.children.map(compactNode);
+  if (children.length === 1 && children[0].type === "dir") {
+    const only = children[0];
+    return {
+      type: "dir",
+      name: `${node.name}/${only.name}`,
+      path: only.path,
+      children: only.children,
+    };
+  }
+  return { type: "dir", name: node.name, path: node.path, children: dirsFirst(children) };
+}
+
+/** Build the compacted folder tree for the changed-files sidebar. */
+function buildSidebarTree(files: GithubChangedFile[]): SidebarTree[] {
+  const root: TreeDirNode = { type: "dir", name: "", path: "", children: [] };
+  for (const file of files) {
+    const parts = file.path.split("/");
+    let node = root;
+    for (let i = 0; i < parts.length - 1; i++) {
+      const part = parts[i];
+      let dir = node.children.find((c): c is TreeDirNode => c.type === "dir" && c.name === part);
+      if (!dir) {
+        dir = { type: "dir", name: part, path: parts.slice(0, i + 1).join("/"), children: [] };
+        node.children.push(dir);
+      }
+      node = dir;
+    }
+    node.children.push({ type: "file", name: parts[parts.length - 1], file });
+  }
+  return dirsFirst(root.children.map(compactNode));
+}
+
+// VS Code–style tree indentation, tuned for the narrow sidebar.
+const TREE_INDENT_STEP = 10;
+const TREE_BASE_PAD = 8;
+const treeIndent = (depth: number) => depth * TREE_INDENT_STEP + TREE_BASE_PAD;
+
+/**
+ * One node in the sidebar file tree — a collapsible folder or a file leaf.
+ * Names truncate on the LEFT (rtl) so the end of the path — the most specific
+ * part — stays visible; the name isn't `flex-1`, so short names still sit
+ * beside their icon rather than drifting right.
+ */
+function SidebarNode({
+  node,
+  depth,
+  activePath,
+  onSelectFile,
+  collapsedDirs,
+  onToggleDir,
+}: {
+  node: SidebarTree;
+  depth: number;
+  activePath: string | null;
+  onSelectFile: (path: string) => void;
+  collapsedDirs: ReadonlySet<string>;
+  onToggleDir: (path: string) => void;
 }) {
-  const meta = STATUS_META[file.status];
-  const { dir, name } = splitPath(file.path);
+  if (node.type === "file") {
+    const meta = STATUS_META[node.file.status];
+    return (
+      <button
+        type="button"
+        onClick={() => onSelectFile(node.file.path)}
+        title={node.file.path}
+        style={{ paddingLeft: `${treeIndent(depth)}px` }}
+        className={cn(
+          "flex w-full items-center gap-1.5 py-1 pr-2 text-left text-ui hover:bg-muted/60",
+          node.file.path === activePath && "bg-muted",
+        )}
+      >
+        {/* Empty chevron column so the status letter lines up under a sibling
+            folder's icon. */}
+        <span className="size-3.5 shrink-0" aria-hidden />
+        <span
+          className={cn("w-3.5 shrink-0 text-center font-mono text-xs", meta.className)}
+          title={meta.label}
+        >
+          {meta.letter}
+        </span>
+        <span className="min-w-0 truncate [direction:rtl]">
+          <bdi>{node.name}</bdi>
+        </span>
+        <span className="ml-auto flex shrink-0 items-center">
+          <DiffStat file={node.file} />
+        </span>
+      </button>
+    );
+  }
+
+  const open = !collapsedDirs.has(node.path);
   return (
-    <button
-      type="button"
-      onClick={onSelect}
-      title={file.path}
-      className={cn(
-        "flex w-full items-center gap-2 px-2 py-1 text-left text-ui hover:bg-muted/60",
-        selected && "bg-muted",
-      )}
-    >
-      <span className={cn("w-3 shrink-0 text-center font-mono text-xs", meta.className)}>
-        {meta.letter}
-      </span>
-      <span className="min-w-0 flex-1 truncate">
-        {dir && <span className="text-muted-foreground">{dir}</span>}
-        <span className="font-medium">{name}</span>
-      </span>
-      <DiffStat file={file} />
-    </button>
+    <>
+      <button
+        type="button"
+        onClick={() => onToggleDir(node.path)}
+        aria-expanded={open}
+        title={node.path}
+        style={{ paddingLeft: `${treeIndent(depth)}px` }}
+        className="flex w-full items-center gap-1.5 py-1 pr-2 text-left text-ui hover:bg-muted/60"
+      >
+        <ChevronRightIcon
+          aria-hidden
+          className={cn(
+            "size-3.5 shrink-0 text-muted-foreground transition-transform",
+            open && "rotate-90",
+          )}
+        />
+        <FolderIcon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
+        <span className="min-w-0 truncate font-medium [direction:rtl]">
+          <bdi>{node.name}</bdi>
+        </span>
+      </button>
+      {open &&
+        node.children.map((child) => (
+          <SidebarNode
+            key={child.type === "file" ? child.file.path : child.path}
+            node={child}
+            depth={depth + 1}
+            activePath={activePath}
+            onSelectFile={onSelectFile}
+            collapsedDirs={collapsedDirs}
+            onToggleDir={onToggleDir}
+          />
+        ))}
+    </>
   );
 }
 
@@ -266,14 +451,62 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
   const prDiff = useGithubPrDiff(conversationId, baseRef);
 
   const themeType = useResolvedThemeMode();
-  // Diff layout preference is app-global (shared with the FileViewer); no
-  // in-panel toggle in v1, so read the persisted value once on mount.
-  const diffStyle = useMemo(
-    () => (readFileViewPreferences().diffLayout === "split" ? "split" : "unified"),
-    [],
+  // Diff layout is the app-global FileViewer preference (unified/split); seed
+  // from the persisted value and write toggles back so the choice carries over.
+  const [diffStyle, setDiffStyle] = useState<"unified" | "split">(() =>
+    readFileViewPreferences().diffLayout === "split" ? "split" : "unified",
   );
+  const toggleDiffStyle = useCallback(() => {
+    setDiffStyle((prev) => {
+      const next = prev === "split" ? "unified" : "split";
+      writeFileViewPreferences({ ...readFileViewPreferences(), diffLayout: next });
+      return next;
+    });
+  }, []);
 
   const files = useMemo<GithubChangedFile[]>(() => changes.data?.data ?? [], [changes.data]);
+  // The sidebar groups the flat file list into a compacted folder tree (the
+  // diff scroll below stays linear, in file order).
+  const fileTree = useMemo(() => buildSidebarTree(files), [files]);
+
+  // Per-file collapse is lifted here so the toolbar's "expand/collapse all" can
+  // drive every section; a path in the set is collapsed.
+  const [collapsedPaths, setCollapsedPaths] = useState<ReadonlySet<string>>(() => new Set());
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  // Collapsed folders in the sidebar tree (empty = all expanded).
+  const [collapsedDirs, setCollapsedDirs] = useState<ReadonlySet<string>>(() => new Set());
+  const toggleDir = useCallback((path: string) => {
+    setCollapsedDirs((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  }, []);
+
+  // Drag-to-resize the file sidebar via a handle on its right edge.
+  const {
+    width: sidebarWidth,
+    containerRef: bodyRef,
+    handleProps: sidebarHandleProps,
+  } = useResizableColumn(192, 140, 560);
+
+  const toggleOne = useCallback((path: string) => {
+    setCollapsedPaths((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  }, []);
+
+  const allCollapsed = files.length > 0 && files.every((f) => collapsedPaths.has(f.path));
+  const toggleAll = useCallback(() => {
+    setCollapsedPaths((prev) => {
+      const everyCollapsed = files.length > 0 && files.every((f) => prev.has(f.path));
+      return everyCollapsed ? new Set<string>() : new Set(files.map((f) => f.path));
+    });
+  }, [files]);
 
   // Parse the one whole-PR patch into per-file diffs, keyed by path.
   const filesByPath = useMemo(() => {
@@ -404,147 +637,202 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
         : null;
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
-      {/* Header: repo + PR metadata + Refresh. */}
-      <div className="shrink-0 space-y-1.5 border-b border-border px-3 py-2.5">
-        <div className="flex items-center justify-between gap-2">
-          <span className="min-w-0 truncate text-xs text-muted-foreground">
-            {data.repo?.name_with_owner ?? "GitHub"}
-            {data.branch && (
-              <>
-                {" · "}
-                <span className="font-mono">{data.branch}</span>
-                {baseRef && <span className="text-muted-foreground"> → {baseRef}</span>}
-              </>
-            )}
-          </span>
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            aria-label="Refresh"
-            onClick={refresh}
-            className="shrink-0"
-          >
-            <RefreshCwIcon
-              className={cn(
-                "size-3.5",
-                (info.isFetching || changes.isFetching || prDiff.isFetching) && "animate-spin",
-              )}
-            />
-          </Button>
-        </div>
-        {pr ? (
-          <>
-            <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-              <a
-                href={pr.url}
-                target="_blank"
-                rel="noreferrer"
-                className="group inline-flex min-w-0 items-center gap-1 text-ui font-medium hover:underline"
-              >
-                <span className="truncate">{pr.title}</span>
-                <span className="shrink-0 text-muted-foreground">#{pr.number}</span>
-                <ExternalLinkIcon className="size-3 shrink-0 text-muted-foreground opacity-0 group-hover:opacity-100" />
-              </a>
-            </div>
-            {/* CI status checks (from the PR's statusCheckRollup), on their own
-                line as pills; hover a pill to see the job names in that bucket. */}
-            {checks && checks.total > 0 && (
-              <div className="flex flex-wrap items-center gap-1.5 text-muted-foreground">
-                <span className="text-ui font-medium">Checks</span>
-                <CheckPill
-                  label="passed"
-                  count={checks.passing}
-                  runs={checks.runs.filter((r) => r.bucket === "passing")}
-                  icon={<CircleCheckIcon className="size-3 text-green-600 dark:text-green-400" />}
-                  className="border-green-500/25 bg-green-500/10 text-green-700 dark:text-green-400"
-                />
-                <CheckPill
-                  label="pending"
-                  count={checks.pending}
-                  runs={checks.runs.filter((r) => r.bucket === "pending")}
-                  icon={<CircleDotIcon className="size-3 text-amber-600 dark:text-amber-400" />}
-                  className="border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-400"
-                />
-                <CheckPill
-                  label="failed"
-                  count={checks.failing}
-                  runs={checks.runs.filter((r) => r.bucket === "failing")}
-                  icon={<CircleXIcon className="size-3 text-red-600 dark:text-red-400" />}
-                  className="border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400"
-                />
-              </div>
-            )}
-          </>
-        ) : (
-          <p className="text-ui text-muted-foreground">
-            {ghNote ?? (
-              <>
-                No open PR for <span className="font-mono">{data.branch}</span>
-                {baseRef && (
-                  <>
-                    {" "}
-                    — showing changes vs <span className="font-mono">{baseRef}</span>
-                  </>
-                )}
-                .
-              </>
-            )}
-          </p>
-        )}
-      </div>
-
-      {/* Body: sidebar (jump-to-file) + one scroll of all files' diffs. */}
-      <div className="flex min-h-0 flex-1">
-        <div className="w-48 shrink-0 overflow-y-auto border-r border-border py-1">
-          {changes.isLoading ? (
-            <div className="flex items-center justify-center p-4 text-muted-foreground">
-              <Loader2Icon className="size-4 animate-spin" />
-            </div>
-          ) : changes.error ? (
-            <p className="px-2 py-1 text-ui text-muted-foreground">
-              {changes.error instanceof RunnerOfflineError
-                ? "Runner offline."
-                : (changes.error as Error).message}
-            </p>
-          ) : files.length === 0 ? (
-            <p className="px-2 py-1 text-ui text-muted-foreground">No changes vs base.</p>
-          ) : (
-            files.map((file) => (
-              <FileRow
-                key={file.path}
-                file={file}
-                selected={file.path === activePath}
-                onSelect={() => jumpTo(file.path)}
-              />
-            ))
-          )}
-        </div>
-        <div ref={scrollRef} onScroll={onScroll} className="min-w-0 flex-1 overflow-y-auto">
-          {files.length === 0 || prDiff.isLoading ? (
-            <PanelMessage>
-              {changes.isLoading || prDiff.isLoading ? (
+    <TooltipProvider delayDuration={0}>
+      <div className="flex h-full min-h-0 flex-col">
+        {/* Header: repo + PR metadata + Refresh. */}
+        <div className="shrink-0 border-b border-border p-2">
+          <div className="flex items-center justify-between gap-2">
+            <span className="min-w-0 truncate text-xs text-muted-foreground">
+              {data.repo?.name_with_owner ?? "GitHub"}
+              {data.branch && (
                 <>
-                  <Loader2Icon className="size-5 animate-spin" />
-                  Loading changes…
+                  {" · "}
+                  <span className="font-mono">{data.branch}</span>
+                  {baseRef && <span className="text-muted-foreground"> → {baseRef}</span>}
                 </>
-              ) : (
-                "No changes vs base."
               )}
-            </PanelMessage>
-          ) : (
-            files.map((file) => (
-              <GithubFileSection
-                key={file.path}
-                file={file}
-                fileDiff={filesByPath.get(file.path)}
-                options={diffOptions}
-                registerRef={registerRef}
+            </span>
+            <IconButton label="Refresh" onClick={refresh}>
+              <RefreshCwIcon
+                className={cn(
+                  "size-3.5",
+                  (info.isFetching || changes.isFetching || prDiff.isFetching) && "animate-spin",
+                )}
               />
-            ))
+            </IconButton>
+          </div>
+          {pr ? (
+            <>
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                <a
+                  href={pr.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="group inline-flex min-w-0 items-center gap-1 text-ui font-medium hover:underline"
+                >
+                  <span className="truncate">{pr.title}</span>
+                  <span className="shrink-0 text-muted-foreground">#{pr.number}</span>
+                  <ExternalLinkIcon className="size-3 shrink-0 text-muted-foreground opacity-0 group-hover:opacity-100" />
+                </a>
+              </div>
+              {/* CI status checks (from the PR's statusCheckRollup), on their own
+                line as pills; hover a pill to see the job names in that bucket. */}
+              {checks && checks.total > 0 && (
+                <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-muted-foreground">
+                  <span className="text-ui font-medium">Checks</span>
+                  <CheckPill
+                    label="passed"
+                    count={checks.passing}
+                    runs={checks.runs.filter((r) => r.bucket === "passing")}
+                    icon={
+                      <CircleCheckIcon className="size-2.5 text-green-600 dark:text-green-400" />
+                    }
+                    className="border-green-500/25 bg-green-500/10 text-green-700 dark:text-green-400"
+                  />
+                  <CheckPill
+                    label="pending"
+                    count={checks.pending}
+                    runs={checks.runs.filter((r) => r.bucket === "pending")}
+                    icon={<CircleDotIcon className="size-2.5 text-amber-600 dark:text-amber-400" />}
+                    className="border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-400"
+                  />
+                  <CheckPill
+                    label="failed"
+                    count={checks.failing}
+                    runs={checks.runs.filter((r) => r.bucket === "failing")}
+                    icon={<CircleXIcon className="size-2.5 text-red-600 dark:text-red-400" />}
+                    className="border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400"
+                  />
+                </div>
+              )}
+            </>
+          ) : (
+            <p className="mt-1 text-ui text-muted-foreground">
+              {ghNote ?? (
+                <>
+                  No open PR for <span className="font-mono">{data.branch}</span>
+                  {baseRef && (
+                    <>
+                      {" "}
+                      — showing changes vs <span className="font-mono">{baseRef}</span>
+                    </>
+                  )}
+                  .
+                </>
+              )}
+            </p>
+          )}
+          {/* Controls bar: hide the file list (left); toggle layout + expand/
+            collapse every diff (right). */}
+          {files.length > 0 && (
+            <div className="mt-1.5 flex w-full items-center justify-between">
+              <IconButton
+                label={sidebarCollapsed ? "Show file list" : "Hide file list"}
+                onClick={() => setSidebarCollapsed((v) => !v)}
+                className="size-5 text-muted-foreground"
+              >
+                {sidebarCollapsed ? (
+                  <PanelLeftOpenIcon className="size-3.5" />
+                ) : (
+                  <PanelLeftCloseIcon className="size-3.5" />
+                )}
+              </IconButton>
+              <div className="flex items-center gap-0.5">
+                <IconButton
+                  label={diffStyle === "split" ? "Switch to unified view" : "Switch to split view"}
+                  onClick={toggleDiffStyle}
+                  className="size-5 text-muted-foreground"
+                >
+                  {diffStyle === "split" ? (
+                    <Rows2Icon className="size-3.5" />
+                  ) : (
+                    <Columns2Icon className="size-3.5" />
+                  )}
+                </IconButton>
+                <IconButton
+                  label={allCollapsed ? "Expand all diffs" : "Collapse all diffs"}
+                  onClick={toggleAll}
+                  className="size-5 text-muted-foreground"
+                >
+                  {allCollapsed ? (
+                    <ChevronsUpDownIcon className="size-3.5" />
+                  ) : (
+                    <ChevronsDownUpIcon className="size-3.5" />
+                  )}
+                </IconButton>
+              </div>
+            </div>
           )}
         </div>
+
+        {/* Body: sidebar (jump-to-file) + one scroll of all files' diffs. */}
+        <div ref={bodyRef as React.RefObject<HTMLDivElement>} className="flex min-h-0 flex-1">
+          {!sidebarCollapsed && (
+            <div
+              style={{ width: `${sidebarWidth}px` }}
+              className="relative shrink-0 overflow-y-auto border-r border-border pb-1"
+            >
+              {/* Drag the right edge to resize the file list. */}
+              <div
+                {...sidebarHandleProps}
+                aria-label="Resize file list"
+                className="absolute inset-y-0 right-0 z-10 w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50"
+              />
+              {changes.isLoading ? (
+                <div className="flex items-center justify-center p-4 text-muted-foreground">
+                  <Loader2Icon className="size-4 animate-spin" />
+                </div>
+              ) : changes.error ? (
+                <p className="px-2 py-1 text-ui text-muted-foreground">
+                  {changes.error instanceof RunnerOfflineError
+                    ? "Runner offline."
+                    : (changes.error as Error).message}
+                </p>
+              ) : files.length === 0 ? (
+                <p className="px-2 py-1 text-ui text-muted-foreground">No changes vs base.</p>
+              ) : (
+                fileTree.map((node) => (
+                  <SidebarNode
+                    key={node.type === "file" ? node.file.path : node.path}
+                    node={node}
+                    depth={0}
+                    activePath={activePath}
+                    onSelectFile={jumpTo}
+                    collapsedDirs={collapsedDirs}
+                    onToggleDir={toggleDir}
+                  />
+                ))
+              )}
+            </div>
+          )}
+          <div ref={scrollRef} onScroll={onScroll} className="min-w-0 flex-1 overflow-y-auto">
+            {files.length === 0 || prDiff.isLoading ? (
+              <PanelMessage>
+                {changes.isLoading || prDiff.isLoading ? (
+                  <>
+                    <Loader2Icon className="size-5 animate-spin" />
+                    Loading changes…
+                  </>
+                ) : (
+                  "No changes vs base."
+                )}
+              </PanelMessage>
+            ) : (
+              files.map((file) => (
+                <GithubFileSection
+                  key={file.path}
+                  file={file}
+                  fileDiff={filesByPath.get(file.path)}
+                  options={diffOptions}
+                  registerRef={registerRef}
+                  collapsed={collapsedPaths.has(file.path)}
+                  onToggleCollapsed={() => toggleOne(file.path)}
+                />
+              ))
+            )}
+          </div>
+        </div>
       </div>
-    </div>
+    </TooltipProvider>
   );
 }

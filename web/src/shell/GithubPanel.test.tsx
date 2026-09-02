@@ -82,6 +82,8 @@ function renderPanel() {
 let scrollIntoView: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
+  // The diff-layout toggle seeds from persisted prefs; start each test clean.
+  window.localStorage.clear();
   // Fire the observer callback immediately on observe so lazy sections mount.
   class IO {
     private cb: IntersectionObserverCallback;
@@ -176,10 +178,93 @@ describe("GithubPanel", () => {
   it("jumps to a file's section when its sidebar row is clicked", async () => {
     renderPanel();
     await screen.findAllByTestId("diff");
-    // The sidebar row is a button; the section header with the same name is not.
+    // Both the sidebar row and the section header are buttons matching the
+    // name; the sidebar row (which scrolls) is first in the DOM.
     const row = screen.getAllByRole("button", { name: /app\.ts/ })[0];
     fireEvent.click(row);
     expect(scrollIntoView).toHaveBeenCalledWith({ block: "start" });
+  });
+
+  it("collapses a file's diff when its section header is clicked", async () => {
+    renderPanel();
+    expect(await screen.findAllByTestId("diff")).toHaveLength(2);
+    // The section header carries aria-expanded; the sidebar row doesn't.
+    const header = screen.getByRole("button", { name: /app\.ts/, expanded: true });
+    fireEvent.click(header);
+    // Only the other file's diff remains rendered.
+    const remaining = screen.getAllByTestId("diff");
+    expect(remaining.map((d) => d.getAttribute("data-path"))).toEqual(["hello.py"]);
+  });
+
+  it("collapses and expands every diff from the toolbar", async () => {
+    renderPanel();
+    expect(await screen.findAllByTestId("diff")).toHaveLength(2);
+    fireEvent.click(screen.getByRole("button", { name: "Collapse all diffs" }));
+    expect(screen.queryAllByTestId("diff")).toHaveLength(0);
+    // The same button now offers the inverse action.
+    fireEvent.click(screen.getByRole("button", { name: "Expand all diffs" }));
+    expect(screen.getAllByTestId("diff")).toHaveLength(2);
+  });
+
+  it("hides and shows the file sidebar from the toolbar", async () => {
+    renderPanel();
+    await screen.findAllByTestId("diff");
+    // hello.py appears as a sidebar jump row and as a section header.
+    expect(screen.getAllByRole("button", { name: /hello\.py/ })).toHaveLength(2);
+    fireEvent.click(screen.getByRole("button", { name: "Hide file list" }));
+    // Sidebar gone → only the section header remains.
+    expect(screen.getAllByRole("button", { name: /hello\.py/ })).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Show file list" }));
+    expect(screen.getAllByRole("button", { name: /hello\.py/ })).toHaveLength(2);
+  });
+
+  it("toggles the diff layout between unified and split", async () => {
+    renderPanel();
+    await screen.findAllByTestId("diff");
+    // Defaults to unified, so the toggle offers split; clicking flips its label.
+    fireEvent.click(screen.getByRole("button", { name: "Switch to split view" }));
+    expect(screen.getByRole("button", { name: "Switch to unified view" })).toBeInTheDocument();
+  });
+
+  it("groups the sidebar into a folder tree, compacting single-child chains", async () => {
+    state.changes = {
+      data: {
+        available: true,
+        data: [
+          file("omnigent/runner/app.py", "modified"),
+          file("omnigent/runner/util.py", "created"),
+        ],
+      },
+      isLoading: false,
+      error: null,
+      isFetching: false,
+    };
+    renderPanel();
+    // The lone omnigent → runner chain collapses to a single "omnigent/runner"
+    // folder row (exact name; the diff section headers carry the full path).
+    expect(await screen.findByRole("button", { name: "omnigent/runner" })).toBeInTheDocument();
+    // Each file shows as a leaf keyed by its basename.
+    expect(screen.getAllByRole("button", { name: /app\.py/ }).length).toBeGreaterThan(0);
+    expect(screen.getAllByRole("button", { name: /util\.py/ }).length).toBeGreaterThan(0);
+  });
+
+  it("collapses a folder to hide its files in the sidebar tree", async () => {
+    state.changes = {
+      data: {
+        available: true,
+        data: [file("omnigent/runner/app.py", "modified")],
+      },
+      isLoading: false,
+      error: null,
+      isFetching: false,
+    };
+    renderPanel();
+    const folder = await screen.findByRole("button", { name: "omnigent/runner" });
+    // Before collapse: the sidebar leaf + the diff section header both match.
+    expect(screen.getAllByRole("button", { name: /app\.py/ })).toHaveLength(2);
+    fireEvent.click(folder);
+    // After collapse: only the diff section header remains (sidebar leaf gone).
+    expect(screen.getAllByRole("button", { name: /app\.py/ })).toHaveLength(1);
   });
 
   it("renders a non-git workspace message without a PR body", () => {
