@@ -288,7 +288,9 @@ it.
   with `curl <server_url>/health` inside a sandbox. On Tier 3+, check
   `/tmp/omnigent-host.log` inside the sandbox.
 - **Slow first launch** — the initial create from a new image builds a
-  Daytona snapshot (minutes); subsequent launches are seconds.
+  Daytona snapshot (minutes); subsequent launches are seconds. If the build
+  outlasts the registration budget, raise
+  `OMNIGENT_MANAGED_HOST_ONLINE_TIMEOUT_S` (seconds, default 120) on the server.
 - **"Organization is suspended: Please verify your email address"** —
   complete email verification in the
   [dashboard](https://app.daytona.io/dashboard/limits) (signing up via
