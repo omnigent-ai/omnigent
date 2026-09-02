@@ -134,6 +134,25 @@ describe("ConnectionIndicator", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
+  it("says the session is stopped after an explicit stop — unlike the silent runner_asleep", () => {
+    // The bug this band fixes: confirming the kebab's "Stop session" used to
+    // close the dialog and change NOTHING on screen (the stopped session
+    // classified as runner_asleep, which renders nothing). An explicit stop
+    // must be visibly acknowledged, with the relaunch affordance named.
+    renderWithContext({ kind: "stopped" }, null);
+    const band = screen.getByTestId("stopped-indicator");
+    expect(band).toHaveTextContent(/session stopped/i);
+    expect(band).toHaveTextContent(/send a message to start it again/i);
+  });
+
+  it("shows the stopped band for terminal-first sessions too", () => {
+    // Terminal-first sessions suppress most bands (the header toggle owns
+    // the chrome), but an explicit stop is user-requested state — it must
+    // not be swallowed by the terminal-first early-out.
+    renderWithContext({ kind: "stopped" }, makeCtx());
+    expect(screen.getByTestId("stopped-indicator")).toBeInTheDocument();
+  });
+
   it("shows the passive Connecting… band for a non-terminal-first starting session", () => {
     // A freshly-created regular session whose runner is spinning up gets a
     // muted, non-interactive heartbeat — NOT a banner, NOT a button.

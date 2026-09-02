@@ -53,6 +53,7 @@ import {
   updateProjectConfig as apiUpdateProjectConfig,
 } from "@/lib/projectsApi";
 import { releaseConversation, useChatStore } from "@/store/chatStore";
+import { markSessionStopped } from "@/store/stoppedSessions";
 import type { Session } from "@/lib/types";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import { markConversationSeen } from "./useUnseenConversations";
@@ -1088,12 +1089,20 @@ export function useLeaveSession() {
  * header merges snapshot fields over the list row (snapshot winning),
  * so a snapshot left stale at the pre-stop state would clobber the
  * now-stopped state and the header's Stop gate would lag.
+ *
+ * Also records the confirmed stop in the stopped-sessions store: the
+ * server keeps no persistent stopped marker (the tunnel drop flips
+ * `runner_online` honestly), so without it the open view would render
+ * the stopped session exactly like an idle-asleep one — no feedback at
+ * all that the stop happened (`useSessionLiveness` reads the marker to
+ * surface the `stopped` state).
  */
 export function useStopSession() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => stopSession(id),
     onSuccess: (_data, id) => {
+      markSessionStopped(id);
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["session", id] });
     },
@@ -1248,6 +1257,9 @@ export function useBulkStopSessions() {
         if (results[i].status === "fulfilled") succeeded.push(ids[i]);
         else failed.push(ids[i]);
       }
+      // Same explicit-stop marker as the single-session stop: the open
+      // view reads it to say "stopped" instead of rendering nothing.
+      for (const id of succeeded) markSessionStopped(id);
       if (failed.length > 0) {
         throw new BulkConversationMutationError("stop", {
           failed,

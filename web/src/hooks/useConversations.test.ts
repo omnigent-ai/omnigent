@@ -38,6 +38,7 @@ import {
 } from "./useConversations";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "@/shell/sidebarNav";
+import { useStoppedSessions } from "@/store/stoppedSessions";
 
 vi.mock("./useSessionUpdatesConnected", () => ({ useSessionUpdatesConnected: vi.fn() }));
 
@@ -1563,6 +1564,45 @@ describe("fetchPinnedConversations filter-honored detection", () => {
 });
 
 describe("useStopSession invalidation", () => {
+  beforeEach(() => {
+    useStoppedSessions.setState({ stoppedAt: {} });
+  });
+
+  it('records the confirmed stop so the open view can say "stopped"', async () => {
+    // The server keeps no persistent stopped marker — without this record
+    // the stopped session classifies as runner_asleep and the open view
+    // renders NOTHING (the confirm dialog closing was the only feedback).
+    fetchMock.mockResolvedValueOnce(mockResponse({ queued: false }));
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+
+    const { result } = renderHook(() => useStopSession(), { wrapper });
+    result.current.mutate("conv_x");
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(useStoppedSessions.getState().stoppedAt.conv_x).toEqual(expect.any(Number));
+  });
+
+  it("does NOT record a stop the server rejected", async () => {
+    // A failed stop leaves the session running — marking it stopped would
+    // show a false "Session stopped" over a still-live session.
+    fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 503 }));
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+
+    const { result } = renderHook(() => useStopSession(), { wrapper });
+    result.current.mutate("conv_x");
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    expect(useStoppedSessions.getState().stoppedAt.conv_x).toBeUndefined();
+  });
+
   it("invalidates the conversations list AND the per-session snapshot", async () => {
     // The endpoint answers POST /v1/sessions/{id}/events → {queued:false}.
     fetchMock.mockResolvedValueOnce(mockResponse({ queued: false }));
@@ -1875,6 +1915,23 @@ describe("useBulkStopSessions", () => {
       succeeded: ["conv_a"],
       total: 2,
     });
+  });
+
+  it("records stop markers only for the sessions whose stop landed", async () => {
+    // The succeeded session must read "stopped" in its open view; the
+    // failed one is still running and must not be falsely marked.
+    useStoppedSessions.setState({ stoppedAt: {} });
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ queued: false }))
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 503 }));
+
+    const { rendered } = renderBulkStopHook();
+    rendered.result.current.mutate(["conv_a", "conv_b"]);
+    await waitFor(() => expect(rendered.result.current.isError).toBe(true));
+
+    const { stoppedAt } = useStoppedSessions.getState();
+    expect(stoppedAt.conv_a).toEqual(expect.any(Number));
+    expect(stoppedAt.conv_b).toBeUndefined();
   });
 });
 
