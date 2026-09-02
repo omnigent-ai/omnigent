@@ -828,8 +828,15 @@ async def test_run_turn_streams_text_and_usage() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_run_turn_times_out_at_prompt_deadline(monkeypatch) -> None:
-    """run_turn bounds an idle turn by the module's prompt-timeout constant."""
+    """run_turn bounds an idle turn by the module's prompt-timeout constant.
+
+    Fails fast on a 30s cap and checks wall-clock elapsed, so a regression to
+    the real 300s default is an assertion failure, not a multi-minute hang.
+    """
+    import time
+
     from omnigent.inner import goose_executor
 
     monkeypatch.setattr(goose_executor, "_PROMPT_TIMEOUT_SECONDS", 0.05)
@@ -846,13 +853,18 @@ async def test_run_turn_times_out_at_prompt_deadline(monkeypatch) -> None:
 
     executor._send = fake_send  # type: ignore[method-assign]
 
+    start = time.monotonic()
     events = [e async for e in executor.run_turn([{"role": "user", "content": "hi"}], [], "")]
+    elapsed = time.monotonic() - start
 
     errors = [e for e in events if isinstance(e, ExecutorError)]
     assert len(errors) == 1
     assert errors[0].message == "Timeout waiting for goose response"
     assert errors[0].retryable is True
     assert not any(isinstance(e, TurnComplete) for e in events)
+    # Comfortably above the 0.05s patched deadline plus scheduling slack, and
+    # comfortably below the real 300s default a regression would fall back to.
+    assert elapsed < 10.0
 
 
 def test_history_prefix_serializes_prior_turns() -> None:
@@ -1123,6 +1135,28 @@ async def test_ensure_session_uses_server_assigned_id_and_caches() -> None:
     executor._rpc.reset_mock()
     assert await executor._ensure_session() == "20260623_7"
     executor._rpc.assert_not_called()  # cached
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_ensure_initialized_times_out_at_init_deadline(monkeypatch) -> None:
+    """The ``initialize`` handshake is bounded by the module's init-timeout
+    constant, not left to hang forever against a stuck goose subprocess."""
+    from omnigent.inner import goose_executor
+
+    monkeypatch.setattr(goose_executor, "_INIT_TIMEOUT_SECONDS", 0.05)
+
+    executor = GooseExecutor()
+
+    async def fake_send(msg: dict) -> None:
+        # Goose never replies: the handshake hangs until the deadline.
+        return None
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    with pytest.raises(asyncio.TimeoutError):
+        await executor._ensure_initialized()
+    assert executor._initialized is False
 
 
 @pytest.mark.asyncio

@@ -143,11 +143,14 @@ def _timeout_from_env(name: str, default: str) -> float:
     Thinking-mode models emit reasoning tokens that never reach us as ACP
     notifications, so a turn can look idle for minutes; both deadlines are
     configurable for that reason. Parsing is import-time and fail-loud: a
-    malformed, non-positive, or non-finite value aborts goose at startup.
+    malformed, non-positive, or non-finite value aborts goose at startup. A
+    set-but-empty value (e.g. a bare ``export FOO=``) falls back to *default*
+    like every other env var this harness reads, rather than crashing.
     """
     err = f"{name} must be a positive finite number of seconds"
+    raw = (os.environ.get(name) or "").strip() or default
     try:
-        value = float(os.environ.get(name, default))
+        value = float(raw)
     except ValueError as exc:
         raise ValueError(err) from exc
     if not math.isfinite(value) or value <= 0:

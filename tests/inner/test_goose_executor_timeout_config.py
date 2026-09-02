@@ -78,6 +78,43 @@ def test_timeout_rejects_non_positive_or_non_finite(env_var: str, value: str) ->
     assert env_var in result.stderr.strip().splitlines()[-1]
 
 
+@pytest.mark.parametrize("env_var", [_PROMPT_TIMEOUT_ENV, _INIT_TIMEOUT_ENV])
+def test_timeout_set_but_empty_falls_back_to_default(env_var: str) -> None:
+    """A bare ``export FOO=`` (set-but-empty) must not crash the harness."""
+    result = _run(_subprocess_env(**{env_var: ""}))
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines() == ["300.0", "30.0"]
+
+
+@pytest.mark.parametrize("env_var", [_PROMPT_TIMEOUT_ENV, _INIT_TIMEOUT_ENV])
+def test_timeout_whitespace_only_falls_back_to_default(env_var: str) -> None:
+    result = _run(_subprocess_env(**{env_var: "   "}))
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines() == ["300.0", "30.0"]
+
+
+@pytest.mark.parametrize(
+    ("env_var", "override", "expected"),
+    [
+        (_PROMPT_TIMEOUT_ENV, " 600 ", "600.0"),
+        (_INIT_TIMEOUT_ENV, " 600 ", "600.0"),
+    ],
+)
+def test_timeout_surrounding_whitespace_is_stripped(
+    env_var: str, override: str, expected: str
+) -> None:
+    result = _run(_subprocess_env(**{env_var: override}))
+
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.strip().splitlines()
+    if env_var == _PROMPT_TIMEOUT_ENV:
+        assert lines[0] == expected
+    else:
+        assert lines[1] == expected
+
+
 def test_timeouts_are_independent() -> None:
     result = _run(_subprocess_env(**{_PROMPT_TIMEOUT_ENV: "600"}))
     assert result.returncode == 0, result.stderr
