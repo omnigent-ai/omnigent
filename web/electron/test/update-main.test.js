@@ -21,6 +21,7 @@ function loadMainHarness({
   fs.writeFileSync(path.join(userData, "settings.json"), JSON.stringify(settings), "utf8");
 
   const ipcHandlers = new Map();
+  const ipcListeners = new Map();
   const appEvents = new Map();
   const mainImmediates = [];
   const calls = {
@@ -28,6 +29,7 @@ function loadMainHarness({
     appExit: 0,
     checkForUpdates: 0,
     downloadUpdate: 0,
+    findBarsCreated: 0,
     quitAndInstall: [],
     sent: [],
     showMessageBox: [],
@@ -36,17 +38,23 @@ function loadMainHarness({
 
   const sender = {
     getURL: () => "https://server.example/app",
+    send: (channel, payload) => calls.sent.push({ channel, payload }),
+    on: () => {},
+    removeListener: () => {},
+    stopFindInPage: () => {},
   };
   const win = {
     isDestroyed: () => false,
-    webContents: {
-      getURL: () => "https://server.example/app",
-      send: (channel, payload) => calls.sent.push({ channel, payload }),
-    },
+    webContents: sender,
     isMinimized: () => false,
     restore: () => {},
     focus: () => {},
+    on: () => {},
+    removeListener: () => {},
+    getContentBounds: () => ({ x: 0, y: 0, width: 1200, height: 800 }),
   };
+  let focusedWindow = win;
+  const windowsByContents = new Map([[sender, win]]);
 
   class FakeSemVer {
     constructor(version) {
@@ -95,11 +103,30 @@ function loadMainHarness({
       },
       setAppUserModelId: () => {},
     },
-    BrowserWindow: Object.assign(function BrowserWindow() {}, {
-      fromWebContents: (webContents) => (webContents === sender ? win : null),
-      getFocusedWindow: () => win,
-      getAllWindows: () => [win],
-    }),
+    BrowserWindow: Object.assign(
+      function BrowserWindow(options) {
+        if (!options?.parent) return {};
+        calls.findBarsCreated += 1;
+        const bar = new EventEmitter();
+        const contents = new EventEmitter();
+        contents.send = () => {};
+        contents.stopFindInPage = () => {};
+        Object.assign(bar, {
+          webContents: contents,
+          isDestroyed: () => false,
+          loadFile: () => Promise.resolve(),
+          setBounds: () => {},
+          show: () => {},
+          focus: () => {},
+        });
+        return bar;
+      },
+      {
+        fromWebContents: (webContents) => windowsByContents.get(webContents) ?? null,
+        getFocusedWindow: () => focusedWindow,
+        getAllWindows: () => [win],
+      },
+    ),
     Menu: {
       buildFromTemplate: (template) => ({ template }),
       setApplicationMenu: (menu) => calls.setApplicationMenu.push(menu),
@@ -114,7 +141,7 @@ function loadMainHarness({
     },
     ipcMain: {
       handle: (channel, handler) => ipcHandlers.set(channel, handler),
-      on: () => {},
+      on: (channel, listener) => ipcListeners.set(channel, listener),
     },
     nativeImage: {
       createFromPath: () => ({ isEmpty: () => true }),
@@ -162,7 +189,7 @@ function loadMainHarness({
   // into the menu, the IPC surface, and the before-quit install handoff.
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    '\nmodule.exports.testApi = { buildMenu, registerIpc, windows, updater, setQuitTimeouts: (o) => { if (typeof (o && o.cleanup) === "number") quitCleanupTimeoutMs = o.cleanup; if (typeof (o && o.installFallback) === "number") quitInstallFallbackMs = o.installFallback; } }';
+    '\nmodule.exports.testApi = { buildMenu, registerIpc, windows, updater, pendingActionInvocations, setQuitTimeouts: (o) => { if (typeof (o && o.cleanup) === "number") quitCleanupTimeoutMs = o.cleanup; if (typeof (o && o.installFallback) === "number") quitInstallFallbackMs = o.installFallback; } }';
 
   const module = { exports: {} };
   const sandbox = {
@@ -203,10 +230,35 @@ function loadMainHarness({
   };
 
   vm.runInNewContext(source, sandbox, { filename: mainPath });
+  const trackWindow = (url = "https://other.example/app") => {
+    const otherSender = {
+      getURL: () => url,
+      send: (channel, payload) => calls.sent.push({ channel, payload }),
+    };
+    const otherWindow = {
+      isDestroyed: () => false,
+      webContents: otherSender,
+      isMinimized: () => false,
+      restore: () => {},
+      focus: () => {},
+    };
+    windowsByContents.set(otherSender, otherWindow);
+    module.exports.testApi.windows.set(otherWindow, {
+      origin: new URL(url).origin,
+      serverUrl: url,
+      badgeCount: 0,
+      actionBindings: null,
+    });
+    return {
+      win: otherWindow,
+      event: { sender: otherSender, senderFrame: { url } },
+    };
+  };
   module.exports.testApi.windows.set(win, {
     origin: "https://server.example",
     serverUrl: "https://server.example/app",
     badgeCount: 0,
+    actionBindings: null,
   });
 
   return {
@@ -220,6 +272,12 @@ function loadMainHarness({
       unpinned: { sender, senderFrame: { url: "https://evil.example/app" } },
     },
     ipcHandlers,
+    ipcListeners,
+    win,
+    setFocused: (target) => {
+      focusedWindow = target;
+    },
+    trackWindow,
     pendingMainImmediates: () => mainImmediates.length,
     readSettings: () => JSON.parse(fs.readFileSync(path.join(userData, "settings.json"), "utf8")),
     runMainImmediates: () => {
@@ -276,6 +334,175 @@ describe("in-app navigation menu actions", () => {
       channel: "omnigent:open-path",
       payload: "/",
     });
+  });
+});
+
+describe("native action binding synchronization", () => {
+  const snapshot = {
+    version: 1,
+    bindings: [
+      { action: "session.action.new", accelerator: "Ctrl+J" },
+      { action: "workbench.action.navigateSettings", accelerator: null },
+      { action: "file.action.find", accelerator: "Ctrl+Alt+F" },
+    ],
+  };
+
+  it("accepts complete snapshots only from the pinned main frame", async (t) => {
+    const harness = loadMainHarness();
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    const setBindings = harness.ipcListeners.get("omnigent:set-action-bindings");
+
+    setBindings(harness.events.unpinned, snapshot);
+    assert.equal(harness.api.windows.get(harness.win).actionBindings, null);
+    setBindings(harness.events.pinned, { version: 1, bindings: [] });
+    assert.equal(harness.api.windows.get(harness.win).actionBindings, null);
+    setBindings(harness.events.pinned, {
+      ...snapshot,
+      bindings: snapshot.bindings.map((binding) =>
+        binding.action === "session.action.new"
+          ? { ...binding, accelerator: "Not+A+Real+Accelerator" }
+          : binding,
+      ),
+    });
+    assert.equal(harness.api.windows.get(harness.win).actionBindings, null);
+    for (const accelerator of ["Enter", "Shift+CmdOrCtrl+Z", "Ctrl+Alt+F"]) {
+      setBindings(harness.events.pinned, {
+        ...snapshot,
+        bindings: snapshot.bindings.map((binding) =>
+          binding.action === "session.action.new" ? { ...binding, accelerator } : binding,
+        ),
+      });
+      assert.equal(harness.api.windows.get(harness.win).actionBindings, null);
+    }
+
+    setBindings(harness.events.pinned, snapshot);
+    await flushPromises();
+    assert.deepEqual(
+      Object.fromEntries(harness.api.windows.get(harness.win).actionBindings),
+      Object.fromEntries(snapshot.bindings.map((binding) => [binding.action, binding.accelerator])),
+    );
+    const rebuilds = harness.calls.setApplicationMenu.length;
+    setBindings(harness.events.pinned, snapshot);
+    await flushPromises();
+    assert.equal(harness.calls.setApplicationMenu.length, rebuilds);
+
+    setBindings(harness.events.pinned, { version: 1, bindings: [] });
+    await flushPromises();
+    assert.equal(harness.api.windows.get(harness.win).actionBindings, null);
+    setBindings(harness.events.pinned, snapshot);
+    await flushPromises();
+
+    setBindings(harness.events.pinned, {
+      ...snapshot,
+      bindings: snapshot.bindings.map((binding) =>
+        binding.action === "session.action.new"
+          ? { ...binding, accelerator: "CmdOrCtrl+C" }
+          : binding,
+      ),
+    });
+    await flushPromises();
+    assert.equal(harness.api.windows.get(harness.win).actionBindings, null);
+    assert.equal(
+      findMenuItem(harness.calls.setApplicationMenu.at(-1), "new_session").accelerator,
+      "CmdOrCtrl+N",
+    );
+  });
+
+  it("keeps each window's accelerators isolated and follows focus", async (t) => {
+    const harness = loadMainHarness();
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    const setBindings = harness.ipcListeners.get("omnigent:set-action-bindings");
+    setBindings(harness.events.pinned, snapshot);
+    await flushPromises();
+    assert.equal(
+      findMenuItem(harness.calls.setApplicationMenu.at(-1), "new_session").accelerator,
+      "Ctrl+J",
+    );
+
+    const other = harness.trackWindow();
+    setBindings(other.event, {
+      ...snapshot,
+      bindings: snapshot.bindings.map((binding) =>
+        binding.action === "session.action.new" ? { ...binding, accelerator: "Ctrl+L" } : binding,
+      ),
+    });
+    await flushPromises();
+    assert.equal(
+      findMenuItem(harness.calls.setApplicationMenu.at(-1), "new_session").accelerator,
+      "Ctrl+J",
+    );
+
+    harness.setFocused(other.win);
+    harness.api.buildMenu();
+    assert.equal(
+      findMenuItem(harness.calls.setApplicationMenu.at(-1), "new_session").accelerator,
+      "Ctrl+L",
+    );
+  });
+
+  it("uses renderer accelerators and invokes actions without the legacy path", async (t) => {
+    const harness = loadMainHarness();
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    harness.ipcListeners.get("omnigent:set-action-bindings")(harness.events.pinned, snapshot);
+    await flushPromises();
+
+    const menu = harness.calls.setApplicationMenu.at(-1);
+    const settingsItem = findMenuItem(menu, "open_settings");
+    const newSessionItem = findMenuItem(menu, "new_session");
+    const findItem = findMenuItem(menu, "find");
+    assert.equal(settingsItem.accelerator, null);
+    assert.equal(newSessionItem.accelerator, "Ctrl+J");
+    assert.equal(findItem.accelerator, "Ctrl+Alt+F");
+
+    harness.calls.sent.length = 0;
+    settingsItem.click();
+    newSessionItem.click();
+    assert.deepEqual(
+      harness.calls.sent.map(({ channel, payload }) => ({ channel, action: payload.action })),
+      [
+        { channel: "omnigent:invoke-action", action: "workbench.action.navigateSettings" },
+        { channel: "omnigent:invoke-action", action: "session.action.new" },
+      ],
+    );
+  });
+
+  it("correlates find results with the exact trusted renderer", async (t) => {
+    const harness = loadMainHarness();
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    harness.ipcListeners.get("omnigent:set-action-bindings")(harness.events.pinned, snapshot);
+    await flushPromises();
+    const findItem = findMenuItem(harness.calls.setApplicationMenu.at(-1), "find");
+
+    findItem.click();
+    const invocation = harness.calls.sent.at(-1);
+    assert.equal(invocation.channel, "omnigent:invoke-action");
+    assert.equal(invocation.payload.action, "file.action.find");
+    assert.equal(harness.api.pendingActionInvocations.size, 1);
+
+    harness.ipcListeners.get("omnigent:action-result")(harness.events.unpinned, {
+      requestId: invocation.payload.requestId,
+      handled: true,
+    });
+    assert.equal(harness.api.pendingActionInvocations.size, 1);
+    harness.ipcListeners.get("omnigent:action-result")(harness.events.pinned, {
+      requestId: invocation.payload.requestId,
+      handled: true,
+    });
+    assert.equal(harness.api.pendingActionInvocations.size, 0);
+    assert.equal(harness.calls.findBarsCreated, 0);
+
+    findItem.click();
+    const declined = harness.calls.sent.at(-1);
+    harness.ipcListeners.get("omnigent:action-result")(harness.events.pinned, {
+      requestId: declined.payload.requestId,
+      handled: false,
+    });
+    assert.equal(harness.api.pendingActionInvocations.size, 0);
+    assert.equal(harness.calls.findBarsCreated, 1);
   });
 });
 

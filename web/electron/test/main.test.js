@@ -26,6 +26,10 @@ const vm = require("node:vm");
 
 const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
 const preloadSource = readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
+const desktopActionBridgeSource = readFileSync(
+  path.join(__dirname, "../../src/actions/desktopActionBridge.ts"),
+  "utf8",
+);
 const setupSource = readFileSync(path.join(__dirname, "../setup/index.html"), "utf8");
 const urlHelpers = require("../src/url");
 
@@ -265,6 +269,52 @@ describe("setup clipboard IPC wiring", () => {
       liveCode,
       /ipcMain\.handle\("omnigent:copy-setup-text",[\s\S]{0,200}!isSetupPageSender\(event\)[\s\S]{0,300}clipboard\.writeText\(text\)/,
     );
+  });
+});
+
+describe("native action bridge wiring", () => {
+  it("exposes full snapshots, exact unsubscribe, and handled results", () => {
+    assert.match(preloadSource, /ipcRenderer\.send\("omnigent:set-action-bindings",\s*snapshot\)/);
+    assert.match(
+      preloadSource,
+      /ipcRenderer\.on\("omnigent:invoke-action",\s*listener\)[\s\S]{0,120}removeListener\("omnigent:invoke-action",\s*listener\)/,
+    );
+    assert.match(
+      preloadSource,
+      /ipcRenderer\.send\("omnigent:action-result",\s*\{\s*requestId,\s*handled:/,
+    );
+  });
+
+  it("checks pinned senders before accepting binding snapshots and results", () => {
+    assert.match(
+      liveCode,
+      /ipcMain\.on\("omnigent:set-action-bindings"[\s\S]{0,180}!isPinnedOriginSender\(event\)/,
+    );
+    assert.match(
+      liveCode,
+      /function finishRendererAction[\s\S]{0,180}!isPinnedOriginSender\(event\)/,
+    );
+  });
+
+  it("keeps renderer and main-process reserved accelerator lists in lockstep", () => {
+    const values = (source, name) => {
+      const body = source.match(new RegExp(`${name}\\s*=\\s*new Set\\(\\[([\\s\\S]*?)\\]\\)`))?.[1];
+      return [...(body?.matchAll(/"([^"]+)"/g) ?? [])].map((match) => match[1]);
+    };
+    const mainValues = values(mainSource, "RESERVED_NATIVE_ACCELERATORS");
+    const rendererValues = values(desktopActionBridgeSource, "RESERVED_ELECTRON_ACCELERATORS");
+    assert.ok(mainValues.length > 15, "reserved accelerator extraction must not be empty");
+    assert.deepEqual(mainValues, rendererValues);
+  });
+
+  it("rebuilds on focus and clears snapshots before document changes", () => {
+    assert.match(liveCode, /win\.on\("focus",\s*scheduleMenuRebuild\)/);
+    assert.match(
+      liveCode,
+      /if \(state\.origin !== origin\)[\s\S]{0,140}clearWindowActionBindings\(win\)/,
+    );
+    assert.match(liveCode, /did-start-navigation[\s\S]{0,400}clearWindowActionBindings\(win\)/);
+    assert.match(liveCode, /render-process-gone[\s\S]{0,100}clearWindowActionBindings\(win\)/);
   });
 });
 

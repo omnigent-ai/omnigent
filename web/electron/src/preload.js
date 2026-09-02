@@ -137,6 +137,42 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * setup page, so a connected server can't repoint the CLI at an arbitrary one.
    */
   resetCliPath: () => ipcRenderer.invoke("omnigent:cli-reset-path"),
+  // Native menu accelerators mirror the effective renderer keymap. The main
+  // process validates the complete snapshot again against its action allowlist.
+  actions: {
+    setBindings: (snapshot) => {
+      if (
+        snapshot?.version === 1 &&
+        Array.isArray(snapshot.bindings) &&
+        snapshot.bindings.every(
+          (binding) =>
+            binding &&
+            typeof binding.action === "string" &&
+            (typeof binding.accelerator === "string" || binding.accelerator === null),
+        )
+      ) {
+        ipcRenderer.send("omnigent:set-action-bindings", snapshot);
+      }
+    },
+    onInvoke: (callback) => {
+      const listener = (_event, invocation) => {
+        if (
+          invocation &&
+          typeof invocation.action === "string" &&
+          typeof invocation.requestId === "string"
+        ) {
+          callback({ action: invocation.action, requestId: invocation.requestId });
+        }
+      };
+      ipcRenderer.on("omnigent:invoke-action", listener);
+      return () => ipcRenderer.removeListener("omnigent:invoke-action", listener);
+    },
+    reportResult: (requestId, handled) => {
+      if (typeof requestId === "string") {
+        ipcRenderer.send("omnigent:action-result", { requestId, handled: handled === true });
+      }
+    },
+  },
   // Update bridge for the server page — CONFIG ONLY, by design. Desktop update
   // NOTIFICATIONS are owned by the shell now (a native corner overlay with its
   // own preload + the Server menu). This bridge stays so Settings can still

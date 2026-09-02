@@ -107,6 +107,9 @@ export const DEFAULT_KEYBINDINGS: readonly KeybindingRule[] = [
   rule("workbench.openKeyboardShortcuts", "workbench.action.openKeyboardShortcuts", "primary+/", {
     allowDefaultPrevented: true,
   }),
+  rule("workbench.navigateSettings", "workbench.action.navigateSettings", "primary+,", {
+    when: when(CONTEXT_KEYS.isNativeShell),
+  }),
   rule(
     "workbench.toggleConversationsSidebar",
     "workbench.action.toggleConversationsSidebar",

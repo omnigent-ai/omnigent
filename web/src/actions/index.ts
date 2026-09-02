@@ -11,6 +11,7 @@ export {
   useSuspendKeybindingDispatch,
 } from "./ActionProvider";
 export type { ActionScopeHandle, ActionScopeOptions, ActionsApi } from "./ActionProvider";
+export { DesktopActionSync } from "./DesktopActionSync";
 export { KeybindingDispatcher } from "./KeybindingDispatcher";
 export { DEFAULT_KEYBINDINGS } from "./defaultKeybindings";
 export {
@@ -44,6 +45,19 @@ export {
   readUserKeybindings,
 } from "./keybindingPreferences";
 export type { KnownUserKeybindingRule, UserKeybindingRule } from "./keybindingPreferences";
+export {
+  DESKTOP_ACTION_BINDING_VERSION,
+  DESKTOP_MENU_ACTIONS,
+  desktopActionBindingSnapshot,
+  isDesktopMenuAction,
+  keyStrokeToElectronAccelerator,
+} from "./desktopActionBridge";
+export type {
+  DesktopActionBinding,
+  DesktopActionBindingSnapshot,
+  DesktopActionInvocation,
+  DesktopMenuAction,
+} from "./desktopActionBridge";
 export { useRegisterAction } from "./useRegisterAction";
 export type { ActionInvalidationKey } from "./useRegisterAction";
 export { and, contextsMayOverlap, equals, not, or, when } from "./context";

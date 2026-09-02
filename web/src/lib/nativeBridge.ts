@@ -128,6 +128,22 @@ export interface NativeInsets {
 
 export type NativeViewMode = "chat" | "terminal";
 
+export interface DesktopActionBindingSnapshot {
+  version: 1;
+  bindings: readonly { action: string; accelerator: string | null }[];
+}
+
+export interface DesktopActionInvocation {
+  action: string;
+  requestId: string;
+}
+
+export interface ElectronActionBridge {
+  setBindings: (snapshot: DesktopActionBindingSnapshot) => void;
+  onInvoke: (callback: (invocation: DesktopActionInvocation) => void) => () => void;
+  reportResult: (requestId: string, handled: boolean) => void;
+}
+
 export interface NativeViewModeParams {
   /** Currently selected view. */
   mode: NativeViewMode;
@@ -155,6 +171,8 @@ interface ElectronDesktopApi extends NativeShellApi {
    * idle, so the web never shows a (duplicate) banner. Absent on older shells.
    */
   updates?: ElectronUpdateBridge;
+  /** Native menu accelerators and action invocation; absent on older shells. */
+  actions?: ElectronActionBridge;
   /** Current server origin + managed/recent choices, or null on a foreign page. */
   getServerPicker?: () => Promise<ServerPickerInfo | null>;
   /** Re-point this window to a server URL returned by the picker. */
@@ -397,6 +415,57 @@ export function isElectronShell(): boolean {
 /** Desktop auto-update bridge, or undefined outside Electron / older shells. */
 export function updateBridge(): ElectronUpdateBridge | undefined {
   return electronApi()?.updates;
+}
+
+/** Complete native action bridge, or undefined outside Electron / older shells. */
+export function actionBridge(): ElectronActionBridge | undefined {
+  const actions = electronApi()?.actions;
+  return actions &&
+    typeof actions.setBindings === "function" &&
+    typeof actions.onInvoke === "function" &&
+    typeof actions.reportResult === "function"
+    ? actions
+    : undefined;
+}
+
+/** Returns false only when a present bridge rejected the publish. */
+export function setDesktopActionBindings(snapshot: DesktopActionBindingSnapshot): boolean {
+  const bridge = actionBridge();
+  if (!bridge) return true;
+  try {
+    bridge.setBindings(snapshot);
+    return true;
+  } catch (err) {
+    console.warn("[nativeBridge] electron action setBindings failed:", err);
+    return false;
+  }
+}
+
+export function clearDesktopActionBindings(): void {
+  try {
+    actionBridge()?.setBindings({ version: 1, bindings: [] });
+  } catch (err) {
+    console.warn("[nativeBridge] electron action clearBindings failed:", err);
+  }
+}
+
+export function onDesktopActionInvoked(
+  callback: (invocation: DesktopActionInvocation) => void,
+): () => void {
+  try {
+    return actionBridge()?.onInvoke(callback) ?? (() => {});
+  } catch (err) {
+    console.warn("[nativeBridge] electron action onInvoke failed:", err);
+    return () => {};
+  }
+}
+
+export function reportDesktopActionResult(requestId: string, handled: boolean): void {
+  try {
+    actionBridge()?.reportResult(requestId, handled);
+  } catch (err) {
+    console.warn("[nativeBridge] electron action reportResult failed:", err);
+  }
 }
 
 /**

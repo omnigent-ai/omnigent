@@ -6,7 +6,7 @@ import { useOmnigentPageView } from "@/lib/analytics";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
-import { ActionsProvider, KeybindingDispatcher } from "@/actions";
+import { ActionsProvider, DesktopActionSync, KeybindingDispatcher } from "@/actions";
 
 // Bind a page component to its analytics page-view id. Declaring the id here,
 // beside the component, keeps the route table clean and means no route ships
@@ -66,6 +66,7 @@ const SettingsPage = lazy(() =>
 function ActionShell() {
   return (
     <ActionsProvider>
+      <DesktopActionSync />
       <KeybindingDispatcher />
       <AppShell />
     </ActionsProvider>

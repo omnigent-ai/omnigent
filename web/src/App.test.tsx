@@ -9,6 +9,7 @@ vi.mock("@/actions", () => ({
   ActionsProvider: ({ children }: { children: React.ReactNode }) => (
     <div data-testid="actions-provider">{children}</div>
   ),
+  DesktopActionSync: () => <span data-testid="desktop-action-sync" />,
   KeybindingDispatcher: () => <span data-testid="keybinding-dispatcher" />,
 }));
 vi.mock("@/shell/AppShell", () => ({
@@ -61,6 +62,7 @@ describe("action runtime route boundary", () => {
     renderUsageRoute(true);
     expect(await screen.findByText("usage page")).toBeInTheDocument();
     expect(screen.getByTestId("actions-provider")).toBeInTheDocument();
+    expect(screen.getByTestId("desktop-action-sync")).toBeInTheDocument();
     expect(screen.getByTestId("keybinding-dispatcher")).toBeInTheDocument();
   });
 

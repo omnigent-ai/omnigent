@@ -36,6 +36,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { execFile } = require("node:child_process");
+const { randomUUID } = require("node:crypto");
 const { registerLocalhostCors } = require("./localhost_cors");
 const {
   normalizeUrl,
@@ -544,6 +545,8 @@ function applyDockIcon() {
  *   so the OS badge aggregates per distinct ORIGIN (not per window — two
  *   windows on the same server report the same number and must not be
  *   double-counted), then sums across origins.
+ * @property {Map<string, string | null> | null} actionBindings Full renderer-owned
+ *   native menu accelerator snapshot, or null for shells/pages using fallbacks.
  * @property {ReturnType<typeof createBrowserViewRegistry>} [browserRegistry]
  *   Per-conversation embedded-browser view registry for this window.
  *
@@ -663,6 +666,8 @@ function pinWindow(win, origin) {
   const state = windows.get(win);
   if (!state) return;
   if (state.origin !== origin) {
+    // Renderer bindings are origin- and page-version-specific.
+    clearWindowActionBindings(win);
     // Leaving a server: this window's unread contribution goes with it.
     state.badgeCount = 0;
     updateBadge();
@@ -1322,6 +1327,7 @@ function createWindow(targetUrl, opts = {}) {
     serverUrl: destination ? serverUrl : null,
     ephemeral,
     badgeCount: 0,
+    actionBindings: null,
     // Per-conversation embedded-browser view registry for this window.
     browserRegistry: createBrowserRegistryForWindow(win),
   });
@@ -1421,6 +1427,14 @@ function createWindow(targetUrl, opts = {}) {
   win.webContents.on("did-create-window", (child) => hardenOauthPopup(child));
 
   registerNavigationFallbacks(win);
+  win.webContents.on("did-start-navigation", (details, _url, isInPlace, isMainFrame) => {
+    const mainFrame =
+      typeof details?.isMainFrame === "boolean" ? details.isMainFrame : isMainFrame === true;
+    const sameDocument =
+      typeof details?.isSameDocument === "boolean" ? details.isSameDocument : isInPlace === true;
+    if (mainFrame && !sameDocument) clearWindowActionBindings(win);
+  });
+  win.webContents.on("render-process-gone", () => clearWindowActionBindings(win));
 
   // Databricks workspace-hosted Omnigent renders inside the workspace's
   // top-nav chrome (the SPA is a workspace page). On a dedicated desktop
@@ -1431,6 +1445,7 @@ function createWindow(targetUrl, opts = {}) {
   // The desktop never auto-connects this machine as a runner — on launch or on
   // connect. Connecting is an explicit action from the host menu.
 
+  win.on("focus", scheduleMenuRebuild);
   win.on("closed", () => {
     // Destroy this window's embedded-browser views, else they leak webContents.
     try {
@@ -1440,7 +1455,9 @@ function createWindow(targetUrl, opts = {}) {
     }
     awayWatches.get(win)?.dispose();
     awayWatches.delete(win);
+    clearWindowActionBindings(win);
     windows.delete(win);
+    scheduleMenuRebuild();
     updateBadge(); // drop this window's contribution from the app-wide badge
   });
   attachContextMenu(win);
@@ -1559,6 +1576,7 @@ function positionFindBar(target, bar) {
  * @param {BrowserWindow} target The shell window to search.
  */
 function openFindBar(target) {
+  if (target.isDestroyed()) return;
   const existing = findBars.get(target);
   if (existing && !existing.isDestroyed()) {
     existing.focus();
@@ -1979,6 +1997,220 @@ function changeServer() {
   }
 }
 
+const DESKTOP_ACTION_BINDING_VERSION = 1;
+const MAX_DESKTOP_ACTION_BINDINGS = 8;
+const DESKTOP_MENU_ACTIONS = new Set([
+  "session.action.new",
+  "workbench.action.navigateSettings",
+  "file.action.find",
+]);
+const pendingActionInvocations = new Map();
+const RESERVED_NATIVE_ACCELERATORS = new Set([
+  "CmdOrCtrl+A",
+  "CmdOrCtrl+C",
+  "CmdOrCtrl+V",
+  "CmdOrCtrl+X",
+  "CmdOrCtrl+Z",
+  "CmdOrCtrl+Shift+Z",
+  "CmdOrCtrl+Y",
+  "CmdOrCtrl+W",
+  "CmdOrCtrl+R",
+  "CmdOrCtrl+Shift+R",
+  "CmdOrCtrl+Q",
+  "CmdOrCtrl+Shift+N",
+  "CmdOrCtrl+0",
+  "CmdOrCtrl+=",
+  "CmdOrCtrl+Shift+=",
+  "CmdOrCtrl+-",
+  "Cmd+Q",
+  "Cmd+H",
+  "Cmd+Alt+H",
+  "Cmd+M",
+  "Cmd+Alt+Shift+V",
+  "Ctrl+Cmd+F",
+  "Cmd+Alt+I",
+  "Ctrl+Shift+I",
+  "Alt+F4",
+  "F11",
+  "F12",
+]);
+let menuRebuildScheduled = false;
+
+function scheduleMenuRebuild() {
+  if (menuRebuildScheduled) return;
+  menuRebuildScheduled = true;
+  void Promise.resolve().then(() => {
+    menuRebuildScheduled = false;
+    buildMenu();
+  });
+}
+
+function isValidElectronAccelerator(accelerator) {
+  if (accelerator === null) return true;
+  if (typeof accelerator !== "string" || accelerator.length === 0 || accelerator.length > 64) {
+    return false;
+  }
+  const parts = accelerator.split("+");
+  const key = parts.pop();
+  const modifierOrder = new Map([
+    ["CmdOrCtrl", 0],
+    ["Ctrl", 1],
+    ["Cmd", 2],
+    ["Alt", 3],
+    ["Shift", 4],
+  ]);
+  if (
+    parts.some((part) => !modifierOrder.has(part)) ||
+    new Set(parts).size !== parts.length ||
+    !parts.some((part) => part !== "Shift") ||
+    parts.some(
+      (part, index) => index > 0 && modifierOrder.get(parts[index - 1]) > modifierOrder.get(part),
+    )
+  ) {
+    return false;
+  }
+  return (
+    !RESERVED_NATIVE_ACCELERATORS.has(accelerator) &&
+    typeof key === "string" &&
+    (/^[A-Z0-9]$/.test(key) ||
+      /^F(?:[1-9]|1[0-9]|2[0-4])$/.test(key) ||
+      [
+        "Space",
+        "Enter",
+        "Esc",
+        "Tab",
+        "Backspace",
+        "Delete",
+        "Up",
+        "Down",
+        "Left",
+        "Right",
+        "Home",
+        "End",
+        "PageUp",
+        "PageDown",
+        "Insert",
+        ",",
+        ".",
+        "/",
+        ";",
+        "'",
+        "[",
+        "]",
+        "\\",
+        "-",
+        "=",
+        "`",
+      ].includes(key))
+  );
+}
+
+function normalizeActionBindings(snapshot) {
+  if (
+    snapshot?.version !== DESKTOP_ACTION_BINDING_VERSION ||
+    !Array.isArray(snapshot.bindings) ||
+    snapshot.bindings.length > MAX_DESKTOP_ACTION_BINDINGS
+  ) {
+    return null;
+  }
+  const bindings = new Map();
+  const accelerators = new Set();
+  for (const binding of snapshot.bindings) {
+    if (
+      !binding ||
+      !DESKTOP_MENU_ACTIONS.has(binding.action) ||
+      bindings.has(binding.action) ||
+      !isValidElectronAccelerator(binding.accelerator)
+    ) {
+      return null;
+    }
+    if (binding.accelerator !== null && accelerators.has(binding.accelerator)) return null;
+    bindings.set(binding.action, binding.accelerator);
+    if (binding.accelerator !== null) accelerators.add(binding.accelerator);
+  }
+  if (bindings.size !== 0 && bindings.size !== DESKTOP_MENU_ACTIONS.size) return null;
+  return bindings;
+}
+
+function actionBindingsEqual(left, right) {
+  if (left === right) return true;
+  if (!(left instanceof Map) || !(right instanceof Map) || left.size !== right.size) return false;
+  for (const [action, accelerator] of left) {
+    if (right.get(action) !== accelerator) return false;
+  }
+  return true;
+}
+
+function clearWindowActionBindings(win) {
+  const state = windows.get(win);
+  if (state?.actionBindings !== null) {
+    state.actionBindings = null;
+    if (focusedActionWindow() === win) scheduleMenuRebuild();
+  }
+  for (const [requestId, pending] of pendingActionInvocations) {
+    if (pending.target !== win) continue;
+    clearTimeout(pending.timer);
+    pendingActionInvocations.delete(requestId);
+  }
+}
+
+function focusedActionWindow() {
+  const focused = BrowserWindow.getFocusedWindow();
+  const direct = focusedConnectedWindow(focused, windows);
+  if (direct || !focused || windows.has(focused)) return direct;
+  return focusedConnectedWindow(focused.getParentWindow?.(), windows);
+}
+
+function actionAccelerator(action, fallback) {
+  const state = windows.get(focusedActionWindow());
+  if (!(state?.actionBindings instanceof Map)) return fallback;
+  return state.actionBindings.has(action) ? state.actionBindings.get(action) : null;
+}
+
+function canInvokeRendererAction(target) {
+  const state = windows.get(target);
+  if (!(state?.actionBindings instanceof Map) || !state.origin || target.isDestroyed())
+    return false;
+  return originOf(target.webContents.getURL()) === state.origin;
+}
+
+function invokeRendererAction(target, action, fallback, awaitResult = false) {
+  if (!target || !canInvokeRendererAction(target)) {
+    fallback?.();
+    return false;
+  }
+  const requestId = randomUUID();
+  if (fallback && awaitResult) {
+    // A late fallback could run alongside a renderer action after a long main-
+    // thread pause. Drop stale requests instead; healthy renderers explicitly
+    // report notHandled when native whole-window Find should take over.
+    const timer = setTimeout(() => pendingActionInvocations.delete(requestId), 5_000);
+    pendingActionInvocations.set(requestId, { target, fallback, timer });
+  }
+  try {
+    target.webContents.send("omnigent:invoke-action", { action, requestId });
+    return true;
+  } catch {
+    const pending = pendingActionInvocations.get(requestId);
+    if (pending) {
+      clearTimeout(pending.timer);
+      pendingActionInvocations.delete(requestId);
+    }
+    fallback?.();
+    return false;
+  }
+}
+
+function finishRendererAction(event, result) {
+  if (!isPinnedOriginSender(event) || typeof result?.requestId !== "string") return;
+  const pending = pendingActionInvocations.get(result.requestId);
+  if (!pending || pending.target.isDestroyed() || pending.target.webContents !== event.sender)
+    return;
+  clearTimeout(pending.timer);
+  pendingActionInvocations.delete(result.requestId);
+  if (result.handled !== true) pending.fallback();
+}
+
 // ---------------------------------------------------------------------------
 // Application menu — start from Electron's standard menu (which wires up the
 // platform text-editing shortcuts: Cmd/Ctrl-A/C/V/X/Z via the Edit role) and
@@ -1989,10 +2221,15 @@ function changeServer() {
 
 function buildMenu() {
   const isMac = process.platform === "darwin";
-  const settingsItem = settingsMenuItem(() => {
-    const target = focusedConnectedWindow(BrowserWindow.getFocusedWindow(), windows);
-    sendOpenPath(target, SETTINGS_PATH);
-  });
+  const settingsItem = settingsMenuItem(
+    () => {
+      const target = focusedActionWindow() ?? activeWindow();
+      invokeRendererAction(target, "workbench.action.navigateSettings", () =>
+        sendOpenPath(target, SETTINGS_PATH),
+      );
+    },
+    actionAccelerator("workbench.action.navigateSettings", "CmdOrCtrl+,"),
+  );
 
   /** @type {Electron.MenuItemConstructorOptions[]} */
   const template = [];
@@ -2009,8 +2246,11 @@ function buildMenu() {
     {
       id: "new_session",
       label: "New Session",
-      accelerator: "CmdOrCtrl+N",
-      click: () => sendOpenPath(activeWindow(), "/"),
+      accelerator: actionAccelerator("session.action.new", "CmdOrCtrl+N"),
+      click: () => {
+        const target = focusedActionWindow() ?? activeWindow();
+        invokeRendererAction(target, "session.action.new", () => sendOpenPath(target, "/"));
+      },
     },
     {
       id: "new_window",
@@ -2116,10 +2356,17 @@ function buildMenu() {
       {
         id: "find",
         label: "Find…",
-        accelerator: "CmdOrCtrl+F",
+        accelerator: actionAccelerator("file.action.find", "CmdOrCtrl+F"),
         click: () => {
           const target = findTargetForShortcut();
-          if (target) openFindBar(target);
+          invokeRendererAction(
+            target,
+            "file.action.find",
+            () => {
+              if (target) openFindBar(target);
+            },
+            true,
+          );
         },
       },
     ],
@@ -2338,6 +2585,31 @@ function browserRegistryForSender(event) {
 }
 
 function registerIpc() {
+  ipcMain.on("omnigent:set-action-bindings", (event, snapshot) => {
+    if (!isPinnedOriginSender(event)) {
+      console.warn("[omnigent] blocked action bindings from an untrusted page");
+      return;
+    }
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const state = windows.get(win);
+    const normalized = normalizeActionBindings(snapshot);
+    if (!state) return;
+    if (!normalized) {
+      console.warn("[omnigent] ignored invalid native action binding snapshot");
+      clearWindowActionBindings(win);
+      return;
+    }
+    if (normalized.size === 0) {
+      clearWindowActionBindings(win);
+      return;
+    }
+    const next = normalized;
+    if (actionBindingsEqual(state.actionBindings, next)) return;
+    state.actionBindings = next;
+    if (focusedActionWindow() === win) scheduleMenuRebuild();
+  });
+  ipcMain.on("omnigent:action-result", finishRendererAction);
+
   // Setup page → persist URL and navigate the SENDING window to it. We target
   // the window that owns the setup page (via its webContents) rather than a
   // global, so connecting from one window doesn't hijack another.
