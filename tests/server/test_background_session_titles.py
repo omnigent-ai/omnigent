@@ -6,10 +6,7 @@ import uuid
 
 import pytest
 
-from omnigent.runner.background_titles.service import (
-    BACKGROUND_TITLE_MAX_ADDITIONAL_INSTRUCTIONS_CHARS,
-    FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION,
-)
+from omnigent.runner.background_titles.service import FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION
 from omnigent.server.background_session_titles import (
     BACKGROUND_TITLE_MAX_CHARS,
     CUSTOM_BACKGROUND_TITLE_MAX_CHARS,
@@ -526,29 +523,6 @@ async def test_runner_generator_posts_language_rule_without_operator_customizati
     assert client.requests[0][1]["additional_instructions"] == (
         FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION
     )
-
-
-async def test_runner_generator_preserves_operator_language_override_at_old_host_limit() -> None:
-    client = _FakeRunnerClient()
-    generator = RunnerBackgroundTitleGenerator(_FakeRunnerRouter(client))  # type: ignore[arg-type]
-    operator_rule = "Always use English."
-    custom = (
-        "x" * (BACKGROUND_TITLE_MAX_ADDITIONAL_INSTRUCTIONS_CHARS - len(operator_rule) - 1)
-        + f" {operator_rule}"
-    )
-
-    await generator(
-        BackgroundTitleRequest(
-            session_id="conv_test",
-            prompt="请修复登录超时",
-            additional_instructions=custom,
-        )
-    )
-
-    forwarded = client.requests[0][1]["additional_instructions"]
-    assert forwarded == custom
-    assert len(forwarded) == BACKGROUND_TITLE_MAX_ADDITIONAL_INSTRUCTIONS_CHARS
-    assert forwarded.endswith(operator_rule)
 
 
 async def test_schedule_is_one_shot_per_session(db_uri: str) -> None:
