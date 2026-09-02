@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
+from omnigent import codex_native_forwarder as codex_fwd
 from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
 from omnigent.llms.context_window import ModelPricing
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
@@ -6065,6 +6066,109 @@ async def test_external_session_usage_records_per_model_breakdown(
     assert bucket["output_tokens"] == 500
     assert bucket["total_tokens"] == 1500
     assert bucket["total_cost_usd"] == pytest.approx(0.42)
+
+
+async def test_native_codex_forwarder_preserves_child_model_in_subtree_rollup(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native parent and child usage retain separate model pricing in the subtree."""
+    parent_pricing = ModelPricing(
+        input_per_token=10e-6,
+        output_per_token=20e-6,
+        cache_read_per_token=1e-6,
+    )
+    child_pricing = ModelPricing(
+        input_per_token=1e-6,
+        output_per_token=2e-6,
+        cache_read_per_token=0.1e-6,
+    )
+    pricing = {"parent-model": parent_pricing, "child-model": child_pricing}
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing_with_provider",
+        lambda model, **_kwargs: pricing.get(model),
+    )
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"], title="parent")
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.create_conversation(
+        kind="sub_agent",
+        title="default:tiny-probe",
+        parent_conversation_id=parent["id"],
+        agent_id=agent["id"],
+    )
+
+    parent_response = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_session_usage",
+            "data": {
+                "cumulative_input_tokens": 66_785,
+                "cumulative_cache_read_input_tokens": 49_408,
+                "cumulative_output_tokens": 127,
+                "model": "parent-model",
+            },
+        },
+    )
+    state = codex_fwd._CodexForwarderState(
+        model="parent-model",
+        posted_model="parent-model",
+        parent_session_id=parent["id"],
+    )
+    state.note_child_thread("thread_child", child.id)
+    await codex_fwd._apply_child_resume(
+        client,
+        parent_session_id=parent["id"],
+        child_session_id=child.id,
+        child_thread_id="thread_child",
+        response={
+            "result": {
+                "model": "child-model",
+                "thread": {"id": "thread_child", "turns": []},
+            },
+        },
+        forwarder_state=state,
+    )
+    tracker = codex_fwd._CodexElicitationTaskTracker()
+    await codex_fwd._handle_event(
+        client,
+        session_id=parent["id"],
+        bridge_dir=Path(),
+        event={
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread_child",
+                "turnId": "turn_child",
+                "tokenUsage": {
+                    "total": {
+                        "inputTokens": 20_280,
+                        "cachedInputTokens": 9_984,
+                        "outputTokens": 23,
+                    }
+                },
+            },
+        },
+        usage_coalescer=codex_fwd._SessionUsageCoalescer(client, parent["id"]),
+        elicitation_tracker=tracker,
+        expected_thread_id="thread_parent",
+        forwarder_state=state,
+    )
+    await tracker.close()
+    await state.close_child_usage_coalescers(client)
+    assert parent_response.status_code == 202, parent_response.text
+
+    child_usage = _read_session_usage(db_uri, child.id)
+    assert set(child_usage["by_model"]) == {"child-model"}
+    assert child_usage["by_model"]["child-model"]["input_tokens"] == 10_296
+    assert child_usage["by_model"]["child-model"]["cache_read_input_tokens"] == 9_984
+    assert child_usage["total_cost_usd"] == pytest.approx(0.0113404)
+
+    root = (await client.get(f"/v1/sessions/{parent['id']}")).json()
+    assert set(root["usage_by_model"]) == {"parent-model", "child-model"}
+    assert root["usage_by_model"]["parent-model"]["total_cost_usd"] == pytest.approx(0.225718)
+    assert root["usage_by_model"]["child-model"]["total_cost_usd"] == pytest.approx(0.0113404)
+    assert root["total_cost_usd"] == pytest.approx(0.2370584)
 
 
 async def test_external_session_usage_cost_only_attributes_to_model(
