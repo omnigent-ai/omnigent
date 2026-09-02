@@ -163,6 +163,31 @@ describe("TerminalExtraKeys pointer semantics", () => {
     expect(key("Control")).toHaveAttribute("aria-pressed", "false");
   });
 
+  it("pointercancel after the long-press fired restores the modifier's pre-press state", () => {
+    // WHY: a scroll or palm that cancels the gesture after 500 ms must not
+    // leave Ctrl locked — whatever the timer did is undone.
+    const target = makeTarget();
+    render(<TerminalExtraKeys target={target} />);
+    const ctrl = key("Control");
+
+    pointerDown(ctrl);
+    act(() => vi.advanceTimersByTime(LONG_PRESS_MS + 50));
+    expect(ctrl).toHaveAttribute("data-modifier-state", "locked");
+    fireEvent.pointerCancel(ctrl, { pointerId: 1 });
+    expect(ctrl).toHaveAttribute("data-modifier-state", "off");
+    expect(installedTransform(target)).toBeNull();
+
+    // From an armed pre-state the cancel goes back to armed, not off.
+    tap(ctrl);
+    expect(ctrl).toHaveAttribute("data-modifier-state", "armed");
+    pointerDown(ctrl);
+    act(() => vi.advanceTimersByTime(LONG_PRESS_MS + 50));
+    expect(ctrl).toHaveAttribute("data-modifier-state", "locked");
+    fireEvent.pointerCancel(ctrl, { pointerId: 1 });
+    expect(ctrl).toHaveAttribute("data-modifier-state", "armed");
+    expect(typeof installedTransform(target)).toBe("function");
+  });
+
   it("activates from a keyboard/AT click (detail 0) without pointer events", () => {
     const target = makeTarget();
     render(<TerminalExtraKeys target={target} />);
