@@ -6,6 +6,7 @@ import atexit
 import contextlib
 import logging
 import os
+import re
 import sys
 import threading
 from collections.abc import Callable, Iterator, Sequence
@@ -103,6 +104,61 @@ _LEVEL_COLORS = {
     logging.ERROR: "\x1b[31m",
     logging.CRITICAL: "\x1b[91m",
 }
+_REDACTED = "[REDACTED]"
+_QUOTED_OR_NONSPACE_VALUE = r'(?:"[^"\r\n]*"|\'[^\'\r\n]*\'|\S+)'
+_AUTHORIZATION_VALUE = r'(?:(?:"[^"\r\n]*"|\'[^\'\r\n]*\')|(?:bearer\s+)?\S+)'
+_AUTHORIZATION_PATTERN = re.compile(
+    rf"(?i)(\bauthorization\b[\"']?\s*[:=]\s*)({_AUTHORIZATION_VALUE})"
+)
+_NAMED_SECRET_PATTERN = re.compile(
+    rf"(?i)(\b[\w.-]*(?:token|api[_-]?key|secret|password|credential)"
+    rf"\b[\"']?\s*[:=]\s*)({_QUOTED_OR_NONSPACE_VALUE})"
+)
+_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Keep the broad standalone-bearer behavior: short or punctuation-heavy
+    # credentials are still secrets.
+    re.compile(r"(?i)(\bbearer\s+)\S+"),
+    # Common provider-specific token shapes.
+    re.compile(r"\bsk-[A-Za-z0-9_-]{10,}\b"),
+    re.compile(r"\bdapi[A-Za-z0-9]{10,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"\bAIza[A-Za-z0-9_-]{20,}\b"),
+    # JWTs and long mixed-case opaque values are token-like even without a
+    # nearby label. Requiring lower, upper, and numeric characters avoids
+    # treating UUIDs, hashes, and normal lower-case identifiers as secrets.
+    re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b"),
+    re.compile(
+        r"(?<![A-Za-z0-9_])"
+        r"(?=[A-Za-z0-9_]{32,}(?![A-Za-z0-9_]))"
+        r"(?=[A-Za-z0-9_]*[a-z])"
+        r"(?=[A-Za-z0-9_]*[A-Z])"
+        r"(?=[A-Za-z0-9_]*[0-9])"
+        r"[A-Za-z0-9_]{32,}"
+        r"(?![A-Za-z0-9_])"
+    ),
+)
+
+
+def _replace_named_secret(match: re.Match[str]) -> str:
+    value = match.group(2)
+    if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
+        replacement = f"{value[0]}{_REDACTED}{value[0]}"
+    else:
+        replacement = _REDACTED
+    return match.group(1) + replacement
+
+
+def redact_log_text(text: str) -> str:
+    """Replace secret- and token-shaped substrings in log text."""
+    text = _AUTHORIZATION_PATTERN.sub(_replace_named_secret, text)
+    text = _NAMED_SECRET_PATTERN.sub(_replace_named_secret, text)
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub(
+            lambda match: match.group(1) + _REDACTED if match.lastindex else _REDACTED,
+            text,
+        )
+    return text
 
 
 def format_log_level_name(levelno: int, levelname: str, *, use_colors: bool) -> str:
@@ -199,6 +255,13 @@ class TerminalLogFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         with log_record_display_fields(record, use_colors=self._use_colors):
             return super().format(record)
+
+
+class RedactingLogFormatter(TerminalLogFormatter):
+    """Format a complete record, then remove token-like strings from it."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_log_text(super().format(record))
 
 
 def data_dir() -> Path:
@@ -391,7 +454,7 @@ def terminal_stream_handler() -> logging.Handler:
 
 def terminal_log_formatter() -> logging.Formatter:
     """Return the formatter used by mirrored terminal process logs."""
-    return TerminalLogFormatter(use_colors=terminal_supports_color())
+    return RedactingLogFormatter(use_colors=terminal_supports_color())
 
 
 def _unlink_if_empty(path: Path) -> None:
@@ -436,7 +499,7 @@ def configure_process_logging(
     path.parent.mkdir(parents=True, exist_ok=True)
     _current_process_log_path = path
 
-    formatter = TerminalLogFormatter(use_colors=False)
+    formatter = RedactingLogFormatter(use_colors=False)
     handlers: list[logging.Handler] = []
 
     file_handler = _ProcessLogFileHandler(path, encoding="utf-8")
