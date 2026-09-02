@@ -33,6 +33,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from omnigent.native_bridge_ids import normalize_bridge_id
+
 # Env var the runner stamps on the harness process so the executor can
 # locate its bridge directory. Mirrors ``HARNESS_CODEX_NATIVE_BRIDGE_DIR``.
 OPENCODE_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_OPENCODE_NATIVE_BRIDGE_DIR"
@@ -293,11 +295,14 @@ def bridge_dir_for_bridge_id(bridge_id: str) -> Path:
     """
     Return the bridge directory for an OpenCode-native bridge id.
 
-    :param bridge_id: Opaque bridge id, e.g. ``"conv_abc123"``.
+    :param bridge_id: Opaque bridge id, e.g. ``"abc123"``. A legacy
+        ``conv_``-prefixed id is normalised, so both spellings of a session
+        share one directory.
     :returns: Absolute bridge directory under
         ``~/.omnigent/opencode-native``.
     """
-    digest = hashlib.sha256(bridge_id.encode("utf-8")).hexdigest()[:_ID_HASH_CHARS]
+    normalized = normalize_bridge_id(bridge_id)
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:_ID_HASH_CHARS]
     return _BRIDGE_ROOT / digest
 
 

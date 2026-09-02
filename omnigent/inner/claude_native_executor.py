@@ -143,10 +143,7 @@ class ClaudeNativeExecutor(Executor):
         del tools, system_prompt
         if not _session_is_active(self._bridge_dir, self._request_session_id):
             yield ExecutorError(
-                message=(
-                    "Claude native session is no longer active after /clear; "
-                    "open the latest conversation and retry."
-                )
+                message=_stale_session_message(self._bridge_dir, self._request_session_id)
             )
             return
         text = _latest_user_text(messages, self._bridge_dir)
@@ -358,6 +355,26 @@ def _request_session_id_from_env() -> str | None:
     """
     raw = os.environ.get(REQUEST_SESSION_ID_ENV_VAR, "").strip()
     return raw or None
+
+
+def _stale_session_message(bridge_dir: Path, request_session_id: str | None) -> str:
+    """
+    Build the turn-rejected message for a bridge bound to another session.
+
+    Names both sides of the mismatch: a bridge whose owner is an unrelated id
+    (rather than the expected post-``/clear`` successor) points at an id-shape
+    disagreement between the terminal and this executor, not at a real ``/clear``.
+
+    :param bridge_dir: Native bridge directory.
+    :param request_session_id: Omnigent session id this turn belongs to.
+    :returns: Error message for the rejected turn.
+    """
+    return (
+        "Claude native session is no longer active after /clear; "
+        "open the latest conversation and retry. "
+        f"(bridge {bridge_dir} is bound to session "
+        f"{read_active_session_id(bridge_dir)!r}, this turn is {request_session_id!r})"
+    )
 
 
 def _session_is_active(bridge_dir: Path, request_session_id: str | None) -> bool:
