@@ -352,7 +352,10 @@ describe("InboxPage comments and errors", () => {
     renderPage();
 
     expect(await screen.findByTestId("inbox-comment")).toBeInTheDocument();
-    expect(screen.getByText("alice")).toBeInTheDocument();
+    // The visible author label is the humanized display name; the raw
+    // identity stays on the title attribute for hover disambiguation.
+    expect(screen.getByText("Alice")).toBeInTheDocument();
+    expect(screen.getByTitle("alice")).toBeInTheDocument();
     expect(screen.getByText("src/app.ts")).toBeInTheDocument();
     expect(screen.getByText("Please reconsider this line.")).toBeInTheDocument();
     expect(screen.getByText(/1 comment/)).toBeInTheDocument();

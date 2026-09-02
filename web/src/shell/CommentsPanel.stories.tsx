@@ -18,6 +18,7 @@ function comment(overrides: Partial<Comment> & { id: string }): Comment {
     updated_at: createdAt * 1_000_000,
     anchor_content: "def compute_totals(rows):",
     created_by: null,
+    edited_at: null,
     ...overrides,
   };
 }

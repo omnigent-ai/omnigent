@@ -36,6 +36,11 @@ class Comment:
     :param created_by: Email of the user who created the comment,
         e.g. ``"alice@example.com"``. ``None`` for legacy comments created
         before per-user attribution was added, or in single-user mode.
+    :param edited_at: Unix timestamp in **microseconds** of the last
+        **body** edit, or ``None`` when the text was never rewritten.
+        Unlike ``updated_at`` it is not bumped by status-only changes
+        (e.g. marking a comment addressed), so clients can surface an
+        "edited" indicator only when the visible text actually changed.
     """
 
     id: str
@@ -49,6 +54,7 @@ class Comment:
     updated_at: int  # unix timestamp (microseconds) of last body/status mutation
     anchor_content: str | None = None
     created_by: str | None = None
+    edited_at: int | None = None
 
 
 @dataclasses.dataclass

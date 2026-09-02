@@ -66,6 +66,7 @@ function makeComment(overrides: Partial<Comment> & { id: string; path: string })
     updated_at: 0,
     anchor_content: null,
     created_by: null,
+    edited_at: null,
     ...overrides,
   };
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { userColor, userColorTint, userInitials } from "./userBadge";
+import { userColor, userColorTint, userDisplayName, userInitials } from "./userBadge";
 
 describe("userInitials", () => {
   it("takes the first letters of the first two local-part segments", () => {
@@ -15,6 +15,30 @@ describe("userInitials", () => {
 
   it("handles identities without an @", () => {
     expect(userInitials("local")).toBe("L");
+  });
+});
+
+describe("userDisplayName", () => {
+  it("title-cases the email local part's segments into a human name", () => {
+    // The attribution row must show a person, not an address — the raw
+    // email stays available separately (tooltips, identity comparisons).
+    expect(userDisplayName("alice.smith@example.com")).toBe("Alice Smith");
+    expect(userDisplayName("corey-zumar@databricks.com")).toBe("Corey Zumar");
+    expect(userDisplayName("a_b@example.com")).toBe("A B");
+  });
+
+  it("handles single-segment local parts", () => {
+    expect(userDisplayName("bob@example.com")).toBe("Bob");
+  });
+
+  it("handles identities without an @", () => {
+    expect(userDisplayName("local")).toBe("Local");
+  });
+
+  it("never returns the raw email address", () => {
+    // The whole point: whatever the mapping produces, the visible label
+    // must not be the bare address.
+    expect(userDisplayName("sami.zayn@ui.test")).not.toContain("@");
   });
 });
 

@@ -71,6 +71,7 @@ function makeComment(overrides: Partial<Comment> = {}): Comment {
     updated_at: 0,
     anchor_content: "quick",
     created_by: null,
+    edited_at: null,
     ...overrides,
   };
 }

@@ -42,6 +42,7 @@ function makeComment(
     updated_at: 0,
     anchor_content: "hello",
     created_by: null,
+    edited_at: null,
   };
 }
 
@@ -231,6 +232,47 @@ describe("CommentsPanel read-only collaborator gating", () => {
 function makeAuthoredComment(id: string, author: string | null): Comment {
   return { ...makeComment(id), created_by: author };
 }
+
+// ── Attribution rendering (display name + edited indicator) ────────────────
+//
+// The card footer must show a human display name (raw email only in the
+// tooltip) and an "(edited)" marker when the body text was rewritten —
+// but not for status-only changes, which never touch the visible text.
+
+describe("CommentsPanel attribution rendering", () => {
+  it("shows the author's display name, not the raw email", () => {
+    renderGated({
+      canEdit: false,
+      comments: [{ ...makeComment("c1"), created_by: "sami.zayn@ui.test" }],
+    });
+    // The always-visible label is the humanized local part; rendering the
+    // bare address here is the bug this guards against.
+    expect(screen.getByText("Sami Zayn")).toBeInTheDocument();
+    expect(screen.queryByText("sami.zayn@ui.test")).toBeNull();
+  });
+
+  it('renders "You" for authorless (single-user) comments', () => {
+    renderGated({ canEdit: false, comments: [makeComment("c1")] });
+    expect(screen.getByText("You")).toBeInTheDocument();
+  });
+
+  it("marks a body-edited comment with an edited indicator", () => {
+    renderGated({
+      canEdit: false,
+      comments: [{ ...makeComment("c1"), edited_at: 1_700_000_001_000_000 }],
+    });
+    // A rewritten body must be visibly flagged so collaborators can tell
+    // the text changed since they last read it.
+    expect(screen.getByTestId("comment-edited")).toHaveTextContent(/edited/i);
+  });
+
+  it("shows no edited indicator for a never-edited comment", () => {
+    renderGated({ canEdit: false, comments: [makeComment("c1")] });
+    // edited_at null (creation, or status-only changes) → no marker; a
+    // false positive would brand every comment as edited from birth.
+    expect(screen.queryByTestId("comment-edited")).toBeNull();
+  });
+});
 
 describe("CommentsPanel author-only edit/delete gating", () => {
   afterEach(() => {

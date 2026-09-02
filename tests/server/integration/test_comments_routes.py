@@ -557,6 +557,69 @@ async def test_comment_api_serializes_updated_at(
     assert patched["created_at"] == 1_000
 
 
+async def test_comment_api_serializes_edited_at_for_body_edits_only(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``edited_at`` rides the comment API: null until a body rewrite.
+
+    The web card's "edited" indicator keys off this field, so it must be
+    ``None`` on creation and after status-only PATCHes, and stamped only
+    when the visible text actually changes.
+    """
+    alice = "alice@example.com"
+    session_id = _seed_session_with_grants(db_uri, {alice: LEVEL_EDIT})
+
+    us = 1_000_000  # edited_at is epoch-µs, like updated_at
+    clock = {"now": 1_000}
+    monkeypatch.setattr(
+        "omnigent.stores.comment_store.sqlalchemy_store.now_epoch_us",
+        lambda: clock["now"] * us,
+    )
+
+    created = await _add_comment(
+        auth_client,
+        session_id,
+        user=alice,
+        path="src/app.py",
+        body="fix me",
+        start_index=0,
+        end_index=6,
+    )
+    # A fresh comment was never rewritten — no edit marker input.
+    assert created["edited_at"] is None
+
+    # A status-only change is a workflow action, not a text edit.
+    clock["now"] = 2_000
+    status_resp = await auth_client.patch(
+        f"/v1/sessions/{session_id}/comments/{created['id']}",
+        json={"status": "addressed"},
+        headers={"X-Forwarded-Email": alice},
+    )
+    status_resp.raise_for_status()
+    assert status_resp.json()["edited_at"] is None
+
+    # A body rewrite is what the indicator exists for.
+    clock["now"] = 3_000
+    body_resp = await auth_client.patch(
+        f"/v1/sessions/{session_id}/comments/{created['id']}",
+        json={"body": "fix me properly"},
+        headers={"X-Forwarded-Email": alice},
+    )
+    body_resp.raise_for_status()
+    assert body_resp.json()["edited_at"] == 3_000 * us
+
+    # The stamp survives a fresh GET (persisted, not just echoed).
+    list_resp = await auth_client.get(
+        f"/v1/sessions/{session_id}/comments",
+        headers={"X-Forwarded-Email": alice},
+    )
+    list_resp.raise_for_status()
+    listed = {c["id"]: c for c in list_resp.json()}[created["id"]]
+    assert listed["edited_at"] == 3_000 * us
+
+
 async def test_patch_rejects_unknown_status_with_400(
     auth_client: httpx.AsyncClient,
     db_uri: str,
