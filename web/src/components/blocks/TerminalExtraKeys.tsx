@@ -107,8 +107,11 @@ export const TerminalExtraKeys = memo(function TerminalExtraKeys({
   }, [clearPress]);
 
   const activate = useCallback(
-    (key: ExtraKeyDef) => {
+    (key: ExtraKeyDef, focused: boolean) => {
       if (key.kind === "modifier") {
+        // A modifier only pays off with the next typed character; pointer
+        // presses focused on pointerdown, assistive-tech clicks have not yet.
+        if (!focused) targetRef.current.focus();
         commit(reduceModifiers(modsRef.current, { type: "tap", mod: key.id }));
         return;
       }
@@ -157,7 +160,7 @@ export const TerminalExtraKeys = memo(function TerminalExtraKeys({
       const press = pressRef.current;
       if (!press || press.pointerId !== e.pointerId) return;
       clearPress();
-      if (!press.longPressFired) activate(press.key);
+      if (!press.longPressFired) activate(press.key, true);
     },
     [activate, clearPress],
   );
@@ -183,7 +186,7 @@ export const TerminalExtraKeys = memo(function TerminalExtraKeys({
       // Pointer taps are handled on pointerup; only keyboard / assistive-tech
       // activation (a synthesized click, detail 0) reaches here.
       if (e.detail !== 0) return;
-      activate(key);
+      activate(key, false);
     },
     [activate],
   );
