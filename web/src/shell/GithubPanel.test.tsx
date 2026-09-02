@@ -20,6 +20,9 @@ const state = vi.hoisted(() => ({
     error: unknown;
     isFetching: boolean;
   } | null,
+  // Per-file diffs the stubbed parsePatchFiles yields (name + optional
+  // rename fields), so tests can exercise renamed/pure-rename rendering.
+  parsedFiles: [] as { name: string; prevName?: string; type?: string }[],
 }));
 
 vi.mock("@/hooks/useGithub", () => ({
@@ -37,9 +40,10 @@ vi.mock("@/hooks/useGithub", () => ({
 
 // The diff rendering (@pierre/diffs) is exercised by the library itself; here
 // we only assert a section renders one diff per parsed file. parsePatchFiles is
-// stubbed to yield a file per path present in the patch marker.
+// stubbed to yield the files configured on `state` (name + optional rename
+// metadata), matching the whole-PR patch.
 vi.mock("@pierre/diffs", () => ({
-  parsePatchFiles: () => [{ files: [{ name: "hello.py" }, { name: "src/app.ts" }] }],
+  parsePatchFiles: () => [{ files: state.parsedFiles }],
 }));
 vi.mock("@pierre/diffs/react", () => ({
   FileDiff: ({ fileDiff }: { fileDiff: { name: string } }) => (
@@ -149,6 +153,8 @@ beforeEach(() => {
     error: null,
     isFetching: false,
   };
+  // Default parsed diffs mirror the two changed files above.
+  state.parsedFiles = [{ name: "hello.py" }, { name: "src/app.ts" }];
 });
 
 afterEach(() => {
@@ -265,6 +271,28 @@ describe("GithubPanel", () => {
     fireEvent.click(folder);
     // After collapse: only the diff section header remains (sidebar leaf gone).
     expect(screen.getAllByRole("button", { name: /app\.py/ })).toHaveLength(1);
+  });
+
+  it("shows a pure rename as a note with an old → new header", async () => {
+    state.changes = {
+      data: { available: true, data: [file("omnigent/new_name.py", "renamed")] },
+      isLoading: false,
+      error: null,
+      isFetching: false,
+    };
+    state.parsedFiles = [
+      { name: "omnigent/new_name.py", prevName: "omnigent/old_name.py", type: "rename-pure" },
+    ];
+    renderPanel();
+    // No diff body for a 100%-similarity rename — a note instead.
+    expect(await screen.findByText("File renamed without changes.")).toBeInTheDocument();
+    expect(screen.queryByTestId("diff")).toBeNull();
+    // The section header reads old → new.
+    expect(
+      screen.getByRole("button", {
+        name: /omnigent\/old_name\.py\s*→\s*omnigent\/new_name\.py/,
+      }),
+    ).toBeInTheDocument();
   });
 
   it("renders a non-git workspace message without a PR body", () => {

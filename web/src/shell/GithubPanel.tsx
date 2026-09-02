@@ -26,8 +26,13 @@ import {
   CircleXIcon,
   Columns2Icon,
   ExternalLinkIcon,
+  FileDiffIcon,
+  FileMinusIcon,
+  FilePlusIcon,
+  FileSymlinkIcon,
   FolderIcon,
   Loader2Icon,
+  type LucideIcon,
   PanelLeftCloseIcon,
   PanelLeftOpenIcon,
   RefreshCwIcon,
@@ -97,14 +102,24 @@ function IconButton({
   );
 }
 
+// GitHub-style status icons (a file glyph carrying the change kind) instead of
+// bare A/M/D/R letters — quicker to recognize at a glance.
 const STATUS_META: Record<
   GithubChangedFile["status"],
-  { letter: string; label: string; className: string }
+  { label: string; className: string; Icon: LucideIcon }
 > = {
-  created: { letter: "A", label: "Added", className: "text-green-600 dark:text-green-400" },
-  modified: { letter: "M", label: "Modified", className: "text-amber-600 dark:text-amber-400" },
-  deleted: { letter: "D", label: "Deleted", className: "text-red-600 dark:text-red-400" },
-  renamed: { letter: "R", label: "Renamed", className: "text-blue-600 dark:text-blue-400" },
+  created: { label: "Added", className: "text-green-600 dark:text-green-400", Icon: FilePlusIcon },
+  modified: {
+    label: "Modified",
+    className: "text-amber-600 dark:text-amber-400",
+    Icon: FileDiffIcon,
+  },
+  deleted: { label: "Deleted", className: "text-red-600 dark:text-red-400", Icon: FileMinusIcon },
+  renamed: {
+    label: "Renamed",
+    className: "text-blue-600 dark:text-blue-400",
+    Icon: FileSymlinkIcon,
+  },
 };
 
 /** Diffstat (+adds −removes) shared by the sidebar row and the section header. */
@@ -178,8 +193,14 @@ function GithubFileSection({
   }, [seen]);
 
   const meta = STATUS_META[file.status];
+  const StatusIcon = meta.Icon;
   const { dir, name } = splitPath(file.path);
   const ToggleIcon = collapsed ? ChevronRightIcon : ChevronDownIcon;
+  // A rename carries its old path in the parsed patch; a pure rename (100%
+  // similarity) has no hunks, so show a note instead of an empty diff.
+  const renamedFrom =
+    fileDiff?.prevName && fileDiff.prevName !== file.path ? fileDiff.prevName : null;
+  const pureRename = fileDiff?.type === "rename-pure";
 
   return (
     <div ref={ref} data-github-file={file.path}>
@@ -187,26 +208,33 @@ function GithubFileSection({
         type="button"
         onClick={onToggleCollapsed}
         aria-expanded={!collapsed}
-        title={file.path}
+        title={renamedFrom ? `${renamedFrom} → ${file.path}` : file.path}
         className="group sticky top-0 z-10 flex w-full cursor-pointer items-center gap-2 border-b border-border bg-secondary px-3 py-1.5 text-left dark:bg-muted"
       >
         <ToggleIcon
           aria-hidden="true"
           className="size-3.5 shrink-0 text-muted-foreground transition-colors group-hover:text-foreground"
         />
-        <span
-          className={cn("w-3 shrink-0 text-center font-mono text-xs", meta.className)}
-          title={meta.label}
-        >
-          {meta.letter}
-        </span>
+        <StatusIcon aria-hidden className={cn("size-3.5 shrink-0", meta.className)} />
         <span className="min-w-0 flex-1 truncate text-ui">
-          {dir && <span className="text-muted-foreground">{dir}</span>}
-          <span className="font-medium">{name}</span>
+          {renamedFrom ? (
+            <>
+              <span className="text-muted-foreground">{renamedFrom}</span>
+              <span className="text-muted-foreground"> → </span>
+              <span className="font-medium">{file.path}</span>
+            </>
+          ) : (
+            <>
+              {dir && <span className="text-muted-foreground">{dir}</span>}
+              <span className="font-medium">{name}</span>
+            </>
+          )}
         </span>
         <DiffStat file={file} />
       </button>
-      {collapsed ? null : !seen ? (
+      {collapsed ? null : pureRename ? (
+        <div className="p-4 text-ui text-muted-foreground">File renamed without changes.</div>
+      ) : !seen ? (
         <div className="flex items-center justify-center gap-2 p-6 text-ui text-muted-foreground">
           <Loader2Icon className="size-4 animate-spin" />
           Loading diff…
@@ -374,6 +402,7 @@ function SidebarNode({
 }) {
   if (node.type === "file") {
     const meta = STATUS_META[node.file.status];
+    const StatusIcon = meta.Icon;
     return (
       <button
         type="button"
@@ -385,15 +414,10 @@ function SidebarNode({
           node.file.path === activePath && "bg-muted",
         )}
       >
-        {/* Empty chevron column so the status letter lines up under a sibling
+        {/* Empty chevron column so the status icon lines up under a sibling
             folder's icon. */}
         <span className="size-3.5 shrink-0" aria-hidden />
-        <span
-          className={cn("w-3.5 shrink-0 text-center font-mono text-xs", meta.className)}
-          title={meta.label}
-        >
-          {meta.letter}
-        </span>
+        <StatusIcon aria-hidden className={cn("size-3.5 shrink-0", meta.className)} />
         <span className="min-w-0 truncate [direction:rtl]">
           <bdi>{node.name}</bdi>
         </span>
