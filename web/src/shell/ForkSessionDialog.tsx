@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { sandboxOptionLabel } from "@/lib/capabilities";
 import { useNavigate } from "@/lib/routing";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -94,14 +95,18 @@ const SAME_AS_SOURCE = "__same__";
  */
 function HostLabel({ host }: { host: Host }) {
   const isOnline = host.status === "online";
+  // A server-managed sandbox host reads as its provider label (e.g.
+  // "Databricks Sandbox"), matching the chat header's host badge — its
+  // generated machine name (e.g. "managed-a1b2c3") means nothing to users.
+  const label = host.sandbox_provider ? sandboxOptionLabel(host.sandbox_provider) : host.name;
   return (
     <span className="flex items-center gap-2">
-      {host.name.toLowerCase().includes("cloud") ? (
+      {host.sandbox_provider || host.name.toLowerCase().includes("cloud") ? (
         <MonitorCloudIcon className="size-4 text-muted-foreground" />
       ) : (
         <MonitorIcon className="size-4 text-muted-foreground" />
       )}
-      <span className="font-mono text-sm">{host.name}</span>
+      <span className="font-mono text-sm">{label}</span>
       <span
         className={`inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${
           isOnline ? "text-green-600" : "text-muted-foreground"
@@ -705,8 +710,18 @@ export function ForkSessionForm({
   const { data: sourceAgent } = useSessionAgent(sourceSessionId);
 
   // Hosts for the picker — only for a coding source (a non-coding fork
-  // never shows the host field).
-  const { data: hosts } = useHosts({ enabled: isCodingSource });
+  // never shows the host field). Server-managed sandbox hosts are normally
+  // hidden from pickers (they're launch targets the server creates, not
+  // user machines), but the SOURCE's own sandbox host must stay offerable:
+  // for a managed-deployment user that sandbox is the only compute, so
+  // hiding it leaves the fork dialog with no launch target at all and the
+  // session can never be forked. Fetch unfiltered, then keep personal
+  // hosts plus the source's own sandbox host.
+  const { data: rawHosts } = useHosts({ enabled: isCodingSource, includeSandbox: true });
+  const hosts = useMemo(
+    () => rawHosts?.filter((h) => !h.sandbox_provider || h.host_id === sourceHostId),
+    [rawHosts, sourceHostId],
+  );
   const allHosts = hosts ?? [];
   const onlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "online"), [hosts]);
   const offlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "offline"), [hosts]);
