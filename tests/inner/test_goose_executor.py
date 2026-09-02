@@ -827,6 +827,34 @@ async def test_run_turn_streams_text_and_usage() -> None:
     assert completes[0].usage == {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}
 
 
+@pytest.mark.asyncio
+async def test_run_turn_times_out_at_prompt_deadline(monkeypatch) -> None:
+    """run_turn bounds an idle turn by the module's prompt-timeout constant."""
+    from omnigent.inner import goose_executor
+
+    monkeypatch.setattr(goose_executor, "_PROMPT_TIMEOUT_SECONDS", 0.05)
+
+    executor = GooseExecutor()
+    executor._initialized = True
+    executor._session_id = "20260623_1"
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+
+    async def fake_send(msg: dict) -> None:
+        # Idle from the start: never resolve the pending future, never enqueue.
+        return None
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    events = [e async for e in executor.run_turn([{"role": "user", "content": "hi"}], [], "")]
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert len(errors) == 1
+    assert errors[0].message == "Timeout waiting for goose response"
+    assert errors[0].retryable is True
+    assert not any(isinstance(e, TurnComplete) for e in events)
+
+
 def test_history_prefix_serializes_prior_turns() -> None:
     """_history_prefix renders prior turns as labeled role: content lines."""
     prior = [
