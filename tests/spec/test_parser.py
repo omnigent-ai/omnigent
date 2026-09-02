@@ -736,6 +736,76 @@ def test_parse_skill_colon_recovery_keeps_other_yaml_errors_loud(
         _parse_skill(skill_md)
 
 
+def test_parse_skill_colon_recovery_leaves_other_keys_alone(
+    tmp_path: Path,
+) -> None:
+    """
+    A colon in a non-description key still raises, keeping the skill hidden.
+
+    ``user-invocable: false: internal only`` is invalid YAML. Quoting it would
+    make the value the truthy string ``"false: internal only"``, so a skill its
+    author marked internal would appear in the user's ``/`` menu. Recovery is
+    scoped to ``description`` precisely so that cannot happen.
+    """
+    skill_dir = tmp_path / "internal-skill"
+    skill_dir.mkdir()
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(
+        "---\nname: internal-skill\ndescription: orchestrates\n"
+        "user-invocable: false: internal only\n---\nContent."
+    )
+
+    with pytest.raises(OmnigentError, match=r"invalid YAML frontmatter"):
+        _parse_skill(skill_md)
+
+
+def test_parse_skill_colon_recovery_does_not_absorb_indented_keys(
+    tmp_path: Path,
+) -> None:
+    """
+    A mis-indented setting is not folded into a recovered description.
+
+    Continuation lines fold into a plain scalar, but an indented
+    ``user-invocable: false`` is a mis-indented setting, not prose. Absorbing
+    it would drop the flag and publish an internal skill, so the run stops
+    there and the file is rejected instead.
+    """
+    skill_dir = tmp_path / "indented-key"
+    skill_dir.mkdir()
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(
+        "---\nname: indented-key\ndescription: orchestrates things: internally\n"
+        "  user-invocable: false\n---\nContent."
+    )
+
+    with pytest.raises(OmnigentError, match=r"invalid YAML frontmatter"):
+        _parse_skill(skill_md)
+
+
+def test_parse_skill_colon_recovery_folds_wrapped_prose(
+    tmp_path: Path,
+) -> None:
+    """
+    A wrapped description recovers, and later keys keep their own meaning.
+
+    The continuation line is prose, so it folds with a single space the way a
+    YAML plain scalar would; ``user-invocable`` is a sibling key rather than
+    part of the description and still parses as a boolean.
+    """
+    skill_dir = tmp_path / "wrapped"
+    skill_dir.mkdir()
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(
+        "---\nname: wrapped\ndescription: Use when foo: bar\n"
+        "  and also when baz qux\nuser-invocable: false\n---\nContent."
+    )
+
+    skill = _parse_skill(skill_md)
+
+    assert skill.description == "Use when foo: bar and also when baz qux"
+    assert skill.user_invocable is False
+
+
 def test_parse_skill_invalid_yaml_frontmatter_in_bundle_raises(
     agent_dir: Path,
 ) -> None:
