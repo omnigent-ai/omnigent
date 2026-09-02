@@ -174,6 +174,41 @@ function renderSandboxLanding(): { rerender: (ui: ReactNode) => void } {
   return { rerender };
 }
 
+/** Render with Smart Routing enabled server-side, so a routing-eligible
+ *  native agent can actually turn routing on (the plain renderLanding has no
+ *  CapabilitiesProvider, so its server info stays "loading" and routing is
+ *  never eligible). Returns rerender so a test can re-drive the same mount. */
+function renderRoutingLanding(): { rerender: (ui: ReactNode) => void; unmount: () => void } {
+  const info: ServerInfo = {
+    accounts_enabled: false,
+    single_user: false,
+    login_url: null,
+    needs_setup: false,
+    databricks_features: false,
+    managed_sandboxes_enabled: false,
+    sandbox_provider: null,
+    sharing_mode: "on",
+    public_sharing_enabled: true,
+    server_version: null,
+    smart_routing_enabled: true,
+    smart_routing_sources: { external: true, oss: false },
+    features: { harness_install: false },
+    harness_install_enabled: false,
+    installable_harnesses: [],
+    dictation_available: false,
+  };
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  function Wrapper({ children }: { children: ReactNode }) {
+    return (
+      <QueryClientProvider client={client}>
+        <CapabilitiesProvider info={info}>{children}</CapabilitiesProvider>
+      </QueryClientProvider>
+    );
+  }
+  const { rerender, unmount } = render(<NewChatLandingScreen />, { wrapper: Wrapper });
+  return { rerender, unmount };
+}
+
 /**
  * Open the picker and commit (select + close) an agent by clicking its row.
  * The composed agents these tests use live under the "Custom agents"
@@ -775,6 +810,45 @@ describe("NewChatLandingScreen project prefill", () => {
 
     const body = await submitAndReadBody();
     expect(body.model_override).toBe("sonnet");
+  });
+
+  it("lets the project default win over a landing draft that restored Smart Routing on", async () => {
+    // Cross-review edge (OMNI-5841 Polly note #1): a parked landing draft can
+    // restore costControlMode="on". On the remount, the project default must
+    // still win — the model-seed clears the restored routing before the
+    // routing-seed effect early-returns for the valid pin — so the create pins
+    // the model and does NOT also send routing (which would silently drop it).
+    setClaudeAgentAndModels();
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID });
+    const { unmount } = renderRoutingLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
+        "Claude Code",
+      ),
+    );
+
+    // Turn Smart Routing on via the config modal, then park the draft by
+    // unmounting (submittedRef stays false → landingDraft keeps routing "on").
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-config-model"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-model"));
+    fireEvent.click(screen.getByRole("option", { name: "Smart Routing" }));
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-save"));
+    unmount();
+
+    // Remount for the SAME project, now with a stored model default. The
+    // restored routing draft must not shadow the pin.
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, model: "opus" });
+    renderRoutingLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
+        "Claude Code",
+      ),
+    );
+
+    const body = await submitAndReadBody();
+    expect(body.model_override).toBe("opus");
+    expect(body.cost_control_mode_override).not.toBe("on");
   });
 
   it("still seeds the recent workspace when the worktree probe errors", async () => {
