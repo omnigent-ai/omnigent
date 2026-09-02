@@ -9922,6 +9922,13 @@ def host_stop(
     if server is None:
         server = _host_group_option(ctx, "server")
     records = _selected_daemon_records(server=server, all_targets=all_targets, default_all=False)
+    if not records and server is None and not all_targets:
+        # A bare stop resolved a target (config server, or "local") that has
+        # no daemon record — e.g. a wrapper started the host with --server
+        # but dispatches nested host commands without it. Stop what the user
+        # actually has running instead of silently no-opping, mirroring how
+        # a bare `host status` reports every registered daemon.
+        records = _list_daemon_records()
     if not records:
         click.echo("No matching host daemon found.")
         return

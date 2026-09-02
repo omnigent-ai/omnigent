@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -735,6 +736,122 @@ def test_host_stop_drops_stale_foreign_daemon_record(
         "stale foreign daemon record survived stop — a subsequent host start "
         "would be blocked by an 'already running' conflict"
     )
+
+
+def _write_server_target_daemon_record(
+    daemons_dir: Path,
+    *,
+    target: str,
+    pid: int,
+) -> Path:
+    """Persist a server-target daemon record the way a real enrollment does.
+
+    :param daemons_dir: The registry directory (``<data>/daemons``).
+    :param target: Normalized server target, e.g. ``"http://127.0.0.1:6767"``.
+    :param pid: Daemon process id to record.
+    :returns: Path of the written record (name matches
+        ``_daemon_record_path``'s sha256-derived scheme).
+    """
+    daemons_dir.mkdir(parents=True, exist_ok=True)
+    record_path = daemons_dir / (hashlib.sha256(target.encode()).hexdigest()[:16] + ".json")
+    record_path.write_text(
+        json.dumps(
+            {
+                "pid": pid,
+                "target": target,
+                "mode": "server",
+                "server_url": target,
+                "log_path": None,
+                "started_at": 1781200000,
+                "host_id": "host_stop_fallback_test",
+                "resolved_server_url": None,
+                "config_sig": None,
+            }
+        )
+    )
+    return record_path
+
+
+def test_bare_host_stop_falls_back_to_all_daemon_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A selector-less ``host stop`` stops the daemon the user has running.
+
+    A managed wrapper starts the host with ``--server <url>`` but dispatches
+    nested host commands without it, so ``host stop`` arrives with no
+    ``--server`` flag and no ``server:`` config key. That resolves the target
+    to ``"local"``, which matches no record for the server-target daemon —
+    the command used to print "No matching host daemon found." and exit 0
+    while the daemon kept running. With no selector at all, stop must fall
+    back to every registered daemon (mirroring ``host status``).
+    """
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    # An empty HOME-side config: no `server:` key may leak into resolution.
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+
+    target = "http://127.0.0.1:6767"
+    record_path = _write_server_target_daemon_record(tmp_path / "daemons", target=target, pid=4242)
+
+    signalled: list[tuple[int, int]] = []
+
+    def _recording_kill(pid: int, sig: int) -> None:
+        signalled.append((pid, sig))
+
+    # Alive until signalled, dead afterwards — models a daemon that obeys
+    # SIGTERM, so _terminate_daemon's grace-period poll returns promptly.
+    monkeypatch.setattr("omnigent.cli._pid_alive", lambda pid: not signalled)
+    monkeypatch.setattr("omnigent.cli.os.kill", _recording_kill)
+
+    result = CliRunner().invoke(cli, ["host", "stop", "--daemon-only"])
+
+    assert result.exit_code == 0, result.output
+    assert "No matching host daemon found." not in result.output, (
+        f"bare `host stop` no-opped instead of stopping the running daemon: {result.output}"
+    )
+    assert (4242, signal.SIGTERM) in signalled, (
+        f"the server-target daemon was never signalled; output: {result.output}"
+    )
+    assert not record_path.exists(), f"daemon registry record survived the stop: {result.output}"
+    assert target in result.output, f"stop output should name the stopped target: {result.output}"
+
+
+def test_host_stop_explicit_server_still_stops_only_that_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``--server`` selector must not widen to other daemons.
+
+    The bare-stop fallback applies only when the user named no target at
+    all: with ``--server <url>``, a non-matching selector still reports
+    "No matching host daemon found." rather than tearing down daemons the
+    user did not ask about.
+    """
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+
+    other_target = "http://127.0.0.1:6767"
+    record_path = _write_server_target_daemon_record(
+        tmp_path / "daemons", target=other_target, pid=4242
+    )
+
+    signalled: list[tuple[int, int]] = []
+    monkeypatch.setattr("omnigent.cli._pid_alive", lambda pid: True)
+    monkeypatch.setattr("omnigent.cli.os.kill", lambda pid, sig: signalled.append((pid, sig)))
+
+    result = CliRunner().invoke(
+        cli,
+        ["host", "stop", "--daemon-only", "--server", "http://127.0.0.1:9999"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "No matching host daemon found." in result.output, (
+        f"a non-matching explicit selector should no-op: {result.output}"
+    )
+    assert not signalled, (
+        f"an explicit --server selector must not signal other targets: {signalled}"
+    )
+    assert record_path.exists(), "the unrelated daemon's record must survive"
 
 
 def test_add_daemon_host_status_skips_http_for_dead_process() -> None:
