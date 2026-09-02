@@ -3479,7 +3479,7 @@ requires-dist = [
 
 [[package]]
 name = "omnigent-issue-prioritization"
-version = "0.2.0"
+version = "0.2.1"
 source = { editable = ".github/triage_v2" }
 dependencies = [
     { name = "databricks-sdk", version = "0.67.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-antigravity'" },
