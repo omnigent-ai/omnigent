@@ -18,14 +18,16 @@
 import { useEffect } from "react";
 
 import { schemaFields } from "@/components/blocks/ElicitationSchemaForm";
+import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
 import type { ElicitationBlock } from "@/lib/blocks";
 import { useChatStore } from "@/store/chatStore";
 
-export function useApproveHotkey(): void {
+export function useApproveHotkey(isMac = isMacPlatform()): void {
   useEffect(() => {
     const handler = (e: globalThis.KeyboardEvent): void => {
-      // Cmd/Ctrl, not Alt/Shift (mirrors the session-switch hotkey's guard).
-      if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
+      // Platform command modifier, not Alt/Shift (mirrors the session-switch guard):
+      // only ⌘↵ on macOS and only Ctrl+↵ on Win/Linux.
+      if (!hasCommandModifier(e, isMac) || e.altKey || e.shiftKey) return;
       if (e.key !== "Enter") return;
 
       const { blocks, submitApproval } = useChatStore.getState();
@@ -51,5 +53,5 @@ export function useApproveHotkey(): void {
 
     window.addEventListener("keydown", handler, true);
     return () => window.removeEventListener("keydown", handler, true);
-  }, []);
+  }, [isMac]);
 }
