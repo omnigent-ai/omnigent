@@ -15,6 +15,7 @@ then render deterministically, with no dependence on model output.
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 
@@ -119,7 +120,7 @@ def test_queued_row_controls_meet_mobile_tap_target(
         # packed so closely that a finger tap is ambiguous: with >=44px-wide
         # targets that do not overlap, adjacent centers sit >=~44px apart.
         cluster = [boxes[label] for label in _ACTION_LABELS[1:]]
-        for left, right in zip(cluster, cluster[1:]):
+        for left, right in itertools.pairwise(cluster):
             left_cx = left["x"] + left["width"] / 2
             right_cx = right["x"] + right["width"] / 2
             spacing = right_cx - left_cx
