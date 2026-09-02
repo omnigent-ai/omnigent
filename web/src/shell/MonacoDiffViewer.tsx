@@ -289,7 +289,12 @@ export function MonacoDiffViewer({
             lineNumbersMinChars: 3,
             folding: false,
             glyphMargin: false,
-            lineDecorationsWidth: 4,
+            // The gap between the line numbers and the code. This is a
+            // fixed-pixel lane that stays constant as the numbers grow (unlike
+            // per-element padding, which Monaco has no option for), so the diff
+            // keeps consistent breathing room whether the file has 2 lines or
+            // 2 million.
+            lineDecorationsWidth: 12,
           }
         : {}),
     };
