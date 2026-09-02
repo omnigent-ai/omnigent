@@ -21,7 +21,12 @@ from omnigent.runner import create_runner_app
 from omnigent.runner.background_titles import BackgroundTitleContext
 from omnigent.runner.background_titles import claude_native as claude_native_titles
 from omnigent.runner.background_titles import codex_native as codex_native_titles
-from omnigent.runner.background_titles.service import build_background_title_instructions
+from omnigent.runner.background_titles import sdk as sdk_titles
+from omnigent.runner.background_titles import service as title_service
+from omnigent.runner.background_titles.service import (
+    background_title_model,
+    build_background_title_instructions,
+)
 from tests.runner.helpers import NullServerClient
 
 
@@ -273,6 +278,7 @@ async def test_background_title_resolves_synthetic_claude_policy_gate(
     ]
     [(_url, body)] = harness_client.requests
     assert body["max_output_tokens"] == 32
+    assert body["model_override"] == "haiku"
 
 
 @pytest.mark.parametrize("evaluation_id", [None, ""])
@@ -329,8 +335,15 @@ async def test_background_title_rejects_policy_gate_without_evaluation_id(
         "error": "title_harness_failed",
         "detail": "Harness requested policy evaluation without an id.",
     }
-    [process_key] = process_manager.released
-    assert uuid.UUID(process_key).hex == process_key
+    # The economy-tier attempt fails the same policy check, then the
+    # session-model retry hits it again; both synthetic processes are released.
+    first_key, second_key = process_manager.released
+    assert first_key != second_key
+    for process_key in process_manager.released:
+        assert uuid.UUID(process_key).hex == process_key
+    [(_, first_body), (_, second_body)] = harness_client.requests
+    assert first_body["model_override"] == "haiku"
+    assert "model_override" not in second_body
 
 
 @pytest.mark.asyncio
@@ -452,6 +465,50 @@ async def test_claude_native_title_uses_tool_free_print_mode(
     assert "--no-session-persistence" in args
     assert captured["kwargs"]["cwd"] == str(tmp_path)
     assert "CLAUDECODE" not in captured["kwargs"]["env"]
+
+
+@pytest.mark.asyncio
+async def test_claude_native_title_prefers_title_model_over_session_sources(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"Debug authentication timeout\n", b""
+
+    async def create_subprocess_exec(command: str, *args: str, **kwargs: Any) -> FakeProcess:
+        captured.update(command=command, args=args)
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        "omnigent.claude_native.resolve_native_claude_config",
+        lambda spec=None: None,
+    )
+    monkeypatch.setattr(
+        "omnigent.claude_launcher.resolve_claude_launch",
+        lambda command, args: (command, args),
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
+
+    title = await claude_native_titles.generate_background_title(
+        BackgroundTitleContext(
+            prompt="please investigate the authentication timeout",
+            harness="claude-native",
+            spawn_env={"HARNESS_CLAUDE_SDK_MODEL": "claude-sonnet-5"},
+            process_manager=None,
+            cwd=tmp_path,
+            model_override="claude-sonnet-4-6",
+            title_model="haiku",
+        )
+    )
+
+    assert title == "Debug authentication timeout"
+    args = list(captured["args"])
+    assert args[args.index("--model") + 1] == "haiku"
 
 
 @pytest.mark.asyncio
@@ -661,6 +718,7 @@ async def test_codex_native_title_uses_ephemeral_tool_free_exec(
     assert "--skip-git-repo-check" in args
     assert args[args.index("--model") + 1] == "gpt-5.4-mini"
     assert "features.shell_tool=false" in args
+    assert "features.plugins=false" in args
     assert 'web_search="disabled"' in args
     assert all("sk-sentinel-do-not-use" not in arg for arg in args)
     assert "omnigent-codex-title-" in captured["kwargs"]["cwd"]
@@ -679,6 +737,61 @@ async def test_codex_native_title_uses_ephemeral_tool_free_exec(
     assert captured["codex_home_mode"] == 0o700
     assert captured["config_mode"] == 0o600
     assert captured["agents_exists"] is False
+
+
+@pytest.mark.asyncio
+async def test_codex_native_title_prefers_title_model_over_session_sources(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    launch_models: list[str | None] = []
+    exec_args: list[str] = []
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"", b""
+
+    def fake_launch(*, model: str | None, spec: Any = None) -> NativeCodexLaunch:
+        launch_models.append(model)
+        return NativeCodexLaunch([], model, None)
+
+    async def create_subprocess_exec(command: str, *args: str, **kwargs: Any) -> FakeProcess:
+        exec_args.extend(args)
+        return FakeProcess()
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.resolve_native_codex_launch",
+        fake_launch,
+    )
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server._find_codex_cli",
+        lambda: "codex",
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+        lambda: source_home,
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
+
+    title = await codex_native_titles.generate_background_title(
+        BackgroundTitleContext(
+            prompt="please investigate the authentication timeout",
+            harness="codex-native",
+            spawn_env={},
+            process_manager=None,
+            model_override="gpt-5.4-mini",
+            title_model="gpt-5.6-luna",
+        )
+    )
+
+    assert title is None  # the fake process never writes the output file
+    assert launch_models == ["gpt-5.6-luna"]
+    assert exec_args[exec_args.index("--model") + 1] == "gpt-5.6-luna"
 
 
 @pytest.mark.asyncio
@@ -801,6 +914,162 @@ async def test_background_title_dispatches_any_registered_harness(
     assert process_manager.released == []
 
 
+def _register_fake_title_generator(
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    generator: Any,
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.runner.background_titles.service.background_title_generators",
+        lambda: {harness: BackgroundTitleGeneratorSpec("example:generate")},
+    )
+    monkeypatch.setattr(
+        "omnigent.runner.background_titles.service.load_object",
+        lambda _path: generator,
+    )
+
+
+def _title_context(harness: str, **overrides: Any) -> BackgroundTitleContext:
+    kwargs: dict[str, Any] = {
+        "prompt": "please investigate the authentication timeout",
+        "harness": harness,
+        "spawn_env": {},
+        "process_manager": None,
+    }
+    kwargs.update(overrides)
+    return BackgroundTitleContext(**kwargs)
+
+
+def test_background_title_model_registers_economy_tier_per_harness() -> None:
+    assert background_title_model("claude-sdk") == "haiku"
+    assert background_title_model("claude-native") == "haiku"
+    assert background_title_model("codex") == "gpt-5.6-luna"
+    assert background_title_model("codex-native") == "gpt-5.6-luna"
+    assert background_title_model("pi") is None
+    assert background_title_model("community-example") is None
+
+
+@pytest.mark.asyncio
+async def test_background_title_dispatch_pins_economy_model_for_mapped_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contexts: list[BackgroundTitleContext] = []
+
+    async def generate_title(context: BackgroundTitleContext) -> str:
+        contexts.append(context)
+        return "Debug authentication timeout"
+
+    _register_fake_title_generator(monkeypatch, "codex", generate_title)
+
+    title = await title_service.generate_background_title(
+        _title_context("codex", model_override="gpt-5.4-mini")
+    )
+
+    assert title == "Debug authentication timeout"
+    [context] = contexts
+    assert context.title_model == "gpt-5.6-luna"
+    assert context.model_override == "gpt-5.4-mini"
+
+
+@pytest.mark.asyncio
+async def test_background_title_dispatch_retries_with_session_model_after_economy_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempted_models: list[str | None] = []
+
+    async def generate_title(context: BackgroundTitleContext) -> str:
+        attempted_models.append(context.title_model)
+        if context.title_model is not None:
+            raise RuntimeError("provider does not serve the economy model")
+        return "Debug authentication timeout"
+
+    _register_fake_title_generator(monkeypatch, "claude-sdk", generate_title)
+
+    title = await title_service.generate_background_title(_title_context("claude-sdk"))
+
+    assert title == "Debug authentication timeout"
+    assert attempted_models == ["haiku", None]
+
+
+@pytest.mark.asyncio
+async def test_background_title_dispatch_retries_after_empty_economy_title(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempted_models: list[str | None] = []
+
+    async def generate_title(context: BackgroundTitleContext) -> str | None:
+        attempted_models.append(context.title_model)
+        if context.title_model is not None:
+            return None
+        return "Debug authentication timeout"
+
+    _register_fake_title_generator(monkeypatch, "claude-native", generate_title)
+
+    title = await title_service.generate_background_title(_title_context("claude-native"))
+
+    assert title == "Debug authentication timeout"
+    assert attempted_models == ["haiku", None]
+
+
+@pytest.mark.asyncio
+async def test_background_title_dispatch_does_not_retry_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    async def generate_title(context: BackgroundTitleContext) -> str:
+        nonlocal attempts
+        attempts += 1
+        raise TimeoutError
+
+    _register_fake_title_generator(monkeypatch, "codex-native", generate_title)
+
+    with pytest.raises(TimeoutError):
+        await title_service.generate_background_title(_title_context("codex-native"))
+
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_background_title_dispatch_leaves_unmapped_harness_on_session_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contexts: list[BackgroundTitleContext] = []
+
+    async def generate_title(context: BackgroundTitleContext) -> str:
+        contexts.append(context)
+        return "Debug authentication timeout"
+
+    _register_fake_title_generator(monkeypatch, "pi", generate_title)
+
+    title = await title_service.generate_background_title(_title_context("pi"))
+
+    assert title == "Debug authentication timeout"
+    [context] = contexts
+    assert context.title_model is None
+
+
+@pytest.mark.asyncio
+async def test_sdk_title_event_carries_title_model_as_model_override() -> None:
+    harness_client = _FakeHarnessClient()
+    process_manager = _FakeProcessManager(harness_client)
+
+    title = await sdk_titles.generate_background_title(
+        BackgroundTitleContext(
+            prompt="please investigate the authentication timeout",
+            harness="codex",
+            spawn_env={},
+            process_manager=process_manager,  # type: ignore[arg-type]
+            title_model="gpt-5.6-luna",
+        )
+    )
+
+    assert title == "Debug authentication timeout"
+    [(_url, body)] = harness_client.requests
+    assert body["model_override"] == "gpt-5.6-luna"
+    assert body["model"] == "session-title"
+
+
 @pytest.mark.asyncio
 async def test_background_title_skips_unsupported_harness_without_spawning(
     monkeypatch: pytest.MonkeyPatch,
@@ -888,8 +1157,15 @@ async def test_background_title_surfaces_harness_failure_and_releases_process(
         "error": "title_harness_failed",
         "detail": "Codex authentication expired.",
     }
-    [process_key] = process_manager.released
-    assert uuid.UUID(process_key).hex == process_key
+    # The economy-tier attempt fails, then the session-model retry fails
+    # identically; both synthetic processes are released.
+    first_key, second_key = process_manager.released
+    assert first_key != second_key
+    for process_key in process_manager.released:
+        assert uuid.UUID(process_key).hex == process_key
+    [(_, first_body), (_, second_body)] = harness_client.requests
+    assert first_body["model_override"] == "gpt-5.6-luna"
+    assert "model_override" not in second_body
 
 
 @pytest.mark.asyncio

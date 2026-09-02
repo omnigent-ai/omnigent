@@ -344,12 +344,13 @@ leaked runner env), and the per-surface mechanics (`web` / `mobile` / `terminal`
 `cli` / `desktop`), plus the empty-recordings and caption rules. This section states only
 *which clip repro-agent produces*:
 
-- a **`reproduced`** facet → **before-fix footage** (`kind: "before"`): run the
-  authored test so it FAILS; the failing run's video is the proof the bug is live
-  (e.g. `recordings/1234/before-picker.webm`).
-- an **`already_fixed`** facet → **proof-it-works footage** (`kind: "fixed"`): run
-  the same authored test so it PASSES; the passing run's video shows the journey
-  behaving correctly on the running build (e.g. `recordings/1234/fixed-picker.webm`).
+- a **`reproduced`** facet → **before-fix footage** (`kind: "before"`): use the
+  authored test to drive and verify the failure, but film only the product surface
+  and the user-visible bug (e.g. `recordings/1234/before-picker.webm`). Never film
+  pytest, assertion output, logs, or the test source.
+- an **`already_fixed`** facet → **proof-it-works footage** (`kind: "fixed"`): use
+  the same test to drive and verify the passing journey, while the video shows only
+  the product behaving correctly (e.g. `recordings/1234/fixed-picker.webm`).
 
 `not_reproduced` and `needs_more_info` facets have nothing to film — skip them.
 Name the clip `<before|fixed>-<facet>.<ext>` when you move it to a stable path.
@@ -399,8 +400,10 @@ choice:
   "test_path": "tests/e2e_ui/model_catalog/test_1234.py",
   "recordings": [
     {"surface": "web", "kind": "before", "path": "recordings/1234/before-picker.webm", "format": "webm",
+     "capture_mode": "playwright_ui",
      "caption": "open the model picker → select the catalog → picker shows raw IDs instead of names"}
   ],
+  "recording_unavailable_reason": "",
   "session_id": "dc59e331-...",
   "journey": "open model picker → select catalog → picker shows raw IDs",
   "evidence": "snapshot ref / response / log excerpt, plus root-cause leads"
@@ -438,7 +441,7 @@ Field meanings:
   excerpt), plus any root-cause leads you noticed while reproducing (hypotheses
   only — you do not fix).
 - `recordings` — the Step 4 captures: a list of
-  `{"surface", "kind", "path", "format", "caption"}` objects. `kind` is
+  `{"surface", "kind", "path", "format", "capture_mode", "caption"}` objects. `kind` is
   `"before"` for a `reproduced` facet's failing run or `"fixed"` for an
   `already_fixed` facet's passing run (the fix step later re-records the same
   drivers post-fix as `"after"`); `path` workspace-relative. `caption` is a
@@ -448,10 +451,14 @@ Field meanings:
   the catalog → picker shows raw IDs"`. Phrase it for *this* clip's outcome: a
   `before` caption ends in the failure, a `fixed` caption ends in the correct
   behavior (the journey completing). This is per-recording (each clip drives its
-  own steps), distinct from the bug-level `journey` field. Include an entry for
-  the authored-but-unrendered VHS tape too (`"format": "tape"`) when rendering
-  was skipped. Empty list when nothing was recorded — then say what was missing
-  in `evidence`.
+  own steps), distinct from the bug-level `journey` field. `capture_mode` is one
+  of the surface-appropriate values in `dev/recording-lanes.md`. Keep an
+  authored-but-unrendered VHS tape in the artifact, but do not declare it as a
+  recording. Empty list when nothing valid was recorded.
+- `recording_unavailable_reason` — empty when every expected clip is present;
+  otherwise the concrete per-surface tooling or reachability blocker. For an
+  API-only bug, say that the evidence is textual. Never substitute a synthetic
+  fallback or test-runner video.
 
 Keep the prose before the block terse — the one exception is the full test
 source, which you paste in full. You produce the live-confirmed reproduction +

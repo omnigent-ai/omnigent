@@ -38,6 +38,16 @@ export const PROJECT_LABEL_KEY = "omni_project";
  */
 export const PINNED_LABEL_KEY = "omnigent.pinned";
 
+/**
+ * The reserved `conversation_labels` key holding the epoch-SECONDS time a
+ * session was archived. Written by the server on the archive transition and
+ * deleted on unarchive, so its absence is normal for sessions archived before
+ * this shipped (readers fall back to `updated_at`). Seconds, not the pin key's
+ * epoch-ms, to match that fallback's unit. Mirrors the server's
+ * `ARCHIVED_AT_LABEL_KEY`.
+ */
+export const ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at";
+
 /** Filter dimensions encoded by a `["conversations", ...]` query key. */
 export interface ConversationListFilters {
   searchQuery: string;
@@ -286,9 +296,8 @@ export function insertNewRowsIntoPages(
   candidates: Map<string, SessionListWireItem>,
   filters: ConversationListFilters,
   skip?: (id: string) => boolean,
-): { data: ConversationsInfiniteData | undefined; inserted: Set<string> } {
-  const inserted = new Set<string>();
-  if (!data || candidates.size === 0 || filters.searchQuery) return { data, inserted };
+): { data: ConversationsInfiniteData | undefined; inserted: Conversation[] } {
+  if (!data || candidates.size === 0 || filters.searchQuery) return { data, inserted: [] };
   const present = new Set<string>();
   for (const page of data.pages) for (const c of page.data) present.add(c.id);
   const rows: Conversation[] = [];
@@ -306,12 +315,11 @@ export function insertNewRowsIntoPages(
     };
     if (conv.parent_session_id != null || violatesKnownMembership(conv, filters)) continue;
     rows.push(conv);
-    inserted.add(id);
   }
-  if (rows.length === 0) return { data, inserted };
+  if (rows.length === 0) return { data, inserted: [] };
   const [first, ...rest] = data.pages;
   const nextFirst = { ...first, data: [...rows, ...first.data], first_id: rows[0].id };
-  return { data: { ...data, pages: [nextFirst, ...rest] }, inserted };
+  return { data: { ...data, pages: [nextFirst, ...rest] }, inserted: rows };
 }
 
 /**

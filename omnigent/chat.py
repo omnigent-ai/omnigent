@@ -1248,6 +1248,26 @@ def _finish_native_redirect_progress(
     )
 
 
+def _server_get(url: str, **kwargs: Any) -> httpx.Response:
+    """
+    ``httpx.get`` that never routes a loopback target through the env proxy.
+
+    Loopback traffic must not use a proxy, and httpx's env-derived proxy
+    setup can itself fail at client construction when the environment
+    carries an entry it cannot parse as ``host:port`` (e.g.
+    ``NO_PROXY=fe80::/10`` raises ``httpx.InvalidURL`` before any request
+    is sent), so skip it entirely for loopback URLs. Non-loopback targets
+    keep httpx's default proxy handling.
+
+    :param url: Absolute request URL, e.g. ``"http://127.0.0.1:6767/v1/info"``.
+    :param kwargs: Extra ``httpx.get`` keyword arguments.
+    :returns: The HTTP response.
+    """
+    if is_loopback_url(url):
+        kwargs["trust_env"] = False
+    return httpx.get(url, **kwargs)
+
+
 def _wrapper_label_for_conversation(
     *,
     base_url: str,
@@ -1268,12 +1288,12 @@ def _wrapper_label_for_conversation(
     :returns: Wrapper label value, or ``None``.
     """
     try:
-        resp = httpx.get(
+        resp = _server_get(
             f"{base_url}/v1/sessions/{conversation_id}",
             headers=_remote_headers(server_url=base_url, host_id=None),
             timeout=10.0,
         )
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, httpx.InvalidURL) as exc:
         logger.warning(
             "wrapper-label probe failed for %s on %s: %s",
             conversation_id,
@@ -1357,12 +1377,12 @@ def _attach_session_info(
     """
     empty = _AttachSessionInfo(runner_online=False, agent_name=None, harness=None)
     try:
-        resp = httpx.get(
+        resp = _server_get(
             f"{base_url}/v1/sessions/{conversation_id}",
             headers=_remote_headers(server_url=base_url, host_id=None),
             timeout=10.0,
         )
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, httpx.InvalidURL) as exc:
         logger.warning("session probe failed for %s on %s: %s", conversation_id, base_url, exc)
         return empty
     if resp.status_code != 200:
@@ -1418,16 +1438,17 @@ def _pick_agent(base_url: str, *, quiet: bool = False) -> str:
         sessions exist, or no agent name can be discovered.
     """
     try:
-        resp = httpx.get(
+        resp = _server_get(
             f"{base_url}/v1/sessions",
             headers=_remote_headers(server_url=base_url, host_id=None),
             params={"limit": 100},
             timeout=10.0,
         )
-    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError) as exc:
-        # No connection was ever established — a stale/unreachable server
-        # URL is an environment problem, not a crash. Same guard as the
-        # daemon path (_prepare_chat_session_via_daemon).
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError, httpx.InvalidURL) as exc:
+        # No connection was ever established — a stale/unreachable server URL
+        # or a proxy environment httpx cannot parse is an environment problem,
+        # not a crash. Same guard as the daemon path
+        # (_prepare_chat_session_via_daemon).
         raise click.ClickException(_unreachable_server_message(base_url)) from exc
     resp.raise_for_status()
     sessions = resp.json()["data"]
@@ -1528,10 +1549,11 @@ def _await_accounts_first_run_setup(
     if cli_auth.load_token(base_url) is not None:
         return
     try:
-        info = httpx.get(f"{base_url}/v1/info", timeout=5.0).json()
-    except (httpx.HTTPError, ValueError):
-        # /v1/info unreachable / unparseable: don't block — let the normal
-        # path run and surface any real error.
+        info = _server_get(f"{base_url}/v1/info", timeout=5.0).json()
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError):
+        # /v1/info unreachable / unparseable, or a proxy environment httpx
+        # cannot parse (InvalidURL is not an HTTPError): don't block — let
+        # the normal path run and surface any real error.
         return
     if not (isinstance(info, dict) and info.get("accounts_enabled") and info.get("needs_setup")):
         # Header / OIDC, or an admin already exists (token minted at boot):
@@ -1584,6 +1606,38 @@ def _unreachable_server_message(base_url: str) -> str:
         f"Could not connect to the Omnigent server at {display_server_url(base_url)}. "
         "Check the URL, your network connection, and any HTTP proxy settings."
     )
+
+
+def _unparseable_proxy_env_error(base_url: str, exc: httpx.InvalidURL) -> click.ClickException:
+    """
+    Build the CLI error for a proxy environment httpx cannot parse.
+
+    For non-loopback servers ``trust_env`` stays on, so any client build can
+    raise ``httpx.InvalidURL`` (not an ``HTTPError``) on a proxy value it
+    cannot split as ``host:port`` (e.g. ``NO_PROXY=fe80::/10``) — an
+    environment problem, not a crash.
+
+    :param base_url: Server base URL the request targeted.
+    :param exc: The construction-time parse failure.
+    :returns: The actionable error naming the URL and the parse failure.
+    """
+    return click.ClickException(
+        f"{_unreachable_server_message(base_url)} "
+        f"(the proxy environment could not be parsed: {exc})"
+    )
+
+
+@contextlib.contextmanager
+def _actionable_proxy_env(base_url: str) -> Generator[None, None, None]:
+    """
+    Degrade an unparseable proxy environment to a clean CLI error.
+
+    :param base_url: Server base URL for the error message.
+    """
+    try:
+        yield
+    except httpx.InvalidURL as exc:
+        raise _unparseable_proxy_env_error(base_url, exc) from exc
 
 
 async def _prepare_chat_session_via_daemon(
@@ -1709,6 +1763,11 @@ async def _prepare_chat_session_via_daemon(
         # --server URL, or a proxy refusing the tunnel. These three are
         # siblings under TransportError, so each has to be named.
         raise click.ClickException(_unreachable_server_message(base_url)) from exc
+    except httpx.InvalidURL as exc:
+        # Raised at client construction when the proxy environment carries a
+        # value httpx cannot parse as host:port; not an HTTPError, so it
+        # needs its own guard.
+        raise _unparseable_proxy_env_error(base_url, exc) from exc
     return _DaemonChatSession(session_id=session_id, runner_id=runner_id)
 
 
@@ -1970,7 +2029,7 @@ def _poll_remote_runner(
     start = time.monotonic()
     deadline = start + timeout
     status_url = f"{base_url}/v1/runners/{runner_id}/status"
-    last_error: httpx.HTTPError | None = None
+    last_error: Exception | None = None
     last_status: int | None = None
     while time.monotonic() < deadline:
         if runner_proc.poll() is not None:
@@ -1979,7 +2038,7 @@ def _poll_remote_runner(
                 f"{format_runner_log_tail(log_path)}"
             )
         try:
-            resp = httpx.get(status_url, headers=headers, timeout=2.0)
+            resp = _server_get(status_url, headers=headers, timeout=2.0)
             if resp.status_code == 200 and resp.json().get("online") is True:
                 return
             last_status = resp.status_code
@@ -1990,6 +2049,11 @@ def _poll_remote_runner(
                     "or check remote auth credentials."
                     f"{format_runner_log_tail(log_path)}"
                 )
+        except httpx.InvalidURL as exc:
+            # Construction-time proxy-env parse failure (not an HTTPError,
+            # e.g. NO_PROXY=fe80::/10): deterministic on every poll, so fail
+            # fast with the actionable error instead of burning the timeout.
+            raise _unparseable_proxy_env_error(base_url, exc) from exc
         except httpx.HTTPError as exc:
             last_error = exc
         elapsed = time.monotonic() - start
@@ -2266,7 +2330,8 @@ def _run_headless_prompt(
                 print(result_text)
 
     try:
-        asyncio.run(_main())
+        with _actionable_proxy_env(base_url):
+            asyncio.run(_main())
     except ClientOmnigentError as exc:
         # SETUP-phase failure: SessionsChat.send raises on a terminal
         # ``session.status: failed`` (no response.failed is emitted).
@@ -2804,7 +2869,8 @@ def _assert_resume_conversation_exists(
             await client.sessions.get(conversation_id)
 
     try:
-        asyncio.run(_lookup())
+        with _actionable_proxy_env(base_url):
+            asyncio.run(_lookup())
     except ClientOmnigentError as exc:
         if exc.status_code == 404:
             raise click.ClickException(f"Conversation {conversation_id!r} not found.") from exc
@@ -2856,7 +2922,8 @@ def _run_picker(
                 agent_name_filter=agent_name,
             )
 
-    return asyncio.run(_lookup())
+    with _actionable_proxy_env(base_url):
+        return asyncio.run(_lookup())
 
 
 def _resolve_latest_conversation_id(
@@ -2895,7 +2962,8 @@ def _resolve_latest_conversation_id(
                 agent_name=agent_name,
             )
 
-    return asyncio.run(_lookup())
+    with _actionable_proxy_env(base_url):
+        return asyncio.run(_lookup())
 
 
 async def _resolve_latest_conversation_id_async(
@@ -3689,12 +3757,12 @@ def _wait_for_server(port: int, server: LocalServer, timeout: float = 45.0) -> N
         if server.proc.poll() is not None:
             _raise_server_failed(server)
         try:
-            resp = httpx.get(f"{base_url}/health", timeout=2.0)
+            resp = _server_get(f"{base_url}/health", timeout=2.0)
             if resp.status_code == 200:
                 runner_id = server.runner_id
                 if runner_id is None:
                     return
-                runner_resp = httpx.get(
+                runner_resp = _server_get(
                     f"{base_url}/v1/runners/{runner_id}/status",
                     timeout=2.0,
                 )
@@ -4073,7 +4141,7 @@ def _run_repl(
                 ),
             )
 
-    with contextlib.suppress(KeyboardInterrupt):
+    with contextlib.suppress(KeyboardInterrupt), _actionable_proxy_env(base_url):
         asyncio.run(_main())
 
 
@@ -4142,7 +4210,8 @@ def _run_one_shot(
                 click.echo(text)
 
     try:
-        asyncio.run(_main())
+        with _actionable_proxy_env(base_url):
+            asyncio.run(_main())
     except ClientOmnigentError as exc:
         # A turn that fails before the LLM stream starts (SETUP-phase
         # failure: spec resolution, spawn-env build) ends with only a

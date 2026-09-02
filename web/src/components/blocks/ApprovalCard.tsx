@@ -52,7 +52,7 @@ import {
 import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/nativeCodingAgents";
 import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
-import type { RememberScope } from "@/lib/types";
+import type { CodexPersistMode, RememberScope } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
 import { AskUserQuestionForm, type AskUserQuestionAnswers } from "./AskUserQuestionForm";
 import { ExitPlanModeReview } from "./ExitPlanModeReview";
@@ -85,6 +85,7 @@ export type SubmitApprovalFn = (
   elicitationId: string,
   action: "accept" | "decline",
   content?: Record<string, unknown>,
+  meta?: Record<string, unknown>,
 ) => void;
 
 interface ApprovalCardProps {
@@ -104,6 +105,7 @@ interface ApprovalCardProps {
   response: {
     action: "accept" | "decline" | "cancel" | "auto_resolved";
     content?: Record<string, unknown>;
+    _meta?: Record<string, unknown>;
   } | null;
   /**
    * Structured AskUserQuestion payload — set when the server-side
@@ -151,6 +153,8 @@ interface ApprovalCardProps {
    * elicitation (edit tools take the ``allowAllEdits`` path instead).
    */
   rememberScope?: RememberScope | null;
+  /** Codex-native MCP persistence scopes advertised by the request. */
+  codexPersistModes?: CodexPersistMode[];
   /**
    * Verdict submitter override. Defaults to `chatStore.submitApproval`
    * (the in-chat path: optimistic block flip + resolve POST + rollback).
@@ -159,6 +163,8 @@ interface ApprovalCardProps {
    */
   onSubmit?: SubmitApprovalFn;
 }
+
+const EMPTY_CODEX_PERSIST_MODES: CodexPersistMode[] = [];
 
 export function ApprovalCard({
   elicitationId,
@@ -175,12 +181,18 @@ export function ApprovalCard({
   codexCommand,
   allowAllEdits,
   rememberScope,
+  codexPersistModes = EMPTY_CODEX_PERSIST_MODES,
   onSubmit,
 }: ApprovalCardProps) {
   const submit: SubmitApprovalFn =
     onSubmit ??
-    ((id, action, content) => {
-      void useChatStore.getState().submitApproval(id, action, content);
+    ((id, action, content, meta) => {
+      const store = useChatStore.getState();
+      if (meta === undefined) {
+        void store.submitApproval(id, action, content);
+      } else {
+        void store.submitApproval(id, action, content, meta);
+      }
     });
   const submitBinary = (action: "accept" | "decline") => {
     submit(elicitationId, action);
@@ -216,6 +228,9 @@ export function ApprovalCard({
     // signals intent, never the rule — then echoes an ``addRules``
     // permission update back to the PermissionRequest hook.
     submit(elicitationId, "accept", { remember: true });
+  };
+  const submitCodexPersist = (mode: CodexPersistMode) => {
+    submit(elicitationId, "accept", undefined, { persist: mode });
   };
   const submitPlanRejection = (feedback: string) => {
     // The typed feedback rides on `content.feedback`; the server
@@ -283,6 +298,7 @@ export function ApprovalCard({
     response.content.execpolicy_amendment.every((entry) => typeof entry === "string");
   const acceptedAllEdits = response?.content?.allow_all_edits === true;
   const acceptedRemember = response?.content?.remember === true;
+  const acceptedCodexPersist = response?.["_meta"]?.persist;
   // Persistent "don't ask again" affordance: label by the WebFetch
   // domain when present, else the tool name. Drives the third binary
   // button and the responded-state pill.
@@ -301,6 +317,28 @@ export function ApprovalCard({
         <CheckIcon className="mr-1 size-3.5" />
         Approve
       </Button>
+      {codexPersistModes.includes("session") && (
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => submitCodexPersist("session")}
+          componentId="approval.approve_session"
+        >
+          <CheckIcon className="mr-1 size-3.5" />
+          Approve for this session
+        </Button>
+      )}
+      {codexPersistModes.includes("always") && (
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => submitCodexPersist("always")}
+          componentId="approval.approve_always"
+        >
+          <CheckIcon className="mr-1 size-3.5" />
+          Always allow
+        </Button>
+      )}
       {allowAllEdits && (
         <Button
           size="sm"
@@ -423,6 +461,12 @@ export function ApprovalCard({
       label = rememberTarget
         ? `Approved · won't ask again for ${rememberTarget}`
         : "Approved · won't ask again";
+    } else if (acceptedCodexPersist === "session") {
+      icon = <CheckIcon className="size-4 text-success" />;
+      label = "Approved for this session";
+    } else if (acceptedCodexPersist === "always") {
+      icon = <CheckIcon className="size-4 text-success" />;
+      label = "Always allowed";
     } else if (accepted) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = isExitPlanMode ? "Plan approved" : "Approved";
@@ -628,6 +672,7 @@ export function ElicitationCard({
       codexCommand={item.codexCommand}
       allowAllEdits={item.allowAllEdits}
       rememberScope={item.rememberScope}
+      codexPersistModes={item.codexPersistModes}
       onSubmit={onSubmit}
     />
   );

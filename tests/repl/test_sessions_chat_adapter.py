@@ -131,6 +131,48 @@ def test_terminal_events_translate() -> None:
     assert isinstance(_server_event_to_sdk_event(cancelled), ResponseCancelled)
 
 
+def test_failed_event_source_is_forwarded() -> None:
+    """``FailedEvent.source`` must survive the REPL's schema→SDK translation.
+
+    The REPL processes events through ``_server_event_to_sdk_event`` which
+    converts Pydantic ``FailedEvent`` objects (not raw SSE dicts), so the
+    ``source`` field must be declared on the schema and forwarded explicitly.
+    Without this, every ``ResponseFailed`` would use the dataclass default
+    (``"execution"``), causing context-window overflows (source ``"llm"``) to
+    render as ``[execution]`` in the REPL.
+    """
+    failed_llm = FailedEvent(
+        type="response.failed",
+        source="llm",
+        response=_resp_obj("failed"),
+    )
+    failed_harness = FailedEvent(
+        type="response.failed",
+        source="harness",
+        response=_resp_obj("failed"),
+    )
+    failed_exec = FailedEvent(
+        type="response.failed",
+        source="execution",
+        response=_resp_obj("failed"),
+    )
+    failed_default = FailedEvent(type="response.failed", response=_resp_obj("failed"))
+
+    out_llm = _server_event_to_sdk_event(failed_llm)
+    out_harness = _server_event_to_sdk_event(failed_harness)
+    out_exec = _server_event_to_sdk_event(failed_exec)
+    out_default = _server_event_to_sdk_event(failed_default)
+
+    assert isinstance(out_llm, ResponseFailed)
+    assert out_llm.source == "llm"
+    assert isinstance(out_harness, ResponseFailed)
+    assert out_harness.source == "harness"
+    assert isinstance(out_exec, ResponseFailed)
+    assert out_exec.source == "execution"
+    assert isinstance(out_default, ResponseFailed)
+    assert out_default.source == "execution"
+
+
 def test_incomplete_event_preserves_reason() -> None:
     """``IncompleteEvent`` carries the ``incomplete_details.reason`` through.
 

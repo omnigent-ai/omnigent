@@ -198,6 +198,14 @@ _CLAUDE_MODEL_CONFIRM_POLL_S = 0.25
 _CLAUDE_MODEL_LATE_DIALOG_BUDGET_S = 1200.0
 _CLAUDE_MODEL_LATE_DIALOG_POLL_S = 2.0
 
+# After a stale-pane recreate the TUI reboots with ``--resume``. Poll until
+# the input box is usable before typing into it. Only a recreate waits: a live
+# pane is left to ``inject_slash_command``'s own composer reclaim. Same pacing
+# as the other pane polls above (one tmux capture each). Module-level so tests
+# can tighten the budget.
+_CLAUDE_PANE_READY_TIMEOUT_S = 30.0
+_CLAUDE_PANE_READY_POLL_S = 0.25
+
 
 def _warn_unresolved_sub_agent(session_id: str | None, sub_agent_name: str) -> None:
     """
@@ -1252,7 +1260,10 @@ def _is_context_overflow_error(event: _JsonObject) -> tuple[int, int] | None:
     return 128000, 128001
 
 
-def _response_failed_event(error: Mapping[str, object]) -> bytes:
+def _response_failed_event(
+    error: Mapping[str, object],
+    source: str = "execution",
+) -> bytes:
     """
     Encode one ``response.failed`` SSE frame.
 
@@ -1261,10 +1272,17 @@ def _response_failed_event(error: Mapping[str, object]) -> bytes:
 
     :param error: Error payload to place under ``response.error``,
         e.g. ``{"code": "connection_error", "message": "dropped"}``.
+    :param source: Where the fault originated -- ``"llm"`` for
+        inference/context errors, ``"harness"`` for Claude Code/harness
+        process failures, ``"execution"`` for runner configuration
+        or infrastructure failures.  Forwarded as-is to the AP server
+        so it can persist the right ``ErrorData.source``.
     :returns: UTF-8 encoded SSE frame bytes.
     """
     response = {"status": "failed", "error": error}
-    payload = json.dumps({"type": "response.failed", "response": response, "error": error})
+    payload = json.dumps(
+        {"type": "response.failed", "source": source, "response": response, "error": error}
+    )
     return f"event: response.failed\ndata: {payload}\n\n".encode()
 
 
@@ -2934,6 +2952,38 @@ def create_runner_app(
                 _session_workspace_cache[session_id] = snapshot.workspace
         return _session_workspace_cache.get(session_id)
 
+    async def _fetch_session_model_override(session_id: str) -> str | None:
+        """One-shot uncached read of the persisted ``/model`` override.
+
+        Legacy (no-envelope) init only — current servers ship the override in
+        the init envelope. Deliberately NOT cached in ``_SessionSnapshot``:
+        ``model_override`` is mutable (a ``/model`` switch changes it), so a
+        value stored in the long-lived identity cache would go stale and reseed
+        the old model on a later re-init, forcing a needless respawn. Each init
+        re-reads it fresh.
+        """
+        try:
+            resp = await server_client.get(f"/v1/sessions/{session_id}")
+            if resp.status_code == 200:
+                raw = resp.json().get("model_override")
+                if isinstance(raw, str) and raw:
+                    return raw
+            else:
+                _logger.warning(
+                    "legacy model_override fallback for %s: session GET returned "
+                    "HTTP %s; a model-pinned first turn may respawn",
+                    session_id,
+                    resp.status_code,
+                )
+        except Exception:  # noqa: BLE001 — best-effort, but surface it
+            _logger.warning(
+                "legacy model_override fallback for %s failed; a model-pinned "
+                "first turn may respawn",
+                session_id,
+                exc_info=True,
+            )
+        return None
+
     async def _session_runtime_cwd(session_id: str) -> Path | None:
         workspace = await _session_workspace_value(session_id)
         if workspace and workspace.strip():
@@ -3302,12 +3352,25 @@ def create_runner_app(
                 server_client=server_client,
                 routing_class=_routing_class,
             )
+            # Seed the initial spawn with the persisted /model override so a
+            # model-pinned session's first turn doesn't force a wasteful
+            # model-switch respawn. Current servers ship the override in the
+            # init envelope (read fresh each init); legacy (no-envelope) servers
+            # fall back to a one-shot uncached GET. Both sources are read fresh
+            # so a later /model switch can't reseed a stale model. Native
+            # harnesses no-op (_build_spawn_env_from_spec guards on env=None).
+            _model_override = (
+                init_context.envelope.snapshot.model_override
+                if init_context.envelope is not None
+                else await _fetch_session_model_override(session_id)
+            )
             spawn_env = _build_spawn_env_from_spec(
                 spec,
                 harness_name,
                 workdir=_resolved_spec_workdir(spec_entry),
                 cwd=await _session_runtime_cwd(session_id),
                 session_id=session_id,
+                model_override=_model_override,
             )
             if spawn_env is None:
                 spawn_env = await _resolve_native_spawn_env(
@@ -4890,6 +4953,7 @@ def create_runner_app(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
         try:
             settled = await asyncio.to_thread(
                 set_permission_mode,
@@ -4909,6 +4973,68 @@ def create_runner_app(
             )
         return JSONResponse(status_code=200, content={"permission_mode": settled})
 
+    async def _prepare_claude_native_pane_for_injection(
+        conv_id: str,
+        bridge_dir: Path,
+    ) -> None:
+        """Heal a dead-but-registered Claude pane before typing into it.
+
+        Registry membership is not liveness: a pane whose tmux server died
+        without ``close()`` stays registered advertising a socket that is
+        gone, so anything typed into it fails: tmux cannot connect, or the pane
+        never renders. ``_ensure_native_terminal_for_turn`` already probes and
+        recreates such an entry, so it is reused rather than growing a second
+        recovery path.
+
+        Only a recreate waits for :func:`claude_pane_ready`, because only a
+        recreate reboots the TUI (via ``--resume``) with no input box yet.
+        That is what the ``is_alive()`` probe distinguishes. On a LIVE pane the
+        one thing that reports "not ready" is a surface occupying the composer
+        (shell mode, the ctrl+r search, a hand-opened picker), which this poll
+        has no way to clear: ``inject_slash_command`` reclaims the composer
+        itself in ``_restore_occupied_input``. Waiting here would stall the
+        case inject already handles for the whole budget, then inject anyway.
+
+        No terminal registry means there is nothing to heal, and a recreate that
+        produced no pane is not waited on either (inject keeps its own short
+        advertisement timeout in both cases).
+        """
+        from omnigent.claude_native_bridge import claude_pane_ready
+
+        terminal_registry = resource_registry.terminal_registry if resource_registry else None
+        if terminal_registry is None:
+            return
+        terminal_name = native_terminal_name("claude-native")
+        if terminal_name is None:
+            return
+        # This probe duplicates the ensure path's own detection on purpose: its
+        # only job is to decide whether the readiness poll below runs at all.
+        instance = terminal_registry.get(conv_id, terminal_name, "main")
+        if instance is not None and await instance.is_alive():
+            return
+        await _ensure_native_terminal_for_turn(conv_id, "claude-native")
+        if terminal_registry.get(conv_id, terminal_name, "main") is None:
+            # The ensure swallows its own failures, so an unregistered pane here
+            # means nothing was created and nothing is booting. Waiting cannot
+            # help; let the injection fail fast as it did before.
+            return
+        deadline = time.monotonic() + _CLAUDE_PANE_READY_TIMEOUT_S
+        while True:
+            if await asyncio.to_thread(claude_pane_ready, bridge_dir):
+                return
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(_CLAUDE_PANE_READY_POLL_S)
+        # Let the injection report its own failure, as it did before this heal
+        # existed. Logged, else a pane that recreates but never boots is
+        # indistinguishable from a plain slow request.
+        _logger.warning(
+            "claude-native pane not ready %ss after re-create for session=%s; injecting anyway",
+            _CLAUDE_PANE_READY_TIMEOUT_S,
+            conv_id,
+            extra={"session_id": conv_id},
+        )
+
     async def _handle_claude_native_effort_change(
         conv_id: str,
         effort: str | None,
@@ -4927,6 +5053,7 @@ def create_runner_app(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
         command = f"/effort {effort}"
         try:
             # An effort switch invalidates the prompt cache on a session with
@@ -5022,6 +5149,7 @@ def create_runner_app(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
         selected_model = model.strip()
         claude_config = await _resolve_session_claude_launch_config(conv_id)
         resolved_model = (
@@ -5224,6 +5352,7 @@ def create_runner_app(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
         try:
             await asyncio.to_thread(
                 inject_slash_command,
@@ -7296,6 +7425,7 @@ def create_runner_app(
                         )
                         _fail_status = {
                             "type": "response.failed",
+                            "source": "harness",
                             "error": {
                                 "status": harness_resp.status_code,
                             },
@@ -7308,7 +7438,9 @@ def create_runner_app(
                             conv_id,
                             error={"status": harness_resp.status_code},
                         )
-                        yield _response_failed_event({"status": harness_resp.status_code})
+                        yield _response_failed_event(
+                            {"status": harness_resp.status_code}, source="harness"
+                        )
                         return
 
                     _omnigent_task_id = cast(str | None, body.get("task_id"))
@@ -7680,12 +7812,13 @@ def create_runner_app(
                 }
                 _overflow_fail = {
                     "type": "response.failed",
+                    "source": "llm",
                     "response": {"status": "failed", "error": _error},
                     "error": _error,
                 }
                 _publish_event(conv_id, _overflow_fail)
                 _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
-                yield _response_failed_event(_error)
+                yield _response_failed_event(_error, source="llm")
 
             except (httpx.HTTPError, RuntimeError) as exc:
                 _logger.exception(
@@ -7701,12 +7834,13 @@ def create_runner_app(
                 }
                 _http_fail = {
                     "type": "response.failed",
+                    "source": "harness",
                     "response": {"status": "failed", "error": _error},
                     "error": _error,
                 }
                 _publish_event(conv_id, _http_fail)
                 _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
-                yield _response_failed_event(_error)
+                yield _response_failed_event(_error, source="harness")
 
         return StreamingResponse(
             proxy_stream(),

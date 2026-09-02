@@ -9,7 +9,7 @@
 // Python class name lowercased (e.g. ResponseStartBlock → "response_start").
 
 import type { RoutingDecisionExtras } from "./routingDecision";
-import type { RememberScope, Response } from "./types";
+import type { CodexPersistMode, RememberScope, Response } from "./types";
 
 /**
  * Metadata attached to every stream block.
@@ -457,6 +457,7 @@ export interface ElicitationBlock {
   response: {
     action: "accept" | "decline" | "cancel" | "auto_resolved";
     content?: Record<string, unknown>;
+    _meta?: Record<string, unknown>;
   } | null;
   /**
    * Structured AskUserQuestion payload — present when the gated
@@ -502,6 +503,8 @@ export interface ElicitationBlock {
    * Absent/null for all other elicitations.
    */
   rememberScope?: RememberScope | null;
+  /** Codex-native MCP approval persistence modes advertised by the request. */
+  codexPersistModes?: CodexPersistMode[];
 }
 
 /** Union of all block types. */

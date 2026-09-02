@@ -473,13 +473,17 @@ export function ChatHeader({
             popover; self-hides when the agent has neither configured. */}
         {conversationId && <AgentInfoButton agent={boundAgent} sessionId={conversationId} />}
         {/* Chat/Terminal switcher for terminal-first sessions — self-gates to
-            null otherwise (and in the iOS shell, where it's the native bar). */}
+            null otherwise. Renders on every shell, iOS included. */}
         {conversationId && <ViewModeToggle />}
         {/* Fallback mobile kebab for sessions with no owner-managed menu:
             the action buttons above (Share · Agent info) plus the same
             workspace-rail entries, so a phone still needs only one trigger. */}
         {(hasHeaderMenu || workspaceItems) && (!actionConversation || !isMobile) && (
-          <DropdownMenu>
+          // Non-modal on mobile: modal mode's body-wide pointer-events:none
+          // makes the menu the sole touch target, so touch-target adjustment
+          // snaps outside taps onto it and the menu can't be dismissed (see
+          // HeaderConversationMenu).
+          <DropdownMenu modal={!isMobile}>
             <DropdownMenuTrigger asChild>
               <Button
                 type="button"

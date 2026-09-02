@@ -3,12 +3,13 @@
 Shared reference for **repro-agent** and **resolve-agent**. Both film the same
 kinds of journeys on the same surfaces; only *which* clip they produce differs:
 
-- **repro-agent** films the reproduction — a `reproduced` facet yields a
-  **`before`** clip (the test FAILS, showing the live bug); an `already_fixed`
-  facet yields a **`fixed`** clip (the test PASSES on the running build).
-- **resolve-agent** films the resolution — after the fix, the recovered test now
-  PASSES, and that passing run is the **`after`** clip (the human-visible half of
-  the fail→pass proof). On the review path it films the reviewed PR head.
+- **repro-agent** films the product journey — a `reproduced` facet yields a
+  **`before`** clip showing the live bug; an `already_fixed` facet yields a
+  **`fixed`** clip showing the correct user-visible outcome.
+- **resolve-agent** films the product journey after the fix as the **`after`**
+  clip (the human-visible half of the fail→pass proof). The recovered test
+  verifies the result separately. On the review path it films the reviewed PR
+  head.
 
 Everything else below — which surface to drive, how to stand the recorder up, and
 the per-surface mechanics — is identical for both. Each agent's own AGENTS.md says
@@ -20,7 +21,9 @@ A `web` / `mobile` / `terminal` / `cli` / `desktop` facet is expected to yield a
 drive it on that surface and film it. Only an `api` facet — a failure no user
 observes on any surface (a wrong value in a response, an internal state a pytest
 asserts) — legitimately has no recording; `recordings: []` is correct there and is
-not a gap.
+not a gap. Tests may drive and verify the journey, but the clip itself must show
+the product surface and user-visible outcome, never the test process, pytest
+output, assertions, logs, or a synthetic evidence-summary slide.
 
 **One verdict-appropriate clip per facet — nothing else.** Every recording must
 correspond to a facet, and its `kind` must match that facet's verdict. Do **not**
@@ -30,11 +33,20 @@ confuses the reader.
 
 Recording is **best-effort**: if the tooling below is missing, or a user-facing
 facet's state is genuinely unreachable in this harness, keep `recordings: []` for
-that facet and **name the specific blocker** in your evidence/handoff — an empty
-recordings list on a `web`/`mobile`/`terminal`/`cli`/`desktop` facet must always come with
-a concrete reason, never a silent skip. Never let recording block or distort the
-work itself, and never fabricate a hollow journey that doesn't reach the failure
-just to produce a video.
+that facet and **name the specific blocker** in `recording_unavailable_reason` —
+an empty recordings list on a `web`/`mobile`/`terminal`/`cli`/`desktop` facet must
+always come with a concrete reason, never a silent skip. Never let recording block
+or distort the work itself, and never fabricate a hollow journey that doesn't
+reach the failure just to produce a video. Missing or rejected footage never
+blocks the verdict, fix, or PR.
+
+Every declared recording includes `capture_mode`, which records how the product
+surface was filmed. Use `playwright_ui` for browser-page capture, `electron` for
+the desktop harness, `vhs_user_command` for a VHS tape that types the real user
+command, and `screen` for a direct device/screen capture. Do not declare a raw
+recorder output: copy the selected clip to a stable `<kind>-<facet>.<ext>` path
+first, then declare only that path. Undeclared media remains available in the CI
+artifact for debugging but is not attached to Linear or a PR.
 
 ## The recorder needs its own local server
 

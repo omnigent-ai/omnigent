@@ -394,6 +394,10 @@ async def _run_fire_for_task(
         # enforced even for a defaulted workspace, exactly as ``POST /v1/sessions``
         # does — an agent that pins an absolute cwd outside HOME records a failed
         # run instead of silently launching outside its declared boundary.
+        # Scheduled tasks have no project field, so there is nothing for the
+        # project-aware create resolver to do here. If tasks ever grow one,
+        # the create below must route through resolve_project_session_create
+        # so ownership/default-fill semantics match POST /v1/sessions.
         validate_workspace = preflight is not None and effective.workspace is not None
         validation_error = await _validate_fire_session_inputs(
             deps, effective, validate_workspace=validate_workspace

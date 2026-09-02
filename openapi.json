@@ -1717,7 +1717,8 @@
             "enum": [
               "llm",
               "execution",
-              "tool"
+              "tool",
+              "harness"
             ],
             "title": "Source",
             "type": "string"
@@ -1812,11 +1813,12 @@
             "title": "Sequence Number"
           },
           "source": {
-            "description": "Origin of the error \u2014 `\"llm\"` for LLM-call failures, `\"execution\"` for timeouts, `\"tool\"` for tool failures (currently emitted by retry exhaustion paths).",
+            "description": "Origin of the error -- `\"llm\"` for LLM-call failures, `\"execution\"` for timeouts, `\"tool\"` for tool failures, `\"harness\"` for harness process failures.",
             "enum": [
               "llm",
               "execution",
-              "tool"
+              "tool",
+              "harness"
             ],
             "title": "Source",
             "type": "string"
@@ -1876,6 +1878,18 @@
             ],
             "default": null,
             "title": "Sequence Number"
+          },
+          "source": {
+            "default": "execution",
+            "description": "Where the fault originated -- `\"llm\"` for inference/context errors, `\"harness\"` for Claude Code/harness process failures, `\"execution\"` for runner configuration or infrastructure failures.",
+            "enum": [
+              "llm",
+              "execution",
+              "tool",
+              "harness"
+            ],
+            "title": "Source",
+            "type": "string"
           },
           "type": {
             "const": "response.failed",
@@ -2251,7 +2265,7 @@
         "type": "object"
       },
       "ImportSessionRequest": {
-        "description": "Request body for importing one local harness session.",
+        "description": "Request body for importing one local harness session.\n\n`project_id` files the imported session into a first-class project the\ncaller owns, with the same ownership, default-fill, and mismatch-warning\nsemantics as `POST /v1/sessions`.",
         "properties": {
           "external_session_id": {
             "maxLength": 128,
@@ -2272,6 +2286,17 @@
             "minItems": 1,
             "title": "Items",
             "type": "array"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
           },
           "source": {
             "enum": [
@@ -4689,6 +4714,12 @@
             "title": "Branch Name",
             "type": "string"
           },
+          "existing_branch": {
+            "default": false,
+            "description": "When `True`, `branch_name` already exists and the host checks it out into a fresh worktree (the deleted-worktree recreate path) instead of creating a new branch. Create mode only; invalid with `existing_worktree` and with `base_branch` (an existing branch has no base to fork).",
+            "title": "Existing Branch",
+            "type": "boolean"
+          },
           "existing_worktree": {
             "default": false,
             "description": "When `True`, bind to the pre-existing worktree at `workspace` instead of creating one (see above).",
@@ -5296,7 +5327,7 @@
         "type": "object"
       },
       "SessionModelEvent": {
-        "description": "Active-model report from a terminal-backed integration.\n\nEmitted after an `external_model_change` POST from a native\nforwarder \u2014 the launch's own model report, or a switch made inside\nthe pane (a `/model` command or the in-TUI picker). Every surface\nre-renders its model display from this.",
+        "description": "Active-model report from a harness integration.\n\nEmitted after an `external_model_change` POST from a native\nforwarder or when an SDK relay reports its concrete model in terminal\nresponse usage. Every surface re-renders its model display from this.",
         "properties": {
           "conversation_id": {
             "description": "Session identifier, e.g. `\"conv_abc123\"`.",

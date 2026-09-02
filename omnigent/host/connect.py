@@ -140,6 +140,10 @@ from omnigent.runner.transports.ws_tunnel.limits import (
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
 )
+from omnigent.runtime.websocket_metrics import (
+    record_websocket_connected,
+    record_websocket_disconnected,
+)
 from omnigent.suspend_watch import watch_for_resume
 from omnigent.tls import client_ssl_context
 from omnigent.version import VERSION
@@ -593,6 +597,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # NAMES, not secrets, so allowlisting it leaks nothing on its own.
         # (Literal, not RUNNER_ENV_PASSTHROUGH_ENV_VAR, which is defined below.)
         "OMNIGENT_RUNNER_ENV_PASSTHROUGH",
+        # Keep host and spawned-runner routing decisions aligned when the
+        # host-slice-key kill switch is explicitly disabled.
+        "OMNIGENT_HOST_SLICE_KEY_ENABLED",
     }
     # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
     # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
@@ -1520,7 +1527,12 @@ class HostProcess:
         # first turn dies confusingly inside the executor. ``None`` (an
         # older server, or a session with no resolvable harness) skips the
         # check so version skew fails open.
-        if frame.harness is not None and not harness_is_configured(frame.harness):
+        #
+        # Off the loop: the check runs ``<cli> --version``, up to 10s on a hung
+        # CLI, which inline would stall the keepalive pong and every other frame.
+        if frame.harness is not None and not await asyncio.to_thread(
+            harness_is_configured, frame.harness
+        ):
             return HostLaunchRunnerResultFrame(
                 request_id=frame.request_id,
                 status="failed",
@@ -2848,6 +2860,7 @@ class HostProcess:
                     repo_path=frame.repo_path,
                     branch_name=frame.branch_name,
                     base_branch=frame.base_branch,
+                    existing_branch=frame.existing_branch,
                 )
         except WorktreeError as exc:
             return HostCreateWorktreeResultFrame(
@@ -3409,15 +3422,30 @@ class HostProcess:
             raise
         # An accepted upgrade proves the credentials work: login redirects
         # from here on are server restarts, not an unauthenticated host.
+        reconnect = self._ever_connected
         self._ever_connected = True
         self._login_redirect_streak = 0
         self._auth_retry_streak = 0
         self._refused_streak = 0
         self._conn_upgrade_accepted = True
-        await self._ensure_owner_user_id()
+        record_websocket_connected("host", reconnect=reconnect)
+        disconnect_error: BaseException | None = None
         try:
+            await self._ensure_owner_user_id()
             await self._serve_frames(ws)
+        except BaseException as exc:
+            disconnect_error = exc
+            raise
         finally:
+            record_websocket_disconnected(
+                "host",
+                disconnect_error,
+                local_shutdown=(
+                    isinstance(disconnect_error, asyncio.CancelledError | KeyboardInterrupt)
+                    or self._lifecycle_lost.is_set()
+                ),
+                resumed_from_suspend=self._woke_from_suspend,
+            )
             # Drop the watcher tasks' send target — exit reports raised
             # between connections park in _unreported_exits instead of
             # racing a half-closed socket.
@@ -3846,6 +3874,7 @@ def run_host_process(
     config_path: Path | None = None,
     *,
     daemon_target: str | None = None,
+    lifecycle_lock: DaemonLifecycleLock | None = None,
 ) -> None:
     """Entry point for ``omnigent host``.
 
@@ -3860,6 +3889,9 @@ def run_host_process(
         ``"local"`` or a server URL. When given, the daemon binds its lifetime
         to that record (flock + self-terminate on delete/reassign). ``None``
         (the historical default) runs without the lifecycle guard.
+    :param lifecycle_lock: A lock already acquired by an auto-launched daemon
+        before it claimed the registry record. When provided, it is retained
+        for the host process lifetime instead of acquiring another handle.
     :raises SystemExit: With :data:`HOST_FATAL_EXIT_CODE` when the tunnel
         fails permanently (auth / authorization / outdated server, or a
         loopback server that is gone). The actionable cause is printed
@@ -3908,9 +3940,8 @@ def run_host_process(
     if _cli_log is not None and _cli_log != host_log_path:
         print(f"CLI diagnostics: {display_log_path(_cli_log)}")
 
-    lifecycle_lock = (
-        DaemonLifecycleLock.for_target(daemon_target) if daemon_target is not None else None
-    )
+    if lifecycle_lock is None and daemon_target is not None:
+        lifecycle_lock = DaemonLifecycleLock.for_target(daemon_target)
     host = HostProcess(identity, server_url, lifecycle_lock=lifecycle_lock)
     try:
         asyncio.run(host.run())

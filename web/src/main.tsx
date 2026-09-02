@@ -13,6 +13,7 @@ import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
 import { createBootServerInfo, withBootTimeout } from "./lib/bootCapabilities";
 import { isLoginRedirectPending, resolveIdentity } from "./lib/identity";
+import { hideNativeChatTerminalBar } from "./lib/nativeChatTerminalBar";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
 import {
@@ -67,6 +68,12 @@ const bootIdentity = resolveIdentity();
 // Mirror the iOS shell's native bar footprints into the inset CSS variables.
 // No-op off the iOS shell (the inset vars stay at their env()-only defaults).
 initNativeInsets();
+
+// The Chat/Terminal switcher lives in the header (ViewModeToggle) on every
+// shell; assert the iOS shell's legacy bottom pill hidden before the router
+// mounts, so stale shell state (a page served before the pill's retirement)
+// can never float it — on any route, chat or auth. No-op off the iOS shell.
+hideNativeChatTerminalBar();
 
 // Apply the saved desktop UI font size and family before first paint so there's no flash.
 applyDesktopUiFontSize(readUiFontSizePx());
