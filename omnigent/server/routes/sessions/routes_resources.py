@@ -270,9 +270,10 @@ def register_resources_routes(
         :param conversation: Conversation loaded during authorization.
         :param runner_path: Runner-relative URL carrying ``download=true``.
         :returns: The attachment, streamed as the runner sends it, or the
-            runner's own error body for a directory or out-of-grant path.
-        :raises OmnigentError: ``not_found`` when the file is missing;
-            ``runner_unavailable`` when the runner predates downloads.
+            runner's own error body and status for a missing file, a
+            directory, or an out-of-grant path.
+        :raises OmnigentError: ``runner_unavailable`` when the runner
+            predates downloads.
         :raises HTTPException: 502 when no runner can be reached.
         """
         runner_client = await _get_runner_client_for_resource_access(
@@ -326,14 +327,8 @@ def register_resources_routes(
             payload = resp.json()
         except ValueError:
             payload = None
-        error = payload.get("error") if isinstance(payload, dict) else None
-        if not isinstance(error, dict):
+        if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
             raise HTTPException(status_code=502, detail="runner download failed")
-        if resp.status_code == 404:
-            raise OmnigentError(
-                str(error.get("message") or "File not found"),
-                code=ErrorCode.NOT_FOUND,
-            )
         return JSONResponse(status_code=resp.status_code, content=payload)
 
     async def _proxy_get_to_runner(

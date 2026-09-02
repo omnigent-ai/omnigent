@@ -3109,20 +3109,15 @@ async def test_filesystem_download_rejects_runner_without_download_support(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("runner_status", "runner_code", "expected_code"),
-    [
-        (404, "path_not_found", "not_found"),
-        (400, "invalid_path", "invalid_path"),
-        (403, "path_unreachable", "path_unreachable"),
-    ],
+    ("runner_status", "code"),
+    [(404, "path_not_found"), (400, "invalid_path"), (403, "path_unreachable")],
 )
 async def test_filesystem_download_forwards_runner_errors(
     client: httpx.AsyncClient,
     runner_status: int,
-    runner_code: str,
-    expected_code: str,
+    code: str,
 ) -> None:
-    """A missing, directory, or out-of-grant path keeps the runner's status."""
+    """A missing, directory, or out-of-grant path keeps the runner's status and code."""
     runner = FastAPI()
 
     @runner.get(_FS_ROUTE)
@@ -3130,14 +3125,14 @@ async def test_filesystem_download_forwards_runner_errors(
         del session_id, environment_id, relative_path
         return JSONResponse(
             status_code=runner_status,
-            content={"error": {"code": runner_code, "message": "nope"}},
+            content={"error": {"code": code, "message": "nope"}},
         )
 
     async with _runner_app_client(runner):
         resp = await client.get(_DOWNLOAD_URL)
 
     assert resp.status_code == runner_status
-    assert resp.json()["error"] == {"code": expected_code, "message": "nope"}
+    assert resp.json()["error"] == {"code": code, "message": "nope"}
 
 
 @pytest.mark.asyncio
