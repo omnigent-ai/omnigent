@@ -2379,6 +2379,57 @@ def _falsey_flag(raw: object) -> bool:
     return isinstance(raw, str) and raw.strip().lower() in _FALSEY_STRINGS
 
 
+# A top-level ``key: value`` frontmatter line with the value on the same line.
+_FRONTMATTER_SCALAR_RE = re.compile(r"\A(?P<key>[A-Za-z0-9_.-]+):[ \t]+(?P<value>\S.*)\Z")
+
+# Value openers that mean YAML structure (flow collection, block scalar, anchor,
+# alias, tag) or an already-quoted scalar. Quoting these would change what the
+# frontmatter says, so they are left for the strict parse to accept or reject.
+_YAML_VALUE_INDICATORS = ("'", '"', "[", "{", "|", ">", "&", "*", "!", "?", "%", "@", "`")
+
+
+def _quote_frontmatter_values_with_colons(frontmatter_str: str) -> str:
+    """
+    Quote plain frontmatter scalars whose value carries a ``": "``.
+
+    Skill authors write prose in ``description:`` and prose contains colons,
+    which YAML reads as a nested mapping and rejects. Claude Code accepts those
+    files, so rejecting them drops a skill the user has installed. Rewriting
+    only the offending line and re-parsing keeps every other malformed
+    frontmatter loud: a value opening a flow collection, block scalar, or quote
+    is left alone, as is one carrying a `` #`` comment, since quoting either
+    would change its meaning rather than recover it.
+
+    :param frontmatter_str: Raw frontmatter block, e.g.
+        ``"name: x\ndescription: does y: and z\n"``.
+    :returns: The block with colon-bearing plain scalars double-quoted.
+    """
+    lines = frontmatter_str.split("\n")
+    out: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        index += 1
+        match = _FRONTMATTER_SCALAR_RE.match(line)
+        value = match.group("value").rstrip() if match else ""
+        if (
+            match is None
+            or value.startswith(_YAML_VALUE_INDICATORS)
+            or " #" in value
+            or (": " not in value and not value.endswith(":"))
+        ):
+            out.append(line)
+            continue
+        # A plain scalar folds its indented continuation lines into one value
+        # with single spaces, so absorb them before quoting the whole thing.
+        while index < len(lines) and lines[index][:1] in (" ", "\t") and lines[index].strip():
+            value = f"{value} {lines[index].strip()}"
+            index += 1
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        out.append(f'{match.group("key")}: "{escaped}"')
+    return "\n".join(out)
+
+
 def _parse_skill(skill_md: Path) -> SkillSpec:
     """
     Parse a single ``SKILL.md`` file into a :class:`SkillSpec`.
@@ -2416,10 +2467,16 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
     try:
         frontmatter = yaml.safe_load(frontmatter_str)
     except yaml.YAMLError as exc:
-        raise OmnigentError(
-            f"SKILL.md has invalid YAML frontmatter: {skill_md}: {exc}",
-            code=ErrorCode.INVALID_INPUT,
-        ) from exc
+        # Retry with colon-bearing prose quoted before giving up, and report
+        # the ORIGINAL error if that still fails so the message names the real
+        # complaint rather than the rewrite's.
+        try:
+            frontmatter = yaml.safe_load(_quote_frontmatter_values_with_colons(frontmatter_str))
+        except yaml.YAMLError:
+            raise OmnigentError(
+                f"SKILL.md has invalid YAML frontmatter: {skill_md}: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
     if not isinstance(frontmatter, dict):
         raise OmnigentError(
             f"SKILL.md frontmatter must be a YAML mapping: {skill_md}",
