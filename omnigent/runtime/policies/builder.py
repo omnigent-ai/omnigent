@@ -1463,11 +1463,15 @@ def _load_session_policy_specs(
     Load enabled session policies from the store and convert
     them to :class:`FunctionPolicySpec` instances.
 
-    Results are cached per ``(workspace_id, conversation_id)`` and
-    invalidated on any mutation via :func:`invalidate_session_policy_specs_cache`.
-    There is no TTL — the cache entry is permanent until explicitly evicted,
-    so session policy changes (including ``sys_add_policy``) take effect
-    immediately on the next engine build.
+    Results are cached per ``(workspace_id, conversation_id)`` with a
+    30 s TTL (see :data:`_SESSION_POLICY_SPECS_CACHE`). Mutations call
+    :func:`invalidate_session_policy_specs_cache` for immediate local
+    eviction on the replica that handled the change; the TTL is the
+    safety net for replicas in a horizontally-scaled deployment that
+    never received the invalidation signal. Same-replica mutations
+    (including ``sys_add_policy``) still take effect on the next engine
+    build via the explicit invalidation; cross-replica propagation is
+    bounded to ≤ 30 s.
 
     Only ``type="python"`` policies are instantiable today. An
     enabled policy of an unsupported type (e.g. ``type="url"``)
