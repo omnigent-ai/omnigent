@@ -2049,10 +2049,12 @@ def _poll_remote_runner(
                     "or check remote auth credentials."
                     f"{format_runner_log_tail(log_path)}"
                 )
-        except (httpx.HTTPError, httpx.InvalidURL) as exc:
-            # InvalidURL is not an HTTPError: httpx raises it at client
-            # construction when the proxy environment carries an entry it
-            # cannot parse as host:port (e.g. NO_PROXY=fe80::/10).
+        except httpx.InvalidURL as exc:
+            # Construction-time proxy-env parse failure (not an HTTPError,
+            # e.g. NO_PROXY=fe80::/10): deterministic on every poll, so fail
+            # fast with the actionable error instead of burning the timeout.
+            raise _unparseable_proxy_env_error(base_url, exc) from exc
+        except httpx.HTTPError as exc:
             last_error = exc
         elapsed = time.monotonic() - start
         poll_interval = (

@@ -3404,9 +3404,14 @@ def test_prepare_chat_session_via_daemon_reports_unparseable_proxy_env(
             )
         )
 
-    message = str(excinfo.value)
-    assert "https://example.databricksapps.com" in message
-    assert "proxy environment could not be parsed" in message
+    # Exact match: proves the error names the target server and the parse
+    # failure (a substring URL probe here trips CodeQL's url-sanitization rule).
+    assert str(excinfo.value) == (
+        "Could not connect to the Omnigent server at "
+        "https://example.databricksapps.com. "
+        "Check the URL, your network connection, and any HTTP proxy settings. "
+        "(the proxy environment could not be parsed: Invalid port: ':')"
+    )
     # No runner is launched against a server we could not reach.
     assert "launch" not in captured
 
@@ -3436,20 +3441,21 @@ def test_pick_agent_reports_unparseable_proxy_env_as_click_error(
 def test_wait_for_remote_runner_surfaces_unparseable_proxy_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The remote runner-status poll degrades InvalidURL to a loud timeout.
+    """The remote runner-status poll fails fast on an unparseable proxy env.
 
     A remote base_url keeps ``trust_env`` on, so a proxy value httpx cannot
-    parse raises ``InvalidURL`` on every poll; it must surface as the
-    ClickException timeout detail, not escape to the crash handler.
+    parse raises ``InvalidURL`` at client construction on every poll. That
+    failure is deterministic, so the poll must raise the actionable
+    ClickException on the first attempt instead of burning the timeout
+    (or escaping to the crash handler).
     """
     proc = SimpleNamespace(poll=lambda: None, returncode=None)
-    monotonic_values = iter([0.0, 0.0, 0.05, 10.0])
+    sleeps: list[float] = []
 
     def _invalid_proxy_env(*_args: object, **_kwargs: object) -> object:
         raise httpx.InvalidURL("Invalid port: ':'")
 
-    monkeypatch.setattr("omnigent.chat.time.monotonic", lambda: next(monotonic_values))
-    monkeypatch.setattr("omnigent.chat.time.sleep", lambda _s: None)
+    monkeypatch.setattr("omnigent.chat.time.sleep", sleeps.append)
     monkeypatch.setattr("omnigent.chat.httpx.get", _invalid_proxy_env)
 
     with pytest.raises(click.ClickException) as excinfo:
@@ -3461,7 +3467,11 @@ def test_wait_for_remote_runner_surfaces_unparseable_proxy_env(
             timeout=5.0,
         )
 
-    assert "Invalid port" in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "proxy environment could not be parsed" in message
+    assert "Invalid port" in message
+    # Deterministic construction-time failure: no retry sleeps, no timeout burn.
+    assert sleeps == []
 
 
 def test_run_attach_errors_loud_when_host_offline(monkeypatch: pytest.MonkeyPatch) -> None:
