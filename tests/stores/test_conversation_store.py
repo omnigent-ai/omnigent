@@ -2088,6 +2088,52 @@ def test_update_title_bumps_updated_at(
     )
 
 
+@pytest.mark.parametrize(
+    "rebind",
+    ["replace_runner_id", "clear_runner_id", "clear_host_binding", "set_host_id"],
+)
+def test_runner_host_rebind_does_not_bump_updated_at(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
+    rebind: str,
+) -> None:
+    """
+    Runner/host binding is live state, so it must leave updated_at alone.
+
+    The sidebar lights its unread dot when ``updated_at`` exceeds the viewer's
+    last-seen baseline, so a rebind that stamped ``now`` would flag a
+    long-quiet conversation as unread with nothing new to read.
+    """
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    host_id = "292dfcdf8a31f1319b469f4fa179ac6b"
+    _register_host(db_uri, host_id)
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation(
+        workspace="/Users/corey/projects/myapp",
+    )
+    assert conv.updated_at == 1000
+
+    # Three days later, with no new conversation content at all.
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000 + 3 * 86_400)
+    if rebind == "replace_runner_id":
+        conversation_store.replace_runner_id(conv.id, "runner_abc123")
+    elif rebind == "clear_runner_id":
+        conversation_store.clear_runner_id(conv.id)
+    elif rebind == "clear_host_binding":
+        conversation_store.clear_host_binding(conv.id)
+    else:
+        conversation_store.set_host_id(conv.id, host_id)
+
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.updated_at == 1000, (
+        f"{rebind} bumped updated_at to {fetched.updated_at} with no new "
+        "content; that lights the sidebar unread dot on a quiet conversation."
+    )
+
+
 # ── sort_by=updated_at ────────────────────────────────
 
 
