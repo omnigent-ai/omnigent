@@ -579,6 +579,13 @@ class _ForwardDedupeState:
     # prevents the limiter from recovering.
     cost_retry_not_before: float = 0.0
     cost_retry_failures: int = 0
+    # Set when the transcript phase sees a ``/compact`` refusal
+    # (``is_compact_noop``). The spinner dismissal is DEFERRED until after the
+    # hook phase runs, because the ``PreCompact`` hook (which raises the
+    # spinner via ``in_progress``) can land in the SAME poll as the refusal
+    # and is forwarded after transcript items — dismissing first would clear
+    # nothing and then the hook would strand a fresh spinner.
+    pending_compaction_dismiss: bool = False
 
 
 @dataclass(frozen=True)
@@ -996,6 +1003,17 @@ async def forward_claude_transcript_to_session(
                             # (the user-message reset only fires on the next turn).
                             response_id=state.current_response_id,
                         )
+                        # Deferred ``/compact``-refusal dismissal: runs AFTER
+                        # the hook phase so the ``failed`` post always follows
+                        # the ``PreCompact`` ``in_progress`` that raised the
+                        # spinner, even when both land in this same poll.
+                        if dedupe.pending_compaction_dismiss:
+                            dedupe.pending_compaction_dismiss = False
+                            await _maybe_dismiss_stranded_compaction_spinner(
+                                client,
+                                session_id=current_session_id,
+                                bridge_dir=bridge_dir,
+                            )
                         subagent_state = await _forward_available_subagents(
                             client=client,
                             parent_session_id=current_session_id,
@@ -3423,15 +3441,14 @@ async def _forward_available_items(
             continue
         # ``/compact`` refusal ("Not enough messages to compact."). Claude
         # fired ``PreCompact`` (raising the spinner) but declined to compact,
-        # so no completion signal follows and the spinner is stranded. Dismiss
-        # it here; the item itself still forwards below as a normal
-        # ``slash_command`` bubble carrying the refusal text, so the web shows
-        # the same message Claude did. Best-effort — a failed dismissal POST
-        # is logged, not retried (there is nothing durable to persist).
+        # so no completion signal follows and the spinner is stranded. Defer
+        # the dismissal (see ``pending_compaction_dismiss``) — the raising
+        # ``PreCompact`` hook can land in the SAME poll and is forwarded AFTER
+        # this transcript phase, so dismissing now would clear nothing and
+        # leave a fresh spinner. The item itself still forwards below as a
+        # normal ``slash_command`` bubble carrying the refusal text.
         if item.is_compact_noop:
-            await _maybe_dismiss_stranded_compaction_spinner(
-                client, session_id=session_id, bridge_dir=bridge_dir
-            )
+            dedupe.pending_compaction_dismiss = True
         if skip_user_messages and item.item_type == "message" and item.data.get("role") == "user":
             seen_source_ids.append(item.source_id)
             seen.add(item.source_id)

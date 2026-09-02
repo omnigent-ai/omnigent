@@ -1701,6 +1701,105 @@ async def test_forwarder_posts_compaction_in_progress_on_precompact_hook(
 
 
 @pytest.mark.asyncio
+async def test_compact_refusal_in_progress_precedes_failed_same_poll(
+    tmp_path: Path,
+) -> None:
+    """
+    A same-poll ``/compact`` refusal posts ``in_progress`` BEFORE ``failed``.
+
+    Regression for the stranded spinner: the ``PreCompact`` hook (→
+    ``in_progress``, which raises the spinner) is forwarded AFTER transcript
+    items each poll, and Claude writes the refusal (transcript) and the
+    ``PreCompact`` (hook) close enough to land in one poll. If the dismissal
+    fired during the transcript phase it would clear nothing, then the hook
+    would raise a spinner that never clears. The dismissal is deferred to
+    after the hook phase, so the ordered posts are ``in_progress`` then
+    ``failed`` — a net-dismissed spinner.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    # The two records Claude writes for a declined /compact: the command echo
+    # and the standalone refusal stdout.
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "compact-cmd",
+                        "message": {
+                            "role": "user",
+                            "content": (
+                                "<command-name>/compact</command-name>\n<command-args></command-args>"
+                            ),
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "system",
+                        "subtype": "local_command",
+                        "uuid": "compact-stdout",
+                        "isMeta": False,
+                        "content": (
+                            "<local-command-stdout>Not enough messages to compact."
+                            "</local-command-stdout>"
+                        ),
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "PreCompact", "session_id": "claude-session"},
+    )
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        # Collect compaction-status posts until both edges are seen.
+        statuses: list[str] = []
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while "failed" not in statuses and asyncio.get_running_loop().time() < deadline:
+            request = await _get_recorded_request(server)
+            if request["body"].get("type") == "external_compaction_status":
+                statuses.append(request["body"]["data"]["status"])
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    # in_progress (spinner raised by the hook) must land before failed
+    # (the deferred dismissal), so the net effect is a dismissed spinner.
+    assert statuses == ["in_progress", "failed"], (
+        f"expected in_progress then failed, got {statuses!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_forwarder_posts_compaction_completed_on_compact_session_start(
     tmp_path: Path,
 ) -> None:
