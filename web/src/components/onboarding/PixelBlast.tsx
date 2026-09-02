@@ -196,12 +196,18 @@ export default function PixelBlast({
       return;
     }
 
+    // A lost context (StrictMode's double-invoke reuses the canvas) fails to
+    // compile with a null info log — teardown noise, not a real failure.
+    if (gl.isContextLost()) return;
+
     let program: WebGLProgram;
     try {
       program = createProgram(gl);
     } catch (error) {
-      console.error("PixelBlast WebGL2 initialization failed:", error);
-      canvas.dataset.webglUnavailable = "true";
+      if (!gl.isContextLost()) {
+        console.error("PixelBlast WebGL2 initialization failed:", error);
+        canvas.dataset.webglUnavailable = "true";
+      }
       return;
     }
 
@@ -312,8 +318,8 @@ export default function PixelBlast({
       resizeObserver.disconnect();
       gl.deleteBuffer(positionBuffer);
       gl.deleteVertexArray(vertexArray);
-      gl.deleteProgram(program);
-      gl.getExtension("WEBGL_lose_context")?.loseContext();
+      // No loseContext(): it's idempotent per canvas and would poison re-init on
+      // StrictMode's remount; GC reclaims a truly unmounted canvas's context.
     };
   }, [color, patternDensity, patternScale, pixelSize, speed]);
 
