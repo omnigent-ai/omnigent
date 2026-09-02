@@ -45,6 +45,7 @@ def approval_decision(
     trusted_successors: set[str],
     reviews: list[dict[str, Any]],
     commits: list[dict[str, Any]],
+    timeline: list[dict[str, Any]] | None = None,
 ) -> ApprovalDecision:
     """Accept current approval or trusted same-repository successor commits."""
     maintainers = {login.casefold() for login in maintainers}
@@ -60,10 +61,11 @@ def approval_decision(
     for login, review in latest_decisive_reviews(reviews).items():
         if login.casefold() not in maintainers:
             continue
-        if str(review.get("state") or "").upper() != "APPROVED":
+        review_state = str(review.get("state") or "").upper()
+        if review_state not in {"APPROVED", "DISMISSED"}:
             continue
         approved_sha = str(review.get("commit_id") or "")
-        if approved_sha == head_sha:
+        if review_state == "APPROVED" and approved_sha == head_sha:
             return ApprovalDecision(True, f"Current head approved by maintainer @{login}.")
         if not same_repository:
             failures.append(f"@{login}'s approval predates a fork-head update")
@@ -83,6 +85,16 @@ def approval_decision(
             if author_login not in trusted_successors or committer_login not in trusted_successors:
                 untrusted.append(str(commit.get("sha") or "")[:9])
         if not untrusted:
+            if review_state == "DISMISSED" and not trusted_automatic_dismissal(
+                review=review,
+                successor_shas={str(commit.get("sha") or "") for commit in successors},
+                trusted_successors=trusted_successors,
+                timeline=timeline or [],
+            ):
+                failures.append(
+                    f"@{login}'s approval was not auto-dismissed by trusted automation"
+                )
+                continue
             return ApprovalDecision(
                 True,
                 f"Maintainer @{login} approved {approved_sha[:9]}; only trusted "
@@ -94,6 +106,31 @@ def approval_decision(
 
     reason = "; ".join(failures) if failures else "awaiting approval from a maintainer"
     return ApprovalDecision(False, reason)
+
+
+def trusted_automatic_dismissal(
+    *,
+    review: dict[str, Any],
+    successor_shas: set[str],
+    trusted_successors: set[str],
+    timeline: list[dict[str, Any]],
+) -> bool:
+    review_id = str(review.get("id") or "")
+    for event in timeline:
+        dismissed = event.get("dismissed_review") or {}
+        actor = event.get("actor") or {}
+        if str(event.get("event") or "") != "review_dismissed":
+            continue
+        if str(dismissed.get("review_id") or "") != review_id:
+            continue
+        if str(dismissed.get("state") or "").upper() != "APPROVED":
+            continue
+        if str(actor.get("login") or "").casefold() not in trusted_successors:
+            continue
+        if str(dismissed.get("dismissal_commit_id") or "") not in successor_shas:
+            continue
+        return True
+    return False
 
 
 def gh_json(arguments: list[str]) -> Any:
@@ -136,6 +173,7 @@ def main() -> int:
     pull = gh_json(["api", f"repos/{args.repository}/pulls/{args.pr_number}"])
     reviews = paginated(f"repos/{args.repository}/pulls/{args.pr_number}/reviews")
     commits = paginated(f"repos/{args.repository}/pulls/{args.pr_number}/commits")
+    timeline = paginated(f"repos/{args.repository}/issues/{args.pr_number}/timeline")
     decision = approval_decision(
         repository=args.repository,
         author=str((pull.get("user") or {}).get("login") or ""),
@@ -145,6 +183,7 @@ def main() -> int:
         trusted_successors=set(args.trusted_successor),
         reviews=reviews,
         commits=commits,
+        timeline=timeline,
     )
     if decision.approved:
         print(decision.reason)
