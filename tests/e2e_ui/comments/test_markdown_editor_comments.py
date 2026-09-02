@@ -91,6 +91,36 @@ def seeded_markdown_session(
 # ---------------------------------------------------------------------------
 
 
+def test_markdown_search_escape_closes_search_before_file(
+    page: Page,
+    seeded_markdown_session: tuple[str, str, str],
+) -> None:
+    """Focused Escape routes through close-search before close-file."""
+    base_url, session_id, file_path = seeded_markdown_session
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+    file_button = page.get_by_role("button", name=re.compile(re.escape(file_path))).filter(
+        has_text=file_path
+    )
+    expect(file_button).to_be_visible(timeout=30_000)
+    file_button.click()
+
+    file_viewer = page.locator('[data-testid="file-viewer"]:visible')
+    close_file = page.get_by_role("button", name=f"Close {file_path}", exact=True).first
+    expect(close_file).to_be_visible()
+
+    page.keyboard.press("Control+f")
+    search = file_viewer.get_by_placeholder("Find…")
+    expect(search).to_be_visible()
+    search.fill("Editor")
+    search.press("Escape")
+    expect(search).to_be_hidden()
+    expect(close_file).to_be_visible()
+
+    page.keyboard.press("Escape")
+    expect(close_file).to_be_hidden()
+
+
 def test_markdown_rich_text_editor_add_comment(
     page: Page,
     seeded_markdown_session: tuple[str, str, str],

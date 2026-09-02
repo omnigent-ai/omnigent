@@ -29,10 +29,13 @@ import {
   SquareTerminalIcon,
   XIcon,
 } from "lucide-react";
+import { useFormattedActionKeybinding } from "@/hooks/useFormattedActionKeybinding";
 import { useMessageNavigationActions } from "@/hooks/useMessageNavigationActions";
 import {
   ActionScopeProvider,
   HANDLED,
+  and,
+  equals,
   NOT_HANDLED,
   useActionScopeRegistration,
   type ActionSource,
@@ -40,10 +43,7 @@ import {
 import { ComposerActionBindings } from "@/components/ComposerActionBindings";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import {
-  composerSendShortcutKeys,
-  KeyboardShortcutTooltipContent,
-} from "@/components/KeyboardShortcut";
+import { KeyboardShortcutTooltipContent } from "@/components/KeyboardShortcut";
 import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
 import { useNavigate, useParams } from "@/lib/routing";
 import {
@@ -4469,6 +4469,14 @@ export function Composer({
   const isMobile = useIsMobileViewport();
   const isCoarsePointer = useIsCoarsePointer();
   const preventsKeyboardSubmit = isMobile || isCoarsePointer;
+  const sendShortcut = useFormattedActionKeybinding("composer.action.send", {
+    mode: "composer",
+    context: and(
+      equals("composerSuggestionsOpen", false),
+      equals("composerEnterInserts", preventsKeyboardSubmit),
+      equals("composerSubmitWithModEnter", submitWithModEnter),
+    ),
+  });
   const isMobileRef = useRef(isMobile);
   isMobileRef.current = isMobile;
 
@@ -5602,7 +5610,7 @@ export function Composer({
                 {!showInterruptButton && !preventsKeyboardSubmit && (
                   <KeyboardShortcutTooltipContent
                     label="Send"
-                    keys={composerSendShortcutKeys(submitWithModEnter)}
+                    keys={sendShortcut ? [sendShortcut] : []}
                   />
                 )}
               </Tooltip>

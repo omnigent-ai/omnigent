@@ -21,7 +21,7 @@ interface MarkdownSearchBarProps {
   /** Shared mutable ref read by TipTapSearchExtension's plugin. */
   searchStateRef: RefObject<SearchDecorationState | null>;
   open: boolean;
-  /** Called when the bar closes (Escape / ✕) so the toolbar toggle stays in sync. */
+  /** Called when the close action or ✕ button closes the bar. */
   onClose: () => void;
   inputRef: RefObject<HTMLInputElement | null>;
 }
@@ -122,9 +122,6 @@ export function MarkdownSearchBar({
             e.preventDefault();
             if (e.shiftKey) goPrev();
             else goNext();
-          } else if (e.key === "Escape") {
-            e.preventDefault();
-            close();
           }
         }}
         placeholder="Find…"

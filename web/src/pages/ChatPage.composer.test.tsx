@@ -280,7 +280,7 @@ describe("Composer send shortcut", () => {
     const tooltip = await screen.findByRole("tooltip");
 
     expect(within(tooltip).getByText("Send")).toBeInTheDocument();
-    expect(tooltipKeys(tooltip)).toEqual(["Ctrl", "↵"]);
+    expect(tooltipKeys(tooltip)).toEqual(["Ctrl+↵"]);
   });
 
   it("keeps Enter native and hides its hint on a desktop-width coarse pointer", () => {

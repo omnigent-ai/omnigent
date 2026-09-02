@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   COMPOSER_SEND_SHORTCUT_STORAGE_KEY,
   DEFAULT_SUBMIT_WITH_MOD_ENTER,
-  isComposerSendKey,
   parseSubmitWithModEnter,
   readSubmitWithModEnter,
   writeSubmitWithModEnter,
@@ -40,30 +39,5 @@ describe("composerSendShortcutPreferences", () => {
 
     expect(() => writeSubmitWithModEnter(true)).not.toThrow();
     expect(readSubmitWithModEnter()).toBe(DEFAULT_SUBMIT_WITH_MOD_ENTER);
-  });
-});
-
-describe("isComposerSendKey", () => {
-  it("keeps Enter and the legacy modifier chord in default mode", () => {
-    expect(isComposerSendKey({ key: "Enter" }, false, false)).toBe(true);
-    expect(isComposerSendKey({ key: "Enter", shiftKey: true }, false, false)).toBe(false);
-    expect(isComposerSendKey({ key: "Enter", metaKey: true }, false, false)).toBe(true);
-    expect(isComposerSendKey({ key: "Enter", ctrlKey: true }, false, false)).toBe(true);
-  });
-
-  it("uses Command/Ctrl+Enter only for the alternate shortcut", () => {
-    expect(isComposerSendKey({ key: "Enter" }, true, false)).toBe(false);
-    expect(isComposerSendKey({ key: "Enter", metaKey: true }, true, false)).toBe(true);
-    expect(isComposerSendKey({ key: "Enter", ctrlKey: true }, true, false)).toBe(true);
-  });
-
-  it("never submits from composition, modified chords, or mobile Enter", () => {
-    expect(isComposerSendKey({ key: "Enter", metaKey: true, isComposing: true }, true, false)).toBe(
-      false,
-    );
-    expect(isComposerSendKey({ key: "Enter", metaKey: true, shiftKey: true }, true, false)).toBe(
-      false,
-    );
-    expect(isComposerSendKey({ key: "Enter", metaKey: true }, true, true)).toBe(false);
   });
 });

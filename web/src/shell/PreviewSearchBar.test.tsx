@@ -143,14 +143,11 @@ describe("PreviewSearchBar", () => {
     expect(screen.getByText("1 / 2")).toBeDefined();
   });
 
-  it("calls onClose and clears highlights on Escape", async () => {
+  it("leaves Escape to the centralized file search action", async () => {
     const { onClose } = renderBar();
     const input = await act(async () => type("the"));
-    expect(painted.size).toBeGreaterThan(0);
-    await act(async () => {
-      fireEvent.keyDown(input, { key: "Escape" });
-    });
-    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(fireEvent.keyDown(input, { key: "Escape" })).toBe(true);
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   it("calls onClose when the ✕ button is clicked", async () => {

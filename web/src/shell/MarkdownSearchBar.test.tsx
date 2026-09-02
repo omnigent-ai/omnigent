@@ -10,6 +10,13 @@ import { Editor } from "@tiptap/core";
 import { Markdown } from "@tiptap/markdown";
 import { StarterKit } from "@tiptap/starter-kit";
 import { createRef } from "react";
+import {
+  ActionScope,
+  ActionsProvider,
+  HANDLED,
+  KeybindingDispatcher,
+  useRegisterAction,
+} from "@/actions";
 import type { RefObject } from "react";
 import { MarkdownSearchBar } from "./MarkdownSearchBar";
 import {
@@ -53,6 +60,38 @@ function renderBar(props: { open?: boolean; onClose?: () => void } = {}) {
     />,
   );
   return { ...utils, onClose };
+}
+
+function CloseSearchHandler({ onClose }: { onClose: () => void }) {
+  useRegisterAction("file.action.closeSearch", {
+    acceptsKeybindings: true,
+    run: () => {
+      onClose();
+      return HANDLED;
+    },
+  });
+  return null;
+}
+
+function renderCentralizedBar(onClose: () => void) {
+  const inputRef = createRef<HTMLInputElement>();
+  return render(
+    <ActionsProvider>
+      <KeybindingDispatcher />
+      <ActionScope mode="fileViewer" context={{ fileSearchOpen: true }}>
+        <div>
+          <CloseSearchHandler onClose={onClose} />
+          <MarkdownSearchBar
+            editor={editor}
+            searchStateRef={searchStateRef}
+            open
+            onClose={onClose}
+            inputRef={inputRef}
+          />
+        </div>
+      </ActionScope>
+    </ActionsProvider>,
+  );
 }
 
 function type(value: string) {
@@ -139,14 +178,13 @@ describe("MarkdownSearchBar", () => {
     expect(screen.getByText("1 / 2")).toBeDefined();
   });
 
-  it("calls onClose on Escape and clears highlights", async () => {
-    const { onClose } = renderBar();
+  it("routes focused Escape through the centralized file search action", async () => {
+    const onClose = vi.fn();
+    renderCentralizedBar(onClose);
     const input = await act(async () => type("the"));
-    expect(editor!.view.dom.querySelectorAll(".md-search-match")).toHaveLength(2);
-    await act(async () => {
-      fireEvent.keyDown(input, { key: "Escape" });
-    });
-    expect(onClose).toHaveBeenCalledTimes(1);
+    input.focus();
+    expect(fireEvent.keyDown(input, { key: "Escape" })).toBe(false);
+    expect(onClose).toHaveBeenCalledOnce();
   });
 
   it("calls onClose when the ✕ button is clicked", async () => {

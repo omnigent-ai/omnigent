@@ -7,17 +7,6 @@ const IS_MAC =
   /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent || "");
 
 export const MOD_KEY = IS_MAC ? "⌘" : "Ctrl";
-export const ALT_KEY = IS_MAC ? "⌥" : "Alt";
-export const ENTER_KEY = "↵";
-export const SHIFT_KEY = "⇧";
-
-export function composerSendShortcutKeys(submitWithModEnter: boolean): string[] {
-  return submitWithModEnter ? [MOD_KEY, ENTER_KEY] : [ENTER_KEY];
-}
-
-export function composerNewLineShortcutKeys(submitWithModEnter: boolean): string[] {
-  return submitWithModEnter ? [ENTER_KEY] : [SHIFT_KEY, ENTER_KEY];
-}
 
 export function Kbd({
   children,

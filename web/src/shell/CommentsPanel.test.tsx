@@ -218,6 +218,43 @@ describe("CommentsPanel read-only collaborator gating", () => {
   });
 });
 
+describe("CommentsPanel keyboard ownership", () => {
+  it("does not submit a new comment during IME composition", () => {
+    const onAddComment = vi.fn();
+    renderGated({
+      canEdit: true,
+      activeSelection: FRESH_SELECTION,
+      handlers: { onAddComment },
+    });
+    const textarea = screen.getByPlaceholderText("Add a comment…");
+    fireEvent.change(textarea, { target: { value: "draft" } });
+    fireEvent.keyDown(textarea, { key: "Enter", isComposing: true });
+    expect(onAddComment).not.toHaveBeenCalled();
+  });
+
+  it("claims Escape while cancelling an inline edit", () => {
+    renderGated({ canEdit: true, comments: [makeComment("c1")] });
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    const textarea = screen.getByDisplayValue("Comment c1");
+    expect(fireEvent.keyDown(textarea, { key: "Escape" })).toBe(false);
+    expect(screen.getByRole("button", { name: "Edit" })).toBeInTheDocument();
+  });
+
+  it("claims Mod+Enter while saving an inline edit", () => {
+    const onEditComment = vi.fn();
+    renderGated({
+      canEdit: true,
+      comments: [makeComment("c1")],
+      handlers: { onEditComment },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    const textarea = screen.getByDisplayValue("Comment c1");
+    fireEvent.change(textarea, { target: { value: "Updated" } });
+    expect(fireEvent.keyDown(textarea, { key: "Enter", ctrlKey: true })).toBe(false);
+    expect(onEditComment).toHaveBeenCalledWith("c1", "Updated");
+  });
+});
+
 // ── Author-only edit/delete gating (created_by vs current user) ─────────────
 //
 // Even with edit access (canEdit=true), a collaborator may only edit/delete

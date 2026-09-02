@@ -8,8 +8,9 @@ import {
   unbindDefaultKeybinding,
 } from "@/actions";
 import { resetKeybindingStoreForTesting } from "@/actions/KeybindingStore";
+import { writeSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { EmbeddedProvider } from "@/lib/embedded";
-import { KeyboardShortcutsDialog, openKeyboardShortcuts } from "./KeyboardShortcutsDialog";
+import { KeyboardShortcutsDialog } from "./KeyboardShortcutsDialog";
 // The pinned-session row shows in both shells; only its chord differs (Alt in
 // the browser). Default the mock to browser (false); flip per-test for native.
 const isNativeShell = vi.fn(() => false);
@@ -69,6 +70,15 @@ describe("KeyboardShortcutsDialog", () => {
     expect(screen.getByText("Select previous suggestion")).toBeTruthy();
   });
 
+  it("shows the active composer send preference", () => {
+    writeSubmitWithModEnter(true);
+    renderDialog();
+    toggleViaHotkey();
+    const row = screen.getByText("Send message").closest("li")!;
+    expect(within(row).getByText("Ctrl+↵")).toBeInTheDocument();
+    expect(within(row).queryByText("↵")).toBeNull();
+  });
+
   it("toggles closed on a second hotkey press", async () => {
     renderDialog();
     toggleViaHotkey();
@@ -76,13 +86,6 @@ describe("KeyboardShortcutsDialog", () => {
 
     toggleViaHotkey();
     await waitFor(() => expect(screen.queryByText("Send message")).toBeNull());
-  });
-
-  it("opens when openKeyboardShortcuts() is dispatched (menu entry path)", async () => {
-    renderDialog();
-    openKeyboardShortcuts();
-    // The event dispatch isn't wrapped in act(), so wait for the re-render.
-    expect(await screen.findByText("Send message")).toBeTruthy();
   });
 
   it("shows the active pinned-session chord for the current shell", () => {
