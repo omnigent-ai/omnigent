@@ -978,6 +978,62 @@ describe("ForkSessionDialog", () => {
       expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
     });
 
+    it("leaves the host unpicked with a reconnect hint when the source host is offline", () => {
+      // The caller's own source host is offline while another of their hosts
+      // is online. A cross-host clone isn't supported (it would be created
+      // broken — runner never starts), so the dialog must NOT silently
+      // default to the other machine: it leaves the host unpicked, explains
+      // why, and keeps submit greyed.
+      setHosts([
+        host({ host_id: "host_1", name: "arca", status: "offline" }),
+        host({ host_id: "host_2", name: "other-laptop", status: "online" }),
+      ]);
+      renderDialog(CODING);
+
+      const hint = screen.getByTestId("fork-session-source-host-offline-hint");
+      expect(hint).toHaveTextContent("arca");
+      expect(hint).toHaveTextContent(/isn't supported/);
+      // No silent cross-host default: nothing selected, submit disabled.
+      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Select a host");
+      expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
+    });
+
+    it("warns about the unsupported cross-host clone when a different host is picked", () => {
+      // Explicitly picking a different machine is still allowed (the user
+      // may want the history there regardless), but the dialog must say the
+      // clone may fail to start — not just the soft file-references note.
+      setHosts([
+        host({ host_id: "host_1", name: "arca", status: "offline" }),
+        host({ host_id: "host_2", name: "other-laptop", status: "online" }),
+      ]);
+      renderDialog(CODING);
+
+      const trigger = screen.getByTestId("fork-session-host-select");
+      fireEvent.pointerDown(trigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+      fireEvent.click(trigger);
+      fireEvent.click(screen.getByTestId("fork-session-host-option-host_2"));
+
+      const warning = screen.getByTestId("fork-session-cross-host-warning");
+      expect(warning).toHaveTextContent(/isn't supported/);
+      // The explicit pick replaces the reconnect hint.
+      expect(screen.queryByTestId("fork-session-source-host-offline-hint")).toBeNull();
+    });
+
+    it("still defaults to the caller's own host when the source host isn't theirs", () => {
+      // Forking a shared session that ran on someone else's machine: the
+      // caller can't reconnect that host, so their own online host stays the
+      // default — but the cross-host warning still explains the limitation.
+      renderDialog({
+        sourceTitle: "My session",
+        sourceWorkspace: "/owners/repo",
+        sourceHostId: "host_other",
+      });
+
+      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("serena-laptop");
+      expect(screen.getByTestId("fork-session-cross-host-warning")).toBeInTheDocument();
+      expect(screen.queryByTestId("fork-session-source-host-offline-hint")).toBeNull();
+    });
+
     it("clears the worktree branch when the host changes (no stale source branch)", () => {
       // Two online hosts; source ran on host_1 with branch "main" (prefills
       // the base ref). Switching to host_2 must reset the worktree fields so a
