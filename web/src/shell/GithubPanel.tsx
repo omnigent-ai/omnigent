@@ -28,7 +28,7 @@ import { FileDiff } from "@pierre/diffs/react";
 import { parsePatchFiles, type FileDiffMetadata } from "@pierre/diffs";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { useQueryClient } from "@tanstack/react-query";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
@@ -163,12 +163,13 @@ function GithubFileSection({
   );
 }
 
-// How many job names to list in a pill's popover before collapsing the rest.
+// How many job names to list in a pill's hover card before collapsing the rest.
 const CHECK_NAMES_SHOWN = 25;
 
 /**
- * A CI-status pill (e.g. "✓ 66 passed") that opens a popover listing the
- * individual job names in that bucket. Renders nothing when the bucket is empty.
+ * A CI-status pill (e.g. "✓ 66 passed"); hovering it reveals the individual job
+ * names in that bucket, each with the status icon and a divider between rows.
+ * Renders nothing when the bucket is empty.
  */
 function CheckPill({
   label,
@@ -179,7 +180,7 @@ function CheckPill({
 }: {
   label: string;
   count: number;
-  /** All checks; filtered to this pill's bucket for the popover list. */
+  /** All checks; filtered to this pill's bucket for the hover list. */
   runs: GithubCheckRun[];
   icon: React.ReactNode;
   /** Tint for the pill + icon. */
@@ -190,8 +191,8 @@ function CheckPill({
   const shown = names.slice(0, CHECK_NAMES_SHOWN);
   const overflow = names.length - shown.length;
   return (
-    <Popover>
-      <PopoverTrigger asChild>
+    <HoverCard openDelay={100} closeDelay={100}>
+      <HoverCardTrigger asChild>
         <button
           type="button"
           className={cn(
@@ -202,40 +203,31 @@ function CheckPill({
           {icon}
           {count} {label}
         </button>
-      </PopoverTrigger>
-      <PopoverContent side="bottom" align="start" className="max-h-64 max-w-xs overflow-y-auto p-2">
+      </HoverCardTrigger>
+      <HoverCardContent
+        side="bottom"
+        align="start"
+        className="max-h-64 w-auto max-w-xs overflow-y-auto p-1"
+      >
         {names.length === 0 ? (
-          <p className="text-xs text-muted-foreground">No job details.</p>
+          <p className="px-1.5 py-1 text-muted-foreground">No job details.</p>
         ) : (
-          <ul className="space-y-0.5 text-xs">
+          <ul className="divide-y divide-border">
             {shown.map((r) => (
-              <li key={`${r.name} ${r.url ?? ""}`} className="truncate">
-                {r.name}
+              <li key={r.url ?? r.name} className="flex items-center gap-2 px-1.5 py-1.5">
+                <span className="shrink-0">{icon}</span>
+                <span className="truncate" title={r.name}>
+                  {r.name}
+                </span>
               </li>
             ))}
-            {overflow > 0 && <li className="text-muted-foreground">+{overflow} more</li>}
+            {overflow > 0 && (
+              <li className="px-1.5 py-1.5 text-muted-foreground">+{overflow} more</li>
+            )}
           </ul>
         )}
-      </PopoverContent>
-    </Popover>
-  );
-}
-
-/** A colored pill for the PR state (open / draft / merged / closed). */
-function StateBadge({ state, isDraft }: { state: string; isDraft: boolean }) {
-  const upper = state.toUpperCase();
-  const label =
-    isDraft && upper === "OPEN" ? "Draft" : upper.charAt(0) + upper.slice(1).toLowerCase();
-  const className =
-    upper === "MERGED"
-      ? "bg-purple-500/15 text-purple-600 dark:text-purple-400"
-      : upper === "CLOSED"
-        ? "bg-red-500/15 text-red-600 dark:text-red-400"
-        : isDraft
-          ? "bg-muted text-muted-foreground"
-          : "bg-green-500/15 text-green-600 dark:text-green-400";
-  return (
-    <span className={cn("rounded-full px-2 py-0.5 text-xs font-medium", className)}>{label}</span>
+      </HoverCardContent>
+    </HoverCard>
   );
 }
 
@@ -451,7 +443,6 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
         {pr ? (
           <>
             <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-              <StateBadge state={pr.state} isDraft={pr.is_draft} />
               <a
                 href={pr.url}
                 target="_blank"
@@ -464,7 +455,7 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
               </a>
             </div>
             {/* CI status checks (from the PR's statusCheckRollup), on their own
-                line as pills; click a pill to see the job names in that bucket. */}
+                line as pills; hover a pill to see the job names in that bucket. */}
             {checks && checks.total > 0 && (
               <div className="flex flex-wrap items-center gap-1.5 text-muted-foreground">
                 <span className="text-ui font-medium">Checks</span>
