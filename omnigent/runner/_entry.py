@@ -1263,6 +1263,11 @@ async def _resolve_agent_spec_from_server(
         other than 404.
     """
     from omnigent.runner.native import ResolvedSpec
+    from omnigent.runtime.company_brain import (
+        COMPANY_BRAIN_MCP_TOKEN_HEADER,
+        COMPANY_BRAIN_MCP_URL_HEADER,
+        attach_company_brain_mcp,
+    )
     from omnigent.spec import load
 
     if session_id is None:
@@ -1308,6 +1313,10 @@ async def _resolve_agent_spec_from_server(
         dest.mkdir(parents=True)
         load(resp.content, dest=dest, expand_env=expand_env, prune_invalid_sub_agents=True)
     spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    if spec.company_brain:
+        managed_url = resp.headers.get(COMPANY_BRAIN_MCP_URL_HEADER, "").strip()
+        managed_token = resp.headers.get(COMPANY_BRAIN_MCP_TOKEN_HEADER, "").strip()
+        attach_company_brain_mcp(spec, url=managed_url, token=managed_token)
     return ResolvedSpec(spec=spec, workdir=dest)
 
 

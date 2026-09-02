@@ -289,6 +289,13 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     skills_filter = _parse_skills_filter(raw.get("skills"))
     mcp_servers = _discover_mcp_servers(root / "tools" / "mcp", expand_env=expand_env)
     mcp_servers = mcp_servers + _parse_inline_mcp_servers(raw_tools, expand_env=expand_env)
+    if any(server.name == "company-brain" for server in mcp_servers):
+        raise ValueError(
+            "MCP server name 'company-brain' is reserved; use top-level company_brain: true"
+        )
+    raw_company_brain = raw.get("company_brain", False)
+    if not isinstance(raw_company_brain, bool):
+        raise ValueError("top-level company_brain: must be true or false")
     local_tools = _discover_local_tools(root / "tools")
     sub_agents = _discover_sub_agents(root / "agents", expand_env=expand_env)
 
@@ -315,6 +322,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         timers=timers,
         spawn=spawn,
         agent_session_sharing=agent_session_sharing,
+        company_brain=raw_company_brain,
     )
 
 

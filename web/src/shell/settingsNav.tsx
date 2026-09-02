@@ -10,6 +10,7 @@ import { useEffect } from "react";
 import {
   ArchiveIcon,
   ArrowLeftIcon,
+  BrainCircuitIcon,
   DownloadIcon,
   GitBranchIcon,
   KeyboardIcon,
@@ -38,6 +39,7 @@ export type SettingsSectionId =
   | "import"
   | "account"
   | "members"
+  | "company-brain"
   | "policies"
   | "sharing"
   | "archived"
@@ -52,6 +54,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "import",
   "account",
   "members",
+  "company-brain",
   "policies",
   "sharing",
   "archived",
@@ -125,6 +128,7 @@ export function settingsNavGroups(
     // so drop both from the nav there. Policies stays: global policies apply
     // to a solo user's own sessions too.
     const adminItems: SettingsNavItem[] = [];
+    adminItems.push({ id: "company-brain", label: "Company brain", icon: BrainCircuitIcon });
     if (!isSingleUser) adminItems.push({ id: "members", label: "Members", icon: UsersIcon });
     adminItems.push({ id: "policies", label: "Policies", icon: ShieldCheckIcon });
     if (!isSingleUser) adminItems.push({ id: "sharing", label: "Sharing", icon: Share2Icon });

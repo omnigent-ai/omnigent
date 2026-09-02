@@ -56,6 +56,9 @@
 # Must satisfy pyproject requires-python (>=3.12); 3.11 fails dependency resolution.
 ARG PYTHON_VERSION=3.12
 ARG NODE_VERSION=22
+ARG BUN_VERSION=1.2.23
+ARG GBRAIN_VERSION=0.46.30.0
+ARG GBRAIN_COMMIT=872c3d6ae4073eb6e77c661d0a72f30b31c4c999
 
 # ── Web UI builder ──────────────────────────────────────
 # Builds the web SPA so `docker build` works from a clean checkout —
@@ -114,6 +117,7 @@ COPY pyproject.toml setup.py ./
 # dependency bytes baked in by the install step.
 COPY LICENSE NOTICE ./
 COPY sdks/ ./sdks/
+COPY integrations/company_brain/ ./integrations/company_brain/
 COPY omnigent/ ./omnigent/
 # The built-in polly agent's packaged bundle (omnigent/resources/examples/
 # polly) is a symlink into the top-level examples/ tree. Ship examples/ so the
@@ -161,6 +165,22 @@ ARG OMNIGENT_EXTRAS=
 RUN if [ -n "${OMNIGENT_EXTRAS}" ]; then \
         uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} -e ".[${OMNIGENT_EXTRAS}]"; \
     fi
+
+FROM oven/bun:${BUN_VERSION}-slim AS gbrain-builder
+
+ARG GBRAIN_VERSION
+ARG GBRAIN_COMMIT
+ENV PATH="/root/.bun/bin:${PATH}"
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates git \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN bun install -g "github:garrytan/gbrain#${GBRAIN_COMMIT}" \
+ && installed="$(gbrain --version)" \
+ && expected="gbrain ${GBRAIN_VERSION}" \
+ && [ "$installed" = "$expected" ] \
+ && test -x "$(command -v gbrain)"
 
 # ── Node alias stage ─────────────────────────────────────
 # Pure alias so the host stage can COPY node out of a version-pinned
@@ -342,7 +362,7 @@ RUN set -eu; \
 # site-packages and imports no longer require /build at runtime.
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /build /build
-RUN pip install --no-cache-dir /build /build/sdks/python-client /build/sdks/ui \
+RUN pip install --no-cache-dir /build /build/sdks/python-client /build/sdks/ui /build/integrations/company_brain \
  && ! grep -R --include='*.pth' --include='*.egg-link' -nE '/build(/|$)' /opt/venv/lib/python*/site-packages
 
 # Sandbox launchers exec commands through `bash -lc`, and Debian's
@@ -363,15 +383,24 @@ CMD ["sleep", "infinity"]
 # ── Server runtime (default target) ─────────────────────
 FROM python:${PYTHON_VERSION}-slim AS runtime
 
+ARG GBRAIN_VERSION
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PATH="/opt/venv/bin:${PATH}"
+  PATH="/opt/venv/bin:/root/.bun/bin:${PATH}"
 
 # curl + ca-certificates only — for the HEALTHCHECK and for outbound
 # HTTPS to LLM gateways / external services.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl ca-certificates \
+ && apt-get install -y --no-install-recommends curl ca-certificates git \
  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=gbrain-builder /usr/local/bin/bun /usr/local/bin/bun
+COPY --from=gbrain-builder /root/.bun /root/.bun
+RUN ln -s /root/.bun/install/global/node_modules/gbrain/src/cli.ts /usr/local/bin/gbrain \
+ && [ "$(gbrain --version)" = "gbrain ${GBRAIN_VERSION}" ]
+RUN git config --system credential.helper \
+  '!f() { [ "$1" = get ] || return 0; [ -n "$GIT_TOKEN" ] || return 0; printf "username=%s\npassword=%s\n" "${GIT_USERNAME:-x-access-token}" "$GIT_TOKEN"; }; f'
 
 # Preserve /build/ in the runtime stage — the venv's editable install
 # .pth files reference /build/omnigent and /build/sdks/* by absolute

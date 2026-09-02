@@ -72,6 +72,7 @@ from omnigent.server.performance_metrics import (
 )
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
+from omnigent.server.routes.company_brain import create_company_brain_router
 from omnigent.server.routes.default_policies import create_default_policies_router
 from omnigent.server.routes.dictation import create_dictation_router
 from omnigent.server.routes.harnesses import create_harnesses_router
@@ -98,6 +99,7 @@ from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
     ArtifactStore,
+    CompanyBrainStore,
     ConversationStore,
     FileStore,
 )
@@ -1025,6 +1027,8 @@ def create_app(
     policy_store: PolicyStore | None = None,
     permission_store: PermissionStore | None = None,
     scheduled_task_store: ScheduledTaskStore | None = None,
+    company_brain_store: CompanyBrainStore | None = None,
+    company_brain_service: Any | None = None,
     project_store: ProjectStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
@@ -1384,6 +1388,7 @@ def create_app(
         # creates + owner-grants a session, launches its runner, and records
         # the run — all fire-and-forget so the timer re-arms immediately.
         scheduled_task_scheduler: ScheduledTaskScheduler | None = None
+        company_brain_scheduler: Any | None = None
         if scheduled_task_store is not None:
             from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
 
@@ -1431,6 +1436,22 @@ def create_app(
             # endpoints (see routes/scheduled_tasks.py); there is no startup
             # sweep and no periodic reconcile.
 
+        if company_brain_store is not None and company_brain_service is not None:
+            from omnigent.server.company_brain_scheduler import CompanyBrainScheduler
+
+            company_brain_scheduler = CompanyBrainScheduler(
+                company_brain_store,
+                company_brain_service,
+            )
+            app_inst.state.company_brain_scheduler = company_brain_scheduler
+            try:
+                await company_brain_scheduler.start()
+            except Exception as exc:
+                _logger.exception(
+                    "company brain scheduler failed to start; continuing without schedules (%s)",
+                    exc,
+                )
+
         try:
             yield
         finally:
@@ -1439,6 +1460,8 @@ def create_app(
             # cancel. Only the per-job scheduler holds timers that need stopping.
             if scheduled_task_scheduler is not None:
                 scheduled_task_scheduler.stop()
+            if company_brain_scheduler is not None:
+                company_brain_scheduler.stop()
             metrics_publish_task.cancel()
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task
@@ -2565,6 +2588,18 @@ def create_app(
             ),
             prefix="/v1",
             tags=["scheduled_tasks"],
+        )
+    if company_brain_store is not None:
+        app.include_router(
+            create_company_brain_router(
+                company_brain_store,
+                service=company_brain_service,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+                admin_list=admin_list,
+            ),
+            prefix="/v1",
+            tags=["company_brain"],
         )
     # Admin control for the server-wide sharing settings. Always mounted (the
     # handlers self-gate on admin); PUT is a no-op-reject unless this server

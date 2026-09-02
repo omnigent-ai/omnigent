@@ -1,13 +1,14 @@
 """
 Bump the omnigent project version across all packages in lockstep.
 
-The four distributions in this repo release together at a single
+The five distributions in this repo release together at a single
 version:
 
 - ``omnigent``         — root ``pyproject.toml``
 - ``omnigent-client``  — ``sdks/python-client/pyproject.toml``
 - ``omnigent-ui-sdk``  — ``sdks/ui/pyproject.toml``
 - ``omnigent-slack``   — ``integrations/slack/pyproject.toml``
+- ``omnigent-company-brain`` — ``integrations/company_brain/pyproject.toml``
 
 Each declares its own ``[project].version``. The first three ``==``-pin
 their siblings in ``[project].dependencies``; the root ``omnigent``
@@ -21,7 +22,7 @@ It edits ONLY the ``[project].version`` line and the sibling ``==``
 pins, matched by package name — never a blind version-string replace —
 so unrelated version literals (host/runner wire-protocol versions,
 docstring examples, third-party dependency floors like
-``databricks-mcp>=0.9.0``) are left untouched.
+``databricks-sdk>=0.56.0,<1``) are left untouched.
 
 The desktop app (``web/electron/package.json``) co-versions with the
 lockstep too, stamped with the *semver translation* of the version —
@@ -91,13 +92,13 @@ def packages(root: Path) -> list[Package]:
     Return the lockstep packages with their paths rooted at *root*.
 
     :param root: Repo root, e.g. ``Path("/repo")``.
-    :returns: The four :class:`Package` entries.
+    :returns: The five :class:`Package` entries.
     """
     return [
         Package(
             "omnigent",
             root / "pyproject.toml",
-            ("omnigent-client", "omnigent-ui-sdk", "omnigent-slack"),
+            ("omnigent-client", "omnigent-ui-sdk", "omnigent-slack", "omnigent-company-brain"),
         ),
         Package(
             "omnigent-client",
@@ -118,6 +119,14 @@ def packages(root: Path) -> list[Package]:
         Package(
             "omnigent-slack",
             root / "integrations" / "slack" / "pyproject.toml",
+            (),
+        ),
+        # omnigent-company-brain drives ingestion over subprocess/HTTP and
+        # imports no omnigent siblings, so like omnigent-slack it pins none;
+        # the root package ``==``-pins it in [project.dependencies].
+        Package(
+            "omnigent-company-brain",
+            root / "integrations" / "company_brain" / "pyproject.toml",
             (),
         ),
     ]

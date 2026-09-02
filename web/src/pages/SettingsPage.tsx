@@ -231,6 +231,9 @@ const PoliciesPage = lazy(() =>
 const SharingPage = lazy(() =>
   import("@/pages/SharingPage").then((m) => ({ default: m.SharingPage })),
 );
+const CompanyBrainPage = lazy(() =>
+  import("@/pages/CompanyBrainPage").then((m) => ({ default: m.CompanyBrainPage })),
+);
 
 /**
  * The current viewer's user id, resolved reactively. Uses `getCurrentUserId`
@@ -285,10 +288,17 @@ export function SettingsPage() {
   // Rendered in ANY multi-user mode (accounts AND OIDC), not gated on
   // `accountsEnabled` — the nav + pages handle admin gating, and Members runs
   // read-only under OIDC (no password actions).
-  if (section === "members" || section === "policies" || section === "sharing") {
+  if (
+    section === "members" ||
+    section === "policies" ||
+    section === "sharing" ||
+    section === "company-brain"
+  ) {
     return (
       <Suspense fallback={null}>
-        {section === "members" ? (
+        {section === "company-brain" ? (
+          <CompanyBrainPage />
+        ) : section === "members" ? (
           <MembersPage />
         ) : section === "policies" ? (
           <PoliciesPage />

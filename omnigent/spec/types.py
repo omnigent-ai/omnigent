@@ -1589,4 +1589,5 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     timers: bool = False
     spawn: bool = False
     agent_session_sharing: SharePolicy = SharePolicy.NONE
+    company_brain: bool = False
     source_rel_dir: str | None = field(default=None, compare=False)

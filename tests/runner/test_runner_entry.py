@@ -47,6 +47,10 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
+from omnigent.runtime.company_brain import (
+    COMPANY_BRAIN_MCP_TOKEN_HEADER,
+    COMPANY_BRAIN_MCP_URL_HEADER,
+)
 
 # Force-load the MCP streamable-http client before any test monkeypatches
 # httpx.AsyncClient: the MCP SDK evaluates `httpx.AsyncClient | None` eagerly at
@@ -2388,6 +2392,73 @@ async def test_resolve_agent_spec_from_server_caches_success_by_agent_version(
     assert cache_dir.is_dir()
     assert (cache_dir / "config.yaml").read_text() == config_bytes.decode()
     assert [path.name for path in tmp_path.iterdir()] == ["ag_cached-v7"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_spec_attaches_server_managed_company_brain(
+    tmp_path: Path,
+) -> None:
+    config_bytes = (
+        b"spec_version: 1\nname: brain-agent\ncompany_brain: true\n"
+        b"executor:\n  config:\n    harness: claude-sdk\n"
+    )
+    bundle_buf = io.BytesIO()
+    with tarfile.open(fileobj=bundle_buf, mode="w:gz") as tf:
+        info = tarfile.TarInfo(name="config.yaml")
+        info.size = len(config_bytes)
+        tf.addfile(info, io.BytesIO(config_bytes))
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            content=bundle_buf.getvalue(),
+            headers={
+                "X-Agent-Version": "1",
+                COMPANY_BRAIN_MCP_URL_HEADER: "https://brain.example/mcp",
+                COMPANY_BRAIN_MCP_TOKEN_HEADER: "runner-only-token",
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://server.test",
+    ) as client:
+        resolved = await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_brain", session_id="conv_brain"
+        )
+
+    assert resolved is not None
+    assert resolved.spec.mcp_servers[0].name == "company-brain"
+    assert resolved.spec.mcp_servers[0].headers == {"Authorization": "Bearer runner-only-token"}
+    assert resolved.workdir is not None
+    assert "runner-only-token" not in (resolved.workdir / "config.yaml").read_text()
+
+
+@pytest.mark.asyncio
+async def test_resolve_company_brain_spec_fails_without_managed_headers(
+    tmp_path: Path,
+) -> None:
+    config_bytes = (
+        b"spec_version: 1\nname: brain-agent\ncompany_brain: true\n"
+        b"executor:\n  config:\n    harness: claude-sdk\n"
+    )
+    bundle_buf = io.BytesIO()
+    with tarfile.open(fileobj=bundle_buf, mode="w:gz") as tf:
+        info = tarfile.TarInfo(name="config.yaml")
+        info.size = len(config_bytes)
+        tf.addfile(info, io.BytesIO(config_bytes))
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, request=request, content=bundle_buf.getvalue())
+        ),
+        base_url="http://server.test",
+    ) as client:
+        with pytest.raises(ValueError, match="managed MCP URL or token is missing"):
+            await _resolve_agent_spec_from_server(
+                client, tmp_path, "ag_brain", session_id="conv_brain"
+            )
 
 
 @pytest.mark.asyncio

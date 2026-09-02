@@ -977,6 +977,7 @@ def create_sessions_router(
         auth_provider=auth_provider,
         permission_store=permission_store,
         agent_cache=agent_cache,
+        runner_tunnel_tokens=runner_tunnel_tokens,
     )
 
     return router

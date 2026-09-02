@@ -1,0 +1,3 @@
+Portions of the OAuth provider, state, and credential-encryption behavior are
+derived from qm (https://github.com/yc-software/qm), licensed under the MIT
+License. Copyright (c) 2026 QM contributors.

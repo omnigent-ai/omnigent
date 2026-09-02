@@ -4072,6 +4072,9 @@ def server(
     # with "unable to open database file".
     _ensure_sqlite_parent_dir(db_uri)
 
+    from omnigent.stores.company_brain_store.sqlalchemy_store import (
+        SqlAlchemyCompanyBrainStore,
+    )
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
     from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
@@ -4085,8 +4088,52 @@ def server(
     policy_store = SqlAlchemyPolicyStore(db_uri)
     permission_store = SqlAlchemyPermissionStore(db_uri)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(db_uri)
+    company_brain_store = SqlAlchemyCompanyBrainStore(db_uri)
     project_store = SqlAlchemyProjectStore(db_uri)
     artifact_store = _create_artifact_store(art_loc)
+
+    company_brain_service = None
+    company_brain_encryption_key = os.environ.get("OMNIGENT_COMPANY_BRAIN_ENCRYPTION_KEY")
+    company_brain_state_secret = os.environ.get("OMNIGENT_COMPANY_BRAIN_OAUTH_STATE_SECRET")
+    if company_brain_encryption_key and company_brain_state_secret:
+        from omnigent_company_brain.encryption import CredentialCipher
+        from omnigent_company_brain.oauth import OAuthStateCodec
+
+        from omnigent.host.local_server import _local_data_dir
+        from omnigent.server.company_brain_service import CompanyBrainService
+
+        raw_brain_config = cfg.get("company_brain")
+        brain_config = raw_brain_config if isinstance(raw_brain_config, dict) else {}
+        brain_root = Path(
+            os.environ.get("OMNIGENT_COMPANY_BRAIN_DATA_DIR")
+            or brain_config.get("data_dir")
+            or (_local_data_dir() / "company-brain")
+        ).expanduser()
+        company_brain_service = CompanyBrainService(
+            store=company_brain_store,
+            credential_cipher=CredentialCipher.from_material(company_brain_encryption_key),
+            oauth_state_codec=OAuthStateCodec(company_brain_state_secret),
+            repo_path=Path(
+                os.environ.get("OMNIGENT_COMPANY_BRAIN_REPO_PATH")
+                or brain_config.get("repo_path")
+                or (brain_root / "repo")
+            ).expanduser(),
+            gbrain_state_path=Path(
+                os.environ.get("OMNIGENT_COMPANY_BRAIN_GBRAIN_STATE_PATH")
+                or brain_config.get("gbrain_state_path")
+                or (brain_root / "gbrain")
+            ).expanduser(),
+            repo_url=os.environ.get("OMNIGENT_COMPANY_BRAIN_REPO_URL")
+            or brain_config.get("repo_url"),
+            mcp_url=os.environ.get("OMNIGENT_COMPANY_BRAIN_MCP_URL")
+            or brain_config.get("mcp_url"),
+            mcp_auth_ref=os.environ.get("OMNIGENT_COMPANY_BRAIN_MCP_AUTH_REF")
+            or brain_config.get("mcp_auth_ref"),
+            gbrain_executable=os.environ.get("OMNIGENT_GBRAIN_EXECUTABLE", "gbrain"),
+            push_git=os.environ.get("OMNIGENT_COMPANY_BRAIN_GIT_PUSH", "0") == "1",
+            no_embedding=os.environ.get("OMNIGENT_COMPANY_BRAIN_NO_EMBEDDING", "0") == "1",
+            artifact_store=artifact_store,
+        )
 
     # Initialize the runtime with store references so workflow code
     # can access them via getter functions (get_agent_cache(), etc.).
@@ -4229,6 +4276,8 @@ def server(
         runner_tunnel_tokens=_runner_tunnel_tokens,
         permission_store=permission_store,
         scheduled_task_store=scheduled_task_store,
+        company_brain_store=company_brain_store,
+        company_brain_service=company_brain_service,
         project_store=project_store,
         auth_provider=auth_provider,
         host_store=host_store,

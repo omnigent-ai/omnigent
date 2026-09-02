@@ -23,6 +23,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+case "${1:-}" in
+  "") company_brain=0 ;;
+  --company-brain) company_brain=1 ;;
+  *)
+    echo "Usage: $0 [--company-brain]" >&2
+    exit 2
+    ;;
+esac
+
 if [[ ! -f .env ]]; then
   cp .env.example .env
   echo "→ created .env from .env.example"
@@ -61,6 +70,27 @@ current_value() {
   grep -E "^${key}=" .env | head -n 1 | cut -d= -f2- || true
 }
 
+ensure_hex_secret() {
+  local key="$1" bytes="$2"
+  local value generated expected_length
+  value=$(current_value "$key")
+  if [[ -z "$value" || "$value" == "<"*">" ]]; then
+    expected_length=$((bytes * 2))
+    if ! generated=$(openssl rand -hex "$bytes"); then
+      echo "ERROR: failed to generate ${key}" >&2
+      return 1
+    fi
+    if [[ ! "$generated" =~ ^[0-9a-f]+$ || ${#generated} -ne $expected_length ]]; then
+      echo "ERROR: openssl returned invalid material for ${key}" >&2
+      return 1
+    fi
+    set_or_replace_kv "$key" "$generated"
+    echo "→ generated ${key}"
+  else
+    echo "→ ${key} already set, leaving alone"
+  fi
+}
+
 pg_current=$(current_value POSTGRES_PASSWORD)
 if [[ -z "$pg_current" || "$pg_current" == "change-me-please" ]]; then
   set_or_replace_kv POSTGRES_PASSWORD "$(openssl rand -hex 16)"
@@ -90,6 +120,13 @@ else
   echo "→ OMNIGENT_ACCOUNTS_COOKIE_SECRET already set, leaving alone"
 fi
 
+if [[ "$company_brain" == "1" ]]; then
+  ensure_hex_secret GBRAIN_POSTGRES_PASSWORD 16
+  ensure_hex_secret GBRAIN_ADMIN_BOOTSTRAP_TOKEN 32
+  ensure_hex_secret OMNIGENT_COMPANY_BRAIN_ENCRYPTION_KEY 32
+  ensure_hex_secret OMNIGENT_COMPANY_BRAIN_OAUTH_STATE_SECRET 32
+fi
+
 echo
 echo "✓ deploy/docker/.env is ready. Next:"
 echo "    docker compose up -d && docker compose logs omnigent"
@@ -100,3 +137,7 @@ echo "  the first admin (username + password) via the web form. For any"
 echo "  public-domain deploy also set:"
 echo "    OMNIGENT_ACCOUNTS_BASE_URL=<your public URL>"
 echo "  in .env so that link and invite links resolve to the right host."
+if [[ "$company_brain" == "1" ]]; then
+  echo "  Company Brain secrets are ready; configure its URLs and OAuth clients, then run:"
+  echo "    docker compose --profile company-brain up -d"
+fi

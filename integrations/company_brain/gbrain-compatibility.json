@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "gbrain": {
+    "commit": "872c3d6ae4073eb6e77c661d0a72f30b31c4c999",
+    "install": "bun install -g github:garrytan/gbrain#v0.46.30.0",
+    "tag": "v0.46.30.0",
+    "version": "0.46.30.0"
+  },
+  "contracts": {
+    "engine_init_http": "gbrain init --url <dedicated-postgres-url> --non-interactive",
+    "engine_init_local": "gbrain init --pglite --path <state>/brain.pglite --non-interactive --no-embedding",
+    "http_engine_constraint": "PGLite HTTP serve cannot accept concurrent sync; always-on pilots use dedicated Postgres",
+    "postgres_image": "pgvector/pgvector:0.8.1-pg16@sha256:33198da2828a14c30348d2ccb4750833d5ed9a44c88d840a0e523d7417120337",
+    "http_mcp": "gbrain serve --http --surface starter --public-url <https-url>",
+    "http_mcp_auth": "OAuth 2.1 read-scoped agent client; no database credential",
+    "mcp_endpoint": "/mcp",
+    "mcp_operations": [
+      "context_pack",
+      "delta",
+      "get_page",
+      "recall",
+      "search",
+      "synthesize",
+      "traverse_graph"
+    ],
+    "source_id": "company-shared",
+    "source_register": "gbrain sources add company-shared --path <committed-repo> --name <name>",
+    "source_status": "gbrain sources status --json",
+    "sync": "gbrain sync --source company-shared --repo <committed-repo> --no-pull --yes --json"
+  },
+  "transforms": {
+    "binary_max_bytes": 26214400,
+    "binary_provenance": "content-addressed Omnigent artifact with deterministic Git pointer",
+    "google": [
+      "calendar-event.v1",
+      "google-binary-markitdown.v1",
+      "google-doc.v1",
+      "google-sheet.v1",
+      "google-slides.v1"
+    ],
+    "google_binary_mime_types": [
+      "application/pdf",
+      "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ],
+    "sheet_table_bounds": {
+      "columns": 50,
+      "rows": 500
+    }
+  },
+  "document_contract": "brain-document.v1",
+  "visibility": "org-shared"
+}

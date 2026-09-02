@@ -38,6 +38,58 @@ services:
       timeout: 5s
       retries: 5
 
+  gbrain-postgres:
+    image: pgvector/pgvector:0.8.1-pg16@sha256:33198da2828a14c30348d2ccb4750833d5ed9a44c88d840a0e523d7417120337
+    profiles: [company-brain]
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        test -n "$${POSTGRES_PASSWORD:-}" || { echo "GBRAIN_POSTGRES_PASSWORD is required" >&2; exit 1; }
+        exec docker-entrypoint.sh postgres
+    environment:
+      POSTGRES_DB: gbrain
+      POSTGRES_USER: gbrain
+      POSTGRES_PASSWORD: "${GBRAIN_POSTGRES_PASSWORD:-}"
+    volumes:
+      - gbrain-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gbrain -d gbrain"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  gbrain:
+    image: ${OMNIGENT_IMAGE:-ghcr.io/omnigent-ai/omnigent-server}:${OMNIGENT_IMAGE_TAG:-latest}
+    profiles: [company-brain]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      args:
+        PYPI_INDEX_URL: ${PYPI_INDEX_URL:-https://pypi.org/simple}
+    restart: unless-stopped
+    depends_on:
+      gbrain-postgres:
+        condition: service_healthy
+    command: ["sh", "/build/integrations/company_brain/scripts/serve-gbrain.sh"]
+    environment:
+      GBRAIN_HOME: /data/company-brain/gbrain
+      GBRAIN_DATABASE_URL: postgresql://gbrain:${GBRAIN_POSTGRES_PASSWORD:-}@gbrain-postgres:5432/gbrain
+      GBRAIN_PUBLIC_URL: "${GBRAIN_PUBLIC_URL:-}"
+      GBRAIN_ADMIN_BOOTSTRAP_TOKEN: "${GBRAIN_ADMIN_BOOTSTRAP_TOKEN:-}"
+      GBRAIN_NO_EMBEDDING: "${OMNIGENT_COMPANY_BRAIN_NO_EMBEDDING:-1}"
+      GBRAIN_BIND: 0.0.0.0
+      GBRAIN_PORT: "3131"
+    volumes:
+      - company-brain-data:/data/company-brain
+    ports:
+      - "127.0.0.1:${GBRAIN_PORT:-3131}:3131"
+    healthcheck:
+      test: ["CMD", "sh", "/build/integrations/company_brain/scripts/healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   omnigent:
     # Pre-built image published to GHCR on every main-branch merge.
     # `docker compose pull` fetches the latest; pin OMNIGENT_IMAGE_TAG
@@ -57,6 +109,9 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      gbrain:
+        condition: service_healthy
+        required: false
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-omnigent}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-omnigent}
       ARTIFACT_DIR: /data/artifacts
@@ -75,6 +130,28 @@ services:
       # empty/unset would fall back to /root/.omnigent/ inside the
       # ephemeral container.
       OMNIGENT_ADMIN_CREDENTIALS_PATH: /data/admin-credentials
+      GBRAIN_DATABASE_URL: postgresql://gbrain:${GBRAIN_POSTGRES_PASSWORD:-}@gbrain-postgres:5432/gbrain
+      OMNIGENT_COMPANY_BRAIN_DATA_DIR: /data/company-brain
+      OMNIGENT_COMPANY_BRAIN_ENCRYPTION_KEY: "${OMNIGENT_COMPANY_BRAIN_ENCRYPTION_KEY:-}"
+      OMNIGENT_COMPANY_BRAIN_OAUTH_STATE_SECRET: "${OMNIGENT_COMPANY_BRAIN_OAUTH_STATE_SECRET:-}"
+      OMNIGENT_COMPANY_BRAIN_REPO_PATH: /data/company-brain/repo
+      OMNIGENT_COMPANY_BRAIN_GBRAIN_STATE_PATH: /data/company-brain/gbrain
+      OMNIGENT_COMPANY_BRAIN_REPO_URL: "${OMNIGENT_COMPANY_BRAIN_REPO_URL:-}"
+      OMNIGENT_COMPANY_BRAIN_MCP_URL: "${OMNIGENT_COMPANY_BRAIN_MCP_URL:-}"
+      OMNIGENT_COMPANY_BRAIN_MCP_TOKEN: "${OMNIGENT_COMPANY_BRAIN_MCP_TOKEN:-}"
+      OMNIGENT_COMPANY_BRAIN_MCP_AUTH_REF: "${OMNIGENT_COMPANY_BRAIN_MCP_AUTH_REF:-}"
+      OMNIGENT_COMPANY_BRAIN_GIT_PUSH: "${OMNIGENT_COMPANY_BRAIN_GIT_PUSH:-1}"
+      OMNIGENT_COMPANY_BRAIN_NO_EMBEDDING: "${OMNIGENT_COMPANY_BRAIN_NO_EMBEDDING:-1}"
+      OMNIGENT_GBRAIN_EXECUTABLE: gbrain
+      GOOGLE_OAUTH_CLIENT_ID: "${GOOGLE_OAUTH_CLIENT_ID:-}"
+      GOOGLE_OAUTH_CLIENT_SECRET: "${GOOGLE_OAUTH_CLIENT_SECRET:-}"
+      GOOGLE_WORKSPACE_DOMAIN: "${GOOGLE_WORKSPACE_DOMAIN:-}"
+      SLACK_OAUTH_CLIENT_ID: "${SLACK_OAUTH_CLIENT_ID:-}"
+      SLACK_OAUTH_CLIENT_SECRET: "${SLACK_OAUTH_CLIENT_SECRET:-}"
+      NOTION_OAUTH_CLIENT_ID: "${NOTION_OAUTH_CLIENT_ID:-}"
+      NOTION_OAUTH_CLIENT_SECRET: "${NOTION_OAUTH_CLIENT_SECRET:-}"
+      GIT_TOKEN: "${GIT_TOKEN:-}"
+      GIT_USERNAME: "${GIT_USERNAME:-x-access-token}"
 
       # ── Auth ─────────────────────────────────────────
       # OMNIGENT_AUTH_ENABLED is the single auth switch. "1" (the
@@ -151,9 +228,12 @@ services:
       OMNIGENT_ACCOUNTS_AUTO_OPEN: "${OMNIGENT_ACCOUNTS_AUTO_OPEN:-0}"
     volumes:
       - artifact-data:/data
+      - company-brain-data:/data/company-brain
     ports:
       - "${OMNIGENT_PORT:-8000}:8000"
 
 volumes:
   postgres-data:
   artifact-data:
+  company-brain-data:
+  gbrain-postgres-data:

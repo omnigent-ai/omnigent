@@ -1650,3 +1650,189 @@ class SqlScheduledTaskRun(OmnigentBase):
             "conversation_id",
         ),
     )
+
+
+class SqlBrainInstallation(OmnigentBase):
+    __tablename__ = "brain_installations"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
+    repo_path: Mapped[str] = mapped_column(String(2048), nullable=False)
+    repo_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    gbrain_state_path: Mapped[str] = mapped_column(String(2048), nullable=False)
+    mcp_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    mcp_auth_ref: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="ready")
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('provisioning', 'ready', 'degraded', 'disabled')",
+            name="ck_brain_installations_status",
+        ),
+        UniqueConstraint("workspace_id", name="uq_brain_installations_workspace"),
+    )
+
+
+class SqlIntegrationConnection(OmnigentBase):
+    __tablename__ = "integration_connections"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    credential_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    account_label: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    granted_scopes_json: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="connected")
+    last_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "provider IN ('google', 'slack', 'notion')",
+            name="ck_integration_connections_provider",
+        ),
+        CheckConstraint(
+            "status IN ('connected', 'needs_reconnect', 'disconnected', 'error')",
+            name="ck_integration_connections_status",
+        ),
+        Index(
+            "ix_integration_connections_provider",
+            "workspace_id",
+            "provider",
+            "created_at",
+            "id",
+        ),
+    )
+
+
+class SqlIntegrationSelection(OmnigentBase):
+    __tablename__ = "integration_selections"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
+    connection_id: Mapped[str] = mapped_column(Uuid16, nullable=False)
+    external_resource_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    resource_name: Mapped[str] = mapped_column(String(512), nullable=False)
+    resource_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    transform_profile: Mapped[str] = mapped_column(String(128), nullable=False)
+    visibility_class: Mapped[str] = mapped_column(
+        String(32), nullable=False, server_default="org-shared"
+    )
+    rrule: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False, server_default="UTC")
+    state: Mapped[str] = mapped_column(String(32), nullable=False, server_default="active")
+    last_synced_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    page_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    last_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "visibility_class = 'org-shared'",
+            name="ck_integration_selections_visibility",
+        ),
+        CheckConstraint(
+            "state IN ('active', 'paused', 'disconnected')",
+            name="ck_integration_selections_state",
+        ),
+        UniqueConstraint(
+            "workspace_id",
+            "connection_id",
+            "external_resource_id",
+            name="uq_integration_selections_resource",
+        ),
+        Index(
+            "ix_integration_selections_connection",
+            "workspace_id",
+            "connection_id",
+            "created_at",
+            "id",
+        ),
+    )
+
+
+class SqlIntegrationSyncRun(OmnigentBase):
+    __tablename__ = "integration_sync_runs"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
+    connection_id: Mapped[str] = mapped_column(Uuid16, nullable=False)
+    selection_id: Mapped[str] = mapped_column(Uuid16, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    trigger: Mapped[str] = mapped_column("trigger_kind", String(32), nullable=False)
+    fetched_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    changed_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    deleted_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    skipped_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    commit_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    gbrain_result_json: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    scheduled_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    started_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    finished_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'running', 'succeeded', 'failed', 'skipped')",
+            name="ck_integration_sync_runs_status",
+        ),
+        CheckConstraint(
+            "trigger_kind IN ('manual', 'schedule', 'retry')",
+            name="ck_integration_sync_runs_trigger",
+        ),
+        Index(
+            "ix_integration_sync_runs_selection",
+            "workspace_id",
+            "selection_id",
+            "created_at",
+            "id",
+        ),
+    )
+
+
+class SqlOAuthStateNonce(OmnigentBase):
+    __tablename__ = "oauth_state_nonces"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    nonce_sha256: Mapped[str] = mapped_column(String(64), primary_key=True)
+    expires_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (Index("ix_oauth_state_nonces_expiry", "workspace_id", "expires_at"),)

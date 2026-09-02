@@ -9,14 +9,8 @@ This Software contains code from the following open source projects, licensed un
 openai - https://pypi.org/project/openai/
 Copyright 2026 OpenAI.
 
-databricks-mcp - https://pypi.org/project/databricks-mcp/
-Copyright Databricks, Inc.
-
 databricks-sdk - https://pypi.org/project/databricks-sdk/
 Copyright 2023 Databricks, Inc. All rights reserved.
-
-mlflow-tracing - https://pypi.org/project/mlflow-tracing/
-Copyright 2018 Databricks, Inc. All rights reserved.
 
 ftfy - https://pypi.org/project/ftfy/
 Copyright Robyn Speer.

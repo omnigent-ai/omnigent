@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Annotated, Any
 
 from fastapi import (
@@ -16,8 +17,13 @@ from fastapi import (
 from fastapi.responses import Response
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.runtime.company_brain import (
+    COMPANY_BRAIN_MCP_TOKEN_HEADER,
+    COMPANY_BRAIN_MCP_URL_HEADER,
+)
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -77,6 +83,18 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.permission_store import PermissionStore
 
 
+def _runner_can_receive_managed_config(
+    tunnel_token: str,
+    runner_id: str | None,
+    allowed_tunnel_tokens: frozenset[str] | None,
+) -> bool:
+    if not tunnel_token:
+        return False
+    if allowed_tunnel_tokens is not None and tunnel_token in allowed_tunnel_tokens:
+        return True
+    return isinstance(runner_id, str) and token_bound_runner_id(tunnel_token) == runner_id
+
+
 def register_agent_routes(
     router: APIRouter,
     *,
@@ -87,6 +105,7 @@ def register_agent_routes(
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
     agent_cache: AgentCache | None = None,
+    runner_tunnel_tokens: frozenset[str] | None = None,
 ) -> None:
     """Register the agent sub-resource routes on router."""
 
@@ -193,21 +212,38 @@ def register_agent_routes(
                 "Agent bundle not found in artifact store",
                 code=ErrorCode.INTERNAL_ERROR,
             )
+        headers = {
+            "Cache-Control": "private, no-store",
+            "Pragma": "no-cache",
+            "X-Agent-Version": str(agent.version),
+            "X-Agent-Name": agent.name,
+            "X-Agent-Session-Scoped": "true" if agent.session_id is not None else "false",
+        }
+        tunnel_token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+        runner_authorized = _runner_can_receive_managed_config(
+            tunnel_token,
+            conv.runner_id,
+            runner_tunnel_tokens,
+        )
+        if runner_authorized:
+            parsed = validate_agent_bundle(
+                bundle_bytes,
+                enforce_handler_allowlist=not local_single_user_enabled(),
+            )
+            if parsed.company_brain:
+                managed_url = os.environ.get("OMNIGENT_COMPANY_BRAIN_MCP_URL", "").strip()
+                managed_token = os.environ.get("OMNIGENT_COMPANY_BRAIN_MCP_TOKEN", "").strip()
+                if not managed_url or not managed_token:
+                    raise OmnigentError(
+                        "Company brain MCP is not configured for this runner",
+                        code=ErrorCode.INTERNAL_ERROR,
+                    )
+                headers[COMPANY_BRAIN_MCP_URL_HEADER] = managed_url
+                headers[COMPANY_BRAIN_MCP_TOKEN_HEADER] = managed_token
         return Response(
             content=bundle_bytes,
             media_type="application/gzip",
-            headers={
-                "X-Agent-Version": str(agent.version),
-                "X-Agent-Name": agent.name,
-                # Provenance for the runner's env-expansion decision:
-                # session-scoped agents are
-                # tenant-uploaded and must NOT have ${VAR} expanded
-                # against the runner process env; template agents
-                # (session_id is None) are operator-authored and may.
-                # The runner fails safe (treats a missing header as
-                # session-scoped → no expansion).
-                "X-Agent-Session-Scoped": "true" if agent.session_id is not None else "false",
-            },
+            headers=headers,
         )
 
     @router.put(

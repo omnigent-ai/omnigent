@@ -7,6 +7,8 @@ compose` runs.
 The stack:
 - `postgres` — persistent DB on a Docker volume
 - `omnigent` — the server image (built from `../Dockerfile`)
+- optional `gbrain-postgres` — digest-pinned pgvector/Postgres 16 for Company Brain
+- optional `gbrain` — the pinned read-only Company Brain MCP service
 
 Auth is in-process — the server has both header-proxy and native
 OIDC modes built in (see [Multi-user mode](#multi-user-mode-oidc)
@@ -38,6 +40,25 @@ Reset everything (drops the DB and the artifact store):
 ```bash
 docker compose down -v
 ```
+
+## Company Brain profile
+
+Company Brain is opt-in and keeps its index in a separate pgvector database. Generate its local
+secrets, fill in the public URL, private Git repository, read-only MCP bearer, and provider OAuth
+credentials in `.env`, then start the profile:
+
+```bash
+./bootstrap.sh --company-brain
+docker compose --profile company-brain up -d --build
+docker compose --profile company-brain exec gbrain gbrain doctor
+docker compose --profile company-brain exec gbrain gbrain sources status --json
+```
+
+The first successful source sync creates `company-shared`. Register the read-only agent client as
+described in [`integrations/company_brain/README.md`](../../integrations/company_brain/README.md),
+set `OMNIGENT_COMPANY_BRAIN_MCP_TOKEN`, and recreate the `omnigent` service. The Git remote is cloned
+into the dedicated Company Brain volume on first publication; `GIT_TOKEN` is consumed by an
+environment-backed credential helper and is not embedded in the remote URL.
 
 ## Release features
 

@@ -312,12 +312,15 @@ def _publish_agent_changed(session_id: str, agent: Agent) -> None:
 
 def _summary_from_config(server: MCPServerConfig) -> MCPServerSummary:
     """Return the safe API summary for an MCP server config."""
+    managed_company_brain = server.name == "company-brain"
     return MCPServerSummary(
         name=server.name,
         transport=server.transport,
         description=server.description,
-        url=server.url,
-        headers=dict.fromkeys(server.headers, "[REDACTED]") if server.headers else {},
+        url=None if managed_company_brain else server.url,
+        headers={}
+        if managed_company_brain
+        else (dict.fromkeys(server.headers, "[REDACTED]") if server.headers else {}),
         command=server.command,
         args=server.args,
     )

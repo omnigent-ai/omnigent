@@ -121,11 +121,21 @@ describe("settingsNavGroups", () => {
     expect(ids(false, false)).not.toContain("members");
     // Admin on an accounts deploy → all appear, grouped under "Admin".
     const accountsAdmin = settingsNavGroups(true, false, true).find((g) => g.title === "Admin");
-    expect(accountsAdmin?.items.map((i) => i.id)).toEqual(["members", "policies", "sharing"]);
+    expect(accountsAdmin?.items.map((i) => i.id)).toEqual([
+      "company-brain",
+      "members",
+      "policies",
+      "sharing",
+    ]);
     // Admin under OIDC (accountsEnabled false) → still appears. This is the
     // #1489 fix: OIDC previously had no admin chrome at all.
     const oidcAdmin = settingsNavGroups(false, false, true).find((g) => g.title === "Admin");
-    expect(oidcAdmin?.items.map((i) => i.id)).toEqual(["members", "policies", "sharing"]);
+    expect(oidcAdmin?.items.map((i) => i.id)).toEqual([
+      "company-brain",
+      "members",
+      "policies",
+      "sharing",
+    ]);
   });
 
   it("drops Members and Sharing from the Admin group in single-user mode, keeping Policies", () => {
@@ -135,7 +145,7 @@ describe("settingsNavGroups", () => {
     const singleUserAdmin = settingsNavGroups(false, false, true, true).find(
       (g) => g.title === "Admin",
     );
-    expect(singleUserAdmin?.items.map((i) => i.id)).toEqual(["policies"]);
+    expect(singleUserAdmin?.items.map((i) => i.id)).toEqual(["company-brain", "policies"]);
   });
 });
 
@@ -261,6 +271,8 @@ describe("SettingsSidebarBody", () => {
     renderBody();
     const members = screen.getByTestId("settings-nav-members");
     const policies = screen.getByTestId("settings-nav-policies");
+    const companyBrain = screen.getByTestId("settings-nav-company-brain");
+    expect(companyBrain).toHaveAttribute("href", "/settings/company-brain");
     expect(members).toHaveAttribute("href", "/settings/members");
     expect(policies).toHaveAttribute("href", "/settings/policies");
   });

@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path
 
 from omnigent.entities import LoadedAgent
+from omnigent.runtime.company_brain import resolve_company_brain_mcp
 from omnigent.spec import AgentSpec
 from omnigent.spec import load as load_spec
 from omnigent.stores.artifact_store import ArtifactStore
@@ -92,6 +93,7 @@ class AgentCache:
         # Tier 2: disk cache (directory already extracted)
         if workdir.is_dir():
             spec = load_spec(workdir, expand_env=expand_env, prune_invalid_sub_agents=True)
+            resolve_company_brain_mcp(spec)
             self._specs[agent_id] = spec
             return LoadedAgent(spec=spec, workdir=workdir)
 
@@ -145,6 +147,7 @@ class AgentCache:
                 expand_env=expand_env,
                 prune_invalid_sub_agents=True,
             )
+            resolve_company_brain_mcp(spec)
         finally:
             tmp_path.unlink()
 
@@ -202,6 +205,7 @@ class AgentCache:
                 expand_env=expand_env,
                 prune_invalid_sub_agents=True,
             )
+            resolve_company_brain_mcp(spec)
         finally:
             tmp_path.unlink()
 

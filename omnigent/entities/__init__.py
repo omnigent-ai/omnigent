@@ -3,6 +3,12 @@
 from omnigent.entities.account import Account, AccountToken
 from omnigent.entities.agent import Agent, LoadedAgent
 from omnigent.entities.comment import Comment, CommentsFingerprint
+from omnigent.entities.company_brain import (
+    BrainInstallation,
+    IntegrationConnection,
+    IntegrationSelection,
+    IntegrationSyncRun,
+)
 from omnigent.entities.connection import ProviderConnection
 from omnigent.entities.conversation import (
     DEFAULT_GENERATED_TITLE_MAX_CHARS,
@@ -49,6 +55,7 @@ __all__ = [
     "Account",
     "AccountToken",
     "Agent",
+    "BrainInstallation",
     "Comment",
     "CommentsFingerprint",
     "CompactionData",
@@ -58,6 +65,9 @@ __all__ = [
     "ErrorData",
     "FunctionCallData",
     "FunctionCallOutputData",
+    "IntegrationConnection",
+    "IntegrationSelection",
+    "IntegrationSyncRun",
     "ItemData",
     "LoadedAgent",
     "MessageData",

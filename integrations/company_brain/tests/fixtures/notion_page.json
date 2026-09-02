@@ -1,0 +1,40 @@
+{
+  "blocks": [
+    {
+      "heading_2": {"rich_text": [{"plain_text": "Decision"}]},
+      "type": "heading_2"
+    },
+    {
+      "paragraph": {
+        "rich_text": [
+          {"annotations": {"bold": true}, "plain_text": "Approved"},
+          {"plain_text": " for a six-week pilot."}
+        ]
+      },
+      "type": "paragraph"
+    },
+    {
+      "to_do": {"checked": true, "rich_text": [{"plain_text": "Record the DPIA owner"}]},
+      "type": "to_do"
+    },
+    {
+      "unsupported_widget": {},
+      "type": "unsupported_widget"
+    }
+  ],
+  "connection_id": "notion-connection",
+  "page": {
+    "archived": false,
+    "created_time": "2026-08-02T10:00:00Z",
+    "id": "page-456",
+    "in_trash": false,
+    "last_edited_time": "2026-08-24T16:15:00Z",
+    "properties": {
+      "Name": {
+        "title": [{"plain_text": "Vendor pilot decision"}],
+        "type": "title"
+      }
+    },
+    "url": "https://www.notion.so/page-456"
+  }
+}

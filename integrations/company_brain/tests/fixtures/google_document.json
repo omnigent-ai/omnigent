@@ -1,0 +1,12 @@
+{
+  "connection_id": "google-connection",
+  "file": {
+    "createdTime": "2026-08-01T09:00:00Z",
+    "id": "doc-123",
+    "mimeType": "application/vnd.google-apps.document",
+    "modifiedTime": "2026-08-25T14:30:00Z",
+    "name": "Incident response handbook",
+    "webViewLink": "https://docs.google.com/document/d/doc-123/edit"
+  },
+  "exported_markdown": "## Escalation\r\n\r\nPage the security lead and incident commander.  \r\n"
+}

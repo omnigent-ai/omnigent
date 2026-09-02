@@ -1,0 +1,30 @@
+{
+  "channel": {
+    "id": "C0123",
+    "is_private": false,
+    "name": "security"
+  },
+  "connection_id": "slack-connection",
+  "messages": [
+    {
+      "reactions": [
+        {"count": 2, "name": "white_check_mark"}
+      ],
+      "text": "The vendor review is approved for the pilot.",
+      "ts": "1787752800.000100",
+      "user": "U01"
+    },
+    {
+      "edited": {"ts": "1787753100.000300", "user": "U02"},
+      "text": "I added the retention condition to the register.",
+      "thread_ts": "1787752800.000100",
+      "ts": "1787753100.000200",
+      "user": "U02"
+    }
+  ],
+  "users": {
+    "U01": "Ada",
+    "U02": "Ben"
+  },
+  "workspace_domain": "example"
+}
