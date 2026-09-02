@@ -93,6 +93,7 @@ export function matchingKeybindingRules(
         right.scopeRank - left.scopeRank ||
         (right.rule.priority ?? 0) - (left.rule.priority ?? 0) ||
         contextSpecificity(right.rule.when) - contextSpecificity(left.rule.when) ||
+        Number(right.rule.origin === "user") - Number(left.rule.origin === "user") ||
         right.index - left.index,
     )
     .map(({ rule }) => rule);

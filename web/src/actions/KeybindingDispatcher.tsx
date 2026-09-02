@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { DEFAULT_KEYBINDINGS } from "./defaultKeybindings";
+import { useKeybindingSnapshot } from "./KeybindingStore";
 import { matchingKeybindingRules, type KeybindingEnvironment } from "./keybindingResolver";
 import { useInternalActionRuntime } from "./ActionProvider";
 import type { ActionId, ActionInvocation, KeybindingRule } from "./types";
@@ -38,12 +38,10 @@ function invocationFor<A extends ActionId>(
 }
 
 /** Installs the only application-owned global keyboard dispatch listeners. */
-export function KeybindingDispatcher({
-  rules = DEFAULT_KEYBINDINGS,
-}: {
-  rules?: readonly KeybindingRule[];
-}) {
+export function KeybindingDispatcher({ rules }: { rules?: readonly KeybindingRule[] }) {
   const actions = useInternalActionRuntime();
+  const storedKeymap = useKeybindingSnapshot();
+  const effectiveRules = rules ?? storedKeymap.effectiveRules;
   const pendingCapture = useRef<PendingChord | null>(null);
   const pendingBubble = useRef<PendingChord | null>(null);
 
@@ -97,8 +95,14 @@ export function KeybindingDispatcher({
         }
       }
 
-      const candidates = matchingKeybindingRules(rules, event, 0, phase, environment).filter(
-        (rule) => actions.registry.canHandle(rule.action, resolution, { keyboardOnly: true }),
+      const candidates = matchingKeybindingRules(
+        effectiveRules,
+        event,
+        0,
+        phase,
+        environment,
+      ).filter((rule) =>
+        actions.registry.canHandle(rule.action, resolution, { keyboardOnly: true }),
       );
 
       // A chord prefix intentionally wins over a single-stroke binding with
@@ -146,7 +150,7 @@ export function KeybindingDispatcher({
       document.removeEventListener("visibilitychange", clearChords);
       clearChords();
     };
-  }, [actions, rules]);
+  }, [actions, effectiveRules]);
 
   return null;
 }

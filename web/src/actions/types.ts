@@ -43,14 +43,17 @@ export const ACTION_IDS = [
 
 export type ActionId = (typeof ACTION_IDS)[number];
 
+/** Payload-bearing actions live here so validators can be exhaustive over this map. */
+export interface ActionArgsById {
+  "session.action.openPinned": { slot: number };
+  "composer.action.acceptSuggestion": { behavior: "openOrAttach" | "attach" };
+  "terminal.action.sendSequence": { data: string };
+}
+
 /** Compile-time payload for an action. Most actions take no arguments. */
-export type ActionArgs<A extends ActionId> = A extends "session.action.openPinned"
-  ? { slot: number }
-  : A extends "composer.action.acceptSuggestion"
-    ? { behavior: "openOrAttach" | "attach" }
-    : A extends "terminal.action.sendSequence"
-      ? { data: string }
-      : undefined;
+export type ActionArgs<A extends ActionId> = A extends keyof ActionArgsById
+  ? ActionArgsById[A]
+  : undefined;
 
 export type ArglessActionId = {
   [A in ActionId]: undefined extends ActionArgs<A> ? A : never;
@@ -193,5 +196,7 @@ export type KeybindingRule<A extends ActionId = ActionId> = A extends ActionId
       allowDefaultPrevented?: boolean;
       preventDefault?: boolean;
       stopPropagation?: boolean;
+      /** Runtime-only origin used to break otherwise-equal user/default conflicts. */
+      origin?: "default" | "user";
     } & ActionArgsField<A>
   : never;
