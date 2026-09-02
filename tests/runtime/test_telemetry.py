@@ -936,6 +936,70 @@ def test_init_honors_operator_service_name_without_argument(
     assert os.environ["OTEL_SERVICE_NAME"] == "my-deployment"
 
 
+def test_flush_metrics_returns_false_when_uninitialized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Without an installed SDK meter provider there is nothing to flush;
+    ``flush_metrics`` must report failure instead of raising.
+    """
+    monkeypatch.setattr(telemetry, "_meter_provider", None)
+
+    assert telemetry.flush_metrics() is False
+
+
+def test_flush_metrics_force_flushes_installed_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``flush_metrics`` delivers metrics recorded since the last periodic
+    exporter tick: with a provider whose reader would never tick on its
+    own, a recorded counter value must reach the exporter on flush.
+    """
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import (
+        InMemoryMetricReader,
+    )
+
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader], shutdown_on_exit=False)
+    monkeypatch.setattr(telemetry, "_meter_provider", provider)
+
+    counter = provider.get_meter("flush-test").create_counter("flush.test.requests")
+    counter.add(3)
+
+    assert telemetry.flush_metrics() is True
+
+    metrics_data = reader.get_metrics_data()
+    points = [
+        point.value
+        for resource_metrics in metrics_data.resource_metrics
+        for scope_metrics in resource_metrics.scope_metrics
+        for metric in scope_metrics.metrics
+        if metric.name == "flush.test.requests"
+        for point in metric.data.data_points
+    ]
+    assert points == [3]
+    provider.shutdown()
+
+
+def test_flush_metrics_reports_flush_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A provider whose flush raises must surface as ``False`` — shutdown
+    paths call this best-effort and must never crash on export errors.
+    """
+
+    class _ExplodingProvider:
+        def force_flush(self, timeout_millis: float = 10000) -> bool:
+            raise RuntimeError("exporter connection lost")
+
+    monkeypatch.setattr(telemetry, "_meter_provider", _ExplodingProvider())
+
+    assert telemetry.flush_metrics() is False
+
+
 def _stub_fastapi_instrumentor(monkeypatch: pytest.MonkeyPatch) -> list[FastAPI]:
     """
     Replace ``FastAPIInstrumentor.instrument_app`` with a recorder.

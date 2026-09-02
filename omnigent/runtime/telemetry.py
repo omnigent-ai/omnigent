@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from fastapi import FastAPI
     from opentelemetry.context import Context
     from opentelemetry.sdk._logs.export import LogRecordExporter
+    from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.metrics.export import MetricExporter
     from opentelemetry.sdk.trace.export import SpanExporter
     from opentelemetry.trace import Span
@@ -58,6 +59,9 @@ _capture_content: bool = False
 _initialized: bool = False
 _metrics_initialized: bool = False
 _logs_initialized: bool = False
+# SDK meter provider installed by _init_otel_metrics, kept so shutdown
+# paths can force-flush the final export interval (see flush_metrics).
+_meter_provider: MeterProvider | None = None
 
 # Session (conversation) id for the current execution context. Set once at a
 # session boundary (request hook, executor turn, forwarder task); the
@@ -1072,10 +1076,38 @@ def _init_otel_metrics() -> None:
             resource=Resource.create({SERVICE_NAME: service_name}),
         )
         otel_metrics.set_meter_provider(provider)
+        global _meter_provider
+        _meter_provider = provider
         _metrics_initialized = True
     except Exception:
         _logger.exception("failed to initialize OpenTelemetry metrics")
         _metrics_initialized = True
+
+
+def flush_metrics(timeout_millis: float = 5000) -> bool:
+    """
+    Force-flush pending metrics through the installed SDK meter provider.
+
+    Graceful shutdown must call this explicitly: metrics recorded since
+    the last periodic exporter tick sit in the SDK until the next tick,
+    and the SDK's own atexit flush never runs when the process exits by
+    re-raising a termination signal (uvicorn's signal-capture path), so
+    without an explicit flush the final export interval is dropped.
+
+    :param timeout_millis: Maximum time to wait for the export, e.g.
+        ``5000``.
+    :returns: ``True`` when the provider reported a successful flush;
+        ``False`` when metrics export was never initialized or the
+        flush failed.
+    """
+    provider = _meter_provider
+    if provider is None:
+        return False
+    try:
+        return bool(provider.force_flush(timeout_millis=timeout_millis))
+    except Exception:
+        _logger.exception("failed to flush OpenTelemetry metrics")
+        return False
 
 
 def _logs_exporter_name() -> str:

@@ -851,6 +851,47 @@ async def test_publish_server_metrics_periodically_exports_until_cancelled() -> 
 
 
 @pytest.mark.asyncio
+async def test_publish_server_metrics_publishes_final_snapshot_on_cancel() -> None:
+    """
+    Cancelling the publisher emits one final snapshot before exiting.
+
+    Requests handled between the last periodic tick and a graceful
+    shutdown must still reach the exported counters: with a long
+    interval so no tick ever fires, the counter delta recorded before
+    cancellation must be published by the cancellation path itself.
+    """
+    inputs = _FakeMetricInputs()
+    metrics = _fake_metrics(inputs)
+    meter = _FakeMeter()
+    publisher = ServerMetricsOtelPublisher(meter=meter)
+    task = asyncio.create_task(
+        publish_server_metrics_periodically(
+            metrics,
+            otel_publisher=publisher,
+            interval_seconds=3600.0,
+        )
+    )
+    # Let the publisher enter its sleep, then handle traffic it never
+    # gets a periodic tick to bridge.
+    await asyncio.sleep(0)
+    started_at = metrics.request_started()
+    metrics.request_finished(started_at=started_at)
+
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    started = meter.counters["omnigent.server.http.requests.started"].records
+    completed = meter.counters["omnigent.server.http.requests.completed"].records
+    assert [record.amount for record in started] == [1], (
+        "tail-window request never bridged into the exported started counter"
+    )
+    assert [record.amount for record in completed] == [1], (
+        "tail-window request never bridged into the exported completed counter"
+    )
+
+
+@pytest.mark.asyncio
 async def test_create_app_metrics_middleware_counts_http_requests(
     app: FastAPI,
     client: httpx.AsyncClient,
