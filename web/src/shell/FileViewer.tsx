@@ -93,6 +93,7 @@ import {
   detectLang,
   isBinaryPath,
   isImageFile,
+  isMarkdownTooLargeForRichView,
   isModelFile,
   isNotebookPath,
   isPdfFile,
@@ -643,7 +644,12 @@ function FileViewerBody({
   // View mode toggle — markdown defaults to the rich-text editor, HTML and
   // notebooks to their rendered preview, and everything else to source.
   const lang = detectLang(path);
-  const isPreviewable = lang === "markdown" || lang === "html" || isNotebookPath(path);
+  // Oversized markdown can't use the rich editor/preview (the markdown lexer
+  // overflows the call stack on multi-MiB buffers), so it drops to the plain
+  // Monaco source surface like any other large file.
+  const markdownTooLarge = isMarkdownTooLargeForRichView(lang, fileContent.length);
+  const isPreviewable =
+    (lang === "markdown" && !markdownTooLarge) || lang === "html" || isNotebookPath(path);
   // Images and PDFs render through CodeViewer's own viewers regardless of view
   // mode; they have no source/diff representation, so diff is suppressed for
   // them (Monaco would otherwise render the base64 payload as garbage text).
@@ -764,7 +770,12 @@ function FileViewerBody({
   // would swallow the browser's find-in-page with no find widget to show.
   const isMonacoFindSurface =
     diffViewActive ||
-    (lang !== "markdown" && viewMode !== "preview" && !isImage && !isPdf && !isModel && !isBinary);
+    ((lang !== "markdown" || markdownTooLarge) &&
+      viewMode !== "preview" &&
+      !isImage &&
+      !isPdf &&
+      !isModel &&
+      !isBinary);
   // Cmd+F must open find-in-file only while the file viewer is the surface the
   // user is working in. The viewer stays mounted beside the chat, so `open`
   // alone can't tell them apart, and reading `document.activeElement` at
@@ -923,7 +934,7 @@ function FileViewerBody({
     menu?: ToolbarOption[];
   }
   const toolbarActions: ToolbarAction[] = [];
-  if (lang === "markdown" && viewMode !== "diff") {
+  if (lang === "markdown" && !markdownTooLarge && viewMode !== "diff") {
     // Markdown is a segmented control over three reachable modes: the rich-text
     // Editor (default), the rendered Preview, and raw Source. Switching away
     // from the editor must guard unsaved edits; the read-only preview/source
