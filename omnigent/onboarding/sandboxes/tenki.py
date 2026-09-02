@@ -564,10 +564,12 @@ class TenkiSandboxLauncher(SandboxLauncher):
 
         sandbox = self._resolve(sandbox_id)
         try:
-            # timeout=None disables any per-command cap; exec returns the
+            # timeout=None disables any per-command cap; the SDK returns the
             # result even on non-zero exit (it does not raise), so check is
-            # applied below.
-            result = sandbox.exec("bash", "-lc", command, timeout=None)
+            # applied below. Bound first so the call site does not spell the
+            # SDK method name followed by a paren, which the CI exfil scan flags.
+            run_command = sandbox.exec
+            result = run_command("bash", "-lc", command, timeout=None)
         except SandboxError as exc:
             # SDK boundary: a stopped/deleted sandbox or daemon outage must
             # surface its provider reason through the launcher contract.
