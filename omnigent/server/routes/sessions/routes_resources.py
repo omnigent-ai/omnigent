@@ -330,7 +330,8 @@ def register_resources_routes(
         :param session_id: Session/conversation identifier.
         :param conversation: Conversation loaded during authorization.
         :param op: Host-side op name — ``"list_or_read"`` / ``"changes"``
-            / ``"diff"`` / ``"search"``.
+            / ``"diff"`` / ``"search"`` / ``"github_info"`` /
+            ``"github_changes"`` / ``"github_diff"`` / ``"github_pr_diff"``.
         :param host_params: Op-specific args for the host reader.
         :param runner_path: Runner-relative URL for the live path.
         :param runner_params: Optional query params for the runner path.
@@ -2018,6 +2019,74 @@ def register_resources_routes(
         )
 
     @file_read_router.get(
+        "/sessions/{session_id}/resources/github/diff",
+        # Internal (UI GitHub diff view) — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def read_github_pr_diff(
+        request: Request,
+        session_id: str,
+        base: str | None = Query(default=None),
+    ) -> Any:
+        """
+        Return the whole PR as one unified diff patch.
+
+        One ``git diff`` covering every changed file, gzipped on the way out
+        (patches are large). The web view parses it client-side into per-file
+        diffs. Falls back to the host tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param base: Base branch name; the default is derived when omitted.
+        :returns: JSON with the ``patch`` text.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_READ)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_pr_diff",
+            host_params={"base": base},
+            runner_path=f"/v1/sessions/{session_id}/resources/github/diff",
+            runner_params={"base": base} if base else None,
+        )
+
+    @file_read_router.get(
+        "/sessions/{session_id}/resources/github/diff/{relative_path:path}",
+        # Internal (UI GitHub diff view) — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def read_github_file_diff(
+        request: Request,
+        session_id: str,
+        relative_path: str,
+        base: str | None = Query(default=None),
+    ) -> Any:
+        """
+        Return before/after content for a file in the branch-vs-base diff.
+
+        Reads the file at HEAD and at the base branch's merge-base via
+        ``git show``. Falls back to the host tunnel when the runner is offline,
+        so the diff stays viewable from the workspace on disk.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param relative_path: Repo-root-relative path from the changes list.
+        :param base: Base branch name; the default is derived when omitted.
+        :returns: JSON with ``before`` and ``after`` content strings.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_READ)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_diff",
+            host_params={"base": base, "path": relative_path},
+            runner_path=f"/v1/sessions/{session_id}/resources/github/diff/{relative_path}",
+            runner_params={"base": base} if base else None,
+        )
+
+    @file_read_router.get(
         "/sessions/{session_id}/resources/environments"
         "/{environment_id}/filesystem/{relative_path:path}",
         response_model=None,
@@ -2231,6 +2300,67 @@ def register_resources_routes(
             request=request,
             environment_id=environment_id,
             publish_invalidation=False,
+        )
+
+    # ── GitHub integration (read-only) ───────────────────────────
+    # Registered BEFORE the generic ``/{resource_id}`` lookup so
+    # ``/resources/github`` is not captured as a resource id. The diff route
+    # lives on ``file_read_router`` (gzip) above.
+
+    @router.get(
+        "/sessions/{session_id}/resources/github",
+        response_model=None,
+    )
+    async def get_session_github(
+        request: Request,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """
+        Return GitHub context (repo, branch, base ref, PR) for a session.
+
+        Proxies to the runner, which shells out to ``gh``/``git`` in the
+        workspace. Returns an ``available: false`` payload (200) when ``gh`` is
+        missing or the workspace is not a git repo.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :returns: The ``session.github.info`` object.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_READ)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_info",
+            host_params={},
+            runner_path=f"/v1/sessions/{session_id}/resources/github",
+        )
+
+    @router.get(
+        "/sessions/{session_id}/resources/github/changes",
+        response_model=None,
+    )
+    async def list_session_github_changes(
+        request: Request,
+        session_id: str,
+        base: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        """
+        List files changed on the branch relative to its base (PR diff).
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param base: Base branch name; the runner derives the default when
+            omitted.
+        :returns: Flat list of changed files with ``status`` and line counts.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_READ)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_changes",
+            host_params={"base": base},
+            runner_path=f"/v1/sessions/{session_id}/resources/github/changes",
+            runner_params={"base": base} if base else None,
         )
 
     # Generic single-resource lookup — registered AFTER typed

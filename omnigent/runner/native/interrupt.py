@@ -49,6 +49,7 @@ from omnigent.runner.resource_registry import SessionResourceRegistry
 
 if TYPE_CHECKING:
     from omnigent.codex_native_bridge import CodexNativeBridgeState
+    from omnigent.harness_plugins import NativeCodingAgent
 
 
 class SubagentDeliveryAck(Protocol):
@@ -244,6 +245,52 @@ _UNIFORM_STOP: dict[str, _UniformStop] = {
 }
 
 
+def native_agent_for_cancel(wrapper_label: str | None) -> NativeCodingAgent | None:
+    """Resolve a native agent from a session wrapper or sub-agent wrapper label.
+
+    :param wrapper_label: ``omnigent.wrapper`` value, e.g. ``"goose-native-ui"``
+        or ``"claude-code-native-ui-subagent"``.
+    :returns: The matching :class:`~omnigent.harness_plugins.NativeCodingAgent`,
+        or ``None`` when the label is missing or not native.
+    """
+    from omnigent.native_coding_agents import (
+        NATIVE_CODING_AGENTS,
+        native_coding_agent_for_wrapper_label,
+    )
+
+    agent = native_coding_agent_for_wrapper_label(wrapper_label)
+    if agent is not None:
+        return agent
+    if not wrapper_label:
+        return None
+    for candidate in NATIVE_CODING_AGENTS:
+        if candidate.subagent_wrapper_label == wrapper_label:
+            return candidate
+    return None
+
+
+def native_cancel_capability(wrapper_label: str | None) -> str:
+    """Classify a child's wrapper for parent-side ``sys_cancel_task`` routing.
+
+    Mirrors :meth:`NativeInterruptRunner.stop` instead of comparing one Claude
+    wrapper label:
+
+    * ``"stop"`` — Claude's dedicated stop, or a key in :data:`_UNIFORM_STOP`
+    * ``"best_effort"`` — remaining native agents (Codex/Pi alias stop to
+      interrupt; Antigravity/OpenCode have no stop handler)
+    * ``"inprocess"`` — no native agent for this label
+
+    :param wrapper_label: The work entry's ``omnigent.wrapper`` value.
+    :returns: One of ``"stop"``, ``"best_effort"``, or ``"inprocess"``.
+    """
+    agent = native_agent_for_cancel(wrapper_label)
+    if agent is None:
+        return "inprocess"
+    if agent.key == "claude" or agent.key in _UNIFORM_STOP:
+        return "stop"
+    return "best_effort"
+
+
 class NativeInterruptRunner:
     """Forward interrupt / stop events into a session's native harness bridge."""
 
@@ -385,6 +432,10 @@ class NativeInterruptRunner:
                 module.kill_session, module.bridge_dir_for_session_id(conv_id), timeout_s=1.0
             )
         except RuntimeError as exc:
+            # 503 means the kill attempt failed — including a transient tmux
+            # error against a still-running pane. This is not proof the pane
+            # is already gone. Claude's genuine gone case is
+            # ``TmuxSessionNotAdvertised`` and returns 204 from ``_claude_stop``.
             return JSONResponse(
                 status_code=503,
                 content={

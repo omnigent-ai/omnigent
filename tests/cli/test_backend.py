@@ -13,8 +13,10 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import re
 import sys
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -88,6 +90,30 @@ def _patch_daemon_spawn(
         return proc
 
     monkeypatch.setattr(cli.subprocess, "Popen", _popen)
+
+    def _claim(
+        target: str,
+        spawned: cli._SpawnedDaemonProcess,
+        **_kwargs: object,
+    ) -> cli._HostDaemonRecord | None:
+        env = captured["env"]
+        assert isinstance(env, dict)
+        mode = "local" if target == "local" else "server"
+        cli._write_daemon_record(
+            cli._HostDaemonRecord(
+                pid=spawned.pid,
+                target=target,
+                mode=mode,
+                server_url=None if mode == "local" else target,
+                log_path=spawned.log_path,
+                started_at=int(cli.time.time()),
+                config_sig=str(env[cli.DAEMON_CONFIG_SIG_ENV_VAR]),
+            )
+        )
+        cli._HOST_PID_PATH.write_text(f"{spawned.pid}\n{target}\n")
+        return cli._find_daemon_record(target)
+
+    monkeypatch.setattr(cli, "_wait_for_daemon_claim", _claim)
 
 
 def _write_daemon_registry_record(
@@ -542,6 +568,95 @@ def test_ensure_host_daemon_young_offline_daemon_not_torn_down(
 
     assert torn_down == []
     assert "args" not in captured  # reused despite being offline (still connecting)
+
+
+def test_concurrent_ensure_host_daemon_elects_one_daemon(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Concurrent launchers may spawn, but only one daemon claims the target."""
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_build_host_daemon_env", lambda **_kw: {})
+    monkeypatch.setattr(cli, "server_config_signature", lambda **_kw: "sig")
+    live_pids: set[int] = set()
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: pid in live_pids)
+
+    both_spawned = threading.Barrier(2)
+    spawn_count = 0
+    count_lock = threading.Lock()
+
+    def _spawn(**_kw: object) -> cli._SpawnedDaemonProcess:
+        nonlocal spawn_count
+        with count_lock:
+            spawn_count += 1
+            count = spawn_count
+        pid = 4241 + count
+        both_spawned.wait(timeout=5)
+        if count == 1:
+            live_pids.add(pid)
+            target = "https://server.example.com"
+            cli._write_daemon_record(
+                cli._HostDaemonRecord(
+                    pid=pid,
+                    target=target,
+                    mode="server",
+                    server_url=target,
+                    log_path=str(tmp_path / "host.log"),
+                    started_at=int(cli.time.time()),
+                    config_sig="sig",
+                )
+            )
+        return cli._SpawnedDaemonProcess(pid=pid, log_path=str(tmp_path / "host.log"))
+
+    monkeypatch.setattr(cli, "_spawn_host_daemon_process", _spawn)
+    errors: list[Exception] = []
+
+    def _ensure() -> None:
+        try:
+            _ensure_host_daemon("https://server.example.com")
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    first = threading.Thread(target=_ensure)
+    second = threading.Thread(target=_ensure)
+    first.start()
+    second.start()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert spawn_count == 2
+    record = cli._find_daemon_record("https://server.example.com")
+    assert record is not None
+    assert record.pid == 4242
+
+
+def test_ensure_host_daemon_warns_when_spawned_daemon_never_claims(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A spawned daemon that never writes its record is surfaced, not silent."""
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_build_host_daemon_env", lambda **_kw: {})
+    monkeypatch.setattr(cli, "server_config_signature", lambda **_kw: "sig")
+    log_path = tmp_path / "host.log"
+    monkeypatch.setattr(
+        cli,
+        "_spawn_host_daemon_process",
+        lambda **_kw: cli._SpawnedDaemonProcess(pid=4242, log_path=str(log_path)),
+    )
+    # The daemon crashes before claiming: no record ever appears.
+    monkeypatch.setattr(cli, "_wait_for_daemon_claim", lambda *_a, **_kw: None)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.cli"):
+        _ensure_host_daemon("https://server.example.com")
+
+    assert any(
+        "did not claim its registry record" in message and str(log_path) in message
+        for message in caplog.messages
+    )
 
 
 def _online_record() -> cli._HostDaemonRecord:

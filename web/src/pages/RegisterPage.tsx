@@ -17,8 +17,11 @@
  * type a mixed-case value that the server then rejects.
  */
 
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { useSearchParams } from "@/lib/routing";
+import { useLoginV2 } from "@/lib/useLoginV2";
+import { AuthCardShell } from "@/pages/onboarding/AuthCardShell";
+import { JoinTeamStep } from "@/pages/onboarding/JoinTeamStep";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { register as registerRequest } from "@/lib/accountsApi";
@@ -26,6 +29,7 @@ import { register as registerRequest } from "@/lib/accountsApi";
 const MIN_PASSWORD_LENGTH = 8;
 
 export function RegisterPage() {
+  const loginV2 = useLoginV2();
   const [params] = useSearchParams();
   const invite = params.get("invite") ?? "";
 
@@ -34,6 +38,7 @@ export function RegisterPage() {
   const [confirm, setConfirm] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [accepted, setAccepted] = useState(false); // v2: invite landing accepted
 
   // Server rejects invites that are missing / expired / redeemed
   // with a generic 400. Surface the same generic UI in the
@@ -69,6 +74,115 @@ export function RegisterPage() {
     setError(result.error);
   }
 
+  const body: ReactNode = (
+    <>
+      <div className="space-y-1 text-center">
+        <h1 className="text-2xl font-semibold tracking-tight">Create your account</h1>
+        <p className="text-ui text-muted-foreground">
+          You were invited to join this Omnigent server.
+        </p>
+      </div>
+
+      {missingInvite ? (
+        <div
+          role="alert"
+          className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
+        >
+          This page needs an invite token in the URL — make sure you opened the link your admin sent
+          you.
+        </div>
+      ) : (
+        <form onSubmit={onSubmit} className="space-y-4">
+          <div className="space-y-1.5">
+            <label htmlFor="register-username" className="text-ui font-medium leading-none">
+              Username
+            </label>
+            <Input
+              id="register-username"
+              type="text"
+              autoComplete="username"
+              value={username}
+              onChange={(e) => setUsername(e.target.value.toLowerCase())}
+              disabled={submitting}
+              required
+              pattern="[a-z0-9][a-z0-9._\-]{0,63}(@[a-z0-9.\-]+\.[a-z]{2,})?"
+              title="Lowercase letters, digits, dots, hyphens, underscores (or a lowercase email)"
+            />
+            <p className="text-sm text-muted-foreground">
+              Lowercase letters, digits, dots, hyphens, underscores — or a lowercase email.
+            </p>
+          </div>
+
+          <div className="space-y-1.5">
+            <label htmlFor="register-password" className="text-ui font-medium leading-none">
+              Password
+            </label>
+            <Input
+              id="register-password"
+              type="password"
+              autoComplete="new-password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              disabled={submitting}
+              required
+              minLength={MIN_PASSWORD_LENGTH}
+            />
+          </div>
+
+          <div className="space-y-1.5">
+            <label htmlFor="register-confirm" className="text-ui font-medium leading-none">
+              Confirm password
+            </label>
+            <Input
+              id="register-confirm"
+              type="password"
+              autoComplete="new-password"
+              value={confirm}
+              onChange={(e) => setConfirm(e.target.value)}
+              disabled={submitting}
+              required
+              minLength={MIN_PASSWORD_LENGTH}
+            />
+          </div>
+
+          {error !== null && (
+            <div
+              role="alert"
+              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
+            >
+              {error}
+            </div>
+          )}
+
+          <Button
+            type="submit"
+            className="w-full"
+            disabled={submitting || password.length < MIN_PASSWORD_LENGTH || username.length === 0}
+            componentId="register.create_account"
+          >
+            {submitting ? "Creating…" : "Create account"}
+          </Button>
+        </form>
+      )}
+    </>
+  );
+
+  // v2: a valid invite shows the "Join your team" landing first (Accept →
+  // form); a missing invite skips it. One shell across both steps so the panel
+  // isn't remounted (a fresh AnimatedOmnigentPanel re-inits its WebGL context).
+  if (loginV2) {
+    const showLanding = !missingInvite && !accepted;
+    return (
+      <AuthCardShell panelHeight={showLanding ? 340 : undefined}>
+        {showLanding ? (
+          <JoinTeamStep onAccept={() => setAccepted(true)} />
+        ) : (
+          <div className="flex flex-col gap-6">{body}</div>
+        )}
+      </AuthCardShell>
+    );
+  }
+
   return (
     <div
       className="flex min-h-screen items-center justify-center bg-background px-4"
@@ -79,98 +193,7 @@ export function RegisterPage() {
         paddingBottom: "var(--omnigent-safe-bottom)",
       }}
     >
-      <div className="w-full max-w-sm space-y-6">
-        <div className="space-y-1 text-center">
-          <h1 className="text-2xl font-semibold tracking-tight">Create your account</h1>
-          <p className="text-ui text-muted-foreground">
-            You were invited to join this Omnigent server.
-          </p>
-        </div>
-
-        {missingInvite ? (
-          <div
-            role="alert"
-            className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
-          >
-            This page needs an invite token in the URL — make sure you opened the link your admin
-            sent you.
-          </div>
-        ) : (
-          <form onSubmit={onSubmit} className="space-y-4">
-            <div className="space-y-1.5">
-              <label htmlFor="register-username" className="text-ui font-medium leading-none">
-                Username
-              </label>
-              <Input
-                id="register-username"
-                type="text"
-                autoComplete="username"
-                value={username}
-                onChange={(e) => setUsername(e.target.value.toLowerCase())}
-                disabled={submitting}
-                required
-                pattern="[a-z0-9][a-z0-9._\-]{0,63}(@[a-z0-9.\-]+\.[a-z]{2,})?"
-                title="Lowercase letters, digits, dots, hyphens, underscores (or a lowercase email)"
-              />
-              <p className="text-sm text-muted-foreground">
-                Lowercase letters, digits, dots, hyphens, underscores — or a lowercase email.
-              </p>
-            </div>
-
-            <div className="space-y-1.5">
-              <label htmlFor="register-password" className="text-ui font-medium leading-none">
-                Password
-              </label>
-              <Input
-                id="register-password"
-                type="password"
-                autoComplete="new-password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                disabled={submitting}
-                required
-                minLength={MIN_PASSWORD_LENGTH}
-              />
-            </div>
-
-            <div className="space-y-1.5">
-              <label htmlFor="register-confirm" className="text-ui font-medium leading-none">
-                Confirm password
-              </label>
-              <Input
-                id="register-confirm"
-                type="password"
-                autoComplete="new-password"
-                value={confirm}
-                onChange={(e) => setConfirm(e.target.value)}
-                disabled={submitting}
-                required
-                minLength={MIN_PASSWORD_LENGTH}
-              />
-            </div>
-
-            {error !== null && (
-              <div
-                role="alert"
-                className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
-              >
-                {error}
-              </div>
-            )}
-
-            <Button
-              type="submit"
-              className="w-full"
-              disabled={
-                submitting || password.length < MIN_PASSWORD_LENGTH || username.length === 0
-              }
-              componentId="register.create_account"
-            >
-              {submitting ? "Creating…" : "Create account"}
-            </Button>
-          </form>
-        )}
-      </div>
+      <div className="w-full max-w-sm space-y-6">{body}</div>
     </div>
   );
 }

@@ -864,3 +864,46 @@ def test_log_sse_event_noop_when_sink_disabled(monkeypatch: pytest.MonkeyPatch) 
     with _capturing_sse_logger() as records:
         session_stream._log_sse_event("conv_1", {"type": "response.completed"})
     assert records == []
+
+
+@contextlib.contextmanager
+def _capturing_audit_logger() -> Iterator[list[logging.LogRecord]]:
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    logger = session_stream.audit_event_logger()
+    old_level = logger.level
+    logger.setLevel(logging.INFO)
+    handler = _Capture()
+    logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+
+
+def test_log_sse_event_emits_turn_finished_on_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A terminal SSE event emits one first-class turn_finished audit row carrying
+    # the outcome + safe ids; a non-terminal event emits none.
+    monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
+    with _capturing_audit_logger() as records:
+        session_stream._log_sse_event(
+            "conv_1", {"type": "response.completed", "response": {"id": "resp_1"}}
+        )
+        session_stream._log_sse_event(
+            "conv_1", {"type": "response.failed", "error": {"code": "timeout", "message": "x"}}
+        )
+        session_stream._log_sse_event("conv_1", {"type": "response.output_text.delta"})
+
+    assert [r.event_name for r in records] == ["turn_finished", "turn_finished"]
+    completed = records[0]
+    assert completed.session_id == "conv_1"
+    assert completed.levelno == logging.INFO
+    assert completed.attributes == {"outcome": "completed", "response_id": "resp_1"}
+    failed = records[1]
+    assert failed.levelno == logging.WARNING
+    assert failed.attributes == {"outcome": "failed", "error_code": "timeout"}  # no message text

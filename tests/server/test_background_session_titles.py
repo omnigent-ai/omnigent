@@ -6,6 +6,7 @@ import uuid
 
 import pytest
 
+from omnigent.runner.background_titles.service import FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION
 from omnigent.server.background_session_titles import (
     BACKGROUND_TITLE_MAX_CHARS,
     CUSTOM_BACKGROUND_TITLE_MAX_CHARS,
@@ -503,10 +504,25 @@ async def test_runner_generator_posts_session_configuration() -> None:
                 "harness_override": "claude-sdk",
                 "model_override": "claude-sonnet-4-6",
                 "sub_agent_name": None,
-                "additional_instructions": "Use the requested slug format.",
+                "additional_instructions": (
+                    "Use the requested slug format.\n"
+                    "Unless another language is explicitly requested, write the title "
+                    "in the same primary language as the user's message."
+                ),
             },
         )
     ]
+
+
+async def test_runner_generator_posts_language_rule_without_operator_customization() -> None:
+    client = _FakeRunnerClient()
+    generator = RunnerBackgroundTitleGenerator(_FakeRunnerRouter(client))  # type: ignore[arg-type]
+
+    await generator(BackgroundTitleRequest(session_id="conv_test", prompt="请修复登录超时"))
+
+    assert client.requests[0][1]["additional_instructions"] == (
+        FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION
+    )
 
 
 async def test_schedule_is_one_shot_per_session(db_uri: str) -> None:

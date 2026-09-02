@@ -13,6 +13,7 @@ afterEach(cleanup);
 
 const FILE_VIEWER_NOOP = {
   openFile: () => {},
+  openGithubTab: () => {},
   isChangedPath: () => false,
   conversationId: undefined,
   workspaceRoot: null,

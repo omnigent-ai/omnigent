@@ -508,6 +508,37 @@ def test_env_var_name_override_is_validated(monkeypatch: pytest.MonkeyPatch) -> 
         KubernetesSandboxLauncher()._resolve_namespace()
 
 
+def test_pod_ready_timeout_defaults_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no config and no env var, the hardcoded default wins."""
+    monkeypatch.delenv(k8s._POD_READY_TIMEOUT_ENV_VAR, raising=False)
+    assert k8s._resolve_pod_ready_timeout_s(None) == k8s._POD_READY_TIMEOUT_S
+
+
+def test_pod_ready_timeout_env_var_overrides_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no explicit config, the env var overrides the hardcoded default."""
+    monkeypatch.setenv(k8s._POD_READY_TIMEOUT_ENV_VAR, "300")
+    assert k8s._resolve_pod_ready_timeout_s(None) == 300
+
+
+def test_pod_ready_timeout_config_wins_over_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    """sandbox.kubernetes.pod_ready_timeout_s takes precedence over the env var."""
+    monkeypatch.setenv(k8s._POD_READY_TIMEOUT_ENV_VAR, "300")
+    assert k8s._resolve_pod_ready_timeout_s(45) == 45
+
+
+def test_pod_ready_timeout_env_var_accepts_float_string(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A float-looking env value is accepted, matching the E2B lifetime resolver."""
+    monkeypatch.setenv(k8s._POD_READY_TIMEOUT_ENV_VAR, "120.0")
+    assert k8s._resolve_pod_ready_timeout_s(None) == 120
+
+
+def test_pod_ready_timeout_env_var_rejects_non_numeric(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A malformed env value fails fast with a clear error instead of a raw ValueError."""
+    monkeypatch.setenv(k8s._POD_READY_TIMEOUT_ENV_VAR, "not-a-number")
+    with pytest.raises(click.ClickException, match="must be a number of seconds"):
+        k8s._resolve_pod_ready_timeout_s(None)
+
+
 # ── SDK-driven tests (fake kubernetes client) ───────────────
 
 

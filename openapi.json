@@ -1717,7 +1717,8 @@
             "enum": [
               "llm",
               "execution",
-              "tool"
+              "tool",
+              "harness"
             ],
             "title": "Source",
             "type": "string"
@@ -1812,11 +1813,12 @@
             "title": "Sequence Number"
           },
           "source": {
-            "description": "Origin of the error \u2014 `\"llm\"` for LLM-call failures, `\"execution\"` for timeouts, `\"tool\"` for tool failures (currently emitted by retry exhaustion paths).",
+            "description": "Origin of the error -- `\"llm\"` for LLM-call failures, `\"execution\"` for timeouts, `\"tool\"` for tool failures, `\"harness\"` for harness process failures.",
             "enum": [
               "llm",
               "execution",
-              "tool"
+              "tool",
+              "harness"
             ],
             "title": "Source",
             "type": "string"
@@ -1876,6 +1878,18 @@
             ],
             "default": null,
             "title": "Sequence Number"
+          },
+          "source": {
+            "default": "execution",
+            "description": "Where the fault originated -- `\"llm\"` for inference/context errors, `\"harness\"` for Claude Code/harness process failures, `\"execution\"` for runner configuration or infrastructure failures.",
+            "enum": [
+              "llm",
+              "execution",
+              "tool",
+              "harness"
+            ],
+            "title": "Source",
+            "type": "string"
           },
           "type": {
             "const": "response.failed",
@@ -4013,6 +4027,13 @@
             "title": "Dictation Available",
             "type": "boolean"
           },
+          "enabled_connections": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Enabled Connections",
+            "type": "array"
+          },
           "features": {
             "additionalProperties": {
               "type": "boolean"
@@ -4107,6 +4128,7 @@
           "managed_sandboxes_enabled",
           "sandbox_provider",
           "sandbox_providers",
+          "enabled_connections",
           "sharing_mode",
           "public_sharing_enabled",
           "server_version",
@@ -5313,7 +5335,7 @@
         "type": "object"
       },
       "SessionModelEvent": {
-        "description": "Active-model report from a terminal-backed integration.\n\nEmitted after an `external_model_change` POST from a native\nforwarder \u2014 the launch's own model report, or a switch made inside\nthe pane (a `/model` command or the in-TUI picker). Every surface\nre-renders its model display from this.",
+        "description": "Active-model report from a harness integration.\n\nEmitted after an `external_model_change` POST from a native\nforwarder or when an SDK relay reports its concrete model in terminal\nresponse usage. Every surface re-renders its model display from this.",
         "properties": {
           "conversation_id": {
             "description": "Session identifier, e.g. `\"conv_abc123\"`.",
@@ -13158,6 +13180,107 @@
           }
         },
         "summary": "Copy Session Files",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github": {
+      "get": {
+        "description": "Return GitHub context (repo, branch, base ref, PR) for a session.\n\nProxies to the runner, which shells out to `gh`/`git` in the\nworkspace. Returns an `available: false` payload (200) when `gh` is\nmissing or the workspace is not a git repo.\n\n**Returns:** The `session.github.info` object.",
+        "operationId": "get_session_github_v1_sessions__session_id__resources_github_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Github",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/changes": {
+      "get": {
+        "description": "List files changed on the branch relative to its base (PR diff).\n\n**Returns:** Flat list of changed files with `status` and line counts.",
+        "operationId": "list_session_github_changes_v1_sessions__session_id__resources_github_changes_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Base branch name; the runner derives the default when omitted.",
+            "in": "query",
+            "name": "base",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Base"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Github Changes",
         "tags": [
           "session_resources"
         ]

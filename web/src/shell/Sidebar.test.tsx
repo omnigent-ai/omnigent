@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
+import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
@@ -60,6 +61,10 @@ const {
 
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: useHostsMock,
+  // The project-settings dialog (mounted by Sidebar rows) resolves model
+  // options through this hook; no test here opens it, so an empty catalog is
+  // enough to keep the module contract satisfied.
+  useHostModelOptions: () => ({ data: [] }),
 }));
 
 // Mutation hooks are only invoked on row actions; stub them. useConversations
@@ -269,6 +274,7 @@ beforeEach(() => {
   useHostsMock.mockReturnValue({ data: [] });
   localStorage.clear();
   clearSessionDrafts();
+  clearOptimisticTitles();
   projectsMock.length = 0;
   moveToProjectSpy.mockReset();
   deleteProjectSpy.mockReset();
@@ -296,6 +302,26 @@ describe("Sidebar session list", () => {
 
     expect(screen.getByText("No sessions")).toHaveClass("text-ui");
     expect(screen.getByText("No sessions")).not.toHaveClass("text-sm");
+  });
+
+  it("flips a just-created session's row to its provisional first-prompt label", () => {
+    mockConversations([
+      conv("conv_opt", "Claude Code", {
+        title: null,
+        labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      }),
+    ]);
+    renderSidebar();
+
+    // Before the landing form's stash lands (and for sessions born
+    // elsewhere), the row reads as the wrapper name.
+    expect(screen.getByText("Claude Code")).toBeInTheDocument();
+
+    act(() => recordOptimisticTitle("conv_opt", "debug the login redirect"));
+
+    const label = screen.getByText("debug the login redirect");
+    expect(label).toHaveClass("italic", "text-muted-foreground");
+    expect(screen.queryByText("Claude Code")).not.toBeInTheDocument();
   });
 
   it("uses the interface text token for session-list errors", () => {
@@ -350,13 +376,13 @@ describe("Sidebar session list", () => {
     // as desktop; only desktop hover widens it for the revealed controls.
     expect(row).toHaveClass("pr-2");
     expect(row.className).not.toMatch(/(?:^|\s)pr-28(?:\s|$)/);
-    expect(row.className).toContain("md:group-hover:pr-14");
+    expect(row.className).toContain("md:group-hover:pr-20");
     // Keyed on `:focus-visible`, matching when the trailing controls appear and
     // the state marker fades. `focus-within` would also fire for a plain click,
     // narrowing the reserve on the selected row while the marker stayed put.
-    expect(row.className).toContain("md:group-has-[:focus-visible]:pr-14");
-    expect(row.className).not.toContain("md:group-focus-within:pr-14");
-    expect(row.className).not.toMatch(/(?:^|\s)md:pr-14(?:\s|$)/);
+    expect(row.className).toContain("md:group-has-[:focus-visible]:pr-20");
+    expect(row.className).not.toContain("md:group-focus-within:pr-20");
+    expect(row.className).not.toMatch(/(?:^|\s)md:pr-20(?:\s|$)/);
   });
 
   it("narrows the awaiting row's reserve on the same trigger that fades its tag", () => {
@@ -379,7 +405,7 @@ describe("Sidebar session list", () => {
     // Every state that narrows the reserve must also fade the tag, and vice
     // versa, so the two can never disagree about whether the space is free.
     for (const trigger of ["md:group-hover:", "md:group-has-[:focus-visible]:"]) {
-      expect(row.className).toContain(`${trigger}pr-14`);
+      expect(row.className).toContain(`${trigger}pr-20`);
       expect(tag.parentElement!.className).toContain(`${trigger}opacity-0`);
     }
     // `focus-within` fires for a plain mouse click, which the tag's fade does
