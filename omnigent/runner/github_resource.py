@@ -106,39 +106,59 @@ def _gh(argv: list[str], *, cwd: str) -> tuple[int | None, str, str]:
     return _run(["gh", *argv], cwd=cwd, timeout=_gh_timeout_seconds())
 
 
-def _summarize_checks(rollup: Any) -> dict[str, int]:
-    """Reduce a ``statusCheckRollup`` list to passing/failing/pending counts."""
-    passing = failing = pending = 0
+# Cap the per-check list so a pathological rollup can't bloat the payload; the
+# counts stay exact regardless.
+_MAX_CHECK_RUNS = 300
+
+
+def _classify_check(check: dict[str, Any]) -> str:
+    """Bucket a single ``statusCheckRollup`` entry: passing / failing / pending."""
+    # CheckRun carries status/conclusion; StatusContext carries state.
+    state = check.get("state")
+    if state is not None:
+        upper = str(state).upper()
+        if upper == "SUCCESS":
+            return "passing"
+        if upper in ("FAILURE", "ERROR"):
+            return "failing"
+        return "pending"
+    if str(check.get("status", "")).upper() != "COMPLETED":
+        return "pending"
+    conclusion = str(check.get("conclusion", "")).upper()
+    return "passing" if conclusion in ("SUCCESS", "NEUTRAL", "SKIPPED") else "failing"
+
+
+def _summarize_checks(rollup: Any) -> dict[str, Any]:
+    """Summarize a ``statusCheckRollup`` into bucket counts + per-check details.
+
+    :returns: ``{passing, failing, pending, total, runs}`` where ``runs`` is a
+        list of ``{name, bucket, url}`` (the job names the UI shows on hover).
+    """
+    counts = {"passing": 0, "failing": 0, "pending": 0}
+    runs: list[dict[str, Any]] = []
     if isinstance(rollup, list):
         for check in rollup:
             if not isinstance(check, dict):
                 continue
-            # CheckRun carries status/conclusion; StatusContext carries state.
-            state = check.get("state")
-            if state is not None:
-                upper = str(state).upper()
-                if upper == "SUCCESS":
-                    passing += 1
-                elif upper in ("FAILURE", "ERROR"):
-                    failing += 1
-                else:
-                    pending += 1
-                continue
-            status = str(check.get("status", "")).upper()
-            if status != "COMPLETED":
-                pending += 1
-                continue
-            conclusion = str(check.get("conclusion", "")).upper()
-            if conclusion in ("SUCCESS", "NEUTRAL", "SKIPPED"):
-                passing += 1
-            else:
-                failing += 1
-    total = passing + failing + pending
+            bucket = _classify_check(check)
+            counts[bucket] += 1
+            if len(runs) < _MAX_CHECK_RUNS:
+                # CheckRun → name (falling back to the workflow); StatusContext
+                # → context. Link is detailsUrl (CheckRun) or targetUrl (status).
+                name = check.get("name") or check.get("context") or check.get("workflowName")
+                runs.append(
+                    {
+                        "name": str(name) if name else "check",
+                        "bucket": bucket,
+                        "url": check.get("detailsUrl") or check.get("targetUrl") or None,
+                    }
+                )
     return {
-        "passing": passing,
-        "failing": failing,
-        "pending": pending,
-        "total": total,
+        "passing": counts["passing"],
+        "failing": counts["failing"],
+        "pending": counts["pending"],
+        "total": counts["passing"] + counts["failing"] + counts["pending"],
+        "runs": runs,
     }
 
 

@@ -122,7 +122,16 @@ beforeEach(() => {
         author: "dev",
         base_ref: "main",
         head_ref: "test/pr-view",
-        checks: { passing: 66, failing: 2, pending: 0, total: 68 },
+        checks: {
+          passing: 66,
+          failing: 2,
+          pending: 0,
+          total: 68,
+          runs: [
+            { name: "unit tests", bucket: "passing", url: null },
+            { name: "e2e", bucket: "failing", url: null },
+          ],
+        },
       },
     },
     isLoading: false,
@@ -146,15 +155,16 @@ afterEach(() => {
 });
 
 describe("GithubPanel", () => {
-  it("shows the PR header with title and a labeled CI checks line", async () => {
+  it("shows the PR header with title and CI check pills", async () => {
     renderPanel();
     expect(await screen.findByText("chore: dummy PR")).toBeInTheDocument();
     expect(screen.getByText("#6000")).toBeInTheDocument();
-    // CI checks are on their own line, explicitly labeled (not a diffstat).
-    expect(screen.getByText("Checks:")).toBeInTheDocument();
-    expect(screen.getByText(/Passed: 66/)).toBeInTheDocument();
-    expect(screen.getByText(/Failed: 2/)).toBeInTheDocument();
-    expect(screen.getByText(/Pending: 0/)).toBeInTheDocument();
+    // CI checks are on their own line as labeled pills (not a diffstat). A
+    // zero bucket (pending) renders no pill.
+    expect(screen.getByText("Checks")).toBeInTheDocument();
+    expect(screen.getByText(/66\s*passed/)).toBeInTheDocument();
+    expect(screen.getByText(/2\s*failed/)).toBeInTheDocument();
+    expect(screen.queryByText(/pending/)).toBeNull();
   });
 
   it("stacks a diff section per changed file", async () => {

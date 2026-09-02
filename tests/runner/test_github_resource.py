@@ -154,21 +154,32 @@ def test_github_pr_diff_unresolvable_base(repo: Path) -> None:
 def test_summarize_checks_mixed() -> None:
     """The reducer classifies CheckRun (status/conclusion) and StatusContext (state)."""
     rollup = [
-        {"status": "COMPLETED", "conclusion": "SUCCESS"},
-        {"status": "COMPLETED", "conclusion": "FAILURE"},
-        {"status": "IN_PROGRESS", "conclusion": None},
-        {"state": "SUCCESS"},
-        {"state": "PENDING"},
-        {"state": "ERROR"},
+        {"name": "unit", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "u"},
+        {"name": "e2e", "status": "COMPLETED", "conclusion": "FAILURE"},
+        {"workflowName": "bench", "status": "IN_PROGRESS", "conclusion": None},
+        {"context": "legacy-ok", "state": "SUCCESS", "targetUrl": "t"},
+        {"context": "legacy-wait", "state": "PENDING"},
+        {"context": "legacy-err", "state": "ERROR"},
     ]
-    assert _summarize_checks(rollup) == {
-        "passing": 2,
-        "failing": 2,
-        "pending": 2,
-        "total": 6,
-    }
+    result = _summarize_checks(rollup)
+    assert result["passing"] == 2
+    assert result["failing"] == 2
+    assert result["pending"] == 2
+    assert result["total"] == 6
+    # Per-check details carry the job name, bucket, and link (name falls back to
+    # context / workflowName; url falls back to targetUrl).
+    assert {"name": "unit", "bucket": "passing", "url": "u"} in result["runs"]
+    assert {"name": "e2e", "bucket": "failing", "url": None} in result["runs"]
+    assert {"name": "bench", "bucket": "pending", "url": None} in result["runs"]
+    assert {"name": "legacy-ok", "bucket": "passing", "url": "t"} in result["runs"]
 
 
 def test_summarize_checks_empty() -> None:
-    """A missing/empty rollup summarizes to all zeros."""
-    assert _summarize_checks(None) == {"passing": 0, "failing": 0, "pending": 0, "total": 0}
+    """A missing/empty rollup summarizes to all zeros with no runs."""
+    assert _summarize_checks(None) == {
+        "passing": 0,
+        "failing": 0,
+        "pending": 0,
+        "total": 0,
+        "runs": [],
+    }

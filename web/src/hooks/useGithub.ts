@@ -24,11 +24,21 @@ import {
   type WorkspaceChangedFile,
 } from "@/hooks/useWorkspaceChangedFiles";
 
+/** One CI check the PR ran, bucketed for the checks summary. */
+export interface GithubCheckRun {
+  name: string;
+  bucket: "passing" | "failing" | "pending";
+  /** Link to the run on GitHub, or null when unknown. */
+  url: string | null;
+}
+
 export interface GithubChecks {
   passing: number;
   failing: number;
   pending: number;
   total: number;
+  /** Per-check details (job names) for the hover breakdown. */
+  runs: GithubCheckRun[];
 }
 
 export interface GithubPr {
