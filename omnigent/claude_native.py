@@ -1426,14 +1426,16 @@ def _resolve_session_id_for_resume(
     :param session_id: Explicit ``--resume <id>``; wins over the picker.
     :param resume_picker: ``True`` for bare ``--resume`` (no value).
     :returns: Conversation id, or ``None`` for "start fresh" / picker cancelled.
-    :raises click.ClickException: Picker requested but no prior sessions exist.
+    :raises click.ClickException: Picker requested but no prior sessions
+        exist, or the server answered the picker's session listing with
+        an error (e.g. a gateway 5xx while the upstream app is down).
     """
     if session_id is not None:
         return session_id
     if not resume_picker:
         return None
     # Deferred — omnigent_client / repl pull in heavy graphs we don't want at startup.
-    from omnigent_client import OmnigentClient
+    from omnigent_client import OmnigentClient, OmnigentError
 
     from omnigent.repl._resume_picker import pick_conversation_by_wrapper_label_from_sdk
 
@@ -1445,7 +1447,42 @@ def _resolve_session_id_for_resume(
                 client, wrapper_value=_WRAPPER_LABEL_VALUE, agent_name=_AGENT_NAME
             )
 
-    return asyncio.run(_drive())
+    try:
+        return asyncio.run(_drive())
+    except OmnigentError as exc:
+        # An HTTP error on the picker's session listing (e.g. a gateway
+        # 502 while the upstream app restarts) is a server-side condition,
+        # not a wrapper bug — surface an actionable message instead of
+        # letting the raw error hit the crash handler. Only 5xx gets the
+        # "transient, retry" framing; a 4xx (auth, bad request) needs the
+        # user to fix something, not wait.
+        status = f" (HTTP {exc.status_code})" if exc.status_code else ""
+        if exc.status_code is None or exc.status_code >= 500:
+            hint = (
+                "This is usually a transient server-side problem — retry "
+                "in a moment, and check the server is healthy "
+                f"(e.g. `curl {base_url}/health`)."
+            )
+        else:
+            hint = (
+                "Check that your credentials are valid (e.g. `omnigent "
+                "login`) and that --server points at the right Omnigent "
+                "server."
+            )
+        raise click.ClickException(
+            f"Could not list sessions for --resume from the omnigent server "
+            f"at {base_url}: {exc}{status}. {hint}"
+        ) from exc
+    except httpx.HTTPError as exc:
+        # Transport-level failure reaching the server (connect/read errors,
+        # timeouts) on the same journey — same actionable treatment as the
+        # unreachable-server handler on the session-create path.
+        raise click.ClickException(
+            f"Could not reach the omnigent server at {base_url} while "
+            f"listing sessions for --resume: {exc}. Confirm the server is "
+            f"running and reachable from here (e.g. `curl {base_url}/health`), "
+            "and that --server is correct."
+        ) from exc
 
 
 def _align_working_directory_with_session(
