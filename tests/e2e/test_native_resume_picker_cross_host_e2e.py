@@ -108,6 +108,13 @@ def _subprocess_env(home: Path | None = None) -> dict[str, str]:
     )
     if home is not None:
         env["HOME"] = str(home)
+        # The host daemon's lifecycle lock is keyed by data_dir()/daemons,
+        # and data_dir() prefers OMNIGENT_DATA_DIR over $HOME. The test
+        # session sets one shared OMNIGENT_DATA_DIR (see tests/conftest.py),
+        # so without a per-role override both daemons — same server URL —
+        # collide on one lock and the second exits before coming online.
+        # Pin the data dir under this role's HOME to match its identity.
+        env["OMNIGENT_DATA_DIR"] = str(home / ".omnigent")
     return env
 
 
