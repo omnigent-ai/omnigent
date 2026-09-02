@@ -296,3 +296,98 @@ async def test_create_session_policy_no_telemetry_on_error(
         )
     assert resp.status_code == 409
     mock_emit.assert_not_called()
+
+
+# ── Spec-policy list inclusion ─────────────────────────────────────────────
+
+
+def test_spec_to_response_includes_factory_params() -> None:
+    """``_spec_to_response`` surfaces ``factory_params`` from spec ``function.arguments``.
+
+    Without the fix, ``_spec_to_response`` never read ``spec.function.arguments``
+    so ``factory_params`` was absent from the response.  With the fix, a spec
+    like ``cost_budget(max_cost_usd=3.0)`` exposes ``factory_params`` in the
+    dict that ``list_policies`` returns.
+    """
+    from omnigent.server.routes.session_policies import _spec_to_response
+    from omnigent.spec.types import FunctionPolicySpec, FunctionRef
+
+    spec = FunctionPolicySpec(
+        name="session_cost_guard",
+        on=[],
+        function=FunctionRef(
+            path="omnigent.policies.builtins.cost.cost_budget",
+            arguments={"max_cost_usd": 3.0},
+        ),
+    )
+    result = _spec_to_response(spec, "spec")
+
+    assert result["source"] == "spec"
+    assert result["handler"] == "omnigent.policies.builtins.cost.cost_budget"
+    assert result["factory_params"] == {"max_cost_usd": 3.0}, (
+        f"factory_params absent or wrong: {result}"
+    )
+
+
+def test_spec_to_response_no_factory_params_when_arguments_none() -> None:
+    """``_spec_to_response`` omits ``factory_params`` when spec has no arguments."""
+    from omnigent.server.routes.session_policies import _spec_to_response
+    from omnigent.spec.types import FunctionPolicySpec, FunctionRef
+
+    spec = FunctionPolicySpec(
+        name="simple_guard",
+        on=[],
+        function=FunctionRef(
+            path="omnigent.policies.builtins.cost.cost_budget",
+            arguments=None,
+        ),
+    )
+    result = _spec_to_response(spec, "spec")
+    assert "factory_params" not in result
+
+
+async def test_list_policies_includes_spec_policies(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """``GET /v1/sessions/{id}/policies`` includes agent-spec guardrail policies.
+
+    The list endpoint builds ``admin_data + session_data`` but omitted
+    ``spec_data``.  With the fix, when the session is bound to an agent that
+    declares a ``cost_budget`` guardrail, that policy appears in the list with
+    ``source="spec"`` and correct ``factory_params``.
+    """
+    from tests.server.helpers import create_test_agent
+
+    agent = await create_test_agent(
+        client,
+        name="spec-policy-list-agent",
+        guardrails={
+            "policies": {
+                "session_cost_guard": {
+                    "type": "function",
+                    "function": {
+                        "path": "omnigent.policies.builtins.cost.cost_budget",
+                        "arguments": {"max_cost_usd": 5.0},
+                    },
+                }
+            }
+        },
+    )
+    # Create a new session bound to this agent (not the agent's own session).
+    session_resp = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert session_resp.status_code == 201
+    session_id = session_resp.json().get("session_id") or session_resp.json()["id"]
+
+    resp = await client.get(f"/v1/sessions/{session_id}/policies")
+    assert resp.status_code == 200
+    policies = resp.json()["data"]
+
+    spec_policies = [
+        p
+        for p in policies
+        if p.get("source") == "spec" and "cost_budget" in str(p.get("handler", ""))
+    ]
+    assert spec_policies, f"Spec-declared cost_budget policy missing from list; got: {policies!r}"
+    assert spec_policies[0].get("factory_params", {}).get("max_cost_usd") == 5.0

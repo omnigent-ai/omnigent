@@ -10,6 +10,8 @@ view. Spec policies have ``id=None`` and cannot be patched or deleted.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
 import uuid
 from typing import Any
@@ -25,6 +27,7 @@ from omnigent.policies.registry import (
     validate_factory_params,
 )
 from omnigent.runtime import get_caps
+from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.builder import invalidate_session_policy_specs_cache
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
 from omnigent.server.routes._auth_helpers import get_user_id, require_access
@@ -35,13 +38,16 @@ from omnigent.server.schemas import (
     UpdateSessionPolicyRequest,
 )
 from omnigent.spec.types import FunctionPolicySpec, PolicySpec
-from omnigent.stores import ConversationStore
+from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.events import PolicyDeletedEvent as _TelPolicyDeletedEvent
 from omnigent.telemetry.events import PolicyRegisteredEvent as _TelPolicyRegisteredEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
+
+
+_logger = logging.getLogger(__name__)
 
 
 def _generate_policy_id() -> str:
@@ -97,7 +103,11 @@ def _spec_to_response(spec: PolicySpec, source: str) -> dict[str, Any]:
         entry = get_entry(handler)
         description = entry.description if entry else handler
 
-    return {
+    factory_params: dict[str, Any] | None = None
+    if isinstance(spec, FunctionPolicySpec) and spec.function and spec.function.arguments:
+        factory_params = spec.function.arguments
+
+    result: dict[str, Any] = {
         "id": None,
         "object": "session.policy",
         "name": spec.name,
@@ -109,6 +119,9 @@ def _spec_to_response(spec: PolicySpec, source: str) -> dict[str, Any]:
         "created_at": 0,
         "updated_at": None,
     }
+    if factory_params is not None:
+        result["factory_params"] = factory_params
+    return result
 
 
 def create_session_policies_router(
@@ -116,6 +129,8 @@ def create_session_policies_router(
     conversation_store: ConversationStore,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
+    agent_store: AgentStore | None = None,
+    agent_cache: AgentCache | None = None,
 ) -> APIRouter:
     """Build the session policies router.
 
@@ -136,6 +151,12 @@ def create_session_policies_router(
     :param permission_store: Permission store used to check
         session-level access grants. ``None`` disables
         permission enforcement.
+    :param agent_store: Agent store used to look up the agent bound
+        to a session so its spec-declared policies can be included
+        in the list response. ``None`` skips spec policy inclusion.
+    :param agent_cache: Cache used to load the bound agent's spec
+        and surface its guardrail policies. ``None`` skips spec
+        policy inclusion.
     :returns: A configured :class:`APIRouter`.
     """
     router = APIRouter()
@@ -267,7 +288,37 @@ def create_session_policies_router(
         # Session policies from the store.
         session_policies = store.list_for_session(session_id)
         session_data = [_entity_to_response(p) for p in session_policies]
-        return {"object": "list", "data": admin_data + session_data}
+        # Agent-spec (guardrails) policies from the bound agent's spec.
+        # These are enforced by the policy engine but were omitted from
+        # this list, making them invisible to users.
+        spec_data: list[dict[str, Any]] = []
+        if agent_store is not None and agent_cache is not None:
+            conv = conversation_store.get_conversation(session_id)
+            if conv is not None and conv.agent_id is not None:
+                agent = agent_store.get(conv.agent_id)
+                if agent is not None:
+                    try:
+                        # agent_cache.load may download/extract a bundle on
+                        # cache miss; run it in a thread to avoid stalling the
+                        # event loop.
+                        loaded = await asyncio.to_thread(
+                            agent_cache.load,
+                            agent.id,
+                            agent.bundle_location,
+                            expand_env=agent.session_id is None,
+                        )
+                        if loaded.spec.guardrails and loaded.spec.guardrails.policies:
+                            spec_data = [
+                                _spec_to_response(p, "spec")
+                                for p in loaded.spec.guardrails.policies
+                            ]
+                    except Exception:  # noqa: BLE001
+                        _logger.debug(
+                            "Failed to load spec policies for session %s",
+                            session_id,
+                            exc_info=True,
+                        )
+        return {"object": "list", "data": admin_data + session_data + spec_data}
 
     @router.get("/sessions/{session_id}/policies/{policy_id}")
     async def get_policy(

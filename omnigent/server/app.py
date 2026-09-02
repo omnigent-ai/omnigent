@@ -2535,6 +2535,8 @@ def create_app(
                 conversation_store,
                 auth_provider=auth_provider,
                 permission_store=permission_store,
+                agent_store=agent_store,
+                agent_cache=agent_cache,
             ),
             prefix="/v1",
             tags=["session_policies"],
