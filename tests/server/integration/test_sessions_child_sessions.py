@@ -1663,6 +1663,47 @@ async def test_multipart_create_with_parent_links_child(
     assert child_id in listed_ids
 
 
+@pytest.mark.parametrize(
+    "harness,config,expected_args",
+    [
+        (
+            "codex-native",
+            {"yolo": True},
+            ["--dangerously-bypass-approvals-and-sandbox"],
+        ),
+        (
+            "claude-native",
+            {"permission_mode": "bypassPermissions"},
+            ["--permission-mode", "bypassPermissions"],
+        ),
+    ],
+)
+async def test_multipart_child_derives_native_bypass_args_from_uploaded_spec(
+    client: httpx.AsyncClient,
+    harness: str,
+    config: dict[str, Any],
+    expected_args: list[str],
+) -> None:
+    """A config-path child persists the uploaded agent's bypass stance."""
+    parent = await _create_parent_session(client, agent_name=f"bundle-yolo-parent-{harness}")
+    child_bundle = build_agent_bundle(
+        name=f"bundle-yolo-child-{harness}",
+        executor={"type": "omnigent", "config": {"harness": harness, **config}},
+        include_llm=False,
+    )
+
+    resp = await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({"parent_session_id": parent["id"]})},
+        files={"bundle": ("agent.tar.gz", child_bundle, "application/gzip")},
+    )
+
+    assert resp.status_code == 201, resp.text
+    child = await client.get(f"/v1/sessions/{resp.json()['session_id']}")
+    assert child.status_code == 200, child.text
+    assert child.json()["terminal_launch_args"] == expected_args
+
+
 async def test_multipart_create_with_unknown_parent_404s(
     client: httpx.AsyncClient,
 ) -> None:

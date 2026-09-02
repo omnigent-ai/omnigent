@@ -163,14 +163,16 @@ class _ConversationStore:
 
         :param conversation_id: Conversation id to update.
         :param title: Optional title to set.
-        :param kwargs: Extra store fields ignored by this test stub.
+        :param kwargs: Additional conversation fields used by relay tests.
         :returns: Updated conversation, or ``None`` if absent.
         """
-        del kwargs
         conv = self._conversations.get(conversation_id)
         if conv is None:
             return None
-        conv.title = title
+        if title is not None:
+            conv.title = title
+        if "reported_model" in kwargs:
+            conv.reported_model = kwargs["reported_model"]
         return conv
 
     def set_labels(
@@ -4324,6 +4326,56 @@ async def test_relay_skips_malformed_resource_created_from_runner() -> None:
 
     events = [i for i in store.appended_items if i.type == "resource_event"]
     assert events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_type", ["response.completed", "response.failed"])
+async def test_relay_persists_harness_reported_model(
+    terminal_type: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDK terminal usage records the concrete model on the session snapshot."""
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session_id, event: published.append(event),
+    )
+    store = _ConversationStore()
+    client = _FakeStreamingRunnerClient(
+        [
+            _sse_frame(
+                {
+                    "type": terminal_type,
+                    "response": {
+                        "id": "resp_model",
+                        "model": "repro_agent",
+                        "usage": {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "total_tokens": 0,
+                            "model": "claude-opus-4-8",
+                        },
+                    },
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    await _relay_runner_stream(session_id, client, store)  # type: ignore[arg-type]
+
+    assert store.get_conversation(session_id).reported_model == "claude-opus-4-8"  # type: ignore[union-attr]
+    model_events = [event for event in published if event.get("type") == "session.model"]
+    assert model_events == [
+        {
+            "type": "session.model",
+            "conversation_id": session_id,
+            "model": "claude-opus-4-8",
+        }
+    ]
 
 
 @pytest.mark.asyncio

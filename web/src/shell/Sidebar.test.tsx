@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
+import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
@@ -269,6 +270,7 @@ beforeEach(() => {
   useHostsMock.mockReturnValue({ data: [] });
   localStorage.clear();
   clearSessionDrafts();
+  clearOptimisticTitles();
   projectsMock.length = 0;
   moveToProjectSpy.mockReset();
   deleteProjectSpy.mockReset();
@@ -296,6 +298,26 @@ describe("Sidebar session list", () => {
 
     expect(screen.getByText("No sessions")).toHaveClass("text-ui");
     expect(screen.getByText("No sessions")).not.toHaveClass("text-sm");
+  });
+
+  it("flips a just-created session's row to its provisional first-prompt label", () => {
+    mockConversations([
+      conv("conv_opt", "Claude Code", {
+        title: null,
+        labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      }),
+    ]);
+    renderSidebar();
+
+    // Before the landing form's stash lands (and for sessions born
+    // elsewhere), the row reads as the wrapper name.
+    expect(screen.getByText("Claude Code")).toBeInTheDocument();
+
+    act(() => recordOptimisticTitle("conv_opt", "debug the login redirect"));
+
+    const label = screen.getByText("debug the login redirect");
+    expect(label).toHaveClass("italic", "text-muted-foreground");
+    expect(screen.queryByText("Claude Code")).not.toBeInTheDocument();
   });
 
   it("uses the interface text token for session-list errors", () => {

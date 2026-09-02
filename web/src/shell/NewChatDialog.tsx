@@ -83,6 +83,7 @@ import { authenticatedFetch } from "@/lib/identity";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { isComposerSendKey, readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
+import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { HarnessSetupDialog } from "@/shell/HarnessSetupDialog";
@@ -188,9 +189,7 @@ import {
   controlHost,
   getHostIdentity,
   isElectronShell,
-  isIOSShell,
   onHostStatusChanged,
-  setNativeViewMode,
   type HostIdentity,
 } from "@/lib/nativeBridge";
 import {
@@ -2029,21 +2028,6 @@ export function NewChatLandingScreen() {
   // via the Start button's componentId covers Enter-key sends too, which never
   // submit the form and would otherwise bypass the Button entirely.
   const { trackClick } = useOmnigentAnalytics();
-  // No session here, so there is nothing to switch between: assert the iOS
-  // shell's native Chat/Terminal bar is hidden. ChatPage's own bar is driven by
-  // the session surface and hides itself on unmount, but that is the only thing
-  // holding the native state down — and the bar was showing over this screen,
-  // so state the truth for this route instead of trusting a teardown that runs
-  // elsewhere. Idempotent, and re-asserted on every mount of this screen.
-  useEffect(() => {
-    if (!isIOSShell()) return;
-    setNativeViewMode({
-      mode: "chat",
-      terminalEnabled: false,
-      terminalStartingUp: false,
-      visible: false,
-    });
-  }, []);
   const heading = useHeading();
   const poweredBy = usePoweredBy();
   const serverUrl = getCliServerUrl();
@@ -4350,6 +4334,8 @@ export function NewChatLandingScreen() {
           : matchSkillInvocation(initialPrompt, agent?.skills ?? []),
         files,
       });
+      // Label the new row with the prompt until the server's seed title lands.
+      recordOptimisticTitle(data.id, initialPrompt);
       // Scope the recall entry to the new session id so ArrowUp surfaces it in
       // the freshly-opened chat (whose composer reads the same per-conversation
       // key). Sanitized text so recall reproduces exactly what was sent.

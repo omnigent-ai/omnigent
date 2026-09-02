@@ -286,16 +286,20 @@
         margin: 0 0 4px;
       }
       .modal-switch-to-new-experience {
-        margin-top: 14px;
         padding: 9px 12px;
         font-weight: 500;
-        border: none;
         border: 1px solid var(--border);
         background: var(--background);
         color: var(--foreground);
+        /* Alt/Option-only affordance: reserves its space always so the modal
+           doesn't reflow, but stays invisible until revealed (see .is-visible). */
+        visibility: hidden;
       }
-      .modal-switch-to-new-experienc:hover {
-        border: 1px solid color-mix(in srgb, var(--border) 90%, transparent);
+      .modal-switch-to-new-experience.is-visible {
+        visibility: visible;
+      }
+      .modal-switch-to-new-experience:hover {
+        color: color-mix(in srgb, var(--foreground) 80%, transparent);
       }
       .modal-close {
         margin-top: 14px;
@@ -685,12 +689,33 @@
         return false;
       }
 
+      // The "Switch to new experience" button is an Alt/Option-only affordance:
+      // hidden until the user holds Alt while the CLI modal is open. Listeners
+      // are scoped to the modal being open so nothing lingers globally.
+      // visibility (not the `hidden` attribute): reserves layout space so the
+      // modal doesn't reflow when it toggles, and — being visibility:hidden —
+      // it's non-interactive (no clicks, no pointer/cursor) while concealed.
+      const setNewUxVisible = (visible) => {
+        cliModalNewUX.classList.toggle("is-visible", visible);
+      };
+      const onAltKey = (e) => {
+        if (e.key === "Alt") setNewUxVisible(e.type === "keydown");
+      };
       function openCliModal() {
         cliModal.hidden = false;
+        setNewUxVisible(false); // reset: revealed only while Alt is held
+        window.addEventListener("keydown", onAltKey);
+        window.addEventListener("keyup", onAltKey);
+        // Releasing Alt outside the window (focus loss) never fires keyup, so
+        // re-hide when the window is blurred to avoid a stuck-visible button.
+        window.addEventListener("blur", () => setNewUxVisible(false), { once: true });
         void refreshCliStatus();
       }
       function closeCliModal() {
         cliModal.hidden = true;
+        window.removeEventListener("keydown", onAltKey);
+        window.removeEventListener("keyup", onAltKey);
+        setNewUxVisible(false);
       }
 
       if (setup.getCliStatus) {

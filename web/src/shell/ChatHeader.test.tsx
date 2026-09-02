@@ -517,6 +517,23 @@ describe("ChatHeader — floating mobile controls", () => {
       "max-md:backdrop-blur-xl",
     );
   });
+
+  it("keeps the page touchable while the fallback menu is open on mobile", () => {
+    // Modal mode's body-wide pointer-events:none leaves the menu as the only
+    // touch target, so touch-target adjustment snaps outside taps onto it and
+    // a phone can never dismiss the menu (see HeaderConversationMenu).
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "conv-1",
+      canShare: true,
+      hasHeaderMenu: true,
+    });
+
+    fireEvent.pointerDown(screen.getByTestId("session-actions-menu"), { button: 0 });
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    expect(document.body.style.pointerEvents).not.toBe("none");
+  });
 });
 
 describe("ChatHeader — title-adjacent conversation actions", () => {
