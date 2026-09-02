@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
 import type { Host } from "@/hooks/useHosts";
-import { useHosts } from "@/hooks/useHosts";
+import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useProjectConfig, useProjects } from "@/hooks/useConversations";
@@ -664,6 +664,117 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.project_id).toBe("proj_alpha");
     expect("workspace" in body).toBe(false);
     expect(body.git).toBeUndefined();
+  });
+
+  // ── Project default model ── the stored `model` seeds the composer's model
+  // pick (→ create-body model_override) while the composer sits on the
+  // project's configured agent. These pin the seed itself plus the two races
+  // around it: an invalid stored id must behave as "no default", and an
+  // async-arriving config must not clobber a pick the user already committed.
+  const CLAUDE_AGENT_ID = "ag_claude";
+  const HARNESS_OPTIONS_KEY = "omnigent:last-mode-by-harness";
+
+  function setClaudeAgentAndModels(): void {
+    vi.mocked(useAvailableAgents).mockReturnValue({
+      data: [
+        agent(),
+        agent({
+          id: CLAUDE_AGENT_ID,
+          name: "claude-native-ui",
+          display_name: "Claude Code",
+          harness: "claude-native",
+        }),
+      ],
+    } as ReturnType<typeof useAvailableAgents>);
+    vi.mocked(useHostModelOptions).mockReturnValue({
+      data: [
+        { id: "opus", displayName: "Opus" },
+        { id: "sonnet", displayName: "Sonnet" },
+      ],
+    } as ReturnType<typeof useHostModelOptions>);
+  }
+
+  it("seeds the create body's model_override from the project's stored default model", async () => {
+    setClaudeAgentAndModels();
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, model: "opus" });
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
+        "Claude Code",
+      ),
+    );
+    const body = await submitAndReadBody();
+    // The waitFor above proves the configured agent is selected (an unchanged
+    // config agent is omitted from the body for default-fill, so assert the
+    // model_override contract that is the point of this test).
+    expect(body.model_override).toBe("opus");
+  });
+
+  it("outranks the remembered per-harness pick with the project default", async () => {
+    setClaudeAgentAndModels();
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { model: "sonnet" } }),
+    );
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, model: "opus" });
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
+        "Claude Code",
+      ),
+    );
+    const body = await submitAndReadBody();
+    expect(body.model_override).toBe("opus");
+  });
+
+  it("treats an invalid stored project model as no default (remembered pick still seeds)", async () => {
+    // A retired/unknown id must not seed — and must not displace the user's
+    // remembered pick, which stays the effective model.
+    setClaudeAgentAndModels();
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { model: "sonnet" } }),
+    );
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, model: "retired-model" });
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
+        "Claude Code",
+      ),
+    );
+    const body = await submitAndReadBody();
+    expect(body.model_override).toBe("sonnet");
+  });
+
+  it("does not clobber a user's committed model pick when the project config arrives late", async () => {
+    // The config's model can resolve (or refresh) after the composer is
+    // interactive; a pick the user already committed via the config modal
+    // must survive that async arrival.
+    setClaudeAgentAndModels();
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID });
+    const { rerender } = renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
+        "Claude Code",
+      ),
+    );
+
+    // Commit "Sonnet" through the agent-config modal (the user's explicit pick).
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-config-model"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-model"));
+    fireEvent.click(screen.getByRole("option", { name: "Sonnet" }));
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-save"));
+
+    // The project default (Opus) lands afterwards — it must not reseed.
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, model: "opus" });
+    rerender(<NewChatLandingScreen />);
+
+    const body = await submitAndReadBody();
+    expect(body.model_override).toBe("sonnet");
   });
 
   it("still seeds the recent workspace when the worktree probe errors", async () => {

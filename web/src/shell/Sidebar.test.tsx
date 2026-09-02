@@ -61,6 +61,10 @@ const {
 
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: useHostsMock,
+  // The project-settings dialog (mounted by Sidebar rows) resolves model
+  // options through this hook; no test here opens it, so an empty catalog is
+  // enough to keep the module contract satisfied.
+  useHostModelOptions: () => ({ data: [] }),
 }));
 
 // Mutation hooks are only invoked on row actions; stub them. useConversations
