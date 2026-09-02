@@ -475,7 +475,11 @@ class BwrapSandboxBackend(SandboxBackend):
         # letting the last mount win.
         if policy.read_roots is not None:
             for root in policy.read_roots:
-                if any(_is_same_path(root, write_root) for write_root in policy.write_roots):
+                # Read roots only expand visibility; they never restrict an
+                # overlapping cwd or explicit write grant.
+                if _is_same_path(root, cwd_resolved) or any(
+                    _is_same_path(root, write_root) for write_root in policy.write_roots
+                ):
                     continue
                 bwrap_args += ["--ro-bind-try", str(root), str(root)]
 

@@ -538,6 +538,22 @@ def test_wrap_launcher_argv_write_grant_wins_exact_read_overlap(
     assert mounts == ["--bind"]
 
 
+def test_wrap_launcher_argv_deduplicates_read_only_cwd(tmp_path: Path) -> None:
+    """An explicit read grant for read-only cwd does not duplicate its mount."""
+    backend = _make_backend()
+    root = tmp_path.resolve(strict=False)
+    policy = _make_policy(tmp_path, read_roots=[root])
+
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    mounts = [
+        argv[i]
+        for i in range(len(argv) - 2)
+        if argv[i + 1] == str(root) and argv[i + 2] == str(root)
+    ]
+    assert mounts == ["--ro-bind"]
+
+
 def test_wrap_launcher_argv_nested_write_mount_follows_read_parent(
     tmp_path: Path,
 ) -> None:
