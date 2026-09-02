@@ -6,21 +6,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from omnigent_slack.approvals import (
-    ClickTarget,
-    ElicitationCoordinator,
-    Verdict,
-)
-from omnigent_slack.auth_manager import pack_user_key
-from omnigent_slack.elicitation import ElicitationController, ElicitationTurnState
-from omnigent_slack.models import SlackTurn, ThreadKey, event_is_dm
-from omnigent_slack.notifications import (
-    SlackNotifier,
-    format_output_file,
-    format_policy_denied,
-    format_todos,
-)
-from omnigent_slack.omnigent import (
+from omnigent_bot_core.omnigent import (
     AuthRequiredError,
     HarnessNotConfiguredError,
     HostUnavailableError,
@@ -36,6 +22,21 @@ from omnigent_slack.omnigent import (
     extract_output_file,
     extract_policy_denied,
     extract_todos,
+)
+
+from omnigent_slack.approvals import (
+    ClickTarget,
+    ElicitationCoordinator,
+    Verdict,
+)
+from omnigent_slack.auth_manager import pack_user_key
+from omnigent_slack.elicitation import ElicitationController, ElicitationTurnState
+from omnigent_slack.models import SlackTurn, ThreadKey, event_is_dm
+from omnigent_slack.notifications import (
+    SlackNotifier,
+    format_output_file,
+    format_policy_denied,
+    format_todos,
 )
 from omnigent_slack.setup import SetupFlow, host_unavailable_text
 from omnigent_slack.store import SQLiteStore

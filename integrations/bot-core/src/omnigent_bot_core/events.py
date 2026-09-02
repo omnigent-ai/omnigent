@@ -60,7 +60,7 @@ class ElicitationRequest:
     # Non-empty for a form-mode ``AskUserQuestion`` elicitation.
     questions: list[ElicitationQuestion] = field(default_factory=list)
     # True when the elicitation asks for typed/structured input we can't collect
-    # with Slack buttons (a non-empty requestedSchema that isn't AskUserQuestion).
+    # with buttons/menus (a non-empty requestedSchema that isn't AskUserQuestion).
     needs_typed_input: bool = False
 
     @property
@@ -69,7 +69,7 @@ class ElicitationRequest:
 
     @property
     def is_supported(self) -> bool:
-        """Whether the bot can render this elicitation natively in Slack.
+        """Whether a bot can render this elicitation natively in chat.
 
         Classified by the *decision shape*, NOT the delivery ``mode``. A
         ``url``-mode elicitation just carries a suggested out-of-band approve
@@ -143,7 +143,7 @@ def session_status(event: dict[str, Any]) -> tuple[str, str | None] | None:
 def extract_elicitation_resolved(event: dict[str, Any]) -> str | None:
     """Return the ``elicitation_id`` of a ``response.elicitation_resolved`` event.
 
-    The server pushes this when an elicitation is resolved — by our own Slack
+    The server pushes this when an elicitation is resolved — by our own
     verdict, or externally (web UI / another client). The turn loop keeps reading
     the stream while a card is shown, so it observes resolution as a normal push
     event (the web UI's model) rather than polling ``pending_elicitations``.

@@ -9,10 +9,12 @@ description = "Slack Socket Mode bot that drives Omnigent sessions."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    # The Omnigent client both bots share (SSE parsing, the turn loop,
+    # the login flows). Version-locked with the release cycle.
+    "omnigent-bot-core==0.12.0.dev0",
     "aiosqlite>=0.21.0",
     "aiohttp>=3.12.0",
     "cryptography>=42.0.0",
-    "httpx>=0.28.0",
     "pydantic-settings>=2.10.0",
     "slack-bolt>=1.29.0",
     "slack-sdk>=3.43.0",
@@ -20,3 +22,9 @@ dependencies = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/omnigent_slack"]
+
+# Resolve the shared client from the tree rather than an index, so an editable
+# checkout builds without publishing it first. Mirrors how the root package
+# resolves this one.
+[tool.uv.sources]
+omnigent-bot-core = { path = "../bot-core", editable = true }

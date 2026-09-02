@@ -3,8 +3,8 @@ from typing import Any
 
 import httpx
 import respx
+from omnigent_bot_core.omnigent import OmnigentClientPool
 from omnigent_slack.models import ThreadKey, UserConfig
-from omnigent_slack.omnigent import OmnigentClientPool
 from omnigent_slack.setup import (
     ACTION_SETUP_START,
     AGENT_BLOCK,
@@ -99,7 +99,7 @@ def _flow(store: SQLiteStore, pool: OmnigentClientPool, auth: Any = None) -> Set
 
 
 def test_select_modal_lists_agents_and_hosts() -> None:
-    from omnigent_slack.omnigent import ValidatedServer
+    from omnigent_bot_core.omnigent import ValidatedServer
 
     view = select_modal(
         _SERVER,
@@ -483,7 +483,7 @@ async def test_post_enrollment_advance_uses_freshly_stored_token(tmp_path: Path)
     # token the cached client still has none — its re-validate re-hits the auth
     # wall and the modal stalls on "requires authentication". _on_success must
     # invalidate that cached client so the re-fetch picks up the new token.
-    from omnigent_slack.omnigent import ClientAuth
+    from omnigent_bot_core.omnigent import ClientAuth
 
     # A mutable token that only appears after "enrollment".
     token_box: dict[str, str | None] = {"token": None}
@@ -574,7 +574,7 @@ async def test_post_enrollment_validate_failure_shows_error_not_hang(tmp_path: P
     # Regression: the callback stored a token (browser shows "You're connected"),
     # but validating it against the server fails — e.g. the granted scope isn't
     # accepted. The modal must show a failure screen, not hang on "waiting".
-    from omnigent_slack.omnigent import ClientAuth
+    from omnigent_bot_core.omnigent import ClientAuth
 
     async def _resolver(server_url: str, user_id: str) -> ClientAuth | None:
         return ClientAuth("stored-but-rejected", lambda: _noop())

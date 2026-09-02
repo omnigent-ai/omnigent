@@ -1,8 +1,8 @@
 """Client side of the Omnigent browserless-login flows.
 
-A Slack user authorizes this bot to act as their own Omnigent identity
-without any credential passing through Slack. The bot relays a login
-link into the setup modal and polls in the background until the user
+A chat user authorizes a bot to act as their own Omnigent identity
+without any credential passing through the chat platform. The bot relays a login
+link into the ephemeral setup message and polls in the background until the user
 finishes in their browser. Two server auth modes are supported, detected
 from the server itself (see :func:`probe_auth_mode`, mirroring the
 ``omnigent login`` CLI):
@@ -104,7 +104,7 @@ def _token_from_response(
     non-numeric ``expires_in`` would otherwise raise
     ``JSONDecodeError``/``KeyError``/``ValueError`` — none of which the
     login poller's caller catches, so the background task would die and
-    leave the setup modal hung on "waiting for approval…". Normalise them
+    leave the setup message hung on "waiting for approval…". Normalise them
     into ``OAuthError`` so the caller reports a clean failure.
     """
     try:
@@ -123,7 +123,7 @@ def _token_from_response(
 class PendingLogin:
     """A login in progress: a link to show the user + how to complete it.
 
-    Flow-agnostic. ``verification_url`` goes in the modal; the caller then
+    Flow-agnostic. ``verification_url`` goes in the setup message; the caller then
     awaits :meth:`poll` in the background until it returns a
     :class:`TokenResult` or raises an :class:`OAuthError` subclass.
     :meth:`close` releases the underlying HTTP client.

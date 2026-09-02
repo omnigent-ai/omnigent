@@ -14,8 +14,8 @@ import httpx
 
 # Pure event parsing, DTOs, and the base error live in ``events``; the client
 # and pool here build on them. Re-exported below so existing
-# ``from omnigent_slack.omnigent import extract_delta`` sites keep working.
-from omnigent_slack.events import (
+# ``from omnigent_bot_core.omnigent import extract_delta`` sites keep working.
+from omnigent_bot_core.events import (
     ElicitationOption,
     ElicitationQuestion,
     ElicitationRequest,
@@ -83,7 +83,7 @@ class RunnerUnavailableError(OmnigentError):
 class AuthRequiredError(OmnigentError):
     """The Omnigent server rejected an unauthenticated request (HTTP 401).
 
-    The Slack bot has no way to authenticate yet, so callers surface this as a
+    A bot has no way to authenticate yet, so callers surface this as a
     "not supported" message during setup rather than retrying.
     """
 
@@ -160,6 +160,14 @@ _RESPONSE_TERMINAL_EVENT_TYPES = frozenset(
         "response.failed",
         "response.cancelled",
         "response.incomplete",
+        # An in-band error is a turn that began and failed — most visibly a
+        # harness that couldn't start at all (no tmux, no binary), where the
+        # server reports the failure with NO preceding ``running`` edge and no
+        # delta. Without this the stale-pre-turn guard below reads the
+        # accompanying id-less ``failed`` as a status replayed from before the
+        # turn and ignores it, so the loop waits out the full idle grace while
+        # the user watches an unchanging placeholder.
+        "response.error",
     }
 )
 
@@ -184,14 +192,14 @@ def _is_auth_redirect(location: str) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class ValidatedServer:
-    """Outcome of probing an Omnigent server during Slack setup."""
+    """Outcome of probing an Omnigent server during a bot's setup flow."""
 
     agents: list[dict[str, Any]]
     online_hosts: list[dict[str, Any]]
 
 
 class ClientAuth:
-    """Holds a Slack user's delegated bearer token for one server.
+    """Holds one user's delegated bearer token for one server.
 
     Supplies the current access token on every request and knows how to
     refresh it. ``refresh`` returns the new access token, or ``None`` if
@@ -376,7 +384,7 @@ class OmnigentClient:
         session_id = _extract_session_id(payload)
         if session_id is None:
             # Log the raw body for operators, but keep it out of the exception —
-            # it surfaces to the Slack thread, and a server body can carry
+            # it surfaces to the conversation, and a server body can carry
             # internal detail (matches the discipline in _raise_for_status).
             self._logger.warning("Create session response had no id: %r", payload)
             raise OmnigentError("Omnigent server returned no session id.")
@@ -385,7 +393,7 @@ class OmnigentClient:
 
     async def submit_message(self, session_id: str, text: str) -> None:
         self._logger.info(
-            "Submitting Slack message to Omnigent session_id=%s chars=%s",
+            "Submitting message to Omnigent session_id=%s chars=%s",
             session_id,
             len(text),
         )
@@ -772,8 +780,13 @@ class OmnigentClient:
                             # (the scaffold's completed/failed/cancelled) before its
                             # id-less idle, so an id-less idle that follows one is a
                             # real end, not a claude-native cold-start flap (which
-                            # emits no ``response.*`` at all).
+                            # emits no ``response.*`` at all). These envelopes also
+                            # mark the turn STARTED — a harness that fails before
+                            # producing anything emits no ``running`` edge, and
+                            # without this its id-less ``failed`` would be dismissed
+                            # as a stale pre-turn status and the turn would hang.
                             if event.get("type") in _RESPONSE_TERMINAL_EVENT_TYPES:
+                                turn_started = True
                                 turn_produced = True
 
                             if is_hard_terminal_event(event):
@@ -1056,9 +1069,9 @@ AuthResolver = Callable[[str, str], Awaitable["ClientAuth | None"]]
 
 
 class OmnigentClientPool:
-    """Caches one client per ``(server_url, slack_user_id)``.
+    """Caches one client per ``(server_url, discord_user_id)``.
 
-    The bot targets one operator-fixed server, but each Slack user carries
+    The bot targets one operator-fixed server, but each user carries
     their own delegated token, so clients are keyed per user (the server_url
     is part of the key mainly so cached clients are dropped cleanly if the
     operator repoints the bot). An optional ``auth_resolver`` supplies each
@@ -1146,7 +1159,7 @@ async def _raise_for_status(response: httpx.Response) -> None:
         error_code, error_message = _extract_error(response)
         # The raw server body can carry internal paths/stack traces; log it for
         # operators but keep it out of the exception message, which surfaces to
-        # the Slack channel (visible to everyone in the thread). Guard the body
+        # the conversation (visible to everyone in it). Guard the body
         # access: if the stream couldn't be read, classify on status alone.
         body = "<unread>"
         with contextlib.suppress(Exception):

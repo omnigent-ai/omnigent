@@ -203,7 +203,8 @@ def _resolve_top_package(filename: str) -> str | None:
 # or starts with ``<prefix>_`` are always shown (never collapsed), even
 # when installed under site-packages in a distributed wheel. Covers the
 # three core packages — ``omnigent``, ``omnigent_client``,
-# ``omnigent_ui_sdk`` — plus the ``omnigent_slack`` integration.
+# ``omnigent_ui_sdk`` — plus the ``omnigent_slack`` and ``omnigent_discord``
+# integrations.
 _DEFAULT_FIRST_PARTY_PREFIXES = ("omnigent",)
 
 
