@@ -1,6 +1,5 @@
 import {
   BotIcon,
-  CheckIcon,
   FileIcon,
   FolderTreeIcon,
   FileDiffIcon,
@@ -8,6 +7,7 @@ import {
   Loader2Icon,
   MaximizeIcon,
   MinimizeIcon,
+  MoreHorizontalIcon,
   PlusIcon,
   TerminalIcon,
   XIcon,
@@ -83,11 +83,12 @@ function readPreferredShell(): string | null {
 
 // ---------------------------------------------------------------------------
 // NewTabMenu — the "+" affordance in the tab strip. Opens a small dropdown
-// ("Open new") to spin up a Shell as a rail tab. When the agent declares a
-// single terminal, "Shell" launches it directly; when several are declared,
-// "Shell" nests a submenu so the user picks which type to launch — the last
-// pick is remembered (check-marked, and launched on a plain "Shell" click).
-// Gated on the agent's spec declaring terminal access — renders nothing else.
+// ("Open new") to spin up a Shell as a rail tab. A top "Shell" item launches
+// the remembered default (the last-picked type, else the first declared name);
+// when several types are declared, a "More shells" flyout lists them all so the
+// user can pick a specific one (remembered as the new default). The flyout
+// trigger only reveals the submenu — it never launches. Gated on the agent's
+// spec declaring terminal access — renders nothing else.
 //
 // The "Shell" item also reflects the session's liveness so opening a shell on
 // a disconnected session isn't a silent 502:
@@ -150,10 +151,7 @@ function NewTabMenu({
   // Remembered shell type, persisted across remounts/reloads. Seeded from
   // localStorage so the "+" in either strip spot agrees on the current pick.
   const [preferred, setPreferred] = useState<string | null>(() => readPreferredShell());
-  // Controlled so a launch can force the menu closed. The submenu "Shell"
-  // trigger preventDefaults its click (to launch the default without toggling
-  // the submenu), which also suppresses Radix's auto-close — leaving the menu
-  // stuck open until a second click. Closing here fixes that.
+  // Controlled so a launch can force the menu closed on select.
   const [menuOpen, setMenuOpen] = useState(false);
   // Shell access mirrors NewTerminalButton's gate: the agent's spec must
   // declare a non-empty ``terminals:`` block.
@@ -192,8 +190,8 @@ function NewTabMenu({
     launchShell(name);
   };
 
-  // One declared shell → a direct "Shell" action. Several → a nested submenu
-  // so the user picks which type to launch (mirrors NewTerminalButton's picker).
+  // One declared shell → just the "Shell" item. Several → a "More shells"
+  // flyout to pick a specific type.
   const multipleShells = declaredTerminals.length > 1;
 
   // Liveness-derived affordance for the "Shell" item. A create in flight on a
@@ -201,8 +199,8 @@ function NewTabMenu({
   // an offline session disables the item since the browser can't reconnect it.
   const isReconnecting = create.isPending && connectState === "wakeable";
   const shellDisabled = create.isPending || connectState === "offline";
-  // Icon + label + trailing hint, shared by the single-item and submenu-trigger
-  // renders so both reflect the same connect state.
+  // Icon + label + trailing hint for the "Shell" item, reflecting the connect
+  // state.
   const shellItemContent = (
     <>
       {isReconnecting ? (
@@ -246,21 +244,18 @@ function NewTabMenu({
             paint over the dropdown (#3980). Only this rail menu needs it. */}
         <SuppressBrowserView />
         <DropdownMenuLabel>Open new</DropdownMenuLabel>
-        {multipleShells ? (
+        {/* Remembered default shell — the direct-launch item. */}
+        <DropdownMenuItem onSelect={() => launchShell(defaultShell)} disabled={shellDisabled}>
+          {shellItemContent}
+        </DropdownMenuItem>
+        {/* Other declared types live behind a flyout whose trigger only reveals
+            the submenu — it never launches, so the type list stays discoverable.
+            Picking one launches it and remembers it as the new default. */}
+        {multipleShells && (
           <DropdownMenuSub>
-            {/* Clicking "Shell" launches the remembered default immediately —
-                the type selection is optional. Hover/right-arrow still opens the
-                submenu to pick a specific type. onClick fires the default and
-                lets the menu close on its own; preventDefault stops the click
-                from only toggling the submenu open. */}
-            <DropdownMenuSubTrigger
-              disabled={shellDisabled}
-              onClick={(e) => {
-                e.preventDefault();
-                launchShell(defaultShell);
-              }}
-            >
-              {shellItemContent}
+            <DropdownMenuSubTrigger disabled={shellDisabled}>
+              <MoreHorizontalIcon className="size-4" />
+              <span className="whitespace-nowrap">More shells</span>
             </DropdownMenuSubTrigger>
             <DropdownMenuSubContent>
               {declaredTerminals.map((name) => (
@@ -269,21 +264,11 @@ function NewTabMenu({
                   onSelect={() => pickShell(name)}
                   disabled={shellDisabled}
                 >
-                  <CheckIcon
-                    className={cn("size-4", name === defaultShell ? "opacity-100" : "opacity-0")}
-                  />
                   {name}
                 </DropdownMenuItem>
               ))}
             </DropdownMenuSubContent>
           </DropdownMenuSub>
-        ) : (
-          <DropdownMenuItem
-            onSelect={() => launchShell(declaredTerminals[0])}
-            disabled={shellDisabled}
-          >
-            {shellItemContent}
-          </DropdownMenuItem>
         )}
       </DropdownMenuContent>
     </DropdownMenu>

@@ -443,10 +443,10 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     await waitFor(() => expect(screen.queryByRole("menuitem", { name: /shell/i })).toBeNull());
   });
 
-  it("launches the default shell directly when several are declared (type selection is optional)", async () => {
-    // Multiple declared terminals → "Shell" nests a submenu to pick a type, but
-    // clicking it directly launches the default (declared[0]) without forcing a
-    // selection.
+  it("launches the default shell from the top 'Shell' item when several are declared", async () => {
+    // Multiple declared terminals → a top "Shell" item launches the default
+    // (declared[0] with no prior pick); the types live in the "More shells"
+    // flyout below.
     useSessionAgentMock.mockReturnValue({
       data: { terminals: ["zsh", "bash", "fish"] },
     } as unknown as ReturnType<typeof useSessionAgent>);
@@ -462,16 +462,15 @@ describe('WorkspacePanel "+" new-tab menu', () => {
 
     const { openTerminalTab } = renderWorkspace({ showBrowserTab: false });
 
-    // Open the "+" menu and click the "Shell" submenu trigger directly.
+    // Open the "+" menu and click the top "Shell" item (not "More shells").
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
-    fireEvent.click(await screen.findByRole("menuitem", { name: /shell/i }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: /^shell$/i }));
 
     // Launches the default (first-declared) shell without a further pick.
     expect(mutate).toHaveBeenCalledWith("zsh", expect.any(Object));
     expect(openTerminalTab).toHaveBeenCalledWith("terminal:terminal_zsh_s1");
 
-    // The menu closes on its own — the submenu trigger's preventDefault would
-    // otherwise leave it stuck open, needing a second click to dismiss.
+    // The menu closes on its own after the launch.
     await waitFor(() => expect(screen.queryByRole("menuitem", { name: /shell/i })).toBeNull());
 
     // Focus is not restored to the "+" trigger on close — that focus return is
@@ -479,7 +478,7 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(screen.getByRole("button", { name: "Open new" })).not.toHaveFocus();
   });
 
-  it("remembers the picked shell type as the new default (persisted + check-marked)", async () => {
+  it("remembers the flyout-picked shell type as the new default (persisted)", async () => {
     window.localStorage.removeItem("omnigent:preferred-shell");
     useSessionAgentMock.mockReturnValue({
       data: { terminals: ["zsh", "bash", "fish"] },
@@ -493,18 +492,18 @@ describe('WorkspacePanel "+" new-tab menu', () => {
 
     renderWorkspace({ showBrowserTab: false });
 
-    // Open the submenu (ArrowRight — a plain click on "Shell" launches the
-    // default instead) and pick "bash", which persists as the preferred type.
+    // Open the "More shells" flyout (ArrowRight) and pick "bash", which persists
+    // as the preferred type under the app-global key.
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
-    const shellTrigger = await screen.findByRole("menuitem", { name: /shell/i });
-    shellTrigger.focus();
-    fireEvent.keyDown(shellTrigger, { key: "ArrowRight" });
+    const moreShells = await screen.findByRole("menuitem", { name: /more shells/i });
+    moreShells.focus();
+    fireEvent.keyDown(moreShells, { key: "ArrowRight" });
     fireEvent.click(await screen.findByRole("menuitem", { name: /^bash$/i }));
     expect(mutate).toHaveBeenCalledWith("bash", expect.any(Object));
     expect(window.localStorage.getItem("omnigent:preferred-shell")).toBe("bash");
 
-    // A fresh menu seeds its default from the persisted pick — clicking "Shell"
-    // now launches bash without opening the submenu.
+    // A fresh menu seeds its default from the persisted pick — the top "Shell"
+    // item now launches bash.
     cleanup();
     mutate.mockClear();
     useSessionAgentMock.mockReturnValue({
@@ -512,7 +511,7 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     } as unknown as ReturnType<typeof useSessionAgent>);
     renderWorkspace({ showBrowserTab: false });
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
-    fireEvent.click(await screen.findByRole("menuitem", { name: /shell/i }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: /^shell$/i }));
     expect(mutate).toHaveBeenCalledWith("bash", expect.any(Object));
 
     window.localStorage.removeItem("omnigent:preferred-shell");
