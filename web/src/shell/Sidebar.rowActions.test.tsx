@@ -311,11 +311,11 @@ describe("quick pin/unpin hover button", () => {
     renderSidebar();
 
     const rowLink = screen.getByRole("link", { name: "My Session" });
-    expect(rowLink).not.toHaveClass("md:pr-14");
+    expect(rowLink).not.toHaveClass("md:pr-20");
 
     fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
 
-    expect(rowLink).toHaveClass("md:pr-14");
+    expect(rowLink).toHaveClass("md:pr-20");
   });
 
   it("sizes the project-folder header controls to match the session-row kebab", () => {

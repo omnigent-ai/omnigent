@@ -190,6 +190,7 @@ import {
 } from "./sidebarNav";
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { SIDEBAR_ROW } from "./sidebarStyles";
+import { TooltipArrow } from "radix-ui/tooltip";
 
 // Positioning for a row's trailing session-state badge. Anchored at the row's
 // right-1 edge in every viewport: on desktop it fades on hover so the pin +
@@ -3582,6 +3583,11 @@ function ConversationRow({
     if (nextArchived) showArchivedToast();
   }
 
+  function runUnarchive() {
+    const nextArchived = !isArchived;
+    archive.mutate({ id: conversation.id, archived: nextArchived });
+  }
+
   function confirmLeave() {
     // Leave is a self-revoke, so it needs the viewer's own id. The menu item is
     // gated on the row NOT being owned by the viewer, which is only decidable
@@ -3657,8 +3663,8 @@ function ConversationRow({
         // `focus-within` also fires for a plain click, which shrank the reserve
         // on the selected row while the marker stayed put, sliding the title
         // under it.
-        !selectionMode && "md:group-hover:pr-14 md:group-has-[:focus-visible]:pr-14",
-        !selectionMode && menuOpen && "md:pr-14",
+        !selectionMode && "md:group-hover:pr-20 md:group-has-[:focus-visible]:pr-20",
+        !selectionMode && menuOpen && "md:pr-20",
         selectionMode && "pr-2 pl-8",
         !selectionMode && isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
         selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
@@ -3874,6 +3880,44 @@ function ConversationRow({
               )}
             </Button>
           )}
+          <Tooltip disableHoverableContent>
+            <TooltipContent>
+              <TooltipArrow />
+              {isArchived ? "Unarchive conversation" : "Archive conversation"}
+            </TooltipContent>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label={isArchived ? "Unarchive conversation" : "Archive conversation"}
+                data-testid="quick-archive-conversation"
+                className={cn(
+                  "text-muted-foreground transition-opacity",
+                  "hidden md:inline-flex",
+                  "md:opacity-0 md:group-hover:opacity-100",
+                  "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
+                )}
+                onClick={(e) => {
+                  // Keep the toggle click off the surrounding Link (no navigation).
+                  e.preventDefault();
+                  e.stopPropagation();
+                  if (!isArchived) {
+                    runArchive();
+                  } else {
+                    runUnarchive();
+                  }
+                }}
+              >
+                {isArchived ? (
+                  <ArchiveRestoreIcon className="size-3.5" data-icon-size="14" />
+                ) : (
+                  <ArchiveIcon className="size-3.5" data-icon-size="14" />
+                )}
+              </Button>
+            </TooltipTrigger>
+          </Tooltip>
+
           <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
             <DropdownMenuTrigger asChild>
               <Button
