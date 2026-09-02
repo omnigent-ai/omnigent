@@ -262,6 +262,13 @@ import {
   writeCodeBlockWordWrap,
 } from "@/lib/codeWrapPreferences";
 import {
+  TERMINAL_EXTRA_KEYS_DEFAULT,
+  readTerminalExtraKeysMode,
+  terminalExtraKeysModes,
+  writeTerminalExtraKeysMode,
+  type TerminalExtraKeysMode,
+} from "@/lib/terminalExtraKeysPreferences";
+import {
   TERMINAL_THEME_DEFAULT,
   writeTerminalThemeMode,
   type TerminalThemeMode,
@@ -547,6 +554,12 @@ function Section({
   );
 }
 
+const terminalExtraKeysLabels: Record<TerminalExtraKeysMode, string> = {
+  auto: "Auto (touch devices)",
+  on: "Always",
+  off: "Never",
+};
+
 const transcriptViewCards: {
   value: TranscriptViewDefault;
   label: string;
@@ -748,6 +761,46 @@ function PaneCornersRow() {
     <div className="mt-4 border-t border-border pt-4">
       <PaneCornersControl />
     </div>
+  );
+}
+
+/** Extra-keys row (Esc / Tab / Ctrl / arrows) under the terminal on touch devices. */
+function TerminalExtraKeysControl() {
+  const [mode, setMode] = useState(() => readTerminalExtraKeysMode());
+  const labelId = useId();
+  const choose = useCallback((next: string) => {
+    if (!terminalExtraKeysModes.includes(next as TerminalExtraKeysMode)) return;
+    setMode(next as TerminalExtraKeysMode);
+    writeTerminalExtraKeysMode(next as TerminalExtraKeysMode);
+  }, []);
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Extra keys row"
+      helper="Show Esc, Tab, Ctrl, Alt, Shift and arrow keys under the terminal for on-screen keyboards."
+    >
+      <Select
+        value={mode}
+        onValueChange={choose}
+        componentId="settings.appearance.terminal_extra_keys"
+        valueHasNoPii
+      >
+        <SelectTrigger
+          aria-labelledby={labelId}
+          data-testid="terminal-extra-keys-select"
+          className="w-full sm:w-56"
+        >
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {terminalExtraKeysModes.map((value) => (
+            <SelectItem key={value} value={value} data-testid={`terminal-extra-keys-${value}`}>
+              {terminalExtraKeysLabels[value]}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </ThemeSubsection>
   );
 }
 
@@ -1294,6 +1347,7 @@ function AppearanceSection() {
     setTheme("system");
 
     writeTerminalThemeMode(TERMINAL_THEME_DEFAULT);
+    writeTerminalExtraKeysMode(TERMINAL_EXTRA_KEYS_DEFAULT);
 
     commitThemePalette(DEFAULT_PALETTE);
     writeCustomTheme(DEFAULT_CUSTOM_THEME);
@@ -1334,6 +1388,7 @@ function AppearanceSection() {
           "omnigent:code-font-weight",
           CODE_BLOCK_WORD_WRAP_STORAGE_KEY,
           "omnigent:terminal-theme",
+          "omnigent:terminal-extra-keys",
           "omnigent:ui-theme-palette",
           "omnigent:custom-theme",
           "omnigent:default-transcript-view",
@@ -1437,6 +1492,10 @@ function AppearanceSection() {
             <div className="mt-4 border-t border-border pt-4">
               <ProjectFolderPaginationControl />
             </div>
+          </SettingsGroup>
+
+          <SettingsGroup title="Terminal" testId="settings-group-terminal">
+            <TerminalExtraKeysControl />
           </SettingsGroup>
 
           <SettingsGroup title="Interface typography" testId="settings-group-interface-type">
