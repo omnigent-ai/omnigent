@@ -245,7 +245,11 @@ function NewTabMenu({
         <SuppressBrowserView />
         <DropdownMenuLabel>Open new</DropdownMenuLabel>
         {/* Remembered default shell — the direct-launch item. */}
-        <DropdownMenuItem onSelect={() => launchShell(defaultShell)} disabled={shellDisabled}>
+        <DropdownMenuItem
+          onSelect={() => launchShell(defaultShell)}
+          disabled={shellDisabled}
+          className="cursor-pointer"
+        >
           {shellItemContent}
         </DropdownMenuItem>
         {/* Other declared types live behind a flyout whose trigger only reveals
@@ -263,6 +267,7 @@ function NewTabMenu({
                   key={name}
                   onSelect={() => pickShell(name)}
                   disabled={shellDisabled}
+                  className="cursor-pointer"
                 >
                   {name}
                 </DropdownMenuItem>
