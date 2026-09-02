@@ -94,6 +94,7 @@ import { ChatHeader } from "./ChatHeader";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import { FileViewer } from "./FileViewer";
 import { FileViewerContext } from "./FileViewerContext";
+import { SPLIT_DIFF_MIN_WIDTH } from "./codeViewerHelpers";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
@@ -223,20 +224,35 @@ export function AppShell() {
     extensionId: string;
   }>();
   const [fileViewerCommentsOpen, setFileViewerCommentsOpen] = useState(false);
+  // True while the rail's FileViewer shows the diff view — drives the rail's
+  // split-diff width floor below.
+  const [railDiffViewActive, setRailDiffViewActive] = useState(false);
   const [rightRailTab, setRightRailTab] = useState<RightRailTab>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).rightRailTab ?? "files") : "files",
   );
-  // The comments panel only contributes to the min width when the rail is
-  // actually showing the file viewer — on any other tab the FileViewer
-  // is unmounted, so the 720 floor would just waste horizontal space. Both
-  // the Files and Changes tabs surface the inline viewer, so either qualifies.
-  // 240px (CommentsPanel default/min width) + 480px comfortable code viewer
-  // width. The panel can be dragged wider, but this floor keeps it usable at
-  // its default; widening past it is the user's choice via the inline handle.
-  const inlinePanelMinWidth =
-    (rightRailTab === "files" || rightRailTab === "changes") && fileViewerCommentsOpen
-      ? 720
-      : undefined;
+  // Width floors apply only while the rail is actually showing the file
+  // viewer — on any other tab the FileViewer is unmounted, so a floor would
+  // just waste horizontal space. Both the Files and Changes tabs surface the
+  // inline viewer, so either qualifies.
+  // • Comments open: 240px (CommentsPanel default/min width) + 480px
+  //   comfortable code viewer width.
+  // • Diff view showing: SPLIT_DIFF_MIN_WIDTH, so the diff content area
+  //   clears Monaco's 900px inline breakpoint — otherwise the rail's compact
+  //   default silently collapses a saved split preference into the unified
+  //   rendering and hides the split/unified toggle, even on a viewport with
+  //   room to spare. With comments open beside the diff, the comments width
+  //   stacks on top.
+  // The floors only raise the rendered width — the user's persisted width
+  // preference is untouched, and on a viewport too narrow to grant a floor the
+  // chat column's own minimum still wins (see useResizableInlinePanel.clamp).
+  const railShowsFileViewer = rightRailTab === "files" || rightRailTab === "changes";
+  const inlinePanelMinWidth = !railShowsFileViewer
+    ? undefined
+    : railDiffViewActive
+      ? SPLIT_DIFF_MIN_WIDTH + (fileViewerCommentsOpen ? 240 : 0)
+      : fileViewerCommentsOpen
+        ? 720
+        : undefined;
   const [searchParams, setSearchParams] = useSearchParams();
   const [sidebarOpen, setSidebarOpen] = useState(initialSidebarOpen);
   // Extension pages own their top chrome. The shell header only carries the
@@ -2068,6 +2084,7 @@ export function AppShell() {
                     onCloseFile={closeFile}
                     onShowScopeView={showScopeView}
                     onCommentsOpenChange={setFileViewerCommentsOpen}
+                    onDiffViewActiveChange={setRailDiffViewActive}
                     openTerminalTab={openTerminalTab}
                     openTerminals={openTerminals}
                     selectedTerminalKey={selectedTerminalKey}

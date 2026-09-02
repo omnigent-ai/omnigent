@@ -304,6 +304,13 @@ interface FileViewerProps {
   /** Called when the comments panel opens or closes inside the viewer. */
   onCommentsOpenChange?: (open: boolean) => void;
   /**
+   * Called when the diff view starts or stops showing, so the host rail can
+   * widen to `SPLIT_DIFF_MIN_WIDTH` — at the rail's compact default Monaco
+   * stays under its 900px inline breakpoint, so a split preference silently
+   * renders unified and the split/unified toggle is hidden.
+   */
+  onDiffViewActiveChange?: (active: boolean) => void;
+  /**
    * Sort order for the prev/next navigation. Must match the order the
    * Changes list (`FilesPanel` → `FlatFileList`) is sorted by, or the
    * "X/N" index won't line up with the list. Defaults to "recent".
@@ -340,6 +347,7 @@ function FileViewerBody({
   permissionLevel,
   frameless,
   onCommentsOpenChange,
+  onDiffViewActiveChange,
   sort = "recent",
 }: FileViewerProps) {
   // null = single-user mode (no enforcement); undefined = prop not provided (treat as unrestricted).
@@ -748,6 +756,18 @@ function FileViewerBody({
   const viewMode: "editor" | "preview" | "source" | "diff" =
     diffActive && isDiffAvailable ? "diff" : fileViewMode;
   const diffViewActive = viewMode === "diff";
+
+  // Tell the host when the diff view is (or stops being) on screen, so the
+  // inline rail can claim the width side-by-side needs (SPLIT_DIFF_MIN_WIDTH).
+  // Keyed on the diff view, not the split layout: the width is what keeps the
+  // split/unified toggle offered, so gating on split would hide the toggle
+  // the moment the user switched to unified — trapping them there. The
+  // cleanup clears the claim on unmount (file closed, viewer swapped out) so
+  // a stale floor can't keep the rail wide with no diff showing.
+  useEffect(() => {
+    onDiffViewActiveChange?.(diffViewActive);
+    return () => onDiffViewActiveChange?.(false);
+  }, [diffViewActive, onDiffViewActiveChange]);
 
   // Cmd/Ctrl+F opens find-in-file on the Monaco-backed surfaces (code
   // source/editor and the diff view). Those surfaces would otherwise rely on

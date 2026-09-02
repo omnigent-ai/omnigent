@@ -44,10 +44,11 @@ export type SaveStatus = "idle" | "unsaved" | "saving" | "saved" | "error" | "of
 export const MONACO_SPLIT_BREAKPOINT = 900;
 
 /**
- * Panel width AppShell boosts to when a file opens so the diff content area
- * reliably clears `MONACO_SPLIT_BREAKPOINT`. The extra ~20px accounts for the
- * panel border, scrollbar, and any chrome that sits between the rail edge and
- * the Monaco editor surface.
+ * Rail width floor AppShell holds while a side-by-side diff is showing, so
+ * the diff content area reliably clears `MONACO_SPLIT_BREAKPOINT` instead of
+ * silently collapsing to the inline view at the rail's compact default. The
+ * extra ~20px accounts for the panel border, scrollbar, and any chrome that
+ * sits between the rail edge and the Monaco editor surface.
  */
 export const SPLIT_DIFF_MIN_WIDTH = 920;
 
