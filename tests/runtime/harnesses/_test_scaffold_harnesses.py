@@ -425,6 +425,36 @@ class _WedgedFastHeartbeatHarness(HarnessApp):
         await asyncio.Event().wait()  # never set; hang until the watchdog fires
 
 
+class _WedgeOnceThenCompleteHarness(HarnessApp):
+    """
+    Wedges on the first ``run_turn`` invocation, completes on the second.
+
+    Models the reported mid-run failure: a turn makes real progress, then
+    one LLM call hangs and emits nothing for the whole idle window. The
+    scaffold's recovery must abandon the wedged invocation and re-run the
+    turn; the retry finds a healthy "call" and the turn completes instead
+    of the whole run hard-stopping on a single transiently wedged call.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._attempts = 0
+
+    async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
+        del request
+        self._attempts += 1
+        # Real progress first — the wedge hits a turn that was working.
+        ctx.emit(
+            OutputTextDeltaEvent(
+                type="response.output_text.delta",
+                delta=f"progress-attempt-{self._attempts} ",
+            )
+        )
+        if self._attempts == 1:
+            await asyncio.Event().wait()  # the wedged call: emits nothing more
+        ctx.emit(OutputTextDeltaEvent(type="response.output_text.delta", delta="recovered-done"))
+
+
 class _ParkingElicitFastHeartbeatHarness(HarnessApp):
     """
     Parks on ``ctx.elicit`` while fast heartbeats fire, then echoes
@@ -478,6 +508,7 @@ _FIXTURES: dict[str, type[HarnessApp]] = {
     "slow_stream": _SlowStreamHarness,
     "shutdown_tracking": _ShutdownTrackingHarness,
     "parking_elicit_fast_heartbeat": _ParkingElicitFastHeartbeatHarness,
+    "wedge_once_then_complete": _WedgeOnceThenCompleteHarness,
 }
 
 
