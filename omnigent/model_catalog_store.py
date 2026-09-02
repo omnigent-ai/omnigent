@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
@@ -43,6 +44,35 @@ def fingerprint_of(*parts: object) -> str:
         digest.update(repr(part).encode("utf-8"))
         digest.update(b"\x00")
     return digest.hexdigest()[:16]
+
+
+def binary_identity(command: str | None) -> tuple[str, int, int] | None:
+    """
+    Identity of the executable a harness probe runs, for its fingerprint.
+
+    A catalog records what one specific binary offers, so an upgraded
+    binary must miss rather than serve the old answer. The real path
+    catches installs that keep each release in its own directory, and
+    size plus mtime catches a binary replaced in place.
+
+    :param command: Executable name or path, e.g. ``"claude"``, or
+        ``None`` when the caller resolved none.
+    :returns: ``(real path, size, mtime_ns)``, or ``None`` when the
+        executable is missing or unreadable. ``None`` is a stable facet
+        value, so a probe that cannot resolve its binary keys
+        consistently rather than churning the stored catalog.
+    """
+    if not command:
+        return None
+    resolved = command if os.path.isabs(command) else shutil.which(command)
+    if not resolved:
+        return None
+    try:
+        real_path = os.path.realpath(resolved)
+        stat_result = os.stat(real_path)
+    except OSError:
+        return None
+    return real_path, stat_result.st_size, stat_result.st_mtime_ns
 
 
 #: Catalog entries older than this get a background refresh on read, and
@@ -246,6 +276,7 @@ def catalog_contains(rows: list[dict[str, Any]], token: str) -> bool:
 
 __all__ = [
     "CATALOG_STALE_AFTER_S",
+    "binary_identity",
     "catalog_age_s",
     "catalog_contains",
     "catalog_is_stale",

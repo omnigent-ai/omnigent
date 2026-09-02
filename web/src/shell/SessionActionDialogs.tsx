@@ -42,17 +42,19 @@ export function useArchiveSessionAction() {
   const archive = useArchiveConversation();
 
   return (conversation: Conversation, archived: boolean): void => {
-    archive.mutate(
-      { id: conversation.id, archived },
-      archived
-        ? {
-            onSuccess: () => {
-              navigate("/", { replace: true });
-              showToast(<ArchivedToast />);
-            },
-          }
-        : undefined,
-    );
+    if (!archived) {
+      archive.mutate({ id: conversation.id, archived });
+      return;
+    }
+    // The row leaves the sidebar optimistically (useArchiveConversation flips
+    // the cached `archived` flag in onMutate), and the caller may be viewing
+    // the session being archived, so leave its chat surface now —
+    // synchronously — and fire the toast NOW, not in a mutate onSuccess:
+    // navigating away unmounts the caller, and per-call mutate callbacks don't
+    // fire once their observer unmounts.
+    navigate("/", { replace: true });
+    archive.mutate({ id: conversation.id, archived: true });
+    showToast(<ArchivedToast />);
   };
 }
 

@@ -27,6 +27,7 @@ from types import SimpleNamespace
 import pytest
 import yaml as _yaml
 
+from omnigent.errors import OmnigentError
 from omnigent.runtime.workflow import (
     _build_claude_sdk_spawn_env,
     _build_codex_spawn_env,
@@ -322,6 +323,64 @@ def test_codex_uses_openai_global_default(config_home: Path) -> None:
     assert env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] == "printf %s sk-oai-secret"
     assert env["HARNESS_CODEX_MODEL"] == "gpt-default-model"
     # Codex defaults to the Responses wire API when the family omits wire_api.
+    assert env["HARNESS_CODEX_WIRE_API"] == "responses"
+
+
+def test_codex_rejects_chat_only_openrouter_before_harness_spawn(config_home: Path) -> None:
+    """A chat-only OpenRouter route fails before Codex can make a bad request."""
+    _write_config(
+        config_home,
+        {
+            "providers": {
+                "openrouter": {
+                    "kind": "gateway",
+                    "default": True,
+                    "openai": _key_family(
+                        "https://openrouter.ai/api/v1",
+                        "sk-or-test",
+                        "stealth/ox-alpha",
+                        wire_api="chat",
+                    ),
+                }
+            }
+        },
+    )
+    spec = _make_spec(harness="codex")
+
+    with pytest.raises(OmnigentError) as raised:
+        _build_codex_spawn_env(spec, workdir=None)
+
+    message = str(raised.value).lower()
+    assert "codex" in message
+    assert "chat" in message
+    assert "responses" in message
+    assert "openrouter.ai/api/v1" in message
+
+
+def test_codex_accepts_explicit_responses_wire_at_same_provider_url(config_home: Path) -> None:
+    """The chat-wire guard does not reject a Responses-capable route by vendor name."""
+    _write_config(
+        config_home,
+        {
+            "providers": {
+                "openrouter": {
+                    "kind": "gateway",
+                    "default": True,
+                    "openai": _key_family(
+                        "https://openrouter.ai/api/v1",
+                        "sk-or-test",
+                        "openai/gpt-5",
+                        wire_api="responses",
+                    ),
+                }
+            }
+        },
+    )
+    spec = _make_spec(harness="codex")
+
+    env = _build_codex_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CODEX_GATEWAY_BASE_URL"] == "https://openrouter.ai/api/v1"
     assert env["HARNESS_CODEX_WIRE_API"] == "responses"
 
 

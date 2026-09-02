@@ -32,6 +32,10 @@ import {
 } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  composerSendShortcutKeys,
+  KeyboardShortcutTooltipContent,
+} from "@/components/KeyboardShortcut";
 import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
 import { useNavigate, useParams } from "@/lib/routing";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
@@ -71,7 +75,10 @@ import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
-import { useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
+import {
+  serverSwitcherHiddenForSurface,
+  useSurfaceFrontmost,
+} from "@/hooks/useNativeServerSwitcher";
 import { isIOSShell, onNativeSidebarDrag, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
 import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
 import { agentDisplayLabel } from "@/components/AgentInfo";
@@ -120,6 +127,8 @@ import {
   nativeCodingAgentForSubagentWrapper,
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
+import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import { isComposerSendKey, readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
   buildMentionPreamble,
   detectMentionAt,
@@ -136,7 +145,10 @@ import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 // after the pure helpers moved to the shared lib.
 export { detectMentionAt, mentionMarkerFor };
 export type { MentionItem, MentionState };
+import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { useSession } from "@/hooks/useSession";
+import { useGithubInfo } from "@/hooks/useGithub";
+import { useOpenGithubTab } from "@/shell/FileViewerContext";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
 import {
@@ -220,6 +232,7 @@ import { SessionImage } from "@/components/SessionImage";
 import { GoalControl, GoalStatusPill, useGoalState, type Goal } from "@/components/goal";
 import { copyText } from "@/lib/clipboard";
 import { showToast } from "@/components/ui/toast";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import {
   ConnectionIndicator,
@@ -643,16 +656,24 @@ export function shouldShowAuthorBadge(
  * turn immediately instead of stalling behind that background work. (The
  * "Working…" spinner and sidebar dot still treat ``waiting`` as active — those
  * reflect background activity, which is a separate concern from send gating.)
+ *
+ * ``alwaysSteer`` (a per-device preference) drops the busy gate entirely: a
+ * follow-up sent mid-turn is POSTed now — steered into the running turn —
+ * instead of parking in the queue strip. The ``hasQueued`` guard still holds:
+ * once this conversation has a queued message it must drain in order, or a
+ * direct send could overtake a still-queued earlier one on an idle flicker.
  */
 export function shouldQueueSend(
   conversationId: string | null,
   status: "idle" | "streaming",
   sessionStatus: SessionStatus,
   queuedMessages: QueuedMessage[],
+  alwaysSteer = false,
 ): boolean {
   if (conversationId === null) return false;
-  const isBusy = status === "streaming" || sessionStatus === "running";
   const hasQueued = queuedMessages.some((m) => m.conversationId === conversationId);
+  if (alwaysSteer) return hasQueued;
+  const isBusy = status === "streaming" || sessionStatus === "running";
   return isBusy || hasQueued;
 }
 
@@ -1177,6 +1198,7 @@ export function ChatPage() {
   // the hydration early-returns below (hook order).
   const fallbackPickerKind = modelPickerKindForConv({
     labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
+    harness: activeSession?.harness ?? null,
   });
   const hostProbeHarness =
     fallbackPickerKind === "codex"
@@ -1238,10 +1260,18 @@ export function ChatPage() {
       return;
     }
     // Queue instead of POSTing now (see shouldQueueSend). enqueueMessage flushes
-    // FIFO immediately when genuinely idle, so nothing stalls.
+    // FIFO immediately when genuinely idle, so nothing stalls. With the
+    // always-steer preference on, a mid-turn follow-up skips the queue and is
+    // POSTed now instead.
     const chat = useChatStore.getState();
     if (
-      shouldQueueSend(chat.conversationId, chat.status, chat.sessionStatus, chat.queuedMessages)
+      shouldQueueSend(
+        chat.conversationId,
+        chat.status,
+        chat.sessionStatus,
+        chat.queuedMessages,
+        readAlwaysSteer(),
+      )
     ) {
       chat.enqueueMessage(text, files);
       return;
@@ -1295,6 +1325,7 @@ export function ChatPage() {
   // Once present, the live session snapshot is authoritative.
   const capabilitySource = {
     labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
+    harness: activeSession?.harness ?? null,
   };
   const modelPickerKind = modelPickerKindForConv(capabilitySource);
   // Effort ladders key on the model the session is actually on — the
@@ -1714,10 +1745,10 @@ export function updateWarmTerminalSurfaces(
  * The conversation scroll surface + composer — the content of the
  * "Main Agent" tab (and also the standalone view on `/`).
  *
- * In terminal-first sessions, when the connection pill is set to
+ * In terminal-first sessions, when the header switcher is set to
  * Terminal, the conversation + composer are replaced by an inline
- * `MainTerminalView`. The pill itself stays visible (rendered via
- * `ConnectionIndicator`) so the user can flip back to Chat.
+ * `MainTerminalView`. The switcher itself stays visible (in the header,
+ * see ViewModeToggle) so the user can flip back to Chat.
  */
 function MainAgentSurface({
   conversationId,
@@ -1902,12 +1933,16 @@ function MainAgentSurface({
   );
   useEffect(() => {
     if (!isIOSShell()) return;
-    setNativeServerSwitcherHidden(!surfaceFrontmost);
+    setNativeServerSwitcherHidden(serverSwitcherHiddenForSurface(surfaceFrontmost));
   }, [surfaceFrontmost]);
   useEffect(() => {
     if (!isIOSShell()) return;
     return () => setNativeServerSwitcherHidden(true);
   }, []);
+  // Keys the transcript so a warm switch (no hydration remount) still re-runs
+  // its mount-only scroll-to-bottom and anchor capture. Store id, not the URL
+  // prop, which leads the mirrored blocks by a commit (see the switchTo effect).
+  const activeConversationId = useChatStore((s) => s.conversationId);
   // The conversation's scroll container + the StickToBottom controls needed to
   // override its bottom-lock, lifted out of the context by
   // ConversationScrollRefBridge so the pinned-but-unmasked JumpToTopButton can
@@ -2048,11 +2083,7 @@ function MainAgentSurface({
           readOnly={entry.readOnly}
         />
         {isShown && (
-          <ConnectionIndicator
-            liveness={liveness}
-            onShowReconnectHelp={onShowReconnectHelp}
-            surfaceFrontmost={surfaceFrontmost}
-          />
+          <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
         )}
       </div>
     );
@@ -2070,10 +2101,10 @@ function MainAgentSurface({
         <>
           {/* Task tracker pinned above the thread. Sibling of the viewport (not
           an overlay) so it shrinks the scroll area rather than covering
-          messages. mt clears the floating header (h-14 mobile / h-12 desktop).
-          Self-hides with no tasks. ponytail: header offset is the web height;
-          native shells (data-ios/android) size their header via CSS vars — not
-          tuned here. */}
+          messages. mt clears the floating header (h-14 mobile / h-12 desktop);
+          native shells shift the header by the safe area, so index.css
+          re-derives this offset for them (.chat-plan-accordion). Self-hides
+          with no tasks. */}
           <ChatPlanAccordion className="mt-14 md:mt-12" />
           {/* Wrapper div gives us a ref to scope the SelectionPopup to the
           conversation area without requiring Conversation to forward refs. */}
@@ -2086,7 +2117,10 @@ function MainAgentSurface({
             ChatHeader overlay's controls (geometry in index.css). Dropped
             when the Plan accordion is pinned above — its solid bar already
             occludes content scrolling past the viewport's top edge. */}
-            <Conversation className={cn(!hasTasks && "chat-scroll-fade", "flex-1")}>
+            <Conversation
+              key={activeConversationId ?? "landing"}
+              className={cn(!hasTasks && "chat-scroll-fade", "flex-1")}
+            >
               {/* Override ConversationContent's default spacing so the thread keeps
               16px side gutters and consecutive agent turns read as one thread.
               The left inset grows *continuously* as the conversation area
@@ -2301,14 +2335,10 @@ function MainAgentSurface({
             wrapperLabel={wrapperLabel}
           />
 
-          {/* Chat/Terminal toggle for terminal-first sessions, reconnect-or-
-          fork banner when unreachable, nothing otherwise. Sits below the
-          composer so its position is consistent with the terminal view. */}
-          <ConnectionIndicator
-            liveness={liveness}
-            onShowReconnectHelp={onShowReconnectHelp}
-            surfaceFrontmost={surfaceFrontmost}
-          />
+          {/* Reconnect-or-fork banner when unreachable, nothing otherwise.
+          Sits below the composer so its position is consistent with the
+          terminal view. */}
+          <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
         </>
       )}
     </>
@@ -2471,6 +2501,21 @@ function historyLoadThreshold(el: HTMLElement): number {
 /** Finger travel before a touch drag counts as "show me what's above". */
 const TOUCH_DRAG_SLOP_PX = 8;
 
+/**
+ * Follow-up pages one gesture may chain beyond the page it fetched itself.
+ *
+ * Settled tool-heavy turns mount folded behind "Worked for" rows, so a fetched
+ * page can land with near-zero height: scrollTop never crosses the load
+ * threshold and the moved cursor would otherwise re-feed the next fetch until
+ * history ran out — one small drag used to page in the entire transcript. A
+ * fresh gesture grants a fresh budget, so older history stays reachable at a
+ * reader-paced rate instead of a runaway loop.
+ */
+const PREPEND_CHAIN_PAGES_PER_GESTURE = 2;
+
+/** Quiet gap after which the next wheel-up tick counts as a new gesture. */
+const WHEEL_GESTURE_QUIET_MS = 300;
+
 export function HistoryAutoLoader({
   scrollElement,
 }: {
@@ -2507,6 +2552,11 @@ export function HistoryAutoLoader({
   const scrolledUpRef = useRef(false);
   const lastScrollTopRef = useRef<number | null>(null);
   const touchStartYRef = useRef<number | null>(null);
+  // Whether the current touch sequence already granted its gesture budget.
+  const touchGestureSpentRef = useRef(false);
+  const lastWheelUpAtRef = useRef(Number.NEGATIVE_INFINITY);
+  // Prepend-fed fetches left before the chain must wait for a fresh gesture.
+  const chainBudgetRef = useRef(PREPEND_CHAIN_PAGES_PER_GESTURE);
 
   // Position across a prepend is held by native scroll anchoring, not by this
   // component. Writing scrollTop here instead used to interrupt the reader's
@@ -2520,11 +2570,13 @@ export function HistoryAutoLoader({
     // Baseline from where the pane currently sits, so the reader's very first
     // upward scroll already has something to compare against.
     lastScrollTopRef.current = el.scrollTop;
-    // Arming has to re-run the paging effect itself: a pane with no scroll
-    // range fires no scroll event, so nothing else would notice the gesture.
-    const armScrollUp = () => {
-      if (scrolledUpRef.current) return;
+    // A gesture has to re-run the paging effect itself: a pane with no scroll
+    // range fires no scroll event, so nothing else would notice it. It also
+    // refills the chain budget — every fresh ask for what's above buys a
+    // bounded amount of prepend-fed follow-up, never the whole history.
+    const noteUpwardGesture = () => {
       scrolledUpRef.current = true;
+      chainBudgetRef.current = PREPEND_CHAIN_PAGES_PER_GESTURE;
       setScrollRevision((revision) => revision + 1);
     };
     const handleScroll = () => {
@@ -2533,25 +2585,38 @@ export function HistoryAutoLoader({
       // Only an upward move counts. The open's scroll-to-bottom and a
       // prepend's native anchor correction both move scrollTop DOWN the
       // document (larger), so neither can arm paging on its own.
-      if (previous !== null && el.scrollTop < previous - 0.5) scrolledUpRef.current = true;
+      if (previous !== null && el.scrollTop < previous - 0.5) {
+        scrolledUpRef.current = true;
+        chainBudgetRef.current = PREPEND_CHAIN_PAGES_PER_GESTURE;
+      }
       // Every scroll re-runs the paging effect, armed or not: staying near the
       // top has to keep paging, not just the moment the reader arrives there.
       setScrollRevision((revision) => revision + 1);
     };
     // Wheel/trackpad up, and a touch drag downward (which reveals what is
     // above). These fire whether or not the pane has anywhere to scroll.
+    // Both emit many events per physical gesture, so the budget refill keys
+    // on the gesture's start — one touch sequence grants once, and a wheel
+    // burst grants again only after a quiet gap — keeping the bound truly
+    // per-gesture even when pages settle mid-drag.
     const handleWheel = (event: WheelEvent) => {
-      if (event.deltaY < 0) armScrollUp();
+      if (event.deltaY >= 0) return;
+      const now = performance.now();
+      const newGesture = now - lastWheelUpAtRef.current > WHEEL_GESTURE_QUIET_MS;
+      lastWheelUpAtRef.current = now;
+      if (newGesture) noteUpwardGesture();
     };
     const handleTouchStart = (event: TouchEvent) => {
       touchStartYRef.current = event.touches[0]?.clientY ?? null;
+      touchGestureSpentRef.current = false;
     };
     const handleTouchMove = (event: TouchEvent) => {
       const start = touchStartYRef.current;
       const current = event.touches[0]?.clientY;
-      if (start !== null && current !== undefined && current > start + TOUCH_DRAG_SLOP_PX) {
-        armScrollUp();
-      }
+      if (start === null || current === undefined || current <= start + TOUCH_DRAG_SLOP_PX) return;
+      if (touchGestureSpentRef.current) return;
+      touchGestureSpentRef.current = true;
+      noteUpwardGesture();
     };
     el.addEventListener("scroll", handleScroll, { passive: true });
     el.addEventListener("wheel", handleWheel, { passive: true });
@@ -2582,6 +2647,7 @@ export function HistoryAutoLoader({
       generationRef.current = historyGeneration;
       // A new window is a new open: require a fresh upward scroll.
       scrolledUpRef.current = false;
+      chainBudgetRef.current = PREPEND_CHAIN_PAGES_PER_GESTURE;
       lastScrollTopRef.current = el.scrollTop;
     }
 
@@ -2601,6 +2667,16 @@ export function HistoryAutoLoader({
       el.scrollTop >= historyLoadThreshold(el)
     ) {
       return;
+    }
+
+    // A prepend re-feeding the chain spends gesture budget: without a bound,
+    // folded (height-neutral) pages would re-feed fetches until history ran
+    // out. A real-height prepend passes here too until its async anchor
+    // scroll lands; that upward-scroll refill keeps scroll-range paging
+    // unchanged. Once spent, the chain waits for the reader's next gesture.
+    if (itemsChanged && !scrollPositionChanged) {
+      if (chainBudgetRef.current <= 0) return;
+      chainBudgetRef.current -= 1;
     }
 
     void state.loadMoreHistory();
@@ -3122,16 +3198,22 @@ function isSystemBubble(bubble: Bubble): boolean {
   return isSystemUserContent(bubble.content);
 }
 
-function CompactionLoadingIndicator() {
+function CompactionLoadingIndicator({ createdAtS }: { createdAtS?: number }) {
   const [elapsed, setElapsed] = useState(0);
-  const startRef = useRef(performance.now());
 
   useEffect(() => {
-    const id = window.setInterval(() => {
-      setElapsed(Math.round((performance.now() - startRef.current) / 1000));
-    }, 1000);
+    // Calculate elapsed time from the actual compaction start time (if available)
+    // rather than component mount time, so the timer persists across session switches.
+    const startTimeMs = createdAtS != null ? createdAtS * 1000 : Date.now();
+
+    const updateElapsed = () => {
+      setElapsed(Math.round((Date.now() - startTimeMs) / 1000));
+    };
+
+    updateElapsed();
+    const id = window.setInterval(updateElapsed, 1000);
     return () => window.clearInterval(id);
-  }, []);
+  }, [createdAtS]);
 
   return (
     <Message from="assistant" data-testid="compacting-indicator">
@@ -3188,7 +3270,7 @@ export const BubbleView = memo(
   }) {
     if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
     if (bubble.kind === "compaction_loading") {
-      return <CompactionLoadingIndicator />;
+      return <CompactionLoadingIndicator createdAtS={bubble.createdAtS} />;
     }
     if (bubble.kind === "compaction") return <CompactionMarker />;
     if (bubble.kind === "routing_decision") {
@@ -3685,10 +3767,9 @@ interface ComposerProps {
   /** Show Polly's Codex command-backed Goal control. */
   showPollyCodexGoalControl?: boolean;
   /**
-   * Terminal-first session (Chat/Terminal pill present). Presentation
-   * only: tightens the composer's bottom padding to `pb-1.5` so it sits
-   * closer to the pill beneath it; non-terminal-first chats use the
-   * roomier `pb-3`.
+   * Terminal-first session. Presentation only: tightens the composer's
+   * bottom padding to `pb-1.5` (the status line beneath already cushions
+   * the edge); non-terminal-first chats use the roomier `pb-3`.
    */
   isTerminalFirst?: boolean;
   /**
@@ -3980,6 +4061,13 @@ function ComposerStatusLine({
   const { session } = useSession(conversationId);
   const isHostBound = !!session?.hostId;
 
+  // PR link → opens the workspace rail's GitHub tab. Shares the info query's
+  // cache with the GitHub panel, so opening the tab is instant.
+  const github = useGithubInfo(conversationId ?? undefined);
+  const openGithubTab = useOpenGithubTab();
+  const prNumber = github.data?.pr?.number ?? null;
+  const showPr = !!conversationId && !isSubAgentSession && prNumber !== null && !!openGithubTab;
+
   const showBranch = !!conversationId && !!gitBranch;
   // Host indicator (green/red dot + host name), left of the worktree branch.
   // Hidden on sub-agent sessions — the header's child-session slot owns the
@@ -3999,7 +4087,8 @@ function ComposerStatusLine({
   // the badge is where it lives and an unreachable session often has no
   // branch/ring at all.
   const showHostBadge = showHost && isHostBound;
-  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showHostBadge) return null;
+  if (!showBranch && !showPr && !showPlanMode && !showGoal && !showRing && !showHostBadge)
+    return null;
 
   return (
     <div
@@ -4022,6 +4111,18 @@ function ComposerStatusLine({
               {gitBranch}
             </span>
           </span>
+        )}
+        {showPr && (
+          <button
+            type="button"
+            data-testid="composer-pr-link"
+            onClick={() => openGithubTab?.()}
+            title="View this PR in the GitHub tab"
+            className="flex shrink-0 items-center gap-1.5 rounded text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          >
+            <GithubMono size={14} aria-hidden />
+            <span className="tabular-nums underline underline-offset-2">#{prNumber}</span>
+          </button>
         )}
       </div>
       {/* Right: model/effort and context ring, never shrinks. */}
@@ -4284,6 +4385,7 @@ export function Composer({
   wrapperLabel = null,
 }: ComposerProps) {
   const [value, setValue] = useState("");
+  const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   const [files, setFiles] = useState<File[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
@@ -4436,17 +4538,11 @@ export function Composer({
   // On mobile, programmatic focus immediately summons the software keyboard.
   // Keep desktop's fast-type affordance, but let mobile users explicitly tap
   // the composer when switching back from Terminal or changing sessions.
-  const [isMobile, setIsMobile] = useState(
-    () => typeof window !== "undefined" && window.matchMedia("(max-width: 767px)").matches,
-  );
+  const isMobile = useIsMobileViewport();
+  const isCoarsePointer = useIsCoarsePointer();
+  const preventsKeyboardSubmit = isMobile || isCoarsePointer;
   const isMobileRef = useRef(isMobile);
   isMobileRef.current = isMobile;
-  useEffect(() => {
-    const mq = window.matchMedia("(max-width: 767px)");
-    const handler = (e: MediaQueryListEvent) => setIsMobile(e.matches);
-    mq.addEventListener("change", handler);
-    return () => mq.removeEventListener("change", handler);
-  }, []);
 
   useEffect(() => {
     const restored = conversationId ? getSessionDraft(conversationId) : undefined;
@@ -5017,10 +5113,32 @@ export function Composer({
       return;
     }
 
+    // Touch-primary newline behavior outranks autocomplete and desktop submit
+    // preferences. Leave the event untouched so the textarea inserts it.
+    if (preventsKeyboardSubmit && e.key === "Enter") {
+      return;
+    }
+
+    const shouldSubmitFromKeyboard = isComposerSendKey(
+      {
+        key: e.key,
+        shiftKey: e.shiftKey,
+        metaKey: e.metaKey,
+        ctrlKey: e.ctrlKey,
+        altKey: e.altKey,
+        isComposing: e.nativeEvent.isComposing,
+      },
+      submitWithModEnter,
+      preventsKeyboardSubmit,
+    );
+    // Plain Enter still completes an open suggestion. In Mod+Enter mode, the
+    // explicit send chord bypasses suggestions so the modifier has one meaning.
+    const shouldPreferSendOverCompletion = submitWithModEnter && shouldSubmitFromKeyboard;
+
     // "@"-mention menu navigation (shared useMentionBrowser) — mutually
     // exclusive with the slash menu below (a mention token can't also read as a
     // "/"-command). Takes priority over history recall and submission.
-    if (handleMentionKeyDown(e)) return;
+    if (!shouldPreferSendOverCompletion && handleMentionKeyDown(e)) return;
 
     // When the suggestions menu is open, ArrowUp/Down navigate it and
     // Enter/Tab complete the highlighted item. These take priority over
@@ -5036,7 +5154,11 @@ export function Composer({
         setMenuIndex((i) => (i <= 0 ? menuMatches.length - 1 : i - 1));
         return;
       }
-      if ((e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !isMobile)) && menuIndex >= 0) {
+      if (
+        !shouldPreferSendOverCompletion &&
+        (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !isMobile)) &&
+        menuIndex >= 0
+      ) {
         e.preventDefault();
         applyMenuSelection(menuMatches[menuIndex]!);
         return;
@@ -5050,9 +5172,9 @@ export function Composer({
       }
     }
 
-    // Enter sends; Shift+Enter inserts a newline. On mobile, Enter inserts a
-    // newline (no Shift available on-screen) and Send must be tapped instead.
-    if (e.key === "Enter" && !e.shiftKey && !isMobile && !e.nativeEvent.isComposing) {
+    // Mobile Enter behavior takes precedence over this desktop preference:
+    // software-keyboard Enter inserts a newline and Send remains an explicit tap.
+    if (shouldSubmitFromKeyboard) {
       e.preventDefault();
       // The mention menu is briefly closed while its listing loads (see
       // ``mentionListingPending``); swallow Enter so the in-progress "@dir/"
@@ -5118,10 +5240,7 @@ export function Composer({
   return (
     <form
       onSubmit={handleSubmit}
-      className={cn(
-        "chat-composer-form px-4 md:px-6",
-        isTerminalFirst ? "terminal-first-composer-form pb-1.5" : "pb-3",
-      )}
+      className={cn("chat-composer-form px-4 md:px-6", isTerminalFirst ? "pb-1.5" : "pb-3")}
     >
       {/* Hidden file input for the attach button */}
       <input
@@ -5545,35 +5664,47 @@ export function Composer({
                 openNonce={pickerOpenNonce}
               />
             </div>
-            <Button
-              type="submit"
-              size="icon"
-              variant={showInterruptButton ? "destructive" : "default"}
-              // Send button fades more decisively when there's no draft —
-              // overrides the base 50% disabled-opacity so the affordance
-              // reads as "waiting for input", not "almost active".
-              className={cn(
-                "size-9 shrink-0 rounded-lg md:size-8",
-                !showInterruptButton &&
-                  "hover:bg-primary/90 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
-              )}
-              // Interrupt stays live during a pending elicitation —
-              // cancelling the turn is the other legitimate way out.
-              disabled={
-                showInterruptButton
-                  ? isReadOnly
-                  : !hasDraft || disabled || isReadOnly || hasPendingElicitation
-              }
-              title={showInterruptButton ? "Interrupt" : "Send"}
-              aria-label={showInterruptButton ? "Interrupt" : "Send"}
-            >
-              {showInterruptButton ? (
-                <SquareIcon className="size-4 fill-current" />
-              ) : (
-                <ArrowUpIcon className="size-4" viewBox="4 4 16 16" />
-              )}
-              <span className="sr-only">{showInterruptButton ? "Interrupt" : "Send"}</span>
-            </Button>
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="submit"
+                    size="icon"
+                    variant={showInterruptButton ? "destructive" : "default"}
+                    // Send button fades more decisively when there's no draft —
+                    // overrides the base 50% disabled-opacity so the affordance
+                    // reads as "waiting for input", not "almost active".
+                    className={cn(
+                      "size-9 shrink-0 rounded-lg md:size-8",
+                      !showInterruptButton &&
+                        "hover:bg-primary/90 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
+                    )}
+                    // Interrupt stays live during a pending elicitation —
+                    // cancelling the turn is the other legitimate way out.
+                    disabled={
+                      showInterruptButton
+                        ? isReadOnly
+                        : !hasDraft || disabled || isReadOnly || hasPendingElicitation
+                    }
+                    title={showInterruptButton ? "Interrupt" : undefined}
+                    aria-label={showInterruptButton ? "Interrupt" : "Send"}
+                  >
+                    {showInterruptButton ? (
+                      <SquareIcon className="size-4 fill-current" />
+                    ) : (
+                      <ArrowUpIcon className="size-4" viewBox="4 4 16 16" />
+                    )}
+                    <span className="sr-only">{showInterruptButton ? "Interrupt" : "Send"}</span>
+                  </Button>
+                </TooltipTrigger>
+                {!showInterruptButton && !preventsKeyboardSubmit && (
+                  <KeyboardShortcutTooltipContent
+                    label="Send"
+                    keys={composerSendShortcutKeys(submitWithModEnter)}
+                  />
+                )}
+              </Tooltip>
+            </TooltipProvider>
           </div>
         </div>
       </div>
@@ -5846,8 +5977,25 @@ export function readOnlyReasonForSessionLabels(
   return null;
 }
 
+/**
+ * A custom (label-less) session resolved to the native Codex harness.
+ *
+ * Custom YAML agents get no `omnigent.wrapper` presentation label, so the
+ * resolved harness is the capability evidence. Any wrapper label — including
+ * sub-agent variants like `codex-native-ui-subagent`, which cannot honor
+ * mid-session overrides — keeps the label authoritative and skips the
+ * fallback.
+ */
+function isLabelLessCodexNative(
+  conv:
+    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
+): boolean {
+  return conv?.labels?.["omnigent.wrapper"] == null && conv?.harness === "codex-native";
+}
+
 export function effortLevelsForConv(
-  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  conv:
+    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
   codexModelOptions: readonly NativeModelOption[] = [],
   currentModel: string | null = null,
 ): readonly string[] {
@@ -5859,7 +6007,9 @@ export function effortLevelsForConv(
     case "pi-native-ui":
       return PI_NATIVE_EFFORT_LEVELS;
     default:
-      return EFFORT_LEVELS;
+      return isLabelLessCodexNative(conv)
+        ? codexEffortLevelsForModel(codexModelOptions, currentModel)
+        : EFFORT_LEVELS;
   }
 }
 
@@ -5871,7 +6021,8 @@ export function effortLevelsForConv(
  * `TerminalFirstContext.tsx`).
  */
 export function modelPickerKindForConv(
-  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  conv:
+    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
 ): NativeModelPickerKind | null {
   switch (conv?.labels?.["omnigent.wrapper"]) {
     case "claude-code-native-ui":
@@ -5897,12 +6048,13 @@ export function modelPickerKindForConv(
       // model_select handler, so the picker surfaces that as the live model.
       return "pi";
     default:
-      return null;
+      return isLabelLessCodexNative(conv) ? "codex" : null;
   }
 }
 
 export function shouldShowModelPicker(
-  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  conv:
+    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
 ): boolean {
   return modelPickerKindForConv(conv) !== null;
 }
@@ -5915,7 +6067,8 @@ export function shouldShowModelPicker(
  * :returns: True only when the session supports Web UI effort controls.
  */
 export function shouldShowEffortPicker(
-  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+  conv:
+    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
 ): boolean {
   return supportsEffortControl(conv);
 }

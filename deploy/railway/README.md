@@ -19,9 +19,9 @@ a managed Postgres, and serves it over HTTPS on `*.up.railway.app`.
 - **omnigent** — web service that pulls `ghcr.io/omnigent-ai/omnigent-server`
   via `deploy/docker/Dockerfile.prebuilt`, served on `https://<project>.up.railway.app`.
 - **Postgres** — Railway-managed PostgreSQL plugin you add to the project.
-  Railway links its `DATABASE_URL` into the app as a reference to the database
-  instance's variable (largely automatic), but the value can lag on the first
-  deploy — see step 2.
+  Adding the plugin does **not** wire its `DATABASE_URL` into the app on its
+  own. You add that reference variable on the omnigent service yourself before
+  the app can boot (see step 2).
 
 Artifact storage uses the container's local filesystem by default (ephemeral
 across redeploys). For persistence, add a Railway Volume mounted at
@@ -41,12 +41,15 @@ steps below are validated end-to-end:
 1. **Deploy from the repo** — New Project → Deploy from GitHub repo → this repo.
    Railway reads `railway.toml` and pulls the image. **Add a Postgres plugin**
    to the project.
-2. **Database** — Railway links the Postgres `DATABASE_URL` into the app as a
-   reference to the db instance's variable (largely automatic when you add the
-   plugin). If the first deploy errors with `DATABASE_URL is required`, the
-   reference value simply hadn't propagated yet — **redeploy** and it resolves.
-   (To confirm, the app service should have a `DATABASE_URL` variable
-   referencing the Postgres service, e.g. `${{Postgres.DATABASE_URL}}`.)
+2. **Add the `DATABASE_URL` reference on the app service** (required before the
+   first successful boot). Adding the Postgres plugin does **not** inject its
+   `DATABASE_URL` into the omnigent service. Open the **omnigent** service →
+   **Variables**, add a variable named `DATABASE_URL`, and set its value to a
+   reference to the Postgres service: `${{Postgres.DATABASE_URL}}`. If your
+   database service is named something other than `Postgres`, match that name
+   (for example `${{my-db.DATABASE_URL}}`). Until this reference is set, the
+   deploy errors with `DATABASE_URL is required` on every boot, so add it, then
+   **redeploy**.
 3. **Create the first admin.** No credentials are auto-generated. The
    first-boot **Deploy logs** print a "No admin yet" line pointing at your
    `*.up.railway.app` URL (printed once; idempotent — later boots don't

@@ -18,7 +18,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "build:overlay": "vite build --config vite.update-overlay.config.ts"
+    "build:overlay": "vite build --config vite.update-overlay.config.ts",
+    "build:server-selector-v2": "vite build --config vite.server-selector-v2.config.ts",
+    "dev:server-selector-v2": "vite --config vite.server-selector-v2.config.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
@@ -37,6 +39,7 @@
     "@opentelemetry/resources": "^2.8.0",
     "@opentelemetry/sdk-trace-web": "^2.8.0",
     "@opentelemetry/semantic-conventions": "^1.41.1",
+    "@pierre/diffs": "1.3.6",
     "@radix-ui/react-use-controllable-state": "^1.2.2",
     "@shikijs/monaco": "4.2.0",
     "@streamdown/cjk": "^1.0.3",

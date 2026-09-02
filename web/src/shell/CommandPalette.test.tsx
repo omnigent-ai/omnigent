@@ -399,10 +399,11 @@ describe("CommandPalette — actions", () => {
     fireEvent.click(screen.getByText("Archive session"));
 
     expect(onOpenChange).toHaveBeenCalledWith(false);
-    expect(archiveConversation).toHaveBeenCalledWith(
-      { id: "active-session", archived: true },
-      expect.objectContaining({ onSuccess: expect.any(Function) }),
-    );
+    // Archive navigates away and toasts synchronously (the caller unmounts, so a
+    // per-call mutate onSuccess wouldn't fire), and the mutation carries no
+    // callback of its own.
+    expect(navigate).toHaveBeenCalledWith("/", { replace: true });
+    expect(archiveConversation).toHaveBeenCalledWith({ id: "active-session", archived: true });
   });
 
   it("opens the shared rename dialog for the active session", () => {

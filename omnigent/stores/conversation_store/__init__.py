@@ -16,14 +16,15 @@ from omnigent.entities import (
 )
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
 
-# Label set on a fork of a session that had a working directory. Its
-# value is the source session id. Presence marks the (unbound) clone as
-# needing a host + working directory before it can run, so the
-# online-dot reports it offline until bound and the UI opens the
-# directory picker instead of silently dropping the first message.
-# Forks of chat-only sources (no workspace) get no label and resume
-# in-process like a brand-new chat session. Canonical home is the store
-# layer; the server route and the SQLAlchemy store both import it.
+# Label set on a fork of a session that had a working directory, or a
+# runner-bound native session whose working-directory metadata was lost.
+# Its value is the source session id. Presence marks the (unbound) clone
+# as needing a host + working directory before it can run, so the
+# online-dot reports it offline until bound and the UI opens the directory
+# picker instead of silently dropping the first message. Forks of
+# chat-only sources get no label and resume in-process like a brand-new
+# chat session. Canonical home is the store layer; the server route and
+# the SQLAlchemy store both import it.
 FORK_SOURCE_LABEL_KEY = "omnigent.fork.source_id"
 
 # One-shot fork directive: the SOURCE session's runtime-native session id
@@ -141,6 +142,14 @@ def pinned_label_key(user_id: str | None) -> str:
     return f"{PINNED_LABEL_KEY}.{suffix}"
 
 
+# Epoch-SECONDS time a session was archived, written on archive and deleted on
+# unarchive. A label rather than a ``conversations`` column, so ageing out old
+# archived sessions needs no schema migration; readers fall back to
+# ``updated_at`` when it is absent. Seconds, not the pin key's epoch-ms, to
+# match that fallback's unit.
+ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at"
+
+
 # Labels that must NOT cross into a new session context — deliberately
 # dropped both when forking (not copied to the clone) and on an in-place
 # agent switch (deleted from the switched session). Two distinct reasons
@@ -171,9 +180,11 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
     }
 )
 
-# Source identity belongs only to the original imported session. Unlike runtime
-# instance labels, these survive an in-place agent switch but never a fork.
-_FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS
+# Source identity belongs only to the original imported session, and a fork is
+# born unarchived so it must not inherit its parent's archive time. Unlike
+# runtime instance labels, these survive an in-place agent switch but never a
+# fork.
+_FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {ARCHIVED_AT_LABEL_KEY}
 
 
 @dataclass(frozen=True)
@@ -374,6 +385,7 @@ class ConversationStore(ABC):
         git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
         conversation_id: str | None = None,
+        project_id: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation. Generates a unique
@@ -1307,6 +1319,10 @@ class ConversationStore(ABC):
         method; internal sub-agent code also uses it to keep child
         conversations on the parent's current runner.
 
+        Runner/host binding is live state, not conversation activity, so
+        this must NOT bump ``updated_at`` (it drives sidebar ordering
+        and the unread dot).
+
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
         :param runner_id: Runner identifier to bind to,
@@ -1326,6 +1342,10 @@ class ConversationStore(ABC):
         Counterpart to :meth:`replace_runner_id` for the 1:1
         session↔runner invariant — /clear and /switch unbind the old
         session before binding the runner to the new one.
+
+        Runner/host binding is live state, not conversation activity, so
+        this must NOT bump ``updated_at`` (it drives sidebar ordering
+        and the unread dot).
 
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -1354,6 +1374,10 @@ class ConversationStore(ABC):
         ``workspace`` together never violates
         ``ck_conversations_workspace_required_for_host`` (workspace
         is only required while ``host_id`` is set).
+
+        Runner/host binding is live state, not conversation activity, so
+        this must NOT bump ``updated_at`` (it drives sidebar ordering
+        and the unread dot).
 
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -1400,6 +1424,10 @@ class ConversationStore(ABC):
         Used when the server asks a host to spawn a runner for
         an existing session. Last-write-wins semantics (like
         :meth:`replace_runner_id`).
+
+        Runner/host binding is live state, not conversation activity, so
+        this must NOT bump ``updated_at`` (it drives sidebar ordering
+        and the unread dot).
 
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -1473,6 +1501,7 @@ class ConversationStore(ABC):
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
+        project_id: str | None = None,
     ) -> CreatedSession:
         """
         Atomically create a session and its session-scoped agent.

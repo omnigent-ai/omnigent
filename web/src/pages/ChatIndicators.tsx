@@ -1,11 +1,8 @@
-import { useEffect, useRef } from "react";
 import { AlertTriangleIcon, Loader2Icon, WifiOffIcon } from "lucide-react";
 import { ConversationEmptyState } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ErrorBanner } from "@/components/blocks/StatusBlocks";
-import { useIOSNativeKeyboardVisible } from "@/hooks/useIOSNativeKeyboardInset";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
-import { isIOSShell, onNativeViewModeChanged, setNativeViewMode } from "@/lib/nativeBridge";
 import type { SandboxStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
@@ -52,19 +49,11 @@ export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
 export function ConnectionIndicator({
   liveness,
   onShowReconnectHelp,
-  surfaceFrontmost = true,
 }: {
   liveness: SessionLiveness;
   onShowReconnectHelp: () => void;
-  // Whether the chat/terminal surface is frontmost (not under a drawer). Gates
-  // the native iOS bar so it doesn't float over an opened sidebar/panel.
-  surfaceFrontmost?: boolean;
 }) {
   const terminalFirst = useTerminalFirst();
-  const keyboardVisible = useIOSNativeKeyboardVisible(
-    terminalFirst?.isTerminalFirst === true,
-    terminalFirst?.view === "chat",
-  );
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
   // Genuinely-unreachable states get the reconnect banner, for
   // both terminal-first and regular sessions. `runner_asleep` (host up,
@@ -72,20 +61,6 @@ export function ConnectionIndicator({
   // host the server wakes on the next message), and `unknown` (pre-poll) are
   // NOT unreachable — they're handled below.
   const unreachable = liveness.kind === "host_offline" || liveness.kind === "local_stranded";
-
-  // In the iOS shell the Chat/Terminal toggle is the native Liquid Glass bar,
-  // not the in-page pill. Drive it from here (always mounted) with the SAME
-  // visibility the pill would have, expressed as a stable boolean so switching
-  // views never flickers the bar. Hook is called unconditionally (before any
-  // early return) to satisfy the rules of hooks.
-  const nativeBarVisible =
-    isIOSShell() &&
-    terminalFirst?.isTerminalFirst === true &&
-    !terminalFirst.isShellView &&
-    sandboxStatus?.stage !== "failed" &&
-    !keyboardVisible &&
-    surfaceFrontmost;
-  useNativeChatTerminalBar(terminalFirst, nativeBarVisible);
 
   if (sandboxStatus !== null) {
     // A failed launch owns this band with its reason. An IN-FLIGHT
@@ -107,79 +82,39 @@ export function ConnectionIndicator({
     // `local_stranded` keeps the banner everywhere (no host, hence no badge).
     const composerOnScreen = !(terminalFirst?.isTerminalFirst && terminalFirst.view === "terminal");
     if (liveness.kind === "host_offline" && composerOnScreen) {
-      return nativeBarVisible ? (
-        <div
-          aria-hidden
-          className={cn(
-            "omnigent-native-bottom-spacer",
-            terminalFirst?.view === "chat" && "omnigent-native-bottom-spacer--chat",
-          )}
-        />
-      ) : null;
+      return null;
     }
     return (
-      <>
-        <div className={cn("mx-auto mb-4 flex w-full justify-center px-6", CHAT_COLUMN_WIDTH)}>
-          {/* Reconnect affordance styled as the destructive error pill (never
+      <div className={cn("mx-auto mb-4 flex w-full justify-center px-6", CHAT_COLUMN_WIDTH)}>
+        {/* Reconnect affordance styled as the destructive error pill (never
               raw red text). Keeps its own click → reconnect dialog rather than
               the ErrorBanner's async Retry, since some states need the picker. */}
-          <button
-            type="button"
-            data-testid="disconnected-indicator"
-            onClick={onShowReconnectHelp}
-            className="flex items-center gap-2 rounded-[12px] px-4 py-2 text-sm text-destructive transition-[filter] hover:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-            style={{
-              background:
-                "color-mix(in srgb, var(--destructive) 4%, var(--app-shell-bg, var(--background)))",
-              border: "1px solid color-mix(in srgb, var(--destructive) 32%, transparent)",
-            }}
-          >
-            <WifiOffIcon className="size-3.5 shrink-0" />
-            <span>
-              {liveness.kind === "host_offline"
-                ? "Host is offline — click to reconnect"
-                : "Agent disconnected — click to reconnect"}
-            </span>
-          </button>
-        </div>
-        {nativeBarVisible && (
-          <div
-            aria-hidden
-            className={cn(
-              "omnigent-native-bottom-spacer",
-              terminalFirst?.view === "chat" && "omnigent-native-bottom-spacer--chat",
-            )}
-          />
-        )}
-      </>
+        <button
+          type="button"
+          data-testid="disconnected-indicator"
+          onClick={onShowReconnectHelp}
+          className="flex items-center gap-2 rounded-[12px] px-4 py-2 text-sm text-destructive transition-[filter] hover:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          style={{
+            background:
+              "color-mix(in srgb, var(--destructive) 4%, var(--app-shell-bg, var(--background)))",
+            border: "1px solid color-mix(in srgb, var(--destructive) 32%, transparent)",
+          }}
+        >
+          <WifiOffIcon className="size-3.5 shrink-0" />
+          <span>
+            {liveness.kind === "host_offline"
+              ? "Host is offline — click to reconnect"
+              : "Agent disconnected — click to reconnect"}
+          </span>
+        </button>
+      </div>
     );
   }
 
-  // Terminal-first sessions: the Chat/Terminal toggle lives in the header
-  // (ViewModeToggle) for every reachable state — only the unreachable
-  // states above replace this band with the reconnect banner. In the iOS
-  // shell the toggle is the native Liquid Glass bar, so this band still
-  // reserves a spacer for its footprint.
+  // Terminal-first sessions: the Chat/Terminal switcher lives in the header
+  // (ViewModeToggle) on every shell, iOS included — this band renders
+  // nothing for them outside the unreachable states above.
   if (terminalFirst?.isTerminalFirst) {
-    // In the iOS shell the toggle is the native bar (driven above). Render only
-    // a spacer reserving its fixed footprint so the composer clears it — and
-    // nothing when the bar is hidden.
-    if (isIOSShell()) {
-      // Chat reserves a touch less than terminal: the composer's own bottom
-      // content (the status line) already cushions the gap to the bar.
-      return nativeBarVisible ? (
-        <div
-          aria-hidden
-          className={cn(
-            "omnigent-native-bottom-spacer",
-            terminalFirst.view === "chat" && "omnigent-native-bottom-spacer--chat",
-          )}
-        />
-      ) : null;
-    }
-    // Outside the iOS shell the Chat/Terminal switcher lives in the header
-    // (ViewModeToggle) — this band renders nothing for terminal-first
-    // sessions now that the in-page pill is gone.
     return null;
   }
 
@@ -365,56 +300,4 @@ export function McpStartupIndicator() {
       </MessageContent>
     </Message>
   );
-}
-
-/**
- * Mirrors the Chat/Terminal state onto the iOS shell's native Liquid Glass
- * switcher and routes its taps back into `setView`. Driven by a stable
- * `visible` boolean (not this hook's mount/unmount), so toggling Chat/Terminal
- * updates the bar in place instead of flickering it hidden→shown. A no-op
- * outside the iOS shell; the caller renders its own in-page pill there.
- */
-function useNativeChatTerminalBar(
-  ctx: ReturnType<typeof useTerminalFirst> | null,
-  visible: boolean,
-): void {
-  const native = isIOSShell();
-  const view = ctx?.view ?? "chat";
-  const terminalEnabled = ctx?.isTerminalFirst === true;
-  const terminalStartingUp = ctx?.terminalStartingUp ?? false;
-
-  // Keep `setView` reachable from the subscribe-once effect without
-  // resubscribing whenever the callback identity changes.
-  const setViewRef = useRef(ctx?.setView);
-  setViewRef.current = ctx?.setView;
-
-  // Push current state + visibility down whenever any of it changes.
-  useEffect(() => {
-    if (!native) return;
-    setNativeViewMode({
-      mode: view,
-      terminalEnabled,
-      terminalStartingUp,
-      visible,
-    });
-  }, [native, view, terminalEnabled, terminalStartingUp, visible]);
-
-  // Belt-and-suspenders: hide the bar if the host component ever unmounts.
-  useEffect(() => {
-    if (!native) return;
-    return () => {
-      setNativeViewMode({
-        mode: "chat",
-        terminalEnabled: false,
-        terminalStartingUp: false,
-        visible: false,
-      });
-    };
-  }, [native]);
-
-  // Route native taps back into the web layer.
-  useEffect(() => {
-    if (!native) return;
-    return onNativeViewModeChanged((mode) => setViewRef.current?.(mode));
-  }, [native]);
 }

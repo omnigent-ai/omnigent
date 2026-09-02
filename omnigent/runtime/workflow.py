@@ -47,6 +47,7 @@ from omnigent.onboarding.detected import (
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
     BEDROCK_KIND,
+    CHAT_WIRE_API,
     CLI_CONFIG_KIND,
     DATABRICKS_KIND,
     OPENAI_FAMILY,
@@ -741,8 +742,18 @@ def _apply_provider_family(
     :param harness_type: ``"claude-sdk"`` or ``"codex"``.
     :param family: The resolved provider family for this harness.
     :raises OmnigentError: If no model is resolvable (neither the spec nor
-        the family declares one).
+        the family declares one), or if a Codex provider is configured for
+        the unsupported Chat Completions wire API.
     """
+    if harness_type == "codex" and family.wire_api == CHAT_WIRE_API:
+        raise OmnigentError(
+            "The 'codex' harness requires an OpenAI Responses API endpoint, but "
+            f"provider endpoint {family.base_url!r} is configured with "
+            "'wire_api: chat'. Choose a Responses-capable endpoint and set "
+            "'wire_api: responses', or use a harness that supports Chat Completions.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
     cfg = _UCODE_HARNESS_CONFIGS[harness_type]
     env[_HARNESS_GATEWAY_FLAG[harness_type]] = "true"
     env[cfg.base_url_key] = family.base_url
@@ -1174,7 +1185,10 @@ def _build_claude_sdk_spawn_env(
     env: dict[str, str] = {}
     model = _resolve_spec_model(spec)
     if model is not None:
-        env["HARNESS_CLAUDE_SDK_MODEL"] = model
+        # Specs may pin the provider-routed spelling ("anthropic/<name>") so
+        # generic clients route correctly, but the claude CLI rejects
+        # vendor-prefixed model ids — hand it the bare name.
+        env["HARNESS_CLAUDE_SDK_MODEL"] = model.removeprefix("anthropic/")
     # Session workspace (the selected working folder), not the bundle workdir.
     # Without this the SDK subprocess inherits the runner's launch cwd — see
     # ``HARNESS_CLAUDE_SDK_CWD`` in ``omnigent/inner/claude_sdk_harness.py``.

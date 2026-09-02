@@ -31,6 +31,7 @@ from omnigent.cost_plan import (
     reserved_cost_control_keys,
 )
 from omnigent.db.utils import generate_agent_id
+from omnigent.debug_logging import add_audit_attrs, debug_event
 from omnigent.entities import (
     CommentsFingerprint,
     Conversation,
@@ -48,6 +49,7 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
 from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runtime import (
     pending_elicitations,
     user_session_stream,
@@ -168,6 +170,7 @@ from omnigent.server.schemas import (
     AutomaticSessionRenameResponse,
     CreatedSessionResponse,
     PaginatedList,
+    ProjectSessionCreateRequest,
     ReadStatePutRequest,
     SessionAgentChangedEvent,
     SessionCreateRequest,
@@ -198,6 +201,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
+from omnigent.version import VERSION
 
 
 def register_core_routes(
@@ -342,7 +346,7 @@ def register_core_routes(
     )
     async def create_session(
         request: Request,
-    ) -> SessionResponse | CreatedSessionResponse:
+    ) -> SessionResponse | CreatedSessionResponse | dict[str, Any]:
         """
         Create a session.
 
@@ -365,11 +369,31 @@ def register_core_routes(
         user_id = _require_user(request, auth_provider)
         content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
         if content_type == "multipart/form-data":
-            return await _create_bundled_session_from_multipart(request, user_id)
+            result, project_warnings = await _create_bundled_session_from_multipart(
+                request, user_id
+            )
+            # Surface the freshly-minted session id (the request path has no
+            # {session_id} on create); the middleware promotes a bag session_id
+            # to the audit row's session_id column.
+            add_audit_attrs(session_id=result.session_id, agent=result.agent_id)
+            if project_warnings:
+                return {
+                    **result.model_dump(mode="json"),
+                    "warnings": list(project_warnings),
+                }
+            return result
 
         try:
             payload = await request.json()
-            body = SessionCreateRequest.model_validate(payload)
+            # Dispatch on the VALUE, not key presence: a null project_id is
+            # "no project", so it must keep the legacy request shape (and its
+            # 422 contract) byte-identical to an absent key.
+            create_model = (
+                ProjectSessionCreateRequest
+                if isinstance(payload, dict) and payload.get("project_id") is not None
+                else SessionCreateRequest
+            )
+            body = create_model.model_validate(payload)
         except json.JSONDecodeError as exc:
             raise HTTPException(
                 status_code=422,
@@ -390,7 +414,7 @@ def register_core_routes(
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
-        resp = await _create_session_from_existing_agent(
+        resp, project_warnings = await _create_session_from_existing_agent(
             conversation_store,
             agent_store,
             runner_router,
@@ -403,6 +427,7 @@ def register_core_routes(
             file_store=file_store,
             artifact_store=artifact_store,
             background_title_coordinator=background_title_coordinator,
+            project_store=project_store,
         )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
@@ -430,16 +455,35 @@ def register_core_routes(
             _publish_terminal_pending(resp.id, True)
         _rc = await _get_runner_client(resp.id, runner_router)
         if _rc is not None and conv is not None:
+            # Send the full session-init envelope (not the legacy id-only body)
+            # so the runner seeds the first spawn from current session state —
+            # notably the persisted /model override — rather than relying on a
+            # best-effort reverse GET whose failure would silently reintroduce
+            # the first-turn respawn. Older runners ignore the extra
+            # ``session_init`` key and still read the top-level id fields.
+            # A session not yet bound to an agent keeps the id-only body: the
+            # envelope builder requires an agent_id.
+            init_body: dict[str, Any] = {
+                "session_id": resp.id,
+                "agent_id": conv.agent_id,
+                "sub_agent_name": conv.sub_agent_name,
+            }
+            if conv.agent_id is not None:
+                try:
+                    init_body = build_runner_session_init_payload(conv, server_version=VERSION)
+                except Exception:
+                    # Must not fail the create, but the degradation loses the
+                    # seeded override — surface it instead of silently
+                    # downgrading (a bare ValueError catch would swallow a
+                    # pydantic ValidationError here).
+                    _logger.warning(
+                        "session-init envelope build failed for %s; falling back to the "
+                        "id-only body (a model-pinned first turn may respawn)",
+                        resp.id,
+                        exc_info=True,
+                    )
             try:
-                await _rc.post(
-                    "/v1/sessions",
-                    json={
-                        "session_id": resp.id,
-                        "agent_id": conv.agent_id,
-                        "sub_agent_name": conv.sub_agent_name,
-                    },
-                    timeout=10.0,
-                )
+                await _rc.post("/v1/sessions", json=init_body, timeout=10.0)
             except (httpx.HTTPError, ConnectionError):
                 _logger.warning(
                     "Failed to notify runner about session %s",
@@ -576,12 +620,18 @@ def register_core_routes(
                 resp.runner_id = runner_id
                 resp.host_id = launch_host_id
 
+        add_audit_attrs(session_id=resp.id, agent=resp.agent_id)
+        if project_warnings:
+            return {
+                **resp.model_dump(mode="json"),
+                "warnings": list(project_warnings),
+            }
         return resp
 
     async def _create_bundled_session_from_multipart(
         request: Request,
         user_id: str | None,
-    ) -> CreatedSessionResponse:
+    ) -> tuple[CreatedSessionResponse, tuple[dict[str, str], ...]]:
         """
         Handle multipart ``POST /v1/sessions`` with inline agent upload.
 
@@ -618,6 +668,16 @@ def register_core_routes(
         if not isinstance(bundle, StarletteUploadFile):
             raise HTTPException(status_code=422, detail=[_multipart_missing_detail("bundle")])
         parsed_metadata = _parse_session_create_metadata(metadata)
+        from omnigent.server.routes._session_create_validation import (
+            resolve_project_session_create,
+        )
+
+        project_resolution = await resolve_project_session_create(
+            body=parsed_metadata,
+            user_id=user_id,
+            project_store=project_store,
+        )
+        parsed_metadata = project_resolution.body
         _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
         _reject_server_reserved_label_seed(parsed_metadata.labels)
 
@@ -674,7 +734,7 @@ def register_core_routes(
                 sandbox_provider=parsed_metadata.sandbox_provider,
                 workspace=parsed_metadata.workspace,
             )
-        return result
+        return result, project_resolution.warnings
 
     # ── GET /sessions/projects ────────────────────────────────────
     #
@@ -1241,6 +1301,10 @@ def register_core_routes(
                 reason="authentication required",
             )
         await websocket.accept()
+        _logger.info(
+            "session-updates stream connected",
+            extra=debug_event("session_updates", phase="connected"),
+        )
 
         watched: list[str] = []
         # Last SessionListItem dump sent per id, used to diff. Keyed only
@@ -1462,8 +1526,16 @@ def register_core_routes(
                 # A client disconnect is the normal terminal condition; any
                 # other exception is a real bug worth surfacing in logs.
                 if exc is not None and not isinstance(exc, WebSocketDisconnect):
-                    _logger.warning("session-updates stream task crashed: %r", exc)
+                    _logger.warning(
+                        "session-updates stream task crashed: %r",
+                        exc,
+                        extra=debug_event("session_updates", phase="error"),
+                    )
         finally:
+            _logger.info(
+                "session-updates stream disconnected",
+                extra=debug_event("session_updates", phase="disconnected"),
+            )
             with contextlib.suppress(RuntimeError):
                 await websocket.close()
 
@@ -2380,15 +2452,47 @@ def register_core_routes(
             else None
         )
 
-        # Keep the fork filed in the source's first-class project, but only
-        # when the forker owns that project — projects are owner-private, so
-        # a fork of a shared session filed in someone else's project stays
-        # unfiled (a foreign project id would show in no folder view).
+        # Keep the fork filed in the source's first-class project, but route
+        # that inherited (not caller-requested) decision through the same
+        # ownership/default chokepoint as a direct create. The fork never asked
+        # for a project, so a source whose agent mismatches its project emits
+        # no warnings here and is never strict-rejected — the mismatch belongs
+        # to the source session, not this request. Forks do not inherit
+        # workspace or worktree settings, so explicit nulls preserve those fork
+        # semantics. A shared source's foreign project retains the historical
+        # terminal behavior: silently leave the fork unfiled.
         fork_project_id = None
-        if source.project_id is not None and project_store is not None:
-            owned = await asyncio.to_thread(project_store.get, source.project_id, user_id=user_id)
-            if owned is not None:
-                fork_project_id = source.project_id
+        from omnigent.server.routes._session_create_validation import (
+            resolve_project_session_create,
+        )
+
+        fork_create_body = (
+            ProjectSessionCreateRequest(
+                project_id=source.project_id,
+                agent_id=base_agent.id,
+                workspace=None,
+                git=None,
+            )
+            if source.project_id is not None
+            else SessionCreateRequest(
+                agent_id=base_agent.id,
+                workspace=None,
+                git=None,
+            )
+        )
+
+        try:
+            fork_resolution = await resolve_project_session_create(
+                body=fork_create_body,
+                user_id=user_id,
+                project_store=project_store,
+                warn_on_mismatch=False,
+            )
+        except OmnigentError as exc:
+            if source.project_id is None or exc.code != ErrorCode.NOT_FOUND:
+                raise
+        else:
+            fork_project_id = fork_resolution.project_id
 
         try:
             new_conv = await asyncio.to_thread(

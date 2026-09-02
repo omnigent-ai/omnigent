@@ -174,9 +174,17 @@ _INIT_CONTAINER_NAME: str = "workspace-prep"
 # image / clone its repo fails fast with a clear reason instead of as a generic
 # online timeout. Kept tight; a cold image pull is the usual slow case —
 # deployments whose host image regularly takes longer to pull can raise the
-# budget via ``sandbox.kubernetes.pod_ready_timeout_s``.
+# budget via ``sandbox.kubernetes.pod_ready_timeout_s``, or, when that isn't
+# set, via :data:`_POD_READY_TIMEOUT_ENV_VAR`.
 _POD_READY_TIMEOUT_S: int = 90
 _POD_READY_POLL_S: float = 2.0
+
+# Env var fallback for the pod-ready wait budget, mirroring
+# omnigent.onboarding.sandboxes.e2b.MAX_LIFETIME_ENV_VAR. Only consulted when
+# the launcher wasn't constructed with an explicit pod_ready_timeout_s (i.e.
+# sandbox.kubernetes.pod_ready_timeout_s is unset in the bundle) — the
+# explicit config key always wins when both are present.
+_POD_READY_TIMEOUT_ENV_VAR: str = "OMNIGENT_K8S_POD_READY_TIMEOUT_S"
 
 # Per-request client timeout for the blocking calls. Without it a stalled
 # apiserver socket blocks indefinitely and the wait deadline never fires.
@@ -287,6 +295,34 @@ def _ensure_sdk() -> None:
         raise click.ClickException(
             "The Kubernetes client is required for the 'kubernetes' sandbox "
             "provider. Install it with `pip install 'omnigent[kubernetes]'`."
+        ) from exc
+
+
+def _resolve_pod_ready_timeout_s(configured: int | None) -> int:
+    """
+    Resolve the pod-ready wait budget for :meth:`_wait_for_pod_running`.
+
+    Precedence: the explicit ``sandbox.kubernetes.pod_ready_timeout_s``
+    config value (``configured``, already parsed by the caller) wins when
+    set; otherwise :data:`_POD_READY_TIMEOUT_ENV_VAR` overrides the
+    :data:`_POD_READY_TIMEOUT_S` default, mirroring
+    ``omnigent.onboarding.sandboxes.e2b.resolve_max_lifetime_s``.
+
+    :param configured: The launcher's ``pod_ready_timeout_s`` constructor
+        argument, or ``None`` when the bundle didn't set it.
+    :returns: The timeout in seconds to wait for the Pod to reach ``Running``.
+    :raises click.ClickException: When the env override is not a number.
+    """
+    if configured is not None:
+        return configured
+    raw = os.environ.get(_POD_READY_TIMEOUT_ENV_VAR)
+    if raw is None:
+        return _POD_READY_TIMEOUT_S
+    try:
+        return int(float(raw))
+    except ValueError as exc:
+        raise click.ClickException(
+            f"{_POD_READY_TIMEOUT_ENV_VAR} must be a number of seconds"
         ) from exc
 
 
@@ -528,6 +564,7 @@ def build_job_manifest(
     agent_name: str | None = None,
     backoff_limit: int = _JOB_BACKOFF_LIMIT,
     active_deadline_seconds: int = _JOB_ACTIVE_DEADLINE_S,
+    runtime_class: str | None = None,
 ) -> dict[str, object]:
     """
     Build the sandbox Job manifest as a plain dict.
@@ -587,6 +624,10 @@ def build_job_manifest(
       container start. Refresh is eventually consistent (kubelet sync, up to
       ~1 min), so the in-sandbox consumer must re-read the file each use — a
       value cached at start defeats the rotation.
+    - An operator *runtime_class* becomes ``spec.runtimeClassName``, scheduling
+      the Pod onto a sandboxed container runtime the cluster provides via a
+      ``RuntimeClass`` object (e.g. Kata Containers micro-VMs, gVisor). Unset
+      keeps the cluster's default runtime — today's behaviour exactly.
 
     :param job_name: DNS-label-safe Job name (see :func:`_new_pod_name`).
     :param namespace: Namespace the Job is created in.
@@ -630,6 +671,8 @@ def build_job_manifest(
     :param backoff_limit: Maximum container restart attempts before the Job
         is marked Failed.
     :param active_deadline_seconds: Hard lifetime cap for the Job.
+    :param runtime_class: ``RuntimeClass`` name set as ``spec.runtimeClassName``,
+        or ``None`` to keep the cluster's default container runtime.
     :returns: The Job manifest dict.
     """
     pod_resources = _resolve_pod_resources(resources)
@@ -788,6 +831,10 @@ def build_job_manifest(
                 _AGENT_LABEL,
                 job_name,
             )
+    if runtime_class is not None:
+        # Opt-in only: an absent key (not an explicit None/null) keeps the
+        # manifest byte-compatible with pre-runtime_class deployments.
+        pod_spec["runtimeClassName"] = runtime_class
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -1024,6 +1071,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         pvc_mounts: Sequence[Mapping[str, object]] | None = None,
         secret_mounts: Sequence[Mapping[str, object]] | None = None,
         pod_ready_timeout_s: int | None = None,
+        runtime_class: str | None = None,
     ) -> None:
         """
         Store provider config for lazy use by :meth:`start_host` / :meth:`terminate`.
@@ -1046,6 +1094,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         self._pvc_mounts = list(pvc_mounts) if pvc_mounts else None
         self._secret_mounts = list(secret_mounts) if secret_mounts else None
         self._pod_ready_timeout_s = pod_ready_timeout_s
+        self._runtime_class = runtime_class
         self._core: k8s_client.CoreV1Api | None = None
         self._batch: k8s_client.BatchV1Api | None = None
         self._api_client: k8s_client.ApiClient | None = None
@@ -1337,6 +1386,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     pvc_mounts=self._pvc_mounts,
                     secret_mounts=self._secret_mounts,
                     agent_name=agent_name,
+                    runtime_class=self._runtime_class,
                 )
                 # Secret before Job so the Pod's secretKeyRef resolves
                 # immediately.
@@ -1434,11 +1484,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         from urllib3.exceptions import HTTPError
 
         core = self._load_core()
-        timeout_s = (
-            self._pod_ready_timeout_s
-            if self._pod_ready_timeout_s is not None
-            else _POD_READY_TIMEOUT_S
-        )
+        timeout_s = _resolve_pod_ready_timeout_s(self._pod_ready_timeout_s)
         deadline = time.monotonic() + timeout_s
         last_reason: str | None = None
         pod_name: str | None = None

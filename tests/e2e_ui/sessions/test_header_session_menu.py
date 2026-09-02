@@ -49,15 +49,18 @@ def test_header_session_menu_renames_owner_and_hides_for_subagent(
         expect(trigger).to_be_visible(timeout=30_000)
         trigger.click()
 
-        # Desktop drops "Rename" and "Add to project" from the kebab — the
-        # breadcrumb title (HeaderTitle) and folder tag (HeaderProjectTag) own
-        # those shortcuts now. Both stay in this menu only on mobile, where the
-        # native shells hide the breadcrumb.
+        # Desktop keeps "Rename" and "Add to project" in the kebab, alongside the
+        # breadcrumb title (HeaderTitle) and folder tag (HeaderProjectTag)
+        # shortcuts. "Add to project" is a submenu trigger, so its label carries
+        # the flyout's own items; match only the leading action label.
         menu_items = page.get_by_role("menuitem")
-        expect(menu_items).to_have_count(4)
-        assert menu_items.all_inner_texts() == [
+        expect(menu_items).to_have_count(6)
+        labels = [text.split("\n")[0] for text in menu_items.all_inner_texts()]
+        assert labels == [
             "Pin",
+            "Rename",
             "Mark as unread",
+            "Add to project",
             "Archive",
             "Delete",
         ]
