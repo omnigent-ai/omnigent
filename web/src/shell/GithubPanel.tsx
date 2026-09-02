@@ -44,17 +44,6 @@ import {
 // chosen by `themeType` from the app's resolved light/dark mode.
 const DIFF_THEME = { dark: "github-dark", light: "github-light" } as const;
 
-// Relabel the collapsed-region affordance to say what clicking does, rather
-// than a line count. The library renders the count / "More unchanged context
-// may be available" into a stable `[data-unmodified-lines]` element inside its
-// shadow DOM; `unsafeCSS` is its supported hook to inject styles there. The
-// step is fixed at expansionLineCount (10), so a static label is accurate for
-// the usual case (a small final chunk may reveal fewer). font-size:0 collapses
-// the original text node; ::after paints ours at the normal size.
-const DIFF_UNSAFE_CSS =
-  "[data-unmodified-lines]{font-size:0}" +
-  '[data-unmodified-lines]::after{content:"Show 10 more lines";font-size:.75rem}';
-
 /** Centered muted message filling the panel — the shared empty/error/loading shell. */
 function PanelMessage({ children }: { children: React.ReactNode }) {
   return (
@@ -282,8 +271,6 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
       // unchanged lines aren't in the patch, so expansion (and the exact
       // trailing-region count) is served by loadDiffFiles on demand.
       expansionLineCount: 10,
-      // Relabel the expand affordance to an action ("Show 10 more lines").
-      unsafeCSS: DIFF_UNSAFE_CSS,
       loadDiffFiles,
     }),
     [themeType, diffStyle, loadDiffFiles],
@@ -402,46 +389,43 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
           </Button>
         </div>
         {pr ? (
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-            <StateBadge state={pr.state} isDraft={pr.is_draft} />
-            <a
-              href={pr.url}
-              target="_blank"
-              rel="noreferrer"
-              className="group inline-flex min-w-0 items-center gap-1 text-ui font-medium hover:underline"
-            >
-              <span className="truncate">{pr.title}</span>
-              <span className="shrink-0 text-muted-foreground">#{pr.number}</span>
-              <ExternalLinkIcon className="size-3 shrink-0 text-muted-foreground opacity-0 group-hover:opacity-100" />
-            </a>
-            {/* CI status checks (from the PR's statusCheckRollup) — icons + a
-                tooltip so this reads as "checks", not a line diffstat. */}
-            {checks && checks.total > 0 && (
-              <span
-                className="flex shrink-0 items-center gap-1.5 text-xs tabular-nums"
-                title={`Checks: ${checks.passing} passing, ${checks.failing} failing, ${checks.pending} pending`}
+          <>
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+              <StateBadge state={pr.state} isDraft={pr.is_draft} />
+              <a
+                href={pr.url}
+                target="_blank"
+                rel="noreferrer"
+                className="group inline-flex min-w-0 items-center gap-1 text-ui font-medium hover:underline"
               >
-                {checks.passing > 0 && (
-                  <span className="flex items-center gap-0.5 text-green-600 dark:text-green-400">
-                    <CircleCheckIcon className="size-3" />
-                    {checks.passing}
-                  </span>
-                )}
-                {checks.failing > 0 && (
-                  <span className="flex items-center gap-0.5 text-red-600 dark:text-red-400">
-                    <CircleXIcon className="size-3" />
-                    {checks.failing}
-                  </span>
-                )}
-                {checks.pending > 0 && (
-                  <span className="flex items-center gap-0.5 text-amber-600 dark:text-amber-400">
-                    <CircleDotIcon className="size-3" />
-                    {checks.pending}
-                  </span>
-                )}
-              </span>
+                <span className="truncate">{pr.title}</span>
+                <span className="shrink-0 text-muted-foreground">#{pr.number}</span>
+                <ExternalLinkIcon className="size-3 shrink-0 text-muted-foreground opacity-0 group-hover:opacity-100" />
+              </a>
+            </div>
+            {/* CI status checks (from the PR's statusCheckRollup), on their own
+                line and explicitly labeled so it reads as CI, not a diffstat. */}
+            {checks && checks.total > 0 && (
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-ui tabular-nums">
+                <span className="font-medium text-foreground">Checks:</span>
+                <span className="flex items-center gap-1 text-green-600 dark:text-green-400">
+                  <CircleCheckIcon className="size-3.5" /> Passed: {checks.passing}
+                </span>
+                <span aria-hidden className="text-muted-foreground">
+                  |
+                </span>
+                <span className="flex items-center gap-1 text-amber-600 dark:text-amber-400">
+                  <CircleDotIcon className="size-3.5" /> Pending: {checks.pending}
+                </span>
+                <span aria-hidden className="text-muted-foreground">
+                  |
+                </span>
+                <span className="flex items-center gap-1 text-red-600 dark:text-red-400">
+                  <CircleXIcon className="size-3.5" /> Failed: {checks.failing}
+                </span>
+              </div>
             )}
-          </div>
+          </>
         ) : (
           <p className="text-ui text-muted-foreground">
             {ghNote ?? (

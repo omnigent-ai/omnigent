@@ -146,14 +146,15 @@ afterEach(() => {
 });
 
 describe("GithubPanel", () => {
-  it("shows the PR header with title and CI check counts", async () => {
+  it("shows the PR header with title and a labeled CI checks line", async () => {
     renderPanel();
     expect(await screen.findByText("chore: dummy PR")).toBeInTheDocument();
     expect(screen.getByText("#6000")).toBeInTheDocument();
-    // The check counts are labeled as checks (tooltip), not a diffstat.
-    const checks = screen.getByTitle(/Checks: 66 passing, 2 failing/);
-    expect(checks).toHaveTextContent("66");
-    expect(checks).toHaveTextContent("2");
+    // CI checks are on their own line, explicitly labeled (not a diffstat).
+    expect(screen.getByText("Checks:")).toBeInTheDocument();
+    expect(screen.getByText(/Passed: 66/)).toBeInTheDocument();
+    expect(screen.getByText(/Failed: 2/)).toBeInTheDocument();
+    expect(screen.getByText(/Pending: 0/)).toBeInTheDocument();
   });
 
   it("stacks a diff section per changed file", async () => {
