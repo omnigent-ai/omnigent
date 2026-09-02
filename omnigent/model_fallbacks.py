@@ -64,13 +64,6 @@ _CODEX_LAUNCH_DEFAULT = StaticModelFallback(
 CODEX_DEFAULT_MODEL = _CODEX_LAUNCH_DEFAULT.model_ids[0]
 
 
-# ── Smart Routing ───────────────────────────────────────────────────────────
-#
-# The router's static tables. A live per-session catalog wins wherever one is
-# in reach (``omnigent.server.smart_routing.fetch_runner_models``) and a
-# deployment's ``routing.*`` settings override each table wholesale; these are
-# what a router that can reach neither falls back to.
-
 _SMART_ROUTING_FALLBACKS: dict[str, StaticModelFallback] = {
     "claude_ladder": StaticModelFallback(
         model_ids=(

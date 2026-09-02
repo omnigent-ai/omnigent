@@ -9998,6 +9998,7 @@ def test_forwarder_collab_item_started_registers_child_before_completed(
     asyncio.run(run())
 
     regs = _registration_posts(posted, "conv_parent")
+    # sanity: exactly one child registration should have been posted
     assert len(regs) == 1, (
         f"Expected 1 child registration after item/started; got {len(regs)}. "
         "collab-agent children must be registered at item/started."

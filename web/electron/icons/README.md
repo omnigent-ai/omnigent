@@ -1,5 +1,7 @@
 # App icons
 
+CURSOR-PR-VIEW-TEST: dummy note for a throwaway PR. Icon assets are unchanged.
+
 - `../../platform-assets/AppIcon.icon` — source of truth for the Apple
   platform icon: an Apple Icon Composer bundle (layered artwork + gradient
   background), shared by Electron and iOS.
