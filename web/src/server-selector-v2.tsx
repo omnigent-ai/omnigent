@@ -39,6 +39,9 @@ function SetupApp() {
   const failedUrl = params.get("url");
   const error = params.get("error") ?? undefined;
   const isEphemeral = params.get("ephemeral") === "1";
+  // "Connect to new server…" opens straight on the server list (?step=server),
+  // skipping the first-run landing/mode intro.
+  const initialStep = params.get("step") === "server" ? ("server" as const) : undefined;
 
   // Prefill: the URL that just failed (retry is the common next step), else the
   // saved server, else the default — except in ephemeral mode, where the whole
@@ -68,6 +71,7 @@ function SetupApp() {
 
   const setup: ServerSelectorV2Setup = {
     initialUrl,
+    initialStep,
     error,
     recentServers,
     managedServers,
