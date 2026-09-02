@@ -410,9 +410,11 @@ def _build_sys_session_send_schema(
                                             "max_cost_usd": {
                                                 "type": "number",
                                                 "description": (
-                                                    "Optional hard limit in USD. "
-                                                    "Blocks tool calls once exceeded "
-                                                    "on expensive models."
+                                                    "Optional hard limit in USD. Once "
+                                                    "subtree spend reaches it, the next "
+                                                    "gate asks the user to approve "
+                                                    "lifting the cap; work stays blocked "
+                                                    "until they approve."
                                                 ),
                                             },
                                             "ask_thresholds_usd": {
