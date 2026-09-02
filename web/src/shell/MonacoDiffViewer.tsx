@@ -274,13 +274,22 @@ export function MonacoDiffViewer({
       hideUnchangedRegions: { enabled: true, contextLineCount: 3 },
       // In auto-height mode the editor is exactly its content height, so there
       // is nothing to scroll inside it — hide its scrollbar and let the wheel
-      // bubble to the page so many stacked diffs scroll as one.
+      // bubble to the page so many stacked diffs scroll as one. Also tighten
+      // the left gutter: an inline diff reserves two line-number columns, and
+      // Monaco's defaults (lineNumbersMinChars 5, plus a folding column and a
+      // glyph margin) leave a wide static band — oversized in the narrow rail
+      // and for short files. Trim the reserved digits and drop the folding /
+      // glyph columns the stacked overview doesn't use.
       ...(autoHeight
         ? {
             scrollbar: {
               vertical: "hidden" as const,
               alwaysConsumeMouseWheel: false,
             },
+            lineNumbersMinChars: 3,
+            folding: false,
+            glyphMargin: false,
+            lineDecorationsWidth: 4,
           }
         : {}),
     };
