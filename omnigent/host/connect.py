@@ -407,6 +407,17 @@ _AUTH_REJECT_ESCALATE_ATTEMPTS = 30
 # endpoint that accepts and never speaks is functionally down.
 _SILENT_CONNECT_ESCALATE_ATTEMPTS = 10
 
+
+def _websocket_close_details(exc: BaseException) -> tuple[int | None, str | None]:
+    """Return the received WebSocket close code and reason, when available."""
+    received = getattr(exc, "rcvd", None)
+    if received is None:
+        return None, None
+    code = getattr(received, "code", None)
+    reason = getattr(received, "reason", None)
+    return code if isinstance(code, int) else None, reason if isinstance(reason, str) else None
+
+
 # Capability discovery is advisory and must not delay the host channel forever.
 _HOST_CAPABILITY_INIT_TIMEOUT_S = 15.0
 
@@ -3254,13 +3265,25 @@ class HostProcess:
                         and not silent_churn
                     )
                     wait_s = _RECONNECT_BASE_S if recycle else backoff
+                    close_code, close_reason = _websocket_close_details(exc)
                     _logger.warning(
-                        "Host tunnel disconnected: %s. Reconnecting in %.1fs%s",
+                        "Host tunnel disconnected: %s. Reconnecting in %.1fs%s; "
+                        "close_code=%s close_reason=%r error_type=%s",
                         exc,
                         wait_s,
-                        " (resumed from suspend — prompt reconnect)"
-                        if woke
-                        else (" (recycle — prompt reconnect)" if recycle else ""),
+                        (
+                            " (resumed from suspend — prompt reconnect)"
+                            if woke
+                            else (" (recycle — prompt reconnect)" if recycle else "")
+                        ),
+                        close_code,
+                        close_reason,
+                        type(exc).__name__,
+                        extra={
+                            "ws_close_code": close_code,
+                            "ws_close_reason": close_reason,
+                            "ws_error_type": type(exc).__name__,
+                        },
                     )
                     # Interruptible backoff: wake early if the lifecycle
                     # monitor loses ownership mid-backoff so the top-of-loop

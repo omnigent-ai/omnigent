@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 from asgiref.testing import ApplicationCommunicator
@@ -269,6 +270,7 @@ async def test_host_tunnel_accepts_and_registers(
 
 async def test_host_tunnel_deregisters_on_disconnect(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     Verify that the host is removed from the registry on disconnect.
@@ -281,11 +283,19 @@ async def test_host_tunnel_deregisters_on_disconnect(
     await _send_hello_and_wait(comm, registry)
     assert registry.get(_HOST_ID) is not None
 
-    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
-    # Give the handler a moment to process the disconnect.
-    await asyncio.sleep(0.1)
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes.host_tunnel"):
+        await comm.send_input(
+            {"type": "websocket.disconnect", "code": 1001, "reason": "rolling restart"}
+        )
+        # Give the handler a moment to process the disconnect.
+        await asyncio.sleep(0.1)
 
     assert registry.get(_HOST_ID) is None
+    disconnect = next(record for record in caplog.records if hasattr(record, "ws_close_code"))
+    assert disconnect.ws_close_code == 1001
+    assert disconnect.ws_close_reason == "rolling restart"
+    assert disconnect.ws_stage == "connected"
+    assert disconnect.ws_registered is True
 
 
 async def test_host_tunnel_upserts_db_on_connect(
