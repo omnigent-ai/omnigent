@@ -2306,3 +2306,51 @@ def test_resolve_databricks_codex_model_matches_servable_ids() -> None:
             _resolve_databricks_codex_model("https://h.example.com", "prof", "databricks-gpt-9-9")
             == "databricks-gpt-9-9"
         )
+
+
+def test_bundle_instructions_and_spawn_note_share_developer_instructions(
+    tmp_path: Path,
+) -> None:
+    """A bundle's ``instructions:`` ride codex's additive channel WITH the note (#3530).
+
+    codex-native has exactly one additive instruction slot, and the routed-spawn
+    note already owned it. The launch site therefore composes the bundle's
+    instructions with the note and passes ONE string; this asserts that string
+    survives the sidecar round trip intact — both texts present, layered on top
+    of the user's own guidance, and fully reversible on a resumed / pinned
+    launch so a session leaving auto-harness mode carries neither stale routing
+    framing nor stale agent instructions.
+    """
+    from omnigent.inner.hook_scripts.subagent_router import smart_routing_spawn_note
+    from omnigent.runner.native.orchestration import (
+        _native_startup_raw_instructions_from_spec,
+    )
+    from omnigent.spec.types import AgentSpec
+
+    bundle_instructions = "# Ferrous Sparrow Protocol\n\nAlways greet in Latin."
+    note = smart_routing_spawn_note("codex-native")
+    author_instructions = _native_startup_raw_instructions_from_spec(
+        AgentSpec(spec_version=1, name="sparrow", instructions=bundle_instructions)
+    )
+    composed = "\n\n".join(x for x in [author_instructions, note] if x) or None
+    assert composed is not None
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    config_path.write_text('developer_instructions = "Keep user guidance."\n', encoding="utf-8")
+
+    _sync_codex_developer_instructions(codex_home, composed)
+
+    active = tomllib.loads(config_path.read_text(encoding="utf-8"))["developer_instructions"]
+    # The regression #3530 reports: this heading never reached the session.
+    assert "Ferrous Sparrow Protocol" in active
+    # ...and the routing framing it used to displace is still there too.
+    assert "sys_session_create" in active
+    assert active.startswith("Keep user guidance.")
+    assert active.index(bundle_instructions) < active.index(note.strip())
+
+    _sync_codex_developer_instructions(codex_home, None)
+
+    resumed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert resumed["developer_instructions"] == "Keep user guidance."
