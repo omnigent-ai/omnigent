@@ -456,8 +456,12 @@ the transition is real:
   fixed tree** — that pair is the proof.
 - **Sanity-check the diff:** the green came from a genuine behavior fix, not from
   loosening an assertion, `skip`/`xfail`, or narrowing the test to dodge the bug.
-- Run the surrounding tests (the file/module you touched, and the fixed code's own
-  test module) to catch a fix that breaks a neighbor.
+- Run only the directly affected test file/module and, when the changed code has a
+  distinct integration boundary, its nearest focused integration test. Do not run
+  the full repository suite, an entire broad test directory, every backend matrix,
+  or unrelated lint/typecheck/build jobs locally; GitHub CI owns that exhaustive
+  coverage after publication. Expand beyond the focused set only when a failure or
+  dependency edge gives concrete evidence that another specific test is affected.
 
 **Prove new tests are hermetic — re-run them in a hostile environment.** A test
 that passes only because the machine happens to be clean is flaky, not green, and
@@ -510,51 +514,6 @@ produces*:
   leaked runner/host env vars per `dev/recording-lanes.md`; an un-stripped
   `online: false` is your own env and must be re-run with the `env -u` prefix, not
   filed as "runner won't come online."
-
-### 2B.6 — Get an independent cross-vendor review before you open the PR
-
-Your fix is green, but a fix reviewed only by the model that wrote it is a blind
-spot. Before opening the PR, get a **second, different-model** pair of eyes on
-your diff — the same discipline the repo's `polly-review.yml` applies to a PR
-after the fact, run here *before* you publish so you can act on it. You reuse the
-server and runner you already run on; no new infrastructure.
-
-1. **Commit first** (Step 3.1 below) so there is a clean diff to review, then
-   capture it: `git diff <base>...HEAD > /tmp/resolve_review_diff.txt` (the merge
-   base with `main`, so the reviewer sees exactly your change).
-2. **Spawn one reviewer child** with `sys_session_create`, addressing a
-   **different-vendor** bundle by `config_path` so a different model reviews —
-   `examples/polly/agents/codex` (a `codex-native` worker). Give the task
-   **purpose `review`** (the only purpose this agent may spawn) and a prompt
-   modeled on `polly-review.yml`'s: tell it to read the diff from
-   `/tmp/resolve_review_diff.txt` and report, in order — **blocking issues**
-   (correctness bugs, broken contracts, data-loss/regression risks), **security
-   vulnerabilities**, **non-blocking notes**, and a one-paragraph **summary**;
-   skip style/formatting/naming. Also ask it specifically to check the two things
-   your own eyes are worst at here: did the fix address the **root cause** vs mask
-   the symptom, and was any test **loosened/skipped/narrowed** to reach green.
-   **Feed it the recurring-pitfalls checklist**: include the contents of
-   `dev/resolve-agent/review-checklist.md` in the prompt and instruct the reviewer
-   to check the diff against **every** item and report any hit as a real
-   finding (these are correctness/hygiene classes this repo has shipped more than
-   once — *not* the cosmetic nits it should otherwise skip). When a review or the
-   PR bots later catch a new recurring class, add a line to that checklist so the
-   next run catches it up front.
-3. **Read the review back** (`sys_session_get_history` on the child) and **act on
-   every finding it surfaces — not only the blocking/security ones**: address each
-   (fix it at the root, or record why it's not actionable), re-run the deliverable
-   (back through 2B.5) so it stays green, and — because the diff changed — refresh
-   the review or note why a finding was left. Treat a non-blocking note the same way
-   you will treat Polly's in 4.3: judge it by whether it's correct, not by its
-   label. Do not open the PR with an unaddressed finding of any severity.
-4. **If no different-vendor bundle is reachable** (e.g. codex isn't configured in
-   this environment), do **not** silently fall back to reviewing your own work as
-   if it were independent. Skip the spawn and record `cross_review: "skipped: no
-   second vendor configured"` in the handoff, so it's honest that no independent
-   review happened. (Polly's automated review still runs on the PR once it's open.)
-
-Fold the outcome into the PR body (a short "Independent review" note) and the
-`cross_review` handoff field.
 
 ## Step 3 — Commit, push, and open the pull request (author path only)
 
@@ -616,9 +575,7 @@ Once the set is genuinely green:
 
 1. **Commit** the fix and the tests on the working branch (the fix builds on the
    repro branch, so the reproduction test and the fix land in one reviewable
-   diff). Follow the repo's commit conventions. You likely committed already in
-   2B.6 to produce the review diff; if the cross-vendor review led to further
-   changes, amend or add a follow-up commit so the branch reflects the final fix.
+   diff). Follow the repo's commit conventions.
    **Never commit workspace artifacts.** The commit must contain only the fix and
    its reproduction test — nothing else. In particular, **never** stage or commit
    the `recordings/` clips or any `.omnigent/` handoff files (e.g.
@@ -632,9 +589,8 @@ Once the set is genuinely green:
    `git rm --cached`) so it never reaches the PR.
 2. **If the input has `skip_push: true`, stop here** — the fix is committed
    locally; do **not** push and do **not** open a PR. Report the branch name in
-   your output (`pushed_branch`) so a human can inspect, push, and PR it. (The
-   cross-vendor review in 2B.6 still runs — it reviews the local diff, no push
-   needed.)
+   your output (`pushed_branch`) so a human can inspect, push, and PR it. The
+   focused local validation in 2B.5 still runs before the handoff is written.
 3. Otherwise **push** the branch. **First make sure `git push` / `gh` have the
    write token — see "Get the GitHub write token" below.** Your shell does **not**
    inherit `GH_TOKEN` (you run in the session's runner, not the CI wrapper's
@@ -1021,10 +977,7 @@ comment and triage it again the same way.
 Repeat push → re-trigger → re-read within the round cap until **every** finding on
 the newest review is either fixed or has a recorded justification — no unaddressed
 notes of any severity remain. Record the final state in the handoff
-(`polly_review`), including which non-blocking notes you fixed vs. justified. If a
-recurring class of bug shows up here, add a one-line check to
-`dev/resolve-agent/review-checklist.md` so the pre-PR reviewer catches it next
-time.
+(`polly_review`), including which non-blocking notes you fixed vs. justified.
 
 ### 4.4 — Write a live-validation prompt a human can paste to an agent
 
@@ -1221,7 +1174,6 @@ the message. Same discipline as repro-agent:
   "recording_unavailable_reason": "",
   "test_audit": "repro e2e was behavioral (failed on raw IDs); no rewrite needed",
   "hermetic_check": "test_picker_label re-run with ambient env vars set — still passes",
-  "cross_review": "codex reviewer: no blocking findings; noted a null-guard, addressed",
   "pr_url": "https://github.com/omnigent-ai/omnigent/pull/4200",
   "reviewed_pr_url": "",
   "pushed_branch": "",
@@ -1282,10 +1234,6 @@ Field meanings:
   touched env-derived defaults: which added/edited tests you re-ran with ambient
   vars set and that they still passed. Empty string when not applicable (no such
   test in the diff).
-- `cross_review` — the result of the Step 2B.6 independent cross-vendor review:
-  the reviewer's verdict and what you did about it, or
-  `"skipped: no second vendor configured"` when none was reachable. Empty in
-  review mode (there you *are* the independent reviewer on someone else's PR).
 - `pr_url` — the ready-for-review PR you **opened** (author mode). Empty in review
   mode, when `skip_push` was set, or if you stopped before opening one.
 - `reviewed_pr_url` — the existing PR you **reviewed** (review mode), or the fork

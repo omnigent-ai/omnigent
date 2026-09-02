@@ -80,14 +80,9 @@ agent_session_sharing: public
 async: true
 cancellable: true
 
-# spawn: true registers sys_session_create so the agent can launch a child
-# session it defines. Before opening the PR (author path), it spawns ONE
-# cross-vendor reviewer child — a different-model bundle (examples/polly/agents/
-# codex, codex-native) given the same diff-review prompt polly-review.yml uses —
-# to double-check its own fix, the way polly has an independent reviewer vet the
-# work. This reuses the server + runner it already runs on; no new infra. The
-# reviewer only reads and comments — it authors no code.
-spawn: true
+# Independent review runs through Polly after publication; the implementation
+# agent does not need child-session creation tools.
+spawn: false
 
 # Declaring os_env registers sys_os_read / sys_os_write / sys_os_edit /
 # sys_os_shell. The agent uses the shell for `git` (branch/commit/push), `gh`
@@ -126,27 +121,3 @@ guardrails:
         path: omnigent.inner.nessie.policies.blast_radius
         arguments:
           gate_pushes: false
-    # Bound the fan-out: this agent spawns at most one reviewer child, so a
-    # low per-turn cap is plenty and stops a runaway create loop. sys_session_create
-    # is counted (like polly) so a self-defined child can't bypass the cap.
-    spawn_bounds:
-      type: function
-      on: [tool_call]
-      function:
-        path: omnigent.inner.nessie.policies.spawn_bounds
-        arguments:
-          max_dispatches_per_turn: 2
-          dispatch_tools: [sys_session_send, sys_session_create]
-    # Require `review` on any sys_session_SEND dispatch. Note this guard only
-    # inspects sys_session_send, NOT the sys_session_create that launches the
-    # reviewer child (create carries no purpose arg) — so it does not itself
-    # constrain that child. spawn_bounds (which counts sys_session_create) caps
-    # the fan-out; the reviewer being read-only rests on its prompt and the codex
-    # bundle's own guardrails. This guard is a backstop for any follow-up sends.
-    headless_subagent_purpose_guard:
-      type: function
-      on: [tool_call]
-      function:
-        path: omnigent.inner.nessie.policies.headless_subagent_purpose_guard
-        arguments:
-          allowed_purposes: [review]
