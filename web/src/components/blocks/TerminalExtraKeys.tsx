@@ -26,9 +26,7 @@ import {
   hasActiveModifier,
   reduceModifiers,
   type ExtraKeyDef,
-  type ModifierId,
   type ModifierStates,
-  type PlainKeyId,
 } from "./terminalExtraKeysModel";
 
 /** Rewrite applied to each typed ``onData`` chunk while a modifier is active. */
@@ -94,24 +92,29 @@ export const TerminalExtraKeys = memo(function TerminalExtraKeys({
   );
   transformRef.current = transform;
 
+  const clearPress = useCallback(() => {
+    const press = pressRef.current;
+    if (press?.timer != null) window.clearTimeout(press.timer);
+    pressRef.current = null;
+  }, []);
+
   // Clear the rewrite and any pending long-press when the row unmounts (the
   // visibility preference flips, the pointer turns fine, the view closes).
   useEffect(() => {
     return () => {
-      const press = pressRef.current;
-      if (press?.timer != null) window.clearTimeout(press.timer);
+      clearPress();
       targetRef.current.setTransform(null);
     };
-  }, []);
+  }, [clearPress]);
 
   const activate = useCallback(
     (key: ExtraKeyDef) => {
       if (key.kind === "modifier") {
-        commit(reduceModifiers(modsRef.current, { type: "tap", mod: key.id as ModifierId }));
+        commit(reduceModifiers(modsRef.current, { type: "tap", mod: key.id }));
         return;
       }
       const state = modsRef.current;
-      const seq = encodeExtraKey(key.id as PlainKeyId, activeModifiers(state), {
+      const seq = encodeExtraKey(key.id, activeModifiers(state), {
         applicationCursor: targetRef.current.applicationCursor(),
       });
       targetRef.current.send(seq);
@@ -119,12 +122,6 @@ export const TerminalExtraKeys = memo(function TerminalExtraKeys({
     },
     [commit],
   );
-
-  const clearPress = useCallback(() => {
-    const press = pressRef.current;
-    if (press?.timer != null) window.clearTimeout(press.timer);
-    pressRef.current = null;
-  }, []);
 
   const onPointerDown = useCallback(
     (e: PointerEvent<HTMLButtonElement>, key: ExtraKeyDef) => {
@@ -142,9 +139,7 @@ export const TerminalExtraKeys = memo(function TerminalExtraKeys({
         press.timer = window.setTimeout(() => {
           press.timer = null;
           press.longPressFired = true;
-          commit(
-            reduceModifiers(modsRef.current, { type: "longPress", mod: key.id as ModifierId }),
-          );
+          commit(reduceModifiers(modsRef.current, { type: "longPress", mod: key.id }));
         }, LONG_PRESS_MS);
       }
       pressRef.current = press;
@@ -189,7 +184,7 @@ export const TerminalExtraKeys = memo(function TerminalExtraKeys({
     >
       {EXTRA_KEY_ROWS.map((row, rowIndex) =>
         row.map((key) => {
-          const modState = key.kind === "modifier" ? mods[key.id as ModifierId] : undefined;
+          const modState = key.kind === "modifier" ? mods[key.id] : undefined;
           return (
             <button
               key={key.id}
