@@ -9,6 +9,7 @@
 //   │  - gutter icon → add comment    │                  │
 //   └──────────────────────────────────┴──────────────────┘
 
+import { toast } from "sonner";
 import {
   lazy,
   Suspense,
@@ -498,9 +499,7 @@ function FileViewerBody({
   );
 
   const downloadFile = useCallback(() => {
-    downloadWorkspaceFile(conversationId, path).catch((err) =>
-      console.warn("Failed to download file", err),
-    );
+    downloadWorkspaceFile(conversationId, path).catch(() => toast.error("Download failed"));
   }, [conversationId, path]);
 
   // Pop the HTML artifact into its own browser tab. The artifact is rendered in

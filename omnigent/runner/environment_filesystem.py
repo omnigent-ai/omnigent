@@ -17,7 +17,7 @@ import re
 import stat
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, ParamSpec
+from typing import TYPE_CHECKING, Any, BinaryIO, Literal, ParamSpec
 
 from omnigent.entities.environment_filesystem import (
     DeleteFilesystemResult,
@@ -913,17 +913,24 @@ class CallerProcessFilesystem:
             entry=entry,
         )
 
-    async def _helper_stat(self, target: str) -> dict[str, Any] | None:
+    async def _helper_stat(
+        self, target: str, *, probe_read: bool = False
+    ) -> dict[str, Any] | None:
         """Stat *target* through the sandboxed helper.
 
-        The helper sees the workspace as the sandbox presents it, so a path
-        the sandbox masks (a dotfile, an escaping symlink) reads as absent
-        here, exactly as it does to the environment's file tools.
+        The helper sees the workspace as the sandbox presents it. Each
+        backend masks differently: bwrap binds ``/dev/null`` over a masked
+        file, so it stats as a character device on another inode, while
+        Seatbelt leaves ``stat`` working and fails the read. ``probe_read``
+        opens the file and reads a byte inside the helper so ``"r"`` means
+        "a regular file the helper can actually read" under either.
 
         :param target: Path as the helper should see it: workspace-relative,
             or absolute for a path under a declared grant.
-        :returns: ``{"s": size, "m": mtime, "d": is_dir, "l": is_symlink}``,
-            or ``None`` when the helper cannot see the path.
+        :param probe_read: Also attempt a one-byte read of a regular file.
+        :returns: ``{"s": size, "m": mtime, "d": is_dir, "l": is_symlink,
+            "r": readable_regular_file, "dev": st_dev, "ino": st_ino}``, or
+            ``None`` when the helper cannot stat the path.
         """
         import json as _json
 
@@ -937,8 +944,16 @@ class CallerProcessFilesystem:
                 "import os, json, stat as S",
                 f"p = {_json.dumps(target)}",
                 "s = os.stat(p)",
+                "r = S.S_ISREG(s.st_mode)",
+                f"if r and {probe_read!r}:",
+                "    try:",
+                "        with open(p, 'rb') as f:",
+                "            f.read(1)",
+                "    except OSError:",
+                "        r = False",
                 "print(json.dumps({'s': s.st_size, 'm': int(s.st_mtime),",
-                "    'd': S.S_ISDIR(s.st_mode), 'l': S.S_ISLNK(s.st_mode)}))",
+                "    'd': S.S_ISDIR(s.st_mode), 'l': S.S_ISLNK(s.st_mode),",
+                "    'r': r, 'dev': s.st_dev, 'ino': s.st_ino}))",
             ]
         )
         result = await _run_os_env_async(
@@ -978,39 +993,57 @@ class CallerProcessFilesystem:
             modified_at=info["m"],
         )
 
-    async def resolve_download(self, path: str) -> Path:
-        """Resolve *path* to a regular file whose bytes may be served directly.
+    async def open_download(self, path: str) -> tuple[BinaryIO, Path, int]:
+        """Open *path* for a raw download, bound to what the sandbox can read.
 
-        Applies the read path's authorization without its transport:
-        ``_resolve`` for containment and grants, then the sandboxed helper's
-        own view for any path the helper can reach, so a file the sandbox
-        masks (a dotfile, an escaping symlink) is refused here exactly as
-        ``read`` refuses it. A path admitted only because the environment is
-        unconfined has no sandbox to consult. The caller streams the file
-        itself, which the helper's single-message protocol cannot do.
+        The bytes are served from this process, since the helper's
+        single-message protocol cannot stream, so the file is opened here
+        first and the sandboxed helper is then asked to stat and read the
+        same path. The helper must report a readable regular file on the
+        very inode this process opened: a bwrap ``/dev/null`` mask is a
+        character device on another inode, a Seatbelt mask stats fine but
+        fails the read, and a path swapped between the two steps no longer
+        matches. A path admitted only because the environment is unconfined
+        has no sandbox to consult.
 
         :param path: Relative path within the environment, or an absolute
             path elsewhere on the filesystem.
-        :returns: The resolved regular file.
+        :returns: The open file at byte 0, its resolved path, and its size.
         :raises InvalidPath: If the path names a directory.
-        :raises FilesystemPathNotFound: If the path is missing or hidden
-            from the helper.
+        :raises FilesystemPathNotFound: If the path is missing, not a
+            regular file, or hidden from the helper.
         :raises PathUnreachable: If an absolute path is out of reach.
         """
         resolved = self._resolve(path)
-        if not self._absolute(path):
-            visible = await self._helper_stat(_validate_path(path) or ".") is not None
-        elif self._within_grants(resolved):
-            visible = await self._helper_stat(str(resolved)) is not None
-        else:
-            visible = resolved.exists()
-        if not visible:
-            raise FilesystemPathNotFound(f"Path {path!r} not found")
         if resolved.is_dir():
             raise InvalidPath(f"Path {path!r} is a directory")
-        if not resolved.is_file():
-            raise FilesystemPathNotFound(f"Path {path!r} not found")
-        return resolved
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        try:
+            fd = os.open(resolved, flags)
+        except OSError as exc:
+            raise FilesystemPathNotFound(f"Path {path!r} not found") from exc
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise FilesystemPathNotFound(f"Path {path!r} not found")
+            if not self._absolute(path):
+                target: str | None = _validate_path(path) or "."
+            elif self._within_grants(resolved):
+                target = str(resolved)
+            else:
+                target = None
+            if target is not None:
+                info = await self._helper_stat(target, probe_read=True)
+                if (
+                    info is None
+                    or not info.get("r")
+                    or (info.get("dev"), info.get("ino")) != (st.st_dev, st.st_ino)
+                ):
+                    raise FilesystemPathNotFound(f"Path {path!r} not found")
+        except BaseException:
+            os.close(fd)
+            raise
+        return os.fdopen(fd, "rb"), resolved, st.st_size
 
     async def edit_text(
         self,

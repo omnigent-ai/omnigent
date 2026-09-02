@@ -41,7 +41,7 @@ import click
 import httpcore
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.debug_logging import runner_primary_session_id
@@ -10049,13 +10049,13 @@ def create_runner_app(
         session_id: str,
         environment_id: str,
         path: str,
-    ) -> FileResponse:
+    ) -> StreamingResponse:
         """Serve a file's complete bytes as an attachment.
 
         The read path inlines content in a JSON envelope, so it caps at
-        ``_MAX_READ_BYTES``. A download streams straight from disk and
-        needs no cap; ``resolve_download`` applies the read path's
-        authorization, sandbox view included, before a byte is served.
+        ``_MAX_READ_BYTES``. A download streams from a descriptor and needs
+        no cap; ``open_download`` binds that descriptor to what the sandbox
+        can read before a byte is served.
 
         :param session_id: Session identifier.
         :param environment_id: Environment resource id.
@@ -10070,11 +10070,39 @@ def create_runner_app(
         await _ensure_session_registered(session_id)
         agent_spec = await _resolve_session_agent_spec(session_id)
         env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
-        resolved = await CallerProcessFilesystem(env).resolve_download(path)
-        return FileResponse(
-            resolved,
-            filename=resolved.name,
-            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        fobj, resolved, size = await CallerProcessFilesystem(env).open_download(path)
+
+        async def _chunks() -> AsyncIterator[bytes]:
+            # Stop at the size announced in Content-Length so a file growing
+            # underneath the download cannot overrun the response.
+            remaining = size
+            try:
+                while remaining > 0:
+                    chunk = await asyncio.to_thread(fobj.read, min(64 * 1024, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    yield chunk
+            finally:
+                fobj.close()
+
+        # Same header Starlette's FileResponse builds: a plain quoted filename
+        # when it is URL-safe, else the RFC 5987 encoded form.
+        quoted = urllib.parse.quote(resolved.name)
+        disposition = (
+            f'attachment; filename="{resolved.name}"'
+            if quoted == resolved.name
+            else f"attachment; filename*=utf-8''{quoted}"
+        )
+        return StreamingResponse(
+            _chunks(),
+            media_type=mimetypes.guess_type(resolved.name)[0] or "application/octet-stream",
+            headers={
+                "Content-Length": str(size),
+                "Content-Disposition": disposition,
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     async def _fs_list_or_read(

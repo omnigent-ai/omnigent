@@ -7,7 +7,7 @@ import functools
 import mimetypes
 import ntpath
 import urllib.parse
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Annotated, Any, cast
 
@@ -22,7 +22,6 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from starlette.background import BackgroundTask
 
 from omnigent.entities import (
     Conversation,
@@ -310,11 +309,18 @@ def register_resources_routes(
                 )
                 if name in resp.headers
             }
-            return StreamingResponse(
-                resp.aiter_raw(),
-                headers=forwarded,
-                background=BackgroundTask(resp.aclose),
-            )
+
+            async def _relay() -> AsyncIterator[bytes]:
+                # Close the runner response on every exit, a client
+                # disconnect included: Starlette skips the background task
+                # on disconnect, which would leak the tunnel request.
+                try:
+                    async for chunk in resp.aiter_raw():
+                        yield chunk
+                finally:
+                    await resp.aclose()
+
+            return StreamingResponse(_relay(), headers=forwarded)
         await resp.aread()
         await resp.aclose()
         if resp.status_code == 200:

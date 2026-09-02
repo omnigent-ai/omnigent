@@ -187,6 +187,8 @@ def test_changes_row_download_saves_the_complete_file(
     assert env.status == 200, env.text()
     target = Path(env.json()["metadata"]["root"]) / "big-download.bin"
     payload = os.urandom(_MAX_READ_BYTES + 1)
+    # A fresh session's workspace may not exist on disk yet.
+    target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(payload)
     # The workspace is a real checkout shared with every other test in the
     # shard, so the file must not outlive the test.
