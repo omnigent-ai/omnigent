@@ -120,7 +120,10 @@ _TURN_CONTEXT_DESYNC_CODE = "runner_turn_context_desync"
 # exceed the old 240s cap, tripping the watchdog and wedging the session
 # in a "Prompt is too long" → compaction → 240s-timeout loop.
 # Env var name kept for the ops knob; ``<= 0`` disables.
-_TURN_IDLE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_TIMEOUT_S", "600"))
+_DEFAULT_TURN_IDLE_TIMEOUT_S = 3600.0
+_TURN_IDLE_TIMEOUT_S = float(
+    os.environ.get("HARNESS_TURN_TIMEOUT_S", _DEFAULT_TURN_IDLE_TIMEOUT_S)
+)
 
 # Absolute per-turn ceiling on TOTAL turn duration. Progress-aware when
 # the idle watchdog is enabled: every real progress event extends the
