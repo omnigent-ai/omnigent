@@ -2477,10 +2477,14 @@ class _HostHttpResult:
         HTTP response was received because the request failed locally.
     :param body: Decoded JSON object or response text, e.g.
         ``{"data": []}`` or ``"not found"``.
+    :param unreachable: ``True`` when the request failed because no server
+        answered at all (connection refused / host unresolvable), as opposed
+        to a slow or erroring server.
     """
 
     status_code: int
     body: _HostJsonObject | str
+    unreachable: bool = False
 
 
 @dataclass(frozen=True)
@@ -2511,11 +2515,14 @@ class _DaemonSessionsResult:
         local daemon's server cannot be discovered.
     :param sessions: Session rows owned by the daemon host id.
     :param error: Human-readable error text, or ``None`` on success.
+    :param unreachable: ``True`` when the error means the server is not
+        answering at all (dead or gone), not merely slow or erroring.
     """
 
     base_url: str | None
     sessions: list[_HostSessionRow]
     error: str | None
+    unreachable: bool = False
 
 
 @dataclass(frozen=True)
@@ -2527,12 +2534,15 @@ class _SessionsPageResult:
     :param last_id: Last session id in the page, e.g. ``"conv_abc123"``.
     :param has_more: Whether another page should be fetched.
     :param error: Human-readable error text, or ``None`` on success.
+    :param unreachable: ``True`` when the page fetch failed because the
+        server is not answering at all.
     """
 
     sessions: list[_HostSessionRow]
     last_id: str | None
     has_more: bool
     error: str | None
+    unreachable: bool = False
 
 
 @dataclass(frozen=True)
@@ -2542,10 +2552,13 @@ class _SessionPagesResult:
 
     :param sessions: Session rows across all fetched pages.
     :param error: Human-readable error text, or ``None`` on success.
+    :param unreachable: ``True`` when the query failed because the server
+        is not answering at all.
     """
 
     sessions: list[_HostSessionRow]
     error: str | None
+    unreachable: bool = False
 
 
 @dataclass(frozen=True)
@@ -8866,6 +8879,10 @@ def _host_http_json(
         return _HostHttpResult(
             status_code=0,
             body=f"{type(exc).__name__}: {exc}",
+            # A connect failure means nothing answered at that address —
+            # distinct from a live-but-slow server (ReadTimeout) or an HTTP
+            # error, which callers may treat differently.
+            unreachable=isinstance(exc, (httpx.ConnectError, ConnectionError)),
         )
     body: _HostJsonObject | str
     try:
@@ -8937,6 +8954,7 @@ def _decode_sessions_page(
             last_id=None,
             has_more=False,
             error=f"session list failed: {_host_error_text(result.body)}",
+            unreachable=result.unreachable,
         )
     if result.status_code >= 400:
         return _SessionsPageResult(
@@ -8999,7 +9017,7 @@ def _fetch_session_pages(
         )
         page = _decode_sessions_page(page_result)
         if page.error is not None:
-            return _SessionPagesResult(sessions=[], error=page.error)
+            return _SessionPagesResult(sessions=[], error=page.error, unreachable=page.unreachable)
         sessions.extend(page.sessions)
         if not page.has_more or page.last_id is None:
             return _SessionPagesResult(sessions=sessions, error=None)
@@ -9021,10 +9039,13 @@ def _sessions_for_daemon(
     """
     base_url = _daemon_base_url(record)
     if base_url is None:
+        # Local mode with no healthy server on record — the server is gone,
+        # not merely slow.
         return _DaemonSessionsResult(
             base_url=None,
             sessions=[],
             error="local Omnigent server is not reachable",
+            unreachable=True,
         )
     host_id = record.host_id or _load_existing_host_id()
     if not host_id:
@@ -9038,7 +9059,12 @@ def _sessions_for_daemon(
         connected_only=connected_only,
     )
     if pages.error is not None:
-        return _DaemonSessionsResult(base_url=base_url, sessions=[], error=pages.error)
+        return _DaemonSessionsResult(
+            base_url=base_url,
+            sessions=[],
+            error=pages.error,
+            unreachable=pages.unreachable,
+        )
     owned = [s for s in pages.sessions if s.get("host_id") == host_id]
     return _DaemonSessionsResult(base_url=base_url, sessions=owned, error=None)
 
@@ -9784,6 +9810,16 @@ def _stop_daemon_sessions(
         if force:
             click.echo(
                 f"{_host_display_url(record.target)}: skipping session stop: {result.error}",
+                err=True,
+            )
+            return 0
+        if result.unreachable:
+            # A dead server holds no reachable sessions to stop; failing here
+            # would strand the daemon and its record until the user discovers
+            # --force. Degrade to a daemon-only stop instead.
+            click.echo(
+                f"{_host_display_url(record.target)}: server is unreachable; "
+                f"skipping session stop: {result.error}",
                 err=True,
             )
             return 0
