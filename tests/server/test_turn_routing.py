@@ -128,19 +128,81 @@ async def test_an_earlier_routing_decision_is_the_authoritative_no_op() -> None:
     assert rec.chips == []
 
 
-async def test_the_forwarders_model_mirror_is_not_treated_as_a_pin() -> None:
-    """codex mirrors ``config.toml``'s model into ``model_override``.
+async def test_a_users_pinned_model_is_kept_unrouted() -> None:
+    """A ``model_override`` with no routing labels is the user's own pin.
 
-    It lands about a second into the first turn — before this hook's round
-    trip finishes — and the mirrored value need not even be the model the
-    thread runs. Treating it as a pin would stop every bare launch from
-    ever routing, so only the decision label gates.
+    Harness-side model reports land in ``reported_model``, and routing's own
+    pins carry a label (the decision label, or the create-prompt fingerprint),
+    so a bare override can only be a request the user made — the picker PATCH,
+    an explicit create model, a scheduled task's configured model. The pin
+    wins over the router, the same answer the composer gate gives.
     """
     rec = _Recorder()
     decision = await resolve_turn_route(
         "conv_1",
         _request(model="databricks-gpt-5-5"),
         conv=_FakeConv(model_override="gpt-5.6-sol"),
+        route_turn=rec.route,
+        pin=rec.pin,
+        persist=rec.persist,
+    )
+    assert decision.action == "allow"
+    # Terminal: pinned is this session's steady state, so the hook writes its
+    # marker and stops paying a round trip per prompt to be told the same thing.
+    assert decision.terminal is True
+    assert rec.routed == []
+    assert rec.pinned == []
+    assert rec.chips == []
+
+
+async def test_a_create_routed_pin_is_not_the_users_and_an_edited_prompt_routes() -> None:
+    """The create's own pin must not read as a user pin.
+
+    A Smart Routing create pins what it routed and records the routed prompt's
+    fingerprint (no decision label yet — the label waits for the first-prompt
+    claim). An EDITED prompt misses the fingerprint reuse, and must then route
+    fresh rather than being mistaken for a user pin.
+    """
+    from omnigent.runner.subagent_routing import CREATE_ROUTE_PROMPT_LABEL_KEY
+    from omnigent.runner.turn_routing import create_route_prompt_fingerprint
+
+    rec = _Recorder()
+    decision = await resolve_turn_route(
+        "conv_1",
+        _request(prompt="an edited prompt the create never saw"),
+        conv=_FakeConv(
+            model_override=LAUNCH_MODEL,
+            labels={
+                CREATE_ROUTE_PROMPT_LABEL_KEY: create_route_prompt_fingerprint(
+                    "the prompt the create routed"
+                )
+            },
+        ),
+        route_turn=rec.route,
+        pin=rec.pin,
+        persist=rec.persist,
+    )
+    assert decision.action == "route"
+    assert rec.pinned == [ROUTED_MODEL]
+
+
+async def test_a_childs_orchestrator_supplied_model_is_not_a_pin() -> None:
+    """A routed parent routes its spawns past a ``sys_session_send`` model.
+
+    The composer gate makes the same choice: smart routing wins over the
+    LLM's own model pick for a child, so a child's override must not read
+    as a user pin.
+    """
+    rec = _Recorder()
+    decision = await resolve_turn_route(
+        "conv_child",
+        _request(),
+        conv=_FakeConv(
+            model_override="gpt-5.6-sol",
+            cost_control_mode_override=None,
+            parent_conversation_id="conv_parent",
+        ),
+        parent=_FakeConv(),
         route_turn=rec.route,
         pin=rec.pin,
         persist=rec.persist,
@@ -1469,48 +1531,47 @@ async def test_a_second_prompt_after_the_decision_lands_declines() -> None:
     assert len(rec.routed) == 1
 
 
-async def test_a_manually_pinned_session_with_routing_on_is_still_hook_routed_once() -> None:
+async def test_a_manually_pinned_session_with_routing_on_is_never_hook_routed() -> None:
     """
-    Add #28: pins the row-91 gap, deliberately unfixed.
+    A user pin survives every hook round trip — including a resume's.
 
     The composer gate declines a manually pinned session (its gate is
-    ``effective_runner_override is None``), but this hook cannot use that check:
-    the codex forwarder mirrors ``config.toml``'s launch model into
-    ``model_override`` about a second into the first turn, so a present
-    ``model_override`` cannot tell a user's pin from the mirror (row 89 — across
-    8 live sessions the mirror won the race in 6, so a presence gate would have
-    wrongly declined routing 6 times out of 8).
-
-    So a bare session the user pinned, with Smart Routing left on, gets routed
-    once by the hook. Closing it needs pin provenance the mirror destroys.
-    Asserted here so it is a recorded decision rather than an accident.
+    ``effective_runner_override is None``); this hook now gives the same
+    answer. Historically it could not: the codex forwarder mirrored
+    ``config.toml``'s launch model into ``model_override`` about a second into
+    the first turn, so a present override could not tell a user's pin from the
+    mirror. Reports have since moved to ``reported_model``, so the override is
+    provenance-clean and the pin gates. A resumed pane's fresh bridge dir
+    repeats the round trip; the answer must hold there too.
     """
     rec = _Recorder()
+    # A real user pin: a model set, and NO routing labels.
+    conv = _FakeConv(model_override="databricks-gpt-5-6-sol")
     decision = await resolve_turn_route(
         "conv_1",
         _request(),
-        # A real user pin: a model set, and NO routing-decision label.
-        conv=_FakeConv(model_override="databricks-gpt-5-6-sol"),
+        conv=conv,
         route_turn=rec.route,
         pin=rec.pin,
         persist=rec.persist,
     )
 
-    assert decision.action == "route"
-    assert decision.model == ROUTED_MODEL
-    assert len(rec.routed) == 1
-    # And exactly once: the decision label it writes is what closes the gate, so
-    # the pin is overridden one time and never again.
+    assert decision.action == "allow"
+    assert rec.routed == []
+    assert rec.pinned == []
+    # The resume's first prompt makes the same round trip (fresh bridge dir, no
+    # local marker) and must keep the same model.
     second = await resolve_turn_route(
         "conv_1",
-        _request(turn_id="turn_2"),
-        conv=_FakeConv(model_override=ROUTED_MODEL, labels=_routed_labels()),
+        _request(turn_id="turn_2", prompt="continue where we left off"),
+        conv=conv,
         route_turn=rec.route,
         pin=rec.pin,
         persist=rec.persist,
     )
     assert second.action == "allow"
-    assert len(rec.routed) == 1
+    assert rec.routed == []
+    assert rec.pinned == []
 
 
 # ── D1: the recovery dedup is a structural compare, not a substring ──
