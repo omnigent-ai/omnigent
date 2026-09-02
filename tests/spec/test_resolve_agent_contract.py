@@ -16,7 +16,8 @@ def test_resolve_agent_delegates_independent_review_to_polly() -> None:
 
 def test_resolve_agent_bounds_local_validation() -> None:
     instructions = (_RESOLVE_AGENT / "AGENTS.md").read_text(encoding="utf-8")
+    normalized = " ".join(instructions.split())
 
-    assert "Run only the directly affected test file/module" in instructions
-    assert "Do not run\n  the full repository suite" in instructions
-    assert "GitHub CI owns that exhaustive\n  coverage after publication" in instructions
+    assert "Run only the directly affected test file/module" in normalized
+    assert "Do not run the full repository suite" in normalized
+    assert "GitHub CI owns that exhaustive coverage after publication" in normalized
