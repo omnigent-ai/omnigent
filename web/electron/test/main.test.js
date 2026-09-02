@@ -268,6 +268,16 @@ describe("setup clipboard IPC wiring", () => {
   });
 });
 
+describe("macOS activation wiring", () => {
+  it("counts tracked shell windows instead of utility windows", () => {
+    assert.match(liveCode, /app\.on\("activate"[\s\S]{0,500}windows\.size === 0/);
+    assert.doesNotMatch(
+      liveCode,
+      /app\.on\("activate"[\s\S]{0,500}BrowserWindow\.getAllWindows\(\)\.length === 0/,
+    );
+  });
+});
+
 describe("managed server preference wiring", () => {
   it("exposes managed servers only through the setup-page bridge", () => {
     assert.match(

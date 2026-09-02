@@ -1183,10 +1183,10 @@ function DefaultBaseBranchControl() {
 }
 
 /**
- * Desktop UI font size stepper. Maps one of the supported discrete px values
- * into typography tokens via --desktop-ui-font-size (see
- * lib/uiFontPreferences.ts) without resizing layout or icons. Mobile keeps its
- * independent responsive size.
+ * UI font size stepper. Maps one of the supported discrete px values into
+ * typography tokens via --desktop-ui-font-size (see lib/uiFontPreferences.ts)
+ * without resizing layout or icons. Desktop reads the value directly; mobile
+ * scales its own base from it, so the setting applies on both surfaces.
  */
 function UiFontSizeControl() {
   // `px` is the committed value: clamped, persisted, and applied to the UI.
@@ -1235,7 +1235,7 @@ function UiFontSizeControl() {
       <div className="flex flex-col">
         <span className="text-ui font-medium">Interface font size</span>
         <span className="text-sm text-muted-foreground">
-          Set text across the desktop interface. Icons and spacing stay fixed.
+          Set text across the interface. Icons and spacing stay fixed.
         </span>
       </div>
       {/* One cohesive pill: [ −  | value px |  + ]. Segments share the pill

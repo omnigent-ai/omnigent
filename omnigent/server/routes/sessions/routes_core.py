@@ -31,6 +31,7 @@ from omnigent.cost_plan import (
     reserved_cost_control_keys,
 )
 from omnigent.db.utils import generate_agent_id
+from omnigent.debug_logging import add_audit_attrs, debug_event
 from omnigent.entities import (
     CommentsFingerprint,
     Conversation,
@@ -48,6 +49,7 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
 from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runtime import (
     pending_elicitations,
     user_session_stream,
@@ -199,6 +201,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
+from omnigent.version import VERSION
 
 
 def register_core_routes(
@@ -369,6 +372,10 @@ def register_core_routes(
             result, project_warnings = await _create_bundled_session_from_multipart(
                 request, user_id
             )
+            # Surface the freshly-minted session id (the request path has no
+            # {session_id} on create); the middleware promotes a bag session_id
+            # to the audit row's session_id column.
+            add_audit_attrs(session_id=result.session_id, agent=result.agent_id)
             if project_warnings:
                 return {
                     **result.model_dump(mode="json"),
@@ -448,16 +455,35 @@ def register_core_routes(
             _publish_terminal_pending(resp.id, True)
         _rc = await _get_runner_client(resp.id, runner_router)
         if _rc is not None and conv is not None:
+            # Send the full session-init envelope (not the legacy id-only body)
+            # so the runner seeds the first spawn from current session state —
+            # notably the persisted /model override — rather than relying on a
+            # best-effort reverse GET whose failure would silently reintroduce
+            # the first-turn respawn. Older runners ignore the extra
+            # ``session_init`` key and still read the top-level id fields.
+            # A session not yet bound to an agent keeps the id-only body: the
+            # envelope builder requires an agent_id.
+            init_body: dict[str, Any] = {
+                "session_id": resp.id,
+                "agent_id": conv.agent_id,
+                "sub_agent_name": conv.sub_agent_name,
+            }
+            if conv.agent_id is not None:
+                try:
+                    init_body = build_runner_session_init_payload(conv, server_version=VERSION)
+                except Exception:
+                    # Must not fail the create, but the degradation loses the
+                    # seeded override — surface it instead of silently
+                    # downgrading (a bare ValueError catch would swallow a
+                    # pydantic ValidationError here).
+                    _logger.warning(
+                        "session-init envelope build failed for %s; falling back to the "
+                        "id-only body (a model-pinned first turn may respawn)",
+                        resp.id,
+                        exc_info=True,
+                    )
             try:
-                await _rc.post(
-                    "/v1/sessions",
-                    json={
-                        "session_id": resp.id,
-                        "agent_id": conv.agent_id,
-                        "sub_agent_name": conv.sub_agent_name,
-                    },
-                    timeout=10.0,
-                )
+                await _rc.post("/v1/sessions", json=init_body, timeout=10.0)
             except (httpx.HTTPError, ConnectionError):
                 _logger.warning(
                     "Failed to notify runner about session %s",
@@ -594,6 +620,7 @@ def register_core_routes(
                 resp.runner_id = runner_id
                 resp.host_id = launch_host_id
 
+        add_audit_attrs(session_id=resp.id, agent=resp.agent_id)
         if project_warnings:
             return {
                 **resp.model_dump(mode="json"),
@@ -1274,6 +1301,10 @@ def register_core_routes(
                 reason="authentication required",
             )
         await websocket.accept()
+        _logger.info(
+            "session-updates stream connected",
+            extra=debug_event("session_updates", phase="connected"),
+        )
 
         watched: list[str] = []
         # Last SessionListItem dump sent per id, used to diff. Keyed only
@@ -1495,8 +1526,16 @@ def register_core_routes(
                 # A client disconnect is the normal terminal condition; any
                 # other exception is a real bug worth surfacing in logs.
                 if exc is not None and not isinstance(exc, WebSocketDisconnect):
-                    _logger.warning("session-updates stream task crashed: %r", exc)
+                    _logger.warning(
+                        "session-updates stream task crashed: %r",
+                        exc,
+                        extra=debug_event("session_updates", phase="error"),
+                    )
         finally:
+            _logger.info(
+                "session-updates stream disconnected",
+                extra=debug_event("session_updates", phase="disconnected"),
+            )
             with contextlib.suppress(RuntimeError):
                 await websocket.close()
 

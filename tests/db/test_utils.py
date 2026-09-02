@@ -30,6 +30,7 @@ from omnigent.db.utils import (
     generate_item_id,
     get_or_create_engine,
     make_managed_session_maker,
+    run_migrations_with_retry,
     set_lakebase_token_provider,
     shared_read_scope,
     strip_nul_bytes,
@@ -968,3 +969,143 @@ def test_shared_read_scope_closes_session_when_init_fails(
     assert counts["out"] == counts["in"], (
         f"a session that failed mid-init leaked its checkout: {counts}"
     )
+
+
+# ── run_migrations_with_retry (cold-start resilience) ──────────────
+
+
+def _operational_error(msg: str = "the database system is starting up") -> Any:
+    """Build an OperationalError shaped like a cold-managed-DB failure."""
+    from sqlalchemy.exc import OperationalError
+
+    return OperationalError(statement=None, params=None, orig=Exception(msg))
+
+
+def test_run_migrations_with_retry_succeeds_first_try(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A healthy DB migrates on the first attempt with no sleeping."""
+    engine = MagicMock()
+    calls: dict[str, int] = {"migrate": 0}
+
+    def _migrate(_engine: Any, _uri: str) -> None:
+        calls["migrate"] += 1
+
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", _migrate)
+    slept: list[float] = []
+
+    run_migrations_with_retry(
+        "postgresql://x",
+        engine_factory=lambda _uri: engine,
+        sleep=slept.append,
+    )
+
+    assert calls["migrate"] == 1
+    assert slept == []
+    # The engine is always disposed, even on the happy path.
+    engine.dispose.assert_called_once()
+
+
+def test_run_migrations_with_retry_recovers_after_cold_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Transient OperationalErrors are retried until one attempt succeeds.
+
+    Each attempt must use a FRESH engine (a poisoned pool from a failed
+    connect is never reused), and every engine created must be disposed.
+    """
+    engines: list[MagicMock] = []
+
+    def _factory(_uri: str) -> MagicMock:
+        e = MagicMock(name=f"engine{len(engines)}")
+        engines.append(e)
+        return e
+
+    attempts: dict[str, int] = {"n": 0}
+
+    def _migrate(_engine: Any, _uri: str) -> None:
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise _operational_error()
+
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", _migrate)
+    slept: list[float] = []
+
+    run_migrations_with_retry(
+        "postgresql://x",
+        backoff_seconds=2.0,
+        engine_factory=_factory,
+        sleep=slept.append,
+    )
+
+    assert attempts["n"] == 3
+    # A distinct engine per attempt, each disposed exactly once.
+    assert len(engines) == 3
+    for e in engines:
+        e.dispose.assert_called_once()
+    # Linear backoff between the two failed attempts: 2.0*1, 2.0*2.
+    assert slept == [2.0, 4.0]
+
+
+def test_run_migrations_with_retry_raises_after_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DB that never comes up fails loudly after max_attempts."""
+    from sqlalchemy.exc import OperationalError
+
+    def _always_cold(_engine: Any, _uri: str) -> None:
+        raise _operational_error()
+
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", _always_cold)
+    engines: list[MagicMock] = []
+    slept: list[float] = []
+
+    def _factory(_uri: str) -> MagicMock:
+        e = MagicMock()
+        engines.append(e)
+        return e
+
+    with pytest.raises(OperationalError):
+        run_migrations_with_retry(
+            "postgresql://x",
+            max_attempts=3,
+            backoff_seconds=1.0,
+            engine_factory=_factory,
+            sleep=slept.append,
+        )
+
+    assert len(engines) == 3
+    for e in engines:
+        e.dispose.assert_called_once()
+    # No sleep after the final (raising) attempt.
+    assert slept == [1.0, 2.0]
+
+
+def test_run_migrations_with_retry_propagates_non_operational_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real migration/schema error is NOT retried — it surfaces at once."""
+
+    def _bad_migration(_engine: Any, _uri: str) -> None:
+        raise ValueError("bad revision")
+
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", _bad_migration)
+    engine = MagicMock()
+    slept: list[float] = []
+
+    with pytest.raises(ValueError, match="bad revision"):
+        run_migrations_with_retry(
+            "postgresql://x",
+            engine_factory=lambda _uri: engine,
+            sleep=slept.append,
+        )
+
+    # Failed on the first attempt without retrying, but still disposed.
+    assert slept == []
+    engine.dispose.assert_called_once()
+
+
+def test_run_migrations_with_retry_rejects_bad_max_attempts() -> None:
+    """max_attempts < 1 is a programming error, not a runtime retry."""
+    with pytest.raises(ValueError, match="max_attempts"):
+        run_migrations_with_retry("postgresql://x", max_attempts=0)

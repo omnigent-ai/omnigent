@@ -1739,10 +1739,10 @@ export function updateWarmTerminalSurfaces(
  * The conversation scroll surface + composer — the content of the
  * "Main Agent" tab (and also the standalone view on `/`).
  *
- * In terminal-first sessions, when the connection pill is set to
+ * In terminal-first sessions, when the header switcher is set to
  * Terminal, the conversation + composer are replaced by an inline
- * `MainTerminalView`. The pill itself stays visible (rendered via
- * `ConnectionIndicator`) so the user can flip back to Chat.
+ * `MainTerminalView`. The switcher itself stays visible (in the header,
+ * see ViewModeToggle) so the user can flip back to Chat.
  */
 function MainAgentSurface({
   conversationId,
@@ -1933,6 +1933,10 @@ function MainAgentSurface({
     if (!isIOSShell()) return;
     return () => setNativeServerSwitcherHidden(true);
   }, []);
+  // Keys the transcript so a warm switch (no hydration remount) still re-runs
+  // its mount-only scroll-to-bottom and anchor capture. Store id, not the URL
+  // prop, which leads the mirrored blocks by a commit (see the switchTo effect).
+  const activeConversationId = useChatStore((s) => s.conversationId);
   // The conversation's scroll container + the StickToBottom controls needed to
   // override its bottom-lock, lifted out of the context by
   // ConversationScrollRefBridge so the pinned-but-unmasked JumpToTopButton can
@@ -2073,11 +2077,7 @@ function MainAgentSurface({
           readOnly={entry.readOnly}
         />
         {isShown && (
-          <ConnectionIndicator
-            liveness={liveness}
-            onShowReconnectHelp={onShowReconnectHelp}
-            surfaceFrontmost={surfaceFrontmost}
-          />
+          <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
         )}
       </div>
     );
@@ -2095,10 +2095,10 @@ function MainAgentSurface({
         <>
           {/* Task tracker pinned above the thread. Sibling of the viewport (not
           an overlay) so it shrinks the scroll area rather than covering
-          messages. mt clears the floating header (h-14 mobile / h-12 desktop).
-          Self-hides with no tasks. ponytail: header offset is the web height;
-          native shells (data-ios/android) size their header via CSS vars — not
-          tuned here. */}
+          messages. mt clears the floating header (h-14 mobile / h-12 desktop);
+          native shells shift the header by the safe area, so index.css
+          re-derives this offset for them (.chat-plan-accordion). Self-hides
+          with no tasks. */}
           <ChatPlanAccordion className="mt-14 md:mt-12" />
           {/* Wrapper div gives us a ref to scope the SelectionPopup to the
           conversation area without requiring Conversation to forward refs. */}
@@ -2111,7 +2111,10 @@ function MainAgentSurface({
             ChatHeader overlay's controls (geometry in index.css). Dropped
             when the Plan accordion is pinned above — its solid bar already
             occludes content scrolling past the viewport's top edge. */}
-            <Conversation className={cn(!hasTasks && "chat-scroll-fade", "flex-1")}>
+            <Conversation
+              key={activeConversationId ?? "landing"}
+              className={cn(!hasTasks && "chat-scroll-fade", "flex-1")}
+            >
               {/* Override ConversationContent's default spacing so the thread keeps
               16px side gutters and consecutive agent turns read as one thread.
               The left inset grows *continuously* as the conversation area
@@ -2326,14 +2329,10 @@ function MainAgentSurface({
             wrapperLabel={wrapperLabel}
           />
 
-          {/* Chat/Terminal toggle for terminal-first sessions, reconnect-or-
-          fork banner when unreachable, nothing otherwise. Sits below the
-          composer so its position is consistent with the terminal view. */}
-          <ConnectionIndicator
-            liveness={liveness}
-            onShowReconnectHelp={onShowReconnectHelp}
-            surfaceFrontmost={surfaceFrontmost}
-          />
+          {/* Reconnect-or-fork banner when unreachable, nothing otherwise.
+          Sits below the composer so its position is consistent with the
+          terminal view. */}
+          <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
         </>
       )}
     </>
@@ -3147,16 +3146,22 @@ function isSystemBubble(bubble: Bubble): boolean {
   return isSystemUserContent(bubble.content);
 }
 
-function CompactionLoadingIndicator() {
+function CompactionLoadingIndicator({ createdAtS }: { createdAtS?: number }) {
   const [elapsed, setElapsed] = useState(0);
-  const startRef = useRef(performance.now());
 
   useEffect(() => {
-    const id = window.setInterval(() => {
-      setElapsed(Math.round((performance.now() - startRef.current) / 1000));
-    }, 1000);
+    // Calculate elapsed time from the actual compaction start time (if available)
+    // rather than component mount time, so the timer persists across session switches.
+    const startTimeMs = createdAtS != null ? createdAtS * 1000 : Date.now();
+
+    const updateElapsed = () => {
+      setElapsed(Math.round((Date.now() - startTimeMs) / 1000));
+    };
+
+    updateElapsed();
+    const id = window.setInterval(updateElapsed, 1000);
     return () => window.clearInterval(id);
-  }, []);
+  }, [createdAtS]);
 
   return (
     <Message from="assistant" data-testid="compacting-indicator">
@@ -3213,7 +3218,7 @@ export const BubbleView = memo(
   }) {
     if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
     if (bubble.kind === "compaction_loading") {
-      return <CompactionLoadingIndicator />;
+      return <CompactionLoadingIndicator createdAtS={bubble.createdAtS} />;
     }
     if (bubble.kind === "compaction") return <CompactionMarker />;
     if (bubble.kind === "routing_decision") {
@@ -3710,10 +3715,9 @@ interface ComposerProps {
   /** Show Polly's Codex command-backed Goal control. */
   showPollyCodexGoalControl?: boolean;
   /**
-   * Terminal-first session (Chat/Terminal pill present). Presentation
-   * only: tightens the composer's bottom padding to `pb-1.5` so it sits
-   * closer to the pill beneath it; non-terminal-first chats use the
-   * roomier `pb-3`.
+   * Terminal-first session. Presentation only: tightens the composer's
+   * bottom padding to `pb-1.5` (the status line beneath already cushions
+   * the edge); non-terminal-first chats use the roomier `pb-3`.
    */
   isTerminalFirst?: boolean;
   /**
@@ -5164,10 +5168,7 @@ export function Composer({
   return (
     <form
       onSubmit={handleSubmit}
-      className={cn(
-        "chat-composer-form px-4 md:px-6",
-        isTerminalFirst ? "terminal-first-composer-form pb-1.5" : "pb-3",
-      )}
+      className={cn("chat-composer-form px-4 md:px-6", isTerminalFirst ? "pb-1.5" : "pb-3")}
     >
       {/* Hidden file input for the attach button */}
       <input

@@ -33,7 +33,12 @@ import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from typing import Any
 
-from omnigent.debug_logging import debug_event, debug_sink_enabled, sse_event_logger
+from omnigent.debug_logging import (
+    audit_event_logger,
+    debug_event,
+    debug_sink_enabled,
+    sse_event_logger,
+)
 from omnigent.runtime import inflight_text, pending_elicitations
 
 _logger = logging.getLogger(__name__)
@@ -89,6 +94,15 @@ _SSE_SKIP_TYPES = frozenset(
 _SSE_WARN_TYPES = frozenset(
     {"response.failed", "response.error", "turn.failed", "response.policy_denied"}
 )
+# Terminal SSE events → the turn's outcome. Emitted once per turn as a
+# first-class ``turn_finished`` audit row (session-scoped), so turn success /
+# failure is queryable without inferring it from the raw SSE stream.
+_TURN_OUTCOME_BY_EVENT_TYPE = {
+    "response.completed": "completed",
+    "response.failed": "failed",
+    "response.cancelled": "cancelled",
+    "response.incomplete": "incomplete",
+}
 # Top-level event fields safe to log — stable identifiers, closed enums, and
 # pure numerics only. Deliberately excludes human/LLM-authored free text
 # (``reason`` — PolicyDeniedEvent's deny reason is LLM-generated and can quote
@@ -163,6 +177,31 @@ def _log_sse_event(conversation_id: str, event: dict[str, Any]) -> None:
         extra = debug_event(event_type, session_id=conversation_id)
         extra["attributes"] = _sse_safe_attributes(event)
         sse_event_logger().log(level, "sse %s", event_type, extra=extra)
+        _log_turn_outcome(conversation_id, event_type, event)
+
+
+def _log_turn_outcome(conversation_id: str, event_type: str, event: dict[str, Any]) -> None:
+    """Emit a first-class ``turn_finished`` audit row on a terminal SSE event.
+
+    One row per turn (terminal events fire once), carrying the outcome plus safe
+    ids, so turn success/failure rate is a direct query rather than an inference
+    over the raw stream. Table-only via the audit logger; caller already gated on
+    :func:`debug_sink_enabled` and wrapped in ``suppress``.
+    """
+    outcome = _TURN_OUTCOME_BY_EVENT_TYPE.get(event_type)
+    if outcome is None:
+        return
+    extra = debug_event("turn_finished", session_id=conversation_id, outcome=outcome)
+    attributes = extra["attributes"]
+    if isinstance(attributes, dict):
+        response = event.get("response")
+        if isinstance(response, dict) and isinstance(response.get("id"), str):
+            attributes["response_id"] = response["id"]
+        error = event.get("error")
+        if isinstance(error, dict) and error.get("code") is not None:
+            attributes["error_code"] = str(error["code"])
+    level = logging.WARNING if outcome in ("failed", "incomplete") else logging.INFO
+    audit_event_logger().log(level, "turn %s", outcome, extra=extra)
 
 
 def publish(conversation_id: str, event: dict[str, Any]) -> None:

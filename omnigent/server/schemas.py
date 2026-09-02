@@ -2989,12 +2989,11 @@ class SessionUsageEvent(_SSEEventBase):
 
 class SessionModelEvent(_SSEEventBase):
     """
-    Active-model report from a terminal-backed integration.
+    Active-model report from a harness integration.
 
     Emitted after an ``external_model_change`` POST from a native
-    forwarder — the launch's own model report, or a switch made inside
-    the pane (a ``/model`` command or the in-TUI picker). Every surface
-    re-renders its model display from this.
+    forwarder or when an SDK relay reports its concrete model in terminal
+    response usage. Every surface re-renders its model display from this.
 
     :param type: Always ``"session.model"``.
     :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
@@ -4111,11 +4110,16 @@ class FailedEvent(_SSEEventBase):
     be absent when the failure occurs before response allocation.
 
     :param type: Always ``"response.failed"``.
+    :param source: Where the fault originated -- ``"llm"`` for
+        inference/context errors, ``"harness"`` for Claude Code/harness
+        process failures, ``"execution"`` for runner configuration
+        or infrastructure failures.
     :param response: The failure response object with ``status="failed"``
         and ``error`` populated.
     """
 
     type: Literal["response.failed"]
+    source: Literal["llm", "execution", "tool", "harness"] = "execution"
     response: ResponseObject | FailedResponseObject
 
 
@@ -4216,16 +4220,16 @@ class ErrorEvent(_SSEEventBase):
     (``except Exception``). Wire shape matches those emits.
 
     :param type: Always ``"response.error"``.
-    :param source: Origin of the error — ``"llm"`` for LLM-call
+    :param source: Origin of the error -- ``"llm"`` for LLM-call
         failures, ``"execution"`` for timeouts, ``"tool"`` for
-        tool failures (currently emitted by retry exhaustion paths).
+        tool failures, ``"harness"`` for harness process failures.
     :param tool_name: Tool identifier when ``source == "tool"``;
         ``None`` for the other sources.
     :param error: Classified error description.
     """
 
     type: Literal["response.error"]
-    source: Literal["llm", "execution", "tool"]
+    source: Literal["llm", "execution", "tool", "harness"]
     tool_name: str | None = None
     error: RetryErrorDetail
 

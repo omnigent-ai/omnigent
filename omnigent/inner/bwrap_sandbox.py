@@ -25,7 +25,8 @@ Default view inside the sandbox:
   ``write_paths: ["."]`` flips it to read-write. Top-level
   dotfiles / dotdirs in cwd are tmpfs-masked unless their name is
   in :data:`_DEFAULT_CWD_ALLOW_HIDDEN` (``.venv`` by default) or
-  :attr:`OSEnvSandboxSpec.cwd_allow_hidden`.
+  :attr:`OSEnvSandboxSpec.cwd_allow_hidden`; the explicit ``"*"``
+  entry allows every dotpath in trusted roots.
 - The per-helper scratch tmpdir created by
   :func:`omnigent.inner.sandbox.create_private_tmpdir` is
   bind-mounted read-write and surfaced via ``$TMPDIR``.

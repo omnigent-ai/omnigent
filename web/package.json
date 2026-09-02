@@ -18,7 +18,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "build:overlay": "vite build --config vite.update-overlay.config.ts"
+    "build:overlay": "vite build --config vite.update-overlay.config.ts",
+    "build:server-selector-v2": "vite build --config vite.server-selector-v2.config.ts",
+    "dev:server-selector-v2": "vite --config vite.server-selector-v2.config.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

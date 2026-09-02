@@ -2,7 +2,8 @@
 
 These cover the logic that diverges from goose-native: appending JSONL commands
 to qwen's ``--input-file`` and parsing its ``--json-file`` stream-json events.
-The event shapes are pinned to ``qwen`` v0.18.1 (see ``docs/QWEN_NATIVE_DESIGN.md``).
+The event shapes cover qwen v0.18.1 and v0.21.14 (see
+``docs/QWEN_NATIVE_DESIGN.md``).
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ from omnigent.qwen_native_forwarder import (
     _ForwardState,
     _new_seen,
     _read_new_compaction_statuses,
-    _read_new_events,
+    _read_new_forward_events,
     _read_state,
     _write_state,
     clear_qwen_bridge_state,
@@ -55,12 +56,16 @@ def _user_ev(uuid: str, text: str) -> dict:
     }
 
 
-def _asst_ev(uuid: str, content: list[dict]) -> dict:
+def _asst_ev(uuid: str, content: list[dict], stop_reason: str | None = None) -> dict:
     return {
         "type": "assistant",
         "uuid": uuid,
-        "message": {"role": "assistant", "content": content},
+        "message": {"role": "assistant", "content": content, "stop_reason": stop_reason},
     }
+
+
+def _message_stop_ev(uuid: str) -> dict:
+    return {"type": "stream_event", "uuid": uuid, "event": {"type": "message_stop"}}
 
 
 def _ev_bytes(obj: dict) -> bytes:
@@ -134,7 +139,7 @@ def test_could_not_load_marker_stripped() -> None:
 def test_read_new_events_incremental_and_partial_line(tmp_path: Path) -> None:
     f = tmp_path / "out.ndjson"
     f.write_bytes(_ev_bytes(_user_ev("u1", "q")))
-    items, off = _read_new_events(f, 0, set(), _AGENT)
+    items, off, _, _ = _read_new_forward_events(f, 0, set(), _AGENT, "")
     assert [i.uuid for i in items] == ["u1"]
     assert off == f.stat().st_size
 
@@ -145,7 +150,7 @@ def test_read_new_events_incremental_and_partial_line(tmp_path: Path) -> None:
         complete_size = f.stat().st_size
         fh.write(b'{"type":"assistant","uuid":"a2"')  # no newline yet
         fh.flush()
-    items, off2 = _read_new_events(f, off, {"u1"}, _AGENT)
+    items, off2, _, _ = _read_new_forward_events(f, off, {"u1"}, _AGENT, "")
     assert [i.uuid for i in items] == ["a1"]
     # Offset stops at the last newline — the partial line is not consumed.
     assert off2 == complete_size
@@ -155,21 +160,233 @@ def test_read_new_events_detects_truncation(tmp_path: Path) -> None:
     f = tmp_path / "out.ndjson"
     # A long first line so the stale offset exceeds the post-truncation size.
     f.write_bytes(_ev_bytes(_user_ev("u1", "first message, intentionally long " * 4)))
-    _, off = _read_new_events(f, 0, set(), _AGENT)
+    _, off, _, _ = _read_new_forward_events(f, 0, set(), _AGENT, "")
     assert off > 0
     # A relaunched terminal truncates + writes a shorter line; size < offset
     # must rewind so the fresh content is not skipped.
     f.write_bytes(_ev_bytes(_user_ev("u2", "fresh")))
     assert f.stat().st_size < off
-    items, _ = _read_new_events(f, off, set(), _AGENT)
+    items, _, _, _ = _read_new_forward_events(f, off, set(), _AGENT, "")
     assert [i.uuid for i in items] == ["u2"]
 
 
 def test_malformed_line_tolerated(tmp_path: Path) -> None:
     f = tmp_path / "out.ndjson"
     f.write_bytes(b"not json\n" + _ev_bytes(_user_ev("u1", "ok")))
-    items, _ = _read_new_events(f, 0, set(), _AGENT)
+    items, _, _, _ = _read_new_forward_events(f, 0, set(), _AGENT, "")
     assert [i.uuid for i in items] == ["u1"]
+
+
+def test_forward_events_preserve_item_then_terminal_output_order(tmp_path: Path) -> None:
+    """The structured result wakes only after its assistant item is available."""
+    events = tmp_path / "out.ndjson"
+    events.write_bytes(
+        _ev_bytes(_user_ev("u1", "question"))
+        + _ev_bytes(_asst_ev("a1", [{"type": "text", "text": "final answer"}]))
+        + _ev_bytes(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "uuid": "r1",
+            }
+        )
+    )
+
+    actions, offset, buffered, stop_reason = _read_new_forward_events(events, 0, set(), _AGENT, "")
+
+    assert [type(action) for action in actions] == [
+        fwd._MirrorItem,
+        fwd._MirrorItem,
+        fwd._TerminalStatus,
+    ]
+    terminal = actions[-1]
+    assert isinstance(terminal, fwd._TerminalStatus)
+    assert terminal.status == "idle"
+    assert terminal.output == "final answer"
+    assert offset == events.stat().st_size
+    assert buffered == ""
+    assert stop_reason is None
+
+
+def test_forward_events_terminal_without_pty_idle_and_failure(tmp_path: Path) -> None:
+    """Wire-protocol results terminate success and error turns without PTY edges."""
+    events = tmp_path / "out.ndjson"
+    events.write_bytes(
+        _ev_bytes(_asst_ev("a1", [{"type": "text", "text": "partial answer"}]))
+        + _ev_bytes(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "result": "tool failed",
+                "uuid": "r1",
+            }
+        )
+    )
+
+    actions, _, _, _ = _read_new_forward_events(events, 0, set(), _AGENT, "")
+
+    terminal = actions[-1]
+    assert isinstance(terminal, fwd._TerminalStatus)
+    assert terminal.status == "failed"
+    assert terminal.output == "tool failed"
+
+
+def test_qwen_021_message_stop_completes_final_text_turn(tmp_path: Path) -> None:
+    """Qwen 0.21.14 uses message_stop instead of a top-level result record."""
+    events = tmp_path / "out.ndjson"
+    events.write_bytes(
+        _ev_bytes(_asst_ev("a1", [{"type": "text", "text": "final answer"}]))
+        + _ev_bytes(_message_stop_ev("stop-1"))
+    )
+
+    actions, _, buffered, stop_reason = _read_new_forward_events(events, 0, set(), _AGENT, "")
+
+    assert [type(action) for action in actions] == [
+        fwd._MirrorItem,
+        fwd._TerminalStatus,
+    ]
+    terminal = actions[-1]
+    assert isinstance(terminal, fwd._TerminalStatus)
+    assert terminal.status == "idle"
+    assert terminal.output == "final answer"
+    assert terminal.response_id == "qwen:stop-1"
+    assert buffered == ""
+    assert stop_reason is None
+
+
+def test_qwen_021_message_stop_skips_tool_use_and_completes_final_turn(tmp_path: Path) -> None:
+    """An intermediate tool-use message_stop must not terminalize the child."""
+    events = tmp_path / "out.ndjson"
+    events.write_bytes(
+        _ev_bytes(
+            _asst_ev(
+                "a-tool",
+                [{"type": "tool_use", "id": "call-1", "name": "read_file"}],
+                stop_reason="tool_use",
+            )
+        )
+        + _ev_bytes(_message_stop_ev("stop-tool"))
+        + _ev_bytes(
+            {
+                "type": "user",
+                "uuid": "tool-result",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "call-1"}],
+                },
+            }
+        )
+        + _ev_bytes(_asst_ev("a-final", [{"type": "text", "text": "done"}]))
+        + _ev_bytes(_message_stop_ev("stop-final"))
+    )
+
+    actions, _, _, _ = _read_new_forward_events(events, 0, set(), _AGENT, "")
+    terminals = [action for action in actions if isinstance(action, fwd._TerminalStatus)]
+
+    assert [terminal.uuid for terminal in terminals] == ["stop-final"]
+    assert terminals[0].output == "done"
+
+
+def test_qwen_021_message_stop_context_survives_poll_boundary(tmp_path: Path) -> None:
+    """Assistant and message_stop can land in separate forwarder polls."""
+    events = tmp_path / "out.ndjson"
+    events.write_bytes(_ev_bytes(_asst_ev("a1", [{"type": "text", "text": "answer"}])))
+
+    first, offset, buffered, stop_reason = _read_new_forward_events(events, 0, set(), _AGENT, "")
+    assert [action.uuid for action in first] == ["a1"]
+    assert buffered == "answer"
+    assert stop_reason == ""
+
+    with open(events, "ab") as fh:
+        fh.write(_ev_bytes(_message_stop_ev("stop-1")))
+
+    second, _, buffered, stop_reason = _read_new_forward_events(
+        events,
+        offset,
+        {"a1"},
+        _AGENT,
+        buffered,
+        stop_reason,
+    )
+    assert [action.uuid for action in second] == ["stop-1"]
+    terminal = second[0]
+    assert isinstance(terminal, fwd._TerminalStatus)
+    assert terminal.output == "answer"
+    assert buffered == ""
+    assert stop_reason is None
+
+
+def test_qwen_021_truncation_resets_persisted_assistant_context(tmp_path: Path) -> None:
+    """A fresh event file must not inherit assistant context from a prior process."""
+    state = _ForwardState(
+        offset=10_000,
+        seen_uuids=[],
+        last_assistant_text="stale answer",
+        last_assistant_stop_reason="tool_use",
+    )
+    assert _write_state(tmp_path, state) is True
+    persisted = _read_state(tmp_path)
+
+    events = tmp_path / "out.ndjson"
+    events.write_bytes(
+        _ev_bytes(_asst_ev("a-fresh", [{"type": "text", "text": "fresh answer"}]))
+        + _ev_bytes(_message_stop_ev("stop-fresh"))
+    )
+    assert events.stat().st_size < persisted.offset
+
+    actions, _, buffered, stop_reason = _read_new_forward_events(
+        events,
+        persisted.offset,
+        set(persisted.seen_uuids or []),
+        _AGENT,
+        persisted.last_assistant_text,
+        persisted.last_assistant_stop_reason,
+    )
+
+    terminals = [action for action in actions if isinstance(action, fwd._TerminalStatus)]
+    assert len(terminals) == 1
+    assert terminals[0].output == "fresh answer"
+    assert buffered == ""
+    assert stop_reason is None
+
+
+def test_result_is_error_is_authoritative_for_custom_success_subtype() -> None:
+    terminal = fwd._event_to_terminal(
+        {
+            "type": "result",
+            "subtype": "success_with_warnings",
+            "is_error": False,
+            "result": "completed with warnings",
+            "uuid": "r-warning",
+        },
+        "",
+    )
+
+    assert terminal is not None
+    assert terminal.status == "idle"
+    assert terminal.output == "completed with warnings"
+
+
+def test_forward_events_dedup_and_genuinely_empty_result(tmp_path: Path) -> None:
+    """Duplicate results stay suppressed and output-free success stays explicit."""
+    events = tmp_path / "out.ndjson"
+    result = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "uuid": "r-empty",
+    }
+    events.write_bytes(_ev_bytes(result) + _ev_bytes(result))
+
+    actions, _, _, _ = _read_new_forward_events(events, 0, {"r-empty"}, _AGENT, "")
+    assert actions == []
+
+    actions, _, _, _ = _read_new_forward_events(events, 0, set(), _AGENT, "")
+    terminals = [action for action in actions if isinstance(action, fwd._TerminalStatus)]
+    assert len(terminals) == 1
+    assert all(terminal.output is None for terminal in terminals)
 
 
 # --- Compaction mirror (chat-recording tail) -------------------------------
@@ -322,11 +539,18 @@ def test_bridge_submit_and_confirmation_append_jsonl(tmp_path: Path) -> None:
 
 
 def test_forward_state_roundtrip_and_clear(tmp_path: Path) -> None:
-    state = _ForwardState(offset=123, seen_uuids=["a", "b"])
+    state = _ForwardState(
+        offset=123,
+        seen_uuids=["a", "b"],
+        last_assistant_text="buffered answer",
+        last_assistant_stop_reason="tool_use",
+    )
     assert _write_state(tmp_path, state) is True
     loaded = _read_state(tmp_path)
     assert loaded.offset == 123
     assert loaded.seen_uuids == ["a", "b"]
+    assert loaded.last_assistant_text == "buffered answer"
+    assert loaded.last_assistant_stop_reason == "tool_use"
     # Clearing resets the cursor so a re-created terminal starts clean.
     clear_qwen_bridge_state(tmp_path)
     cleared = _read_state(tmp_path)
@@ -491,6 +715,91 @@ async def test_post_conversation_item_shape() -> None:
         "item_data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
         "response_id": "qwen:u1",
     }
+
+
+async def test_post_external_session_status_shape() -> None:
+    client = _RecordingClient()
+    terminal = fwd._TerminalStatus(
+        uuid="r1", status="idle", output="answer", response_id="qwen:r1"
+    )
+
+    await fwd._post_external_session_status(  # type: ignore[arg-type]
+        client, session_id="conv_1", terminal=terminal
+    )
+
+    _, body = client.posts[0]
+    assert body == {
+        "type": "external_session_status",
+        "data": {"status": "idle", "response_id": "qwen:r1", "output": "answer"},
+    }
+
+
+async def test_partial_batch_failure_retries_only_terminal_with_buffered_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = tmp_path / "out.ndjson"
+    events.write_bytes(
+        _ev_bytes(_asst_ev("a1", [{"type": "text", "text": "durable answer"}]))
+        + _ev_bytes(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "uuid": "r1",
+            }
+        )
+    )
+    state = _ForwardState(offset=0, seen_uuids=[], last_assistant_text="")
+    item_posts: list[str] = []
+    terminal_posts: list[str | None] = []
+
+    async def _post_item(_client: object, *, session_id: str, item: object) -> None:
+        item_posts.append(item.uuid)  # type: ignore[attr-defined]
+
+    async def _post_terminal(_client: object, *, session_id: str, terminal: object) -> None:
+        if not terminal_posts:
+            terminal_posts.append(None)
+            raise httpx.ConnectError("terminal unavailable")
+        terminal_posts.append(terminal.output)  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(fwd, "_post_conversation_item", _post_item)
+    monkeypatch.setattr(fwd, "_post_external_session_status", _post_terminal)
+    actions, _, _, _ = _read_new_forward_events(events, 0, set(), _AGENT, "")
+
+    with pytest.raises(httpx.ConnectError, match="terminal unavailable"):
+        await fwd._deliver_forward_actions(  # type: ignore[arg-type]
+            object(), session_id="conv", bridge_dir=tmp_path, state=state, actions=actions
+        )
+
+    persisted = _read_state(tmp_path)
+    assert persisted.offset == 0
+    assert persisted.seen_uuids == ["a1"]
+    assert persisted.last_assistant_text == "durable answer"
+    retry_actions, retry_offset, _, _ = _read_new_forward_events(
+        events,
+        persisted.offset,
+        set(persisted.seen_uuids or []),
+        _AGENT,
+        persisted.last_assistant_text,
+        persisted.last_assistant_stop_reason,
+    )
+    assert [action.uuid for action in retry_actions] == ["r1"]
+
+    await fwd._deliver_forward_actions(  # type: ignore[arg-type]
+        object(),
+        session_id="conv",
+        bridge_dir=tmp_path,
+        state=persisted,
+        actions=retry_actions,
+    )
+    persisted.offset = retry_offset
+    assert _write_state(tmp_path, persisted) is True
+
+    assert item_posts == ["a1"]
+    assert terminal_posts == [None, "durable answer"]
+    final = _read_state(tmp_path)
+    assert final.seen_uuids == ["a1", "r1"]
+    assert final.last_assistant_text == ""
 
 
 async def test_forward_loop_posts_new_events_and_persists(

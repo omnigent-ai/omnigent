@@ -32,6 +32,7 @@ import type { ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
 import {
   useHostModelOptions,
+  fetchHosts,
   useHosts,
   useInstallHarness,
   useInstallingHarnesses,
@@ -46,7 +47,9 @@ import type { Conversation } from "@/hooks/useConversations";
 import { setOmnigentHostConfig } from "@/lib/host";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import {
+  connectArcaHost,
   controlHost,
+  getDesktopFeatures,
   getHostIdentity,
   isElectronShell,
   onHostStatusChanged,
@@ -70,10 +73,13 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   getHostIdentity: vi.fn(async () => null),
   onHostStatusChanged: vi.fn(() => () => {}),
   controlHost: vi.fn(async () => ({ ok: false })),
+  getDesktopFeatures: vi.fn(async () => null),
+  connectArcaHost: vi.fn(async () => ({ ok: false })),
 }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(),
+  fetchHosts: vi.fn(async () => []),
   // The setup dialog mounts these; default to inert so tests that don't
   // exercise install / credential-write don't need to wire them up.
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
@@ -959,6 +965,148 @@ describe("Run on this machine (desktop host enrollment)", () => {
     vi.mocked(controlHost).mockClear();
     fireEvent.click(screen.getByTestId("new-chat-landing-connect-error-retry"));
     await waitFor(() => expect(vi.mocked(controlHost)).toHaveBeenCalledWith("start"));
+  });
+});
+
+describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
+  beforeEach(() => {
+    setupLandingMocks();
+    mockHosts([]);
+    vi.mocked(isElectronShell).mockReturnValue(true);
+    vi.mocked(getHostIdentity).mockResolvedValue({ cliInstalled: false, hostId: null });
+    vi.mocked(onHostStatusChanged).mockReturnValue(() => {});
+    vi.mocked(getDesktopFeatures).mockResolvedValue({ databricksInternalFeatures: true });
+    vi.mocked(connectArcaHost).mockClear();
+    vi.mocked(fetchHosts).mockClear();
+  });
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    // Restore the browser defaults so these overrides don't leak into the
+    // other describe blocks (which assume no desktop shell / no MDM flag).
+    vi.mocked(isElectronShell).mockReturnValue(false);
+    vi.mocked(getDesktopFeatures).mockResolvedValue(null);
+  });
+
+  async function openHostMenu() {
+    const chip = await screen.findByTestId("new-chat-landing-host-chip");
+    fireEvent.pointerDown(chip, { button: 0 });
+    fireEvent.click(chip);
+  }
+
+  it("offers the Arca option only when the desktop shell reports the MDM flag", async () => {
+    renderLanding();
+    await openHostMenu();
+    expect(await screen.findByTestId("new-chat-landing-run-on-arca")).toBeTruthy();
+  });
+
+  it("hides the Arca option when the flag is off or unknown (old shell)", async () => {
+    vi.mocked(getDesktopFeatures).mockResolvedValue(null);
+    renderLanding();
+    await openHostMenu();
+    // The menu is open (the escape hatch renders), but no Arca entry.
+    await screen.findByTestId("new-chat-landing-connect-host");
+    expect(screen.queryByTestId("new-chat-landing-run-on-arca")).toBeNull();
+  });
+
+  it("state 3: hides the Arca option entirely and tags the connected row", async () => {
+    // The row is recognized by the host id remembered at connect time — a
+    // host's name (machine hostname) is deliberately not matched against
+    // anything from `arca status`.
+    localStorage.setItem("omnigent:arca-host-id", "arca-1");
+    mockHosts([{ host_id: "arca-1", name: "ip-10-0-0-7", owner: "me", status: "online" }]);
+    renderLanding();
+    await openHostMenu();
+
+    const row = await screen.findByTestId("new-chat-landing-host-arca-1");
+    expect(row.textContent).toContain("Arca instance");
+    expect(screen.queryByTestId("new-chat-landing-run-on-arca")).toBeNull();
+  });
+
+  it("shows a plain Run on Arca item (no status line) while not connected", async () => {
+    renderLanding();
+    await openHostMenu();
+
+    const item = await screen.findByTestId("new-chat-landing-run-on-arca");
+    expect(item.textContent).toContain("Run on Arca");
+    expect(screen.queryByTestId("new-chat-landing-arca-subtitle")).toBeNull();
+  });
+
+  // Silent-outcome cases: a deliberate dismissal, and a failure the connect
+  // console already displayed — neither may echo into the composer strip.
+  async function expectNoArcaError(result: Awaited<ReturnType<typeof connectArcaHost>>) {
+    vi.mocked(connectArcaHost).mockResolvedValue(result);
+    renderLanding();
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-run-on-arca"));
+    await waitFor(() => expect(vi.mocked(connectArcaHost)).toHaveBeenCalled());
+    expect(screen.queryByTestId("new-chat-landing-arca-error")).toBeNull();
+  }
+
+  it("stays silent when the user dismissed the console", async () => {
+    await expectNoArcaError({
+      ok: false,
+      canceled: true,
+      error: "Connecting Arca wasn't approved.",
+    });
+  });
+
+  it("stays silent for a failure the console already displayed", async () => {
+    await expectNoArcaError({
+      ok: false,
+      shownInConsole: true,
+      error: "Couldn't reach the Arca instance.",
+    });
+  });
+
+  it("surfaces a gate failure (no console shown) with a retry", async () => {
+    vi.mocked(connectArcaHost).mockResolvedValue({
+      ok: false,
+      error: "Couldn't reach the Arca instance.",
+    });
+    renderLanding();
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-run-on-arca"));
+
+    const err = await screen.findByTestId("new-chat-landing-arca-error");
+    expect(err.textContent).toContain("Couldn't reach the Arca instance.");
+    expect(vi.mocked(connectArcaHost)).toHaveBeenCalledTimes(1);
+
+    // Retry re-invokes the connect.
+    vi.mocked(connectArcaHost).mockClear();
+    fireEvent.click(screen.getByTestId("new-chat-landing-arca-error-retry"));
+    await waitFor(() => expect(vi.mocked(connectArcaHost)).toHaveBeenCalledTimes(1));
+  });
+
+  it("skips the new-host wait when the daemon was already connected", async () => {
+    vi.mocked(connectArcaHost).mockResolvedValue({ ok: true, alreadyRunning: true });
+    renderLanding();
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-run-on-arca"));
+
+    // No 30s poll, no error — an explanatory toast instead.
+    await waitFor(() =>
+      expect(showToastMock).toHaveBeenCalledWith(
+        "Arca is already connected to this server — pick its host from the list.",
+      ),
+    );
+    expect(vi.mocked(fetchHosts)).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("new-chat-landing-arca-error")).toBeNull();
+  });
+
+  it("selects the host that newly came online after a successful connect", async () => {
+    vi.mocked(connectArcaHost).mockResolvedValue({ ok: true });
+    // First post-connect poll already sees the freshly-registered Arca host.
+    vi.mocked(fetchHosts).mockResolvedValue([
+      { host_id: "arca-1", name: "arca-box", owner: "me", status: "online" },
+    ]);
+    renderLanding();
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-run-on-arca"));
+
+    // selectHost persists the pick — the observable effect of auto-selection.
+    await waitFor(() => expect(localStorage.getItem("omnigent:last-host-choice")).toBe("arca-1"));
+    expect(vi.mocked(connectArcaHost)).toHaveBeenCalledTimes(1);
   });
 });
 

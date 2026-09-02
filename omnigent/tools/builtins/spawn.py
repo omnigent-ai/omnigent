@@ -649,7 +649,8 @@ class SysSessionGetInfoTool(Tool):
     permitted to access (bounded by the server's per-user permission
     model), not just the caller's spawn subtree. Reports lifecycle
     status, title, agent binding (id + name), runner binding and live
-    connectivity, host, reasoning effort, effective model, parent
+    connectivity, host and its reported harness readiness, reasoning effort,
+    effective model, parent
     linkage, workspace / git branch, persisted last-activity time, and
     the count of outstanding approval prompts. Comparing
     ``last_activity_at`` across polls distinguishes a running session that
@@ -661,8 +662,8 @@ class SysSessionGetInfoTool(Tool):
     session is described.
 
     Runner-dispatched: the runner proxies ``GET /v1/sessions/{id}``
-    (plus a best-effort ``GET /v1/runners/{id}/status`` for live
-    connectivity) and projects the result. Returns
+    (plus best-effort runner status and host readiness lookups) and projects
+    the result. Returns
     ``session_not_found`` when the id is unknown and ``access_denied``
     when the server refuses the read.
     """
@@ -678,7 +679,8 @@ class SysSessionGetInfoTool(Tool):
         return (
             "Return a session's metadata: lifecycle status, title, "
             "agent binding (id/name), runner binding + connectivity, "
-            "host, reasoning effort, model, parent session, workspace, "
+            "host + configured harness readiness, reasoning effort, model, "
+            "parent session, workspace, "
             "persisted last-activity time, and outstanding approval "
             "prompts. Global read — any "
             "session you can access. Pass session_id to target another "

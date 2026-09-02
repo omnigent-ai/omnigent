@@ -1,0 +1,86 @@
+/* Onboarding card + animated panel. Ported from the design handoff; `motion`
+   spring resize replaced with CSS transitions, hardcoded colors + the
+   prefers-color-scheme block replaced with repo theme tokens + the .dark class. */
+
+.omnigent-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  max-width: calc(100vw - 48px);
+  max-height: calc(100vh - 48px);
+  padding: 12px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 24px;
+  background: var(--background);
+  box-shadow: 0 4px 12px rgb(0 0 0 / 2%);
+  /* Replaces motion's spring — the flow changes width/height per step. */
+  transition:
+    width 0.42s var(--ease-otto, cubic-bezier(0.34, 1.4, 0.64, 1)),
+    height 0.42s var(--ease-otto, cubic-bezier(0.34, 1.4, 0.64, 1));
+}
+
+.omnigent-animated-panel {
+  position: relative;
+  flex-shrink: 0;
+  overflow: hidden;
+  border-radius: 14px 14px 0 0;
+  background: var(--tag-pink);
+  mask-image: linear-gradient(to bottom, black 0, black calc(100% - 48px), transparent 100%);
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    black 0,
+    black calc(100% - 48px),
+    transparent 100%
+  );
+  transition: height 0.42s var(--ease-otto, cubic-bezier(0.34, 1.4, 0.64, 1));
+}
+
+.omnigent-pixel-field {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  /* Fixed field (original handoff): the shader renders into a constant 1080px
+     square so cell size stays constant; the panel just crops a window into it.
+     Sizing this to the panel (%) compresses the cells and breaks the look. */
+  width: 1080px;
+  height: 1080px;
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+}
+
+.omnigent-panel-logo {
+  position: absolute;
+  z-index: 1;
+  /* Pinned to a fixed offset from the panel top (centers it at the 308px landing
+     height: (308 - 56) / 2). NOT top:50% — with a shrinking panel that re-centers
+     the logo into the collapsing panel so it vanishes in place; a fixed offset
+     lets the panel's overflow clip slide it up and out the top instead. */
+  top: 126px;
+  left: 50%;
+  display: block;
+  object-fit: contain;
+  pointer-events: none;
+  transform: translateX(-50%);
+}
+
+/* Card body (the current onboarding step) sits below the animated panel and
+   fills the remaining card height. */
+.omnigent-card-body {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+}
+
+.dark .omnigent-pixel-field {
+  filter: grayscale(1);
+  opacity: 0.4;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .omnigent-card,
+  .omnigent-animated-panel {
+    transition: none;
+  }
+}

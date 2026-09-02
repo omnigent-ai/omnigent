@@ -449,6 +449,80 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
             base.metadata.create_all(bind=engine, checkfirst=True)
 
 
+def run_migrations_with_retry(
+    db_uri: str,
+    *,
+    max_attempts: int = 8,
+    backoff_seconds: float = 3.0,
+    engine_factory: Callable[[str], Engine] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Connect and run migrations, retrying a cold database with backoff.
+
+    Managed Postgres endpoints (e.g. Databricks Lakebase) suspend after
+    an idle window and take several seconds to resume. A process that
+    boots and migrates once at startup can hit that resume window and
+    fail with a transient :class:`~sqlalchemy.exc.OperationalError`
+    ("the database system is starting up" / connection refused). Callers
+    that treat a startup exception as fatal then crash-loop until the DB
+    happens to be warm. Retrying the connect+migrate with linear backoff
+    lets a cold start self-heal.
+
+    A fresh engine is created per attempt and disposed afterward so a
+    poisoned connection pool from a failed attempt is never reused. Only
+    :class:`~sqlalchemy.exc.OperationalError` is retried; every other
+    exception (including a real migration/schema error) propagates
+    immediately. The final attempt's error is re-raised so a genuinely
+    unreachable database still fails loudly.
+
+    :param db_uri: SQLAlchemy database URL to connect and migrate.
+    :param max_attempts: Total connect+migrate attempts before giving
+        up. Must be >= 1.
+    :param backoff_seconds: Base linear backoff; attempt *n* sleeps
+        ``backoff_seconds * n`` before attempt *n+1*.
+    :param engine_factory: Callable returning an :class:`Engine` for the
+        URI. Defaults to :func:`sqlalchemy.create_engine`. Injectable
+        for tests.
+    :param sleep: Sleep function, injectable for tests. Defaults to
+        :func:`time.sleep`.
+    :raises sqlalchemy.exc.OperationalError: If every attempt fails to
+        connect.
+    """
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be >= 1")
+    if engine_factory is None:
+        import sqlalchemy
+
+        engine_factory = sqlalchemy.create_engine
+
+    from sqlalchemy.exc import OperationalError
+
+    for attempt in range(1, max_attempts + 1):
+        engine = engine_factory(db_uri)
+        try:
+            _run_migrations(engine, db_uri)
+            return
+        except OperationalError as exc:
+            if attempt == max_attempts:
+                _logger.error(
+                    "Database not reachable after %d attempt(s); giving up",
+                    max_attempts,
+                )
+                raise
+            delay = backoff_seconds * attempt
+            _logger.warning(
+                "DB connect/migrate attempt %d/%d failed (%s); retrying in %.0fs "
+                "(a managed endpoint may be resuming from suspend)",
+                attempt,
+                max_attempts,
+                type(exc).__name__,
+                delay,
+            )
+            sleep(delay)
+        finally:
+            engine.dispose()
+
+
 def _get_current_db_revision(engine: Engine) -> str | None:
     """
     Return the database's current Alembic revision, or ``None``.

@@ -252,6 +252,7 @@ def create_imports_router(
         user_id: str | None,
         native_title: str | None = None,
         project_id: str | None = None,
+        host_id: str | None = None,
     ) -> tuple[str, str | None]:
         """Create the conversation, append items, stamp import labels, grant owner.
 
@@ -259,9 +260,12 @@ def create_imports_router(
         (server-read transcripts). ``native_title`` is the harness's own title
         when the caller has one; otherwise the title is synthesized from the
         first user message. ``project_id`` files the session into a project the
-        caller owns (``/imports/local`` passes none). Caller handles the
-        already-imported / force decision first. Returns
-        ``(conversation id, title)``.
+        caller owns (``/imports/local`` passes none). ``host_id`` binds the
+        session to the host that read the transcript (``/imports/local``), so
+        resuming defaults to the machine the workspace lives on; bound only
+        alongside a workspace (the ``ck_conversations_workspace_required_for_host``
+        check constraint). Caller handles the already-imported / force decision
+        first. Returns ``(conversation id, title)``.
         """
         native_agent = native_coding_agent_for_harness(f"{source}-native")
         if native_agent is None:
@@ -283,6 +287,11 @@ def create_imports_router(
         create_kwargs: dict[str, Any] = {"agent_id": agent_id}
         if workspace is not None:
             create_kwargs["workspace"] = workspace
+            # The workspace path lives on the importing host; bind there so
+            # resume lands on the right machine. Requires a workspace (check
+            # constraint), so only set host_id when one is recorded.
+            if host_id is not None:
+                create_kwargs["host_id"] = host_id
         if project_id is not None:
             create_kwargs["project_id"] = project_id
         resolved_create = await resolve_project_session_create(
@@ -292,12 +301,14 @@ def create_imports_router(
         )
         agent_id = resolved_create.body.agent_id
         workspace = resolved_create.body.workspace
+        resolved_host_id = resolved_create.body.host_id
         title = (native_title or "").strip() or title_from_items(items)
         try:
             conversation = await asyncio.to_thread(
                 conversation_store.create_conversation,
                 title=title,
                 agent_id=agent_id,
+                host_id=resolved_host_id,
                 workspace=workspace,
                 conversation_id=_import_conversation_id(source, external_session_id),
                 project_id=resolved_create.project_id,
@@ -484,6 +495,7 @@ def create_imports_router(
                     workspace=workspace if isinstance(workspace, str) else None,
                     user_id=user_id,
                     native_title=native_title if isinstance(native_title, str) else None,
+                    host_id=body.host_id,
                 )
             except (OmnigentError, ValueError):
                 failed += 1

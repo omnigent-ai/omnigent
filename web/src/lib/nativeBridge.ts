@@ -98,13 +98,15 @@ interface NativeShellApi {
    */
   setSidebarOpen?: (open: boolean) => void;
   /**
-   * Drive the native Chat/Terminal switcher (iOS). The web app owns the truth
-   * and pushes the current mode, whether the terminal is reachable / booting,
-   * and whether the switcher should be shown at all. Absent on older shells,
-   * in which case the web renders its own in-page pill instead.
+   * Drive the native Chat/Terminal bar's visibility (iOS). The web app owns
+   * the truth and only ever pushes it hidden now that the switcher lives in
+   * the header. Absent on older shells.
    */
   setViewMode?: (params: NativeViewModeParams) => void;
-  /** Subscribe to taps on the native switcher; returns an unsubscribe. */
+  /**
+   * Subscribe to taps on the native switcher; returns an unsubscribe. Still
+   * exposed by the shell, but unused now that the pill is kept hidden.
+   */
   onViewModeChanged?: (callback: (mode: NativeViewMode) => void) => () => void;
   /**
    * Subscribe to the footprint (CSS px, excluding the OS safe area) of the
@@ -167,6 +169,11 @@ interface ElectronDesktopApi extends NativeShellApi {
   controlHost?: (action: HostControlAction) => Promise<HostActionResult>;
   /** Subscribe to host status-change pings (re-read on fire); returns an unsubscribe. */
   onHostStatusChanged?: (callback: () => void) => () => void;
+  /** Desktop feature gates (MDM-managed); absent on older shells. */
+  getDesktopFeatures?: () => Promise<DesktopFeatures | null>;
+  /** Connect the user's Arca instance to the window's server as a host. */
+  connectArcaHost?: () => Promise<ArcaConnectResult>;
+
   /** The local `omni` CLI status (installed, resolved path, version, source). */
   getCliStatus?: () => Promise<CliStatus | null>;
   /** Clear the CLI-path override (revert to auto-detection); resolves status. */
@@ -193,6 +200,38 @@ interface ElectronDesktopApi extends NativeShellApi {
 
 /** A lifecycle action for the host daemon. */
 export type HostControlAction = "start" | "stop" | "restart";
+
+/** Result of connecting the Arca instance as a host, from the desktop shell. */
+export interface ArcaConnectResult extends HostActionResult {
+  /**
+   * The box's host daemon was already connected to this server (the command
+   * reused it) — so no new host will appear in the host list.
+   */
+  alreadyRunning?: boolean;
+  /**
+   * The user deliberately declined or dismissed the connect console (before
+   * or during the run) — not a failure; UIs should stay silent.
+   */
+  canceled?: boolean;
+  /**
+   * The outcome (success or failure) was already displayed in the connect
+   * console's terminal — UIs must not echo it a second time.
+   */
+  shownInConsole?: boolean;
+}
+
+/**
+ * Desktop-shell feature gates the server can't know about, sourced from MDM
+ * managed preferences. All fields optional: an older shell reports fewer.
+ */
+export interface DesktopFeatures {
+  /**
+   * Databricks-internal features (e.g. the Arca host option) are enabled.
+   * Already scoped by the shell: true only when the MDM flag is set AND the
+   * window's server is Databricks-managed.
+   */
+  databricksInternalFeatures?: boolean;
+}
 
 /** Status of the local `omni` CLI, from the desktop shell. */
 export interface CliStatus {
@@ -624,11 +663,10 @@ export function setNativeSidebarOpen(open: boolean): void {
 }
 
 /**
- * Push the current Chat/Terminal state to the native switcher (iOS). The web
- * app owns this state; the native bar is a thin control surface that renders it
- * and reports taps back via {@link onNativeViewModeChanged}. No-op on shells
- * without the native switcher (older iOS shells, Electron, plain browser) — the
- * caller renders its own in-page pill there.
+ * Push the Chat/Terminal bar state to the iOS shell. The switcher now lives in
+ * the web header (ViewModeToggle) on every shell, so the SPA only ever pushes
+ * `visible: false` — keeping the shell's legacy bottom pill hidden (see
+ * hideNativeChatTerminalBar). No-op on shells without the method.
  */
 export function setNativeViewMode(params: NativeViewModeParams): void {
   setInsetVar("--omnigent-bottom-bar-visible", params.visible ? "1" : "0");
@@ -638,22 +676,6 @@ export function setNativeViewMode(params: NativeViewModeParams): void {
     native.setViewMode(params);
   } catch (err) {
     console.warn("[nativeBridge] native setViewMode failed:", err);
-  }
-}
-
-/**
- * Subscribe to taps on the native Chat/Terminal switcher. The shell sends the
- * mode the user selected; route it into the web view's own state. Returns an
- * unsubscribe; a no-op outside a shell that exposes the native switcher.
- */
-export function onNativeViewModeChanged(callback: (mode: NativeViewMode) => void): () => void {
-  const native = nativeApi();
-  if (!native?.onViewModeChanged) return () => {};
-  try {
-    return native.onViewModeChanged(callback);
-  } catch (err) {
-    console.warn("[nativeBridge] native onViewModeChanged failed:", err);
-    return () => {};
   }
 }
 
@@ -753,6 +775,41 @@ export async function controlHost(action: HostControlAction): Promise<HostAction
     return await electron.controlHost(action);
   } catch (err) {
     console.warn("[nativeBridge] electron controlHost failed:", err);
+    return { ok: false, error: String(err) };
+  }
+}
+
+/**
+ * Fetch the desktop shell's feature gates (MDM-managed). Resolves `null`
+ * outside the Electron shell or under a shell too old to expose them — callers
+ * must treat null / a missing field as disabled.
+ */
+export async function getDesktopFeatures(): Promise<DesktopFeatures | null> {
+  const electron = electronApi();
+  if (!electron?.getDesktopFeatures) return null;
+  try {
+    return await electron.getDesktopFeatures();
+  } catch (err) {
+    console.warn("[nativeBridge] electron getDesktopFeatures failed:", err);
+    return null;
+  }
+}
+
+/**
+ * Connect the user's Arca instance (Databricks-internal sandbox) to the
+ * window's server as a host, via the desktop shell. The shell asks native
+ * consent and runs `arca ssh` — resolving only once the remote host daemon
+ * started (or failed). A no-op `{ ok: false }` outside the shell.
+ */
+export async function connectArcaHost(): Promise<ArcaConnectResult> {
+  const electron = electronApi();
+  if (!electron?.connectArcaHost) {
+    return { ok: false, error: "not running under the desktop shell" };
+  }
+  try {
+    return await electron.connectArcaHost();
+  } catch (err) {
+    console.warn("[nativeBridge] electron connectArcaHost failed:", err);
     return { ok: false, error: String(err) };
   }
 }
