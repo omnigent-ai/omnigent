@@ -4,16 +4,18 @@
 //
 // Layout is GitHub's "Files changed": every file's diff stacked in one scroll
 // view, with the sidebar as a jump-to-file navigator that also highlights the
-// file currently in view. Each file's Monaco diff sizes to its content (no
-// inner scroll) and mounts lazily as it nears the viewport, so a large PR
-// doesn't spin up every editor at once.
+// file currently in view. The whole PR is fetched as ONE unified-diff patch
+// (/resources/github/diff) and parsed client-side into per-file diffs, each
+// rendered with @pierre/diffs' FileDiff. Its `loadDiffFiles` loader lazily
+// fetches a file's full content (/resources/github/diff/{path}) only when the
+// reader expands unchanged context.
 //
 // Data comes from the runner's read-only GitHub resource API (see
 // hooks/useGithub.ts), which shells out to `gh` + `git`. When gh is missing /
 // unauthenticated / the workspace isn't a repo, the panel renders a message
 // rather than an error.
 
-import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CircleCheckIcon,
   CircleDotIcon,
@@ -22,22 +24,25 @@ import {
   Loader2Icon,
   RefreshCwIcon,
 } from "lucide-react";
+import { FileDiff } from "@pierre/diffs/react";
+import { parsePatchFiles, type FileDiffMetadata } from "@pierre/diffs";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { useQueryClient } from "@tanstack/react-query";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 import { readFileViewPreferences } from "@/lib/fileViewPreferences";
 import {
+  fetchGithubFileContents,
   useGithubChangedFiles,
-  useGithubFileDiff,
   useGithubInfo,
+  useGithubPrDiff,
   type GithubChangedFile,
 } from "@/hooks/useGithub";
 
-// Monaco is heavy — load it only once a diff actually renders (mirrors FileViewer).
-const MonacoDiffViewer = lazy(() =>
-  import("./MonacoDiffViewer").then((m) => ({ default: m.MonacoDiffViewer })),
-);
+// Shiki bundled themes matching the app's editor look; the concrete side is
+// chosen by `themeType` from the app's resolved light/dark mode.
+const DIFF_THEME = { dark: "github-dark", light: "github-light" } as const;
 
 /** Centered muted message filling the panel — the shared empty/error/loading shell. */
 function PanelMessage({ children }: { children: React.ReactNode }) {
@@ -58,7 +63,123 @@ const STATUS_META: Record<
   renamed: { letter: "R", label: "Renamed", className: "text-blue-600 dark:text-blue-400" },
 };
 
-/** One row in the changed-files list: status letter, path (basename bold), +/- counts. */
+/** Diffstat (+adds −removes) shared by the sidebar row and the section header. */
+function DiffStat({ file }: { file: GithubChangedFile }) {
+  if (file.lines_added === null && file.lines_removed === null) return null;
+  return (
+    <span className="shrink-0 font-mono text-xs tabular-nums">
+      {file.lines_added !== null && (
+        <span className="text-green-600 dark:text-green-400">+{file.lines_added}</span>
+      )}{" "}
+      {file.lines_removed !== null && (
+        <span className="text-red-600 dark:text-red-400">−{file.lines_removed}</span>
+      )}
+    </span>
+  );
+}
+
+/** Split a path into its directory prefix (with trailing slash) and basename. */
+function splitPath(path: string): { dir: string; name: string } {
+  const i = path.lastIndexOf("/");
+  return i === -1
+    ? { dir: "", name: path }
+    : { dir: path.slice(0, i + 1), name: path.slice(i + 1) };
+}
+
+/** How @pierre/diffs' FileDiff is configured for this read-only stacked view. */
+type DiffOptions = React.ComponentProps<typeof FileDiff>["options"];
+
+/**
+ * One file's section in the stacked diff: a sticky header (status + path +
+ * diffstat) and the file's rendered diff. The diff mounts lazily once the
+ * section nears the viewport (a big PR doesn't build every diff at once).
+ */
+function GithubFileSection({
+  file,
+  fileDiff,
+  options,
+  registerRef,
+}: {
+  file: GithubChangedFile;
+  /** Parsed per-file diff from the whole-PR patch; absent for binary/unparsed. */
+  fileDiff: FileDiffMetadata | undefined;
+  options: DiffOptions;
+  registerRef: (path: string, el: HTMLElement | null) => void;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [seen, setSeen] = useState(false);
+
+  useEffect(() => {
+    registerRef(file.path, ref.current);
+    return () => registerRef(file.path, null);
+  }, [file.path, registerRef]);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || seen) return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) setSeen(true);
+      },
+      { rootMargin: "400px 0px" },
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, [seen]);
+
+  const meta = STATUS_META[file.status];
+  const { dir, name } = splitPath(file.path);
+
+  return (
+    <div ref={ref} data-github-file={file.path}>
+      <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-border bg-card px-3 py-1.5">
+        <span
+          className={cn("w-3 shrink-0 text-center font-mono text-xs", meta.className)}
+          title={meta.label}
+        >
+          {meta.letter}
+        </span>
+        <span className="min-w-0 flex-1 truncate text-ui" title={file.path}>
+          {dir && <span className="text-muted-foreground">{dir}</span>}
+          <span className="font-medium">{name}</span>
+        </span>
+        <DiffStat file={file} />
+      </div>
+      {!seen ? (
+        <div className="flex items-center justify-center gap-2 p-6 text-ui text-muted-foreground">
+          <Loader2Icon className="size-4 animate-spin" />
+          Loading diff…
+        </div>
+      ) : fileDiff ? (
+        <FileDiff fileDiff={fileDiff} options={options} disableWorkerPool />
+      ) : (
+        <div className="p-4 text-ui text-muted-foreground">
+          No text diff available for this file.
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** A colored pill for the PR state (open / draft / merged / closed). */
+function StateBadge({ state, isDraft }: { state: string; isDraft: boolean }) {
+  const upper = state.toUpperCase();
+  const label =
+    isDraft && upper === "OPEN" ? "Draft" : upper.charAt(0) + upper.slice(1).toLowerCase();
+  const className =
+    upper === "MERGED"
+      ? "bg-purple-500/15 text-purple-600 dark:text-purple-400"
+      : upper === "CLOSED"
+        ? "bg-red-500/15 text-red-600 dark:text-red-400"
+        : isDraft
+          ? "bg-muted text-muted-foreground"
+          : "bg-green-500/15 text-green-600 dark:text-green-400";
+  return (
+    <span className={cn("rounded-full px-2 py-0.5 text-xs font-medium", className)}>{label}</span>
+  );
+}
+
+/** One row in the jump-to-file sidebar. */
 function FileRow({
   file,
   selected,
@@ -92,161 +213,71 @@ function FileRow({
   );
 }
 
-/** Diffstat (+adds −removes) shared by the sidebar row and the section header. */
-function DiffStat({ file }: { file: GithubChangedFile }) {
-  if (file.lines_added === null && file.lines_removed === null) return null;
-  return (
-    <span className="shrink-0 font-mono text-xs tabular-nums">
-      {file.lines_added !== null && (
-        <span className="text-green-600 dark:text-green-400">+{file.lines_added}</span>
-      )}{" "}
-      {file.lines_removed !== null && (
-        <span className="text-red-600 dark:text-red-400">−{file.lines_removed}</span>
-      )}
-    </span>
-  );
-}
-
-/** Split a path into its directory prefix (with trailing slash) and basename. */
-function splitPath(path: string): { dir: string; name: string } {
-  const i = path.lastIndexOf("/");
-  return i === -1
-    ? { dir: "", name: path }
-    : { dir: path.slice(0, i + 1), name: path.slice(i + 1) };
-}
-
-/**
- * One file's section in the stacked diff: a sticky header (status + path +
- * diffstat) and the file's Monaco diff, sized to its content. The diff (and its
- * fetch) mount lazily once the section nears the viewport.
- */
-function GithubFileSection({
-  conversationId,
-  file,
-  base,
-  prefs,
-  registerRef,
-}: {
-  conversationId: string;
-  file: GithubChangedFile;
-  base: string | undefined;
-  prefs: ReturnType<typeof readFileViewPreferences>;
-  registerRef: (path: string, el: HTMLElement | null) => void;
-}) {
-  const ref = useRef<HTMLDivElement>(null);
-  // Mount the diff only once the section nears the viewport; keep it mounted
-  // afterwards so scrolling back up doesn't re-fetch/re-mount.
-  const [seen, setSeen] = useState(false);
-
-  useEffect(() => {
-    registerRef(file.path, ref.current);
-    return () => registerRef(file.path, null);
-  }, [file.path, registerRef]);
-
-  useEffect(() => {
-    const el = ref.current;
-    if (!el || seen) return;
-    const io = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((e) => e.isIntersecting)) setSeen(true);
-      },
-      // Prefetch a little before the section is actually on screen.
-      { rootMargin: "400px 0px" },
-    );
-    io.observe(el);
-    return () => io.disconnect();
-  }, [seen]);
-
-  const diff = useGithubFileDiff(conversationId, seen ? file.path : null, base);
-  const meta = STATUS_META[file.status];
-  const { dir, name } = splitPath(file.path);
-
-  return (
-    <div ref={ref} data-github-file={file.path}>
-      <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-border bg-card px-3 py-1.5">
-        <span
-          className={cn("w-3 shrink-0 text-center font-mono text-xs", meta.className)}
-          title={meta.label}
-        >
-          {meta.letter}
-        </span>
-        <span className="min-w-0 flex-1 truncate text-ui" title={file.path}>
-          {dir && <span className="text-muted-foreground">{dir}</span>}
-          <span className="font-medium">{name}</span>
-        </span>
-        <DiffStat file={file} />
-      </div>
-      {!seen || diff.isLoading || (!diff.data && !diff.error) ? (
-        <div className="flex items-center justify-center gap-2 p-6 text-ui text-muted-foreground">
-          <Loader2Icon className="size-4 animate-spin" />
-          Loading diff…
-        </div>
-      ) : diff.error ? (
-        <div className="p-4 text-ui text-muted-foreground">
-          {diff.error instanceof RunnerOfflineError
-            ? "Runner offline."
-            : `Couldn’t load diff: ${(diff.error as Error).message}`}
-        </div>
-      ) : (
-        <Suspense
-          fallback={
-            <div className="flex items-center justify-center gap-2 p-6 text-ui text-muted-foreground">
-              <Loader2Icon className="size-4 animate-spin" />
-              Loading diff…
-            </div>
-          }
-        >
-          <MonacoDiffViewer
-            autoHeight
-            before={diff.data!.before}
-            after={diff.data!.after}
-            path={file.path}
-            layout={prefs.diffLayout}
-            hideWhitespace={prefs.hideWhitespace}
-            wrapLines={prefs.wrapLines}
-            conversationId={conversationId}
-            comments={[]}
-            activeSelection={null}
-            onSetActiveSelection={() => {}}
-          />
-        </Suspense>
-      )}
-    </div>
-  );
-}
-
-/** A colored pill for the PR state (open / draft / merged / closed). */
-function StateBadge({ state, isDraft }: { state: string; isDraft: boolean }) {
-  const upper = state.toUpperCase();
-  const label =
-    isDraft && upper === "OPEN" ? "Draft" : upper.charAt(0) + upper.slice(1).toLowerCase();
-  const className =
-    upper === "MERGED"
-      ? "bg-purple-500/15 text-purple-600 dark:text-purple-400"
-      : upper === "CLOSED"
-        ? "bg-red-500/15 text-red-600 dark:text-red-400"
-        : isDraft
-          ? "bg-muted text-muted-foreground"
-          : "bg-green-500/15 text-green-600 dark:text-green-400";
-  return (
-    <span className={cn("rounded-full px-2 py-0.5 text-xs font-medium", className)}>{label}</span>
-  );
-}
-
 export function GithubPanel({ conversationId }: { conversationId: string }) {
   const queryClient = useQueryClient();
   const info = useGithubInfo(conversationId);
   const baseRef = info.data?.base_ref ?? undefined;
   const changes = useGithubChangedFiles(conversationId, baseRef);
+  const prDiff = useGithubPrDiff(conversationId, baseRef);
 
-  // Diff rendering preferences are app-global (shared with the FileViewer);
-  // no in-panel toggle in v1, so read the persisted values once on mount.
-  const prefs = useMemo(() => readFileViewPreferences(), []);
+  const themeType = useResolvedThemeMode();
+  // Diff layout preference is app-global (shared with the FileViewer); no
+  // in-panel toggle in v1, so read the persisted value once on mount.
+  const diffStyle = useMemo(
+    () => (readFileViewPreferences().diffLayout === "split" ? "split" : "unified"),
+    [],
+  );
 
   const files = useMemo<GithubChangedFile[]>(() => changes.data?.data ?? [], [changes.data]);
 
-  // The stacked diff scrolls as one; the sidebar highlights the file currently
-  // at the top of the viewport and jumps to a file on click.
+  // Parse the one whole-PR patch into per-file diffs, keyed by path.
+  const filesByPath = useMemo(() => {
+    const map = new Map<string, FileDiffMetadata>();
+    const patch = prDiff.data?.patch;
+    if (patch) {
+      try {
+        for (const parsed of parsePatchFiles(patch)) {
+          for (const f of parsed.files) map.set(f.name, f);
+        }
+      } catch {
+        // A malformed patch just yields no rendered diffs (the sidebar and the
+        // per-section "no diff" fallback still render).
+      }
+    }
+    return map;
+  }, [prDiff.data]);
+
+  // Expand-context loader: fetch a file's full old/new content on demand when
+  // the reader expands unchanged regions.
+  const loadDiffFiles = useCallback(
+    async (fd: FileDiffMetadata) => {
+      const { before, after } = await fetchGithubFileContents(conversationId, fd.name, baseRef);
+      return {
+        oldFile: { name: fd.prevName ?? fd.name, contents: before ?? "" },
+        newFile: { name: fd.name, contents: after ?? "" },
+      };
+    },
+    [conversationId, baseRef],
+  );
+
+  const diffOptions = useMemo<DiffOptions>(
+    () => ({
+      theme: DIFF_THEME,
+      themeType,
+      diffStyle,
+      // The section renders its own header; the diff body has none.
+      disableFileHeader: true,
+      // Expand unchanged context 10 lines at a time (default is 100). The
+      // unchanged lines aren't in the patch, so expansion (and the exact
+      // trailing-region count) is served by loadDiffFiles on demand.
+      expansionLineCount: 10,
+      loadDiffFiles,
+    }),
+    [themeType, diffStyle, loadDiffFiles],
+  );
+
+  // The stacked diff scrolls as one; the sidebar highlights the file at the top
+  // of the viewport and jumps to a file on click.
   const scrollRef = useRef<HTMLDivElement>(null);
   const sectionEls = useRef<Map<string, HTMLElement>>(new Map());
   const [activePath, setActivePath] = useState<string | null>(null);
@@ -256,8 +287,6 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
     else sectionEls.current.delete(path);
   }, []);
 
-  // Highlight the last section whose top has scrolled to/above the pane's top
-  // edge. rAF-throttled so the scroll stays smooth.
   const rafRef = useRef<number | null>(null);
   const recomputeActive = useCallback(() => {
     const container = scrollRef.current;
@@ -277,7 +306,6 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
     });
   }, [recomputeActive]);
 
-  // Default the highlight to the first file once the list arrives.
   useEffect(() => {
     setActivePath((prev) =>
       prev && files.some((f) => f.path === prev) ? prev : (files[0]?.path ?? null),
@@ -292,6 +320,7 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
   const refresh = () => {
     void queryClient.invalidateQueries({ queryKey: ["github-info", conversationId] });
     void queryClient.invalidateQueries({ queryKey: ["github-changed-files", conversationId] });
+    void queryClient.invalidateQueries({ queryKey: ["github-pr-diff", conversationId] });
     void queryClient.invalidateQueries({ queryKey: ["github-file-diff", conversationId] });
   };
 
@@ -313,8 +342,6 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
     return <PanelMessage>Couldn’t load GitHub info: {(info.error as Error).message}</PanelMessage>;
   }
   const data = info.data;
-  // ``available`` is false only for a non-git workspace (or no os_env): the
-  // branch-vs-base diff needs a git checkout, so there's nothing to show.
   if (!data || !data.available) {
     if (data?.reason === "not_a_git_repo") {
       return <PanelMessage>This workspace isn’t a git repository.</PanelMessage>;
@@ -324,10 +351,6 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
 
   const pr = data.pr ?? null;
   const checks = pr?.checks;
-  // gh is an enhancement: without it (or its auth) the git diff still renders,
-  // and we surface a one-line note explaining why PR info is missing. This is
-  // also the host-fallback state when the runner is offline and its machine
-  // has no gh.
   const ghNote =
     data.gh_available === false
       ? "GitHub CLI (gh) not installed — showing local branch diff."
@@ -358,7 +381,10 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
             className="shrink-0"
           >
             <RefreshCwIcon
-              className={cn("size-3.5", (info.isFetching || changes.isFetching) && "animate-spin")}
+              className={cn(
+                "size-3.5",
+                (info.isFetching || changes.isFetching || prDiff.isFetching) && "animate-spin",
+              )}
             />
           </Button>
         </div>
@@ -448,9 +474,9 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
           )}
         </div>
         <div ref={scrollRef} onScroll={onScroll} className="min-w-0 flex-1 overflow-y-auto">
-          {files.length === 0 ? (
+          {files.length === 0 || prDiff.isLoading ? (
             <PanelMessage>
-              {changes.isLoading ? (
+              {changes.isLoading || prDiff.isLoading ? (
                 <>
                   <Loader2Icon className="size-5 animate-spin" />
                   Loading changes…
@@ -463,10 +489,9 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
             files.map((file) => (
               <GithubFileSection
                 key={file.path}
-                conversationId={conversationId}
                 file={file}
-                base={baseRef}
-                prefs={prefs}
+                fileDiff={filesByPath.get(file.path)}
+                options={diffOptions}
                 registerRef={registerRef}
               />
             ))

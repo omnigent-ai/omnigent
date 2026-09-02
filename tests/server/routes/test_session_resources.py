@@ -2570,6 +2570,26 @@ async def test_github_changes_forwards_base_param(client: httpx.AsyncClient) -> 
 
 
 @pytest.mark.asyncio
+async def test_github_pr_diff_proxies_whole_patch(client: httpx.AsyncClient) -> None:
+    """GET /resources/github/diff (no path) proxies the whole-PR patch + base."""
+    payload = {"object": "session.github.pr_diff", "patch": "diff --git a/x b/x\n"}
+    fake_runner = _FakeRunnerClient(payload=payload)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff?base=main"
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == payload
+    assert (
+        "GET",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff",
+    ) in fake_runner.calls
+    assert {"base": "main"} in fake_runner.get_params
+
+
+@pytest.mark.asyncio
 async def test_github_diff_proxies_path_and_base(client: httpx.AsyncClient) -> None:
     """GET /resources/github/diff/{path} proxies the path + base to the runner."""
     payload = {

@@ -331,7 +331,7 @@ def register_resources_routes(
         :param conversation: Conversation loaded during authorization.
         :param op: Host-side op name — ``"list_or_read"`` / ``"changes"``
             / ``"diff"`` / ``"search"`` / ``"github_info"`` /
-            ``"github_changes"`` / ``"github_diff"``.
+            ``"github_changes"`` / ``"github_diff"`` / ``"github_pr_diff"``.
         :param host_params: Op-specific args for the host reader.
         :param runner_path: Runner-relative URL for the live path.
         :param runner_params: Optional query params for the runner path.
@@ -2016,6 +2016,39 @@ def register_resources_routes(
             op="diff",
             host_params={"path": relative_path},
             runner_path=path,
+        )
+
+    @file_read_router.get(
+        "/sessions/{session_id}/resources/github/diff",
+        # Internal (UI GitHub diff view) — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def read_github_pr_diff(
+        request: Request,
+        session_id: str,
+        base: str | None = Query(default=None),
+    ) -> Any:
+        """
+        Return the whole PR as one unified diff patch.
+
+        One ``git diff`` covering every changed file, gzipped on the way out
+        (patches are large). The web view parses it client-side into per-file
+        diffs. Falls back to the host tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param base: Base branch name; the default is derived when omitted.
+        :returns: JSON with the ``patch`` text.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_READ)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_pr_diff",
+            host_params={"base": base},
+            runner_path=f"/v1/sessions/{session_id}/resources/github/diff",
+            runner_params={"base": base} if base else None,
         )
 
     @file_read_router.get(

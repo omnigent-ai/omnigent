@@ -3,9 +3,12 @@
 //   useGithubInfo        — GET /resources/github
 //                          repo / branch / base ref / associated PR + CI summary.
 //   useGithubChangedFiles — GET /resources/github/changes?base=<ref>
-//                          files changed on the branch vs its base (PR diff).
-//   useGithubFileDiff    — GET /resources/github/diff/{path}?base=<ref>
-//                          before/after content for one file, fed to Monaco.
+//                          files changed on the branch vs its base (sidebar list).
+//   useGithubPrDiff      — GET /resources/github/diff?base=<ref>
+//                          the whole PR as one unified-diff patch.
+//   fetchGithubFileContents — GET /resources/github/diff/{path}?base=<ref>
+//                          before/after full content for one file, fetched on
+//                          demand to expand unchanged context (not a hook).
 //
 // Runner-offline (503 runner_unavailable) and no-os_env (404) are handled the
 // same way as the workspace filesystem hooks — reusing their helpers.
@@ -169,7 +172,12 @@ export function useGithubChangedFiles(
   });
 }
 
-async function fetchGithubFileDiff(
+/**
+ * Fetch before/after full content for one changed file — used on demand to
+ * expand unchanged context in the diff view (the `loadDiffFiles` loader), not
+ * as a hook. Returns `""` sides normalized by the caller.
+ */
+export async function fetchGithubFileContents(
   conversationId: string,
   path: string,
   base: string | undefined,
@@ -188,21 +196,39 @@ async function fetchGithubFileDiff(
   return (await res.json()) as GithubFileDiffResponse;
 }
 
-/**
- * Fetch before/after content for one changed file. Disabled unless `path` is
- * given and the runner is serveable (the panel only requests a file the user
- * selected from the changed-files list).
- */
-export function useGithubFileDiff(
-  conversationId: string | undefined,
-  path: string | null,
+export interface GithubPrDiffResponse {
+  object: "session.github.pr_diff";
+  /** The whole PR as one unified diff patch (every changed file). */
+  patch: string;
+}
+
+async function fetchGithubPrDiff(
+  conversationId: string,
   base: string | undefined,
-) {
+): Promise<GithubPrDiffResponse> {
+  const params = base ? `?base=${encodeURIComponent(base)}` : "";
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/diff${params}`,
+  );
+  if (res.status === 503 && (await isRunnerUnavailable503(res))) {
+    throw new RunnerOfflineError();
+  }
+  if (!res.ok) throw await errorFromResponse(res);
+  return (await res.json()) as GithubPrDiffResponse;
+}
+
+/**
+ * Fetch the whole PR as one unified diff patch. The panel parses it
+ * client-side into per-file diffs, so the entire PR renders from a single
+ * call. Waits for a base ref (from {@link useGithubInfo}); disabled when the
+ * runner is known offline.
+ */
+export function useGithubPrDiff(conversationId: string | undefined, base: string | undefined) {
   const serveable = useWorkspaceServeable(conversationId);
   return useQuery({
-    queryKey: ["github-file-diff", conversationId, path, base ?? null],
-    queryFn: () => fetchGithubFileDiff(conversationId!, path!, base),
-    enabled: !!conversationId && !!path && serveable !== false,
+    queryKey: ["github-pr-diff", conversationId, base ?? null],
+    queryFn: () => fetchGithubPrDiff(conversationId!, base),
+    enabled: !!conversationId && !!base && serveable !== false,
     retry: shouldRetryRunnerOffline,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,

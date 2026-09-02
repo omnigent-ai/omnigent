@@ -2844,6 +2844,8 @@ class HostProcess:
                 cast("str | None", params.get("base")),
                 str(params.get("path", "")),
             )
+        if op == "github_pr_diff":
+            return r.github_pr_diff(cast("str | None", params.get("base")))
         raise ValueError(f"unknown fs op: {op!r}")
 
     async def _handle_create_worktree(

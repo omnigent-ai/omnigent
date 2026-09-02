@@ -412,3 +412,14 @@ def test_github_file_diff_returns_before_after(tmp_path: Path) -> None:
 
     assert diff["before"] == "base\n"
     assert diff["after"] == "changed\n"
+
+
+def test_github_pr_diff_returns_whole_patch(tmp_path: Path) -> None:
+    """``github_pr_diff`` returns the whole branch-vs-base patch (base derived)."""
+    _git_branch_repo(tmp_path)
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.github_pr_diff(None)
+
+    assert "diff --git a/app.txt b/app.txt" in result["patch"]
+    assert "+changed" in result["patch"]

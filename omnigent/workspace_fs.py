@@ -496,3 +496,11 @@ class WorkspaceReader:
             "_WorkspacePayload",
             github_resource.github_file_diff(str(self._root), resolved or "", relative_path),
         )
+
+    def github_pr_diff(self, base: str | None) -> _WorkspacePayload:
+        """The whole PR as one unified diff patch (base derived if None)."""
+        resolved = github_resource.resolve_base_ref(str(self._root), base)
+        return cast(
+            "_WorkspacePayload",
+            github_resource.github_pr_diff(str(self._root), resolved or ""),
+        )

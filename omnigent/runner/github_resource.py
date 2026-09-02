@@ -313,8 +313,10 @@ def github_changed_files(root: str, base: str) -> dict[str, Any]:
         return {"object": "list", "data": [], "has_more": False}
 
     # numstat first (adds/dels + final path), keyed by path for the status merge.
+    # ``-M`` detects renames so a moved file shows once (matching the whole-PR
+    # patch the diff view parses), not as a delete + add pair.
     counts: dict[str, tuple[int | None, int | None]] = {}
-    rc, out, _ = _git(["diff", "--numstat", diff_base, "HEAD"], cwd=root)
+    rc, out, _ = _git(["diff", "-M", "--numstat", diff_base, "HEAD"], cwd=root)
     if rc == 0:
         for line in out.splitlines():
             parts = line.split("\t")
@@ -327,7 +329,7 @@ def github_changed_files(root: str, base: str) -> dict[str, Any]:
             )
 
     data: list[dict[str, Any]] = []
-    rc, out, _ = _git(["diff", "--name-status", diff_base, "HEAD"], cwd=root)
+    rc, out, _ = _git(["diff", "-M", "--name-status", diff_base, "HEAD"], cwd=root)
     if rc == 0:
         for line in out.splitlines():
             parts = line.split("\t")
@@ -381,3 +383,23 @@ def github_file_diff(root: str, base: str, path: str) -> dict[str, Any]:
         "before": before,
         "after": after,
     }
+
+
+def github_pr_diff(root: str, base: str) -> dict[str, Any]:
+    """Return the whole PR as one unified diff patch (HEAD vs the base merge-base).
+
+    One ``git diff`` for every changed file, so the web view can render the
+    entire PR from a single call (parsed client-side into per-file diffs).
+    ``-M`` detects renames so a move renders as one file rather than a
+    delete + add.
+
+    :param root: Absolute workspace path.
+    :param base: Base branch name, e.g. ``"main"``.
+    :returns: A ``session.github.pr_diff`` object with the ``patch`` text
+        (empty when the base can't be resolved / there are no changes).
+    """
+    diff_base = _resolve_diff_base(root, base)
+    if diff_base is None:
+        return {"object": "session.github.pr_diff", "patch": ""}
+    rc, out, _ = _git(["diff", "-M", diff_base, "HEAD"], cwd=root)
+    return {"object": "session.github.pr_diff", "patch": out if rc == 0 else ""}

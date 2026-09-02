@@ -21,6 +21,7 @@ from omnigent.runner.github_resource import (
     github_changed_files,
     github_file_diff,
     github_info,
+    github_pr_diff,
 )
 
 
@@ -128,6 +129,26 @@ def test_github_changed_files_unresolvable_base(repo: Path) -> None:
     """An unknown base ref yields an empty list rather than an error."""
     result = github_changed_files(str(repo), "does-not-exist")
     assert result == {"object": "list", "data": [], "has_more": False}
+
+
+def test_github_pr_diff_covers_all_files(repo: Path) -> None:
+    """The whole-PR patch is one unified diff spanning every changed file."""
+    result = github_pr_diff(str(repo), "main")
+    patch = result["patch"]
+    # One diff header per changed file, plus the actual change content.
+    assert "diff --git a/fileA.py b/fileA.py" in patch
+    assert "diff --git a/newfile.py b/newfile.py" in patch
+    assert "diff --git a/fileB.py b/fileB.py" in patch
+    assert "+A changed" in patch
+    assert "fileC.py" not in patch  # unchanged file absent
+
+
+def test_github_pr_diff_unresolvable_base(repo: Path) -> None:
+    """An unknown base ref yields an empty patch rather than an error."""
+    assert github_pr_diff(str(repo), "does-not-exist") == {
+        "object": "session.github.pr_diff",
+        "patch": "",
+    }
 
 
 def test_summarize_checks_mixed() -> None:

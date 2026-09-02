@@ -25,21 +25,30 @@ const state = vi.hoisted(() => ({
 vi.mock("@/hooks/useGithub", () => ({
   useGithubInfo: () => state.info,
   useGithubChangedFiles: () => state.changes,
-  // Diff is only requested once a section is "seen" (path non-null).
-  useGithubFileDiff: (_c: string, path: string | null) =>
-    path
-      ? {
-          data: { object: "session.github.file_diff", path, before: "old", after: "new" },
-          isLoading: false,
-          error: null,
-        }
-      : { data: undefined, isLoading: false, error: null },
+  // One whole-PR patch; the panel parses it into per-file diffs.
+  useGithubPrDiff: () => ({
+    data: { object: "session.github.pr_diff", patch: "PATCH" },
+    isLoading: false,
+    error: null,
+    isFetching: false,
+  }),
+  fetchGithubFileContents: async () => ({ before: "old", after: "new" }),
 }));
 
-// The diff engine is exercised in MonacoDiffViewer.test; here we only need to
-// see that a section renders its file's diff.
-vi.mock("./MonacoDiffViewer", () => ({
-  MonacoDiffViewer: ({ path }: { path: string }) => <div data-testid="diff" data-path={path} />,
+// The diff rendering (@pierre/diffs) is exercised by the library itself; here
+// we only assert a section renders one diff per parsed file. parsePatchFiles is
+// stubbed to yield a file per path present in the patch marker.
+vi.mock("@pierre/diffs", () => ({
+  parsePatchFiles: () => [{ files: [{ name: "hello.py" }, { name: "src/app.ts" }] }],
+}));
+vi.mock("@pierre/diffs/react", () => ({
+  FileDiff: ({ fileDiff }: { fileDiff: { name: string } }) => (
+    <div data-testid="diff" data-path={fileDiff.name} />
+  ),
+}));
+// The resolved theme mode drives @pierre/diffs' themeType.
+vi.mock("@/components/theme/useResolvedThemeMode", () => ({
+  useResolvedThemeMode: () => "light",
 }));
 
 import { GithubPanel } from "./GithubPanel";

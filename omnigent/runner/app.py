@@ -9413,6 +9413,20 @@ def create_runner_app(
         result = await _asyncio.to_thread(github_changed_files, root, resolved_base)
         return JSONResponse(status_code=200, content=result)
 
+    @app.get("/v1/sessions/{session_id}/resources/github/diff")
+    async def read_github_pr_diff(
+        session_id: str,
+        base: str | None = Query(default=None),
+    ) -> JSONResponse:
+        import asyncio as _asyncio
+
+        from omnigent.runner.github_resource import github_pr_diff, resolve_base_ref
+
+        root = await _github_workspace_root(session_id)
+        resolved_base = await _asyncio.to_thread(resolve_base_ref, root, base)
+        result = await _asyncio.to_thread(github_pr_diff, root, resolved_base or "")
+        return JSONResponse(status_code=200, content=result)
+
     @app.get("/v1/sessions/{session_id}/resources/github/diff/{relative_path:path}")
     async def read_github_file_diff(
         session_id: str,
