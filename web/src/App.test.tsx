@@ -5,6 +5,12 @@ import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
 vi.mock("@/lib/analytics", () => ({ useOmnigentPageView: vi.fn() }));
+vi.mock("@/actions", () => ({
+  ActionsProvider: ({ children }: { children: React.ReactNode }) => (
+    <div data-testid="actions-provider">{children}</div>
+  ),
+  KeybindingDispatcher: () => <span data-testid="keybinding-dispatcher" />,
+}));
 vi.mock("@/shell/AppShell", () => ({
   AppShell: () => (
     <div>
@@ -22,6 +28,7 @@ vi.mock("@/pages/SettingsPage", async () => {
     SettingsPage: () => <div data-testid="settings-location">{useLocation().pathname}</div>,
   };
 });
+vi.mock("@/pages/ApprovePage", () => ({ ApprovePage: () => <div>approve page</div> }));
 
 import App from "./App";
 
@@ -48,6 +55,27 @@ function renderRoute(path: string) {
     </CapabilitiesProvider>,
   );
 }
+
+describe("action runtime route boundary", () => {
+  it("mounts the action runtime on AppShell routes", async () => {
+    renderUsageRoute(true);
+    expect(await screen.findByText("usage page")).toBeInTheDocument();
+    expect(screen.getByTestId("actions-provider")).toBeInTheDocument();
+    expect(screen.getByTestId("keybinding-dispatcher")).toBeInTheDocument();
+  });
+
+  it("leaves approval-only routes outside the action runtime", async () => {
+    render(
+      <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+        <MemoryRouter initialEntries={["/approve/session/request"]}>
+          <App />
+        </MemoryRouter>
+      </CapabilitiesProvider>,
+    );
+    expect(await screen.findByText("approve page")).toBeInTheDocument();
+    expect(screen.queryByTestId("actions-provider")).toBeNull();
+  });
+});
 
 describe("Usage release feature route", () => {
   it("does not register /usage while the feature is off", async () => {
