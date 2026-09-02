@@ -34,3 +34,26 @@ describe("CodeBlock — lazy Shiki highlighting", () => {
     expect(screen.getByText("42")).toBeTruthy();
   });
 });
+
+describe("CodeBlock — soft wrap", () => {
+  it("keeps white-space: pre by default so columns stay aligned", () => {
+    const { container } = render(<CodeBlock code={"a  b  c"} language="text" />);
+
+    const pre = container.querySelector("pre");
+    expect(pre).toBeTruthy();
+    expect(pre!.className).not.toContain("whitespace-pre-wrap");
+  });
+
+  it("soft-wraps long lines when wrap is set, so nothing scrolls horizontally", () => {
+    const longLine = "x".repeat(2000);
+    const { container } = render(<CodeBlock code={longLine} language="text" wrap />);
+
+    // whitespace-pre-wrap allows breaking at whitespace; wrap-anywhere adds a
+    // break opportunity inside unbroken runs (long paths, hashes, URLs) so a
+    // single giant token still fits the panel width.
+    const pre = container.querySelector("pre");
+    expect(pre).toBeTruthy();
+    expect(pre!.className).toContain("whitespace-pre-wrap");
+    expect(pre!.className).toContain("wrap-anywhere");
+  });
+});
