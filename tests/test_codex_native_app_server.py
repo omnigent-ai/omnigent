@@ -29,6 +29,7 @@ from omnigent.codex_native_app_server import (
     build_codex_native_server,
     discover_codex_model_options,
     framework_approved_tools,
+    trust_all_codex_hooks,
     trust_codex_router_hooks,
     trust_native_policy_hooks,
 )
@@ -1936,6 +1937,94 @@ async def test_trust_step_covers_router_hooks_when_routing_armed(
     for write in _batchwrite_calls(client):
         trusted.update(write.params["edits"][0]["value"])
     assert set(trusted) == {"policy", "gate"}
+
+
+async def test_trust_all_codex_hooks_trusts_user_hooks() -> None:
+    """
+    The runner-owned trust-all pass covers user hooks, not just Omnigent's.
+
+    Codex ignores ``--dangerously-bypass-hook-trust`` for the startup
+    review screen on a persistent ``resume``; persisting trust for the
+    merged user hooks is what keeps that screen from stranding a resumed
+    web session, so this pass must reach hooks the policy trust never does.
+    """
+    client = _FakeCodexClient(
+        hooks=[
+            _hook("ours", _OUR_COMMAND, "untrusted", "sha256:ours"),
+            _hook("theirs", _USER_COMMAND, "untrusted", "sha256:theirs"),
+        ]
+    )
+
+    assert await trust_all_codex_hooks(client.request, cwd=_CWD) == []
+
+    writes = _batchwrite_calls(client)
+    assert len(writes) == 1
+    written = writes[0].params["edits"][0]["value"]
+    assert written == {
+        "ours": {"trusted_hash": "sha256:ours"},
+        "theirs": {"trusted_hash": "sha256:theirs"},
+    }
+
+
+async def test_trust_all_codex_hooks_reports_still_untrusted_without_raising() -> None:
+    """
+    A hash that never flips is returned, not raised.
+
+    The trust-all pass is a UX fix (suppress the review screen), not a
+    security gate, so a persistent failure only risks the screen
+    reappearing and must never block startup.
+    """
+    client = _FakeCodexClient(
+        hooks=[_hook("theirs", _USER_COMMAND, "untrusted", "sha256:theirs")],
+        flip_on_trust=False,
+    )
+
+    assert await trust_all_codex_hooks(client.request, cwd=_CWD) == ["theirs"]
+
+
+async def test_trust_step_trusts_user_hooks_only_when_trust_all_enabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    ``trust_all_hooks`` gates whether the startup step trusts user hooks.
+
+    Runner-owned sessions enable it so a resumed web session never faces
+    the interactive review screen; interactive CLI sessions leave it off so
+    a human at the terminal reviews their own new or changed hooks.
+    """
+
+    async def _fake_connect(self: Any) -> None:
+        return None
+
+    async def _fake_close(self: Any) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient.connect", _fake_connect
+    )
+    monkeypatch.setattr("omnigent.codex_native_app_server.CodexAppServerClient.close", _fake_close)
+
+    for trust_all, expected in ((True, {"policy", "theirs"}), (False, {"policy"})):
+        client = _FakeCodexClient(
+            hooks=[
+                _hook("policy", _OUR_COMMAND, "untrusted", "sha256:policy"),
+                _hook("theirs", _USER_COMMAND, "untrusted", "sha256:theirs"),
+            ]
+        )
+        monkeypatch.setattr(
+            "omnigent.codex_native_app_server.CodexAppServerClient.request",
+            lambda self, method, params, _c=client: _c.request(method, params),
+        )
+        server = _test_app_server(
+            tmp_path, tmp_path / "codex-home", tmp_path / "bridge", Path(_CWD)
+        )
+        server.trust_all_hooks = trust_all
+        await server._trust_policy_hooks()
+
+        trusted: dict[str, Any] = {}
+        for write in _batchwrite_calls(client):
+            trusted.update(write.params["edits"][0]["value"])
+        assert set(trusted) == expected
 
 
 async def test_policy_hook_command_runs_python_isolated() -> None:

@@ -1128,6 +1128,14 @@ class CodexNativeAppServer:
         session config before startup. Runner-owned headless sessions set
         this because nobody can answer Codex's project-trust TUI prompt.
         Interactive CLI sessions leave it disabled.
+    :param trust_all_hooks: Whether to persist trust for every merged hook
+        (user hooks included) during :meth:`start`. Runner-owned headless
+        sessions set this because codex ignores their
+        ``--dangerously-bypass-hook-trust`` flag for the startup
+        hook-review screen on a persistent ``resume`` attach; persisted
+        trust keeps that interactive screen from stranding a resumed web
+        session (see :func:`trust_all_codex_hooks`). Interactive CLI
+        sessions leave it disabled so a human reviews their own hooks.
     :param policy_notice_pending: One-shot flag: ``True`` once a degrade
         reason is recorded, until the runner's terminal-ensure handler
         surfaces it to Omnigent (which posts a single durable banner). Prevents
@@ -1157,6 +1165,7 @@ class CodexNativeAppServer:
     process_owner_lock: CodexNativeProcessOwnerLock | None = None
     codex_cli_version: tuple[int, int, int] | None = None
     trust_project: bool = False
+    trust_all_hooks: bool = False
     router_hooks_registered: bool = False
 
     async def start(self) -> None:
@@ -1390,6 +1399,31 @@ class CodexNativeAppServer:
                 except Exception:  # noqa: BLE001 - routing trust never blocks startup
                     _logger.warning(
                         "codex subagent-routing hook trust failed; routing will not be enforced",
+                        exc_info=True,
+                    )
+            # Runner-owned sessions launch the TUI with
+            # ``--dangerously-bypass-hook-trust``, but codex ignores that flag
+            # for the startup hook-review screen on a persistent ``resume``
+            # attach, stranding a resumed web session behind the interactive
+            # "Hooks need review" prompt. Persist trust for every merged hook so
+            # the review finds nothing to review. Best effort: a failure only
+            # risks the review screen reappearing, never blocks startup.
+            if self.trust_all_hooks:
+                try:
+                    still_untrusted = await trust_all_codex_hooks(
+                        client.request, cwd=str(self.cwd)
+                    )
+                    if still_untrusted:
+                        _logger.warning(
+                            "codex hook trust-all left %d hook(s) untrusted; the startup "
+                            "hook-review screen may still appear on resume: %s",
+                            len(still_untrusted),
+                            ", ".join(still_untrusted),
+                        )
+                except Exception:  # noqa: BLE001 - trust-all never blocks startup
+                    _logger.warning(
+                        "codex hook trust-all failed; the startup hook-review screen "
+                        "may appear on resume",
                         exc_info=True,
                     )
         except RuntimeError as exc:
@@ -1724,19 +1758,22 @@ def _write_codex_policy_hooks_file(
     _ = write_codex_hooks_file(codex_home, payloads, user_hooks_source=user_hooks_source)
 
 
-def _our_hooks_from_list(listed: _JsonObject, cwd: str, module: str) -> list[_JsonObject]:
+def _our_hooks_from_list(listed: _JsonObject, cwd: str, module: str | None) -> list[_JsonObject]:
     """
-    Extract the hooks for *cwd* whose command runs *module*.
+    Extract the hooks for *cwd*, optionally only those running *module*.
 
-    Filtering by module keeps the trust step from ever touching hooks the
-    user's own ``hooks.json`` contributed to the merged file.
+    Filtering by module keeps a trust step from ever touching hooks the
+    user's own ``hooks.json`` contributed to the merged file. Pass
+    ``module=None`` to return every hook for *cwd* (used by the
+    runner-owned trust-all pass, which deliberately covers user hooks —
+    see :func:`trust_all_codex_hooks`).
 
     :param listed: Parsed ``hooks/list`` response envelope, with
         ``result.data`` a list of ``{cwd, hooks: [...]}`` entries.
     :param cwd: The cwd whose hook set to read, e.g.
         ``"/home/user/repo"``.
-    :param module: Hook-script module marker, e.g.
-        ``"omnigent.codex_native_hook"``.
+    :param module: Hook-script module marker to filter on, e.g.
+        ``"omnigent.codex_native_hook"``; ``None`` returns all hooks.
     :returns: The matching hook metadata dicts (possibly empty), each
         with ``key``, ``currentHash``, ``trustStatus``.
     """
@@ -1752,7 +1789,7 @@ def _our_hooks_from_list(listed: _JsonObject, cwd: str, module: str) -> list[_Js
                 hook
                 for raw_hook in hooks
                 if (hook := _string_object_dict(raw_hook)) is not None
-                and module in str(hook.get("command", ""))
+                and (module is None or module in str(hook.get("command", "")))
             ]
     return []
 
@@ -1933,6 +1970,57 @@ async def trust_codex_router_hooks(request: CodexRequestFn, *, cwd: str) -> list
         len(ours),
         ", ".join(sorted(str(h.get("eventName")) for h in ours)),
     )
+    return []
+
+
+async def trust_all_codex_hooks(request: CodexRequestFn, *, cwd: str) -> list[str]:
+    """
+    Persist trust for every hook discovered for *cwd*, user hooks included.
+
+    Runner-owned native sessions launch the TUI with
+    ``--dangerously-bypass-hook-trust``, which already runs every enabled
+    hook regardless of trust state. But codex only honors that flag for the
+    interactive startup hook-review *screen* when the session is not a
+    persistent resume: it computes ``bypass_hook_trust && !is_persistent_resume``,
+    and an Omnigent ``resume <thread_id> --remote`` attach is a persistent
+    resume. So a resumed web/headless session drops back to the interactive
+    "Hooks need review" screen that nobody can answer, stranding the queued
+    chat message. Persisting trust for the merged hooks (the same
+    ``hooks/list`` -> ``config/batchWrite`` flow the TUI's own "Trust all"
+    button uses) makes codex's startup review find nothing to review, so the
+    screen never appears — on a fresh launch or a resume alike.
+
+    This is not a new trust surface: these sessions already execute the very
+    same hooks unconditionally via the bypass flag. It only makes the
+    persisted trust state match that already-chosen behavior. Interactive
+    ``omnigent codex`` sessions never call this — a human at the terminal
+    reviews their own new or changed hooks.
+
+    Best-effort: a trust failure here only means the review screen may still
+    appear, so it returns the still-untrusted keys instead of raising.
+
+    :param request: Bound app-server JSON-RPC request coroutine, e.g.
+        ``client.request``.
+    :param cwd: The session cwd the hooks are scoped to, e.g.
+        ``"/home/user/repo"``.
+    :returns: Keys of hooks still untrusted afterwards; empty when every
+        discovered hook is trusted (or none are).
+    """
+    listed = await request("hooks/list", {"cwds": [cwd]})
+    all_hooks = _our_hooks_from_list(listed, cwd, None)
+    untrusted = [h for h in all_hooks if h.get("trustStatus") not in _TRUSTED_HOOK_STATUSES]
+    if not untrusted:
+        return []
+    await _persist_hook_trust(request, untrusted)
+    relisted = await request("hooks/list", {"cwds": [cwd]})
+    still_untrusted = [
+        h
+        for h in _our_hooks_from_list(relisted, cwd, None)
+        if h.get("trustStatus") not in _TRUSTED_HOOK_STATUSES
+    ]
+    if still_untrusted:
+        return [str(h.get("key")) for h in still_untrusted]
+    _logger.info("codex hook trust-all: trusted %d hook(s) for cwd %s", len(untrusted), cwd)
     return []
 
 
@@ -2160,6 +2248,7 @@ def build_codex_native_server(
     developer_instructions: str | None = None,
     bypass_sandbox: bool = False,
     trust_project: bool = False,
+    trust_all_hooks: bool = False,
 ) -> CodexNativeAppServer:
     """
     Build a configured native Codex app-server process wrapper.
@@ -2198,6 +2287,12 @@ def build_codex_native_server(
     :param trust_project: Whether to trust ``cwd`` in the private session
         config before app-server startup. Intended for runner-owned headless
         sessions whose hidden TUI cannot answer Codex's project-trust prompt.
+    :param trust_all_hooks: Whether to persist trust for every merged hook
+        during startup. Intended for runner-owned headless sessions whose
+        ``--dangerously-bypass-hook-trust`` flag codex ignores for the
+        startup hook-review screen on a persistent ``resume`` attach (see
+        :func:`trust_all_codex_hooks`). Interactive CLI sessions leave it
+        disabled so a human reviews their own new or changed hooks.
     :returns: Configured app-server process wrapper.
     :raises ImportError: If no Codex CLI is available.
     :raises OSError: If Databricks routing was requested but no
@@ -2260,6 +2355,7 @@ def build_codex_native_server(
         python_executable=python_executable,
         pinned_model=pinned_model,
         trust_project=trust_project,
+        trust_all_hooks=trust_all_hooks,
     )
 
 
