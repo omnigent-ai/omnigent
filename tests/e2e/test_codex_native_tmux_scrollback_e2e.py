@@ -96,7 +96,9 @@ def _scrolled_state(socket_path: str) -> tuple[bool, str]:
         the raw fields for the failure message.
     """
     in_mode = _tmux_out(socket_path, "display-message", "-p", "-t", "main", "#{pane_in_mode}")
-    scroll_pos = _tmux_out(socket_path, "display-message", "-p", "-t", "main", "#{scroll_position}")
+    scroll_pos = _tmux_out(
+        socket_path, "display-message", "-p", "-t", "main", "#{scroll_position}"
+    )
     detail = f"pane_in_mode={in_mode!r} scroll_position={scroll_pos!r}"
     scrolled = in_mode == "1" and scroll_pos.isdigit() and int(scroll_pos) > 0
     return scrolled, detail
