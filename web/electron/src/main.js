@@ -137,14 +137,25 @@ function serverSelectorV2DevUrl() {
  * wizard gets HMR — it still runs in this window, keeping the omnigentSetup
  * bridge). If that server isn't running, loadURL rejects and we fall back to
  * the bundled file:// page. Prod always loads file://. Returns the load promise.
+ *
+ * Deferred to the next tick: this is often called from inside a `did-fail-load`
+ * handler (a dead saved server bouncing back to setup). Navigating a webContents
+ * synchronously while the failed load is still tearing down is unreliable —
+ * Electron can drop the new navigation and strand the window on the error page
+ * (seen in dev when BOTH the server and the Vite dev server are down). Letting
+ * the failing load settle first makes the fallback land every time.
  */
 function loadSetupPage(win, search = "") {
   const loadFile = () => win.loadFile(setupPagePath(), search ? { search } : undefined);
   const devUrl = serverSelectorV2DevUrl();
-  if (devUrl) {
-    return win.loadURL(search ? `${devUrl}?${search}` : devUrl).catch(loadFile);
-  }
-  return loadFile();
+  const run = () => {
+    if (win.isDestroyed()) return Promise.resolve();
+    if (devUrl) return win.loadURL(search ? `${devUrl}?${search}` : devUrl).catch(loadFile);
+    return loadFile();
+  };
+  return new Promise((resolve) => {
+    setTimeout(() => resolve(run()), 0);
+  });
 }
 
 /** Absolute path to the bundled find-in-page bar page. */
