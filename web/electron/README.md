@@ -49,8 +49,16 @@ adds native niceties:
   Electron's menu roles, so the usual text-editing shortcuts — Cmd/Ctrl-A,
   C, V, X, Z — work inside the webview's text fields. **Settings…** uses the
   native `Cmd+,` accelerator on macOS (`Ctrl+,` elsewhere) and routes the
-  focused connected window through the SPA without reloading it. Our other
-  custom actions — **New Window**, **New Window on Different Server…**, and
+  focused connected window through the SPA without reloading it. On macOS,
+  **About Omnigent** opens a shell-owned modal showing the platform app and
+  detected CLI versions; the CLI section points users to `omni update`.
+  **Check for Updates…** in
+  the Server menu opens the same modal and starts a check. **Update now** in the
+  shell update prompt opens the modal, hides the prompt, and starts the download;
+  the modal shows live progress and then offers **Restart to update**. Packaged macOS builds
+  resolve the running app's native icon so the modal uses the current
+  `Assets.car`/Liquid Glass appearance rather than the development PNG. Our other custom actions
+  — **New Window**, **New Window on Different Server…**, and
   **Change Server…** — live in a dedicated **Server** submenu. On macOS a
   **Notifications** submenu turns the notification sound on/off (**Play
   Notification Sound**, **off by default** — the user opts in) and picks which
@@ -89,8 +97,9 @@ adds native niceties:
 
 ## How it works (zero UI duplication)
 
-The desktop app does **not** ship a copy of the web UI. It bundles only a tiny
-"connect to server" page (`setup/index.html`). On launch:
+The desktop app does **not** ship a copy of the server web UI. It bundles small
+shell-owned pages for connecting to a server and native utilities such as the
+About modal. On launch:
 
 1. If no server URL is saved yet, it shows the setup page (one input +
    Connect). You enter your Omnigent server URL (default
@@ -151,12 +160,15 @@ electron/
   package.json             # Electron + electron-builder deps and build config
   src/main.js              # main process: window, settings, menu, IPC, badge, notify
   src/preload.js           # contextBridge: window.omnigentDesktop + omnigentSetup
+  src/about_window.js      # shell-owned About modal + guarded update IPC
+  src/about_preload.js     # narrow contextBridge for the About modal
   src/managed_preferences.js # read/validate macOS MDM server choices
   src/find_preload.js      # contextBridge for the find bar: window.omnigentFind
   src/browserViewRegistry.js  # per-conversation WebContentsView registry (browser pane)
   src/browserViewBounds.js    # CSS-px → window-DIP bounds conversion (browser pane)
   src/browserIpc.js           # omnigent:browser-* IPC handlers (extracted from main.js)
   setup/index.html         # the bundled "connect to server" setup page
+  about/index.html         # bundled About UI opened from the macOS app menu
   find/index.html          # the bundled find-in-page bar (Cmd/Ctrl+F)
   icons/                   # app icons
   docs/managed-preferences.md # public MDM configuration contract

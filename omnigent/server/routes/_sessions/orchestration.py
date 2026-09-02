@@ -8753,6 +8753,16 @@ def _create_session_from_bundle(
         )
         metadata = metadata.model_copy(update={"reasoning_effort": seeded_effort})
 
+    if metadata.parent_session_id is not None:
+        try:
+            terminal_launch_args = _derive_terminal_launch_args_from_spec(spec)
+        except ValueError as exc:
+            raise OmnigentError(
+                f"invalid terminal_launch_args in bundled child spec: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        metadata = metadata.model_copy(update={"terminal_launch_args": terminal_launch_args})
+
     agent_id = generate_agent_id()
     agent_bundle_location = bundle_location(agent_id, bundle_bytes)
     try:

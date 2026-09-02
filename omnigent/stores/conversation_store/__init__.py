@@ -16,14 +16,15 @@ from omnigent.entities import (
 )
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
 
-# Label set on a fork of a session that had a working directory. Its
-# value is the source session id. Presence marks the (unbound) clone as
-# needing a host + working directory before it can run, so the
-# online-dot reports it offline until bound and the UI opens the
-# directory picker instead of silently dropping the first message.
-# Forks of chat-only sources (no workspace) get no label and resume
-# in-process like a brand-new chat session. Canonical home is the store
-# layer; the server route and the SQLAlchemy store both import it.
+# Label set on a fork of a session that had a working directory, or a
+# runner-bound native session whose working-directory metadata was lost.
+# Its value is the source session id. Presence marks the (unbound) clone
+# as needing a host + working directory before it can run, so the
+# online-dot reports it offline until bound and the UI opens the directory
+# picker instead of silently dropping the first message. Forks of
+# chat-only sources get no label and resume in-process like a brand-new
+# chat session. Canonical home is the store layer; the server route and
+# the SQLAlchemy store both import it.
 FORK_SOURCE_LABEL_KEY = "omnigent.fork.source_id"
 
 # One-shot fork directive: the SOURCE session's runtime-native session id

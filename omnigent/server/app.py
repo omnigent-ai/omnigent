@@ -139,6 +139,7 @@ class ServerInfoResponse(BaseModel):
     managed_sandboxes_enabled: bool
     sandbox_provider: str | None
     sandbox_providers: list[str]
+    enabled_connections: list[str]
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
     public_sharing_enabled: bool
     server_version: str
@@ -1035,6 +1036,8 @@ def create_app(
     admins: list[str] | None = None,
     allowed_domains: list[str] | None = None,
     sandbox_config: ManagedSandboxDeployment | None = None,
+    github_config: Any | None = None,  # GitHubAppConfig — GitHub App integration
+    github_store: Any | None = None,  # GithubConnectionStore — GitHub App integration
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
@@ -1113,6 +1116,15 @@ def create_app(
         ``host_type="managed"`` create fails with a clear error).
         Managed-host credentials live on the ``hosts`` table, so no
         extra store is wired.
+    :param github_config: Parsed GitHub App configuration
+        (:class:`omnigent.server.github_app.GitHubAppConfig`) enabling
+        the per-user "Connect GitHub" flow. ``None`` disables the
+        integration (the connect UI is hidden and the routes stay
+        unmounted).
+    :param github_store: Persistence for per-user GitHub connections
+        (:class:`omnigent.connections.github.GithubConnectionStore`).
+        Required alongside ``github_config`` to enable the integration;
+        wired together by ``create_app``'s caller.
     :param sharing_mode: Server policy for creating new session
         permission grants (see :class:`SharingMode`): ``ON`` allows
         grants at any level plus public/workspace read, ``READ_ONLY``
@@ -1482,6 +1494,27 @@ def create_app(
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
+    # GitHub App integration: enabled only when both the config and the
+    # connection store are wired. The client is stateless (holds config),
+    # built once and reused for the connect flow.
+    # Per-user connection providers (GitHub, ...). One registry entry per
+    # provider (connections_registry) drives uniform wiring: each gets
+    # ``app.state.<name>_{config,store,client}``, populated only when both its
+    # config and its store are present, else None. The info endpoint's
+    # enabled_connections list and the router mounting below both read these.
+    from omnigent.server.connections_registry import connection_providers
+
+    _connection_inputs = {"github": (github_config, github_store)}
+    for _provider in connection_providers():
+        _cfg, _store = _connection_inputs.get(_provider.name, (None, None))
+        _on = _cfg is not None and _store is not None
+        setattr(app.state, f"{_provider.name}_config", _cfg if _on else None)
+        setattr(app.state, f"{_provider.name}_store", _store if _on else None)
+        setattr(
+            app.state,
+            f"{_provider.name}_client",
+            _provider.client_factory(_cfg) if _on else None,
+        )
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
     # admin-gated auth routes AND ``/v1/me``'s is_admin computation consult the
@@ -2258,6 +2291,17 @@ def create_app(
             managed_sandboxes_enabled = True
             sandbox_provider = sandbox_config.default.provider
             sandbox_providers = list(sandbox_config.launchable_providers())
+        # enabled_connections lists the connection providers this deploy has
+        # wired (config + store present), in a stable order. The web UI shows
+        # the Sandbox Integrations nav when the list is non-empty and renders
+        # one panel per provider. A provider appears only when both its config
+        # and its connection store are present.
+        enabled_connections = [
+            provider
+            for provider in ("github",)
+            if getattr(app.state, f"{provider}_config", None) is not None
+            and getattr(app.state, f"{provider}_store", None) is not None
+        ]
         # sharing_mode is the server's session-sharing policy
         # (on/read_only/off), surfaced so the web app can hide the Share
         # control (off) or restrict it to read-only (read_only) in lockstep
@@ -2321,6 +2365,7 @@ def create_app(
                 "managed_sandboxes_enabled": managed_sandboxes_enabled,
                 "sandbox_provider": sandbox_provider,
                 "sandbox_providers": sandbox_providers,
+                "enabled_connections": enabled_connections,
                 "sharing_mode": sharing_mode.value,
                 "public_sharing_enabled": public_sharing_enabled,
                 "server_version": _server_version(),
@@ -2959,6 +3004,26 @@ def create_app(
             ),
             prefix="/v1",
             tags=["hosts"],
+        )
+
+    # Per-user connection routes (/v1/connections/{provider}/*): connect /
+    # callback / status / disconnect. One registry entry per provider; each is
+    # mounted only when configured (config + store present), so an unconfigured
+    # provider's surface stays absent exactly like a build without the feature.
+    for _provider in connection_providers():
+        _cfg = getattr(app.state, f"{_provider.name}_config", None)
+        _store = getattr(app.state, f"{_provider.name}_store", None)
+        if _cfg is None or _store is None:
+            continue
+        app.include_router(
+            _provider.router_factory(
+                _cfg,
+                _store,
+                auth_provider=auth_provider,
+                client=getattr(app.state, f"{_provider.name}_client", None),
+            ),
+            prefix="/v1",
+            tags=["integrations"],
         )
 
     # Mount the auth router that matches the active provider. OIDC and

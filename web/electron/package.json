@@ -2,7 +2,7 @@
   "name": "omnigent-desktop-electron",
   "productName": "Omnigent",
   "version": "0.13.0-dev.0",
-  "description": "Omnigent desktop shell (Electron edition) — a thin native wrapper around the server-served web UI.",
+  "description": "Omnigent desktop shell (Electron edition) \u2014 a thin native wrapper around the server-served web UI.",
   "private": true,
   "main": "src/main.js",
   "homepage": "https://omnigent.ai",
@@ -61,7 +61,9 @@
     "afterAllArtifactBuild": "build/afterAllArtifactBuild.js",
     "files": [
       "src/**/*",
+      "about/**/*",
       "setup/**/*",
+      "arca-connect/**/*",
       "server-selector-v2/**/*",
       "find/**/*",
       "return-banner/**/*",
@@ -87,7 +89,8 @@
       "entitlementsInherit": "signing/entitlements.mac.inherit.plist",
       "extendInfo": {
         "NSMicrophoneUsageDescription": "Omnigent uses the microphone for voice dictation in the message composer.",
-        "CFBundleIconName": "AppIcon"
+        "CFBundleIconName": "AppIcon",
+        "NSPrefersDisplaySafeAreaCompatibilityMode": false
       },
       "gatekeeperAssess": false,
       "notarize": false,
@@ -164,6 +167,8 @@
     }
   },
   "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
     "electron-updater": "^6.3.9",
     "js-yaml": "^4.3.0"
   }

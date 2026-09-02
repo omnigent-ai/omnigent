@@ -75,6 +75,7 @@ from omnigent.entities import (
     PagedList,
     parse_item_data,
 )
+from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.session_import.models import (
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
     IMPORT_SOURCE_LABEL_KEY,
@@ -3499,7 +3500,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         (:data:`_INSTANCE_SCOPED_LABEL_KEYS` — native bridge ids,
         context metrics), which belong to the source's running instance
         and would mis-route or mis-display on the clone.
-        When the source had a ``workspace``, the fork is additionally
+        When the source had a ``workspace`` — or is a runner-bound native
+        session whose workspace metadata was lost — the fork is additionally
         stamped with ``FORK_SOURCE_LABEL_KEY`` (value = source id) so the
         unbound clone reports offline until it rebinds a directory (see
         :class:`SessionConnectivity`).
@@ -3840,17 +3842,20 @@ class SqlAlchemyConversationStore(ConversationStore):
             # clone is unbound (workspace/host not copied) and must rebind
             # a directory before it can run, so the online-dot reports it
             # offline and the UI opens the directory picker on the first
-            # message instead of dropping it. Forks of chat-only sources
-            # (no workspace) get no such label and resume in-process like
+            # message instead of dropping it. A runner-bound native source
+            # with no workspace gets the same recovery treatment because
+            # that combination reflects lost metadata, not a chat-only
+            # session. Other workspace-less sources resume in-process like
             # a brand-new chat session.
             # Per-user pin keys (``omnigent.pinned.<user>``) are dynamic-suffix,
             # so they're never in the exact-match drop sets — drop them by prefix
             # instead. A fork is a NEW conversation; inheriting the source's pins
             # would show the clone as pinned for the forker AND carry every other
             # user's pin key along as dead data.
+            source_labels = _fetch_labels(session, source_conversation_id)
             fork_labels = {
                 key: value
-                for key, value in _fetch_labels(session, source_conversation_id).items()
+                for key, value in source_labels.items()
                 if key
                 not in (
                     _INSTANCE_SCOPED_LABEL_KEYS
@@ -3886,7 +3891,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                     else None
                 )
             )
-            if source_workspace is not None:
+            source_has_bound_native_runner = bool(
+                source_meta_ref
+                and source_meta_ref.runner_id
+                and native_coding_agent_for_wrapper_label(source_labels.get(WRAPPER_LABEL_KEY))
+                is not None
+            )
+            if source_workspace is not None or source_has_bound_native_runner:
                 fork_labels[FORK_SOURCE_LABEL_KEY] = source_conversation_id
             # Carry the source's native session id as a one-shot fork
             # directive so a native harness can resume + branch the source's

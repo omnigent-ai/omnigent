@@ -23,7 +23,19 @@ def commit(sha: str, login: str = "omni-resolve-agent[bot]"):
     }
 
 
-def decide(*, reviews, commits, head="new", head_repository=REPOSITORY):
+def dismissal_event(*, review_id=1, actor="omni-resolve-agent[bot]", commit_id="new"):
+    return {
+        "event": "review_dismissed",
+        "actor": {"login": actor},
+        "dismissed_review": {
+            "review_id": review_id,
+            "state": "approved",
+            "dismissal_commit_id": commit_id,
+        },
+    }
+
+
+def decide(*, reviews, commits, timeline=None, head="new", head_repository=REPOSITORY):
     return approval_decision(
         repository=REPOSITORY,
         author="contributor",
@@ -33,6 +45,7 @@ def decide(*, reviews, commits, head="new", head_repository=REPOSITORY):
         trusted_successors=TRUSTED,
         reviews=reviews,
         commits=commits,
+        timeline=timeline or [],
     )
 
 
@@ -49,6 +62,31 @@ def test_approval_survives_trusted_same_repo_successor_commits():
     )
     assert decision.approved
     assert "only trusted automation committed" in decision.reason
+
+
+def test_auto_dismissed_approval_survives_the_trusted_push_that_dismissed_it():
+    decision = decide(
+        reviews=[review("DISMISSED", "old")],
+        commits=[commit("old"), commit("new")],
+        timeline=[dismissal_event()],
+    )
+    assert decision.approved
+    assert "only trusted automation committed" in decision.reason
+
+
+def test_dismissed_approval_requires_a_trusted_matching_dismissal_event():
+    manual = decide(
+        reviews=[review("DISMISSED", "old")],
+        commits=[commit("old"), commit("new")],
+        timeline=[dismissal_event(actor="maintainer")],
+    )
+    wrong_commit = decide(
+        reviews=[review("DISMISSED", "old")],
+        commits=[commit("old"), commit("new")],
+        timeline=[dismissal_event(commit_id="other")],
+    )
+    assert not manual.approved
+    assert not wrong_commit.approved
 
 
 def test_approval_does_not_survive_untrusted_or_fork_updates():

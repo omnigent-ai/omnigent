@@ -470,14 +470,17 @@ class BwrapSandboxBackend(SandboxBackend):
         if target is not None:
             bwrap_args += _ensure_executable_visible([target], cwd_resolved)
 
-        # Extra read roots beyond the default toolchain bind set.
-        # Emitted BEFORE the cwd / write-root binds: bwrap layers later
-        # mounts on top of earlier ones, so a read root that equals or
-        # contains a writable path would otherwise remount that path
-        # read-only. Binding read roots first keeps writable-wins
-        # layering for every overlap shape.
+        # Extra read roots beyond the default toolchain bind set. These
+        # mounts precede write grants because bwrap resolves overlaps by
+        # letting the last mount win.
         if policy.read_roots is not None:
             for root in policy.read_roots:
+                # Read roots only expand visibility; they never restrict an
+                # overlapping cwd or explicit write grant.
+                if _is_same_path(root, cwd_resolved) or any(
+                    _is_same_path(root, write_root) for write_root in policy.write_roots
+                ):
+                    continue
                 bwrap_args += ["--ro-bind-try", str(root), str(root)]
 
         # cwd bind: writable iff a write_root resolves to cwd.

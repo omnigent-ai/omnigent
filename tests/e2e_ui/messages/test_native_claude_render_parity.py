@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 import time
 import uuid
@@ -189,6 +190,12 @@ def test_native_claude_message_render_parity(
 # How long to wait for a keystroke to travel browser -> WebSocket -> tmux ->
 # Claude Code and for the TUI to repaint the surface it opened.
 _TUI_SURFACE_TIMEOUT_S = 20.0
+# How many times to re-send a surface's opening keystrokes across that
+# budget. Under load the transit can spread a key sequence out until it
+# stops reading as one gesture (the rewind dialog needs its two Escapes to
+# land as a double tap), so a lost gesture is re-sent — only ever while the
+# surface is verifiably absent, where the keys hit the bare idle composer.
+_TUI_SURFACE_ATTEMPTS = 3
 # The runner advertises the session terminal's private tmux socket + pane here,
 # inside the claude-native bridge directory.
 _TMUX_ADVERT_FILE = "tmux.json"
@@ -247,7 +254,9 @@ def _open_rewind_dialog(page: Page) -> None:
 # Each swallowed a web-composer message before the bridge reclaimed the
 # input box: the history search filtered on it and replayed an old prompt
 # on Enter, shell mode ran it as a bash command, and the rewind dialog
-# dropped it while its Enter committed a checkpoint restore.
+# dropped it while its Enter committed a checkpoint restore. Markers are
+# matched case-insensitively: the TUI's chrome casing drifts across
+# Claude Code releases (e.g. 'Search prompts' became 'search prompts').
 _OCCUPYING_SURFACES: tuple[tuple[str, Callable[[Page], None], str], ...] = (
     ("ctrl+r history search", _open_history_search, "Search prompts"),
     ("shell mode", _enter_shell_mode, "! for shell mode"),
@@ -291,29 +300,78 @@ def _pane_text(base_url: str, session_id: str) -> str:
     return proc.stdout if proc.returncode == 0 else ""
 
 
-def _wait_for_pane_text(page: Page, base_url: str, session_id: str, marker: str) -> None:
-    """Block until the TUI pane renders *marker*, proving the surface opened.
+def _marker_rendered(pane: str, marker: str) -> bool:
+    """Return whether the TUI pane renders *marker*, wrap-tolerantly.
 
-    Without this the journey would pass vacuously: a keystroke that never
-    reached Claude Code leaves an ordinary composer, which of course
-    accepts the message.
+    Case-insensitive (the chrome's casing drifts across Claude Code
+    releases), and tolerant of a narrow pane wrapping a footer's left
+    cell across rows with the right column's text interleaved — each
+    row's fragment before the first multi-space column gap is rejoined
+    so the marker reads whole again.
 
-    :param page: The Playwright page (used for its polling sleep).
+    :param pane: The pane's visible text.
+    :param marker: Text Claude Code renders while the surface is up.
+    :returns: ``True`` when the marker is visible, wrapped or not.
+    """
+    needle = marker.lower()
+    if needle in pane.lower():
+        return True
+    fragments = (
+        re.split(r"\s{2,}", line.strip(), maxsplit=1)[0]
+        for line in pane.splitlines()
+        if line.strip()
+    )
+    return needle in " ".join(fragments).lower()
+
+
+def _occupy_tui_surface(
+    page: Page,
+    base_url: str,
+    session_id: str,
+    label: str,
+    occupy: Callable[[Page], None],
+    marker: str,
+) -> None:
+    """Open a TUI surface and block until the pane proves it rendered.
+
+    Without the proof the journey would pass vacuously: a keystroke that
+    never reached Claude Code leaves an ordinary composer, which of course
+    accepts the message. A gesture the transit spread out (so it never
+    registered) is re-sent up to :data:`_TUI_SURFACE_ATTEMPTS` times — only
+    while the marker is verifiably absent, so the retry keys can only land
+    on the bare idle composer, never on the opened surface.
+
+    :param page: The Playwright page, on the connected Terminal view.
     :param base_url: Spawned server base URL.
     :param session_id: The session/conversation id.
-    :param marker: Text Claude Code renders while the surface is up.
+    :param label: The surface's name for the log, e.g. ``"shell mode"``.
+    :param occupy: Sends the keystrokes that open the surface.
+    :param marker: Text Claude Code renders while the surface is up,
+        matched via :func:`_marker_rendered`.
     :raises AssertionError: If the marker never appears in the pane.
     """
-    deadline = time.monotonic() + _TUI_SURFACE_TIMEOUT_S
+    per_attempt_s = _TUI_SURFACE_TIMEOUT_S / _TUI_SURFACE_ATTEMPTS
     pane = ""
-    while time.monotonic() < deadline:
-        pane = _pane_text(base_url, session_id)
-        if marker in pane:
-            return
-        page.wait_for_timeout(500)
+    for attempt in range(1, _TUI_SURFACE_ATTEMPTS + 1):
+        occupy(page)
+        deadline = time.monotonic() + per_attempt_s
+        while time.monotonic() < deadline:
+            pane = _pane_text(base_url, session_id)
+            if _marker_rendered(pane, marker):
+                return
+            page.wait_for_timeout(500)
+        _log.info(
+            "%s did not render %r within %.1fs (attempt %d/%d); re-sending its keystrokes",
+            label,
+            marker,
+            per_attempt_s,
+            attempt,
+            _TUI_SURFACE_ATTEMPTS,
+        )
     raise AssertionError(
-        f"TUI never rendered {marker!r} within {_TUI_SURFACE_TIMEOUT_S}s — the keystrokes "
-        f"did not reach Claude Code, so this case would prove nothing. Pane was:\n{pane}"
+        f"TUI never rendered {marker!r} in {_TUI_SURFACE_ATTEMPTS} attempts over "
+        f"{_TUI_SURFACE_TIMEOUT_S}s — the keystrokes did not reach Claude Code, so this "
+        f"case would prove nothing. Pane was:\n{pane}"
     )
 
 
@@ -444,8 +502,7 @@ def test_native_claude_composer_delivers_into_an_occupied_tui(
         _open_terminal_view(page)
         _wait_terminal_connected(page)
         _log.info("occupying the TUI composer with %s", label)
-        occupy(page)
-        _wait_for_pane_text(page, base_url, session_id, pane_marker)
+        _occupy_tui_surface(page, base_url, session_id, label, occupy, pane_marker)
         _log.info("%s is up in the TUI; sending from the web composer", label)
 
         _ensure_chat_view(page)

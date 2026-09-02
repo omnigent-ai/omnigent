@@ -34,6 +34,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 from dataclasses import dataclass, field, replace
@@ -1327,6 +1328,76 @@ def fetch_databricks_model_service_entries(
             )
         )
     return tuple(models)
+
+
+# A value no endpoint will honor, so the request trips the output-token
+# validator before the model generates anything.
+_PROBE_OUTPUT_TOKENS = 100_000_000
+
+# Databricks serving endpoints report an exceeded output limit in one of two
+# shapes: "max_tokens (N) cannot exceed CAP" or "max_new_tokens N cannot be
+# greater than max_output_tokens CAP". Capture CAP from either.
+_OUTPUT_CAP_RE = re.compile(r"cannot exceed (\d+)|max_output_tokens\D*?(\d+)")
+
+
+def probe_output_token_cap(
+    base_url: str,
+    token: str,
+    model_id: str,
+    *,
+    api_type: str = "openai-completions",
+    transport: httpx.BaseTransport | None = None,
+) -> int | None:
+    """Discover a serving endpoint's enforced per-request output-token cap.
+
+    The Unity Catalog model-services listing carries no token limits, and a
+    model's native ceiling (its catalog ``max_output_tokens``) can exceed what
+    the Databricks serving endpoint accepts — requesting the native value then
+    fails at runtime. Sending an oversized request trips the endpoint's
+    validator, which names the real cap in its 400 body. The model never
+    generates, so this is a single cheap round-trip that also tracks any future
+    increase to the cap.
+
+    :param base_url: Surface base, e.g. ``https://ws/ai-gateway/mlflow/v1``.
+    :param token: Workspace bearer token.
+    :param model_id: Served model id, e.g. ``system.ai.kimi-k3``.
+    :param api_type: ``"openai-responses"`` or ``"openai-completions"`` —
+        selects the request shape and path.
+    :param transport: Optional httpx transport override for tests.
+    :returns: The cap in tokens, or ``None`` when the endpoint accepts the
+        probe (no cap below it) or the limit cannot be read (network/parse
+        failure). ``None`` means "keep the catalog value".
+    """
+    if api_type == "openai-responses":
+        path = "/responses"
+        body: dict[str, object] = {
+            "model": model_id,
+            "input": "cap probe",
+            "max_output_tokens": _PROBE_OUTPUT_TOKENS,
+        }
+    else:
+        path = "/chat/completions"
+        body = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": "cap probe"}],
+            "max_tokens": _PROBE_OUTPUT_TOKENS,
+        }
+    try:
+        with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
+            resp = client.post(
+                f"{base_url.rstrip('/')}{path}",
+                headers={"Authorization": f"Bearer {token}"},
+                json=body,
+            )
+    except httpx.HTTPError:
+        return None
+    if resp.status_code < 400:
+        return None
+    match = _OUTPUT_CAP_RE.search(resp.text or "")
+    if match is None:
+        return None
+    cap = match.group(1) or match.group(2)
+    return int(cap) if cap else None
 
 
 def _models_url(base_url: str) -> str:

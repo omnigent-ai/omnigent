@@ -9368,6 +9368,91 @@ def create_runner_app(
             },
         )
 
+    # ── GitHub integration (read-only): PR metadata + branch-vs-base diff ──
+    # Backed by the ``gh`` CLI and ``git``; see omnigent.runner.github_resource.
+    # Each shells out synchronously, so it is offloaded to a thread like the
+    # changed-files / diff routes above (a blocked loop 503s the session).
+
+    async def _github_workspace_root(session_id: str) -> str:
+        """Resolve the workspace root for GitHub routes, or 404 when headless."""
+        agent_spec = await _require_os_env(session_id)
+        root = resource_registry.compute_default_env_root(session_id, agent_spec)
+        if root is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Session has no filesystem; GitHub API unavailable.",
+            )
+        return root
+
+    @app.get("/v1/sessions/{session_id}/resources/github")
+    async def read_github_info(session_id: str) -> JSONResponse:
+        import asyncio as _asyncio
+
+        from omnigent.runner.github_resource import github_info
+
+        root = await _github_workspace_root(session_id)
+        info = await _asyncio.to_thread(github_info, root)
+        return JSONResponse(status_code=200, content=info)
+
+    @app.get("/v1/sessions/{session_id}/resources/github/changes")
+    async def read_github_changes(
+        session_id: str,
+        base: str | None = Query(default=None),
+    ) -> JSONResponse:
+        import asyncio as _asyncio
+
+        from omnigent.runner.github_resource import github_changed_files, resolve_base_ref
+
+        root = await _github_workspace_root(session_id)
+        resolved_base = await _asyncio.to_thread(resolve_base_ref, root, base)
+        if not resolved_base:
+            return JSONResponse(
+                status_code=200,
+                content={"object": "list", "data": [], "has_more": False},
+            )
+        result = await _asyncio.to_thread(github_changed_files, root, resolved_base)
+        return JSONResponse(status_code=200, content=result)
+
+    @app.get("/v1/sessions/{session_id}/resources/github/diff")
+    async def read_github_pr_diff(
+        session_id: str,
+        base: str | None = Query(default=None),
+    ) -> JSONResponse:
+        import asyncio as _asyncio
+
+        from omnigent.runner.github_resource import github_pr_diff, resolve_base_ref
+
+        root = await _github_workspace_root(session_id)
+        resolved_base = await _asyncio.to_thread(resolve_base_ref, root, base)
+        result = await _asyncio.to_thread(github_pr_diff, root, resolved_base or "")
+        return JSONResponse(status_code=200, content=result)
+
+    @app.get("/v1/sessions/{session_id}/resources/github/diff/{relative_path:path}")
+    async def read_github_file_diff(
+        session_id: str,
+        relative_path: str,
+        base: str | None = Query(default=None),
+    ) -> JSONResponse:
+        import asyncio as _asyncio
+
+        from omnigent.runner.github_resource import github_file_diff, resolve_base_ref
+
+        # Repo-root-relative paths only; reject traversal even though ``git show``
+        # reads from the object store (not disk) and rejects out-of-tree paths.
+        if relative_path.startswith("/") or any(
+            seg in ("", "..") for seg in relative_path.split("/")
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"code": "invalid_path", "message": "Invalid path"}},
+            )
+        root = await _github_workspace_root(session_id)
+        resolved_base = await _asyncio.to_thread(resolve_base_ref, root, base)
+        result = await _asyncio.to_thread(
+            github_file_diff, root, resolved_base or "", relative_path
+        )
+        return JSONResponse(status_code=200, content=result)
+
     @app.get(
         "/v1/sessions/{session_id}/resources/environments"
         "/{environment_id}/filesystem/{relative_path:path}"

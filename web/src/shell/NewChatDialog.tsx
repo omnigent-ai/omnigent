@@ -184,9 +184,12 @@ import {
   CURSOR_NATIVE_DEFAULT_EXEC_MODE,
   CURSOR_NATIVE_EXEC_MODES,
 } from "@/lib/nativeHarnessModes";
-import { useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
+import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
+import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
+  connectArcaHost,
   controlHost,
+  getDesktopFeatures,
   getHostIdentity,
   isElectronShell,
   onHostStatusChanged,
@@ -2068,6 +2071,7 @@ export function NewChatLandingScreen() {
       workspace: c.workspace,
       agentId: c.agent_id,
       useWorktree: c.use_worktree,
+      model: c.model,
     };
   }, [
     projectParam,
@@ -2372,6 +2376,13 @@ export function NewChatLandingScreen() {
   // consumed in the menu's onOpenChange) — connecting while the menu is open
   // looks janky. A ref so the close handler sees it synchronously.
   const pendingConnectRef = useRef(false);
+  // Arca (Databricks-internal): the desktop shell reports the MDM flag; when
+  // set, the picker offers connecting the user's Arca dev instance as a host.
+  const [arcaEnabled, setArcaEnabled] = useState(false);
+  const [connectingArca, setConnectingArca] = useState(false);
+  const [arcaError, setArcaError] = useState<string | null>(null);
+  // Mirrors pendingConnectRef for the Arca row: connect after the menu closes.
+  const pendingArcaConnectRef = useRef(false);
   // Sandbox repository inputs — composed into the managed create's
   // `workspace` string (`<url>[#<branch>]`); both blank = empty
   // server-created workspace.
@@ -2589,6 +2600,20 @@ export function NewChatLandingScreen() {
     return () => {
       cancelled = true;
       unsubscribe();
+    };
+  }, []);
+
+  // Desktop feature gates (MDM-managed). Read once per mount — the shell
+  // re-reads macOS preferences on every call, so reopening the composer is
+  // enough to pick up a profile change.
+  useEffect(() => {
+    if (!isElectronShell()) return;
+    let cancelled = false;
+    void getDesktopFeatures().then((features) => {
+      if (!cancelled) setArcaEnabled(features?.databricksInternalFeatures === true);
+    });
+    return () => {
+      cancelled = true;
     };
   }, []);
 
@@ -3108,15 +3133,47 @@ export function NewChatLandingScreen() {
   // costControlMode/bypass restored from the landing draft.
   const prevAgentIdRef = useRef<string | null | undefined>(undefined);
   const suppressBypassSeedRef = useRef(false);
+  // Tracks an explicit model pick the user committed in this composer visit
+  // (via the agent-config modal). Once set, an async project-config arrival or
+  // cache refresh must not reseed the project default over the user's choice;
+  // an agent switch starts a fresh visit and re-arms the seed.
+  const userPickedModelRef = useRef(false);
   useEffect(() => {
     const prev = prevAgentIdRef.current;
     prevAgentIdRef.current = effectiveAgentId;
     suppressBypassSeedRef.current =
       prev !== undefined && prev !== null && prev !== effectiveAgentId;
     if (!suppressBypassSeedRef.current) return;
+    userPickedModelRef.current = false;
     setBypassSandbox(false);
     setCostControlMode(null);
   }, [effectiveAgentId, setCostControlMode]);
+  // A project-configured default model (Project settings) outranks the user's
+  // remembered per-harness pick — but only while the composer sits on the
+  // project's configured agent; switching to another agent falls back to the
+  // remembered pick / harness default.
+  const projectDefaultModel =
+    prefillConfig?.model != null &&
+    prefillConfig.agentId != null &&
+    effectiveAgentId === prefillConfig.agentId
+      ? prefillConfig.model
+      : null;
+  // The same default validated against the selected harness's current vocab.
+  // An unknown/retired stored id must behave as "no project default": the
+  // model seed falls back to the remembered pick, and the remembered-routing
+  // seed below stays live (an invalid pin must not suppress it).
+  const projectModelVocab =
+    selectedNativeHarness === "pi-native"
+      ? piModelOptions
+      : selectedNativeHarness === "claude-native"
+        ? claudeModelOptions
+        : selectedNativeHarness === "codex-native"
+          ? codexModelOptions
+          : [];
+  const projectDefaultModelValid =
+    projectDefaultModel != null && projectModelVocab.some((m) => m.id === projectDefaultModel)
+      ? projectDefaultModel
+      : null;
   // Seed the harness's knobs from the user's last picks when the selected
   // harness changes (including the first mount), so a returning user starts a
   // new session on the options they used last for that harness instead of the
@@ -3140,11 +3197,22 @@ export function NewChatLandingScreen() {
     // this holds on every run of this effect — including the re-run when the
     // model catalog resolves, which lands after the routing seed below.
     const storedRoutingOn = stored.routing === "on";
+    // The project's configured default model (validated against the current
+    // vocab) outranks both the remembered pick and remembered routing while
+    // the composer sits on the project's configured agent — unless the user
+    // already committed an explicit pick this visit, which always wins.
+    const projectSeed = (options: readonly { id: string }[]) =>
+      !userPickedModelRef.current &&
+      projectDefaultModel != null &&
+      options.some((m) => m.id === projectDefaultModel)
+        ? projectDefaultModel
+        : null;
     if (selectedNativeHarness === "pi-native") {
       setPickedModel(
-        stored.model != null && piModelOptions.some((model) => model.id === stored.model)
-          ? stored.model
-          : "",
+        projectSeed(piModelOptions) ??
+          (stored.model != null && piModelOptions.some((model) => model.id === stored.model)
+            ? stored.model
+            : ""),
       );
       setPickedEffort(
         stored.effort != null && PI_NATIVE_EFFORTS.some((e) => e.value === stored.effort)
@@ -3161,11 +3229,12 @@ export function NewChatLandingScreen() {
       // nothing stored (or a retired id) it resolves to "" — unselected, so the
       // create omits the override and Claude Code uses its own configured model.
       setPickedModel(
-        !storedRoutingOn &&
+        projectSeed(claudeModelOptions) ??
+          (!storedRoutingOn &&
           stored.model != null &&
           claudeModelOptions.some((m) => m.id === stored.model)
-          ? stored.model
-          : "",
+            ? stored.model
+            : ""),
       );
       setPickedEffort(
         !storedRoutingOn &&
@@ -3185,12 +3254,13 @@ export function NewChatLandingScreen() {
       // also drops any model/effort left in the shared state (e.g. seeded for
       // Claude Code before the harness switch).
       setPickedModel(
-        !storedRoutingOn &&
+        (selectedNativeHarness === "codex-native" ? projectSeed(codexModelOptions) : null) ??
+          (!storedRoutingOn &&
           selectedNativeHarness === "codex-native" &&
           stored.model != null &&
           codexModelOptions.some((m) => m.id === stored.model)
-          ? stored.model
-          : "",
+            ? stored.model
+            : ""),
       );
       if (storedRoutingOn) setPickedEffort("");
     } else if (supportsCursorMode) {
@@ -3198,10 +3268,18 @@ export function NewChatLandingScreen() {
     } else if (supportsAgySkipPermissions) {
       setAgySkipMode(resolve(AGY_NATIVE_SKIP_MODES, AGY_NATIVE_DEFAULT_SKIP_MODE));
     }
-    // Reseed on harness changes and when the selected host's catalog resolves;
-    // capability flags are derived from the same harness and stay omitted.
+    // Reseed on harness changes, when the selected host's catalog resolves,
+    // and when the project's configured default model settles (its config
+    // loads async, so the first run may see it as null); capability flags are
+    // derived from the same harness and stay omitted.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedNativeHarness, claudeModelOptions, codexModelOptions, piModelOptions]);
+  }, [
+    selectedNativeHarness,
+    claudeModelOptions,
+    codexModelOptions,
+    piModelOptions,
+    projectDefaultModel,
+  ]);
   // Smart Routing is remembered per harness alongside the mode/model
   // knobs, in its own effect because eligibility depends on the server flag
   // (which resolves after mount — this must reseed when it lands). A stored
@@ -3214,6 +3292,11 @@ export function NewChatLandingScreen() {
   // switch itself (the router always routes), so it's left alone.
   useEffect(() => {
     if (!selectedNativeHarness || autoRoutingSelected) return;
+    // A *valid* project-configured default model is an explicit pin: a
+    // remembered routing "on" must not re-enter routing and clear it (the
+    // setter drops the model pick when routing turns on). An invalid stored
+    // id never seeds a pin, so it must not suppress the remembered routing.
+    if (projectDefaultModelValid != null && !userPickedModelRef.current) return;
     const storedRouting = readHarnessOptions(selectedNativeHarness).routing;
     if (storedRouting === undefined) return;
     setCostControlMode(smartRoutingEligible && storedRouting === "on" ? "on" : null);
@@ -3222,6 +3305,7 @@ export function NewChatLandingScreen() {
     smartRoutingEligible,
     effectiveAgentId,
     autoRoutingSelected,
+    projectDefaultModelValid,
     setCostControlMode,
   ]);
   // Top-level Smart Routing pins permissions to Default (no override sent), so
@@ -3738,11 +3822,22 @@ export function NewChatLandingScreen() {
   const selectedHostDisplayName = selectedHost
     ? displayNameForHost(selectedHost, thisMachineHostId, navigator.userAgent)
     : null;
+  // The Arca box's row in the host list, known only from the host id stored
+  // when Run on Arca connected it (a host's name is its machine hostname —
+  // no reliable relationship to the arca instance name, so no matching).
+  // While that host is online the Arca option disappears entirely; otherwise
+  // one click connects (starting a stopped instance along the way — the
+  // connect console shows what's happening, so no status needs pre-fetching).
+  const arcaHostId = arcaEnabled ? readArcaHostId() : null;
+  const arcaHostOnline = arcaHostId !== null && onlineHosts.some((h) => h.host_id === arcaHostId);
+  const showArcaOption = arcaEnabled && !arcaHostOnline;
   const hostLabel = connectingThisMachine
     ? "Connecting…"
-    : sandboxSelected
-      ? selectedSandboxLabel
-      : (selectedHostDisplayName ?? (onlineHosts.length === 0 ? "No hosts" : "Choose host"));
+    : connectingArca
+      ? "Connecting to Arca…"
+      : sandboxSelected
+        ? selectedSandboxLabel
+        : (selectedHostDisplayName ?? (onlineHosts.length === 0 ? "No hosts" : "Choose host"));
   // The chip shows just the branch (the "(existing)" distinction lives in the
   // popover's warning; appending it here only gets clipped by the chip's cap).
   const worktreeLabel = branchName.trim() || "Worktree";
@@ -3908,6 +4003,70 @@ export function NewChatLandingScreen() {
       if (identity?.hostId) selectHost(identity.hostId);
     } finally {
       setConnectingThisMachine(false);
+    }
+  }
+
+  // Connect the user's Arca dev instance (Databricks-internal sandbox) as a
+  // host, then select it. The bridge runs `arca ssh … isaac omni host
+  // --background` and resolves once the remote daemon started; the daemon then
+  // registers over its own tunnel moments later, so we poll the host list
+  // briefly to pick the host that newly came online.
+  async function connectArca() {
+    if (connectingArca) return;
+    setConnectingArca(true);
+    setArcaError(null);
+    const onlineBefore = new Set(
+      allHosts.filter((h) => h.status === "online").map((h) => h.host_id),
+    );
+    try {
+      const res = await connectArcaHost();
+      if (!res.ok) {
+        // Deliberate dismissals are not failures, and failures the connect
+        // console already displayed must not be echoed as a second error —
+        // this strip is only for gate failures with no other surface (e.g.
+        // the feature being unavailable to this window).
+        if (!res.canceled && !res.shownInConsole) {
+          setArcaError(res.error ?? "Couldn't connect to Arca.");
+        }
+        return;
+      }
+      // The box's daemon was already connected — its host has been in the
+      // list all along (just not recognized as Arca, e.g. enrolled before
+      // this app remembered ids), so waiting for a NEW online host would
+      // hang out the full grace window and then mislead.
+      if (res.alreadyRunning) {
+        await queryClient.invalidateQueries({ queryKey: ["hosts"] });
+        showToast("Arca is already connected to this server — pick its host from the list.");
+        return;
+      }
+      // Sequential by design: each poll must see the previous one's result.
+      /* oxlint-disable no-await-in-loop */
+      const deadline = Date.now() + 30_000;
+      while (Date.now() < deadline) {
+        const hostList = await queryClient.fetchQuery({
+          queryKey: ["hosts", { includeSandbox: false }],
+          queryFn: () => fetchHosts(false),
+          staleTime: 0,
+        });
+        const fresh = hostList.find((h) => h.status === "online" && !onlineBefore.has(h.host_id));
+        if (fresh) {
+          // Remember which host is the Arca box so the picker can tag it.
+          writeArcaHostId(fresh.host_id);
+          selectHost(fresh.host_id);
+          return;
+        }
+        await new Promise((resolve) => {
+          setTimeout(resolve, 1500);
+        });
+      }
+      /* oxlint-enable no-await-in-loop */
+      // The daemon started but its registration hasn't landed — soft-fail so
+      // the user knows to look at the host list rather than re-running.
+      setArcaError(
+        "Arca started, but the host hasn't appeared yet — it should show up in the host list shortly.",
+      );
+    } finally {
+      setConnectingArca(false);
     }
   }
 
@@ -4856,10 +5015,22 @@ export function NewChatLandingScreen() {
                     setCursorExecMode={setCursorExecMode}
                     setAgySkipMode={setAgySkipMode}
                     setBypassSandbox={setBypassSandbox}
-                    setPickedModel={setPickedModel}
+                    setPickedModel={(m) => {
+                      // A commit from the config modal is the user's explicit
+                      // choice for this visit — later async project-config
+                      // arrivals must not reseed over it.
+                      userPickedModelRef.current = true;
+                      setPickedModel(m);
+                    }}
                     setPickedEffort={setPickedEffort}
                     setPickedHarness={handleSetPickedHarness}
-                    setCostControlMode={setCostControlMode}
+                    setCostControlMode={(mode) => {
+                      // Turning routing on drops the model pick by design;
+                      // that too is an explicit user decision the project
+                      // default must not override afterwards.
+                      userPickedModelRef.current = true;
+                      setCostControlMode(mode);
+                    }}
                   />
                 )}
                 {/* Routing is not a standalone composer toggle — it folds into
@@ -4914,6 +5085,10 @@ export function NewChatLandingScreen() {
                   if (!open && pendingConnectRef.current) {
                     pendingConnectRef.current = false;
                     void connectThisMachine();
+                  }
+                  if (!open && pendingArcaConnectRef.current) {
+                    pendingArcaConnectRef.current = false;
+                    void connectArca();
                   }
                 }}
               >
@@ -5020,6 +5195,7 @@ export function NewChatLandingScreen() {
                           thisMachineHostId,
                           navigator.userAgent,
                         )}
+                        subtitle={host.host_id === arcaHostId ? "Arca instance" : undefined}
                       />
                     </DropdownMenuItem>
                   ))}
@@ -5080,7 +5256,28 @@ export function NewChatLandingScreen() {
                       </span>
                     </DropdownMenuItem>
                   )}
-                  {(allHosts.length > 0 || showConnectThisMachine) && <DropdownMenuSeparator />}
+                  {/* Databricks-internal (MDM-gated): one flat action — run
+                    on the Arca instance, starting it first when it's down.
+                    Hidden entirely once the box is connected: its own
+                    (tagged) host row above covers it. */}
+                  {showArcaOption && (
+                    <DropdownMenuItem
+                      onSelect={() => {
+                        pendingArcaConnectRef.current = true;
+                      }}
+                      disabled={connectingArca}
+                      data-testid="new-chat-landing-run-on-arca"
+                      className="gap-2 text-sm"
+                    >
+                      <MonitorCloudIcon className="size-4 shrink-0 text-muted-foreground" />
+                      <span className="text-sm">
+                        {connectingArca ? "Connecting to Arca…" : "Run on Arca"}
+                      </span>
+                    </DropdownMenuItem>
+                  )}
+                  {(allHosts.length > 0 || showConnectThisMachine || showArcaOption) && (
+                    <DropdownMenuSeparator />
+                  )}
                   {/* Persistent escape hatch: open the connect-a-host
                     instructions. Present even with zero hosts so a fresh user
                     is never stuck. */}
@@ -5451,6 +5648,24 @@ export function NewChatLandingScreen() {
                 onClick={() => void connectThisMachine()}
                 disabled={connectingThisMachine}
                 data-testid="new-chat-landing-connect-error-retry"
+              >
+                Try again
+              </button>
+            </p>
+          )}
+
+          {arcaError && (
+            <p
+              className="flex flex-wrap items-center gap-x-1.5 text-sm text-destructive"
+              data-testid="new-chat-landing-arca-error"
+            >
+              <span>{arcaError}</span>
+              <button
+                type="button"
+                className="underline underline-offset-2 hover:no-underline disabled:opacity-60"
+                onClick={() => void connectArca()}
+                disabled={connectingArca}
+                data-testid="new-chat-landing-arca-error-retry"
               >
                 Try again
               </button>

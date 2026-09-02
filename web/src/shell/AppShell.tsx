@@ -739,6 +739,11 @@ export function AppShell() {
         // Changes tab shares the Files gate — same on-disk workspace, just the
         // changed-files scope.
         changes: showFilesPanel,
+        // GitHub tab shares the Files gate too — it needs a git checkout on
+        // disk. The panel itself renders the "gh not installed" / "not a git
+        // repo" / "no PR" states, so the tab is present whenever there's a
+        // workspace.
+        github: showFilesPanel,
         // Browser tab: shown only when the desktop shell hosts the embedded
         // WebContentsView. A plain web build has no embedded browser, and an
         // older desktop build predates the `browser*` bridge — both hide the
@@ -766,7 +771,7 @@ export function AppShell() {
   // this convergent even when several tabs vanish at once.
   useEffect(() => {
     if (railTabsAvailable[rightRailTab]) return;
-    const next = (["files", "changes", "subagents", "browser"] as const).find(
+    const next = (["files", "changes", "github", "subagents", "browser"] as const).find(
       (t) => railTabsAvailable[t],
     );
     if (next) setRightRailTab(next);
@@ -1124,6 +1129,21 @@ export function AppShell() {
     },
     [setPanelInitialKey, terminalFirst, setSearchParams, conversationId],
   );
+
+  // Reveal the rail on the GitHub tab (from the composer's PR link). Mirrors
+  // openFileViewer's rail-reveal, but deselects any file/shell so the tab's
+  // own content (the stacked diff) shows rather than the FileViewer.
+  const openGithubTab = useCallback(() => {
+    setSelectedFilePath(null);
+    setSelectedTerminalKey(null);
+    if (!terminalFirst) setPanelInitialKey(null);
+    setExecutionLogsKey(null);
+    setFilesPanelOpen(false);
+    setSubagentsPanelOpen(false);
+    setRightRailTab("github");
+    setRightPanelOpen(true);
+    if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
+  }, [conversationId, terminalFirst, setPanelInitialKey]);
 
   // Strip the file-viewer URL params (file/diff/comment). Memoized on
   // ``setSearchParams`` so it always closes over react-router's *current*
@@ -1570,12 +1590,13 @@ export function AppShell() {
   const fileViewerContextValue = useMemo(
     () => ({
       openFile: openFileViewer,
+      openGithubTab,
       isChangedPath,
       conversationId,
       workspaceRoot,
       workspaceHome,
     }),
-    [openFileViewer, isChangedPath, conversationId, workspaceRoot, workspaceHome],
+    [openFileViewer, openGithubTab, isChangedPath, conversationId, workspaceRoot, workspaceHome],
   );
 
   // Context for descendants — ChatPage's ConnectionIndicator reads
@@ -1884,6 +1905,7 @@ export function AppShell() {
                     }
                   }}
                   isChildSession={isChildSession}
+                  subAgentName={activeSession?.subAgentName ?? null}
                   conversationId={conversationId}
                   actionConversation={actionConversation}
                   conversationTitle={headerConversationTitle}
@@ -1966,6 +1988,7 @@ export function AppShell() {
                     rightRailTab={rightRailTab}
                     onRightRailTabChange={handleRightRailTabChange}
                     showFilesPanel={showFilesPanel}
+                    showGithubTab={railTabsAvailable.github}
                     showBrowserTab={railTabsAvailable.browser}
                     changedCount={changedCount}
                     subagentsWorking={subagentsWorking}

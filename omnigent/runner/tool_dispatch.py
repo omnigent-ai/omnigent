@@ -47,10 +47,6 @@ if TYPE_CHECKING:
 
 import httpx
 
-from omnigent._wrapper_labels import (
-    CLAUDE_NATIVE_WRAPPER_VALUE,
-    CODEX_NATIVE_WRAPPER_VALUE,
-)
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.model_override import (
@@ -4267,8 +4263,8 @@ async def _execute_session_query_tool(
 
     - ``sys_session_list`` → ``GET /v1/sessions/{caller}/child_sessions``
     - ``sys_session_get_history`` → ``GET /v1/sessions/{target}/items``
-    - ``sys_session_get_info`` → ``GET /v1/sessions/{target}`` (plus a
-      best-effort ``GET /v1/runners/{id}/status`` for connectivity)
+    - ``sys_session_get_info`` → ``GET /v1/sessions/{target}`` (plus
+      best-effort runner connectivity and host readiness lookups)
     - ``sys_session_close`` → ``GET`` the target snapshot then ``PATCH
       /v1/sessions/{target}`` with a tombstoned title
     - ``sys_session_share`` → ``PUT /v1/sessions/{target}/permissions``
@@ -4362,6 +4358,23 @@ async def _runner_online_or_none(
     return online if isinstance(online, bool) else None
 
 
+async def _host_harnesses_or_none(
+    host_id: str | None,
+    server_client: httpx.AsyncClient,
+) -> _JsonObject | None:
+    """Return the bound host's reported harness readiness, best-effort."""
+    if not host_id:
+        return None
+    try:
+        resp = await server_client.get(f"/v1/hosts/{host_id}", timeout=30.0)
+        if resp.status_code != 200:
+            return None
+        readiness = resp.json().get("configured_harnesses")
+    except Exception:  # noqa: BLE001
+        return None
+    return readiness if isinstance(readiness, dict) else None
+
+
 async def _session_get_info_via_rest(
     args: _JsonObject,
     conversation_id: str,
@@ -4373,13 +4386,15 @@ async def _session_get_info_via_rest(
     Resolves the target from ``args["session_id"]`` (falling back to the
     caller's own ``conversation_id`` when omitted), fetches the session
     snapshot, and projects the metadata fields — status, title, agent
-    binding, runner binding, host, reasoning effort, effective model,
+    binding, runner binding, host and its reported harness readiness,
+    reasoning effort, effective model,
     parent linkage, workspace / git branch, persisted last-activity time,
     and the outstanding approval prompts (the prompts themselves plus a
     count). Runner connectivity
     is resolved best-effort via
     ``GET /v1/runners/{id}/status`` (``runner_online`` is ``None`` when
-    the lookup fails or no runner is bound). The full transcript is
+    the lookup fails or no runner is bound); host readiness is likewise
+    best-effort via ``GET /v1/hosts/{id}``. The full transcript is
     intentionally omitted — that is what ``sys_session_get_history`` returns.
 
     Maps a 404 to ``session_not_found`` and 401/403 to ``access_denied``
@@ -4416,6 +4431,11 @@ async def _session_get_info_via_rest(
     pending = pending_value if isinstance(pending_value, list) else []
     snap_agent_name = _optional_string(snap.get("agent_name"))
     snap_runner_id = _optional_string(snap.get("runner_id"))
+    snap_host_id = _optional_string(snap.get("host_id"))
+    runner_online, configured_harnesses = await asyncio.gather(
+        _runner_online_or_none(snap_runner_id, server_client),
+        _host_harnesses_or_none(snap_host_id, server_client),
+    )
     return json.dumps(
         {
             "session_id": snap.get("id"),
@@ -4433,8 +4453,9 @@ async def _session_get_info_via_rest(
             # unchanged.
             "agent_name": public_agent_name(snap_agent_name),
             "runner_id": snap.get("runner_id"),
-            "runner_online": await _runner_online_or_none(snap_runner_id, server_client),
+            "runner_online": runner_online,
             "host_id": snap.get("host_id"),
+            "configured_harnesses": configured_harnesses,
             "parent_session_id": snap.get("parent_session_id"),
             "sub_agent_name": snap.get("sub_agent_name"),
             "reasoning_effort": snap.get("reasoning_effort"),
@@ -7785,8 +7806,102 @@ async def _execute_task_lifecycle_tool(
     )
 
 
-async def _post_session_stop(server_client: httpx.AsyncClient, task_id: str) -> str | None:
-    """Hard-stop one claude-native child through the server."""
+def _cached_subagent_cancel_result(task_id: str, status: str) -> str:
+    """Return the cached terminal status for a sub-agent cancel."""
+    return json.dumps(
+        {
+            "cancelled": status == "cancelled",
+            "task_id": task_id,
+            "status": status,
+        }
+    )
+
+
+def _best_effort_cancel_result(task_id: str, status: str) -> str:
+    """Return an explicit unconfirmed cancel for harnesses without a hard-stop."""
+    return json.dumps(
+        {
+            "cancel_requested": True,
+            "cancel_confirmed": False,
+            "best_effort": True,
+            "task_id": task_id,
+            "status": status,
+            "message": (
+                "Interrupt forwarded, but no runner-side hard-stop is wired for "
+                "this harness; the child may keep running and no terminal inbox "
+                "status is guaranteed."
+            ),
+        }
+    )
+
+
+def _unconfirmed_hard_stop_result(task_id: str, *, status: str) -> str:
+    """Return an explicit failed-to-confirm hard-stop.
+
+    A ``stop_session`` 503 is a kill failure, not proof the pane is gone
+    (Claude already maps ``TmuxSessionNotAdvertised`` to 204; ``_uniform_stop``
+    503s any ``RuntimeError``, including a transient tmux error on a live
+    pane). Callers must not treat this as a cached terminal / ``absent``
+    result.
+    """
+    return json.dumps(
+        {
+            "cancelled": False,
+            "cancel_requested": True,
+            "cancel_confirmed": False,
+            "best_effort": True,
+            "task_id": task_id,
+            "status": status,
+            "message": (
+                "Hard-stop failed; the native worker may still be running. "
+                "Cleanup is not confirmed."
+            ),
+        }
+    )
+
+
+async def _native_child_pane_alive(task_id: str, wrapper_label: str | None) -> bool:
+    """Probe whether a failed native child's pane still answers.
+
+    ``failed`` does not say whether the harness process is still resident: a
+    required-terminal exit fails the entry after the process died, while a
+    harness-side failure can leave the pane alive. A failed entry earns a
+    hard-stop only when its registered pane is verifiably alive; a dead pane
+    is already gone, so the cached terminal failure is the truthful answer.
+    A later ``stop_session`` 503 is *not* used as a gone signal — that status
+    means the kill attempt failed (see :func:`_unconfirmed_hard_stop_result`).
+
+    The probe reads this runner's terminal registry, which sees the child's
+    pane only because sub-agent sessions run co-located on the parent's
+    runner. If that ever changes, this returns ``False`` and a live failed
+    child degrades to the cached status instead of a hard-stop.
+    """
+    from omnigent.runner.native.interrupt import native_agent_for_cancel
+    from omnigent.runtime import get_terminal_registry
+
+    agent = native_agent_for_cancel(wrapper_label)
+    if agent is None:
+        return False
+    try:
+        instance = get_terminal_registry().get(task_id, agent.terminal_name, "main")
+    except RuntimeError:
+        return False
+    if instance is None:
+        return False
+    try:
+        return await instance.is_alive()
+    except (OSError, RuntimeError):
+        return False
+
+
+async def _post_session_stop(
+    server_client: httpx.AsyncClient, task_id: str
+) -> tuple[int | None, str | None]:
+    """Hard-stop one stop-capable native child through the server.
+
+    :returns: ``(status_code, error)``. ``error`` is ``None`` on 2xx.
+        Transport failures use ``status_code is None``.
+    """
     try:
         resp = await server_client.post(
             f"/v1/sessions/{task_id}/events",
@@ -7794,21 +7909,29 @@ async def _post_session_stop(server_client: httpx.AsyncClient, task_id: str) -> 
             timeout=30.0,
         )
     except httpx.HTTPError as exc:
-        return f"Error: sys_cancel_task stop_session failed: {type(exc).__name__}: {exc}"
+        return None, f"Error: sys_cancel_task stop_session failed: {type(exc).__name__}: {exc}"
     if resp.status_code >= 400:
-        return (
+        return resp.status_code, (
             f"Error: sys_cancel_task stop_session returned {resp.status_code}: {resp.text[:200]}"
         )
-    return None
+    return resp.status_code, None
 
 
-async def _cancel_evicted_claude_native_subagent(
+async def _cancel_evicted_native_subagent(
     task_id: str,
     *,
     conversation_id: str,
     server_client: httpx.AsyncClient | None,
 ) -> str:
-    """Stop an owned claude-native child after its work entry was evicted."""
+    """Stop an owned stop-capable native child after its work entry was evicted.
+
+    Ownership is still verified against the snapshot's ``parent_session_id``
+    and the wrapper must name a harness with a runner-side hard-stop — an
+    evicted entry means the parent no longer knows the child's state, so
+    trusting the caller's task id alone could stop someone else's session.
+    """
+    from omnigent.runner.native.interrupt import native_cancel_capability
+
     if server_client is None:
         return "Error: sys_cancel_task requires server access for sub-agent tasks"
     try:
@@ -7819,15 +7942,20 @@ async def _cancel_evicted_claude_native_subagent(
         return f"Error: no in-flight task with task_id {task_id}"
     snapshot = resp.json()
     labels = snapshot.get("labels") if isinstance(snapshot, dict) else None
+    wrapper = labels.get(_SESSION_WRAPPER_LABEL_KEY) if isinstance(labels, dict) else None
     if (
         not isinstance(snapshot, dict)
         or snapshot.get("parent_session_id") != conversation_id
-        or not isinstance(labels, dict)
-        or labels.get(_SESSION_WRAPPER_LABEL_KEY) != CLAUDE_NATIVE_WRAPPER_VALUE
+        or not isinstance(wrapper, str)
+        or native_cancel_capability(wrapper) != "stop"
     ):
         return f"Error: no in-flight task with task_id {task_id}"
-    stop_error = await _post_session_stop(server_client, task_id)
+    # A 503 is a failed kill, not proof the pane is gone. Report an explicit
+    # unconfirmed result rather than ``absent`` / a cached terminal status.
+    status_code, stop_error = await _post_session_stop(server_client, task_id)
     if stop_error is not None:
+        if status_code == 503:
+            return _unconfirmed_hard_stop_result(task_id, status="unknown")
         return stop_error
     return json.dumps({"cancelled": True, "task_id": task_id, "status": "cancelled"})
 
@@ -7841,23 +7969,25 @@ async def _cancel_subagent_task(
     """
     Cancel a running sub-agent worker, routing by the child's harness.
 
-    Only ``claude-native`` has a runner-side hard-stop, so the cancel
-    event is chosen per harness — the child runner's ``stop_session``
-    handler 204 no-ops for every other harness, so posting it there
-    would silently do nothing:
+    The cancel event is chosen from ``native_cancel_capability``, which
+    mirrors the child runner's ``NativeInterruptRunner.stop`` dispatch
+    (Claude plus the ``_UNIFORM_STOP`` natives):
 
-    * ``claude-native`` — POST ``stop_session``. The child runner
-      hard-kills the worker's tmux pane via ``_handle_claude_native_stop``
-      and marks the work entry cancelled, delivering a terminal payload to
-      the parent inbox and auto-waking it. A bare interrupt (Escape) only
-      cancelled the current turn and left the worker process alive; a stop
-      frees it.
-    * everything else (in-process harnesses, ``codex-native``) — POST
-      ``interrupt``, the path those harnesses actually honor. For an
-      in-process child the runner marks the turn cancelled (via
-      ``_interrupted_sessions`` → ``_on_proxy_stream_end``) and wakes the
-      parent. ``codex-native`` has no runner-side stop yet, so its cancel
-      stays best-effort (see message).
+    * stop-capable natives — POST ``stop_session``: the child runner
+      hard-stops the worker, marks the work entry cancelled, delivers a
+      terminal payload to the parent inbox and auto-wakes it. A bare
+      interrupt only cancelled the current turn and left the worker
+      process alive; a stop frees it. A ``failed`` stop-capable entry
+      still routes when its pane answers the liveness probe — failed
+      does not mean exited. A dead pane returns the cached terminal
+      failure without a stop attempt (already gone). A live pane whose
+      ``stop_session`` returns 503 is reported as an unconfirmed /
+      best-effort cancel: the kill failed and the worker may still be
+      running.
+    * best-effort natives (Codex, Pi, Antigravity, OpenCode) and
+      in-process harnesses — POST ``interrupt``. No runner-side
+      hard-stop is wired for them, so the result is reported
+      best-effort rather than implying process termination.
 
     :param args: Tool arguments containing ``task_id`` or
         ``handle_id``, e.g. ``{"task_id": "conv_child456"}``.
@@ -7867,6 +7997,7 @@ async def _cancel_subagent_task(
     :returns: JSON cancellation result.
     """
     from omnigent.runner import app as _runner_app
+    from omnigent.runner.native.interrupt import native_cancel_capability
 
     task_id = args.get("task_id") or args.get("handle_id")
     if not task_id:
@@ -7875,7 +8006,7 @@ async def _cancel_subagent_task(
         return "Error: sys_cancel_task requires conversation_id"
     entry = _runner_app.get_subagent_work(str(task_id))
     if entry is None:
-        return await _cancel_evicted_claude_native_subagent(
+        return await _cancel_evicted_native_subagent(
             str(task_id),
             conversation_id=conversation_id,
             server_client=server_client,
@@ -7886,23 +8017,19 @@ async def _cancel_subagent_task(
     # busy edge (see ``mark_subagent_work_started``). Cancellation must still
     # route to the child during that window — otherwise cancelling a slow-to-
     # start sub-agent would silently no-op and leave it running. A failed
-    # claude-native entry still falls through because its pane may be alive.
-    is_claude_native = entry.wrapper_label == CLAUDE_NATIVE_WRAPPER_VALUE
-    can_stop_failed_claude = is_claude_native and entry.status == "failed"
-    if entry.status not in ("launching", "running", "waiting") and not can_stop_failed_claude:
-        return json.dumps(
-            {
-                "cancelled": entry.status == "cancelled",
-                "task_id": task_id,
-                "status": entry.status,
-            }
-        )
+    # stop-capable native entry still falls through when its pane is alive.
+    capability = native_cancel_capability(entry.wrapper_label)
+    can_stop_failed = (
+        capability == "stop"
+        and entry.status == "failed"
+        and await _native_child_pane_alive(str(task_id), entry.wrapper_label)
+    )
+    if entry.status not in ("launching", "running", "waiting") and not can_stop_failed:
+        return _cached_subagent_cancel_result(str(task_id), entry.status)
     if server_client is None:
         return "Error: sys_cancel_task requires server access for sub-agent tasks"
 
-    # claude-native is the only harness with a runner-side hard-stop; every
-    # other harness 204 no-ops on stop_session, so route them to interrupt.
-    event_type = "stop_session" if is_claude_native else "interrupt"
+    event_type = "stop_session" if capability == "stop" else "interrupt"
 
     try:
         resp = await server_client.post(
@@ -7914,6 +8041,8 @@ async def _cancel_subagent_task(
     except httpx.HTTPError as exc:
         return f"Error: sys_cancel_task {event_type} failed: {type(exc).__name__}: {exc}"
     if resp.status_code >= 400:
+        if capability == "stop" and resp.status_code == 503:
+            return _unconfirmed_hard_stop_result(str(task_id), status=entry.status)
         return (
             f"Error: sys_cancel_task {event_type} returned {resp.status_code}: {resp.text[:200]}"
         )
@@ -7921,21 +8050,8 @@ async def _cancel_subagent_task(
     updated = _runner_app.get_subagent_work(str(task_id)) or entry
     if updated.status == "cancelled":
         return json.dumps({"cancelled": True, "task_id": task_id, "status": "cancelled"})
-    if updated.wrapper_label == CODEX_NATIVE_WRAPPER_VALUE:
-        return json.dumps(
-            {
-                "cancel_requested": True,
-                "cancel_confirmed": False,
-                "best_effort": True,
-                "task_id": task_id,
-                "status": updated.status,
-                "message": (
-                    "Interrupt forwarded, but a runner-side hard-stop is not wired "
-                    "for codex-native workers yet; the child may keep running and no "
-                    "terminal inbox status is guaranteed."
-                ),
-            }
-        )
+    if capability == "best_effort":
+        return _best_effort_cancel_result(str(task_id), updated.status)
     return json.dumps(
         {
             "cancel_requested": True,

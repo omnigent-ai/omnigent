@@ -125,7 +125,7 @@ def test_codex_gateway_auth_failure_exits_with_actionable_error(
     assert "https://example.test/ai-gateway/codex/v1/responses" in output
     assert "auth likely expired/misconfigured" in output
     assert "wedged LLM" not in output
-    assert "600s harness idle watchdog" not in output
+    assert "harness idle watchdog" not in output
 
     requests = [json.loads(line) for line in request_log.read_text().splitlines()]
     assert any(

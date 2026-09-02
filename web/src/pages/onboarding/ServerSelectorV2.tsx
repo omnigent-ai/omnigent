@@ -34,6 +34,9 @@ export interface ConnectResult {
 export interface ServerSelectorV2Setup {
   /** Initial server URL to prefill (saved / failed / default). */
   initialUrl: string;
+  /** Step to open on. "server" jumps straight to the server list ("Connect to
+   *  new server…" from a connected window); default is the first-run landing. */
+  initialStep?: "server";
   /** Optional error banner (from the shell's ?error=&url= params). */
   error?: string;
   /** Recently-connected server URLs (most recent first). */
@@ -49,6 +52,10 @@ export interface ServerSelectorV2Setup {
    *  outcome so the terminal step can show ready/failed (on success the window
    *  navigates away, so it resolves only on failure in practice). */
   onStartLocal: () => Promise<{ ok: boolean; error?: string }>;
+  /** Subscribe to the local server's startup log lines while it boots; returns
+   *  an unsubscribe. Absent on older shells / browser preview → the terminal
+   *  step shows the coarse phases only. */
+  onSetupLog?: (cb: (line: string) => void) => () => void;
   /** Remove a recent server from the saved list, if the shell supports it. */
   onRemoveServer?: (url: string) => void;
   /** Copy text to the clipboard via the shell's native bridge. */
@@ -74,14 +81,17 @@ const CARD: Record<Step, { height: number; panelHeight: number }> = {
   landing: { height: 560, panelHeight: 308 },
   mode: { height: 560, panelHeight: 96 },
   server: { height: 600, panelHeight: 64 },
-  terminal: { height: 560, panelHeight: 96 },
+  terminal: { height: 560, panelHeight: 240 },
 };
 
 export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   // A failed connect reloads the wizard with an error (from ?error=&url=). That
   // only ever comes from the server-select flow, so open there — otherwise the
   // error banner renders on a step that isn't mounted and stays invisible.
-  const [step, setStep] = useState<Step>(setup.error ? "server" : "landing");
+  // "Connect to new server…" also opens the list directly (initialStep).
+  const [step, setStep] = useState<Step>(
+    setup.error || setup.initialStep === "server" ? "server" : "landing",
+  );
   const { height, panelHeight } = CARD[step];
 
   return (
@@ -125,7 +135,11 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
           />
         )}
         {step === "terminal" && (
-          <SetupTerminalStep onStartLocal={setup.onStartLocal} onBack={() => setStep("mode")} />
+          <SetupTerminalStep
+            onStartLocal={setup.onStartLocal}
+            onSetupLog={setup.onSetupLog}
+            onBack={() => setStep("mode")}
+          />
         )}
         {step === "server" && (
           <ServerSelectStep

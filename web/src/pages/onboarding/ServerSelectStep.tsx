@@ -214,13 +214,21 @@ export function ServerSelectStep({
 
       {(error || invalid || unconfirmedUrl || connectError) && (
         <div role="alert" className="mb-2 text-base text-destructive">
-          {invalid
-            ? "Enter a valid http(s) server URL."
-            : connectError
-              ? connectError
-              : unconfirmedUrl
-                ? "This doesn't look like an Omnigent server. Click Join again to connect anyway."
-                : error}
+          {invalid ? (
+            "Enter a valid http(s) server URL."
+          ) : connectError ? (
+            <>
+              <span className="font-medium">Couldn&apos;t connect to the server: </span>
+              {connectError}
+            </>
+          ) : unconfirmedUrl ? (
+            "This doesn't look like an Omnigent server. Click Join again to connect anyway."
+          ) : (
+            <>
+              <span className="font-medium">Couldn&apos;t connect to the server: </span>
+              {error}
+            </>
+          )}
         </div>
       )}
 

@@ -4171,6 +4171,28 @@ def server(
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
+    # GitHub App integration (per-user "Connect GitHub"). Enabled only
+    # when OMNIGENT_GITHUB_APP_* env supplies a client id/secret + a
+    # resolvable redirect URI; otherwise both stay None and the feature
+    # is inert (see docs/GITHUB_APP_SETUP.md).
+    from omnigent.server.github_app import GitHubAppConfig
+
+    github_config = GitHubAppConfig.from_env()
+    github_store = None
+    if github_config is not None:
+        from omnigent.stores.credential_store import build_secret_cipher
+
+        cipher = build_secret_cipher()
+        if cipher is None:
+            logging.getLogger(__name__).error(
+                "GitHub App is configured but disabled: set OMNIGENT_CREDENTIAL_ENC_KEY "
+                "(the credential store's encryption key) to enable it."
+            )
+        else:
+            from omnigent.connections.github import GithubConnectionStore
+
+            github_store = GithubConnectionStore(db_uri, cipher)
+
     # Accounts mode ergonomics: when accounts mode is selected
     # (OMNIGENT_AUTH_ENABLED=1 without OIDC config, or an explicit
     # OMNIGENT_AUTH_PROVIDER=accounts), supply sensible defaults
@@ -4238,6 +4260,8 @@ def server(
         admins=config_str_list(cfg.get("admins")),
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
+        github_config=github_config,
+        github_store=github_store,
         server_config=title_server_config,
     )
 

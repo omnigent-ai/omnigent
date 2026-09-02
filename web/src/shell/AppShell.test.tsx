@@ -373,6 +373,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     databricks_features: false,
     managed_sandboxes_enabled: false,
     sandbox_provider: null,
+    enabled_connections: [],
     sharing_mode: "on",
     public_sharing_enabled: true,
     server_version: null,

@@ -36,6 +36,41 @@ afterEach(() => {
 describe("useApproveHotkey", () => {
   const pending = { type: "elicitation", elicitationId: "e1", status: "pending" };
 
+  const FIELD_SCHEMA = {
+    type: "object",
+    properties: { branch: { type: "string" } },
+    required: ["branch"],
+  };
+
+  it("does not accept a prompt that asks for fields", () => {
+    // The card disables Submit until the required fields are answered. A
+    // keystroke that accepts anyway walks around that gate and sends the
+    // server none of what it asked for.
+    blocks = [{ ...pending, requestedSchema: FIELD_SCHEMA }];
+    renderHook(() => useApproveHotkey());
+    press();
+    expect(submitApproval).not.toHaveBeenCalled();
+  });
+
+  it("does not reach past a form to accept an older binary prompt", () => {
+    // The newest prompt is the one on screen. Accepting an older one while
+    // someone fills in a form approves something they cannot see.
+    blocks = [
+      { type: "elicitation", elicitationId: "old", status: "pending" },
+      { ...pending, elicitationId: "form", requestedSchema: FIELD_SCHEMA },
+    ];
+    renderHook(() => useApproveHotkey());
+    press();
+    expect(submitApproval).not.toHaveBeenCalled();
+  });
+
+  it("still accepts a bare consent prompt that names no fields", () => {
+    blocks = [{ ...pending, requestedSchema: { type: "object" } }];
+    renderHook(() => useApproveHotkey());
+    press();
+    expect(submitApproval).toHaveBeenCalledWith("e1", "accept");
+  });
+
   it("Cmd+Enter accepts the pending approval", () => {
     blocks = [pending];
     renderHook(() => useApproveHotkey());

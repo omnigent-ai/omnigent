@@ -101,6 +101,12 @@ interface ChatHeaderProps {
   onOpenSidebar: (peek?: boolean) => void;
   /** Whether the active session is a sub-agent (appends its identity). */
   isChildSession: boolean;
+  /**
+   * The session's own ``sub_agent_name`` — identifies a dispatched sub-agent
+   * in the breadcrumb. ``null`` when the session has none (top-level, or an
+   * Add-Agent child bound to its own agent).
+   */
+  subAgentName?: string | null;
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
   /** Owner-managed top-level row backing the title-adjacent action menu. */
@@ -189,6 +195,7 @@ export function ChatHeader({
   sidebarOpen,
   onOpenSidebar,
   isChildSession,
+  subAgentName,
   conversationId,
   actionConversation = null,
   conversationTitle,
@@ -446,6 +453,7 @@ export function ChatHeader({
             titleSlot={titleSlot ?? undefined}
             titleLinkTo={titleLinkTo}
             isChildSession={isChildSession}
+            subAgentName={subAgentName}
             boundAgent={boundAgent}
             wrapperLabel={wrapperLabel}
             actions={isMobile ? undefined : (conversationMenu ?? undefined)}

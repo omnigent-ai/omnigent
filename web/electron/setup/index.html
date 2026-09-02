@@ -433,6 +433,9 @@
       <div class="modal" role="dialog" aria-modal="true" aria-label="Omnigent CLI settings">
         <p class="modal-title">Omnigent CLI</p>
         <p class="cli-note" id="cli-status"></p>
+        <p class="cli-note" id="cli-managed" hidden>
+          Managed by your organization. Host enrollment uses <code>isaac omni</code>.
+        </p>
         <div id="cli-install" hidden>
           <p>
             <a
@@ -446,7 +449,7 @@
           <button type="button" id="cli-redetect">Re-detect</button>
         </div>
         <p id="cli-path-label">Path to the Omnigent CLI</p>
-        <div class="path-row">
+        <div class="path-row" id="cli-path-row">
           <input
             id="cli-path"
             type="text"
@@ -626,14 +629,17 @@
       const cliModalClose = document.getElementById("cli-modal-close");
       const cliModalNewUX = document.getElementById("cli-modal-new-ux");
       const cliStatus = document.getElementById("cli-status");
+      const cliManaged = document.getElementById("cli-managed");
       const cliInstall = document.getElementById("cli-install");
       const cliRedetect = document.getElementById("cli-redetect");
       const cliPathInput = document.getElementById("cli-path");
       const cliBrowse = document.getElementById("cli-browse");
       const cliPathNote = document.getElementById("cli-path-note");
-      // Tracks the last resolved install state so the Start-locally click can
-      // open settings (instead of failing) when the CLI isn't available.
+      // Tracks the last resolved install/policy state so Start locally can
+      // either open customization (public) or explain why it is unavailable
+      // (MDM-managed internal mode).
       let cliInstalled = false;
+      let cliCustomizationDisabled = false;
 
       async function refreshCliStatus() {
         let status;
@@ -644,19 +650,35 @@
         }
         const installed = Boolean(status.installed);
         cliInstalled = installed;
-        // Modal contents: install one-liner only when missing. The resolved /
+        cliCustomizationDisabled = status.customizationDisabled === true;
+        // The gear always opens the status dialog. MDM internal mode explains
+        // that customization is organization-managed and hides its controls;
+        // main-process IPC enforces the same policy.
+        cliGear.hidden = false;
+        cliManaged.hidden = !cliCustomizationDisabled;
+        // Keep the resolved path visible for context, but make customization
+        // controls explicitly inert in managed mode. `disabled` is preferable
+        // to `hidden`: it communicates policy without implying the CLI/path
+        // vanished, and the main-process IPC independently enforces it.
+        cliPathInput.disabled = cliCustomizationDisabled;
+        cliBrowse.disabled = cliCustomizationDisabled;
+        cliRedetect.disabled = cliCustomizationDisabled;
+        cliPathNote.hidden = cliCustomizationDisabled;
+        // Modal contents: install one-liner only when missing AND customization
+        // is allowed. The resolved /
         // auto-detected path is shown as the field's PLACEHOLDER (the value
         // stays empty until the user types an override), so the field reads as
         // "auto" by default.
-        cliInstall.hidden = installed;
+        cliInstall.hidden = installed || cliCustomizationDisabled;
         cliStatus.textContent = installed
           ? status.version
             ? `Found: ${status.version}`
             : "Omnigent CLI found."
           : "Omnigent CLI not found.";
         cliPathInput.placeholder = status.path || "/path/to/omni";
-        // Draw the eye to the (otherwise quiet) gear when the CLI is missing.
-        cliGear.classList.toggle("attention", !installed);
+        // Draw the eye to the (otherwise quiet) gear when the CLI is missing,
+        // unless policy disabled the gear entirely.
+        cliGear.classList.toggle("attention", !cliCustomizationDisabled && !installed);
       }
 
       // Validate + persist the typed path. Returns true when there's nothing to
@@ -719,9 +741,9 @@
       }
 
       if (setup.getCliStatus) {
-        // The gear is the only entry point to the CLI settings — hidden by
-        // default, revealed once we know the bridge exists.
-        cliGear.hidden = false;
+        // The gear opens CLI status/customization. It starts hidden and is
+        // revealed by refreshCliStatus; managed mode keeps it visible but
+        // replaces customization controls with a policy explanation.
         cliGear.addEventListener("click", openCliModal);
         // "Done" commits the typed path (it isn't applied on every keystroke).
         // On an invalid path, keep the modal open so the error stays visible.
@@ -756,9 +778,15 @@
           await refreshCliStatus();
         });
         startLocalBtn.addEventListener("click", async () => {
-          // No CLI yet → open settings (install / set path) rather than fail.
+          // No CLI yet → open settings (install / set path) when policy allows
+          // it; MDM internal mode deliberately disables custom paths.
           if (!cliInstalled) {
-            openCliModal();
+            if (cliCustomizationDisabled) {
+              err.textContent =
+                "The Omnigent CLI was not found. CLI customization is disabled by your organization.";
+            } else {
+              openCliModal();
+            }
             return;
           }
           err.textContent = "";
