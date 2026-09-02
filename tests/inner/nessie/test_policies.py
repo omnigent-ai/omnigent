@@ -192,6 +192,19 @@ _DENY_GAP_COMMANDS = [
     "sudo -n git push -d origin main",  # deletion through sudo wrapper
     "CI=1 git push -d origin main",  # env assignment before git push
     "cd repo && rm -rf /etc",  # destructive statement after a separator
+    # Interpreter-wrapped spellings — the same catastrophic command hidden in a
+    # shell interpreter previously classified as ALLOW because the statement
+    # splitter never unwrapped the wrapper, so an agent that intermittently
+    # emitted ``bash -c "…"`` bypassed even the DENY tier.
+    'bash -c "rm -rf /etc"',  # interpreter-wrapped catastrophic rm
+    'sh -c "git push --force origin main"',  # interpreter-wrapped force-push
+    'bash -lc "rm -rf /etc"',  # -c bundled with other interpreter flags
+    '/bin/bash -c "rm -rf /etc"',  # absolute interpreter path
+    'eval "rm -rf /etc"',  # eval runs its words as a command
+    'env -S "git push --force"',  # env split-string runs its value
+    "nohup rm -rf /etc",  # bare-word wrapper before the command
+    "echo done & rm -rf /etc",  # destructive statement behind a background &
+    "x=$(git push --force origin main)",  # command substitution body executes
 ]
 
 
@@ -226,6 +239,14 @@ def test_blast_radius_denies_destructive_variants(command: str) -> None:
         "git push -o=fast origin main",  # attached push-option value must not over-match `f`
         "CI=1 rm -rf build",  # env assignment does not make scoped cleanup catastrophic
         "CI=1 git push origin main",  # env assignment preserves ordinary-push ASK tier
+        # Interpreter-wrapped spellings of recoverable commands must land on
+        # the same ASK tier as their bare equivalents — the reported
+        # inconsistency was ``rm -rf <scratch>`` asking while
+        # ``bash -c "rm -rf <scratch>"`` executed ungated.
+        'bash -c "rm -rf build"',  # wrapped scoped recursive delete
+        'bash -c "git push origin main"',  # wrapped ordinary outward push
+        "bash -c 'bash -c \"rm -rf build\"'",  # nested interpreter wrappers
+        "timeout 5m git push origin main",  # option-taking wrapper before push
     ],
 )
 def test_blast_radius_recoverable_variants_ask_not_deny(command: str) -> None:
@@ -254,6 +275,8 @@ def test_blast_radius_recoverable_variants_ask_not_deny(command: str) -> None:
         "rm -f stale.log",  # force without recursion
         "rm -- -rf",  # `--` ends flags: deletes a file literally named "-rf" (not recursive)
         "git status",
+        "bash script.sh",  # interpreter without -c runs a file, not an inline command
+        'bash -c "git status"',  # wrapped safe command stays ALLOW after unwrapping
     ],
 )
 def test_blast_radius_safe_commands_allow(command: str) -> None:
