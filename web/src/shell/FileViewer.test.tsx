@@ -1650,6 +1650,32 @@ describe("FileViewer Cmd+F opens find on Monaco surfaces", () => {
     expect(searchOpenOf("code-viewer")).toBe("true");
     document.body.removeChild(chatArea);
   });
+
+  it.each(["pic.png", "doc.pdf", "widget.stl", "blob.bin"])(
+    "does NOT claim Cmd+F on non-Monaco viewers (%s)",
+    (path) => {
+      // Images, PDFs, 3D models, and binary files render CodeViewer's own
+      // viewers / "preview not available" notice, not Monaco — there is no find
+      // widget, so Cmd+F must fall through to the browser's find-in-page.
+      renderViewer({ open: true, path });
+      fireEvent.keyDown(window, { key: "f", metaKey: true });
+      expect(searchOpenOf("code-viewer")).toBe("false");
+    },
+  );
+
+  it("re-seeds the active surface when the viewer reopens the same path", () => {
+    const { rerender } = renderViewer({ open: true, path: "file1.py" });
+    // User clicks into the chat → the viewer is no longer the active surface.
+    const chatArea = document.createElement("div");
+    document.body.appendChild(chatArea);
+    fireEvent.mouseDown(chatArea);
+    // Close, then reopen the SAME path (no path change to re-seed on).
+    rerender(viewerTree({ open: false, path: "file1.py" }));
+    rerender(viewerTree({ open: true, path: "file1.py" }));
+    fireEvent.keyDown(window, { key: "f", metaKey: true });
+    expect(searchOpenOf("code-viewer")).toBe("true");
+    document.body.removeChild(chatArea);
+  });
 });
 
 describe("FileViewer Escape closes the active tab", () => {

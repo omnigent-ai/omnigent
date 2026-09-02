@@ -90,6 +90,7 @@ import {
   MONACO_SPLIT_BREAKPOINT,
   type SaveStatus,
   detectLang,
+  isBinaryPath,
   isImageFile,
   isModelFile,
   isNotebookPath,
@@ -653,6 +654,9 @@ function FileViewerBody({
   // they have no meaningful source/diff/preview text representation, so diff is
   // suppressed and they always resolve to the (viewer-owning) source surface.
   const isModel = isModelFile(path, fileQuery.data?.content_type);
+  // Binary/base64 files render CodeViewer's "Preview not available" notice, not
+  // Monaco — mirrors CodeViewer's own base64/binary-path check.
+  const isBinary = fileQuery.data?.encoding === "base64" || isBinaryPath(path);
   // Show Δ button only when the file appears in the session's changed-files list.
   const isDiffAvailable =
     !isImage &&
@@ -754,7 +758,14 @@ function FileViewerBody({
   // instead, matching how the Shiki/markdown surfaces (handled by their own
   // window listeners in CodeViewer) already open find. Gated to the Monaco
   // surfaces so it never double-handles the CodeViewer-owned ones.
-  const isMonacoFindSurface = diffViewActive || (lang !== "markdown" && viewMode !== "preview");
+  // The find toggle only reaches a Monaco surface: the diff view, or a non-diff
+  // file that CodeViewer renders in Monaco. Exclude the surfaces CodeViewer
+  // returns *before* the Monaco block — markdown (rich editor / its own find
+  // bar), previews, and the image/PDF/model/binary viewers — otherwise Cmd+F
+  // would swallow the browser's find-in-page with no find widget to show.
+  const isMonacoFindSurface =
+    diffViewActive ||
+    (lang !== "markdown" && viewMode !== "preview" && !isImage && !isPdf && !isModel && !isBinary);
   // Cmd+F must open find-in-file only while the file viewer is the surface the
   // user is working in. The viewer stays mounted beside the chat, so `open`
   // alone can't tell them apart, and reading `document.activeElement` at
@@ -765,9 +776,11 @@ function FileViewerBody({
   // works in the chat/composer, Cmd+F falls through to the browser's find.
   const viewerIsActiveSurfaceRef = useRef(true);
   useEffect(() => {
-    // Opening (or switching to) a file makes the viewer the active surface.
-    viewerIsActiveSurfaceRef.current = true;
-  }, [path]);
+    // Opening the viewer (or switching files within it) makes it the active
+    // surface again. Keyed on `open` too, so reopening the same path after the
+    // user had clicked into the chat re-seeds the ref instead of staying stale.
+    if (open) viewerIsActiveSurfaceRef.current = true;
+  }, [open, path]);
   useEffect(() => {
     if (!open) return;
     const track = (e: Event) => {

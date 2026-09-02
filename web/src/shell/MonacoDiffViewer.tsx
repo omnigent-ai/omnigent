@@ -152,7 +152,7 @@ export function MonacoDiffViewer({
       const modified = diffEditor.getModifiedEditor();
       modifiedEditorRef.current = modified;
       // Capture both models so the teardown effect can dispose them itself.
-      originalModelRef.current = diffEditor.getOriginalEditor().getModel();
+      originalModelRef.current = diffEditor.getOriginalEditor()?.getModel() ?? null;
       modifiedModelRef.current = modified.getModel();
       // Align the modified model's offsets with the raw "after" char offsets that
       // comment anchors use (CRLF files would otherwise be counted as LF).
