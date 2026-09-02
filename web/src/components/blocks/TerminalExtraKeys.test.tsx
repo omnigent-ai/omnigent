@@ -220,6 +220,23 @@ describe("TerminalExtraKeys focus policy", () => {
     tap(key("Shift Tab"));
     expect(target.focus).toHaveBeenCalledTimes(1);
   });
+
+  it("focuses the terminal on assistive-tech activation of a modifier only", () => {
+    // WHY: a synthesized click never goes through pointerdown, so the
+    // focus a screen-reader user needs to combine Ctrl with a character
+    // must come from the activation itself; plain keys still never focus.
+    const target = makeTarget();
+    render(<TerminalExtraKeys target={target} />);
+
+    fireEvent.click(key("Control"), { detail: 0 });
+    expect(key("Control")).toHaveAttribute("aria-pressed", "true");
+    expect(target.focus).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(key("Escape"), { detail: 0 });
+    fireEvent.click(key("Tab"), { detail: 0 });
+    expect(target.send).toHaveBeenCalledTimes(2);
+    expect(target.focus).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("TerminalExtraKeys sticky modifiers", () => {

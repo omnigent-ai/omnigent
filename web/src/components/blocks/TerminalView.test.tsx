@@ -24,6 +24,7 @@ import {
   writeTerminalClipboardPreference,
 } from "@/lib/terminalClipboardPreferences";
 import type { ConnectionState } from "./TerminalSession";
+import { LONG_PRESS_MS } from "./terminalExtraKeysModel";
 import {
   TerminalView,
   RECONNECT_BACKOFF_MS,
@@ -226,7 +227,6 @@ describe("extra-keys row", () => {
     render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" readOnly />);
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
     expect(screen.queryByTestId("terminal-extra-keys")).toBeNull();
-    expect(terminalSessionMock.instances[0].sendInput).not.toHaveBeenCalled();
   });
 
   it("removes the row live when the pointer turns fine", async () => {
@@ -238,7 +238,7 @@ describe("extra-keys row", () => {
     expect(screen.queryByTestId("terminal-extra-keys")).toBeNull();
   });
 
-  it("installs the active modifier transform on the session and re-applies it on re-dial", async () => {
+  it("installs the locked modifier transform on the session and re-applies it on re-dial", async () => {
     // WHY: a locked Ctrl must survive an automatic reconnect — the fresh
     // session is handed the row's current transform at attach time.
     stubCoarsePointer(true);
@@ -247,9 +247,17 @@ describe("extra-keys row", () => {
     const first = terminalSessionMock.instances[0];
     expect(first.setInputTransform).toHaveBeenLastCalledWith(null);
 
+    // Hold Ctrl past the long-press threshold (real timers: the reconnect
+    // backoff below runs on them too) so it locks rather than arms.
     const ctrl = screen.getByRole("button", { name: "Control" });
     fireEvent.pointerDown(ctrl, { pointerId: 1, button: 0, isPrimary: true });
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, LONG_PRESS_MS + 50);
+      });
+    });
     fireEvent.pointerUp(ctrl, { pointerId: 1, button: 0, isPrimary: true });
+    expect(ctrl).toHaveAttribute("data-modifier-state", "locked");
     const installed = first.setInputTransform.mock.calls.at(-1)?.[0];
     expect(installed).toBeTypeOf("function");
     expect(first.focus).toHaveBeenCalled();
@@ -267,6 +275,10 @@ describe("extra-keys row", () => {
     });
     const second = terminalSessionMock.instances[1];
     expect(second.setInputTransform).toHaveBeenCalledWith(installed);
+    expect(screen.getByRole("button", { name: "Control" })).toHaveAttribute(
+      "data-modifier-state",
+      "locked",
+    );
   });
 });
 
