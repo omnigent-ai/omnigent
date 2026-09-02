@@ -2305,7 +2305,9 @@ export function NewChatLandingScreen() {
   );
   // Sessions on the selected host — fetched only when a host is selected,
   // to avoid registering hundreds of sessions into the health poll at idle.
-  const { data: directorySessions } = useDirectorySessions(selectedHostId !== null);
+  const { data: directorySessions, isError: directorySessionsErrored } = useDirectorySessions(
+    selectedHostId !== null,
+  );
   // True when the user picked the sandbox option instead of a connected
   // host — the server provisions a sandbox host at create time
   // (host_type: "managed"), so no host_id or workspace is sent.
@@ -2784,10 +2786,35 @@ export function NewChatLandingScreen() {
   // falls through to the global one, then to blank (fork from current branch).
   const projectBaseBranch = storedProjectConfig?.base_branch?.trim() || null;
 
-  // The path the once-per-host auto-seed WOULD land on: the most-recent path,
-  // else the derived home. Exposed as a memo so we can probe its repo for
-  // worktrees before committing to it (see the fork-fresh redirect below).
-  const autoSeedCandidate = useMemo(() => recent[0] ?? derivedHome ?? null, [recent, derivedHome]);
+  // Working directory of the host's most recently active session — the only
+  // signal that sees a session started from a terminal (`omnigent claude` in a
+  // directory records that cwd as its workspace). `recent` is localStorage, so
+  // it only ever holds directories picked in THIS browser; every web pick also
+  // creates a session, making this the same set plus terminal launches, ordered
+  // by real `updated_at`. `undefined` = the list is still resolving, so the
+  // seed can wait rather than locking in a stale browser-local recent.
+  const latestHostWorkspace = useMemo<string | null | undefined>(() => {
+    if (selectedHostId === null || sandboxSelected) return null;
+    // A failed scan must not stall the seed forever — fall through to `recent`.
+    if (directorySessionsErrored) return null;
+    if (directorySessions === undefined) return undefined;
+    const match = directorySessions.find(
+      (s) => s.host_id === selectedHostId && s.workspace != null && isValidWorkspace(s.workspace),
+    );
+    return match?.workspace?.trim() ?? null;
+  }, [directorySessions, directorySessionsErrored, selectedHostId, sandboxSelected]);
+  // Hold the seed while the session list resolves, so a browser-local recent
+  // can't win the race and lock the once-per-host guard below.
+  const autoSeedPending = latestHostWorkspace === undefined;
+
+  // The path the once-per-host auto-seed WOULD land on: the host's last session
+  // workspace, else the most-recent path, else the derived home. Exposed as a
+  // memo so we can probe its repo for worktrees before committing to it (see
+  // the fork-fresh redirect below).
+  const autoSeedCandidate = useMemo(
+    () => latestHostWorkspace ?? recent[0] ?? derivedHome ?? null,
+    [latestHostWorkspace, recent, derivedHome],
+  );
   // "Fork fresh from default": when the project defines a default base branch,
   // a fresh new-chat must NOT silently continue in the last-used worktree — it
   // should fork a new branch off that default. The auto-seed can land on a
@@ -2802,6 +2829,7 @@ export function NewChatLandingScreen() {
     !sandboxSelected &&
     projectBaseBranch !== null &&
     seededHostRef.current !== selectedHostId &&
+    !autoSeedPending &&
     autoSeedCandidate !== null;
   const {
     data: seedWorktrees,
@@ -2840,13 +2868,15 @@ export function NewChatLandingScreen() {
   ]);
 
   // Seed the working directory once per host, into an empty field only, so an
-  // explicit pick isn't clobbered. Prefer the most-recent path; else the
-  // derived home (which can arrive a render later, hence the dep). Holds
-  // off while a project prefill is deciding on a workspace of its own.
+  // explicit pick isn't clobbered. Prefer the host's last session workspace;
+  // else the most-recent path; else the derived home (which can arrive a render
+  // later, hence the dep). Holds off while a project prefill is deciding on a
+  // workspace of its own.
   useEffect(() => {
     if (!prefillSettled) return;
     if (selectedHostId === null) return;
     if (seededHostRef.current === selectedHostId) return;
+    if (autoSeedPending) return;
     if (autoSeedCandidate === null) return;
     // Fork-fresh redirect pending: wait for the probe rather than seeding the
     // wrong path (and locking the once-per-host guard).
@@ -2879,6 +2909,7 @@ export function NewChatLandingScreen() {
   }, [
     selectedHostId,
     autoSeedCandidate,
+    autoSeedPending,
     prefillSettled,
     forkFreshMainPath,
     workspace,

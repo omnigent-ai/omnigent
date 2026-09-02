@@ -1677,6 +1677,57 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
+  it("seeds the working directory from the host's most recent session", async () => {
+    // A session started from a terminal (`omnigent claude` in a directory)
+    // records that cwd as its workspace but never touches this browser's
+    // recents, so the server-side session must win over the stale recent.
+    useDirectorySessionsMock.mockReturnValue({
+      data: [conv({ id: "s1", host_id: "host_1", workspace: "/Users/corey/universe" })],
+    } as unknown as ReturnType<typeof useDirectorySessions>);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+        "universe",
+      ),
+    );
+  });
+
+  it("ignores another host's session when seeding the working directory", async () => {
+    // Paths are host-specific: host_2's workspace must not seed host_1, which
+    // falls back to its own recent ("/Users/corey/repo").
+    useDirectorySessionsMock.mockReturnValue({
+      data: [conv({ id: "s1", host_id: "host_2", workspace: "/Users/corey/universe" })],
+    } as unknown as ReturnType<typeof useDirectorySessions>);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+  });
+
+  it("holds the working-directory seed until the session list resolves", async () => {
+    // Seeding the recent while the scan is in flight would lock the
+    // once-per-host guard and lose to a newer terminal-launched workspace.
+    useDirectorySessionsMock.mockReturnValue({
+      data: undefined,
+      isError: false,
+    } as unknown as ReturnType<typeof useDirectorySessions>);
+    renderLanding();
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-host-chip")).toBeTruthy());
+    expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).not.toContain("repo");
+  });
+
+  it("falls back to the recent when the session scan fails", async () => {
+    // A failed scan must not stall the seed forever — the field still fills.
+    useDirectorySessionsMock.mockReturnValue({
+      data: undefined,
+      isError: true,
+    } as unknown as ReturnType<typeof useDirectorySessions>);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+  });
+
   it("quotes server URLs in host and Lakebox connect commands", () => {
     setOmnigentHostConfig({ cliServerUrlSuffix: "/api?profile=dev&glob=*" });
     renderLanding({ databricks_features: true });
