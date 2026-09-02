@@ -120,4 +120,18 @@ ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
         args=("acp",),
         omnigent_mcp=False,
     ),
+    # MiniMax Code drives ``mcode acp`` and reads the credentials written by
+    # ``mcode login``; Omnigent stores no credential or model selection.
+    "minimax": AcpCliHarness(
+        install=HarnessInstallSpec(
+            "MiniMax Code",
+            "mcode",
+            None,
+            login_args=("login",),
+            install_hint="curl -fsSL https://filecdn.minimax.chat/public/install.sh | bash",
+            auth_hint="run `mcode login` (MiniMax Code manages its own credentials)",
+        ),
+        args=("acp",),
+        aliases=("mcode", "minimax-code"),
+    ),
 }

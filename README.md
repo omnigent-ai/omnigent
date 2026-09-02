@@ -4,7 +4,7 @@
 
 ### The open-source meta-harness for all your AI agents.
 
-Omnigent is an open-source **meta-harness** that gives you a common orchestration layer over Claude Code, Codex, Cursor, OpenCode, Goose, Antigravity, GitHub Copilot, Devin, Kiro, Qwen Code, Kimi Code, Grok Build, Jcode, Hermes, Pi, OpenAI Agents / Open Responses, and the agents you write yourself: swap or combine harnesses without rewriting, enforce policies and sandboxing, and collaborate in real time from any device — terminal, browser, phone, or the native desktop app.
+Omnigent is an open-source **meta-harness** that gives you a common orchestration layer over Claude Code, Codex, Cursor, OpenCode, Goose, Antigravity, GitHub Copilot, Devin, Kiro, Qwen Code, Kimi Code, Grok Build, Jcode, MiniMax Code, Hermes, Pi, OpenAI Agents / Open Responses, and the agents you write yourself: swap or combine harnesses without rewriting, enforce policies and sandboxing, and collaborate in real time from any device — terminal, browser, phone, or the native desktop app.
 
 [![PyPI version](https://img.shields.io/pypi/v/omnigent.svg)](https://pypi.org/project/omnigent/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/omnigent-ai/omnigent/blob/main/LICENSE)
@@ -31,7 +31,7 @@ Omnigent lets you:
 
 - **🤖 Supervise multiple agents.** Mix Claude Code, Codex, Cursor, OpenCode,
   Goose, Antigravity, GitHub Copilot, Devin, Kiro, Qwen Code, Kimi Code, Grok
-  Build, Jcode, Hermes, Pi, OpenAI Agents / Open Responses, and custom agents
+  Build, Jcode, MiniMax Code, Hermes, Pi, OpenAI Agents / Open Responses, and custom agents
   (defined in YAML) together in the same session. Ask one agent to review another's work, or split a task across
   agents that are each good at different things.
 
@@ -336,9 +336,9 @@ Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
 its coding agents or drive a live OpenClaw Gateway session over ACP.
 
 <details>
-<summary>Grok Build and Jcode</summary>
+<summary>Grok Build, Jcode, and MiniMax Code</summary>
 
-Two more coding agents are built in but have no `omnigent <name>` launcher of
+Three more coding agents are built in but have no `omnigent <name>` launcher of
 their own, because each ships a CLI that owns its own login or provider
 config. Install the vendor CLI, set it up, then name the harness:
 
@@ -352,24 +352,30 @@ omnigent run --harness grok           # 'grok-build' also works
 curl -fsSL https://jcode.sh/install | bash
 # configure a provider in ~/.jcode/config.toml
 omnigent run --harness jcode
+
+# MiniMax Code
+curl -fsSL https://filecdn.minimax.chat/public/install.sh | bash
+mcode login
+omnigent run --harness minimax        # 'mcode' and 'minimax-code' also work
 ```
 
-Both speak the [Agent Client Protocol](https://agentclientprotocol.com) over
-stdio, and Omnigent stores no credential for either — each CLI reads back the
-login or config it wrote to disk. That also means `--model` is refused rather
-than silently dropped: each runs its own default model. To pin one, configure
-an `acp:` agent whose command passes the vendor's own model flag. The exception
-is Jcode bound to an OpenAI-compatible Chat Completions provider in Omnigent's
-inference config: Omnigent then writes a session-private Jcode config and
-forwards the agent's `model`. Jcode's ACP server ignores session-scoped MCP
-servers, so Omnigent's MCP tools are not offered to it.
+All three speak the [Agent Client Protocol](https://agentclientprotocol.com) over
+stdio, and Omnigent stores no credential for any of them — each CLI reads back
+the login or config it wrote to disk. That also means `--model` is refused
+rather than silently dropped: each runs its own default model. To pin one,
+configure an `acp:` agent whose command passes the vendor's own model flag. The
+exception is Jcode bound to an OpenAI-compatible Chat Completions provider in
+Omnigent's inference config: Omnigent then writes a session-private Jcode
+config and forwards the agent's `model`. Jcode's ACP server ignores
+session-scoped MCP servers, so Omnigent's MCP tools are not offered to it.
 
 Use the vendor login rather than an API key. A builtin ACP row has no
 `env_passthrough` of its own, and `XAI_API_KEY` is not in the host-to-runner
 credential allowlist, so exporting it in your shell does not reach the agent.
 If you need the key route, pass it explicitly with
 `OMNIGENT_RUNNER_ENV_PASSTHROUGH=XAI_API_KEY`, or configure an `acp:` agent that
-declares the passthrough.
+declares the passthrough. For a MiniMax custom provider or API key, run
+`mcode provider`; MiniMax Code reads that saved configuration itself.
 
 </details>
 
