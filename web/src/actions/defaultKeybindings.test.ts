@@ -96,6 +96,22 @@ describe("default keybindings", () => {
     );
   });
 
+  it("pins legacy globals that intentionally run after preventDefault", () => {
+    const actions = new Set(
+      DEFAULT_KEYBINDINGS.filter((rule) => rule.allowDefaultPrevented).map((rule) => rule.action),
+    );
+    expect(actions).toEqual(
+      new Set([
+        "session.action.new",
+        "session.action.openPinned",
+        "workbench.action.openKeyboardShortcuts",
+        "workbench.action.toggleConversationsSidebar",
+        "workbench.action.toggleWorkspaceSidebar",
+        "composer.action.toggleDictation",
+      ]),
+    );
+  });
+
   it("does not repeat approval or send actions", () => {
     const guarded = DEFAULT_KEYBINDINGS.filter(
       (rule) =>

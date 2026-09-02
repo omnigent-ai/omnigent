@@ -52,6 +52,10 @@ const notTerminalFocus = not(when(CONTEXT_KEYS.terminalFocus));
 const paletteFocusAllowed = and(notMonacoFocus, or(notTerminalFocus, when(CONTEXT_KEYS.eventMeta)));
 const dictationFocusAllowed = and(notMonacoFocus, notTerminalFocus);
 
+// Native shells own plain primary+digit. Browser tabs reserve that chord, so
+// web adds Alt and matches physical DigitN (Alt rewrites e.key on macOS).
+// Legacy pinned handlers also ran after preventDefault, so these rules opt out
+// of the dispatcher's normal focused-widget handoff.
 const pinnedRules: KeybindingRule[] = [];
 for (let slot = 0; slot < 10; slot += 1) {
   const digit = slot === 9 ? "0" : String(slot + 1);
@@ -60,6 +64,7 @@ for (let slot = 0; slot < 10; slot += 1) {
       args: { slot },
       when: when(CONTEXT_KEYS.isNativeShell),
       allowRepeat: true,
+      allowDefaultPrevented: true,
     }),
     rule(
       `session.openPinned.browser.${digit}`,
@@ -69,6 +74,7 @@ for (let slot = 0; slot < 10; slot += 1) {
         args: { slot },
         when: notNativeShell,
         allowRepeat: true,
+        allowDefaultPrevented: true,
       },
     ),
   );
@@ -122,8 +128,21 @@ export const DEFAULT_KEYBINDINGS: readonly KeybindingRule[] = [
   rule("chat.openNextMessage", "chat.action.openNextMessage", "primary+alt+arrowdown", {
     allowRepeat: true,
   }),
+  // The legacy message navigator accepted Shift as an extra modifier.
+  rule(
+    "chat.openPreviousMessage.shift",
+    "chat.action.openPreviousMessage",
+    "primary+alt+shift+arrowup",
+    { allowRepeat: true },
+  ),
+  rule("chat.openNextMessage.shift", "chat.action.openNextMessage", "primary+alt+shift+arrowdown", {
+    allowRepeat: true,
+  }),
+  // Physical KeyV survives Option-modified layouts; terminal and Monaco own
+  // their focused keys, while other legacy widgets did not block this global.
   rule("composer.toggleDictation", "composer.action.toggleDictation", "primary+alt+[KeyV]", {
     stopPropagation: true,
+    allowDefaultPrevented: true,
     when: dictationFocusAllowed,
   }),
 

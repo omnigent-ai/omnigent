@@ -1,7 +1,7 @@
 "use client";
 
+import { HANDLED, useRegisterAction } from "@/actions";
 import { Button } from "@/components/ui/button";
-import { useVoiceDictationHotkey } from "@/hooks/useVoiceDictationHotkey";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { DictationBusyError, DictationSession } from "@/lib/dictation";
 import { isElectronShell } from "@/lib/nativeBridge";
@@ -427,10 +427,20 @@ export const ComposerMicButton = ({
     }
   }, [isListening, Ctor, serverAvailable, toggleServer]);
 
-  // ⌘⌥V toggles dictation from anywhere — same as clicking the button. Enabled
-  // whenever dictation could run (Web Speech OR the server path) and the
-  // composer isn't disabled, so the chord is inert when it can't do anything.
-  useVoiceDictationHotkey(toggle, enableHotkey && (Boolean(Ctor) || serverAvailable) && !disabled);
+  // ⌘⌥V toggles dictation from anywhere — same action as clicking the button.
+  const hotkeyEnabled = enableHotkey && (Boolean(Ctor) || serverAvailable) && !disabled;
+  useRegisterAction(
+    "composer.action.toggleDictation",
+    {
+      acceptsKeybindings: true,
+      isEnabled: () => hotkeyEnabled,
+      run: () => {
+        toggle();
+        return HANDLED;
+      },
+    },
+    hotkeyEnabled, // refresh action availability when capability/disabled state flips
+  );
 
   // While listening, Enter commits (end the take, keep the text) and Esc
   // cancels (end the take, discard back to the pre-dictation snapshot). Bound in

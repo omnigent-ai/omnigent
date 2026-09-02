@@ -30,6 +30,7 @@ import {
   SquareTerminalIcon,
   XIcon,
 } from "lucide-react";
+import { useMessageNavigationActions } from "@/hooks/useMessageNavigationActions";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
@@ -1884,23 +1885,7 @@ function MainAgentSurface({
     [streamBubbles],
   );
 
-  // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) — the composer's own unmodified
-  // ArrowUp/Down history-recall skips modified arrows, so this fires there too.
-  useEffect(() => {
-    // globalThis prefix because React's KeyboardEvent is imported above.
-    const handler = (e: globalThis.KeyboardEvent) => {
-      if (!(e.metaKey || e.ctrlKey) || !e.altKey) return;
-      if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
-      // Yield to a focused widget that already claimed the chord for its own
-      // list navigation (command palette, mention / slash menus).
-      if (e.defaultPrevented) return;
-      e.preventDefault();
-      if (e.key === "ArrowUp") nav.goPrev();
-      else nav.goNext();
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [nav]);
+  useMessageNavigationActions(nav);
 
   // Active reply quotes — each "Reply ↵" click appends; consumed by Composer.
   const [replyQuotes, setReplyQuotes] = useState<ReplyQuote[]>([]);

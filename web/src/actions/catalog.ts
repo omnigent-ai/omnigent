@@ -76,13 +76,13 @@ const definitions = [
     id: "session.action.openPrevious",
     title: "Open previous session",
     category: "Navigation",
-    palette: true,
+    palette: false,
   },
   {
     id: "session.action.openNext",
     title: "Open next session",
     category: "Navigation",
-    palette: true,
+    palette: false,
   },
   {
     id: "session.action.openPinned",
@@ -95,19 +95,19 @@ const definitions = [
     id: "chat.action.acceptApproval",
     title: "Accept approval prompt",
     category: "Chat",
-    palette: true,
+    palette: false,
   },
   {
     id: "chat.action.openPreviousMessage",
     title: "Go to previous message",
     category: "Chat",
-    palette: true,
+    palette: false,
   },
   {
     id: "chat.action.openNextMessage",
     title: "Go to next message",
     category: "Chat",
-    palette: true,
+    palette: false,
   },
   {
     id: "composer.action.send",
@@ -161,7 +161,7 @@ const definitions = [
     id: "composer.action.toggleDictation",
     title: "Toggle voice dictation",
     category: "Composer",
-    palette: true,
+    palette: false,
   },
   {
     id: "composer.action.commitDictation",

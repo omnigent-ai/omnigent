@@ -9,7 +9,7 @@ import {
 } from "@/hooks/useConversations";
 import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { useSessionAgent } from "@/hooks/useAgents";
-import { useApproveHotkey } from "@/hooks/useApproveHotkey";
+import type { ElicitationBlock } from "@/lib/blocks";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
@@ -111,7 +111,7 @@ import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { WorkspacePanel } from "./WorkspacePanel";
 import { SessionRail } from "./SessionRail";
 import type { RightRailTab } from "./railTabs";
-import { HANDLED, useRegisterAction } from "@/actions";
+import { HANDLED, NOT_HANDLED, useRegisterAction } from "@/actions";
 
 /**
  * Top-level layout. The sidebar and right panels are responsive:
@@ -173,11 +173,27 @@ function resolveTerminalViewKey(stored: string | null, agentKey: string): string
   return stored !== null && stored !== CHAT_VIEW_STORAGE_VALUE ? stored : agentKey;
 }
 
+function pendingApproval(): ElicitationBlock | undefined {
+  return [...useChatStore.getState().blocks]
+    .reverse()
+    .find(
+      (block): block is ElicitationBlock =>
+        block.type === "elicitation" && block.status === "pending" && !block.askUserQuestion,
+    );
+}
+
 export function AppShell() {
   const navigate = useNavigate();
-  // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
-  // here so it works on every chat route, regardless of where focus sits.
-  useApproveHotkey();
+  useRegisterAction("chat.action.acceptApproval", {
+    acceptsKeybindings: true,
+    isEnabled: () => pendingApproval() !== undefined,
+    run: () => {
+      const pending = pendingApproval();
+      if (!pending) return NOT_HANDLED;
+      void useChatStore.getState().submitApproval(pending.elicitationId, "accept");
+      return HANDLED;
+    },
+  });
 
   // Lock the iOS shell to the visual viewport so the soft keyboard can't pan
   // the whole document (which would hide the header and break the layout).

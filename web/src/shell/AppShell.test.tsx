@@ -249,6 +249,8 @@ import { useTerminalFirst } from "./TerminalFirstContext";
 import { useForkDialog } from "./ForkDialogContext";
 import { useChatStore } from "@/store/chatStore";
 
+const originalSubmitApproval = useChatStore.getState().submitApproval;
+
 /**
  * Test-only consumer of the TerminalFirstContext provided by AppShell.
  * The production view toggle lives in the header (ViewModeToggle); these
@@ -600,12 +602,70 @@ beforeEach(() => {
     terminalPending: false,
     sessionStatus: "idle",
     status: "idle",
+    blocks: [],
+    submitApproval: originalSubmitApproval,
   });
 });
 
 afterEach(cleanup);
 
 describe("AppShell header", () => {
+  it("accepts the most recent plain approval through the centralized capture action", () => {
+    const submitApproval = vi.fn();
+    useChatStore.setState({
+      blocks: [
+        { type: "elicitation", elicitationId: "old", status: "pending" },
+        { type: "elicitation", elicitationId: "question", status: "pending", askUserQuestion: {} },
+        { type: "elicitation", elicitationId: "new", status: "pending" },
+      ] as never,
+      submitApproval: submitApproval as never,
+    });
+    mockConversations([]);
+    renderShell("/");
+    fireEvent.keyDown(screen.getByTestId("action-settings"), { key: "Enter", ctrlKey: true });
+    expect(submitApproval).toHaveBeenCalledWith("new", "accept");
+  });
+
+  it("leaves Mod+Enter untouched when only a question prompt is pending", () => {
+    const submitApproval = vi.fn();
+    useChatStore.setState({
+      blocks: [
+        { type: "elicitation", elicitationId: "question", status: "pending", askUserQuestion: {} },
+      ] as never,
+      submitApproval: submitApproval as never,
+    });
+    mockConversations([]);
+    renderShell("/");
+    const event = new KeyboardEvent("keydown", {
+      key: "Enter",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    screen.getByTestId("action-settings").dispatchEvent(event);
+    expect(submitApproval).not.toHaveBeenCalled();
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  it("does not re-accept an already-responded approval", () => {
+    const submitApproval = vi.fn();
+    useChatStore.setState({
+      blocks: [{ type: "elicitation", elicitationId: "done", status: "responded" }] as never,
+      submitApproval: submitApproval as never,
+    });
+    mockConversations([]);
+    renderShell("/");
+    const event = new KeyboardEvent("keydown", {
+      key: "Enter",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    screen.getByTestId("action-settings").dispatchEvent(event);
+    expect(submitApproval).not.toHaveBeenCalled();
+    expect(event.defaultPrevented).toBe(false);
+  });
+
   it("opens the command palette through the centralized capture binding", () => {
     mockConversations([]);
     renderShell("/");

@@ -106,7 +106,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
 ];
 
 // Numeric pinned-session jump. The chord is platform-aware (see
-// usePinnedSessionHotkeys): plain Cmd/Ctrl+digit in the Electron shell, but
+// actions/defaultKeybindings.ts): plain Cmd/Ctrl+digit in the native shell, but
 // Cmd/Ctrl+Alt+digit in a browser tab, where plain Cmd+digit is reserved for
 // native tab-switching. Shown in both, with the matching glyphs.
 function pinnedSessionShortcut(native: boolean): Shortcut {
