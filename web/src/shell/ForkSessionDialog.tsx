@@ -172,11 +172,13 @@ export interface ForkRunConfigValue {
   reasoningEffort?: string;
   terminalLaunchArgs?: string[];
   /**
-   * DANGEROUS codex full-bypass opt-in. Only emitted (as `true`) when the
-   * user explicitly picks "Bypass approvals & sandbox" for a codex target;
-   * the fork request carries it as `codex_bypass_sandbox` and the server
-   * stamps the bypass label. Absent otherwise — the source's own bypass is
-   * always dropped, so a fork is never silently armed.
+   * DANGEROUS codex full-bypass opt-in. Emitted (as `true`) whenever the
+   * Approval picker shows "Bypass approvals & sandbox" at submit — an
+   * explicit pick, or the banner-gated stance seeded from a bypass-armed
+   * same-agent source. The fork request carries it as `codex_bypass_sandbox`
+   * and the server stamps the bypass label. Absent otherwise — the source's
+   * own label is always dropped server-side, so a fork is armed only when
+   * the dialog visibly promised it (danger banner shown).
    */
   codexBypassSandbox?: boolean;
 }
@@ -201,6 +203,10 @@ export interface ForkRunConfigValue {
  * inherit / reset-by-family path decides — which is exactly the seeded meaning.
  * This is what keeps the section honest against the async model catalog: a
  * submit before the catalog resolves can't emit a spurious `model_override`.
+ * One deliberate exception: the codex bypass stance is emitted whenever it is
+ * DISPLAYED (seeded or picked), because the server always drops the source's
+ * bypass label — an unsent seed would show a danger banner promising bypass
+ * and then clone with approvals back on.
  *
  * @param targetHarness - Effective target harness key (e.g. "claude-native"),
  *   or null for a non-native target (the section renders nothing).
@@ -315,8 +321,9 @@ function ForkRunConfig({
         : AGY_NATIVE_DEFAULT_SKIP_MODE;
     // Codex bypass rides a LABEL, not launch args, so match it first: a
     // same-agent fork of a bypass-armed codex source seeds the bypass option.
-    // (The source label is still dropped server-side; re-selecting here is the
-    // explicit opt-in that re-arms it — never automatic.)
+    // (The source label is still dropped server-side; the seeded stance is
+    // emitted at submit as the dedicated opt-in — banner-gated on screen —
+    // so the clone runs exactly what the dialog displays.)
     if (
       isCodex &&
       sameAgentAsSource &&
@@ -406,13 +413,20 @@ function ForkRunConfig({
             ? []
             : ["--permission-mode", permission];
       }
-    } else if (hasApproval && touched.mode) {
+    } else if (hasApproval) {
       if (isCodex && mode === CODEX_NATIVE_BYPASS_APPROVAL_VALUE) {
-        // Bypass is a LABEL, not launch args: clear any preset flags and set
-        // the dedicated opt-in the server turns into the bypass label.
-        value.terminalLaunchArgs = [];
+        // Bypass is a LABEL, not launch args: send the dedicated opt-in the
+        // server turns into the bypass label. Sent even UNTOUCHED: the server
+        // always drops the source's own bypass label, so a seeded-but-unsent
+        // stance would display the danger banner and then clone with
+        // approvals back on. Whenever the picker shows bypass — seeded or
+        // picked — the banner is on screen, making Clone the explicit,
+        // visible opt-in. An explicit pick also clears any preset flags; an
+        // untouched seed leaves launch args unsent so the fork copies the
+        // source's, as an untouched control always does.
+        if (touched.mode) value.terminalLaunchArgs = [];
         value.codexBypassSandbox = true;
-      } else {
+      } else if (touched.mode) {
         value.terminalLaunchArgs =
           CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === mode)?.args ?? [];
       }

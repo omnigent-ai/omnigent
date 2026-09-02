@@ -588,7 +588,7 @@ describe("ForkSessionDialog", () => {
     );
   });
 
-  it("arms Codex bypass only on an explicit pick, with a danger banner", async () => {
+  it("arms Codex bypass on an explicit pick, with a danger banner", async () => {
     forkSessionMock.mockResolvedValue({
       id: "conv_fork",
     } as unknown as Awaited<ReturnType<typeof forkSession>>);
@@ -617,6 +617,104 @@ describe("ForkSessionDialog", () => {
         terminalLaunchArgs: [],
         codexBypassSandbox: true,
       },
+    );
+  });
+
+  it("emits the seeded bypass opt-in on an untouched same-agent codex fork", async () => {
+    // A bypass-armed codex source, forked codex→codex (no agent switch): the
+    // Approval picker seeds "Bypass approvals & sandbox" with the danger
+    // banner. Submitting UNTOUCHED must still send the dedicated opt-in —
+    // the server always drops the source's own bypass label, so an unsent
+    // seed would show the banner and then clone with approvals back on
+    // (the displayed stance and the fork's actual stance would diverge).
+    forkSessionMock.mockResolvedValue({
+      id: "conv_fork",
+    } as unknown as Awaited<ReturnType<typeof forkSession>>);
+    setAgents(AVAILABLE_AGENTS, "codex-native");
+    useSessionMock.mockReturnValue({
+      session: {
+        labels: { "omnigent.codex_native.bypass_sandbox": "1" },
+        terminalLaunchArgs: null,
+      },
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useSession>);
+    renderDialog();
+
+    // Seeded, not picked: the bypass stance and its banner are on screen.
+    expect(screen.getByTestId("fork-session-config-approval")).toHaveTextContent(
+      "Bypass approvals & sandbox",
+    );
+    expect(screen.getByTestId("fork-session-codex-bypass-banner")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+    await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+    // Untouched picker: no launch-args override rides along (the fork copies
+    // the source's, as for any untouched control) — only the bypass opt-in.
+    expect(forkSessionMock).toHaveBeenCalledWith("conv_src", undefined, undefined, undefined, {
+      codexBypassSandbox: true,
+    });
+  });
+
+  it("sends no bypass when the seeded stance is changed away before submit", async () => {
+    // Seeding is a default, not a ratchet: stepping the picker back down to
+    // a preset must drop the opt-in and send that preset's launch args.
+    forkSessionMock.mockResolvedValue({
+      id: "conv_fork",
+    } as unknown as Awaited<ReturnType<typeof forkSession>>);
+    setAgents(AVAILABLE_AGENTS, "codex-native");
+    useSessionMock.mockReturnValue({
+      session: {
+        labels: { "omnigent.codex_native.bypass_sandbox": "1" },
+        terminalLaunchArgs: null,
+      },
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useSession>);
+    renderDialog();
+
+    fireEvent.click(screen.getByTestId("fork-session-config-approval"));
+    fireEvent.click(screen.getByRole("option", { name: "Default" }));
+    expect(screen.queryByTestId("fork-session-codex-bypass-banner")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+    await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+    expect(forkSessionMock).toHaveBeenCalledWith("conv_src", undefined, undefined, undefined, {
+      terminalLaunchArgs: [],
+    });
+  });
+
+  it("never seeds bypass across an agent switch away from the codex source", async () => {
+    // The seed is same-AGENT only: switching a bypass-armed codex source to
+    // another harness re-seeds that harness's defaults, so no banner and no
+    // opt-in ride along on an untouched submit.
+    forkSessionMock.mockResolvedValue({
+      id: "conv_fork",
+    } as unknown as Awaited<ReturnType<typeof forkSession>>);
+    setAgents(AVAILABLE_AGENTS, "codex-native");
+    useSessionMock.mockReturnValue({
+      session: {
+        labels: { "omnigent.codex_native.bypass_sandbox": "1" },
+        terminalLaunchArgs: null,
+      },
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useSession>);
+    renderDialog();
+
+    openAgentSelect();
+    fireEvent.click(screen.getByTestId("fork-session-agent-option-ag_claude_native"));
+    expect(screen.queryByTestId("fork-session-codex-bypass-banner")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+    await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+    expect(forkSessionMock).toHaveBeenCalledWith(
+      "conv_src",
+      undefined,
+      "ag_claude_native",
+      undefined,
+      {},
     );
   });
 
