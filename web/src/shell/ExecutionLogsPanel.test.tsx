@@ -9,6 +9,7 @@ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ActionsProvider, KeybindingDispatcher } from "@/actions";
 import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 import type { RawSessionItem } from "@/hooks/useSessionItems";
 
@@ -72,12 +73,15 @@ function renderPanel(
 ) {
   const onClose = props.onClose ?? vi.fn();
   const result = render(
-    <ExecutionLogsPanel
-      open={props.open ?? true}
-      conversationId="conv_main"
-      initialKey={props.initialKey ?? executionLogTabKey("main")}
-      onClose={onClose}
-    />,
+    <ActionsProvider>
+      <KeybindingDispatcher />
+      <ExecutionLogsPanel
+        open={props.open ?? true}
+        conversationId="conv_main"
+        initialKey={props.initialKey ?? executionLogTabKey("main")}
+        onClose={onClose}
+      />
+    </ActionsProvider>,
   );
   return { onClose, ...result };
 }

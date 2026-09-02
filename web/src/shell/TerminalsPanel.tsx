@@ -23,6 +23,13 @@
 // slide-in transition (translate-x) needs ~200ms to settle; on
 // desktop width is set instantly but the timeout is harmless.
 
+import {
+  ActionScopeProvider,
+  HANDLED,
+  NOT_HANDLED,
+  useActionScopeRegistration,
+  useRegisterAction,
+} from "@/actions";
 import { TerminalIcon, XIcon } from "lucide-react";
 import type { CSSProperties } from "react";
 import { useEffect, useRef, useState } from "react";
@@ -120,15 +127,16 @@ export function TerminalsPanel({
     }
   }, [open, initialTerminalKey, setActiveKey]);
 
-  // Esc dismisses — common panel convention.
-  useEffect(() => {
-    if (!open) return;
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") onClose();
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open, onClose]);
+  const actionScope = useActionScopeRegistration({ mode: "terminalsPanel", active: open });
+  useRegisterAction("panel.action.closeTerminals", {
+    scope: actionScope.id,
+    acceptsKeybindings: true,
+    run: () => {
+      if (!open) return NOT_HANDLED;
+      onClose();
+      return HANDLED;
+    },
+  });
 
   // Auto-close when there's nothing left to view.
   useEffect(() => {
@@ -147,6 +155,7 @@ export function TerminalsPanel({
 
   return (
     <aside
+      {...actionScope.rootProps}
       ref={ref}
       data-testid="terminals-panel"
       data-state={open ? "open" : "closed"}
@@ -164,97 +173,105 @@ export function TerminalsPanel({
       aria-hidden={!open}
       data-collapsed={!open || undefined}
     >
-      {/* Resize handle — desktop only. Suppressed in fluid mode. */}
-      {isDesktop && !fluid && (
-        <div
-          {...handleProps}
-          className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
-        />
-      )}
-
-      <header className="flex shrink-0 items-center justify-between border-border border-b px-4 py-2">
-        <h2 className="font-medium text-ui">Shells</h2>
-        <div className="flex items-center gap-1">
-          {/* Renders only when the agent's spec declares terminals. */}
-          <NewTerminalButton
-            conversationId={conversationId}
-            onCreated={(key) => setActiveKey(key)}
+      <ActionScopeProvider scope={actionScope}>
+        {/* Resize handle — desktop only. Suppressed in fluid mode. */}
+        {isDesktop && !fluid && (
+          <div
+            {...handleProps}
+            className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
           />
-          <Button type="button" variant="ghost" size="icon-sm" aria-label="Close" onClick={onClose}>
-            <XIcon className="size-4" />
-          </Button>
-        </div>
-      </header>
+        )}
 
-      {/* Split content.
+        <header className="flex shrink-0 items-center justify-between border-border border-b px-4 py-2">
+          <h2 className="font-medium text-ui">Shells</h2>
+          <div className="flex items-center gap-1">
+            {/* Renders only when the agent's spec declares terminals. */}
+            <NewTerminalButton
+              conversationId={conversationId}
+              onCreated={(key) => setActiveKey(key)}
+            />
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              aria-label="Close"
+              onClick={onClose}
+            >
+              <XIcon className="size-4" />
+            </Button>
+          </div>
+        </header>
+
+        {/* Split content.
           Mobile: flex-col — list on top, xterm below.
           Desktop: flex-row — list on left, xterm on right. */}
-      <div
-        ref={splitRef as React.RefObject<HTMLDivElement>}
-        className="flex min-h-0 flex-1 flex-col md:flex-row overflow-hidden"
-      >
-        {/* List panel */}
         <div
-          className={cn(
-            "relative flex shrink-0 flex-col overflow-y-auto py-1",
-            activeTerminal ? "border-b border-border md:border-b-0 md:border-r" : "flex-1",
-          )}
-          // Width only meaningful on desktop (horizontal split).
-          style={activeTerminal && isDesktop ? { width: listWidth } : undefined}
+          ref={splitRef as React.RefObject<HTMLDivElement>}
+          className="flex min-h-0 flex-1 flex-col md:flex-row overflow-hidden"
         >
-          {/* Column resize handle — desktop only */}
-          {activeTerminal && isDesktop && (
-            <div
-              {...columnHandleProps}
-              className="absolute inset-y-0 right-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
-            />
-          )}
-          {terminals.map((t) => {
-            const key = terminalTabKey(t);
-            const isActive = key === activeKey;
-            return (
-              <button
-                key={key}
-                type="button"
-                className={cn(
-                  "flex w-full items-center gap-2 px-3 py-1.5 text-left",
-                  isActive ? "bg-accent" : "hover:bg-accent/60",
-                )}
-                onClick={() => setActiveKey(isActive ? null : key)}
-              >
-                <TerminalIcon className="size-3.5 shrink-0 text-muted-foreground" />
-                {t.session && <span className="shrink-0 text-sm font-medium">{t.session}</span>}
-                <span className="truncate text-sm text-muted-foreground/70">{t.name}</span>
-                <span className="flex-1" />
-                <TerminalStatusBadge status={getStatus(t)} />
-              </button>
-            );
-          })}
-        </div>
-
-        {/* xterm — only rendered when a terminal is selected */}
-        <div className={cn("min-h-0 min-w-0 flex-1", !activeTerminal && "hidden")}>
-          {expanded && activeTerminal ? (
-            // Scope the key to the session: agent terminals share a fixed id
-            // across same-shape sessions (e.g. `terminal_claude_main`), so id
-            // alone reuses the xterm mount and shows stale scrollback.
-            <div key={`${conversationId}:${activeTerminal.id}`} className="flex h-full flex-col">
-              <TerminalView
-                sessionId={conversationId}
-                terminalId={activeTerminal.id}
-                readOnly={readOnly}
-                directAttachUrl={activeTerminal.directAttachUrl}
-                onStateChange={(state) => {
-                  setTerminalConnectionState(activeTerminal.id, state);
-                }}
-                onActivity={() => markTerminalActive(activeTerminal.id)}
+          {/* List panel */}
+          <div
+            className={cn(
+              "relative flex shrink-0 flex-col overflow-y-auto py-1",
+              activeTerminal ? "border-b border-border md:border-b-0 md:border-r" : "flex-1",
+            )}
+            // Width only meaningful on desktop (horizontal split).
+            style={activeTerminal && isDesktop ? { width: listWidth } : undefined}
+          >
+            {/* Column resize handle — desktop only */}
+            {activeTerminal && isDesktop && (
+              <div
+                {...columnHandleProps}
+                className="absolute inset-y-0 right-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
               />
-            </div>
-          ) : (
-            <div className="flex-1" />
-          )}
+            )}
+            {terminals.map((t) => {
+              const key = terminalTabKey(t);
+              const isActive = key === activeKey;
+              return (
+                <button
+                  key={key}
+                  type="button"
+                  className={cn(
+                    "flex w-full items-center gap-2 px-3 py-1.5 text-left",
+                    isActive ? "bg-accent" : "hover:bg-accent/60",
+                  )}
+                  onClick={() => setActiveKey(isActive ? null : key)}
+                >
+                  <TerminalIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                  {t.session && <span className="shrink-0 text-sm font-medium">{t.session}</span>}
+                  <span className="truncate text-sm text-muted-foreground/70">{t.name}</span>
+                  <span className="flex-1" />
+                  <TerminalStatusBadge status={getStatus(t)} />
+                </button>
+              );
+            })}
+          </div>
+
+          {/* xterm — only rendered when a terminal is selected */}
+          <div className={cn("min-h-0 min-w-0 flex-1", !activeTerminal && "hidden")}>
+            {expanded && activeTerminal ? (
+              // Scope the key to the session: agent terminals share a fixed id
+              // across same-shape sessions (e.g. `terminal_claude_main`), so id
+              // alone reuses the xterm mount and shows stale scrollback.
+              <div key={`${conversationId}:${activeTerminal.id}`} className="flex h-full flex-col">
+                <TerminalView
+                  sessionId={conversationId}
+                  terminalId={activeTerminal.id}
+                  readOnly={readOnly}
+                  directAttachUrl={activeTerminal.directAttachUrl}
+                  onStateChange={(state) => {
+                    setTerminalConnectionState(activeTerminal.id, state);
+                  }}
+                  onActivity={() => markTerminalActive(activeTerminal.id)}
+                />
+              </div>
+            ) : (
+              <div className="flex-1" />
+            )}
+          </div>
         </div>
-      </div>
+      </ActionScopeProvider>
     </aside>
   );
 }

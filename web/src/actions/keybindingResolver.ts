@@ -70,7 +70,7 @@ export function matchingKeybindingRules(
       index,
       scopeRank:
         (rule.activation ?? "focused") === "active"
-          ? -1
+          ? (environment.focusedModeRanks?.get(rule.mode) ?? -1)
           : (environment.focusedModeRanks?.get(rule.mode) ?? (rule.mode === "global" ? 0 : 1)),
     }))
     .filter(({ rule }) => (rule.phase ?? "bubble") === phase)

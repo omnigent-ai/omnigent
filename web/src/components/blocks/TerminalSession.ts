@@ -185,35 +185,6 @@ export type TerminalActivityListener = () => void;
 /** Listener for user keyboard input sent to the terminal. */
 export type TerminalInputListener = () => void;
 
-/** Kitty Keyboard Protocol / CSI-u encoding for Shift+Enter. */
-export const SHIFT_ENTER_CSI_U = "\x1b[13;2u";
-
-/**
- * Return the terminal bytes to send for a browser key event.
- *
- * xterm.js does not currently emit Kitty Keyboard Protocol sequences for
- * Shift+Enter, so the browser attach path synthesizes the CSI-u sequence
- * for that one key combination. This mirrors native terminals that support
- * CSI-u while keeping plain Enter and modified Enter variants on xterm's
- * default path.
- *
- * :param event: Browser keyboard event from xterm's custom key handler.
- * :returns: CSI-u bytes for Shift+Enter, or ``null`` to let xterm handle
- *     the event normally.
- */
-export function terminalKeyEventPayload(event: KeyboardEvent): string | null {
-  if (
-    event.key === "Enter" &&
-    event.shiftKey &&
-    !event.altKey &&
-    !event.ctrlKey &&
-    !event.metaKey
-  ) {
-    return SHIFT_ENTER_CSI_U;
-  }
-  return null;
-}
-
 // Reused across keystrokes — allocating a fresh TextEncoder per keypress
 // is needless churn on the input hot path.
 const INPUT_ENCODER = new TextEncoder();
@@ -492,6 +463,7 @@ export class TerminalSession {
   private readonly dataDispose: { dispose: () => void };
   private readonly osc52Dispose: { dispose: () => void };
   private readonly onClipboardRequest?: TerminalClipboardListener;
+  private readonly onInput?: TerminalInputListener;
   /** Whether this visible, interactive attach may write the local clipboard. */
   private clipboardEnabled: boolean;
   /**
@@ -547,6 +519,7 @@ export class TerminalSession {
     this.clipboardEnabled = clipboardEnabled;
     this.focusOnConnect = focusOnConnect;
     this.onClipboardRequest = onClipboardRequest;
+    this.onInput = onInput;
     // Read the user's code-font preference (Settings → Appearance) at
     // construction; a mid-session change is applied live via setFont(). The
     // xterm.js defaults (15px, no theme) feel out of place inside the app
@@ -663,31 +636,7 @@ export class TerminalSession {
       { signal },
     );
 
-    this.dataDispose = this.term.onData((d) => {
-      onInput?.();
-      // Stamp before the readyState guard so clipboard trust still reflects
-      // local input during a momentary WebSocket hiccup.
-      this.lastUserInputAt = performance.now();
-      if (this.ws.readyState !== WebSocket.OPEN) return;
-      this.ws.send(INPUT_ENCODER.encode(d));
-    });
-
-    this.term.attachCustomKeyEventHandler((e) => {
-      const payload = terminalKeyEventPayload(e);
-      if (payload === null) return true;
-      // xterm invokes this handler for keydown, keypress, and keyup.
-      // Suppress all three so xterm cannot also send a bare Enter; emit
-      // the CSI-u sequence once, on keydown.
-      if (e.type === "keydown") {
-        e.preventDefault();
-        onInput?.();
-        this.lastUserInputAt = performance.now();
-        if (this.ws.readyState === WebSocket.OPEN) {
-          this.ws.send(INPUT_ENCODER.encode(payload));
-        }
-      }
-      return false;
-    });
+    this.dataDispose = this.term.onData((data) => this.sendInput(data));
 
     // Replace xterm's lossy wheel→mouse-report conversion (trackpad deltas
     // are damped and capped to one report per event, which reads as
@@ -730,6 +679,16 @@ export class TerminalSession {
   /** Enable clipboard bridging only for the visible, interactive surface. */
   setClipboardEnabled(enabled: boolean): void {
     this.clipboardEnabled = enabled;
+  }
+
+  /** Send user input through the same activity and trust-accounting path. */
+  sendInput(data: string): void {
+    this.onInput?.();
+    this.lastUserInputAt = performance.now();
+    // Record intent before the transport gate so a brief disconnect preserves clipboard trust.
+    if (this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(INPUT_ENCODER.encode(data));
+    }
   }
 
   /**

@@ -655,6 +655,10 @@ function FileViewerBody({
     acceptsKeybindings: true,
     run: () => {
       if (!open || !onCloseTab || searchOpen) return NOT_HANDLED;
+      if (tocVisible) {
+        setTocOpen(false);
+        return HANDLED;
+      }
       guardDirty(onCloseTab);
       return HANDLED;
     },
@@ -765,6 +769,7 @@ function FileViewerBody({
   const viewMode: "editor" | "preview" | "source" | "diff" =
     diffActive && isDiffAvailable ? "diff" : fileViewMode;
   const diffViewActive = viewMode === "diff";
+  const tocVisible = tocOpen && lang === "markdown" && viewMode === "preview";
   // Persist where the reader was in the content area (markdown source, plain
   // text). The view mode is part of the key because each mode renders a
   // different height, so sharing one offset across modes would drop the reader
@@ -965,9 +970,9 @@ function FileViewerBody({
   if (lang === "markdown" && viewMode === "preview") {
     toolbarActions.push({
       key: "toc",
-      label: tocOpen ? "Hide table of contents" : "Show table of contents",
+      label: tocVisible ? "Hide table of contents" : "Show table of contents",
       icon: <ListIcon className="size-4" />,
-      active: tocOpen,
+      active: tocVisible,
       onSelect: () => setTocOpen((prev) => !prev),
     });
   }
@@ -1502,7 +1507,7 @@ function FileViewerBody({
               setSearchOpen={setSearchOpen}
               searchInputRef={searchInputRef}
               viewMode={viewMode}
-              tocOpen={tocOpen}
+              tocOpen={tocVisible}
               onTocToggle={() => setTocOpen((prev) => !prev)}
               onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
             />

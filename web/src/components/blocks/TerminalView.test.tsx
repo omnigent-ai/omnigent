@@ -11,6 +11,7 @@ import type * as TerminalSessionModule from "./TerminalSession";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ActionsProvider, KeybindingDispatcher } from "@/actions";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 import type { ConnectionState } from "./TerminalSession";
@@ -38,6 +39,7 @@ const terminalSessionMock = vi.hoisted(() => ({
     setTheme: ReturnType<typeof vi.fn>;
     setClipboardEnabled: ReturnType<typeof vi.fn>;
     focus: ReturnType<typeof vi.fn>;
+    sendInput: ReturnType<typeof vi.fn>;
   }[],
 }));
 
@@ -50,6 +52,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     setTheme = vi.fn();
     setClipboardEnabled = vi.fn();
     focus = vi.fn();
+    sendInput = vi.fn();
 
     constructor(
       container: HTMLDivElement,
@@ -61,6 +64,12 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
       clipboardEnabled = true,
       onClipboardRequest?: (text: string) => void,
     ) {
+      const xterm = document.createElement("div");
+      xterm.className = "xterm";
+      const textarea = document.createElement("textarea");
+      textarea.setAttribute("aria-label", "terminal input");
+      xterm.append(textarea);
+      container.append(xterm);
       terminalSessionMock.instances.push({
         url,
         container,
@@ -71,6 +80,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         setTheme: this.setTheme,
         setClipboardEnabled: this.setClipboardEnabled,
         focus: this.focus,
+        sendInput: this.sendInput,
       });
     }
   },
@@ -143,6 +153,64 @@ describe("buildAttachPath", () => {
     // a leading slash is required for that concatenation to be
     // correct against any page origin.
     expect(buildAttachPath("conv_abc", "terminal_bash_s1", false).startsWith("/")).toBe(true);
+  });
+});
+
+describe("terminal keybinding actions", () => {
+  async function renderTerminal(readOnly = false) {
+    render(
+      <ActionsProvider>
+        <KeybindingDispatcher />
+        <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" readOnly={readOnly} />
+      </ActionsProvider>,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    return screen.getByRole("textbox", { name: "terminal input" });
+  }
+
+  it("sends Shift+Enter CSI-u once through the centralized action", async () => {
+    const target = await renderTerminal();
+    const event = new KeyboardEvent("keydown", {
+      key: "Enter",
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    target.dispatchEvent(event);
+    expect(terminalSessionMock.instances[0]!.sendInput).toHaveBeenCalledWith("\x1b[13;2u");
+    expect(terminalSessionMock.instances[0]!.sendInput).toHaveBeenCalledOnce();
+    expect(event.defaultPrevented).toBe(true);
+    fireEvent.keyDown(target, { key: "Enter", shiftKey: true, repeat: true });
+    expect(terminalSessionMock.instances[0]!.sendInput).toHaveBeenCalledTimes(2);
+  });
+
+  it("leaves plain and other modified Enter combinations to xterm", async () => {
+    const target = await renderTerminal();
+    fireEvent.keyDown(target, { key: "Enter" });
+    fireEvent.keyDown(target, { key: "Enter", shiftKey: true, altKey: true });
+    expect(terminalSessionMock.instances[0]!.sendInput).not.toHaveBeenCalled();
+  });
+
+  it("consumes Shift+Enter without writing from a read-only view", async () => {
+    const target = await renderTerminal(true);
+    expect(fireEvent.keyDown(target, { key: "Enter", shiftKey: true })).toBe(false);
+    expect(terminalSessionMock.instances[0]!.sendInput).not.toHaveBeenCalled();
+  });
+
+  it("does not capture Shift+Enter from terminal overlay controls", async () => {
+    render(
+      <ActionsProvider>
+        <KeybindingDispatcher />
+        <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" onResume={() => {}} />
+      </ActionsProvider>,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    act(() =>
+      terminalSessionMock.instances[0]!.onState({ kind: "closed", reason: "gone", code: 1000 }),
+    );
+    const resume = screen.getByRole("button", { name: "Resume session" });
+    expect(fireEvent.keyDown(resume, { key: "Enter", shiftKey: true })).toBe(true);
+    expect(terminalSessionMock.instances[0]!.sendInput).not.toHaveBeenCalled();
   });
 });
 

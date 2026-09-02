@@ -3,6 +3,7 @@ import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useRef } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ActionsProvider, KeybindingDispatcher } from "@/actions";
 import { type TerminalInfo, useTerminals } from "@/hooks/useTerminals";
 import { TerminalsPanel } from "./TerminalsPanel";
 
@@ -74,6 +75,7 @@ function mockTerminalList(terminals: TerminalInfo[]) {
 function renderPanel({
   initialTerminalKey = null,
   readOnly = false,
+  onClose = vi.fn(),
   terminals = [
     makeTerminal("terminal_main", "main", "s1"),
     makeTerminal("terminal_worker", "worker", "s2"),
@@ -81,17 +83,21 @@ function renderPanel({
 }: {
   initialTerminalKey?: string | null;
   readOnly?: boolean;
+  onClose?: () => void;
   terminals?: TerminalInfo[];
 } = {}) {
   mockTerminalList(terminals);
   return render(
-    <TerminalsPanel
-      open
-      conversationId="conv_terminal"
-      initialTerminalKey={initialTerminalKey}
-      readOnly={readOnly}
-      onClose={vi.fn()}
-    />,
+    <ActionsProvider>
+      <KeybindingDispatcher />
+      <TerminalsPanel
+        open
+        conversationId="conv_terminal"
+        initialTerminalKey={initialTerminalKey}
+        readOnly={readOnly}
+        onClose={onClose}
+      />
+    </ActionsProvider>,
   );
 }
 
@@ -107,6 +113,13 @@ afterEach(() => {
 });
 
 describe("TerminalsPanel navigation", () => {
+  it("closes through the centralized Escape action", () => {
+    const onClose = vi.fn();
+    renderPanel({ onClose });
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
   it("opens to the list view with all terminals visible and no terminal mounted", () => {
     renderPanel();
 

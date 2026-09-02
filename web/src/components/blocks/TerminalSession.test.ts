@@ -9,7 +9,6 @@
 import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  SHIFT_ENTER_CSI_U,
   TerminalSession,
   WHEEL_REPORTS_MAX_PER_EVENT,
   applyTerminalCopy,
@@ -21,7 +20,6 @@ import {
   parseTerminalClipboardMessage,
   sgrWheelReports,
   terminalTheme,
-  terminalKeyEventPayload,
   type ConnectionState,
   wheelReportPayload,
   type WheelMouseState,
@@ -202,35 +200,6 @@ describe("terminalTheme", () => {
     expect(theme.background).toBe("#131517");
     expect(theme.foreground).toBe("#e4e4e7");
     expect(theme.brightBlack).toBe("#71717a");
-  });
-});
-
-describe("terminalKeyEventPayload", () => {
-  function keyEvent(init: KeyboardEventInit): KeyboardEvent {
-    return new KeyboardEvent("keydown", init);
-  }
-
-  it("encodes Shift+Enter as Kitty CSI-u", () => {
-    const payload = terminalKeyEventPayload(keyEvent({ key: "Enter", shiftKey: true }));
-
-    // This is the byte sequence prompt-toolkit maps to F20, which the
-    // REPL binds to "insert newline". Returning "\x1b\r" here would be
-    // the old Alt+Enter fallback, not Kitty/CSI-u support.
-    expect(payload).toBe(SHIFT_ENTER_CSI_U);
-    expect(payload).toBe("\x1b[13;2u");
-  });
-
-  it("leaves plain Enter on xterm's default path", () => {
-    expect(terminalKeyEventPayload(keyEvent({ key: "Enter" }))).toBeNull();
-  });
-
-  it("does not override other modified Enter combinations", () => {
-    expect(terminalKeyEventPayload(keyEvent({ key: "Enter", altKey: true }))).toBeNull();
-    expect(terminalKeyEventPayload(keyEvent({ key: "Enter", ctrlKey: true }))).toBeNull();
-    expect(terminalKeyEventPayload(keyEvent({ key: "Enter", metaKey: true }))).toBeNull();
-    expect(
-      terminalKeyEventPayload(keyEvent({ key: "Enter", shiftKey: true, altKey: true })),
-    ).toBeNull();
   });
 });
 
@@ -553,6 +522,21 @@ describe("TerminalSession", () => {
     socket.open();
 
     expect(focusSpy).not.toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it("sends semantic action input through the normal activity path", () => {
+    const onInput = vi.fn();
+    const { socket, session } = makeSession(undefined, onInput);
+    session.sendInput("before-open");
+    expect(onInput).toHaveBeenCalledOnce();
+    expect(socket.sent).toHaveLength(0);
+
+    socket.open();
+    session.sendInput("\x1b[13;2u");
+    expect(onInput).toHaveBeenCalledTimes(2);
+    const payload = socket.sent.find((message) => ArrayBuffer.isView(message));
+    expect(Array.from(payload as Uint8Array)).toEqual([27, 91, 49, 51, 59, 50, 117]);
     session.dispose();
   });
 

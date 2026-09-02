@@ -8,6 +8,13 @@
 // returned cleanup directly — no `useEffect` + `useRef` dance, no
 // guard against a missing `ref.current`.
 
+import {
+  ActionScopeProvider,
+  HANDLED,
+  NOT_HANDLED,
+  useActionScopeRegistration,
+  useRegisterAction,
+} from "@/actions";
 import { Loader2Icon } from "lucide-react";
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
@@ -223,6 +230,23 @@ export function TerminalView({
   activeRef.current = active;
   const focusOnConnectRef = useRef(focusOnConnect);
   focusOnConnectRef.current = focusOnConnect;
+  const terminalScope = useActionScopeRegistration({ mode: "terminal", active });
+  useRegisterAction(
+    "terminal.action.sendSequence",
+    {
+      scope: terminalScope.id,
+      acceptsKeybindings: true,
+      isEnabled: () => active && sessionRef.current !== null,
+      run: ({ args }) => {
+        const session = sessionRef.current;
+        if (!active || !session) return NOT_HANDLED;
+        // Consume the key in read-only terminals without writing a fallback CR.
+        if (!readOnly) session.sendInput(args.data);
+        return HANDLED;
+      },
+    },
+    `${active}:${readOnly}:${state.kind}`,
+  );
   // Track whether this terminal has already tried a keyless re-dial after a
   // 4400 wrong-replica close. If keyless still fails with 4400, the host is
   // genuinely unreachable — stop retrying.
@@ -744,28 +768,31 @@ export function TerminalView({
 
   return (
     <div
+      {...terminalScope.rootProps}
       data-testid="terminal-view"
       data-state={state.kind}
       data-terminal-id={terminalId}
       data-terminal-theme={isDark ? "dark" : "light"}
       className="relative flex min-h-0 flex-1 flex-col"
     >
-      {/* `p-1` lives on the wrapper, not the xterm mount node: FitAddon
-          reads the parent's border-box height but only subtracts the xterm
-          element's own padding, so padding on the mount node oversizes the
-          grid by a row and `overflow-hidden` clips the footer. */}
-      <div className="min-h-0 flex-1 overflow-hidden p-1">
-        <div key={connectAttempt} ref={attachSession} className="h-full w-full overflow-hidden" />
-      </div>
-      {state.kind !== "connected" && (
-        <StatusOverlay
-          state={state}
-          reconnectPending={reconnectPending}
-          onResume={onResume ? handleResume : undefined}
-          resumePending={resumePending}
-          resumeError={resumeError}
-        />
-      )}
+      <ActionScopeProvider scope={terminalScope}>
+        {/* `p-1` lives on the wrapper, not the xterm mount node: FitAddon
+            reads the parent's border-box height but only subtracts the xterm
+            element's own padding, so padding on the mount node oversizes the
+            grid by a row and `overflow-hidden` clips the footer. */}
+        <div className="min-h-0 flex-1 overflow-hidden p-1">
+          <div key={connectAttempt} ref={attachSession} className="h-full w-full overflow-hidden" />
+        </div>
+        {state.kind !== "connected" && (
+          <StatusOverlay
+            state={state}
+            reconnectPending={reconnectPending}
+            onResume={onResume ? handleResume : undefined}
+            resumePending={resumePending}
+            resumeError={resumeError}
+          />
+        )}
+      </ActionScopeProvider>
     </div>
   );
 }

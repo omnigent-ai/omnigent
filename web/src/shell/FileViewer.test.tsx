@@ -32,11 +32,15 @@ vi.mock("./CodeViewer", () => ({
     viewMode,
     path,
     searchOpen,
+    tocOpen,
+    onTocToggle,
     onDirtyChange,
   }: {
     viewMode: string;
     path: string;
     searchOpen?: boolean;
+    tocOpen?: boolean;
+    onTocToggle?: () => void;
     onDirtyChange?: (dirty: boolean) => void;
   }) => (
     <div
@@ -44,9 +48,11 @@ vi.mock("./CodeViewer", () => ({
       data-view-mode={viewMode}
       className={path.endsWith(".py") ? "monaco-editor" : undefined}
       data-search-open={String(!!searchOpen)}
+      data-toc-open={String(!!tocOpen)}
     >
       {path.endsWith(".py") ? <input aria-label={`editor ${path}`} /> : null}
       <button type="button" aria-label="make dirty" onClick={() => onDirtyChange?.(true)} />
+      <button type="button" aria-label="open toc" onClick={onTocToggle} />
     </div>
   ),
 }));
@@ -266,6 +272,16 @@ function viewerTree({
 
 function renderViewer(props: RenderProps = {}) {
   return render(viewerTree(props));
+}
+
+// Markdown modes live in a Radix menu, which opens on pointerdown rather than click.
+function openModeMenu() {
+  fireEvent.pointerDown(screen.getByRole("button", { name: /^View mode/ }), { button: 0 });
+}
+
+function selectMode(mode: "Preview" | "Edit" | "Source") {
+  openModeMenu();
+  fireEvent.click(screen.getByRole("menuitem", { name: mode }));
 }
 
 // ── Setup / teardown ──────────────────────────────────────────────────────────
@@ -1115,16 +1131,6 @@ describe("FileViewer markdown preview/edit/source modes", () => {
 
   const viewModeOf = () => screen.getByTestId("code-viewer").getAttribute("data-view-mode");
 
-  // Markdown's three modes live behind a single "View mode" dropdown (the
-  // toolbar was too full for three side-by-side buttons). Open it, then click
-  // the wanted option. Radix menus open on pointerdown, not click.
-  const openModeMenu = () =>
-    fireEvent.pointerDown(screen.getByRole("button", { name: /^View mode/ }), { button: 0 });
-  const selectMode = (mode: "Preview" | "Edit" | "Source") => {
-    openModeMenu();
-    fireEvent.click(screen.getByRole("menuitem", { name: mode }));
-  };
-
   it("opens a markdown file in the rich-text editor by default", () => {
     // notes.md is not a changed file, so no diff view competes — the default
     // previewable mode ("editor") must reach CodeViewer for markdown. Preview
@@ -1671,6 +1677,35 @@ describe("FileViewer Escape closes the active tab", () => {
     renderWithCloseTab(onCloseTab);
     fireEvent.keyDown(window, { key: "Escape" });
     expect(onCloseTab).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes an open Markdown TOC before closing the file", () => {
+    const onCloseTab = vi.fn();
+    useCommentsMock.mockReturnValue(makeCommentsQuery(undefined));
+    renderViewer({ open: true, path: "README.md", onCloseTab });
+    selectMode("Preview");
+    fireEvent.click(screen.getByRole("button", { name: "open toc" }));
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-toc-open", "true");
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-toc-open", "false");
+    expect(onCloseTab).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onCloseTab).toHaveBeenCalledOnce();
+  });
+
+  it("does not consume Escape for a TOC hidden by another view mode", () => {
+    const onCloseTab = vi.fn();
+    useCommentsMock.mockReturnValue(makeCommentsQuery(undefined));
+    renderViewer({ open: true, path: "README.md", onCloseTab });
+    selectMode("Preview");
+    fireEvent.click(screen.getByRole("button", { name: "open toc" }));
+    selectMode("Edit");
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "editor");
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onCloseTab).toHaveBeenCalledOnce();
   });
 
   it("ignores Escape while focus is in a text field", () => {

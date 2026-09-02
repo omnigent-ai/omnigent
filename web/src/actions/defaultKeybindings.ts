@@ -42,6 +42,9 @@ function rule<A extends ActionId>(
   } as KeybindingRule<A>;
 }
 
+// prompt-toolkit maps CSI-u Shift+Enter to F20; ESC+CR is the old Alt+Enter fallback.
+const SHIFT_ENTER_CSI_U = "\u001b[13;2u";
+
 const suggestionsClosed = not(when(CONTEXT_KEYS.composerSuggestionsOpen));
 const composerEnterSends = not(when(CONTEXT_KEYS.composerEnterInserts));
 const composerSubmitWithModEnter = when(CONTEXT_KEYS.composerSubmitWithModEnter);
@@ -295,11 +298,13 @@ export const DEFAULT_KEYBINDINGS: readonly KeybindingRule[] = [
 
   rule("terminal.sendShiftEnter", "terminal.action.sendSequence", "shift+enter", {
     mode: "terminal",
-    args: { data: "\u001b[13;2u" },
+    args: { data: SHIFT_ENTER_CSI_U },
+    when: when(CONTEXT_KEYS.terminalFocus),
     phase: "capture",
     allowRepeat: true,
     stopPropagation: true,
   }),
+  // Active panel ties intentionally resolve by this bottom-to-top layering order.
   rule("panel.closeFiles", "panel.action.closeFiles", "escape", {
     mode: "filesPanel",
     activation: "active",

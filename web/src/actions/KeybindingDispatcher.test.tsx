@@ -24,6 +24,7 @@ function Handler({
     | "composer.action.dismissSuggestions"
     | "file.action.closeSearch"
     | "panel.action.closeFiles"
+    | "panel.action.closeTerminals"
     | "session.action.new"
     | "workbench.action.toggleConversationsSidebar"
     | "workbench.action.toggleWorkspaceSidebar";
@@ -264,6 +265,49 @@ describe("KeybindingDispatcher", () => {
     });
     expect(dismiss).toHaveBeenCalledOnce();
     expect(closeSearch).not.toHaveBeenCalled();
+  });
+
+  it("closes only the focused active panel when multiple panels are open", () => {
+    const closeFiles = vi.fn(() => HANDLED);
+    const closeTerminals = vi.fn(() => HANDLED);
+    const rules = [
+      {
+        id: "panel.terminals",
+        action: "panel.action.closeTerminals",
+        sequence: parseKeybinding("escape"),
+        mode: "terminalsPanel",
+        activation: "active" as const,
+      },
+      {
+        id: "panel.files",
+        action: "panel.action.closeFiles",
+        sequence: parseKeybinding("escape"),
+        mode: "filesPanel",
+        activation: "active" as const,
+      },
+    ] satisfies KeybindingRule[];
+    renderActions(
+      <>
+        <ActionScope mode="filesPanel">
+          <div>
+            <Handler action="panel.action.closeFiles" run={closeFiles} />
+            <button type="button">Files</button>
+          </div>
+        </ActionScope>
+        <ActionScope mode="terminalsPanel">
+          <div>
+            <Handler action="panel.action.closeTerminals" run={closeTerminals} />
+            <button type="button">Terminals</button>
+          </div>
+        </ActionScope>
+      </>,
+      rules,
+    );
+    const terminals = screen.getByRole("button", { name: "Terminals" });
+    terminals.focus();
+    fireEvent.keyDown(terminals, { key: "Escape" });
+    expect(closeTerminals).toHaveBeenCalledOnce();
+    expect(closeFiles).not.toHaveBeenCalled();
   });
 
   it("falls through a notHandled capture action to a composer bubble action", () => {
