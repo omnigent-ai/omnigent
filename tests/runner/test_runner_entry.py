@@ -1666,7 +1666,7 @@ def test_load_runner_idle_timeout_defaults_when_config_missing(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Missing runner config uses the default one-hour idle timeout.
+    """Missing runner config uses the default 24-hour idle timeout.
 
     :param monkeypatch: Pytest environment patch fixture.
     :param tmp_path: Isolated config home.
