@@ -2548,11 +2548,12 @@ class HostProcess:
         """Serve a read-only workspace filesystem request from the host.
 
         Runs :class:`omnigent.workspace_fs.WorkspaceReader` against the
-        session's workspace so the web UI's file panel keeps working when
-        the runner is offline but the host still holds the workspace on
-        disk. Read-only and confined to the workspace root; never writes
-        or runs a shell. Called inside a worker thread by the dispatcher
-        because git / directory-walk work can block.
+        session's workspace so the web UI's file and GitHub panels keep
+        working when the runner is offline but the host still holds the
+        workspace on disk. Read-only and confined to the workspace root; it
+        never writes, but does run read-only ``git`` (status/show/diff) and,
+        for the GitHub ops, the developer's own ``gh`` CLI. Called inside a
+        worker thread by the dispatcher because that work can block.
 
         :param frame: The fs request frame (op + workspace + params).
         :returns: A result frame with the runner-shaped payload, or an
@@ -2833,6 +2834,15 @@ class HostProcess:
                 include=cast("str | None", params.get("include")),
                 exclude=cast("str | None", params.get("exclude")),
                 limit=_coerce_int(params.get("limit", 500)),
+            )
+        if op == "github_info":
+            return r.github_info()
+        if op == "github_changes":
+            return r.github_changes(cast("str | None", params.get("base")))
+        if op == "github_diff":
+            return r.github_file_diff(
+                cast("str | None", params.get("base")),
+                str(params.get("path", "")),
             )
         raise ValueError(f"unknown fs op: {op!r}")
 
