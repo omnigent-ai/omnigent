@@ -1,6 +1,6 @@
 import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Outlet, useParams, useSearchParams } from "@/lib/routing";
+import { Outlet, useNavigate, useParams, useSearchParams } from "@/lib/routing";
 import {
   PROJECT_LABEL_KEY,
   type Conversation,
@@ -115,6 +115,7 @@ import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { WorkspacePanel } from "./WorkspacePanel";
 import { SessionRail } from "./SessionRail";
 import type { RightRailTab } from "./railTabs";
+import { HANDLED, useRegisterAction } from "@/actions";
 
 /**
  * Top-level layout. The sidebar and right panels are responsive:
@@ -177,6 +178,7 @@ function resolveTerminalViewKey(stored: string | null, agentKey: string): string
 }
 
 export function AppShell() {
+  const navigate = useNavigate();
   // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
   // here so it works on every chat route, regardless of where focus sits.
   useApproveHotkey();
@@ -1320,11 +1322,56 @@ export function AppShell() {
     onToggleRight: toggleRightPanel,
   });
 
-  // ⌘K (Ctrl+K) toggles the command palette. Bound capture-phase, so in the
-  // embedded build we claim the chord ahead of any host-page ⌘K listener.
-  // Bound here where the palette's open-state lives.
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const isEmbedded = useIsEmbedded();
+
+  useRegisterAction("session.action.new", {
+    run: () => {
+      navigate("/");
+      return HANDLED;
+    },
+  });
+  useRegisterAction("workbench.action.navigateInbox", {
+    run: () => {
+      navigate("/inbox");
+      return HANDLED;
+    },
+  });
+  useRegisterAction("workbench.action.navigateAutomations", {
+    run: () => {
+      navigate("/tasks");
+      return HANDLED;
+    },
+  });
+  useRegisterAction("workbench.action.navigateSettings", {
+    run: () => {
+      navigate("/settings");
+      return HANDLED;
+    },
+  });
+  useRegisterAction("workbench.action.toggleConversationsSidebar", {
+    run: () => {
+      toggleLeftSidebar();
+      return HANDLED;
+    },
+  });
+  useRegisterAction("workbench.action.toggleWorkspaceSidebar", {
+    run: () => {
+      toggleRightPanel();
+      return HANDLED;
+    },
+  });
+  useRegisterAction("workbench.action.showCommands", {
+    run: () => {
+      setCommandPaletteOpen((prev) => !prev);
+      return HANDLED;
+    },
+  });
+
+  // Legacy bindings stay active until the next migration opts these actions
+  // into central dispatch. Command-palette capture must still beat embedded
+  // host-page listeners. New session remains unconditionally palette-visible,
+  // while its keyboard binding stays disabled in embedded mode.
   useCommandPaletteHotkey(() => setCommandPaletteOpen((prev) => !prev));
   useNewSessionHotkey(!isEmbedded);
 
@@ -2143,12 +2190,7 @@ export function AppShell() {
               and in embedded mode — the sidebar's "Search" button opens it
               there even though the ⌘K hotkey is disabled (it belongs to the
               host page). */}
-          <CommandPalette
-            open={commandPaletteOpen}
-            onOpenChange={setCommandPaletteOpen}
-            onToggleLeftSidebar={toggleLeftSidebar}
-            onToggleRightSidebar={toggleRightPanel}
-          />
+          <CommandPalette open={commandPaletteOpen} onOpenChange={setCommandPaletteOpen} />
           {/* Transient toasts (e.g. "session archived"). Mounted once here so
               any surface can fire one via showToast(). */}
           {/* Match the previous toast system's effectively unbounded stack so

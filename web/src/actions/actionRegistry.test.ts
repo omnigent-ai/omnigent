@@ -9,6 +9,21 @@ const resolution = {
 };
 
 describe("ActionRegistry", () => {
+  it("keeps API-only actions out of keyboard dispatch until their migration", () => {
+    const registry = new ActionRegistry();
+    const run = vi.fn(() => HANDLED);
+    registry.registerAction({ action: "session.action.new", scopeId: null, run });
+    expect(registry.canHandle("session.action.new", resolution, { keyboardOnly: true })).toBe(
+      false,
+    );
+    expect(registry.execute({ action: "session.action.new", source: "keyboard" }, resolution)).toBe(
+      NOT_HANDLED,
+    );
+    expect(registry.execute({ action: "session.action.new", source: "palette" }, resolution)).toBe(
+      HANDLED,
+    );
+  });
+
   it("executes the newest enabled handler and falls through notHandled", () => {
     const registry = new ActionRegistry();
     const older = vi.fn(() => HANDLED);
@@ -65,9 +80,7 @@ describe("ActionRegistry", () => {
     });
 
     const focused = { ...resolution, focusedScopeIds: ["editor", "file"] };
-    expect(registry.execute({ action: "file.action.find", source: "keyboard" }, focused)).toBe(
-      HANDLED,
-    );
+    expect(registry.execute({ action: "file.action.find", source: "api" }, focused)).toBe(HANDLED);
     expect(calls).toEqual(["editor"]);
   });
 

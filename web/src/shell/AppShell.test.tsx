@@ -20,6 +20,7 @@ import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
+import { ActionsProvider, useActions } from "@/actions";
 
 const runnerHealthState = vi.hoisted(() => ({
   runnerOnline: undefined as boolean | undefined,
@@ -314,6 +315,50 @@ function ForkDialogProbe() {
  * Renders the current search params into a testid element so URL-sync
  * tests can assert on param changes without reaching into router internals.
  */
+function ShellActionProbe() {
+  const { executeAction } = useActions();
+  return (
+    <div>
+      <button
+        type="button"
+        data-testid="action-new"
+        onClick={() => executeAction("session.action.new", "api")}
+      >
+        action-new
+      </button>
+      <button
+        type="button"
+        data-testid="action-inbox"
+        onClick={() => executeAction("workbench.action.navigateInbox", "api")}
+      >
+        action-inbox
+      </button>
+      <button
+        type="button"
+        data-testid="action-automations"
+        onClick={() => executeAction("workbench.action.navigateAutomations", "api")}
+      >
+        action-automations
+      </button>
+      <button
+        type="button"
+        data-testid="action-settings"
+        onClick={() => executeAction("workbench.action.navigateSettings", "api")}
+      >
+        action-settings
+      </button>
+      <button
+        type="button"
+        data-testid="action-toggle-sidebar"
+        aria-label="test toggle action"
+        onClick={() => executeAction("workbench.action.toggleConversationsSidebar", "api")}
+      >
+        toggle action
+      </button>
+    </div>
+  );
+}
+
 function LocationDisplay() {
   const [params] = useSearchParams();
   return <div data-testid="url-params">{params.toString()}</div>;
@@ -394,46 +439,52 @@ function renderShell(path: string, info?: ServerInfo) {
     <QueryClientProvider client={qc}>
       <TooltipProvider>
         <MemoryRouter initialEntries={[path]}>
-          <Routes>
-            <Route element={<AppShell />}>
-              <Route
-                index
-                element={
-                  <>
-                    <div>home</div>
-                    <LocationDisplay />
-                  </>
-                }
-              />
-              <Route
-                path="c/:conversationId"
-                element={
-                  <>
-                    <TerminalFirstViewProbe />
-                    <ForkDialogProbe />
-                    <NavProbe />
-                    <LocationDisplay />
-                  </>
-                }
-              />
-              {/* The settings page itself renders inside the sidebar (its nav
+          <ActionsProvider>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route
+                  index
+                  element={
+                    <>
+                      <div>home</div>
+                      <ShellActionProbe />
+                      <LocationDisplay />
+                    </>
+                  }
+                />
+                <Route
+                  path="c/:conversationId"
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <ForkDialogProbe />
+                      <ShellActionProbe />
+                      <NavProbe />
+                      <LocationDisplay />
+                    </>
+                  }
+                />
+                {/* The settings page itself renders inside the sidebar (its nav
               replaces the session list), so the body here is irrelevant — what
               matters is that the route is /settings, which is what AppShell
               keys the sidebar pin off. The nav-* links stand in for the real
               Settings button and the sidebar's Back row, both of which live in
               components mocked out here. */}
-              <Route
-                path="settings"
-                element={
-                  <>
-                    <div>settings</div>
-                    <NavProbe />
-                    <LocationDisplay />
-                  </>
-                }
-              />
-            </Route>
-          </Routes>
+                <Route path="inbox" element={<div>inbox route</div>} />
+                <Route path="tasks" element={<div>automations route</div>} />
+                <Route
+                  path="settings"
+                  element={
+                    <>
+                      <div>settings</div>
+                      <NavProbe />
+                      <LocationDisplay />
+                    </>
+                  }
+                />
+              </Route>
+            </Routes>
+          </ActionsProvider>
         </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>
@@ -554,6 +605,33 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("AppShell header", () => {
+  it.each([
+    ["action-inbox", "inbox route"],
+    ["action-automations", "automations route"],
+    ["action-settings", "settings"],
+  ])("registers shell navigation action %s", (testId, destination) => {
+    mockConversations([]);
+    renderShell("/");
+    fireEvent.click(screen.getByTestId(testId));
+    expect(screen.getByText(destination)).toBeInTheDocument();
+  });
+
+  it("registers the new-session action", () => {
+    mockConversations([]);
+    renderShell("/c/current");
+    fireEvent.click(screen.getByTestId("action-new"));
+    expect(screen.getByText("home")).toBeInTheDocument();
+  });
+
+  it("registers the same sidebar toggle used by shell UI", () => {
+    mockConversations([]);
+    renderShell("/");
+    const sidebar = screen.getByTestId("sidebar");
+    const before = sidebar.getAttribute("data-open");
+    fireEvent.click(screen.getByTestId("action-toggle-sidebar"));
+    expect(sidebar.getAttribute("data-open")).not.toBe(before);
+  });
+
   it("renders the sidebar toggle on all pages", () => {
     mockConversations([]);
     renderShell("/");

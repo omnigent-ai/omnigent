@@ -19,6 +19,7 @@ export type {
   ActionRegistrationFor,
   ActionResolution,
   AvailableAction,
+  AvailablePaletteAction,
 } from "./actionRegistry";
 export type {
   ActionArgs,
@@ -26,6 +27,8 @@ export type {
   ActionId,
   ActionInvocation,
   ActionResult,
+  ActionIconName,
+  ArglessActionId,
   ActionSource,
   ContextPatch,
   ContextSnapshot,
