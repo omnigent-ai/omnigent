@@ -351,19 +351,12 @@ comment-only outcome. Say precisely why the existing approach won't do (in a
 review comment on that PR, so the author knows), then **switch to the author path
 (Step 2B) and open your own PR** that resolves the bug correctly. In your PR,
 reference the existing one and summarize why a fresh approach was warranted.
-Record `mode: "authored_fix"` and put the reviewed PR's number in your prose so
-the two are linked. **Close the superseded PR the instant yours is open — before
-you emit the interim handoff (Step 3.5) and before you start Step 4** (same reason
-as the fork take-over: two open PRs on one issue trip the duplicate-PR automation,
-which auto-closes the newer one — yours, and a cleanup left for the end of Step 4
-is what a mid-turn SSE drop strands): `gh pr comment <old> --body 'Superseded by
-#<yours> — a different approach was needed; see there.'` then `gh pr close <old>`.
-Closing a PR is a base-repo operation (it flips `state` on the PR object in
-`omnigent-ai/omnigent`), so `pull_requests: write` covers it **even for a
-contributor's fork PR** — expect the close to succeed; run it. Only if it returns
-a real error, record that error in `maintainer_review` and ask the maintainer to
-close it — never leave both open. Use this escape hatch deliberately, not for
-style preferences — a working,
+Record `mode: "authored_fix"`, put `Supersedes #<old>` on its own line in the new
+PR body, and keep the reviewed PR open while the replacement is under review.
+The trusted post-merge workflow closes the old PR only after the replacement
+actually merges. Comment on the old PR immediately with the replacement link so
+the contributor understands the handoff, but **do not close it yourself**. Use
+this escape hatch deliberately, not for style preferences — a working,
 root-cause-sound PR should be reviewed and improved in place, not replaced.
 
 When you keep the PR, you drive it to landable per Step 4 — pushing fixes directly
@@ -685,10 +678,10 @@ Once the set is genuinely green:
      CI-green gate (see 4.1); label it now so the preview builds while you drive
      Step 4. (Review-path fork PRs still wait for green — 4.1.)
    - **If you opened this PR to supersede another** (fork take-over, or the
-     "approach is wrong" escape hatch), you already commented on and closed that PR
-     *before* this handoff — see Step 4's fork-take-over and Step 2A's escape hatch.
-     Set `reviewed_pr_url` to the superseded PR here so the workflow can verify it's
-     closed as a backstop.
+     "approach is wrong" escape hatch), you already commented on that PR but left
+     it open. Ensure the replacement body contains `Supersedes #<old>` on its own
+     line, and set `reviewed_pr_url` so workflow reconciliation can preserve and
+     inform the original PR until the replacement merges.
 6. You do **not** merge. Opening the PR is not the finish line — go to Step 4 and
    drive it to a green, reviewed, ready-for-a-human state.
 
@@ -740,29 +733,17 @@ can land a fix depends on where its branch lives:
       then replay onto your branch, or `git cherry-pick`), then add your fix on top.
     - Credit the original author on the commits (`Co-authored-by: <name> <email>`,
       read from `gh pr view <pr> --json commits`).
-    - In your PR body, link the fork PR (`Builds on #<pr> by @<author>`) and say
-      why you re-opened it (couldn't push to the fork).
-    - **Close the fork PR the instant yours is open — before anything else.**
-      Two open PRs that fix the same issue trip the repo's duplicate-PR automation,
-      which will auto-close the **newer** one — i.e. *yours*. So the moment
-      `gh pr create` returns your PR number, comment on the fork PR pointing to
-      yours and close it **as the very next commands — before you emit the interim
-      handoff (Step 3.5) and before you start driving Step 4**:
+    - In your PR body, put `Supersedes #<pr>` on its own line, credit
+      `@<author>`, and say why you re-opened it (couldn't push to the fork). The
+      duplicate-PR workflow exempts trusted resolve-agent replacement PRs.
+    - Comment on the fork PR as soon as yours opens, but leave it open while the
+      replacement is being reviewed:
       ```
-      gh pr comment <fork-pr> --body 'Superseded by #<your-pr> — I took this over to add a fix because maintainer fork updates were unavailable. Your commits are carried over with credit. Thanks @<author>!'
-      gh pr close <fork-pr>
+      gh pr comment <fork-pr> --body 'Replacement #<your-pr> is open because maintainer fork updates were unavailable. Your commits are carried over with credit. This PR will remain open until the replacement merges. Thanks @<author>!'
       ```
-      Do **not** defer this to the end of Step 4: the session can drop mid-turn
-      (the `--server` SSE stream ends the Run step abruptly), and a cleanup left for
-      last is exactly what gets lost — stranding two open PRs. Close first, then
-      hand off. This both keeps the contributor informed and stops the dedup bot
-      from closing your PR as the duplicate. Closing a PR is a base-repo operation
-      (it flips `state` on the PR object in `omnigent-ai/omnigent`), so
-      `pull_requests: write` covers it **even though the head branch is on a fork**
-      — the fork-push restriction does not apply to a close. Expect it to succeed;
-      run it. Only if the close returns a real error, **record that error in
-      `maintainer_review`** and ask the maintainer to close `#<fork-pr>` in favor of
-      yours — never leave both silently open.
+      The trusted post-merge workflow reads the `Supersedes #<pr>` marker and
+      closes the contributor PR only after your replacement is merged. Never
+      close a contributor PR merely because a replacement was opened.
     - Set `mode: "authored_fix"`, record the fork PR's number in `reviewed_pr_url`,
       and drive **your** PR through the rest of Step 4 (you can push to it).
   - **If the fork PR needs no fix** (repro passes against it, CI green, review
