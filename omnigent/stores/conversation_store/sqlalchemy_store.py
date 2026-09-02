@@ -15,10 +15,12 @@ from sqlalchemy import (
     desc,
     func,
     insert,
+    literal,
     literal_column,
     or_,
     select,
     text,
+    tuple_,
     update,
 )
 from sqlalchemy.orm import QueryableAttribute, Session, aliased, load_only
@@ -2158,11 +2160,16 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         from omnigent.server.auth import LEVEL_OWNER
 
-        # ACL (accessible_by/owned_by) resolves against session_permissions on
-        # the Omnigent DB, so it still needs a pre-fetch; archived now lives on
-        # the AP conversations table and is filtered inline below.
+        # ACL strategy mirrors list_conversations: single-DB pushes the
+        # permission check into the labels query as correlated EXISTS (no
+        # id materialization); split-DB keeps the prefetch fallback since a
+        # cross-DB EXISTS is impossible. Archived lives on the AP
+        # conversations table and is filtered inline below either way.
+        needs_acl = accessible_by is not None or owned_by is not None
+        acl_pushdown = needs_acl and self._conv_engine is self._engine
+
         permission_ids: list[str] | None = None
-        if accessible_by is not None or owned_by is not None:
+        if needs_acl and not acl_pushdown:
             with self._session("list_projects") as meta_sess:
                 accessible_set: set[str] | None = None
                 owned_set: set[str] | None = None
@@ -2209,6 +2216,30 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             if permission_ids is not None:
                 stmt = stmt.where(SqlConversationLabel.conversation_id.in_(permission_ids))
+            if acl_pushdown:
+                if accessible_by is not None:
+                    stmt = stmt.where(
+                        select(SqlSessionPermission.conversation_id)
+                        .where(
+                            SqlSessionPermission.workspace_id == SqlConversationLabel.workspace_id,
+                            SqlSessionPermission.conversation_id
+                            == SqlConversationLabel.conversation_id,
+                            SqlSessionPermission.user_id == accessible_by,
+                        )
+                        .exists()
+                    )
+                if owned_by is not None:
+                    stmt = stmt.where(
+                        select(SqlSessionPermission.conversation_id)
+                        .where(
+                            SqlSessionPermission.workspace_id == SqlConversationLabel.workspace_id,
+                            SqlSessionPermission.conversation_id
+                            == SqlConversationLabel.conversation_id,
+                            SqlSessionPermission.user_id == owned_by,
+                            SqlSessionPermission.level >= LEVEL_OWNER,
+                        )
+                        .exists()
+                    )
             return [row[0] for row in ap_sess.execute(stmt).all()]
 
     def delete_label(
@@ -2339,15 +2370,24 @@ class SqlAlchemyConversationStore(ConversationStore):
         # kind and archived both live on the AP ``conversations`` table now
         # (kind derived from parent-nullness, archived a real column), so they
         # are filtered directly on the AP query below. The only filters that
-        # still require an Omnigent-side prefetch are the permission scopes.
+        # still require Omnigent-side data are the permission scopes.
         needs_meta_filter = (accessible_by is not None) or (owned_by is not None)
 
+        # ACL strategy. Single-DB (the AP and Omnigent tables share one bind):
+        # push the permission check into the conversations query as a
+        # correlated EXISTS, so LIMIT bounds the work and no ids round-trip
+        # through Python — the prefetch otherwise costs O(all-accessible) per
+        # request (ids out, ids back in as an IN clause, two UUID conversions
+        # each). Split-DB: a cross-DB EXISTS is impossible, so keep the
+        # prefetch fallback.
+        acl_pushdown = needs_meta_filter and self._conv_engine is self._engine
+
         qualifying_ids: list[str] | None = None
-        if needs_meta_filter:
+        if needs_meta_filter and not acl_pushdown:
             # Pre-fetch permission-qualifying IDs from the Omnigent DB
             # (session_permissions), then filter the AP query. accessible_by and
             # owned_by are intersected (both applied) to match the prior
-            # behaviour. (ACL pushdown to a single AP query is a follow-up.)
+            # behaviour.
             with self._session("list_conversations") as meta_sess:
                 accessible_set: set[str] | None = None
                 owned_set: set[str] | None = None
@@ -2398,6 +2438,34 @@ class SqlAlchemyConversationStore(ConversationStore):
 
             if qualifying_ids is not None:
                 stmt = stmt.where(SqlConversation.id.in_(qualifying_ids))
+
+            if acl_pushdown:
+                # Correlated on both PK members so Postgres can drive the
+                # semi-join off pk_session_permissions
+                # (workspace_id, user_id, conversation_id). accessible_by and
+                # owned_by are intersected (both applied), matching the
+                # prefetch path.
+                if accessible_by is not None:
+                    stmt = stmt.where(
+                        select(SqlSessionPermission.conversation_id)
+                        .where(
+                            SqlSessionPermission.workspace_id == SqlConversation.workspace_id,
+                            SqlSessionPermission.conversation_id == SqlConversation.id,
+                            SqlSessionPermission.user_id == accessible_by,
+                        )
+                        .exists()
+                    )
+                if owned_by is not None:
+                    stmt = stmt.where(
+                        select(SqlSessionPermission.conversation_id)
+                        .where(
+                            SqlSessionPermission.workspace_id == SqlConversation.workspace_id,
+                            SqlSessionPermission.conversation_id == SqlConversation.id,
+                            SqlSessionPermission.user_id == owned_by,
+                            SqlSessionPermission.level >= LEVEL_OWNER,
+                        )
+                        .exists()
+                    )
 
             # Kind filter as parent-nullness (see above): sub_agent ⇔ parent set.
             if kind_requires_parent is True:
@@ -2703,17 +2771,29 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
         # "after" (forward=True) = further in sort direction;
         # "before" (forward=False) = opposite of sort direction.
-        if forward:
-            ts_cmp = sort_col < sub if is_desc else sort_col > sub
-            id_cmp = (
-                tiebreaker_col < tiebreaker_val if is_desc else tiebreaker_col > tiebreaker_val
-            )
-        else:
-            ts_cmp = sort_col > sub if is_desc else sort_col < sub
-            id_cmp = (
-                tiebreaker_col > tiebreaker_val if is_desc else tiebreaker_col < tiebreaker_val
-            )
-        return stmt.where(or_(ts_cmp, and_(sort_col == sub, id_cmp)))
+        #
+        # Emitted as a ROW-VALUES comparison — ``(sort, tiebreak) < (:ts, :id)``
+        # — not the equivalent ``sort < :ts OR (sort = :ts AND tiebreak < :id)``.
+        # The two are semantically identical, but PostgreSQL can only turn the
+        # row-values form into an index range condition; the OR form is left as
+        # a residual Filter, so a deep cursor re-reads and discards every row
+        # between the index start and the cursor (cost growing with cursor
+        # depth, not page size). Row values are supported by every dialect the
+        # store targets (PostgreSQL, SQLite >= 3.15, MySQL).
+        row = tuple_(sort_col, tiebreaker_col)
+        # Bind the tiebreaker with its column's type. Inside ``tuple_`` a bare
+        # Python value gets no type context, so the ``Uuid16`` decorator never
+        # runs and PostgreSQL is handed a hex string against a ``bytea``
+        # column ("operator does not exist: bytea < character varying"). The
+        # SQLite-rowid branch passes a scalar subquery, which is already typed.
+        cursor_tiebreaker = (
+            literal(tiebreaker_val, tiebreaker_col.type)
+            if isinstance(tiebreaker_col, QueryableAttribute)
+            else tiebreaker_val
+        )
+        cursor_row = tuple_(sub, cursor_tiebreaker)
+        descending_scan = is_desc if forward else not is_desc
+        return stmt.where(row < cursor_row if descending_scan else row > cursor_row)
 
     def update_conversation(
         self,
