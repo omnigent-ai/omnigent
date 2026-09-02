@@ -1,10 +1,6 @@
-// Termux-style extra-keys row rendered under the terminal on touch devices:
-// a fixed 2×7 grid of Esc / Tab / arrows plus sticky Ctrl / Alt / Shift.
-//
-// Hot-path rules (the row must cost nothing while the user just types):
-// modifier state lives in a ref the input transform reads; React state only
-// changes on a modifier tap / long-press / consume, never per keystroke; the
-// transform is installed on the session only while a modifier is active.
+// Termux-style extra-keys row under the terminal on touch devices: a fixed
+// 2×7 grid of Esc / Tab / arrows plus sticky Ctrl / Alt / Shift. Modifier
+// state lives in a ref so a keystroke never waits on a React render.
 
 import {
   memo,
@@ -26,6 +22,7 @@ import {
   hasActiveModifier,
   reduceModifiers,
   type ExtraKeyDef,
+  type ModifierState,
   type ModifierStates,
 } from "./terminalExtraKeysModel";
 
@@ -57,6 +54,8 @@ interface PressState {
   key: ExtraKeyDef;
   timer: number | null;
   longPressFired: boolean;
+  /** Modifier state before this press, restored if the gesture is cancelled. */
+  previous: ModifierState | null;
 }
 
 export const TerminalExtraKeys = memo(function TerminalExtraKeys({
@@ -131,7 +130,13 @@ export const TerminalExtraKeys = memo(function TerminalExtraKeys({
       e.preventDefault();
       e.currentTarget.setPointerCapture(e.pointerId);
       clearPress();
-      const press: PressState = { pointerId: e.pointerId, key, timer: null, longPressFired: false };
+      const press: PressState = {
+        pointerId: e.pointerId,
+        key,
+        timer: null,
+        longPressFired: false,
+        previous: key.kind === "modifier" ? modsRef.current[key.id] : null,
+      };
       if (key.kind === "modifier") {
         // WKWebView honors a programmatic focus only inside the trusted
         // gesture; plain keys never focus (Esc must not summon the keyboard).
@@ -159,9 +164,18 @@ export const TerminalExtraKeys = memo(function TerminalExtraKeys({
 
   const onPointerCancel = useCallback(
     (e: PointerEvent<HTMLButtonElement>) => {
-      if (pressRef.current?.pointerId === e.pointerId) clearPress();
+      const press = pressRef.current;
+      if (!press || press.pointerId !== e.pointerId) return;
+      clearPress();
+      // A cancelled gesture (scroll, palm) undoes a lock the timer already set.
+      if (press.key.kind === "modifier" && press.previous !== null) {
+        const state = modsRef.current;
+        if (state[press.key.id] !== press.previous) {
+          commit({ ...state, [press.key.id]: press.previous });
+        }
+      }
     },
-    [clearPress],
+    [clearPress, commit],
   );
 
   const onClick = useCallback(
