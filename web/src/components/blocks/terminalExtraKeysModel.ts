@@ -2,7 +2,8 @@
 // extra-keys row (Termux-style Esc / Tab / Ctrl / arrows bar for soft
 // keyboards). No DOM or xterm dependency so the whole matrix is unit-testable.
 
-import { SHIFT_ENTER_CSI_U } from "./TerminalSession";
+/** Kitty Keyboard Protocol / CSI-u encoding for Shift+Enter. */
+export const SHIFT_ENTER_CSI_U = "\x1b[13;2u";
 
 export type ModifierId = "ctrl" | "alt" | "shift";
 
@@ -150,7 +151,8 @@ function ctrlChord(ch: string): string {
 export function encodeModifiedInput(data: string, mods: Modifiers): string {
   if (data.length !== 1) return data;
   if (data === "\r" && mods.shift && !mods.ctrl && !mods.alt) return SHIFT_ENTER_CSI_U;
-  const base = mods.ctrl ? ctrlChord(data) : data;
+  // Shift + a soft-keyboard Tab is Shift+Tab, same as the row's own Tab key.
+  const base = data === "\t" && mods.shift ? "\x1b[Z" : mods.ctrl ? ctrlChord(data) : data;
   return mods.alt ? `\x1b${base}` : base;
 }
 
