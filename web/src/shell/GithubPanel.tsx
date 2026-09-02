@@ -44,6 +44,17 @@ import {
 // chosen by `themeType` from the app's resolved light/dark mode.
 const DIFF_THEME = { dark: "github-dark", light: "github-light" } as const;
 
+// Relabel the collapsed-region affordance to say what clicking does, rather
+// than a line count. The library renders the count / "More unchanged context
+// may be available" into a stable `[data-unmodified-lines]` element inside its
+// shadow DOM; `unsafeCSS` is its supported hook to inject styles there. The
+// step is fixed at expansionLineCount (10), so a static label is accurate for
+// the usual case (a small final chunk may reveal fewer). font-size:0 collapses
+// the original text node; ::after paints ours at the normal size.
+const DIFF_UNSAFE_CSS =
+  "[data-unmodified-lines]{font-size:0}" +
+  '[data-unmodified-lines]::after{content:"Show 10 more lines";font-size:.75rem}';
+
 /** Centered muted message filling the panel — the shared empty/error/loading shell. */
 function PanelMessage({ children }: { children: React.ReactNode }) {
   return (
@@ -271,6 +282,8 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
       // unchanged lines aren't in the patch, so expansion (and the exact
       // trailing-region count) is served by loadDiffFiles on demand.
       expansionLineCount: 10,
+      // Relabel the expand affordance to an action ("Show 10 more lines").
+      unsafeCSS: DIFF_UNSAFE_CSS,
       loadDiffFiles,
     }),
     [themeType, diffStyle, loadDiffFiles],
