@@ -114,6 +114,18 @@ function makeOverlay({ platform = process.platform } = {}) {
 }
 
 describe("update overlay", () => {
+  it("creates the overlay as a non-focusable window so the OS never presents it alongside the app", () => {
+    const { controller } = makeOverlay();
+    const overlay = controller.ensureOverlay(new FakeWindow());
+    // A focusable overlay is listed by window switchers / Mission Control /
+    // screen-share pickers as a second app window and steals focus on click.
+    assert.equal(overlay.options.focusable, false);
+    assert.equal(overlay.options.hiddenInMissionControl, true);
+    assert.equal(overlay.options.skipTaskbar, true);
+    // Never-active windows only get clicks via first-mouse delivery (macOS).
+    assert.equal(overlay.options.acceptFirstMouse, true);
+  });
+
   it("excludes the overlay from the macOS shown-windows menu", () => {
     const mac = makeOverlay({ platform: "darwin" });
     const macOverlay = mac.controller.ensureOverlay(new FakeWindow());
