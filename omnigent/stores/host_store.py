@@ -34,6 +34,7 @@ from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
     now_epoch,
+    now_epoch_us,
 )
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 
@@ -82,6 +83,12 @@ class Host:
         ``{"claude-sdk": True, "codex": False}``. ``None`` when the
         host has never reported it (older host build) — unknown, not
         "nothing configured".
+    :param connect_generation: Token identifying the connect that last
+        upserted this row (epoch microseconds). Guards conditional
+        writes such as :meth:`HostStore.set_offline_if_generation` so a
+        superseded connection's cleanup cannot clobber a newer
+        connect's row. ``None`` for rows never connected since the
+        column was added.
     """
 
     host_id: str
@@ -94,6 +101,7 @@ class Host:
     sandbox_id: str | None = None
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     terminating_sandbox_id: str | None = None
+    connect_generation: int | None = None
 
 
 def host_is_live(host: Host, now: int | None = None) -> bool:
@@ -163,6 +171,7 @@ def _row_to_host(row: SqlHost) -> Host:
         sandbox_id=row.sandbox_id,
         terminating_sandbox_id=row.terminating_sandbox_id,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
+        connect_generation=row.connect_generation,
     )
 
 
@@ -254,9 +263,15 @@ class HostStore:
         :param managed_token: Raw launch token for a managed host. When set,
             registration atomically revalidates the current credential instead
             of performing the external-host upsert path.
-        :returns: The upserted :class:`Host`.
+        :returns: The upserted :class:`Host`. Its ``connect_generation``
+            identifies THIS connect's write; cleanup paths pass it to
+            :meth:`set_offline_if_generation` so a superseded connect
+            cannot clobber a newer one's row.
         """
         now = now_epoch()
+        # Epoch-µs so two connects for the same host within one second
+        # still get distinct, ordered generations.
+        generation = now_epoch_us()
         harnesses_json = (
             json.dumps(configured_harnesses) if configured_harnesses is not None else None
         )
@@ -280,6 +295,10 @@ class HostStore:
                             status=encode_host_status("online"),
                             updated_at=now,
                             configured_harnesses=harnesses_json,
+                            # Managed connects stamp a generation like every
+                            # other connect path, so a superseded managed
+                            # connect's cleanup cannot clobber a newer one.
+                            connect_generation=generation,
                         )
                     ),
                 )
@@ -309,6 +328,7 @@ class HostStore:
                 row.status = encode_host_status("online")
                 row.updated_at = now
                 row.configured_harnesses = harnesses_json
+                row.connect_generation = generation
                 return _row_to_host(row)
 
             # host_id is new — check whether (workspace_id, user_id, name)
@@ -323,6 +343,7 @@ class HostStore:
                     name=name,
                     user_id=user_id,
                     configured_harnesses_json=harnesses_json,
+                    generation=generation,
                 )
                 if reowned is not None:
                     return reowned
@@ -345,6 +366,7 @@ class HostStore:
                     host_id,
                     now,
                     harnesses_json,
+                    generation,
                 )
                 return _row_to_host(row)
 
@@ -357,6 +379,7 @@ class HostStore:
                 created_at=now,
                 updated_at=now,
                 configured_harnesses=harnesses_json,
+                connect_generation=generation,
             )
             session.add(row)
             return _row_to_host(row)
@@ -368,6 +391,7 @@ class HostStore:
         new_host_id: str,
         now: int,
         harnesses_json: str | None,
+        generation: int,
     ) -> SqlHost:
         """Replace a host row's host_id while repointing its conversations.
 
@@ -388,6 +412,7 @@ class HostStore:
         :param new_host_id: The host_id the host reconnected with.
         :param now: Unix epoch seconds for the updated_at timestamp.
         :param harnesses_json: JSON-encoded harness readiness, or None.
+        :param generation: Epoch-µs connect token for the new row.
         :returns: The newly inserted :class:`SqlHost` row.
         """
         old_host_id = row.host_id
@@ -443,6 +468,7 @@ class HostStore:
             sandbox_id=sandbox_id,
             terminating_sandbox_id=terminating_sandbox_id,
             configured_harnesses=harnesses_json,
+            connect_generation=generation,
         )
         session.add(new_row)
         session.flush()
@@ -468,6 +494,7 @@ class HostStore:
         name: str,
         user_id: str,
         configured_harnesses_json: str | None = None,
+        generation: int | None = None,
     ) -> Host | None:
         """Re-own an existing host_id row under a new ``(user_id, name)``.
 
@@ -492,6 +519,8 @@ class HostStore:
             ``'{"claude-sdk": true}'``, or ``None`` when unreported.
             Written like the normal connect paths so a re-owned row
             carries fresh (not stale) readiness.
+        :param generation: Epoch-µs connect token to stamp, like the
+            normal connect paths.
         :returns: The re-owned :class:`Host`, or ``None`` if no row holds
             *host_id* (caller falls through to a normal insert).
         """
@@ -516,6 +545,7 @@ class HostStore:
                 status=encode_host_status("online"),
                 updated_at=now,
                 configured_harnesses=configured_harnesses_json,
+                connect_generation=generation,
             )
         )
         return Host(
@@ -528,6 +558,7 @@ class HostStore:
             sandbox_provider=existing.sandbox_provider,
             sandbox_id=existing.sandbox_id,
             configured_harnesses=_parse_configured_harnesses(configured_harnesses_json),
+            connect_generation=generation,
         )
 
     def set_offline(self, host_id: str) -> None:
@@ -549,6 +580,47 @@ class HostStore:
             if row is not None:
                 row.status = encode_host_status("offline")
                 row.updated_at = now_epoch()
+
+    def set_offline_if_generation(self, host_id: str, generation: int | None) -> bool:
+        """
+        Mark a host offline only if its row still belongs to *generation*.
+
+        The generation-safe variant of :meth:`set_offline` for cleanup
+        that may have been superseded: a connect that persisted its row
+        (``upsert_on_connect``) but failed before registering holds no
+        :class:`~omnigent.server.host_registry.HostConnection` to guard
+        with, so its offline cleanup compares the row's
+        ``connect_generation`` at the DB level instead. If a newer
+        connect already re-stamped the row, the UPDATE matches nothing
+        and the newer connection's online status survives — including
+        when that connect landed on another server replica, which an
+        in-memory registry check could never see.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param generation: The ``connect_generation`` this cleanup's
+            connect stamped (from the :class:`Host` that
+            ``upsert_on_connect`` returned). ``None`` never matches —
+            a caller without a token must not blind-write.
+        :returns: ``True`` when the row was marked offline; ``False``
+            when a newer generation owns the row (or it no longer
+            exists), i.e. this cleanup was superseded.
+        """
+        if generation is None:
+            return False
+        with self._session("set_host_offline_if_generation") as session:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlHost)
+                    .where(
+                        SqlHost.workspace_id == current_workspace_id(),
+                        SqlHost.host_id == host_id,
+                        SqlHost.connect_generation == generation,
+                    )
+                    .values(status=encode_host_status("offline"), updated_at=now_epoch())
+                ),
+            )
+            return result.rowcount > 0
 
     def update_harness_readiness(
         self,
