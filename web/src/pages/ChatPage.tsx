@@ -2665,12 +2665,15 @@ const MAX_RESERVED_VIEWPORT_FRACTION = 1 / 3;
  * whenever any content sits above the anchor, so older history stays reachable
  * by scroll-up without a viewport-fill loop.
  *
- * Height = clientHeight − (anchor-top → content-bottom) − top gap, clamped to
- * ≥ 0: a short reply leaves empty space below (anchor stays pinned at top);
- * once the reply alone exceeds the viewport the spacer collapses to 0 and
- * normal stick-to-bottom following resumes. The "content-bottom" edge is the
- * spacer's own top, whose position is fixed by the content above it and so is
- * independent of the height we set — the measurement can't feed back on itself.
+ * Height = clientHeight − (anchor-top → spacer-top) − top gap − the column's
+ * trailing padding, clamped to ≥ 0: a short reply leaves empty space below
+ * (anchor stays pinned at top); once the reply alone exceeds the viewport the
+ * spacer collapses to 0 and normal stick-to-bottom following resumes. The
+ * trailing padding scrolls below the spacer, so reserving it again would leave
+ * the document taller than the viewport — a phantom scroll range that paints a
+ * scrollbar over a fully-visible transcript. Every measured edge is fixed by
+ * content outside the height we set — the measurement can't feed back on
+ * itself.
  */
 export function LatestTurnSpacer({
   scrollElement,
@@ -2743,11 +2746,22 @@ export function LatestTurnSpacer({
     // rect diffs are scroll-invariant (both edges shift together), and the
     // spacer's top is fixed by the content above it, so this is stable across
     // the height we're about to set — it converges in one pass.
-    const anchorToEnd = spacerEl.getBoundingClientRect().top - anchor.getBoundingClientRect().top;
+    const spacerRect = spacerEl.getBoundingClientRect();
+    const anchorToEnd = spacerRect.top - anchor.getBoundingClientRect().top;
+    // The content column's trailing padding sits below the spacer and scrolls
+    // with it; leaving it out of the reservation keeps the document from
+    // outgrowing the viewport by that padding (a phantom scroll range that
+    // paints a scrollbar thumb over a fully-visible transcript).
+    const trailing = spacerEl.parentElement
+      ? Math.max(0, spacerEl.parentElement.getBoundingClientRect().bottom - spacerRect.bottom)
+      : 0;
     const viewport = scrollEl.clientHeight;
     const next = Math.max(
       0,
-      Math.min(viewport - anchorToEnd - topGapPx, viewport * MAX_RESERVED_VIEWPORT_FRACTION),
+      Math.min(
+        viewport - anchorToEnd - topGapPx - trailing,
+        viewport * MAX_RESERVED_VIEWPORT_FRACTION,
+      ),
     );
     const current = Number.parseFloat(spacerEl.style.height) || 0;
     if (Math.abs(current - next) >= 1) spacerEl.style.height = `${next}px`;
