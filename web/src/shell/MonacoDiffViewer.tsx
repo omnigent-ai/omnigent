@@ -48,6 +48,14 @@ interface MonacoDiffViewerProps {
   onSetActiveSelection: (sel: ActiveSelection | null) => void;
   /** In-progress comment body; clicking away won't clear an active draft. */
   pendingBodyRef?: React.RefObject<string>;
+  /**
+   * Size the editor to its content instead of filling its container, and let
+   * the page scroll rather than scrolling inside Monaco. For stacking many
+   * diffs in one scroll view (the GitHub tab). Also disables the comment
+   * affordance and per-file scroll restore, which only make sense for a single
+   * full-height diff.
+   */
+  autoHeight?: boolean;
 }
 
 /**
@@ -70,6 +78,7 @@ export function MonacoDiffViewer({
   activeSelection,
   onSetActiveSelection,
   pendingBodyRef,
+  autoHeight = false,
 }: MonacoDiffViewerProps) {
   const canEdit = useCanEdit(conversationId);
   const lang = detectLang(path);
@@ -111,6 +120,13 @@ export function MonacoDiffViewer({
   const [diffSettled, setDiffSettled] = useState(false);
   const updateDiffSubRef = useRef<{ dispose: () => void } | null>(null);
   const revealRafRef = useRef<number | null>(null);
+  // autoHeight: the editor is sized to its content (see the effect in
+  // handleMount). Null until the first measurement.
+  const [contentHeight, setContentHeight] = useState<number | null>(null);
+  const contentSizeSubsRef = useRef<{ dispose: () => void }[]>([]);
+  // Placeholder height before the real content height is measured, so a
+  // not-yet-mounted / still-computing section reserves roughly its space.
+  const AUTO_HEIGHT_PLACEHOLDER = 160;
 
   // The diff scrolls inside Monaco, so its offset is cached per conversation +
   // file rather than via the DOM scroll-restore hook. Kept in its own namespace
@@ -133,12 +149,31 @@ export function MonacoDiffViewer({
             : monaco.editor.EndOfLineSequence.LF,
         );
       // Restore the reader's place in the diff and cache further scrolling under
-      // the diff's own key.
-      attachEditorScrollRestore(
-        modified,
-        () => scrollKeyRef.current,
-        () => modifiedEditorRef.current === modified,
-      );
+      // the diff's own key — only in fill mode; an auto-height diff has no inner
+      // scroll to restore (the page scrolls).
+      if (!autoHeight) {
+        attachEditorScrollRestore(
+          modified,
+          () => scrollKeyRef.current,
+          () => modifiedEditorRef.current === modified,
+        );
+      } else {
+        // Size the container to the rendered content (max of both panes) and
+        // keep it in sync as regions collapse/expand.
+        const original = diffEditor.getOriginalEditor();
+        const syncHeight = () => {
+          const h = Math.max(
+            original.getContentHeight?.() ?? 0,
+            modified.getContentHeight?.() ?? 0,
+          );
+          if (h > 0) setContentHeight(h);
+        };
+        contentSizeSubsRef.current = [
+          modified.onDidContentSizeChange?.(syncHeight),
+          original.onDidContentSizeChange?.(syncHeight),
+        ].filter((d): d is { dispose: () => void } => d != null);
+        syncHeight();
+      }
       // Reveal once the diff is computed (and its region collapse has painted),
       // deferred a frame so the collapsed layout lands before we fade in. The
       // API is absent in the jsdom test mock, so guard it; a fallback timeout
@@ -154,7 +189,7 @@ export function MonacoDiffViewer({
       }
       setMounted(true);
     },
-    [after],
+    [after, autoHeight],
   );
 
   useEffect(
@@ -163,6 +198,8 @@ export function MonacoDiffViewer({
       diffEditorRef.current = null;
       updateDiffSubRef.current?.dispose();
       updateDiffSubRef.current = null;
+      contentSizeSubsRef.current.forEach((d) => d.dispose());
+      contentSizeSubsRef.current = [];
       if (revealRafRef.current !== null) cancelAnimationFrame(revealRafRef.current);
     },
     [],
@@ -199,7 +236,9 @@ export function MonacoDiffViewer({
     comments,
     activeSelection,
     onSetActiveSelection,
-    canComment: canEdit,
+    // Auto-height (the stacked GitHub overview) is a read-only view — no
+    // inline-comment affordance.
+    canComment: canEdit && !autoHeight,
     pendingBodyRef,
     path,
   });
@@ -233,12 +272,29 @@ export function MonacoDiffViewer({
       // Collapse long unchanged runs into expandable bands (like the old pierre
       // diff / GitHub) so only changed hunks + a few context lines are shown.
       hideUnchangedRegions: { enabled: true, contextLineCount: 3 },
+      // In auto-height mode the editor is exactly its content height, so there
+      // is nothing to scroll inside it — hide its scrollbar and let the wheel
+      // bubble to the page so many stacked diffs scroll as one.
+      ...(autoHeight
+        ? {
+            scrollbar: {
+              vertical: "hidden" as const,
+              alwaysConsumeMouseWheel: false,
+            },
+          }
+        : {}),
     };
-  }, [layout, hideWhitespace, wrapLines]);
+  }, [layout, hideWhitespace, wrapLines, autoHeight]);
 
   return (
-    <div className="flex h-full flex-col">
-      <div className="relative min-h-0 flex-1">
+    <div className={cn("flex flex-col", !autoHeight && "h-full")}>
+      <div
+        className={cn("relative", !autoHeight && "min-h-0 flex-1")}
+        // In auto-height mode the diff sizes to its content; a placeholder
+        // height reserves space until the first measurement so the scroll
+        // position doesn't jump as sections mount.
+        style={autoHeight ? { height: contentHeight ?? AUTO_HEIGHT_PLACEHOLDER } : undefined}
+      >
         {loadError ? (
           <div className="flex items-center justify-center p-8 text-destructive text-ui">
             Failed to load the diff.

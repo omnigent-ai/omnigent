@@ -1,14 +1,19 @@
 // GithubPanel — the right-rail "GitHub" tab. Read-only view of the session
 // branch's relationship to GitHub: the associated PR (number, title, state, CI
-// summary, link out) and the branch-vs-base diff in a GitHub-style master–detail
-// layout (changed-files list on the left, Monaco per-file diff on the right).
+// summary, link out) and the branch-vs-base diff.
+//
+// Layout is GitHub's "Files changed": every file's diff stacked in one scroll
+// view, with the sidebar as a jump-to-file navigator that also highlights the
+// file currently in view. Each file's Monaco diff sizes to its content (no
+// inner scroll) and mounts lazily as it nears the viewport, so a large PR
+// doesn't spin up every editor at once.
 //
 // Data comes from the runner's read-only GitHub resource API (see
 // hooks/useGithub.ts), which shells out to `gh` + `git`. When gh is missing /
 // unauthenticated / the workspace isn't a repo, the panel renders a message
 // rather than an error.
 
-import { Suspense, lazy, useEffect, useMemo, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CircleCheckIcon,
   CircleDotIcon,
@@ -64,7 +69,7 @@ function FileRow({
   onSelect: () => void;
 }) {
   const meta = STATUS_META[file.status];
-  const dir = file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/") + 1) : "";
+  const { dir, name } = splitPath(file.path);
   return (
     <button
       type="button"
@@ -80,19 +85,133 @@ function FileRow({
       </span>
       <span className="min-w-0 flex-1 truncate">
         {dir && <span className="text-muted-foreground">{dir}</span>}
-        <span className="font-medium">{file.name}</span>
+        <span className="font-medium">{name}</span>
       </span>
-      {(file.lines_added !== null || file.lines_removed !== null) && (
-        <span className="shrink-0 font-mono text-xs tabular-nums">
-          {file.lines_added !== null && (
-            <span className="text-green-600 dark:text-green-400">+{file.lines_added}</span>
-          )}{" "}
-          {file.lines_removed !== null && (
-            <span className="text-red-600 dark:text-red-400">−{file.lines_removed}</span>
-          )}
-        </span>
-      )}
+      <DiffStat file={file} />
     </button>
+  );
+}
+
+/** Diffstat (+adds −removes) shared by the sidebar row and the section header. */
+function DiffStat({ file }: { file: GithubChangedFile }) {
+  if (file.lines_added === null && file.lines_removed === null) return null;
+  return (
+    <span className="shrink-0 font-mono text-xs tabular-nums">
+      {file.lines_added !== null && (
+        <span className="text-green-600 dark:text-green-400">+{file.lines_added}</span>
+      )}{" "}
+      {file.lines_removed !== null && (
+        <span className="text-red-600 dark:text-red-400">−{file.lines_removed}</span>
+      )}
+    </span>
+  );
+}
+
+/** Split a path into its directory prefix (with trailing slash) and basename. */
+function splitPath(path: string): { dir: string; name: string } {
+  const i = path.lastIndexOf("/");
+  return i === -1
+    ? { dir: "", name: path }
+    : { dir: path.slice(0, i + 1), name: path.slice(i + 1) };
+}
+
+/**
+ * One file's section in the stacked diff: a sticky header (status + path +
+ * diffstat) and the file's Monaco diff, sized to its content. The diff (and its
+ * fetch) mount lazily once the section nears the viewport.
+ */
+function GithubFileSection({
+  conversationId,
+  file,
+  base,
+  prefs,
+  registerRef,
+}: {
+  conversationId: string;
+  file: GithubChangedFile;
+  base: string | undefined;
+  prefs: ReturnType<typeof readFileViewPreferences>;
+  registerRef: (path: string, el: HTMLElement | null) => void;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  // Mount the diff only once the section nears the viewport; keep it mounted
+  // afterwards so scrolling back up doesn't re-fetch/re-mount.
+  const [seen, setSeen] = useState(false);
+
+  useEffect(() => {
+    registerRef(file.path, ref.current);
+    return () => registerRef(file.path, null);
+  }, [file.path, registerRef]);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || seen) return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) setSeen(true);
+      },
+      // Prefetch a little before the section is actually on screen.
+      { rootMargin: "400px 0px" },
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, [seen]);
+
+  const diff = useGithubFileDiff(conversationId, seen ? file.path : null, base);
+  const meta = STATUS_META[file.status];
+  const { dir, name } = splitPath(file.path);
+
+  return (
+    <div ref={ref} data-github-file={file.path}>
+      <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-border bg-card px-3 py-1.5">
+        <span
+          className={cn("w-3 shrink-0 text-center font-mono text-xs", meta.className)}
+          title={meta.label}
+        >
+          {meta.letter}
+        </span>
+        <span className="min-w-0 flex-1 truncate text-ui" title={file.path}>
+          {dir && <span className="text-muted-foreground">{dir}</span>}
+          <span className="font-medium">{name}</span>
+        </span>
+        <DiffStat file={file} />
+      </div>
+      {!seen || diff.isLoading || (!diff.data && !diff.error) ? (
+        <div className="flex items-center justify-center gap-2 p-6 text-ui text-muted-foreground">
+          <Loader2Icon className="size-4 animate-spin" />
+          Loading diff…
+        </div>
+      ) : diff.error ? (
+        <div className="p-4 text-ui text-muted-foreground">
+          {diff.error instanceof RunnerOfflineError
+            ? "Runner offline."
+            : `Couldn’t load diff: ${(diff.error as Error).message}`}
+        </div>
+      ) : (
+        <Suspense
+          fallback={
+            <div className="flex items-center justify-center gap-2 p-6 text-ui text-muted-foreground">
+              <Loader2Icon className="size-4 animate-spin" />
+              Loading diff…
+            </div>
+          }
+        >
+          <MonacoDiffViewer
+            autoHeight
+            before={diff.data!.before}
+            after={diff.data!.after}
+            path={file.path}
+            layout={prefs.diffLayout}
+            hideWhitespace={prefs.hideWhitespace}
+            wrapLines={prefs.wrapLines}
+            conversationId={conversationId}
+            comments={[]}
+            activeSelection={null}
+            onSetActiveSelection={() => {}}
+          />
+        </Suspense>
+      )}
+    </div>
   );
 }
 
@@ -119,27 +238,56 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
   const info = useGithubInfo(conversationId);
   const baseRef = info.data?.base_ref ?? undefined;
   const changes = useGithubChangedFiles(conversationId, baseRef);
-  const [selectedPath, setSelectedPath] = useState<string | null>(null);
-  const diff = useGithubFileDiff(conversationId, selectedPath, baseRef);
 
   // Diff rendering preferences are app-global (shared with the FileViewer);
   // no in-panel toggle in v1, so read the persisted values once on mount.
   const prefs = useMemo(() => readFileViewPreferences(), []);
 
-  // Memoized so the selection effect below doesn't re-run every render (the
-  // `?? []` fallback would otherwise be a fresh array each time).
   const files = useMemo<GithubChangedFile[]>(() => changes.data?.data ?? [], [changes.data]);
-  // Default the selection to the first changed file, and keep it valid as the
-  // list changes (e.g. after a Refresh).
+
+  // The stacked diff scrolls as one; the sidebar highlights the file currently
+  // at the top of the viewport and jumps to a file on click.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const sectionEls = useRef<Map<string, HTMLElement>>(new Map());
+  const [activePath, setActivePath] = useState<string | null>(null);
+
+  const registerRef = useCallback((path: string, el: HTMLElement | null) => {
+    if (el) sectionEls.current.set(path, el);
+    else sectionEls.current.delete(path);
+  }, []);
+
+  // Highlight the last section whose top has scrolled to/above the pane's top
+  // edge. rAF-throttled so the scroll stays smooth.
+  const rafRef = useRef<number | null>(null);
+  const recomputeActive = useCallback(() => {
+    const container = scrollRef.current;
+    if (!container) return;
+    const top = container.getBoundingClientRect().top;
+    let current: string | null = null;
+    for (const [path, el] of sectionEls.current) {
+      if (el.getBoundingClientRect().top - top <= 8) current = path;
+    }
+    setActivePath((prev) => current ?? prev);
+  }, []);
+  const onScroll = useCallback(() => {
+    if (rafRef.current !== null) return;
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = null;
+      recomputeActive();
+    });
+  }, [recomputeActive]);
+
+  // Default the highlight to the first file once the list arrives.
   useEffect(() => {
-    if (files.length === 0) {
-      if (selectedPath !== null) setSelectedPath(null);
-      return;
-    }
-    if (selectedPath === null || !files.some((f) => f.path === selectedPath)) {
-      setSelectedPath(files[0].path);
-    }
-  }, [files, selectedPath]);
+    setActivePath((prev) =>
+      prev && files.some((f) => f.path === prev) ? prev : (files[0]?.path ?? null),
+    );
+  }, [files]);
+
+  const jumpTo = useCallback((path: string) => {
+    setActivePath(path);
+    sectionEls.current.get(path)?.scrollIntoView({ block: "start" });
+  }, []);
 
   const refresh = () => {
     void queryClient.invalidateQueries({ queryKey: ["github-info", conversationId] });
@@ -147,7 +295,7 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
     void queryClient.invalidateQueries({ queryKey: ["github-file-diff", conversationId] });
   };
 
-  // ── Whole-panel states (before the master–detail body) ──────────────────
+  // ── Whole-panel states (before the header + stacked diff) ───────────────
   if (info.isLoading) {
     return (
       <PanelMessage>
@@ -273,7 +421,7 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
         )}
       </div>
 
-      {/* Master–detail body: changed-files list + per-file diff. */}
+      {/* Body: sidebar (jump-to-file) + one scroll of all files' diffs. */}
       <div className="flex min-h-0 flex-1">
         <div className="w-48 shrink-0 overflow-y-auto border-r border-border py-1">
           {changes.isLoading ? (
@@ -293,39 +441,35 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
               <FileRow
                 key={file.path}
                 file={file}
-                selected={file.path === selectedPath}
-                onSelect={() => setSelectedPath(file.path)}
+                selected={file.path === activePath}
+                onSelect={() => jumpTo(file.path)}
               />
             ))
           )}
         </div>
-        <div className="min-w-0 flex-1">
-          {selectedPath === null ? (
-            <PanelMessage>Select a file to view its diff.</PanelMessage>
-          ) : diff.isLoading || !diff.data ? (
+        <div ref={scrollRef} onScroll={onScroll} className="min-w-0 flex-1 overflow-y-auto">
+          {files.length === 0 ? (
             <PanelMessage>
-              <Loader2Icon className="size-5 animate-spin" />
-              Loading diff…
+              {changes.isLoading ? (
+                <>
+                  <Loader2Icon className="size-5 animate-spin" />
+                  Loading changes…
+                </>
+              ) : (
+                "No changes vs base."
+              )}
             </PanelMessage>
-          ) : diff.error ? (
-            <PanelMessage>Couldn’t load diff: {(diff.error as Error).message}</PanelMessage>
           ) : (
-            <Suspense fallback={<PanelMessage>Loading diff…</PanelMessage>}>
-              {/* key remounts per file so Monaco re-wires EOL/grammar on switch. */}
-              <MonacoDiffViewer
-                key={selectedPath}
-                before={diff.data.before}
-                after={diff.data.after}
-                path={selectedPath}
-                layout={prefs.diffLayout}
-                hideWhitespace={prefs.hideWhitespace}
-                wrapLines={prefs.wrapLines}
+            files.map((file) => (
+              <GithubFileSection
+                key={file.path}
                 conversationId={conversationId}
-                comments={[]}
-                activeSelection={null}
-                onSetActiveSelection={() => {}}
+                file={file}
+                base={baseRef}
+                prefs={prefs}
+                registerRef={registerRef}
               />
-            </Suspense>
+            ))
           )}
         </div>
       </div>
