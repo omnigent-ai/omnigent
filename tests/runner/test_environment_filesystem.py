@@ -545,6 +545,34 @@ async def test_download_rejects_directory_and_missing_path(
 
 
 @pytest.mark.asyncio
+async def test_download_refuses_path_hidden_from_sandbox(
+    client: httpx.AsyncClient,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A file the sandbox hides from the helper is refused, as the read path refuses it.
+
+    The fixture's ``none`` sandbox hides nothing, so the helper's view is
+    stood in for: the download must consult it and stop on a masked path
+    even though the file is on disk.
+    """
+    (workspace / ".env").write_text("SECRET=1")
+    consulted: list[str] = []
+
+    async def _hidden(self: CallerProcessFilesystem, target: str) -> None:
+        del self
+        consulted.append(target)
+
+    monkeypatch.setattr(CallerProcessFilesystem, "_helper_stat", _hidden)
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem/.env",
+        params={"download": "true"},
+    )
+    assert resp.status_code == 404
+    assert consulted == [".env"]
+
+
+@pytest.mark.asyncio
 async def test_filesystem_session_without_agent_id_returns_typed_404(
     registry: SessionResourceRegistry,
 ) -> None:

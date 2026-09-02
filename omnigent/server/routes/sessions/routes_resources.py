@@ -247,9 +247,10 @@ def register_resources_routes(
             raise _session_not_found()
         return conv
 
-    # Per-chunk read budget for a streamed download, mirroring the event
-    # relay: a stall this long means the tunnel is dead, while a large file
-    # legitimately outlives any total timeout.
+    # Per-chunk read budget for a direct HTTP runner client; no total timeout,
+    # since a large file legitimately outlives any. The WebSocket tunnel
+    # transport ignores httpx timeouts: there, a runner that drops aborts the
+    # body iterator once the tunnel closes.
     _download_timeout = httpx.Timeout(connect=5.0, read=45.0, write=None, pool=None)
 
     async def _stream_download_from_runner(

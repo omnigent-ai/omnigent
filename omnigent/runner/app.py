@@ -10054,30 +10054,23 @@ def create_runner_app(
 
         The read path inlines content in a JSON envelope, so it caps at
         ``_MAX_READ_BYTES``. A download streams straight from disk and
-        needs no cap. Authorization is the same ``_resolve`` gate the read
-        path applies before reading.
+        needs no cap; ``resolve_download`` applies the read path's
+        authorization, sandbox view included, before a byte is served.
 
         :param session_id: Session identifier.
         :param environment_id: Environment resource id.
         :param path: Path within the environment, or an absolute path.
         :returns: The file streamed with ``Content-Disposition: attachment``.
         :raises InvalidPath: If the path names a directory.
-        :raises FilesystemPathNotFound: If nothing exists at the path.
+        :raises FilesystemPathNotFound: If nothing the caller may see exists
+            at the path.
         """
-        from omnigent.entities.environment_filesystem import (
-            FilesystemPathNotFound,
-            InvalidPath,
-        )
         from omnigent.runner.environment_filesystem import CallerProcessFilesystem
 
         await _ensure_session_registered(session_id)
         agent_spec = await _resolve_session_agent_spec(session_id)
         env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
-        resolved = CallerProcessFilesystem(env)._resolve(path)
-        if resolved.is_dir():
-            raise InvalidPath(f"Path {path!r} is a directory")
-        if not resolved.is_file():
-            raise FilesystemPathNotFound(f"Path {path!r} not found")
+        resolved = await CallerProcessFilesystem(env).resolve_download(path)
         return FileResponse(
             resolved,
             filename=resolved.name,

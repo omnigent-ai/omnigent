@@ -17,7 +17,7 @@ import re
 import stat
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, ParamSpec
+from typing import TYPE_CHECKING, Any, Literal, ParamSpec
 
 from omnigent.entities.environment_filesystem import (
     DeleteFilesystemResult,
@@ -913,17 +913,20 @@ class CallerProcessFilesystem:
             entry=entry,
         )
 
-    async def stat(self, path: str) -> FilesystemEntry:
-        """Return metadata for a single path via the sandboxed helper.
+    async def _helper_stat(self, target: str) -> dict[str, Any] | None:
+        """Stat *target* through the sandboxed helper.
 
-        :param path: Relative path within the environment.
-        :returns: The filesystem entry.
-        :raises FilesystemPathNotFound: If the path does not exist.
+        The helper sees the workspace as the sandbox presents it, so a path
+        the sandbox masks (a dotfile, an escaping symlink) reads as absent
+        here, exactly as it does to the environment's file tools.
+
+        :param target: Path as the helper should see it: workspace-relative,
+            or absolute for a path under a declared grant.
+        :returns: ``{"s": size, "m": mtime, "d": is_dir, "l": is_symlink}``,
+            or ``None`` when the helper cannot see the path.
         """
         import json as _json
 
-        validated = _validate_path(path) if path else ""
-        target = validated or "."
         # Embed the path as a Python literal via json.dumps and shell-quote
         # the entire script (matching list_dir/search_files). This keeps the
         # caller-controlled path out of any shell-interpreted context: it never
@@ -943,11 +946,23 @@ class CallerProcessFilesystem:
             f"python3 -c {_shell_quote(_script)}",
         )
         if "error" in result or result.get("exit_code", 1) != 0:
-            raise FilesystemPathNotFound(f"Path {path!r} not found")
+            return None
         try:
-            info = _json.loads(result.get("stdout", "{}"))
-        except _json.JSONDecodeError as exc:
-            raise FilesystemPathNotFound(f"Path {path!r} not found") from exc
+            return _json.loads(result.get("stdout", "{}"))
+        except _json.JSONDecodeError:
+            return None
+
+    async def stat(self, path: str) -> FilesystemEntry:
+        """Return metadata for a single path via the sandboxed helper.
+
+        :param path: Relative path within the environment.
+        :returns: The filesystem entry.
+        :raises FilesystemPathNotFound: If the path does not exist.
+        """
+        validated = _validate_path(path) if path else ""
+        info = await self._helper_stat(validated or ".")
+        if info is None:
+            raise FilesystemPathNotFound(f"Path {path!r} not found")
         name = os.path.basename(validated) if validated else ""
         entry_type: Literal["file", "directory", "symlink"] = "file"
         if info.get("d"):
@@ -962,6 +977,40 @@ class CallerProcessFilesystem:
             bytes=info["s"] if entry_type == "file" else None,
             modified_at=info["m"],
         )
+
+    async def resolve_download(self, path: str) -> Path:
+        """Resolve *path* to a regular file whose bytes may be served directly.
+
+        Applies the read path's authorization without its transport:
+        ``_resolve`` for containment and grants, then the sandboxed helper's
+        own view for any path the helper can reach, so a file the sandbox
+        masks (a dotfile, an escaping symlink) is refused here exactly as
+        ``read`` refuses it. A path admitted only because the environment is
+        unconfined has no sandbox to consult. The caller streams the file
+        itself, which the helper's single-message protocol cannot do.
+
+        :param path: Relative path within the environment, or an absolute
+            path elsewhere on the filesystem.
+        :returns: The resolved regular file.
+        :raises InvalidPath: If the path names a directory.
+        :raises FilesystemPathNotFound: If the path is missing or hidden
+            from the helper.
+        :raises PathUnreachable: If an absolute path is out of reach.
+        """
+        resolved = self._resolve(path)
+        if not self._absolute(path):
+            visible = await self._helper_stat(_validate_path(path) or ".") is not None
+        elif self._within_grants(resolved):
+            visible = await self._helper_stat(str(resolved)) is not None
+        else:
+            visible = resolved.exists()
+        if not visible:
+            raise FilesystemPathNotFound(f"Path {path!r} not found")
+        if resolved.is_dir():
+            raise InvalidPath(f"Path {path!r} is a directory")
+        if not resolved.is_file():
+            raise FilesystemPathNotFound(f"Path {path!r} not found")
+        return resolved
 
     async def edit_text(
         self,
