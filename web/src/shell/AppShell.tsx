@@ -1662,10 +1662,10 @@ export function AppShell() {
       freshOnlineGrace);
   // A rail-opened shell (any open terminal key other than the agent's
   // own terminal) takes over the main view chrome-free:
-  // ConnectionIndicator hides the Chat/Terminal pill while this is
-  // true, and MainTerminalView renders the shell with its own close
+  // ViewModeToggle hides the header Chat/Terminal switcher while this
+  // is true, and MainTerminalView renders the shell with its own close
   // affordance. The PANEL_NO_TERMINAL_KEY sentinel ("") is falsy, so
-  // "open with no target" stays a pill view.
+  // "open with no target" keeps the switcher.
   const isShellView = terminalFirst && !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
   const shellViewTargetAvailable =
     isShellView && terminals.some((terminal) => terminalTabKey(terminal) === panelInitialKey);

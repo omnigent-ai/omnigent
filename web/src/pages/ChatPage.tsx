@@ -1739,10 +1739,10 @@ export function updateWarmTerminalSurfaces(
  * The conversation scroll surface + composer — the content of the
  * "Main Agent" tab (and also the standalone view on `/`).
  *
- * In terminal-first sessions, when the connection pill is set to
+ * In terminal-first sessions, when the header switcher is set to
  * Terminal, the conversation + composer are replaced by an inline
- * `MainTerminalView`. The pill itself stays visible (rendered via
- * `ConnectionIndicator`) so the user can flip back to Chat.
+ * `MainTerminalView`. The switcher itself stays visible (in the header,
+ * see ViewModeToggle) so the user can flip back to Chat.
  */
 function MainAgentSurface({
   conversationId,
@@ -2077,11 +2077,7 @@ function MainAgentSurface({
           readOnly={entry.readOnly}
         />
         {isShown && (
-          <ConnectionIndicator
-            liveness={liveness}
-            onShowReconnectHelp={onShowReconnectHelp}
-            surfaceFrontmost={surfaceFrontmost}
-          />
+          <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
         )}
       </div>
     );
@@ -2333,14 +2329,10 @@ function MainAgentSurface({
             wrapperLabel={wrapperLabel}
           />
 
-          {/* Chat/Terminal toggle for terminal-first sessions, reconnect-or-
-          fork banner when unreachable, nothing otherwise. Sits below the
-          composer so its position is consistent with the terminal view. */}
-          <ConnectionIndicator
-            liveness={liveness}
-            onShowReconnectHelp={onShowReconnectHelp}
-            surfaceFrontmost={surfaceFrontmost}
-          />
+          {/* Reconnect-or-fork banner when unreachable, nothing otherwise.
+          Sits below the composer so its position is consistent with the
+          terminal view. */}
+          <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
         </>
       )}
     </>
@@ -3723,10 +3715,9 @@ interface ComposerProps {
   /** Show Polly's Codex command-backed Goal control. */
   showPollyCodexGoalControl?: boolean;
   /**
-   * Terminal-first session (Chat/Terminal pill present). Presentation
-   * only: tightens the composer's bottom padding to `pb-1.5` so it sits
-   * closer to the pill beneath it; non-terminal-first chats use the
-   * roomier `pb-3`.
+   * Terminal-first session. Presentation only: tightens the composer's
+   * bottom padding to `pb-1.5` (the status line beneath already cushions
+   * the edge); non-terminal-first chats use the roomier `pb-3`.
    */
   isTerminalFirst?: boolean;
   /**
@@ -5177,10 +5168,7 @@ export function Composer({
   return (
     <form
       onSubmit={handleSubmit}
-      className={cn(
-        "chat-composer-form px-4 md:px-6",
-        isTerminalFirst ? "terminal-first-composer-form pb-1.5" : "pb-3",
-      )}
+      className={cn("chat-composer-form px-4 md:px-6", isTerminalFirst ? "pb-1.5" : "pb-3")}
     >
       {/* Hidden file input for the attach button */}
       <input
