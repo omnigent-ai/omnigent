@@ -3880,43 +3880,48 @@ function ConversationRow({
               )}
             </Button>
           )}
-          <Tooltip disableHoverableContent>
-            <TooltipContent>
-              <TooltipArrow />
-              {isArchived ? "Unarchive conversation" : "Archive conversation"}
-            </TooltipContent>
-            <TooltipTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-xs"
-                aria-label={isArchived ? "Unarchive conversation" : "Archive conversation"}
-                data-testid="quick-archive-conversation"
-                className={cn(
-                  "text-muted-foreground transition-opacity",
-                  "hidden md:inline-flex",
-                  "md:opacity-0 md:group-hover:opacity-100",
-                  "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
-                )}
-                onClick={(e) => {
-                  // Keep the toggle click off the surrounding Link (no navigation).
-                  e.preventDefault();
-                  e.stopPropagation();
-                  if (!isArchived) {
-                    runArchive();
-                  } else {
-                    runUnarchive();
-                  }
-                }}
-              >
-                {isArchived ? (
-                  <ArchiveRestoreIcon className="size-3.5" data-icon-size="14" />
-                ) : (
-                  <ArchiveIcon className="size-3.5" data-icon-size="14" />
-                )}
-              </Button>
-            </TooltipTrigger>
-          </Tooltip>
+          {/* Archive is owner-only, same as the kebab's Archive item; non-owners
+              don't get the quick affordance and instead see that item disabled
+              with an explanation. */}
+          {isOwner && (
+            <Tooltip disableHoverableContent>
+              <TooltipContent>
+                <TooltipArrow />
+                {isArchived ? "Unarchive conversation" : "Archive conversation"}
+              </TooltipContent>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={isArchived ? "Unarchive conversation" : "Archive conversation"}
+                  data-testid="quick-archive-conversation"
+                  className={cn(
+                    "text-muted-foreground transition-opacity",
+                    "hidden md:inline-flex",
+                    "md:opacity-0 md:group-hover:opacity-100",
+                    "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
+                  )}
+                  onClick={(e) => {
+                    // Keep the toggle click off the surrounding Link (no navigation).
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (!isArchived) {
+                      runArchive();
+                    } else {
+                      runUnarchive();
+                    }
+                  }}
+                >
+                  {isArchived ? (
+                    <ArchiveRestoreIcon className="size-3.5" data-icon-size="14" />
+                  ) : (
+                    <ArchiveIcon className="size-3.5" data-icon-size="14" />
+                  )}
+                </Button>
+              </TooltipTrigger>
+            </Tooltip>
+          )}
 
           <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
             <DropdownMenuTrigger asChild>

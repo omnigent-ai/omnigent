@@ -755,6 +755,39 @@ describe("leave a shared session", () => {
   });
 });
 
+describe("quick-archive owner gate", () => {
+  // Archive is owner-only: the kebab renders its Archive item disabled for
+  // non-owners ("Only the session owner can archive this session"). The hover
+  // quick button must enforce the same gate — so a non-owner never gets the
+  // affordance the menu deliberately blocks.
+  it("hides the quick-archive button on a shared row the viewer doesn't own", () => {
+    mockConversations([{ ...CONV, owner: "other@example.com" }]);
+    renderSidebar();
+    // Non-owned rows live on the "Shared with me" tab (activates on mousedown).
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-shared"));
+
+    expect(screen.getByRole("link", { name: /My Session/ })).toBeInTheDocument();
+    expect(screen.queryByTestId("quick-archive-conversation")).toBeNull();
+
+    // The kebab still carries the (disabled) Archive item — the gate hides only
+    // the quick button, not the explanatory menu entry.
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    expect(screen.getByTestId("archive-conversation")).toHaveAttribute("data-disabled");
+  });
+
+  it("shows the quick-archive button on a row the viewer owns", () => {
+    mockConversations([CONV]);
+    renderSidebar();
+
+    expect(screen.getByTestId("quick-archive-conversation")).toBeInTheDocument();
+  });
+});
+
 describe("pinned row project flyout", () => {
   // Pinning lifts a session out of its project folder into the flat "Pinned"
   // section, so the folder no longer conveys which project it came from. The
