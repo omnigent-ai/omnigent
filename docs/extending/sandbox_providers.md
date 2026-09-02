@@ -137,6 +137,27 @@ The server resolves the provider through the registry and calls
 `prepare()` → `provision()` → `start_host()` → wait for online registration.
 Each managed sandbox authenticates back with a server-minted per-launch token.
 
+### Host-registration timeout
+
+That final wait — for the host process *inside* the sandbox to register with
+the server — is provider-agnostic and budgeted separately from any
+provider-specific "is my instance running yet" wait (Kubernetes's
+`sandbox.kubernetes.pod_ready_timeout_s`, for instance, which finishes first).
+
+| Variable | Set on | Description |
+|---|---|---|
+| `OMNIGENT_MANAGED_HOST_ONLINE_TIMEOUT_S` | Server | Seconds to wait for the sandboxed host to register (default 120) |
+
+A pre-baked image registers in seconds, so the default mostly covers a cold
+registry pull. Raise it when a host image or first-boot script is slow enough
+to blow past it — the symptom is a launch failing with `managed host did not
+come online within 120s`. A non-numeric or non-positive value is rejected when
+it is read.
+
+The parked-message rendezvous budget (how long a message POST waits for an
+in-flight launch to settle) is derived from this value, so raising it widens
+both.
+
 ## Provider capabilities
 
 Providers declare their feature set via a `capabilities` property returning
