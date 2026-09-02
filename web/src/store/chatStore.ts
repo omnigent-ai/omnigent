@@ -2046,7 +2046,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Paint whatever the entry already holds. For a live entry that is the
     // current transcript; for a fresh one it is the initial state.
     mirrorActiveEntry();
-    if (wasLive) return;
+    if (wasLive) {
+      // An open stream is not proof the entry is current: a session stream
+      // routed to the wrong replica stays open and heartbeats while delivering
+      // no events, and a reconnect loop that never re-opens holds the
+      // controller too. Verify the instantly-painted transcript against the
+      // committed snapshot in the background; item-id dedupe makes this a
+      // no-op when the entry really is current.
+      void reconcileOnReconnect(conversationId, entrySetter(entry), entryGetter(entry));
+      return;
+    }
 
     // Cold entry: bind its stream and hydrate history. `hydratePending` replays
     // the snapshot's un-consumed native messages — correct here because a fresh

@@ -603,25 +603,73 @@ describe("chatStore — switchTo", () => {
     expect(state.conversationLoadError).toBeNull();
   });
 
-  it("keeps a backgrounded conversation live, so returning to it needs no refetch", async () => {
+  it("paints a backgrounded conversation instantly from its live entry, no rebind", async () => {
     // The feature: switching away no longer tears the stream down, so switching
-    // back neither re-opens a stream nor re-fetches the snapshot. This is what
-    // the transcript LRU used to approximate (paint stale, then revalidate).
+    // back paints from the retained entry without a hydrating placeholder or a
+    // stream re-open. A background snapshot check revalidates the paint (see
+    // the stale-revisit test below), but the paint itself never waits on it.
     seedSession("conv_a", [userMessage("resp_a", "in a")]);
     seedSession("conv_b", [userMessage("resp_b", "in b")]);
 
     await useChatStore.getState().switchTo("conv_a");
     expect(useChatStore.getState().blocks).toHaveLength(1);
+    const streamOpens = () =>
+      fetchMock.mock.calls.filter(([input]) => String(input).includes("/stream")).length;
+    const opensAfterA = streamOpens();
 
     await useChatStore.getState().switchTo("conv_b");
-    const callsAfterB = fetchMock.mock.calls.length;
+    const opensAfterB = streamOpens();
 
     await useChatStore.getState().switchTo("conv_a");
-    // Painted from the live entry: conv_a's transcript is right there.
+    // Painted from the live entry the moment switchTo returns: conv_a's
+    // transcript is right there, with no hydrating placeholder.
     expect(useChatStore.getState().conversationId).toBe("conv_a");
     expect(useChatStore.getState().blocks).toHaveLength(1);
-    // And nothing was fetched to get it.
-    expect(fetchMock.mock.calls.length).toBe(callsAfterB);
+    expect(useChatStore.getState().loadingConversation).toBe(false);
+    // And no stream was re-opened to get it — the retained pump is reused.
+    expect(streamOpens()).toBe(opensAfterB);
+    expect(opensAfterB).toBe(opensAfterA + 1); // only conv_b's first bind opened one
+
+    // The background revalidation must not duplicate the already-painted
+    // transcript (itemId dedupe): still exactly one block after it settles.
+    await tick();
+    await tick();
+    expect(useChatStore.getState().blocks).toHaveLength(1);
+  });
+
+  it("revalidates a retained live conversation on revisit, recovering items its stream never delivered", async () => {
+    // The stale-revisit bug: a session stream can be open yet deliver nothing
+    // (on a sharded deployment an unkeyed open routes to the wrong replica and
+    // silently misses every event). The retained entry then never learns about
+    // committed items, and — because the entry still counts as live — a revisit
+    // used to paint the stale transcript and skip the refetch entirely, leaving
+    // a finished sub-agent's conversation empty until a full page reload.
+    seedSession("conv_child", []);
+    seedSession("conv_parent", [userMessage("resp_p", "dispatch the worker")]);
+
+    // Visit the child while it has no committed items; its stream stays open
+    // but delivers nothing (the default mock — an eventless live tail).
+    await useChatStore.getState().switchTo("conv_child");
+    expect(useChatStore.getState().blocks).toHaveLength(0);
+
+    // Return to the parent; the child entry stays retained and "live".
+    await useChatStore.getState().switchTo("conv_parent");
+
+    // The child finishes server-side: its reply commits as an item, but the
+    // eventless stream never tells the entry about it.
+    seedSession("conv_child", [assistantMessage("resp_w", "Worker result ready.")]);
+
+    // Revisit the child: paint is instant (stale), then the background
+    // revalidation fetches the committed snapshot and splices the reply in —
+    // no page reload, no rebind.
+    await useChatStore.getState().switchTo("conv_child");
+    await vi.waitFor(() => {
+      const texts = useChatStore
+        .getState()
+        .blocks.filter((b): b is TextDone => b.type === "text_done")
+        .map((b) => b.fullText);
+      expect(texts).toContain("Worker result ready.");
+    });
   });
 
   it("commits a message sent in a backgrounded conversation, in transcript order", async () => {
