@@ -4078,7 +4078,7 @@ function ComposerStatusLine({
             data-testid="composer-pr-link"
             onClick={() => openGithubTab?.()}
             title="View this PR in the GitHub tab"
-            className="flex shrink-0 items-center gap-1.5 rounded font-medium text-primary hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+            className="flex shrink-0 items-center gap-1.5 rounded text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
           >
             <GithubMono size={14} aria-hidden />
             <span className="tabular-nums underline underline-offset-2">#{prNumber}</span>
