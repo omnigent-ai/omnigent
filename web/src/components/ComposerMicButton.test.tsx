@@ -26,7 +26,10 @@ import { ComposerMicButton } from "./ComposerMicButton";
 // Controllable DictationSession stand-in for the server-mode tests. The
 // factory reads the mutable spies at call time, so each test installs its
 // own behavior in beforeEach.
-type SessionStub = { stop: () => Promise<string>; cancel: () => void };
+interface SessionStub {
+  stop: () => Promise<string>;
+  cancel: () => void;
+}
 let sessionStartMock: Mock<(events: DictationSessionEvents) => Promise<SessionStub>>;
 let sessionStopMock: Mock<() => Promise<string>>;
 let sessionCancelMock: Mock<() => void>;
@@ -56,19 +59,30 @@ function installDictationSession() {
 let handlers: Record<string, (event: unknown) => void>;
 let startSpy: ReturnType<typeof vi.fn>;
 let stopSpy: ReturnType<typeof vi.fn>;
+let recognitionLang: string | undefined;
 /** Original navigator.mediaDevices descriptor, restored after each test. */
 let originalMediaDevices: PropertyDescriptor | undefined;
+/** Original navigator.language descriptor, restored after each test. */
+let originalLanguage: PropertyDescriptor | undefined;
 
 function installSpeechRecognition() {
   handlers = {};
   startSpy = vi.fn();
   stopSpy = vi.fn();
+  recognitionLang = undefined;
   // A class (not an arrow fn) so `new Ctor()` is constructable — the component
   // does `new Ctor()` in its mount effect.
   class FakeRecognition {
+    private language = "en-US";
+    get lang() {
+      return this.language;
+    }
+    set lang(value: string) {
+      this.language = value;
+      recognitionLang = value;
+    }
     continuous = false;
     interimResults = false;
-    lang = "en-US";
     start = startSpy;
     stop = stopSpy;
     addEventListener(type: string, handler: (event: unknown) => void) {
@@ -94,6 +108,7 @@ beforeEach(() => {
   // (unavailable in jsdom) is ever constructed. Capture the original descriptor
   // first so afterEach can restore it — otherwise this navigator stub leaks.
   originalMediaDevices = Object.getOwnPropertyDescriptor(navigator, "mediaDevices");
+  originalLanguage = Object.getOwnPropertyDescriptor(navigator, "language");
   Object.defineProperty(navigator, "mediaDevices", {
     configurable: true,
     value: { getUserMedia: vi.fn().mockRejectedValue(new Error("no mic")) },
@@ -110,6 +125,11 @@ afterEach(() => {
   } else {
     delete (navigator as { mediaDevices?: unknown }).mediaDevices;
   }
+  if (originalLanguage) {
+    Object.defineProperty(navigator, "language", originalLanguage);
+  } else {
+    delete (navigator as { language?: unknown }).language;
+  }
 });
 
 describe("ComposerMicButton", () => {
@@ -124,6 +144,30 @@ describe("ComposerMicButton", () => {
     render(<ComposerMicButton onTranscript={vi.fn()} />);
     const button = screen.getByRole("button", { name: "Voice dictation" });
     expect(button).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("defaults Web Speech to the browser language", () => {
+    Object.defineProperty(navigator, "language", { configurable: true, value: "ja-JP" });
+
+    render(<ComposerMicButton onTranscript={vi.fn()} />);
+
+    expect(recognitionLang).toBe("ja-JP");
+  });
+
+  it("prefers an explicit language over the browser language", () => {
+    Object.defineProperty(navigator, "language", { configurable: true, value: "ja-JP" });
+
+    render(<ComposerMicButton onTranscript={vi.fn()} lang="en-GB" />);
+
+    expect(recognitionLang).toBe("en-GB");
+  });
+
+  it("falls back to en-US when the browser language is empty", () => {
+    Object.defineProperty(navigator, "language", { configurable: true, value: "" });
+
+    render(<ComposerMicButton onTranscript={vi.fn()} />);
+
+    expect(recognitionLang).toBe("en-US");
   });
 
   it("starts recognition on click and reflects the recording state", () => {
@@ -270,6 +314,8 @@ const DICTATION_INFO: ServerInfo = {
   public_sharing_enabled: true,
   server_version: "test",
   smart_routing_enabled: false,
+  smart_routing_sources: { external: false, oss: false },
+  features: {},
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: true,

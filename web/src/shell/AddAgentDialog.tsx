@@ -116,9 +116,9 @@ export function AddAgentDialog({
 
         <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto">
           <div className="flex flex-col gap-2">
-            <span className="text-xs font-medium text-muted-foreground">Pick an agent</span>
+            <span className="text-sm font-medium text-muted-foreground">Pick an agent</span>
             {agentList.length === 0 ? (
-              <p data-testid="add-agent-empty" className="text-xs text-muted-foreground">
+              <p data-testid="add-agent-empty" className="text-sm text-muted-foreground">
                 No agents available on this server. Register one with{" "}
                 <code className="font-mono">omnigent server --agent</code>.
               </p>
@@ -137,7 +137,7 @@ export function AddAgentDialog({
 
           {selectedAgent !== null && (
             <div className="flex flex-col gap-1.5">
-              <label htmlFor="add-agent-name" className="text-xs font-medium text-muted-foreground">
+              <label htmlFor="add-agent-name" className="text-sm font-medium text-muted-foreground">
                 Name
               </label>
               {/* Raw input matching NewChatDialog's "Name" field for a
@@ -150,13 +150,13 @@ export function AddAgentDialog({
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 placeholder="Name this agent"
-                className="rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none transition-colors focus-visible:border-ring"
+                className="rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none transition-colors focus-visible:border-ring"
               />
             </div>
           )}
 
           {error !== null && (
-            <p data-testid="add-agent-error" className="text-xs text-destructive">
+            <p data-testid="add-agent-error" className="text-sm text-destructive">
               {error}
             </p>
           )}
@@ -169,9 +169,10 @@ export function AddAgentDialog({
           <Button
             data-testid="add-agent-submit"
             onClick={handleAdd}
-            disabled={selectedAgent === null || !name.trim() || submitting}
+            loading={submitting}
+            disabled={selectedAgent === null || !name.trim()}
           >
-            {submitting ? "Adding…" : "Add"}
+            Add
           </Button>
         </DialogFooter>
       </DialogContent>

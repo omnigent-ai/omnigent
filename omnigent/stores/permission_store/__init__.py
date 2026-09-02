@@ -1,8 +1,8 @@
 """Permission store — manages session-level access grants.
 
-Each grant carries a numeric access level plus an independent, owner-controlled
-approval capability. The ``"__public__"`` sentinel user ID represents public
-read access and can never approve privileged actions.
+Each grant is a ``(user_id, conversation_id, level)`` triple where
+level is an integer: 1=read, 2=edit, 3=manage. The ``"__public__"``
+sentinel user ID represents public read access.
 """
 
 from abc import ABC, abstractmethod
@@ -32,8 +32,6 @@ class PermissionStore(ABC):
         user_id: str,
         conversation_id: str,
         level: int,
-        *,
-        can_approve: bool = False,
     ) -> SessionPermission:
         """Upsert a permission grant.
 
@@ -48,8 +46,6 @@ class PermissionStore(ABC):
             e.g. ``"conv_abc123"``.
         :param level: Numeric permission level (1=read, 2=edit,
             3=manage).
-        :param can_approve: Whether the session owner delegated approval
-            authority to the grantee.
         :returns: The resulting :class:`SessionPermission`.
         """
         ...
@@ -77,6 +73,19 @@ class PermissionStore(ABC):
         :param conversation_id: The session, e.g. ``"conv_abc123"``.
         :returns: The :class:`SessionPermission` if found, otherwise
             ``None``.
+        """
+        ...
+
+    @abstractmethod
+    def reassign_user_grants(self, from_user_id: str, to_user_id: str) -> int:
+        """Move one user's grants to another user.
+
+        Existing destination grants win when both users have access to the
+        same session, and the duplicate source grant is removed.
+
+        :param from_user_id: Source grantee whose grants move.
+        :param to_user_id: Destination grantee that receives them.
+        :returns: Number of grants moved to *to_user_id*.
         """
         ...
 

@@ -17,7 +17,7 @@
 # create it in repo settings with required reviewers). Approving it is the
 # human attestation "I reviewed the draft notes". The publish itself uses the
 # App token — GITHUB_TOKEN-published releases emit no `release: published`
-# event, and publish-changelog.yml + update-homebrew.yml hang off it — and
+# event, and publish-changelog.yml + homebrew-tap-pr.yml hang off it — and
 # sets make_latest explicitly, which API publishes don't do on their own.
 #
 # rc tags never finalize: their drafts deliberately stay unpublished.
@@ -237,5 +237,5 @@ jobs:
             echo ""
             echo "The \`release: published\` event now fires (App-token publish):"
             echo "- **publish-changelog.yml** opens the omnigent-site release-post PR and the docs-publish PR — review and merge both."
-            echo "- **update-homebrew.yml** opens the homebrew-tap bump PR — review the resource diff, then apply the \`pr-pull\` label."
+            echo "- **homebrew-tap-pr.yml** opens the homebrew-tap bump PR — review the resource diff, then apply the \`pr-pull\` label."
           } >> "$GITHUB_STEP_SUMMARY"

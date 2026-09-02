@@ -25,7 +25,8 @@ function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): 
 const fetchMock = vi.fn();
 
 const BUILTINS_URL = "/v1/agents";
-const SCAN_URL = "/v1/sessions?limit=100&kind=any";
+const SCAN_URL = "/v1/sessions?limit=100&kind=any&include_archived=true";
+const HARNESSES_URL = "/v1/harnesses";
 
 /**
  * Stub the global fetch with per-URL responses. Unrouted URLs reject
@@ -88,6 +89,47 @@ describe("useAvailableAgents", () => {
     const urls = fetchMock.mock.calls.map((c) => c[0] as string);
     expect(urls).toContain(BUILTINS_URL);
     expect(urls).toContain(SCAN_URL);
+  });
+
+  it("labels and flags generic-ACP agents from the server harness catalog", async () => {
+    // A seeded ACP agent's name is a slug, so without the catalog the picker
+    // renders Grok Build as "Grok" and — lacking `acpHarness` — groups it under
+    // "Agents" instead of "Harnesses". Both come from the server so a new
+    // builtin ACP row needs no frontend change.
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          { id: "ag_grok", name: "grok", harness: "grok", builtin: true },
+          { id: "ag_polly", name: "polly", harness: "claude-sdk", builtin: true },
+        ],
+        has_more: false,
+      }),
+      [SCAN_URL]: EMPTY_SCAN,
+      [HARNESSES_URL]: mockResponse({
+        data: [
+          { id: "grok", label: "Grok Build", capabilities: { integration_mode: "acp-subprocess" } },
+          {
+            id: "claude-sdk",
+            label: "Claude SDK",
+            capabilities: { integration_mode: "sdk-in-process" },
+          },
+        ],
+      }),
+    });
+
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+    // The catalog is a second query, so wait for the enrichment specifically.
+    await waitFor(() =>
+      expect(result.current.data?.find((a) => a.name === "grok")?.acpHarness).toBe(true),
+    );
+    expect(result.current.data?.find((a) => a.name === "grok")?.display_name).toBe("Grok Build");
+
+    // A composed agent on a non-ACP harness keeps its own name: it must not
+    // inherit the harness label ("Claude SDK") nor move into the Harnesses group.
+    const polly = result.current.data?.find((a) => a.name === "polly");
+    expect(polly?.display_name).toBe("Polly");
+    expect(polly?.acpHarness).toBeUndefined();
   });
 
   it("paginates built-ins so defaults pushed past fork rows are still listed", async () => {
@@ -840,5 +882,130 @@ describe("prefetchAvailableAgentDetails", () => {
 
     // Shadow removed; only the seeded built-in remains.
     expect(queryClient.getQueryData(["available-agents"])).toEqual([kiroBuiltin]);
+  });
+});
+
+// Pinned agents (e.g. a project's configured default) must survive discovery:
+// the recency-bounded scan can miss them and the same-name collapse could
+// otherwise drop or id-swap them, silently rebinding the project.
+describe("useAvailableAgents pinned agents", () => {
+  const PINNED_LOOKUP_URL =
+    "/v1/sessions?limit=1&kind=any&include_archived=true&agent_id=ag_pinned";
+
+  it("resolves a pinned agent whose only sessions are archived or paginated out of the scan", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({ object: "list", data: [], has_more: false }),
+      [SCAN_URL]: EMPTY_SCAN,
+      [PINNED_LOOKUP_URL]: mockResponse({
+        object: "list",
+        data: [
+          { id: "conv_anchor", agent_id: "ag_pinned", agent_name: "deploy-bot", created_at: 100 },
+        ],
+        has_more: false,
+      }),
+    });
+
+    const { result } = renderHook(() => useAvailableAgents({ pinnedAgentIds: ["ag_pinned"] }), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    const pinned = result.current.data?.find((a) => a.id === "ag_pinned");
+    expect(pinned?.name).toBe("deploy-bot");
+    // Anchored to the archived session so hover enrichment still works.
+    expect(pinned?.sessionId).toBe("conv_anchor");
+  });
+
+  it("keeps a pinned agent's id through the same-name newest-wins collapse", async () => {
+    // A newer same-named upload wins the name bucket — without pinning, that
+    // id swap would silently rebind the project to the newer upload.
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({ object: "list", data: [], has_more: false }),
+      [SCAN_URL]: mockResponse({
+        object: "list",
+        data: [
+          { id: "conv_new", agent_id: "ag_new", agent_name: "deploy-bot", created_at: 200 },
+          { id: "conv_old", agent_id: "ag_pinned", agent_name: "deploy-bot", created_at: 100 },
+        ],
+        has_more: false,
+      }),
+    });
+
+    const { result } = renderHook(() => useAvailableAgents({ pinnedAgentIds: ["ag_pinned"] }), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    const ids = (result.current.data ?? []).map((a) => a.id);
+    expect(ids).toContain("ag_pinned");
+    expect(ids).toContain("ag_new");
+  });
+
+  it("restores a pinned session-less catalog template superseded by a newer same-named upload", async () => {
+    // A project pins a user-registered template (builtin: false) that has no
+    // sessions of its own. A newer same-named upload wins the name bucket, so
+    // the template leaves the merged list; the scan can't restore it and the
+    // per-agent session lookup finds nothing. The pin must still resolve from
+    // the catalog instead of surfacing a false "agent unavailable".
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          {
+            id: "ag_pinned",
+            name: "deploy-bot",
+            harness: "claude-sdk",
+            builtin: false,
+            created_at: 100,
+          },
+        ],
+        has_more: false,
+      }),
+      [SCAN_URL]: mockResponse({
+        object: "list",
+        data: [
+          // Newer same-named upload — wins the bucket, evicting the template.
+          { id: "conv_new", agent_id: "ag_upload_v2", agent_name: "deploy-bot", created_at: 200 },
+        ],
+        has_more: false,
+      }),
+    });
+
+    const { result } = renderHook(() => useAvailableAgents({ pinnedAgentIds: ["ag_pinned"] }), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    const ids = (result.current.data ?? []).map((a) => a.id);
+    expect(ids).toContain("ag_pinned");
+    expect(ids).toContain("ag_upload_v2");
+    // Restored straight from the catalog — no per-agent session probe fired.
+    const lookupCalls = fetchMock.mock.calls
+      .map((c) => c[0] as string)
+      .filter((u) => u.includes("agent_id=ag_pinned"));
+    expect(lookupCalls).toEqual([]);
+  });
+
+  it("omits an unresolvable pinned id without failing the rest of the list", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [{ id: "ag_polly", name: "polly", builtin: true }],
+        has_more: false,
+      }),
+      [SCAN_URL]: EMPTY_SCAN,
+      "/v1/sessions?limit=1&kind=any&include_archived=true&agent_id=ag_gone": mockResponse({
+        object: "list",
+        data: [],
+        has_more: false,
+      }),
+    });
+
+    const { result } = renderHook(() => useAvailableAgents({ pinnedAgentIds: ["ag_gone"] }), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly"]);
   });
 });

@@ -17,11 +17,11 @@ from tests.e2e_ui.conftest import open_right_rail
 
 
 def _open_new_shell(page: Page) -> None:
-    """Open a user shell in the main terminal surface."""
+    """Open a user shell as a rail tab via the tab strip's "+" → Shell menu."""
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
-    rail.get_by_role("tab", name=re.compile("Shells")).click()
-    rail.get_by_role("button", name="New shell").click()
+    rail.get_by_role("button", name="Open new").click()
+    page.get_by_role("menuitem", name=re.compile("Shell")).click()
 
 
 def _print_url_at_terminal_origin(page: Page, url: str) -> None:

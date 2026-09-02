@@ -1,8 +1,80 @@
-// Vitest cases for `parseEvent` — the raw-SSE-JSON → typed-event mapping.
+// Vitest cases for `parseEvent` — the raw-SSE-JSON → typed-event mapping —
+// and `withStallGuard` — the byte-level silence watchdog.
 
-import { describe, expect, it } from "vitest";
-import { parseEvent } from "./sse";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { parseEvent, withStallGuard } from "./sse";
 import type { SessionStatusEvent, SessionSupersededEvent, TextDelta } from "./events";
+
+describe("withStallGuard", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** An upstream byte stream the test feeds, plus a cancel probe. */
+  function upstream(): {
+    stream: ReadableStream<Uint8Array>;
+    push: (s: string) => void;
+    cancelled: () => boolean;
+  } {
+    let ctrl: ReadableStreamDefaultController<Uint8Array> | null = null;
+    let cancelled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        ctrl = c;
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    return {
+      stream,
+      push: (s) => ctrl!.enqueue(new TextEncoder().encode(s)),
+      cancelled: () => cancelled,
+    };
+  }
+
+  it("passes chunks through while bytes flow, then trips on silence", async () => {
+    const up = upstream();
+    let stalled = 0;
+    const reader = withStallGuard(up.stream, {
+      stallMs: 1_000,
+      onStall: () => (stalled += 1),
+    }).getReader();
+
+    // Bytes inside the window pass through and re-arm the timer.
+    up.push("a");
+    expect(new TextDecoder().decode((await reader.read()).value)).toBe("a");
+    await vi.advanceTimersByTimeAsync(900);
+    up.push("b");
+    expect(new TextDecoder().decode((await reader.read()).value)).toBe("b");
+    expect(stalled).toBe(0);
+
+    // Silence past the window: the upstream is cancelled and the guarded
+    // stream ends cleanly (done, not an error) — the same shape as a
+    // transport drop, which consumers answer with a reconnect.
+    const pending = reader.read();
+    await vi.advanceTimersByTimeAsync(1_100);
+    expect((await pending).done).toBe(true);
+    expect(stalled).toBe(1);
+    expect(up.cancelled()).toBe(true);
+  });
+
+  it("propagates a consumer cancel upstream without tripping", async () => {
+    const up = upstream();
+    let stalled = 0;
+    const guarded = withStallGuard(up.stream, { stallMs: 1_000, onStall: () => (stalled += 1) });
+
+    await guarded.cancel();
+    expect(up.cancelled()).toBe(true);
+
+    // The armed timer was cleared: silence after cancel is not a stall.
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(stalled).toBe(0);
+  });
+});
 
 describe("parseEvent — response.output_text.delta", () => {
   it("parses a plain delta with no streaming identifiers", () => {
@@ -85,6 +157,30 @@ describe("parseEvent — session.superseded", () => {
   });
 });
 
+describe("parseEvent — session.status (blocked_on)", () => {
+  function blockedOn(data: Record<string, unknown>): string | undefined {
+    const ev = parseEvent("session.status", {
+      conversation_id: "conv_a",
+      status: "running",
+      ...data,
+    });
+    return (ev as SessionStatusEvent | null)?.blockedOn;
+  }
+
+  it("threads the reason so the indicator can name what the agent is parked on", () => {
+    expect(blockedOn({ blocked_on: "permission prompt" })).toBe("permission prompt");
+  });
+
+  it("leaves it undefined when absent (the session is not parked)", () => {
+    expect(blockedOn({})).toBeUndefined();
+  });
+
+  it("ignores an empty or non-string reason rather than rendering a blank one", () => {
+    expect(blockedOn({ blocked_on: "" })).toBeUndefined();
+    expect(blockedOn({ blocked_on: 7 })).toBeUndefined();
+  });
+});
+
 describe("parseEvent — session.status (background_task_count)", () => {
   function bgCount(data: Record<string, unknown>): number | undefined {
     const ev = parseEvent("session.status", { conversation_id: "conv_a", status: "idle", ...data });
@@ -111,6 +207,53 @@ describe("parseEvent — session.status (background_task_count)", () => {
   it("ignores a non-numeric or negative count", () => {
     expect(bgCount({ background_task_count: "2" })).toBeUndefined();
     expect(bgCount({ background_task_count: -1 })).toBeUndefined();
+  });
+});
+
+describe("parseEvent — session.status (background_tasks detail)", () => {
+  function bgTasks(data: Record<string, unknown>) {
+    const ev = parseEvent("session.status", { conversation_id: "conv_a", status: "idle", ...data });
+    return (ev as SessionStatusEvent | null)?.backgroundTasks;
+  }
+
+  it("threads the per-shell detail so the UI can list the shells", () => {
+    expect(
+      bgTasks({
+        background_task_count: 2,
+        background_tasks: [
+          {
+            id: "a",
+            type: "shell",
+            status: "running",
+            description: "Wait for CI",
+            command: "sleep 120",
+          },
+          { description: "Build check" },
+        ],
+      }),
+    ).toEqual([
+      {
+        id: "a",
+        type: "shell",
+        status: "running",
+        description: "Wait for CI",
+        command: "sleep 120",
+      },
+      { description: "Build check" },
+    ]);
+  });
+
+  it("drops non-object entries and entries with no usable string field", () => {
+    expect(
+      bgTasks({ background_tasks: ["garbage", 5, null, { description: "keep me" }, { id: 42 }] }),
+    ).toEqual([{ description: "keep me" }]);
+  });
+
+  it("leaves detail undefined when absent, not an array, or empty after filtering", () => {
+    expect(bgTasks({})).toBeUndefined();
+    expect(bgTasks({ background_tasks: "nope" })).toBeUndefined();
+    expect(bgTasks({ background_tasks: [] })).toBeUndefined();
+    expect(bgTasks({ background_tasks: ["junk", 1] })).toBeUndefined();
   });
 });
 

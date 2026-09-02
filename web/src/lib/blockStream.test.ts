@@ -1655,3 +1655,99 @@ describe("BlockStream — interrupt (Stop) finalizes in-flight content", () => {
     expect(start2).toBeGreaterThan(done1);
   });
 });
+
+describe("BlockStream — native turn start (session.status running)", () => {
+  it("stamps reducer blocks with the turn id from a running status edge", () => {
+    // A native harness emits no `response.created`, so without this the
+    // reasoning block carries an empty response id and groups into its own
+    // bubble — splitting the turn away from its committed items, which is
+    // what kept the "Worked for" fold from forming live on codex.
+    const blocks = reduce([
+      {
+        type: "session_status",
+        conversationId: "conv_1",
+        status: "running",
+        responseId: "codex_t1",
+      },
+      { type: "reasoning_started" },
+      { type: "reasoning_delta", delta: "Planning the run" },
+      { type: "text_delta", delta: "Answer" },
+    ]);
+
+    expect(blocks.length).toBeGreaterThan(0);
+    for (const b of blocks) {
+      expect(b.ctx.responseId).toBe("codex_t1");
+    }
+  });
+
+  it("re-stamps on the next turn's running edge", () => {
+    // The id must track the CURRENT turn: adopt-if-unset would leave turn
+    // 2's reasoning under turn 1's id, splitting it into the wrong bubble.
+    const blocks = reduce([
+      {
+        type: "session_status",
+        conversationId: "conv_1",
+        status: "running",
+        responseId: "codex_t1",
+      },
+      { type: "reasoning_started" },
+      { type: "reasoning_delta", delta: "first turn" },
+      { type: "session_status", conversationId: "conv_1", status: "idle", responseId: "codex_t1" },
+      {
+        type: "session_status",
+        conversationId: "conv_1",
+        status: "running",
+        responseId: "codex_t2",
+      },
+      { type: "reasoning_started" },
+      { type: "reasoning_delta", delta: "second turn" },
+    ]);
+
+    const t2 = blocks.filter((b) => b.ctx.responseId === "codex_t2");
+    expect(t2.length).toBeGreaterThan(0);
+    const secondTurnText = t2
+      .filter((b): b is ReasoningChunk => b.type === "reasoning_chunk")
+      .map((c) => c.text)
+      .join("");
+    // (Chunks flush on a size threshold, so compare on the leading word.)
+    expect(secondTurnText).toContain("second");
+    expect(secondTurnText).not.toContain("first");
+  });
+
+  it("ignores a bare running edge with no turn id", () => {
+    // The PTY-activity relay publishes running/idle with no response id;
+    // adopting that would wipe the turn id mid-stream.
+    const blocks = reduce([
+      {
+        type: "session_status",
+        conversationId: "conv_1",
+        status: "running",
+        responseId: "codex_t1",
+      },
+      { type: "session_status", conversationId: "conv_1", status: "running" },
+      { type: "reasoning_started" },
+      { type: "reasoning_delta", delta: "still turn one" },
+    ]);
+
+    for (const b of blocks) {
+      expect(b.ctx.responseId).toBe("codex_t1");
+    }
+  });
+});
+
+describe("BlockStream — naming a turn already in flight", () => {
+  it("adopts the id without sealing an already-open reasoning section", () => {
+    // Codex opens reasoning ~2s BEFORE the running edge names the turn.
+    // Closing on adopt would split one thought into two reasoning panels.
+    const blocks = reduce([
+      { type: "reasoning_started" },
+      { type: "reasoning_delta", delta: "weighing options" },
+      { type: "session_status", conversationId: "c", status: "running", responseId: "codex_t1" },
+      { type: "reasoning_delta", delta: " and continuing" },
+      { type: "text_delta", delta: "Answer" },
+    ]);
+
+    // Exactly one reasoning section was opened for the whole thought.
+    expect(blocks.filter((b) => b.type === "reasoning_start")).toHaveLength(1);
+  });
+});

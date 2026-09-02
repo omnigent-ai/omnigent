@@ -25,6 +25,8 @@
  * MarkdownRichTextViewer so a regression fails here.
  */
 
+import type * as UseFileContentModule from "@/hooks/useFileContent";
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Editor } from "@tiptap/core";
 import { StarterKit } from "@tiptap/starter-kit";
@@ -43,7 +45,7 @@ installMarkdownParserPatch();
 const SafeListItem = ListItem.extend({ content: "block+" });
 
 vi.mock("@/hooks/useFileContent", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/hooks/useFileContent")>();
+  const actual = await importOriginal<typeof UseFileContentModule>();
   return { ...actual, fetchFileContent: vi.fn().mockResolvedValue(undefined) };
 });
 

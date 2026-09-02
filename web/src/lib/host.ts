@@ -24,6 +24,74 @@ export interface UserSuggestion {
   displayName?: string;
 }
 
+/**
+ * The kind of UI element an analytics event came from. A small, closed set kept
+ * intentionally host-agnostic — the host maps each value onto whatever its own
+ * telemetry taxonomy uses. Omitted when the element doesn't fit any of these.
+ */
+export type OmnigentComponentKind =
+  "button" | "link" | "input" | "textarea" | "checkbox" | "toggle" | "select" | "tabs";
+
+/**
+ * A multi-phase interaction whose *outcome* or *latency* matters — not just that a
+ * control was clicked. Host-agnostic; the host maps each onto its own taxonomy.
+ *   - `agent_run`      — one user prompt → model run.
+ *   - `tool_call`      — a single tool / skill / MCP invocation within a run.
+ *   - `approval`       — a human-in-the-loop permission decision.
+ *   - `list_sessions`  — loading the session list (user-initiated; not background polls).
+ *   - `get_session`    — loading a single session the user opened / switched to.
+ *   - `create_session_sandbox` / `create_session_computer` — a brand-new chat from
+ *     send to the first AI message, split by where the session runs (managed
+ *     sandbox vs the user's computer host); host kind is baked into the kind so
+ *     the host can name/segment the two without a queryable sub-dimension.
+ */
+export type OmnigentInteractionKind =
+  | "agent_run"
+  | "tool_call"
+  | "approval"
+  | "list_sessions"
+  | "get_session"
+  | "create_session_sandbox"
+  | "create_session_computer";
+
+/** Terminal outcome of an interaction, set on the `complete` phase. */
+export type OmnigentInteractionStatus = "success" | "failure" | "cancelled" | "timed_out";
+
+/**
+ * A product-analytics event forwarded to the host. Each carries a stable,
+ * caller-chosen `componentId` / `pageId` so the host can attribute the action.
+ *
+ * PII: `value` on a value-change is only ever set when the emitting call site
+ * explicitly declares the value PII-free (see `useOmnigentAnalytics` in
+ * `lib/analytics.ts`). Free-form field text is never forwarded. Likewise
+ * `interaction_phase.name` must be a bounded, non-PII label (e.g. a tool name
+ * from a fixed set), never user content.
+ */
+export type OmnigentAnalyticsEvent =
+  | { type: "click"; componentId: string; componentKind?: OmnigentComponentKind }
+  | {
+      type: "value_change";
+      componentId: string;
+      componentKind?: OmnigentComponentKind;
+      value?: string | number | boolean;
+    }
+  | { type: "page_view"; pageId: string }
+  | {
+      /**
+       * Start or end of a timed interaction whose outcome or latency matters
+       * (see `OmnigentInteractionKind`). `interactionId` correlates the `start`
+       * and `complete` of one interaction; `status` and `durationMs` are set on
+       * `complete`.
+       */
+      type: "interaction_phase";
+      interactionId: string;
+      interactionKind: OmnigentInteractionKind;
+      phase: "start" | "complete";
+      status?: OmnigentInteractionStatus;
+      name?: string;
+      durationMs?: number;
+    };
+
 export interface OmnigentHostConfig {
   /**
    * Maps an web API path (always starting with `/v1`, `/health`, or
@@ -41,6 +109,15 @@ export interface OmnigentHostConfig {
    * logic and returns the suggestions to display.
    */
   searchUsers?: (query: string, options?: { signal?: AbortSignal }) => Promise<UserSuggestion[]>;
+  /**
+   * Optional product-analytics sink. When supplied by the host, the app's
+   * instrumented components forward clicks, field value-changes, and page views
+   * here (see `lib/analytics.ts`); when omitted (standalone, or before the host
+   * wires it) every emit is a no-op — the app records nothing on its own. The
+   * host owns transport, batching, and any PII policy beyond the app's default
+   * value redaction.
+   */
+  analytics?: (event: OmnigentAnalyticsEvent) => void;
   /**
    * Maps an web WS path (e.g.
    * `/v1/sessions/{id}/resources/terminals/{tid}/attach`) to a fully
@@ -64,6 +141,12 @@ export interface OmnigentHostConfig {
    */
   cliServerUrlSuffix?: string;
   /**
+   * Optional URL to the host's own appearance/theme settings. When the host
+   * owns light/dark (the embed's own switcher is hidden), the settings screen
+   * links here so users can find where to change it. Omitted standalone.
+   */
+  themeSettingsUrl?: string;
+  /**
    * Optional documentation links for embed-only UX hints.
    *
    * Standalone web ignores these values. Embedded hosts can pass one object
@@ -83,7 +166,9 @@ export interface OmnigentHostConfig {
 }
 
 let hostConfig: OmnigentHostConfig = {};
+let hostConfigGeneration = 0;
 let embedRoot: HTMLElement | null = null;
+let embedScopeRoot: HTMLElement | null = null;
 
 export function setOmnigentHostConfig(config: OmnigentHostConfig): void {
   // Guard: never clobber an already-installed fetcher with an empty config.
@@ -93,10 +178,27 @@ export function setOmnigentHostConfig(config: OmnigentHostConfig): void {
   // to bare same-origin paths.
   if (!config?.fetcher && hostConfig.fetcher) return;
   hostConfig = config ?? {};
+  hostConfigGeneration += 1;
 }
 
 export function getOmnigentHostConfig(): OmnigentHostConfig {
   return hostConfig;
+}
+
+export function getOmnigentHostGeneration(): number {
+  return hostConfigGeneration;
+}
+
+/**
+ * True when host-scoped traffic must carry the host_id slice key: either the
+ * embed host fetcher is installed (managed UI) or the standalone dev bundle
+ * was pointed at a Databricks workspace via `npm run dev` (vite.config.ts sets
+ * `VITE_DATABRICKS_WORKSPACE=true`). No fetcher is installed in the dev case,
+ * so the flag is the signal. False for a bare local / self-hosted server
+ * (single replica, no sharding), where emitting the key would just dirty the log.
+ */
+export function isDatabricksWorkspace(): boolean {
+  return hostConfig.fetcher != null || import.meta.env.VITE_DATABRICKS_WORKSPACE === "true";
 }
 
 /**
@@ -108,11 +210,27 @@ export function getOmnigentUserSearch(): OmnigentHostConfig["searchUsers"] {
 }
 
 /**
+ * The host-provided analytics sink, or `undefined` when none is configured.
+ * Consumers use the absence to stay inert (emit nothing).
+ */
+export function getOmnigentAnalytics(): OmnigentHostConfig["analytics"] {
+  return hostConfig.analytics;
+}
+
+/**
  * The host-provided share-link transform, or `undefined` when none is
  * configured. Absence means the relative URL is used unchanged.
  */
 export function getOmnigentTransformShareLink(): OmnigentHostConfig["transformShareLink"] {
   return hostConfig.transformShareLink;
+}
+
+/**
+ * The host-provided URL to its own theme/appearance settings, or `undefined`
+ * standalone. The settings screen links here when the host owns light/dark.
+ */
+export function getOmnigentThemeSettingsUrl(): OmnigentHostConfig["themeSettingsUrl"] {
+  return hostConfig.themeSettingsUrl;
 }
 
 /**
@@ -127,6 +245,47 @@ export function setEmbedRoot(el: HTMLElement | null): void {
 
 export function getEmbedRoot(): HTMLElement | null {
   return embedRoot;
+}
+
+/**
+ * The embed's scope element (`.omnigent-app`) — the outer wrapper the scoped
+ * stylesheet collapses `:root` / `html` / `body` onto. Per-device preference DOM
+ * mutations (UI font size, `--custom-*` theme variables, the `data-theme`
+ * palette attribute) must land here (or a descendant) rather than on
+ * `document.documentElement`: the scoped `.omnigent-app` tokens shadow anything
+ * set on the real document root. Null standalone (falls back to the document
+ * root), where the scoped stylesheet isn't in play.
+ */
+export function setEmbedScopeRoot(el: HTMLElement | null): void {
+  embedScopeRoot = el;
+}
+
+export function getEmbedScopeRoot(): HTMLElement | null {
+  return embedScopeRoot;
+}
+
+/**
+ * The element preference CSS custom properties are set on (UI font size/family,
+ * `--custom-*` theme variables): the embed scope root when embedded, else the
+ * document root.
+ */
+export function getStyleRoot(): HTMLElement | null {
+  if (embedScopeRoot) return embedScopeRoot;
+  return typeof document !== "undefined" ? document.documentElement : null;
+}
+
+/**
+ * The elements theme *attributes* are stamped onto (`data-theme` palette,
+ * `data-custom-translucent-sidebar`). Embedded, both the scope root (matched by
+ * the light `:root[data-theme]` selectors) and the inner `.dark` root (matched
+ * by the dark `.dark[data-theme]` selectors) need them; standalone it's just the
+ * document root.
+ */
+export function getThemeRoots(): HTMLElement[] {
+  if (embedScopeRoot) {
+    return embedRoot ? [embedScopeRoot, embedRoot] : [embedScopeRoot];
+  }
+  return typeof document !== "undefined" ? [document.documentElement] : [];
 }
 
 /**

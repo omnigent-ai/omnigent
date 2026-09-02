@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, Protocol, cast
 
 from sqlalchemy import (
     ColumnElement,
@@ -14,13 +14,14 @@ from sqlalchemy import (
     delete,
     desc,
     func,
+    insert,
     literal_column,
     or_,
     select,
     text,
     update,
 )
-from sqlalchemy.orm import QueryableAttribute, Session, aliased
+from sqlalchemy.orm import QueryableAttribute, Session, aliased, load_only
 from sqlalchemy.sql.selectable import Subquery
 
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
@@ -50,6 +51,7 @@ from omnigent.db.enum_codecs import (
     encode_item_type,
     encode_session_live_status,
 )
+from omnigent.db.query_context import query_name_scope
 from omnigent.db.utils import (
     _supports_fts5,
     build_search_snippet,
@@ -61,8 +63,9 @@ from omnigent.db.utils import (
     get_or_create_conversation_engine,
     get_or_create_engine,
     insert_fts_bulk,
-    make_managed_session_maker,
+    make_named_managed_session_maker,
     now_epoch,
+    shared_read_scope,
     strip_nul_bytes,
 )
 from omnigent.entities import (
@@ -79,6 +82,7 @@ from omnigent.session_import.models import (
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     _INSTANCE_SCOPED_LABEL_KEYS,
+    ARCHIVED_AT_LABEL_KEY,
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
@@ -95,12 +99,37 @@ from omnigent.stores.conversation_store import (
 
 _logger = logging.getLogger(__name__)
 
+# Server-side deadline (ms) for the content-search query in
+# ``list_conversations``. Session search matches ``LOWER(search_text) LIKE
+# '%q%'`` across ``conversation_items``; that is index-backed by the pg_trgm
+# GIN index (migration ``d5e9f1a2b3c4``), but if the index is ever missing the
+# scan can run unbounded and — since the query runs in a worker thread — a
+# client disconnect does not stop it. ``SET LOCAL statement_timeout`` caps it so
+# a degraded deployment fails the search fast instead of pinning a DB
+# connection. Postgres-only; ``SET LOCAL`` reverts on commit so it never leaks
+# to the connection's next pooled use. Longer than the client's own
+# ``SEARCH_FETCH_TIMEOUT_MS`` so the browser gives up first on the happy path.
+_SEARCH_STATEMENT_TIMEOUT_MS = 15_000
+
+# How many co-located sessions ``has_other_live_session_in_workspace`` will
+# name before it stops looking. Real directories hold one or two sessions; the
+# bound keeps the archived-filter query's ``IN`` list small and caps the work a
+# pathological directory can impose on a delete. Hitting it answers "in use".
+_WORKSPACE_SHARER_SCAN_LIMIT = 32
+
+
+class _RowCountResult(Protocol):
+    rowcount: int
+
+
 # Per-session config overrides packed into the ``conversations.session_overrides``
 # JSON blob. Order is fixed so the encoded object is stable across writes.
 _SESSION_OVERRIDE_KEYS = (
     "reasoning_effort",
     "model_override",
+    "reported_model",
     "cost_control_mode_override",
+    "subagent_routing_override",
     "harness_override",
 )
 
@@ -110,7 +139,7 @@ def _encode_session_overrides(overrides: dict[str, str | None]) -> str | None:
 
     Omits keys whose value is ``None`` and returns ``None`` when nothing is
     set, so a session on all agent/spec defaults stores SQL ``NULL`` rather
-    than an empty object. Only the four :data:`_SESSION_OVERRIDE_KEYS` are
+    than an empty object. Only the :data:`_SESSION_OVERRIDE_KEYS` are
     considered; any other keys in *overrides* are ignored.
 
     :param overrides: Mapping of override key to value (missing / ``None``
@@ -126,7 +155,7 @@ def _encode_session_overrides(overrides: dict[str, str | None]) -> str | None:
 def _decode_session_overrides(raw: str | None) -> dict[str, str | None]:
     """Unpack the ``session_overrides`` blob to a full override dict.
 
-    Every one of the four :data:`_SESSION_OVERRIDE_KEYS` is present in the
+    Every one of the :data:`_SESSION_OVERRIDE_KEYS` is present in the
     result (unset keys read back as ``None``) so read-modify-write callers can
     treat the dict uniformly regardless of which overrides were stored.
 
@@ -190,9 +219,12 @@ def _to_conversation(
         session_usage=session_usage,
         reasoning_effort=overrides["reasoning_effort"],
         model_override=overrides["model_override"],
+        reported_model=overrides["reported_model"],
         cost_control_mode_override=overrides["cost_control_mode_override"],
+        subagent_routing_override=overrides["subagent_routing_override"],
         harness_override=overrides["harness_override"],
         sub_agent_name=meta.sub_agent_name if meta else None,
+        task_summary=meta.task_summary if meta else None,
         external_session_id=meta.external_session_id if meta else None,
         # NULL → None; a stored JSON array (e.g. ``"[]"`` or
         # ``'["--foo"]'``) decodes back to a list. ``"[]"`` is a
@@ -273,6 +305,7 @@ def _new_session_metadata_row(
     runner_id: str | None = None,
     workspace: str | None = None,
     terminal_launch_args: list[str] | None = None,
+    project_id: str | None = None,
 ) -> SqlConversationMetadata:
     """
     Build the Omnigent metadata row paired with a new session conversation.
@@ -292,6 +325,7 @@ def _new_session_metadata_row(
         id=conversation_id,
         kind=encode_conversation_kind("sub_agent" if parent_conversation_id else "default"),
         runner_id=runner_id,
+        project_id=project_id,
         workspace=workspace,
         terminal_launch_args=(
             json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
@@ -478,12 +512,17 @@ def _fetch_labels(
     :returns: Mapping from label key to value (string-typed).
         Empty dict when no rows match.
     """
-    rows = session.execute(
-        select(SqlConversationLabel.key, SqlConversationLabel.value).where(
-            SqlConversationLabel.workspace_id == current_workspace_id(),
-            SqlConversationLabel.conversation_id == conversation_id,
+    with query_name_scope("omnigent.conversation_store.select_conversation_labels"):
+        rows = (
+            session.execute(
+                select(SqlConversationLabel.key, SqlConversationLabel.value).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id == conversation_id,
+                )
+            )
+            .tuples()
+            .all()
         )
-    ).all()
     return dict(rows)
 
 
@@ -559,10 +598,14 @@ def _fetch_search_snippets(
     # workspace_id leads the (workspace_id, conversation_id, position) index.
     # Both the aggregate and the join-back below must include it or Postgres
     # can't use that index and falls back to a full table scan of every item.
+    # ILIKE on the raw column rather than ``lower(search_text) LIKE`` for the
+    # same reason as the content match in ``list_conversations``: the lower()
+    # form matches the pg_trgm index expression, and the planner then scans the
+    # whole workspace even though this is already scoped to one page of ids.
     match_pred = and_(
         SqlConversationItem.workspace_id == workspace_id,
         SqlConversationItem.conversation_id.in_(conversation_ids),
-        func.lower(SqlConversationItem.search_text).like(pattern),
+        SqlConversationItem.search_text.ilike(pattern),
     )
     # Earliest matching position per conversation — a small (conv_id, position)
     # aggregate, no bodies materialized.
@@ -693,7 +736,7 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         :param storage_location: SQLAlchemy database URI for the Omnigent DB,
             e.g. ``"sqlite:///omnigent.db"`` or
-            ``"postgresql://user:pass@host/db"``.
+            ``"postgresql://<user>:<password>@host/db"``.
         :param conversation_storage_location: SQLAlchemy database URI for the Agent
             Platform DB (conversations, items, labels). Defaults to
             ``storage_location`` when ``None`` (single-DB mode).
@@ -702,13 +745,20 @@ class SqlAlchemyConversationStore(ConversationStore):
         # Omnigent DB: agents, hosts, policies, files, user_daily_costs,
         # session_permissions, comments, omnigent_conversation_metadata.
         self._engine = get_or_create_engine(storage_location)
-        self._session = make_managed_session_maker(self._engine)
+        self._session = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.conversation_store",
+        )
         # Immediate session: used for read-modify-write operations that must be
         # atomic. On SQLite, ``BEGIN IMMEDIATE`` acquires the write lock before
         # the first read, preventing ``SQLITE_BUSY_SNAPSHOT`` under concurrent
         # writers. On other dialects ``immediate=True`` is a no-op — those paths
         # use ``SELECT … FOR UPDATE`` via ``_supports_for_update`` instead.
-        self._session_immediate = make_managed_session_maker(self._engine, immediate=True)
+        self._session_immediate = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.conversation_store",
+            immediate=True,
+        )
 
         # Agent Platform DB: conversations, conversation_items, conversation_labels.
         # Defaults to the Omnigent DB when not separately configured. Always creates
@@ -720,9 +770,14 @@ class SqlAlchemyConversationStore(ConversationStore):
             if conv_uri == storage_location
             else get_or_create_conversation_engine(conv_uri)
         )
-        self._conv_session = make_managed_session_maker(self._conv_engine)
-        self._conv_session_immediate = make_managed_session_maker(
-            self._conv_engine, immediate=True
+        self._conv_session = make_named_managed_session_maker(
+            self._conv_engine,
+            query_name_prefix="omnigent.conversation_store",
+        )
+        self._conv_session_immediate = make_named_managed_session_maker(
+            self._conv_engine,
+            query_name_prefix="omnigent.conversation_store",
+            immediate=True,
         )
 
         # Dialect-appropriate row-locking flags. Each flag is derived from its
@@ -737,20 +792,24 @@ class SqlAlchemyConversationStore(ConversationStore):
         # same-timestamp collisions in practice. Other dialects fall back to
         # the string id column (non-deterministic for ties; proper fix: add a
         # BIGSERIAL seq col).
-        self._tiebreaker_col = (
+        self._tiebreaker_col: ColumnElement[Any] = (
             literal_column("conversations.rowid")
             if self._conv_engine.dialect.name == "sqlite"
-            else SqlConversation.id
+            else cast(ColumnElement[Any], SqlConversation.id)
         )
         ensure_fts_table(self._conv_engine)
 
-    def _get_meta(
-        self, _unused_session: Session, conversation_id: str
-    ) -> SqlConversationMetadata | None:
+    def _get_meta(self, conversation_id: str) -> SqlConversationMetadata | None:
         """
         Fetch the metadata row for a conversation from the Omnigent DB.
+
+        Always goes through the Omnigent-DB session maker: in split-DB mode
+        ``omnigent_conversation_metadata`` lives on a different engine than the
+        caller's AP session, so the caller's session cannot serve it. A caller
+        inside :func:`shared_read_scope` pays no second pool checkout for it
+        when both logical databases share one engine.
         """
-        with self._session() as meta_sess:
+        with self._session("select_conversation_metadata_by_id") as meta_sess:
             return meta_sess.get(
                 SqlConversationMetadata, (current_workspace_id(), conversation_id)
             )
@@ -826,6 +885,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
         conversation_id: str | None = None,
+        project_id: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation in the database.
@@ -896,9 +956,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             # Get parent's root from AP, then write AP row and Omnigent meta separately.
             root_id = new_id
             if parent_conversation_id is not None:
-                with self._conv_session() as ap_sess:
+                with self._conv_session("select_parent_conversation") as ap_sess:
                     parent_row = ap_sess.get(
-                        SqlConversation, (current_workspace_id(), parent_conversation_id)
+                        SqlConversation,
+                        (current_workspace_id(), parent_conversation_id),
                     )
                     if parent_row is None:
                         raise ConversationNotFoundError(
@@ -907,7 +968,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     root_id = parent_row.root_conversation_id
             if parent_conversation_id is not None and not title:
                 title = f"untitled:{new_id}"
-            with self._conv_session() as ap_sess:
+            with self._conv_session("insert_conversation") as ap_sess:
                 # Application-level (parent, title) uniqueness — there is no DB
                 # unique constraint. Only children are scoped; top-level sessions
                 # (NULL parent) may reuse titles freely. The SELECT seeks this
@@ -918,15 +979,18 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # the runner's find-or-create pre-check, so this fires only on a
                 # genuine collision).
                 if parent_conversation_id is not None:
-                    duplicate = ap_sess.execute(
-                        select(SqlConversation.id)
-                        .where(
-                            SqlConversation.workspace_id == current_workspace_id(),
-                            SqlConversation.parent_conversation_id == parent_conversation_id,
-                            SqlConversation.title == (title or ""),
-                        )
-                        .limit(1)
-                    ).first()
+                    with query_name_scope(
+                        "omnigent.conversation_store.select_duplicate_child_title"
+                    ):
+                        duplicate = ap_sess.execute(
+                            select(SqlConversation.id)
+                            .where(
+                                SqlConversation.workspace_id == current_workspace_id(),
+                                SqlConversation.parent_conversation_id == parent_conversation_id,
+                                SqlConversation.title == (title or ""),
+                            )
+                            .limit(1)
+                        ).first()
                     if duplicate is not None:
                         raise NameAlreadyExistsError(
                             f"sub-agent name already exists under parent "
@@ -953,8 +1017,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 terminal_launch_args=(
                     json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
                 ),
+                project_id=project_id,
             )
-            with self._session() as meta_sess:
+            with self._session("insert_conversation_metadata") as meta_sess:
                 meta_sess.add(meta)
             return _to_conversation(row, meta)
         except IntegrityError as exc:
@@ -989,20 +1054,24 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         Fetch a conversation by its unique ID.
 
-        Issues two queries inside one session: the conversation row
-        (which carries the agent binding + per-session override blob) and
-        a label fetch on ``conversation_labels``.
+        Issues three queries: the conversation row (which carries the agent
+        binding + per-session override blob), the Omnigent-DB metadata row, and
+        a label fetch on ``conversation_labels``. They run inside a
+        :func:`shared_read_scope` so the whole read costs one pool checkout per
+        engine — one in single-DB mode, where the metadata table would otherwise
+        force a second checkout (and, with ``pool_pre_ping``, a second network
+        round trip) for every session read in the product.
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
         :returns: The :class:`Conversation` if found, otherwise
             ``None``.
         """
-        with self._conv_session() as session:
+        with shared_read_scope(), self._conv_session("select_conversation_by_id") as session:
             row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             if row is None:
                 return None
-            meta = self._get_meta(session, conversation_id)
+            meta = self._get_meta(conversation_id)
             return _to_conversation(row, meta, _fetch_labels(session, conversation_id))
 
     def find_imported_conversation(
@@ -1013,7 +1082,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         """Find the original conversation carrying an import provenance pair."""
         source_label = aliased(SqlConversationLabel)
         external_label = aliased(SqlConversationLabel)
-        with self._conv_session() as session:
+        with self._conv_session("select_imported_conversation") as session:
             conversation_id = session.execute(
                 select(SqlConversation.id)
                 .join(
@@ -1048,7 +1117,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         if not conversation_ids:
             return {}
         unique_ids = list(set(conversation_ids))
-        with self._session() as session:
+        with self._session("select_runner_ids") as session:
             rows = session.execute(
                 select(SqlConversationMetadata.id, SqlConversationMetadata.runner_id).where(
                     SqlConversationMetadata.workspace_id == current_workspace_id(),
@@ -1078,7 +1147,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             return {}
         unique_ids = list(set(conversation_ids))
         # runner_id and host_id are in the Omnigent DB (metadata).
-        with self._session() as session:
+        with self._session("get_session_connectivity") as session:
             meta_rows = session.execute(
                 select(
                     SqlConversationMetadata.id,
@@ -1090,10 +1159,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationMetadata.id.in_(unique_ids),
                 )
             ).all()
-        # Fork-source label is in the AP DB.
-        with self._conv_session() as ap_sess:
-            # One pass over the fork-source connectivity marker, which
-            # signals on presence (its value is the source id).
+        # Connectivity markers are in the AP DB. Both signal on presence:
+        # the fork-source label forces an unbound clone to pick a workspace;
+        # the import-source label marks a transcript with no live executor.
+        with self._conv_session("get_session_connectivity") as ap_sess:
             label_rows = ap_sess.execute(
                 select(
                     SqlConversationLabel.conversation_id,
@@ -1102,17 +1171,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ).where(
                     SqlConversationLabel.workspace_id == current_workspace_id(),
                     SqlConversationLabel.conversation_id.in_(unique_ids),
-                    SqlConversationLabel.key.in_([FORK_SOURCE_LABEL_KEY]),
+                    SqlConversationLabel.key.in_([FORK_SOURCE_LABEL_KEY, IMPORT_SOURCE_LABEL_KEY]),
                 )
             ).all()
         needs_workspace_ids = {
             row.conversation_id for row in label_rows if row.key == FORK_SOURCE_LABEL_KEY
+        }
+        imported_ids = {
+            row.conversation_id for row in label_rows if row.key == IMPORT_SOURCE_LABEL_KEY
         }
         return {
             row.id: SessionConnectivity(
                 runner_id=row.runner_id,
                 host_id=row.host_id,
                 needs_workspace=row.id in needs_workspace_ids,
+                imported=row.id in imported_ids,
                 runner_last_seen=row.runner_last_seen,
             )
             for row in meta_rows
@@ -1134,7 +1207,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         if not conversation_ids:
             return {}
         unique_ids = list(set(conversation_ids))
-        with self._conv_session() as session:
+        with self._conv_session("get_conversations") as session:
             rows = list(
                 session.execute(
                     select(SqlConversation).where(
@@ -1151,11 +1224,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             # too — _to_conversation reads ORM columns, which would raise
             # DetachedInstanceError once the session closes.
             labels_by_conv = _fetch_labels_bulk(session, [row.id for row in rows])
-        meta_rows = []
+        meta_rows: list[SqlConversationMetadata] = []
         if rows:
             row_ids = [r.id for r in rows]
-            with self._session() as meta_sess:
-                meta_rows = (
+            with self._session("get_conversations") as meta_sess:
+                meta_rows = list(
                     meta_sess.execute(
                         select(SqlConversationMetadata).where(
                             SqlConversationMetadata.workspace_id == current_workspace_id(),
@@ -1202,7 +1275,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         if not unique_ids:
             return result
 
-        with self._conv_session() as ap_sess:
+        with self._conv_session("list_child_conversation_ids_by_parent") as ap_sess:
             rows = ap_sess.execute(
                 select(SqlConversation.parent_conversation_id, SqlConversation.id)
                 .where(SqlConversation.workspace_id == current_workspace_id())
@@ -1247,7 +1320,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         if not updates:
             return
         stamp = updated_at if updated_at is not None else now_epoch()
-        with self._conv_session() as session:
+        with self._conv_session("set_labels") as session:
             _upsert_labels(session, conversation_id, updates, stamp)
 
     def set_session_state(
@@ -1267,7 +1340,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         import json
 
-        with self._session() as session:
+        with self._session("set_session_state") as session:
             session.execute(
                 update(SqlConversationMetadata)
                 .where(
@@ -1297,7 +1370,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         import json
 
-        with self._session() as session:
+        with self._session("set_session_usage") as session:
             session.execute(
                 update(SqlConversationMetadata)
                 .where(
@@ -1324,14 +1397,17 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: ``True`` if a metadata row was updated; ``False`` if the
             conversation has no metadata row.
         """
-        with self._session() as session:
-            result = session.execute(
-                update(SqlConversationMetadata)
-                .where(
-                    SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.id == conversation_id,
-                )
-                .values(project_id=project_id)
+        with self._session("set_conversation_project") as session:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                    )
+                    .values(project_id=project_id)
+                ),
             )
             return result.rowcount > 0
 
@@ -1366,7 +1442,7 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         from omnigent.stores.conversation_store import apply_session_usage_delta
 
-        with self._session_immediate() as session:
+        with self._session_immediate("increment_session_usage") as session:
             q = select(SqlConversationMetadata).where(
                 SqlConversationMetadata.workspace_id == current_workspace_id(),
                 SqlConversationMetadata.id == conversation_id,
@@ -1408,7 +1484,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         if delta_usd <= 0:
             return
         now = now_epoch()
-        with self._session() as session:
+        with self._session("add_daily_cost") as session:
             dialect = session.bind.dialect.name if session.bind is not None else ""
             if dialect in ("sqlite", "postgresql"):
                 self._upsert_daily_cost_dialect(session, dialect, user_id, day_utc, delta_usd, now)
@@ -1427,10 +1503,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                 )
             else:
-                # mypy sees the Mapped[...] descriptor types; at runtime
-                # these are plain attributes accepting the Python value.
-                existing.cost_usd = existing.cost_usd + delta_usd  # type: ignore[assignment]
-                existing.updated_at = now  # type: ignore[assignment]
+                existing.cost_usd = existing.cost_usd + delta_usd
+                existing.updated_at = now
 
     def _upsert_daily_cost_dialect(
         self,
@@ -1493,7 +1567,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: The accumulated ``cost_usd``, or ``0.0`` when no row
             exists for ``(user_id, day_utc)``.
         """
-        with self._session() as session:
+        with self._session("get_daily_cost") as session:
             row = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
             return float(row.cost_usd) if row is not None else 0.0
 
@@ -1506,7 +1580,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         a plain ``>=`` on the string column; ``SUM`` returns ``NULL`` for
         an empty range, coalesced to ``0.0``.
         """
-        with self._session() as session:
+        with self._session("sum_daily_cost") as session:
             total = session.execute(
                 select(func.coalesce(func.sum(SqlUserDailyCost.cost_usd), 0.0))
                 .where(SqlUserDailyCost.workspace_id == current_workspace_id())
@@ -1514,6 +1588,17 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .where(SqlUserDailyCost.day_utc >= since_day_utc)
             ).scalar_one()
             return float(total or 0.0)
+
+    def list_daily_costs(self, user_id: str, since_day_utc: str) -> list[tuple[str, float]]:
+        with self._session("list_daily_costs") as session:
+            rows = session.execute(
+                select(SqlUserDailyCost.day_utc, SqlUserDailyCost.cost_usd)
+                .where(SqlUserDailyCost.workspace_id == current_workspace_id())
+                .where(SqlUserDailyCost.user_id == user_id)
+                .where(SqlUserDailyCost.day_utc >= since_day_utc)
+                .order_by(SqlUserDailyCost.day_utc.asc())
+            ).all()
+            return [(row.day_utc, float(row.cost_usd)) for row in rows]
 
     def get_daily_cost_state(self, user_id: str, day_utc: str) -> dict[str, float]:
         """
@@ -1529,7 +1614,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: ``{"cost_usd": <float>, "ask_approved_usd": <float>}``;
             both ``0.0`` when no row exists for ``(user_id, day_utc)``.
         """
-        with self._session() as session:
+        with self._session("get_daily_cost_state") as session:
             row = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
             if row is None:
                 return {"cost_usd": 0.0, "ask_approved_usd": 0.0}
@@ -1557,7 +1642,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             user approved continuing past, e.g. ``0.05``.
         """
         now = now_epoch()
-        with self._session() as session:
+        with self._session("set_daily_ask_approved") as session:
             dialect = session.bind.dialect.name if session.bind is not None else ""
             if dialect in ("sqlite", "postgresql"):
                 # Typed as Any to sidestep the mypy variance between the
@@ -1602,8 +1687,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                 )
             else:
-                existing.ask_approved_usd = ask_approved_usd  # type: ignore[assignment]
-                existing.updated_at = now  # type: ignore[assignment]
+                existing.ask_approved_usd = ask_approved_usd
+                existing.updated_at = now
 
     def get_session_owner(self, conversation_id: str) -> str | None:
         """
@@ -1626,7 +1711,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         from omnigent.server.auth import RESERVED_USER_PUBLIC
 
-        with self._session() as session:
+        with self._session("select_session_owner") as session:
             return session.execute(
                 select(SqlSessionPermission.user_id)
                 .where(SqlSessionPermission.workspace_id == current_workspace_id())
@@ -1656,7 +1741,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: A list of matching :class:`ConversationItem`
             objects in relevance order.
         """
-        with self._conv_session() as session:
+        with self._conv_session("search_conversations") as session:
             # Dialect-specific search: the SQLite family (SQLite + D1) has
             # FTS5 virtual tables (MATCH + rank); PostgreSQL doesn't. ILIKE on
             # the JSON data column is a functional fallback there. Proper
@@ -1765,20 +1850,43 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: A :class:`PagedList` of
             :class:`ConversationItem` objects.
         """
-        with self._conv_session() as session:
+        with self._conv_session("list_items") as session:
             is_asc = order == "asc"
             sort_fn = asc if is_asc else desc
-            stmt = select(SqlConversationItem).where(
-                SqlConversationItem.workspace_id == current_workspace_id(),
-                SqlConversationItem.conversation_id == conversation_id,
+            # Load only the columns _to_item reads. search_text is a wide Text
+            # column (roughly mirrors the message body) that this read path never
+            # touches; on Postgres it is TOAST-ed, so omitting it skips a detoast
+            # and roughly halves the bytes pulled per row on a chatty conversation.
+            stmt = (
+                select(SqlConversationItem)
+                .options(
+                    load_only(
+                        SqlConversationItem.id,
+                        SqlConversationItem.type,
+                        SqlConversationItem.status,
+                        SqlConversationItem.response_id,
+                        SqlConversationItem.created_at,
+                        SqlConversationItem.data,
+                        SqlConversationItem.created_by,
+                    )
+                )
+                .where(
+                    SqlConversationItem.workspace_id == current_workspace_id(),
+                    SqlConversationItem.conversation_id == conversation_id,
+                )
             )
             if type is not None:
                 stmt = stmt.where(SqlConversationItem.type == encode_item_type(type))
             if after:
+                # Scope the cursor lookup to conversation_id so it lands on the
+                # (workspace_id, conversation_id, id) primary key as a point
+                # lookup. Without it, (workspace_id, id) leads no index and the
+                # subquery degrades to a workspace-wide scan every paginated page.
                 sub = (
                     select(SqlConversationItem.position)
                     .where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id == conversation_id,
                         SqlConversationItem.id == after,
                     )
                     .scalar_subquery()
@@ -1794,6 +1902,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     select(SqlConversationItem.position)
                     .where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id == conversation_id,
                         SqlConversationItem.id == before,
                     )
                     .scalar_subquery()
@@ -1844,7 +1953,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         if not unique_ids or per_conversation_limit <= 0:
             return result
 
-        with self._conv_session() as session:
+        with self._conv_session("list_latest_message_items_for_conversations") as session:
             ranked = _ranked_latest_message_items(unique_ids)
             rows = session.execute(
                 select(ranked)
@@ -1916,7 +2025,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         now = now_epoch()
         persisted: list[ConversationItem] = []
 
-        with self._conv_session() as session:
+        with self._conv_session("append_conversation_items") as session:
             # Lock the conversation row to serialize position writes.
             # On PostgreSQL this is a row-level FOR UPDATE lock; on
             # SQLite the database-level lock already serializes.
@@ -1953,7 +2062,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                     + 1
                 )
 
+            workspace_id = current_workspace_id()
+            completed_status = encode_item_status("completed")  # items are final on append
             fts_rows: list[tuple[str, str, str]] = []
+            row_values: list[dict[str, object]] = []
             for item in items:
                 position = next_pos
                 next_pos += 1
@@ -1965,38 +2077,46 @@ class SqlAlchemyConversationStore(ConversationStore):
                 data = self._encode_item_data(strip_nul_bytes(json.dumps(data_dict)))
                 search = self._item_search_text(item)
                 item_id = generate_item_id(item.type)
-                row = SqlConversationItem(
-                    id=item_id,
-                    conversation_id=conversation_id,
-                    response_id=item.response_id,
-                    created_at=now,
-                    status=encode_item_status("completed"),  # items are final on append
-                    position=position,
-                    type=encode_item_type(item.type),
-                    data=data,
-                    created_by=item.created_by,
-                )
-                # A backend may omit search_text (see _item_search_text); leaving
-                # the attribute unset drops it from the INSERT so a schema without
-                # the column still works, and skips its FTS row.
+                values: dict[str, object] = {
+                    "workspace_id": workspace_id,
+                    "id": item_id,
+                    "conversation_id": conversation_id,
+                    "response_id": item.response_id,
+                    "created_at": now,
+                    "status": completed_status,
+                    "position": position,
+                    "type": encode_item_type(item.type),
+                    "data": data,
+                    "created_by": item.created_by,
+                }
+                # A backend may omit search_text (see _item_search_text): when it
+                # returns None we drop the column so a schema without it still
+                # works, and skip its FTS row. The hook is all-or-nothing per
+                # store, so the key set stays uniform across the executemany.
                 if search is not None:
-                    row.search_text = search
+                    values["search_text"] = search
                     fts_rows.append((item_id, conversation_id, search))
-                session.add(row)
+                row_values.append(values)
                 persisted.append(
                     ConversationItem(
-                        id=row.id,
+                        id=item_id,
                         # The row stores int codes; the entity carries the
                         # string names. item.type is the source string and
                         # the status was just written as "completed".
                         type=item.type,
                         status="completed",
-                        response_id=row.response_id,
-                        created_at=row.created_at,
+                        response_id=item.response_id,
+                        created_at=now,
                         data=item.data,
                         created_by=item.created_by,
                     )
                 )
+            # One executemany for the batch: positions are pre-allocated above so
+            # the rows carry no inter-row dependency, and a single round-trip
+            # persists all N. A per-row ORM add round-trips per item, which
+            # dominates append latency against a remote managed Postgres.
+            if row_values:
+                session.execute(insert(SqlConversationItem), row_values)
             insert_fts_bulk(session, fts_rows)
 
             # Persist the advanced counter so the next append reads it instead
@@ -2043,7 +2163,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         # the AP conversations table and is filtered inline below.
         permission_ids: list[str] | None = None
         if accessible_by is not None or owned_by is not None:
-            with self._session() as meta_sess:
+            with self._session("list_projects") as meta_sess:
                 accessible_set: set[str] | None = None
                 owned_set: set[str] | None = None
                 if accessible_by is not None:
@@ -2071,7 +2191,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     permission_ids = list(
                         accessible_set if accessible_set is not None else owned_set or set()
                     )
-        with self._conv_session() as ap_sess:
+        with self._conv_session("list_projects") as ap_sess:
             # Non-archived conversations, resolved on the AP table.
             non_archived_ids = select(SqlConversation.id).where(
                 SqlConversation.workspace_id == current_workspace_id(),
@@ -2104,7 +2224,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param conversation_id: The conversation to update.
         :param key: The label key to remove, e.g. ``"omni_project"``.
         """
-        with self._conv_session() as session:
+        with self._conv_session("delete_label") as session:
             session.execute(
                 delete(SqlConversationLabel).where(
                     SqlConversationLabel.workspace_id == current_workspace_id(),
@@ -2228,7 +2348,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             # (session_permissions), then filter the AP query. accessible_by and
             # owned_by are intersected (both applied) to match the prior
             # behaviour. (ACL pushdown to a single AP query is a follow-up.)
-            with self._session() as meta_sess:
+            with self._session("list_conversations") as meta_sess:
                 accessible_set: set[str] | None = None
                 owned_set: set[str] | None = None
                 if accessible_by is not None:
@@ -2257,7 +2377,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                         accessible_set if accessible_set is not None else owned_set or set()
                     )
 
-        with self._conv_session() as session:
+        with self._conv_session("list_conversations") as session:
+            # Bound the content-search scan server-side (Postgres only). SET
+            # LOCAL scopes to this transaction and reverts on commit, so it
+            # can't leak to the connection's next pooled use. See
+            # _SEARCH_STATEMENT_TIMEOUT_MS. A worker-thread query is not stopped
+            # by a client disconnect, so this is the only server-side bound.
+            is_postgres = session.bind is not None and session.bind.dialect.name == "postgresql"
+            if search_query and is_postgres:
+                # Postgres SET does not accept a bind parameter, so the value is
+                # inlined. Safe from injection: it is an int module constant, not
+                # caller input — coerced through int() to keep it that way.
+                session.execute(
+                    text(f"SET LOCAL statement_timeout = {int(_SEARCH_STATEMENT_TIMEOUT_MS)}")
+                )
+
             stmt = select(SqlConversation).where(
                 SqlConversation.workspace_id == current_workspace_id()
             )
@@ -2289,7 +2423,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             if agent_name is not None:
                 # Agents live in the Omnigent DB — resolve to IDs first, then
                 # filter on the conversations.agent_id column directly.
-                with self._session() as agent_sess:
+                with self._session("list_conversations") as agent_sess:
                     agent_ids_for_name = list(
                         agent_sess.execute(
                             select(SqlAgent.id).where(
@@ -2310,13 +2444,28 @@ class SqlAlchemyConversationStore(ConversationStore):
             if search_query:
                 pattern = f"%{search_query.lower()}%"
                 title_match = func.lower(SqlConversation.title).like(pattern)
-                content_match = SqlConversation.id.in_(
+                # Correlated EXISTS rather than ``id IN (SELECT ...)``: the IN
+                # form is uncorrelated, so the match set is built for the WHOLE
+                # workspace before the outer query discards every row the caller
+                # cannot see. Correlating on conversation_id keeps each probe on
+                # the (workspace_id, conversation_id) index and lets it stop at
+                # the first matching item per conversation.
+                # ``ILIKE`` on the raw column, NOT ``lower(search_text) LIKE``:
+                # the latter matches the ``lower(search_text)`` pg_trgm index
+                # expression, and the planner then prefers that index — scanning
+                # every item in the workspace out of a multi-GB index that does
+                # not fit in shared_buffers. ILIKE is the same case-insensitive
+                # match but cannot use that index, so the probe stays on the
+                # (workspace_id, conversation_id) btree above. Do not "simplify"
+                # this back to lower(...) LIKE; see the covering test.
+                content_match = (
                     select(SqlConversationItem.conversation_id)
                     .where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
-                        func.lower(SqlConversationItem.search_text).like(pattern),
+                        SqlConversationItem.conversation_id == SqlConversation.id,
+                        SqlConversationItem.search_text.ilike(pattern),
                     )
-                    .distinct()
+                    .exists()
                 )
                 stmt = stmt.where(or_(title_match, content_match))
             if project is not None:
@@ -2349,7 +2498,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                             first_class_stmt = first_class_stmt.where(
                                 SqlConversationMetadata.id.in_(qualifying_ids)
                             )
-                        with self._session() as meta_sess:
+                        with self._session("list_conversations") as meta_sess:
                             first_class_filed = list(meta_sess.execute(first_class_stmt).scalars())
                     stmt = stmt.where(
                         SqlConversation.id.not_in(first_class_filed),
@@ -2368,7 +2517,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         .where(
                             SqlConversationMetadata.workspace_id == current_workspace_id(),
                             SqlProject.workspace_id == current_workspace_id(),
-                            SqlProject.owner_user_id == owned_by,
+                            SqlProject.user_id == owned_by,
                             SqlProject.name == project,
                         )
                     )
@@ -2385,7 +2534,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                             member_stmt = member_stmt.where(
                                 SqlConversationMetadata.id.in_(qualifying_ids)
                             )
-                        with self._session() as meta_sess:
+                        with self._session("list_conversations") as meta_sess:
                             member_match = list(meta_sess.execute(member_stmt).scalars())
                     stmt = stmt.where(
                         or_(
@@ -2456,7 +2605,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         # Fetch metadata from Omnigent DB and merge.
         meta_by_id: dict[str, SqlConversationMetadata] = {}
         if row_ids:
-            with self._session() as meta_sess:
+            with self._session("list_conversations") as meta_sess:
                 meta_rows = (
                     meta_sess.execute(
                         select(SqlConversationMetadata).where(
@@ -2576,10 +2725,13 @@ class SqlAlchemyConversationStore(ConversationStore):
         _unset_model_override: bool = False,
         cost_control_mode_override: str | None = None,
         _unset_cost_control_mode_override: bool = False,
+        subagent_routing_override: str | None = None,
+        _unset_subagent_routing_override: bool = False,
         harness_override: str | None = None,
         _unset_harness_override: bool = False,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
+        reported_model: str | None = None,
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.
@@ -2591,14 +2743,24 @@ class SqlAlchemyConversationStore(ConversationStore):
             e.g. ``"high"``. ``None`` leaves unchanged.
         :param _unset_reasoning_effort: When ``True``, clear
             ``reasoning_effort`` to ``None``.
-        :param model_override: Per-session LLM model override,
-            e.g. ``"claude-opus-4-7"``. ``None`` leaves unchanged.
+        :param model_override: Per-session LLM model override — the
+            user's request, e.g. ``"claude-opus-4-7"``. ``None``
+            leaves unchanged.
         :param _unset_model_override: When ``True``, clear
             ``model_override`` to ``None``.
+        :param reported_model: The model the harness last reported the
+            session is actually on, verbatim, e.g.
+            ``"claude-opus-4-8[1m]"``. ``None`` leaves unchanged.
+            No ``_unset`` variant — reports only ever move forward.
         :param cost_control_mode_override: Per-session cost-control
             switch, ``"on"`` or ``"off"``. ``None`` leaves unchanged.
         :param _unset_cost_control_mode_override: When ``True``, clear
             ``cost_control_mode_override`` to ``None``.
+        :param subagent_routing_override: Per-session subagent-routing
+            switch, ``"on"`` or ``"off"``. ``None`` leaves unchanged.
+        :param _unset_subagent_routing_override: When ``True``, clear
+            ``subagent_routing_override`` to ``None``, which reads as
+            Default (the switch is two-state; nothing is inherited).
         :param harness_override: Per-session brain-harness override,
             e.g. ``"pi"``. ``None`` leaves unchanged.
         :param _unset_harness_override: When ``True``, clear
@@ -2618,7 +2780,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         now = now_epoch()
         # Two transactions: AP (the conversation row, which carries the agent
         # binding + per-session override blob) and Omnigent (metadata).
-        with self._conv_session() as ap_sess:
+        with self._conv_session("update_conversation") as ap_sess:
             row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if not row:
                 return None
@@ -2642,11 +2804,20 @@ class SqlAlchemyConversationStore(ConversationStore):
             elif model_override is not None:
                 overrides["model_override"] = model_override
                 overrides_changed = True
+            if reported_model is not None:
+                overrides["reported_model"] = reported_model
+                overrides_changed = True
             if _unset_cost_control_mode_override:
                 overrides["cost_control_mode_override"] = None
                 overrides_changed = True
             elif cost_control_mode_override is not None:
                 overrides["cost_control_mode_override"] = cost_control_mode_override
+                overrides_changed = True
+            if _unset_subagent_routing_override:
+                overrides["subagent_routing_override"] = None
+                overrides_changed = True
+            elif subagent_routing_override is not None:
+                overrides["subagent_routing_override"] = subagent_routing_override
                 overrides_changed = True
             if _unset_harness_override:
                 overrides["harness_override"] = None
@@ -2659,13 +2830,29 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ap_changed = True
             if archived is not None:
                 # archived lives on the AP conversations row; a visible state change.
+                # Record the archive time as a label on the false->true transition
+                # only, so a redundant re-archive PATCH can't reset the retention
+                # clock; unarchiving clears it. Same transaction as the flag, and
+                # ahead of the _fetch_labels below, so the response carries it.
+                if archived and not row.archived:
+                    _upsert_labels(
+                        ap_sess, conversation_id, {ARCHIVED_AT_LABEL_KEY: str(now)}, now
+                    )
+                elif not archived:
+                    ap_sess.execute(
+                        delete(SqlConversationLabel).where(
+                            SqlConversationLabel.workspace_id == current_workspace_id(),
+                            SqlConversationLabel.conversation_id == conversation_id,
+                            SqlConversationLabel.key == ARCHIVED_AT_LABEL_KEY,
+                        )
+                    )
                 row.archived = archived
                 ap_changed = True
             if ap_changed:
                 row.updated_at = now
             labels = _fetch_labels(ap_sess, conversation_id)
         if terminal_launch_args is not None:
-            with self._session() as meta_sess:
+            with self._session("update_conversation") as meta_sess:
                 meta = meta_sess.get(
                     SqlConversationMetadata, (current_workspace_id(), conversation_id)
                 )
@@ -2686,7 +2873,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     meta_sess.add(meta)
                 meta.terminal_launch_args = json.dumps(terminal_launch_args)
         else:
-            meta = self._get_meta(ap_sess, conversation_id)
+            meta = self._get_meta(conversation_id)
         return _to_conversation(row, meta, labels)
 
     def rename_conversation_if_title_matches(
@@ -2696,22 +2883,43 @@ class SqlAlchemyConversationStore(ConversationStore):
         title: str,
     ) -> Conversation | None:
         """Rename a conversation with an atomic title compare-and-swap."""
-        with self._conv_session() as session:
-            result = session.execute(
-                update(SqlConversation)
-                .where(
-                    SqlConversation.workspace_id == current_workspace_id(),
-                    SqlConversation.id == conversation_id,
-                    SqlConversation.title == expected_title,
-                )
-                .values(
-                    title=title,
-                    updated_at=now_epoch(),
-                )
+        with self._conv_session("rename_conversation_if_title_matches") as session:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversation)
+                    .where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id == conversation_id,
+                        SqlConversation.title == expected_title,
+                    )
+                    .values(
+                        title=title,
+                        updated_at=now_epoch(),
+                    )
+                ),
             )
             if result.rowcount != 1:
                 return None
         # Bulk UPDATE leaves no in-session ORM row to reuse; re-read.
+        return self.get_conversation(conversation_id)
+
+    def set_task_summary(self, conversation_id: str, task_summary: str) -> Conversation | None:
+        """Set a human-readable task summary on a sub-agent conversation."""
+        with self._session("set_task_summary") as session:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                    )
+                    .values(task_summary=task_summary)
+                ),
+            )
+            if result.rowcount != 1:
+                return None
         return self.get_conversation(conversation_id)
 
     def set_runner_id(self, conversation_id: str, runner_id: str) -> bool:
@@ -2737,7 +2945,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         from sqlalchemy import update
 
-        with self._session() as session:
+        with self._session("set_runner_id") as session:
             stmt = (
                 update(SqlConversationMetadata)
                 .where(
@@ -2747,7 +2955,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .where(SqlConversationMetadata.runner_id.is_(None))
                 .values(runner_id=runner_id)
             )
-            result = session.execute(stmt)
+            result = cast(_RowCountResult, session.execute(stmt))
             return result.rowcount == 1
 
     def touch_runner_liveness(self, runner_ids: list[str], now: int) -> None:
@@ -2765,7 +2973,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             return
         from sqlalchemy import update
 
-        with self._session() as session:
+        with self._session("touch_runner_liveness") as session:
             session.execute(
                 update(SqlConversationMetadata)
                 .where(
@@ -2786,7 +2994,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         from sqlalchemy import update
 
-        with self._session() as session:
+        with self._session("clear_runner_liveness") as session:
             session.execute(
                 update(SqlConversationMetadata)
                 .where(
@@ -2808,7 +3016,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         from sqlalchemy import update
 
-        with self._session() as session:
+        with self._session("set_session_live_status") as session:
             session.execute(
                 update(SqlConversationMetadata)
                 .where(
@@ -2830,7 +3038,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         from sqlalchemy import update
 
-        with self._session() as session:
+        with self._session("set_pending_elicitation_count") as session:
             session.execute(
                 update(SqlConversationMetadata)
                 .where(
@@ -2856,20 +3064,19 @@ class SqlAlchemyConversationStore(ConversationStore):
         :raises ConversationNotFoundError: If no conversation row
             exists for ``conversation_id``.
         """
-        with self._session() as session:
+        with self._session("replace_runner_id") as session:
             meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
             if meta is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
             meta.runner_id = runner_id
-        with self._conv_session() as ap_sess:
+        with self._conv_session("replace_runner_id") as ap_sess:
             ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if ap_row is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
-            ap_row.updated_at = now_epoch()
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
@@ -2883,20 +3090,19 @@ class SqlAlchemyConversationStore(ConversationStore):
         :raises ConversationNotFoundError: If no conversation row
             exists for ``conversation_id``.
         """
-        with self._session() as session:
+        with self._session("clear_runner_id") as session:
             meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
             if meta is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
             meta.runner_id = None
-        with self._conv_session() as ap_sess:
+        with self._conv_session("clear_runner_id") as ap_sess:
             ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if ap_row is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
-            ap_row.updated_at = now_epoch()
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
@@ -2915,7 +3121,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         :raises ConversationNotFoundError: If no conversation row
             exists for ``conversation_id``.
         """
-        with self._session() as session:
+        with self._session("clear_host_binding") as session:
             meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
             if meta is None:
                 raise ConversationNotFoundError(
@@ -2925,13 +3131,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta.workspace = None
             meta.git_branch = None
             meta.runner_id = None
-        with self._conv_session() as ap_sess:
+        with self._conv_session("clear_host_binding") as ap_sess:
             ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if ap_row is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
-            ap_row.updated_at = now_epoch()
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
@@ -2946,7 +3151,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``"runner_token_a1b2c3d4..."``.
         :returns: List of :class:`Conversation` entities.
         """
-        with self._session() as session:
+        with self._session("list_conversations_by_runner_id") as session:
             meta_rows = (
                 session.execute(
                     select(SqlConversationMetadata).where(
@@ -2961,7 +3166,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             return []
         conv_ids = [m.id for m in meta_rows]
         meta_by_id = {m.id: m for m in meta_rows}
-        with self._conv_session() as ap_sess:
+        with self._conv_session("list_conversations_by_runner_id") as ap_sess:
             ap_rows = (
                 ap_sess.execute(
                     select(SqlConversation).where(
@@ -3024,7 +3229,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``host_id`` is being set on a row with no ``workspace``
             and the caller did not supply one).
         """
-        with self._session() as session:
+        with self._session("set_host_id") as session:
             meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
             if meta is None:
                 raise ConversationNotFoundError(
@@ -3035,13 +3240,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 meta.workspace = workspace
             if git_branch is not None:
                 meta.git_branch = git_branch
-        with self._conv_session() as ap_sess:
+        with self._conv_session("set_host_id") as ap_sess:
             ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if ap_row is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
-            ap_row.updated_at = now_epoch()
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
@@ -3068,7 +3272,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         :raises ValueError: If the row already has a different
             ``external_session_id``.
         """
-        with self._session() as session:
+        with self._session("set_external_session_id") as session:
             meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
             if meta is None:
                 raise ConversationNotFoundError(
@@ -3084,7 +3288,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             changed = existing != value
             if changed:
                 meta.external_session_id = value
-        with self._conv_session() as ap_sess:
+        with self._conv_session("set_external_session_id") as ap_sess:
             ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if ap_row is None:
                 raise ConversationNotFoundError(
@@ -3109,6 +3313,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
+        project_id: str | None = None,
     ) -> CreatedSession:
         """
         Atomically insert a conversation row and session-scoped agent.
@@ -3175,6 +3380,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             terminal_launch_args=terminal_launch_args,
             parent_conversation_id=parent_conversation_id,
             runner_id=runner_id,
+            project_id=project_id,
         )
 
     def _create_session_with_agent_with_id(
@@ -3192,6 +3398,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
+        project_id: str | None = None,
     ) -> CreatedSession:
         """Body of :meth:`create_session_with_agent` under a caller-supplied
         ``conversation_id``. The public method generates a fresh id; this seam
@@ -3204,7 +3411,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         # Get parent root_id from AP first.
         root_conversation_id: str | None = None
         if parent_conversation_id is not None:
-            with self._conv_session() as ap_sess:
+            with self._conv_session("create_session_with_agent") as ap_sess:
                 parent_row = ap_sess.get(
                     SqlConversation, (current_workspace_id(), parent_conversation_id)
                 )
@@ -3223,7 +3430,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             agent_id=agent_id,
             session_overrides=_encode_session_overrides({"reasoning_effort": reasoning_effort}),
         )
-        with self._conv_session() as ap_sess:
+        with self._conv_session("create_session_with_agent") as ap_sess:
             ap_sess.add(conversation_row)
             if labels:
                 _upsert_labels(ap_sess, conversation_id, labels, now)
@@ -3239,10 +3446,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             conversation_id,
             parent_conversation_id=parent_conversation_id,
             runner_id=runner_id,
+            project_id=project_id,
             workspace=workspace,
             terminal_launch_args=terminal_launch_args,
         )
-        with self._session() as session:
+        with self._session("create_session_with_agent") as session:
             session.add(agent_row)
             session.add(meta_row)
             session.flush()
@@ -3260,10 +3468,19 @@ class SqlAlchemyConversationStore(ConversationStore):
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
         copy_terminal_launch_args: bool = True,
+        override_model_override: str | None = None,
+        override_model_override_set: bool = False,
+        override_reasoning_effort: str | None = None,
+        override_reasoning_effort_set: bool = False,
+        override_terminal_launch_args: list[str] | None = None,
+        override_terminal_launch_args_set: bool = False,
+        dropped_label_keys: frozenset[str] = frozenset(),
+        extra_labels: dict[str, str] | None = None,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
+        project_id: str | None = None,
     ) -> Conversation:
         """
         Deep-copy a conversation and its items into a new conversation.
@@ -3315,6 +3532,39 @@ class SqlAlchemyConversationStore(ConversationStore):
             the bound agent's defaults — used when the fork switches to
             an agent in a different provider family, where the source's
             model id is meaningless (a model is provider-bound).
+        :param override_model_override: Explicit ``model_override`` for the
+            fork, applied only when ``override_model_override_set`` is
+            ``True`` — then it supersedes the ``copy_model_settings`` copy
+            (a value pins that model; ``None`` clears to the agent default).
+        :param override_model_override_set: Whether the caller chose an
+            explicit ``model_override`` (the fork dialog's model picker).
+            ``False`` (default) inherits per ``copy_model_settings``.
+        :param override_reasoning_effort: Explicit ``reasoning_effort`` for
+            the fork, applied only when ``override_reasoning_effort_set`` is
+            ``True``.
+        :param override_reasoning_effort_set: Whether the caller chose an
+            explicit ``reasoning_effort``. ``False`` (default) inherits per
+            ``copy_model_settings``.
+        :param override_terminal_launch_args: Explicit
+            ``terminal_launch_args`` for the fork (e.g. the permission-mode
+            selector's ``["--permission-mode", "auto"]``), applied only when
+            ``override_terminal_launch_args_set`` is ``True`` — then it
+            supersedes the ``copy_terminal_launch_args`` copy (``[]`` clears
+            them, ``None`` also clears).
+        :param override_terminal_launch_args_set: Whether the caller chose
+            explicit launch args. ``False`` (default) inherits per
+            ``copy_terminal_launch_args``.
+        :param dropped_label_keys: Source labels to NOT copy onto the fork,
+            beyond the always-dropped instance-scoped set. The fork route
+            passes the permission-mode / codex-bypass label keys here when
+            the dialog picks explicit launch args, so the stale copied label
+            can't shadow the freshly chosen mode.
+        :param extra_labels: Labels to stamp on the fork AFTER the copy /
+            drop / presentation-label logic, so a deliberate opt-in wins over
+            the always-drop rule. The fork route passes the DANGEROUS
+            ``codex_native.bypass_sandbox`` label here when the dialog's
+            approval selector explicitly re-arms bypass — the only path that
+            sets it, since the source's own bypass label is always dropped.
         :param carry_history_into_native: When ``True``, stamp
             :data:`FORK_CARRY_HISTORY_LABEL_KEY` on the fork so a native
             target harness rebuilds its transcript instead of starting
@@ -3345,6 +3595,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             response is the source's last one the copy is equivalent to a
             full fork, so the directive is kept. ``None`` (default)
             copies the full history.
+        :param project_id: First-class project to file the fork into
+            (``metadata.project_id``), or ``None`` (default) to leave it
+            unfiled. The caller resolves whether the fork keeps the
+            source's project — projects are owner-private, so the route
+            passes the source's id only when the forker owns it.
         :returns: The newly created :class:`Conversation`.
         :raises LookupError: If no conversation with
             *source_conversation_id* exists.
@@ -3361,10 +3616,19 @@ class SqlAlchemyConversationStore(ConversationStore):
             cloned_agent_description=cloned_agent_description,
             copy_model_settings=copy_model_settings,
             copy_terminal_launch_args=copy_terminal_launch_args,
+            override_model_override=override_model_override,
+            override_model_override_set=override_model_override_set,
+            override_reasoning_effort=override_reasoning_effort,
+            override_reasoning_effort_set=override_reasoning_effort_set,
+            override_terminal_launch_args=override_terminal_launch_args,
+            override_terminal_launch_args_set=override_terminal_launch_args_set,
+            dropped_label_keys=dropped_label_keys,
+            extra_labels=extra_labels,
             carry_history_into_native=carry_history_into_native,
             resume_source_native_session=resume_source_native_session,
             presentation_labels=presentation_labels,
             up_to_response_id=up_to_response_id,
+            project_id=project_id,
         )
 
     def _fork_conversation_with_id(
@@ -3379,10 +3643,19 @@ class SqlAlchemyConversationStore(ConversationStore):
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
         copy_terminal_launch_args: bool = True,
+        override_model_override: str | None = None,
+        override_model_override_set: bool = False,
+        override_reasoning_effort: str | None = None,
+        override_reasoning_effort_set: bool = False,
+        override_terminal_launch_args: list[str] | None = None,
+        override_terminal_launch_args_set: bool = False,
+        dropped_label_keys: frozenset[str] = frozenset(),
+        extra_labels: dict[str, str] | None = None,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
+        project_id: str | None = None,
     ) -> Conversation:
         """Body of :meth:`fork_conversation` under a caller-supplied
         ``conversation_id``. The public method generates a fresh id; this seam
@@ -3393,12 +3666,12 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         # Fetch source metadata (workspace, external_session_id, terminal_launch_args)
         # from the Omnigent DB before opening the AP session.
-        with self._session() as meta_sess:
+        with self._session("fork_conversation") as meta_sess:
             source_meta_ref: SqlConversationMetadata | None = meta_sess.get(
                 SqlConversationMetadata, (current_workspace_id(), source_conversation_id)
             )
 
-        with self._conv_session() as session:
+        with self._conv_session("fork_conversation") as session:
             source = session.get(SqlConversation, (current_workspace_id(), source_conversation_id))
             if source is None:
                 raise LookupError(f"conversation not found: {source_conversation_id!r}")
@@ -3416,15 +3689,25 @@ class SqlAlchemyConversationStore(ConversationStore):
             creating_clone = cloned_agent_bundle_location is not None
             # Model-family-bound overrides (reasoning_effort, model_override, and
             # — same gate — harness_override) copy only when copy_model_settings.
-            # cost_control_mode_override is intentionally never carried onto a fork.
+            # The routing switches (cost_control_mode_override,
+            # subagent_routing_override) are intentionally never carried onto a fork.
+            # An explicit dialog pick (override_*_set) supersedes the inherited
+            # value — the fork dialog seeds the picker from the source, so an
+            # untouched picker sends nothing and inheritance stands.
+            fork_effort = (
+                override_reasoning_effort
+                if override_reasoning_effort_set
+                else (source_overrides["reasoning_effort"] if copy_model_settings else None)
+            )
+            fork_model = (
+                override_model_override
+                if override_model_override_set
+                else (source_overrides["model_override"] if copy_model_settings else None)
+            )
             fork_overrides = _encode_session_overrides(
                 {
-                    "reasoning_effort": (
-                        source_overrides["reasoning_effort"] if copy_model_settings else None
-                    ),
-                    "model_override": (
-                        source_overrides["model_override"] if copy_model_settings else None
-                    ),
+                    "reasoning_effort": fork_effort,
+                    "model_override": fork_model,
                     "harness_override": (
                         source_overrides["harness_override"] if copy_model_settings else None
                     ),
@@ -3490,11 +3773,32 @@ class SqlAlchemyConversationStore(ConversationStore):
                 items_query = items_query.where(SqlConversationItem.position <= cutoff_position)
             source_items = session.execute(items_query).scalars().all()
 
+            # Compaction cursors refer to item IDs. Since every copied item gets
+            # a fresh ID, build the complete mapping before copying any payloads
+            # so compaction records can point at the fork's boundary item.
+            copied_item_ids = {
+                src_item.id: generate_item_id(decode_item_type(src_item.type))
+                for src_item in source_items
+            }
+            decoded_item_data = self._decode_item_data_batch(
+                [src_item.data for src_item in source_items]
+            )
+
             fts_rows: list[tuple[str, str, str]] = []
-            for pos, src_item in enumerate(source_items):
+            for pos, (src_item, decoded_data) in enumerate(
+                zip(source_items, decoded_item_data, strict=True)
+            ):
                 # src_item.type/status are int codes copied verbatim to the new
-                # row; only generate_item_id needs the decoded string type.
-                new_item_id = generate_item_id(decode_item_type(src_item.type))
+                # row. Compaction data is the sole payload containing an item ID.
+                new_item_id = copied_item_ids[src_item.id]
+                copied_data = decoded_data
+                if decode_item_type(src_item.type) == "compaction":
+                    compaction_data = json.loads(decoded_data)
+                    boundary_id = compaction_data.get("last_item_id")
+                    mapped_boundary_id = copied_item_ids.get(boundary_id)
+                    if mapped_boundary_id is not None:
+                        compaction_data["last_item_id"] = mapped_boundary_id
+                        copied_data = json.dumps(compaction_data)
                 new_item = SqlConversationItem(
                     id=new_item_id,
                     conversation_id=new_conv.id,
@@ -3503,7 +3807,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     status=src_item.status,
                     position=pos,
                     type=src_item.type,
-                    data=src_item.data,
+                    data=self._encode_item_data(copied_data),
                     search_text=src_item.search_text,
                     created_by=src_item.created_by,
                 )
@@ -3547,7 +3851,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             fork_labels = {
                 key: value
                 for key, value in _fetch_labels(session, source_conversation_id).items()
-                if key not in (_INSTANCE_SCOPED_LABEL_KEYS | _FORK_ONLY_DROPPED_LABEL_KEYS)
+                if key
+                not in (
+                    _INSTANCE_SCOPED_LABEL_KEYS
+                    | _FORK_ONLY_DROPPED_LABEL_KEYS
+                    | dropped_label_keys
+                )
                 and not key.startswith(f"{PINNED_LABEL_KEY}.")
             }
             source_workspace = source_meta_ref.workspace if source_meta_ref else None
@@ -3558,10 +3867,24 @@ class SqlAlchemyConversationStore(ConversationStore):
             # CLI — Claude Code's ``--permission-mode auto`` makes ``pi`` exit 1
             # at launch (unknown option), which surfaces as
             # ``required_terminal_exited``. Drop them on a switching fork.
+            # An explicit dialog pick (the permission-/approval-mode selector)
+            # supersedes the inherited launch args; an untouched picker sends
+            # nothing, so the same-agent copy / switch-drop rule stands. The
+            # metadata column stores the JSON-encoded string, so the copy path
+            # reuses the source's already-encoded value while an override list
+            # is encoded here (matching create_conversation).
             source_terminal_args = (
-                source_meta_ref.terminal_launch_args
-                if source_meta_ref and copy_terminal_launch_args
-                else None
+                (
+                    json.dumps(override_terminal_launch_args)
+                    if override_terminal_launch_args is not None
+                    else None
+                )
+                if override_terminal_launch_args_set
+                else (
+                    source_meta_ref.terminal_launch_args
+                    if source_meta_ref and copy_terminal_launch_args
+                    else None
+                )
             )
             if source_workspace is not None:
                 fork_labels[FORK_SOURCE_LABEL_KEY] = source_conversation_id
@@ -3595,6 +3918,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                 for _pkey in (UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY):
                     fork_labels.pop(_pkey, None)
                 fork_labels.update(presentation_labels)
+            # Caller-supplied labels stamped LAST so a deliberate opt-in beats
+            # both the copy and the always-drop rules — e.g. the fork dialog
+            # re-arming the DANGEROUS codex bypass. The source's own bypass
+            # label was already dropped (it's instance-scoped), so this is the
+            # only path that sets it, and only from an explicit request field.
+            if extra_labels:
+                fork_labels.update(extra_labels)
             if fork_labels:
                 _upsert_labels(session, new_conv.id, fork_labels, now)
 
@@ -3604,10 +3934,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                 kind=encode_conversation_kind("default"),
                 # Copy terminal args from source so the fork launches with same native args.
                 terminal_launch_args=source_terminal_args,
+                # First-class project membership, resolved by the caller
+                # (None = unfiled).
+                project_id=project_id,
             )
 
         # Write fork metadata (and cloned agent if any) to the Omnigent DB.
-        with self._session() as meta_sess:
+        with self._session("fork_conversation") as meta_sess:
             meta_sess.add(fork_meta)
             if creating_clone and agent_id is not None:
                 assert cloned_agent_name is not None and cloned_agent_bundle_location is not None
@@ -3682,7 +4015,7 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         # AP holds the conversation (agent binding + overrides) + labels;
         # Omnigent holds agent+metadata. Read old_agent_id before overwriting it.
-        with self._conv_session() as ap_sess:
+        with self._conv_session("switch_conversation_agent") as ap_sess:
             row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if row is None:
                 raise LookupError(f"conversation not found: {conversation_id!r}")
@@ -3711,7 +4044,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 _upsert_labels(ap_sess, conversation_id, upserts, now)
 
         # Update agent + metadata on the Omnigent side.
-        with self._session() as session:
+        with self._session("switch_conversation_agent") as session:
             if old_agent_id is not None:
                 old_agent = session.get(SqlAgent, (current_workspace_id(), old_agent_id))
                 if old_agent is not None and old_agent.kind == encode_agent_kind("session"):
@@ -3742,6 +4075,58 @@ class SqlAlchemyConversationStore(ConversationStore):
             raise LookupError(f"conversation not found: {conversation_id!r}")
         return conv
 
+    def has_other_live_session_in_workspace(
+        self,
+        *,
+        host_id: str,
+        workspace: str,
+        exclude_conversation_id: str,
+    ) -> bool:
+        """
+        Is another non-archived conversation sitting in this ``(host_id, workspace)``?
+        See the protocol docstring for the semantics.
+
+        Two queries, not one: ``host_id`` / ``workspace`` live on the metadata
+        table (Omnigent DB) while ``archived`` lives on ``conversations`` (AP
+        DB, which may be a separate engine), so they cannot be joined. They
+        are ordered so the overwhelmingly common answer — nothing else is in
+        the directory — costs a single indexed query and returns before the AP
+        DB is touched at all.
+        """
+        with self._session("check_workspace_used_by_other_session") as meta_sess:
+            candidate_ids = list(
+                meta_sess.scalars(
+                    select(SqlConversationMetadata.id)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.host_id == host_id,
+                        SqlConversationMetadata.workspace == workspace,
+                        SqlConversationMetadata.id != exclude_conversation_id,
+                    )
+                    .limit(_WORKSPACE_SHARER_SCAN_LIMIT)
+                )
+            )
+        if not candidate_ids:
+            return False
+        if len(candidate_ids) >= _WORKSPACE_SHARER_SCAN_LIMIT:
+            # More sharers than we bound the scan to. "In use" is the safe
+            # answer: a wrong "free" deletes a directory out from under a
+            # running session, while a wrong "in use" only leaves it behind.
+            return True
+        with self._conv_session("check_workspace_sharers_are_archived") as conv_sess:
+            return (
+                conv_sess.scalar(
+                    select(SqlConversation.id)
+                    .where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id.in_(candidate_ids),
+                        SqlConversation.archived.is_(False),
+                    )
+                    .limit(1)
+                )
+                is not None
+            )
+
     async def delete_conversation(self, conversation_id: str) -> bool:
         """
         Delete a conversation and all of its descendants, cleaning up
@@ -3761,7 +4146,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         # Omnigent-side rows (metadata/comments/policies/permissions) are cleaned up
         # second. A failure of the second transaction leaves orphaned Omnigent rows
         # for a conversation that no longer exists — an acceptable best-effort tradeoff.
-        with self._conv_session() as ap_sess:
+        with self._conv_session("delete_conversation") as ap_sess:
             row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if not row:
                 return False
@@ -3834,7 +4219,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             ap_sess.delete(row)
 
-        with self._session() as session:
+        with self._session("delete_conversation") as session:
             session.execute(
                 delete(SqlComment).where(
                     SqlComment.workspace_id == current_workspace_id(),

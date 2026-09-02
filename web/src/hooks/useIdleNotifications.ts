@@ -181,17 +181,13 @@ export function useIdleNotifications(activeConversationId?: string): void {
   useEffect(() => {
     return onNativeNotificationActivated((path) => navigateRef.current(path));
     // navigateRef is stable; the listener is mounted once for the app's life.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Desktop shell only: clicking an `omnigent://.../c/<id>` deep link for a
-  // server this window is already on sends the in-app path here (no reload —
-  // the main process only forwards it for a window currently on its pinned
-  // server), so we route to it with the same navigate the notification path
-  // uses. basename-less `/c/<id>` is rebased under the mount by the router.
+  // Desktop shell only: native menu actions and same-server deep links send a
+  // basename-less in-app path here, so route it with the same navigate used for
+  // notification clicks. The router rebases it under the current mount.
   useEffect(() => {
     return onOpenPath((path) => navigateRef.current(path));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Clear any deferred turn-end timers on unmount so a pending cue can't fire
@@ -252,7 +248,6 @@ export function useIdleNotifications(activeConversationId?: string): void {
       window.removeEventListener("keydown", onInteract);
     };
     // pushBadge only touches refs, so the once-mounted listener stays fresh.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Marking a row read/unread in the sidebar rewrites the last-seen map;
@@ -270,7 +265,6 @@ export function useIdleNotifications(activeConversationId?: string): void {
     );
     pushBadge(next, convs);
     // pushBadge and the focus state are refs; rerun only when the map changes.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [unseenTick]);
 
   useEffect(() => {

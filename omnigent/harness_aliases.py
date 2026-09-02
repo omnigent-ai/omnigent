@@ -70,7 +70,7 @@ def native_terminal_name(harness: str | None) -> str | None:
     :returns: The terminal short-name, e.g. ``"cursor"``, or ``None`` when
         *harness* is not a native CLI harness.
     """
-    if not is_native_harness(harness):
+    if harness is None or not is_native_harness(harness):
         return None
     canonical = canonicalize_harness(harness) or harness
     # Canonical native ids are ``<name>-native``; some accepted aliases keep the

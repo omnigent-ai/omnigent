@@ -22,9 +22,9 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
 
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
+from omnigent.json_types import JsonObject as _JsonObject
 
 # Structured error code carried in ``HostLaunchRunnerResultFrame.error_code``
 # when the host refuses a launch because the session's harness is not
@@ -33,11 +33,17 @@ from omnigent.harness_availability import HarnessAvailability, is_harness_availa
 # ``ErrorCode.HARNESS_NOT_CONFIGURED``), and tests.
 HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 
+# when the host refuses a launch because the session's workspace directory
+# does not exist on the host (e.g. the worktree was deleted). Shared by the
+# daemon (producer) and server (consumer) so both can handle it structurally.
+WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
+
 
 class HostFrameKind(str, Enum):
     """All host frame kinds; the value is the JSON wire string."""
 
     HELLO = "host.hello"
+    CONNECTION_ERROR = "host.connection_error"
     HARNESS_READINESS = "host.harness_readiness"
     LAUNCH_RUNNER = "host.launch_runner"
     LAUNCH_RUNNER_RESULT = "host.launch_runner_result"
@@ -68,6 +74,9 @@ class HostFrameKind(str, Enum):
     FS_RESULT = "host.fs_result"
     MODEL_OPTIONS = "host.model_options"
     MODEL_OPTIONS_RESULT = "host.model_options_result"
+    IMPORT_LOCAL = "host.import_local"
+    IMPORT_LOCAL_SESSION = "host.import_local_session"
+    IMPORT_LOCAL_DONE = "host.import_local_done"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -89,10 +98,16 @@ class HostHelloFrame:
         machine, e.g. ``{"claude-sdk": True, "codex": False}``
         (see ``omnigent.onboarding.harness_readiness``). Keys
         cover every accepted harness spelling. ``None`` means
-        unknown (an older host that doesn't report it) — never
+        unknown (an older host, or a startup probe that failed) — never
         treat ``None`` as "nothing is configured". Changes arrive in
         :class:`HostHarnessReadinessFrame`; launch-time checks remain
         authoritative.
+    :param gateway_inference: Per-harness flag for whether that family's
+        launch on this host resolves AI-Gateway-backed inference, e.g.
+        ``{"claude-native": True, "codex": False}`` (see
+        ``omnigent.gateway_inference``). A family that could not be evaluated
+        is omitted. ``None`` means unknown (an older host, or a startup probe
+        that failed) — never treat it as "nothing is gateway-backed".
     """
 
     version: str
@@ -100,8 +115,23 @@ class HostHelloFrame:
     name: str
     runners: list[str] = field(default_factory=list)
     configured_harnesses: dict[str, HarnessAvailability] | None = None
+    gateway_inference: dict[str, bool] | None = None
     telemetry_opt_out: bool = False
     installation_id: str | None = None
+
+
+@dataclass
+class HostConnectionErrorFrame:
+    """Server-side channel failure sent before the WebSocket closes.
+
+    :param stage: Connection stage that failed, e.g. ``"registration"``.
+    :param error: Exception message from the server.
+    :param retryable: Whether reconnecting may recover.
+    """
+
+    stage: str
+    error: str
+    retryable: bool
 
 
 @dataclass
@@ -110,9 +140,16 @@ class HostHarnessReadinessFrame:
 
     :param configured_harnesses: Current launch readiness keyed by every
         accepted harness spelling. Sent only when the map changes.
+    :param gateway_inference: Per-harness flag for whether that family's
+        launch on this host resolves AI-Gateway-backed inference, e.g.
+        ``{"claude-native": True, "codex": False}`` (see
+        ``omnigent.gateway_inference``). A family that could not be evaluated
+        is omitted. ``None`` means unknown (an older host that doesn't report
+        it) — never treat it as "nothing is gateway-backed".
     """
 
     configured_harnesses: dict[str, HarnessAvailability]
+    gateway_inference: dict[str, bool] | None = None
 
 
 @dataclass
@@ -433,12 +470,16 @@ class HostCreateWorktreeFrame:
     :param branch_name: New branch to create, e.g. ``"feature/login"``.
     :param base_branch: Optional base ref, e.g. ``"main"``. ``None``
         branches from ``HEAD``.
+    :param existing_branch: When ``True``, check out the pre-existing
+        ``branch_name`` into a fresh worktree (the deleted-worktree
+        recreate path) instead of creating a new branch.
     """
 
     request_id: str
     repo_path: str
     branch_name: str
     base_branch: str | None = None
+    existing_branch: bool = False
 
 
 @dataclass
@@ -539,7 +580,7 @@ class HostListWorktreesResultFrame:
 
     request_id: str
     status: str
-    worktrees: list[dict[str, Any]] | None = None
+    worktrees: list[_JsonObject] | None = None
     error: str | None = None
 
 
@@ -626,6 +667,12 @@ class HostInstallHarnessResultFrame:
         after the install attempt, e.g. ``{"claude-native": True,
         "codex-native": "needs-auth"}``. ``None`` when the install could
         not run (the server keeps its prior readiness view).
+    :param gateway_inference: Per-harness flag for whether that family's
+        launch on this host resolves AI-Gateway-backed inference, e.g.
+        ``{"claude-native": True, "codex": False}`` (see
+        ``omnigent.gateway_inference``). A family that could not be evaluated
+        is omitted. ``None`` means unknown (an older host that doesn't report
+        it) — never treat it as "nothing is gateway-backed".
     :param error: Why the install failed, e.g. ``"npm not found"`` or
         ``"install timed out"``. ``None`` on success.
     """
@@ -633,6 +680,7 @@ class HostInstallHarnessResultFrame:
     request_id: str
     status: str
     configured_harnesses: dict[str, HarnessAvailability] | None = None
+    gateway_inference: dict[str, bool] | None = None
     error: str | None = None
 
 
@@ -694,6 +742,12 @@ class HostStoreSecretResultFrame:
         otherwise (paired with a non-secret ``error``).
     :param configured_harnesses: Readiness recomputed after the write, e.g.
         ``{"claude-native": True}``. ``None`` when the write could not run.
+    :param gateway_inference: Per-harness flag for whether that family's
+        launch on this host resolves AI-Gateway-backed inference, e.g.
+        ``{"claude-native": True, "codex": False}`` (see
+        ``omnigent.gateway_inference``). A family that could not be evaluated
+        is omitted. ``None`` means unknown (an older host that doesn't report
+        it) — never treat it as "nothing is gateway-backed".
     :param error: Non-secret failure reason, e.g. ``"a gateway requires a
         base_url"``. ``None`` on success.
     """
@@ -701,6 +755,7 @@ class HostStoreSecretResultFrame:
     request_id: str
     status: str
     configured_harnesses: dict[str, HarnessAvailability] | None = None
+    gateway_inference: dict[str, bool] | None = None
     error: str | None = None
 
 
@@ -762,7 +817,7 @@ class HostFsRequestFrame:
     op: str
     workspace: str
     session_id: str
-    params: dict[str, Any] = field(default_factory=dict)
+    params: _JsonObject = field(default_factory=dict)
 
 
 @dataclass
@@ -783,7 +838,7 @@ class HostFsResultFrame:
 
     request_id: str
     status: str
-    payload: dict[str, Any] | None = None
+    payload: _JsonObject | None = None
     error_status: int | None = None
     error_code: str | None = None
     error: str | None = None
@@ -799,16 +854,101 @@ class HostModelOptionsFrame:
 
 @dataclass
 class HostModelOptionsResultFrame:
-    """Host → server: pre-launch model choices resolved on that machine."""
+    """Host → server: pre-launch model choices resolved on that machine.
+
+    :param models: Picker rows the harness can be launched/switched onto
+        by name, e.g. ``[{"id": "opus", "model": "…-opus-5"}]``.
+    :param routable_models: Every model id the harness's endpoint serves,
+        including generations no picker row names — launchable exactly
+        (``--model``) even without a row, so a router may pick one.
+        Empty when the harness cannot enumerate its endpoint.
+    """
 
     request_id: str
     status: str
-    models: list[dict[str, Any]] = field(default_factory=list)
+    models: list[_JsonObject] = field(default_factory=list)
     error: str | None = None
+    routable_models: list[str] = field(default_factory=list)
+
+
+@dataclass
+class HostImportedLocalSession:
+    """One local transcript the host read, normalized for import.
+
+    :param external_session_id: Harness-native session id on the host.
+    :param workspace: The session's recorded working directory, or ``None``.
+    :param items: Items in ``/v1/imports`` wire shape —
+        ``{"type", "response_id", "data"}`` — ready to persist server-side.
+    :param title: The harness's own session title, or ``None`` to let the
+        server synthesize one from the first user message.
+    :param source: Harness this session came from, e.g. ``"claude"``. Carried
+        per session so an "all harnesses" request can mix sources in one batch.
+    """
+
+    external_session_id: str
+    workspace: str | None
+    items: list[_JsonObject]
+    title: str | None = None
+    source: str = ""
+
+
+@dataclass
+class HostImportLocalFrame:
+    """Server → host: read the host's recent local transcripts for a harness.
+
+    The host owns the transcripts (``~/.claude`` etc.); the server can't see
+    them, so it asks the host to enumerate + normalize the most recent ones.
+
+    :param request_id: Unique id for correlating the result.
+    :param source: Harness whose local sessions to read, e.g. ``"claude"``, or
+        ``"all"`` to read every supported harness on the host in one batch.
+    :param limit: Maximum number of most-recent sessions to return per harness.
+    """
+
+    request_id: str
+    source: str
+    limit: int = 10
+
+
+@dataclass
+class HostImportLocalSessionFrame:
+    """Host → server: one normalized local session, streamed as it's read.
+
+    Sent once per session so a large batch never rides in a single frame (the
+    server persists each on arrival). ``total`` is the number of sessions the
+    host expects to stream for this request, so the server can report progress.
+
+    :param request_id: Correlates to the :class:`HostImportLocalFrame`.
+    :param total: Total sessions the host will stream for this request.
+    :param session: The normalized session to persist.
+    """
+
+    request_id: str
+    total: int
+    session: HostImportedLocalSession
+
+
+@dataclass
+class HostImportLocalDoneFrame:
+    """Host → server: the import stream for a request has ended.
+
+    :param request_id: Correlates to the :class:`HostImportLocalFrame`.
+    :param status: ``"ok"`` or ``"failed"``.
+    :param error: Failure detail when ``status`` is ``"failed"``.
+    :param failed: Count of enumerated sessions the host could not read/parse
+        (skipped, no session frame sent). The server folds these into its own
+        failed tally so the reported counts account for every target.
+    """
+
+    request_id: str
+    status: str
+    error: str | None = None
+    failed: int = 0
 
 
 HostFrame = (
     HostHelloFrame
+    | HostConnectionErrorFrame
     | HostHarnessReadinessFrame
     | HostLaunchRunnerFrame
     | HostLaunchRunnerResultFrame
@@ -829,17 +969,26 @@ HostFrame = (
     | HostListWorktreesResultFrame
     | HostCreateDirFrame
     | HostCreateDirResultFrame
+    | HostInstallHarnessFrame
+    | HostInstallHarnessResultFrame
+    | HostStoreSecretFrame
+    | HostStoreSecretResultFrame
+    | HostDetectCredentialsFrame
+    | HostDetectCredentialsResultFrame
     | HostFsRequestFrame
     | HostFsResultFrame
     | HostModelOptionsFrame
     | HostModelOptionsResultFrame
+    | HostImportLocalFrame
+    | HostImportLocalSessionFrame
+    | HostImportLocalDoneFrame
 )
 
 
 # ── Encode / decode ──────────────────────────────────────
 
 
-def _encode_payload(payload: dict[str, Any]) -> str:
+def _encode_payload(payload: _JsonObject) -> str:
     """Serialize a frame payload, injecting the active trace context.
 
     Centralized so every host frame carries a W3C ``traceparent`` (and
@@ -859,7 +1008,9 @@ def _encode_payload(payload: dict[str, Any]) -> str:
     # content capture) before injecting propagation keys, so the span
     # shows exactly what this side sent.
     telemetry.record_message_payload(payload)
-    telemetry.inject_trace_context(payload)
+    trace_context: dict[str, str] = {}
+    telemetry.inject_trace_context(trace_context)
+    payload.update(trace_context)
     return json.dumps(payload)
 
 
@@ -879,8 +1030,18 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "name": frame.name,
                 "runners": list(frame.runners),
                 "configured_harnesses": frame.configured_harnesses,
+                "gateway_inference": frame.gateway_inference,
                 "telemetry_opt_out": frame.telemetry_opt_out,
                 "installation_id": frame.installation_id,
+            }
+        )
+    if isinstance(frame, HostConnectionErrorFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.CONNECTION_ERROR.value,
+                "stage": frame.stage,
+                "error": frame.error,
+                "retryable": frame.retryable,
             }
         )
     if isinstance(frame, HostHarnessReadinessFrame):
@@ -888,6 +1049,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             {
                 "kind": HostFrameKind.HARNESS_READINESS.value,
                 "configured_harnesses": frame.configured_harnesses,
+                "gateway_inference": frame.gateway_inference,
             }
         )
     if isinstance(frame, HostLaunchRunnerFrame):
@@ -1012,6 +1174,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "repo_path": frame.repo_path,
                 "branch_name": frame.branch_name,
                 "base_branch": frame.base_branch,
+                "existing_branch": frame.existing_branch,
             }
         )
     if isinstance(frame, HostCreateWorktreeResultFrame):
@@ -1095,6 +1258,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "status": frame.status,
                 "configured_harnesses": frame.configured_harnesses,
+                "gateway_inference": frame.gateway_inference,
                 "error": frame.error,
             }
         )
@@ -1119,6 +1283,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "status": frame.status,
                 "configured_harnesses": frame.configured_harnesses,
+                "gateway_inference": frame.gateway_inference,
                 "error": frame.error,
             }
         )
@@ -1176,6 +1341,42 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "status": frame.status,
                 "models": frame.models,
                 "error": frame.error,
+                "routable_models": frame.routable_models,
+            }
+        )
+    if isinstance(frame, HostImportLocalFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.IMPORT_LOCAL.value,
+                "request_id": frame.request_id,
+                "source": frame.source,
+                "limit": frame.limit,
+            }
+        )
+    if isinstance(frame, HostImportLocalSessionFrame):
+        s = frame.session
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.IMPORT_LOCAL_SESSION.value,
+                "request_id": frame.request_id,
+                "total": frame.total,
+                "session": {
+                    "external_session_id": s.external_session_id,
+                    "workspace": s.workspace,
+                    "items": s.items,
+                    "title": s.title,
+                    "source": s.source,
+                },
+            }
+        )
+    if isinstance(frame, HostImportLocalDoneFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.IMPORT_LOCAL_DONE.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "error": frame.error,
+                "failed": frame.failed,
             }
         )
     raise TypeError(f"unknown host frame type: {type(frame).__name__}")
@@ -1194,7 +1395,7 @@ def decode_host_frame(text: str) -> HostFrame:
     return _decode_known_host_frame(kind, msg)
 
 
-def _parse_frame_object(text: str) -> dict[str, Any]:
+def _parse_frame_object(text: str) -> _JsonObject:
     """Parse a JSON frame object.
 
     :param text: Raw JSON frame text.
@@ -1210,7 +1411,7 @@ def _parse_frame_object(text: str) -> dict[str, Any]:
     return msg
 
 
-def _parse_host_frame_kind(msg: dict[str, Any]) -> HostFrameKind:
+def _parse_host_frame_kind(msg: _JsonObject) -> HostFrameKind:
     """Parse the host frame kind discriminator.
 
     :param msg: Decoded frame object.
@@ -1228,7 +1429,7 @@ def _parse_host_frame_kind(msg: dict[str, Any]) -> HostFrameKind:
 
 def _decode_known_host_frame(
     kind: HostFrameKind,
-    msg: dict[str, Any],
+    msg: _JsonObject,
 ) -> HostFrame:
     """Decode a host frame with a validated kind.
 
@@ -1240,6 +1441,12 @@ def _decode_known_host_frame(
     match kind:
         case HostFrameKind.HELLO:
             return _decode_host_hello(msg)
+        case HostFrameKind.CONNECTION_ERROR:
+            return HostConnectionErrorFrame(
+                stage=_required_str(msg, "stage"),
+                error=_required_str(msg, "error"),
+                retryable=_required_bool(msg, "retryable"),
+            )
         case HostFrameKind.HARNESS_READINESS:
             return _decode_harness_readiness(msg)
         case HostFrameKind.LAUNCH_RUNNER:
@@ -1300,10 +1507,16 @@ def _decode_known_host_frame(
             return _decode_model_options(msg)
         case HostFrameKind.MODEL_OPTIONS_RESULT:
             return _decode_model_options_result(msg)
+        case HostFrameKind.IMPORT_LOCAL:
+            return _decode_import_local(msg)
+        case HostFrameKind.IMPORT_LOCAL_SESSION:
+            return _decode_import_local_session(msg)
+        case HostFrameKind.IMPORT_LOCAL_DONE:
+            return _decode_import_local_done(msg)
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 
-def _decode_host_hello(msg: dict[str, Any]) -> HostHelloFrame:
+def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
     """Decode a host hello frame.
 
     :param msg: Decoded frame object.
@@ -1315,25 +1528,31 @@ def _decode_host_hello(msg: dict[str, Any]) -> HostHelloFrame:
         name=_required_str(msg, "name"),
         runners=_optional_str_list(msg, "runners"),
         configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+        gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
     )
 
 
-def _decode_harness_readiness(msg: dict[str, Any]) -> HostHarnessReadinessFrame:
+def _decode_harness_readiness(msg: _JsonObject) -> HostHarnessReadinessFrame:
     """Decode a live harness-readiness refresh frame."""
+    raw = msg.get("configured_harnesses")
+    if not isinstance(raw, dict):
+        raise ValueError("harness readiness frame requires a configured_harnesses object")
     configured_harnesses = _optional_str_availability_map(msg, "configured_harnesses")
     if configured_harnesses is None:
         raise ValueError("harness readiness frame requires a configured_harnesses object")
-    raw = msg["configured_harnesses"]
     if len(configured_harnesses) != len(raw):
         raise ValueError("harness readiness frame contains an unsupported availability state")
     if not configured_harnesses:
         raise ValueError("harness readiness frame requires a non-empty configured_harnesses map")
-    return HostHarnessReadinessFrame(configured_harnesses=configured_harnesses)
+    return HostHarnessReadinessFrame(
+        configured_harnesses=configured_harnesses,
+        gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
+    )
 
 
-def _decode_launch_runner(msg: dict[str, Any]) -> HostLaunchRunnerFrame:
+def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
     """Decode a launch-runner frame.
 
     :param msg: Decoded frame object.
@@ -1349,7 +1568,7 @@ def _decode_launch_runner(msg: dict[str, Any]) -> HostLaunchRunnerFrame:
 
 
 def _decode_launch_runner_result(
-    msg: dict[str, Any],
+    msg: _JsonObject,
 ) -> HostLaunchRunnerResultFrame:
     """Decode a launch-runner-result frame.
 
@@ -1365,7 +1584,7 @@ def _decode_launch_runner_result(
     )
 
 
-def _decode_stop_runner(msg: dict[str, Any]) -> HostStopRunnerFrame:
+def _decode_stop_runner(msg: _JsonObject) -> HostStopRunnerFrame:
     """Decode a stop-runner frame.
 
     :param msg: Decoded frame object.
@@ -1378,7 +1597,7 @@ def _decode_stop_runner(msg: dict[str, Any]) -> HostStopRunnerFrame:
 
 
 def _decode_stop_runner_result(
-    msg: dict[str, Any],
+    msg: _JsonObject,
 ) -> HostStopRunnerResultFrame:
     """Decode a stop-runner-result frame.
 
@@ -1392,7 +1611,7 @@ def _decode_stop_runner_result(
     )
 
 
-def _decode_runner_exited(msg: dict[str, Any]) -> HostRunnerExitedFrame:
+def _decode_runner_exited(msg: _JsonObject) -> HostRunnerExitedFrame:
     """Decode a host.runner_exited report frame.
 
     :param msg: Decoded frame object.
@@ -1404,7 +1623,7 @@ def _decode_runner_exited(msg: dict[str, Any]) -> HostRunnerExitedFrame:
     )
 
 
-def _decode_runner_status(msg: dict[str, Any]) -> HostRunnerStatusFrame:
+def _decode_runner_status(msg: _JsonObject) -> HostRunnerStatusFrame:
     """Decode a host.runner_status request frame.
 
     :param msg: Decoded frame object.
@@ -1417,7 +1636,7 @@ def _decode_runner_status(msg: dict[str, Any]) -> HostRunnerStatusFrame:
 
 
 def _decode_runner_status_result(
-    msg: dict[str, Any],
+    msg: _JsonObject,
 ) -> HostRunnerStatusResultFrame:
     """Decode a host.runner_status_result frame.
 
@@ -1430,7 +1649,7 @@ def _decode_runner_status_result(
     )
 
 
-def _decode_stat(msg: dict[str, Any]) -> HostStatFrame:
+def _decode_stat(msg: _JsonObject) -> HostStatFrame:
     """Decode a host.stat request frame.
 
     :param msg: Decoded frame object.
@@ -1442,7 +1661,7 @@ def _decode_stat(msg: dict[str, Any]) -> HostStatFrame:
     )
 
 
-def _decode_stat_result(msg: dict[str, Any]) -> HostStatResultFrame:
+def _decode_stat_result(msg: _JsonObject) -> HostStatResultFrame:
     """Decode a host.stat_result frame.
 
     :param msg: Decoded frame object.
@@ -1458,7 +1677,7 @@ def _decode_stat_result(msg: dict[str, Any]) -> HostStatResultFrame:
     )
 
 
-def _decode_list_dir(msg: dict[str, Any]) -> HostListDirFrame:
+def _decode_list_dir(msg: _JsonObject) -> HostListDirFrame:
     """Decode a host.list_dir request frame.
 
     :param msg: Decoded frame object.
@@ -1476,7 +1695,7 @@ def _decode_list_dir(msg: dict[str, Any]) -> HostListDirFrame:
     )
 
 
-def _decode_list_dir_result(msg: dict[str, Any]) -> HostListDirResultFrame:
+def _decode_list_dir_result(msg: _JsonObject) -> HostListDirResultFrame:
     """Decode a host.list_dir_result frame.
 
     :param msg: Decoded frame object.
@@ -1502,7 +1721,7 @@ def _decode_list_dir_result(msg: dict[str, Any]) -> HostListDirResultFrame:
     )
 
 
-def _decode_list_dir_entry(msg: dict[str, Any]) -> HostListDirEntry:
+def _decode_list_dir_entry(msg: _JsonObject) -> HostListDirEntry:
     """Decode a single entry in a host.list_dir_result.
 
     :param msg: Decoded entry object.
@@ -1525,22 +1744,26 @@ def _decode_list_dir_entry(msg: dict[str, Any]) -> HostListDirEntry:
     )
 
 
-def _decode_create_worktree(msg: dict[str, Any]) -> HostCreateWorktreeFrame:
+def _decode_create_worktree(msg: _JsonObject) -> HostCreateWorktreeFrame:
     """Decode a host.create_worktree request frame.
 
     :param msg: Decoded frame object.
     :returns: Typed host.create_worktree frame.
     """
+    # ``existing_branch`` is absent on frames from older servers — treat
+    # missing (or non-bool) as False so old-server/new-host stays compatible.
+    existing_branch = msg.get("existing_branch")
     return HostCreateWorktreeFrame(
         request_id=_required_str(msg, "request_id"),
         repo_path=_required_str(msg, "repo_path"),
         branch_name=_required_str(msg, "branch_name"),
         base_branch=_optional_nullable_str(msg, "base_branch"),
+        existing_branch=existing_branch is True,
     )
 
 
 def _decode_create_worktree_result(
-    msg: dict[str, Any],
+    msg: _JsonObject,
 ) -> HostCreateWorktreeResultFrame:
     """Decode a host.create_worktree_result frame.
 
@@ -1556,7 +1779,7 @@ def _decode_create_worktree_result(
     )
 
 
-def _decode_remove_worktree(msg: dict[str, Any]) -> HostRemoveWorktreeFrame:
+def _decode_remove_worktree(msg: _JsonObject) -> HostRemoveWorktreeFrame:
     """Decode a host.remove_worktree request frame.
 
     :param msg: Decoded frame object.
@@ -1574,7 +1797,7 @@ def _decode_remove_worktree(msg: dict[str, Any]) -> HostRemoveWorktreeFrame:
 
 
 def _decode_remove_worktree_result(
-    msg: dict[str, Any],
+    msg: _JsonObject,
 ) -> HostRemoveWorktreeResultFrame:
     """Decode a host.remove_worktree_result frame.
 
@@ -1588,7 +1811,7 @@ def _decode_remove_worktree_result(
     )
 
 
-def _decode_list_worktrees(msg: dict[str, Any]) -> HostListWorktreesFrame:
+def _decode_list_worktrees(msg: _JsonObject) -> HostListWorktreesFrame:
     """Decode a host.list_worktrees request frame.
 
     :param msg: Decoded frame object.
@@ -1601,7 +1824,7 @@ def _decode_list_worktrees(msg: dict[str, Any]) -> HostListWorktreesFrame:
 
 
 def _decode_list_worktrees_result(
-    msg: dict[str, Any],
+    msg: _JsonObject,
 ) -> HostListWorktreesResultFrame:
     """Decode a host.list_worktrees_result frame.
 
@@ -1623,7 +1846,7 @@ def _decode_list_worktrees_result(
     )
 
 
-def _decode_create_dir(msg: dict[str, Any]) -> HostCreateDirFrame:
+def _decode_create_dir(msg: _JsonObject) -> HostCreateDirFrame:
     """Decode a host.create_dir request frame.
 
     :param msg: Decoded frame object.
@@ -1635,7 +1858,7 @@ def _decode_create_dir(msg: dict[str, Any]) -> HostCreateDirFrame:
     )
 
 
-def _decode_create_dir_result(msg: dict[str, Any]) -> HostCreateDirResultFrame:
+def _decode_create_dir_result(msg: _JsonObject) -> HostCreateDirResultFrame:
     """Decode a host.create_dir_result frame.
 
     :param msg: Decoded frame object.
@@ -1649,7 +1872,7 @@ def _decode_create_dir_result(msg: dict[str, Any]) -> HostCreateDirResultFrame:
     )
 
 
-def _decode_install_harness(msg: dict[str, Any]) -> HostInstallHarnessFrame:
+def _decode_install_harness(msg: _JsonObject) -> HostInstallHarnessFrame:
     """Decode a host.install_harness request frame.
 
     :param msg: Decoded frame object.
@@ -1661,7 +1884,7 @@ def _decode_install_harness(msg: dict[str, Any]) -> HostInstallHarnessFrame:
     )
 
 
-def _decode_install_harness_result(msg: dict[str, Any]) -> HostInstallHarnessResultFrame:
+def _decode_install_harness_result(msg: _JsonObject) -> HostInstallHarnessResultFrame:
     """Decode a host.install_harness_result frame.
 
     :param msg: Decoded frame object.
@@ -1671,11 +1894,12 @@ def _decode_install_harness_result(msg: dict[str, Any]) -> HostInstallHarnessRes
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
         configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+        gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
         error=_optional_nullable_str(msg, "error"),
     )
 
 
-def _decode_store_secret(msg: dict[str, Any]) -> HostStoreSecretFrame:
+def _decode_store_secret(msg: _JsonObject) -> HostStoreSecretFrame:
     """Decode a host.store_secret request frame.
 
     :param msg: Decoded frame object.
@@ -1693,7 +1917,7 @@ def _decode_store_secret(msg: dict[str, Any]) -> HostStoreSecretFrame:
     )
 
 
-def _decode_store_secret_result(msg: dict[str, Any]) -> HostStoreSecretResultFrame:
+def _decode_store_secret_result(msg: _JsonObject) -> HostStoreSecretResultFrame:
     """Decode a host.store_secret_result frame.
 
     :param msg: Decoded frame object.
@@ -1703,11 +1927,12 @@ def _decode_store_secret_result(msg: dict[str, Any]) -> HostStoreSecretResultFra
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
         configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+        gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
         error=_optional_nullable_str(msg, "error"),
     )
 
 
-def _decode_detect_credentials_result(msg: dict[str, Any]) -> HostDetectCredentialsResultFrame:
+def _decode_detect_credentials_result(msg: _JsonObject) -> HostDetectCredentialsResultFrame:
     """Decode a host.detect_credentials_result frame.
 
     Coerces each credential entry to a ``{family, source, env_var}`` dict of
@@ -1741,7 +1966,7 @@ def _decode_detect_credentials_result(msg: dict[str, Any]) -> HostDetectCredenti
     )
 
 
-def _decode_fs_request(msg: dict[str, Any]) -> HostFsRequestFrame:
+def _decode_fs_request(msg: _JsonObject) -> HostFsRequestFrame:
     """Decode a host.fs_request request frame.
 
     :param msg: Decoded frame object.
@@ -1759,7 +1984,7 @@ def _decode_fs_request(msg: dict[str, Any]) -> HostFsRequestFrame:
     )
 
 
-def _decode_fs_result(msg: dict[str, Any]) -> HostFsResultFrame:
+def _decode_fs_result(msg: _JsonObject) -> HostFsResultFrame:
     """Decode a host.fs_result frame.
 
     :param msg: Decoded frame object.
@@ -1783,7 +2008,7 @@ def _decode_fs_result(msg: dict[str, Any]) -> HostFsResultFrame:
     )
 
 
-def _decode_model_options(msg: dict[str, Any]) -> HostModelOptionsFrame:
+def _decode_model_options(msg: _JsonObject) -> HostModelOptionsFrame:
     """Decode a host.model_options request frame."""
     return HostModelOptionsFrame(
         request_id=_required_str(msg, "request_id"),
@@ -1791,23 +2016,83 @@ def _decode_model_options(msg: dict[str, Any]) -> HostModelOptionsFrame:
     )
 
 
-def _decode_model_options_result(msg: dict[str, Any]) -> HostModelOptionsResultFrame:
+def _decode_model_options_result(msg: _JsonObject) -> HostModelOptionsResultFrame:
     """Decode a host.model_options_result frame."""
     models = msg.get("models", [])
     if not isinstance(models, list) or not all(isinstance(model, dict) for model in models):
         raise ValueError("frame field must be a list of JSON objects: 'models'")
+    # Absent from hosts older than the routable-catalog field; the picker rows
+    # alone remain a valid answer.
+    routable = msg.get("routable_models", [])
+    if not isinstance(routable, list) or not all(isinstance(model, str) for model in routable):
+        raise ValueError("frame field must be a list of strings: 'routable_models'")
     return HostModelOptionsResultFrame(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
         models=models,
         error=_optional_nullable_str(msg, "error"),
+        routable_models=routable,
+    )
+
+
+def _decode_import_local(msg: _JsonObject) -> HostImportLocalFrame:
+    """Decode a host.import_local frame."""
+    return HostImportLocalFrame(
+        request_id=_required_str(msg, "request_id"),
+        source=_required_str(msg, "source"),
+        limit=_required_int(msg, "limit"),
+    )
+
+
+def _decode_imported_local_session(raw: object) -> HostImportedLocalSession:
+    """Decode one normalized session object into a HostImportedLocalSession."""
+    if not isinstance(raw, dict):
+        raise ValueError("'session' must be a JSON object")
+    items = raw.get("items", [])
+    if not isinstance(items, list) or not all(isinstance(i, dict) for i in items):
+        raise ValueError("session 'items' must be a list of JSON objects")
+    workspace = raw.get("workspace")
+    if workspace is not None and not isinstance(workspace, str):
+        raise ValueError("session 'workspace' must be a string or null")
+    title = raw.get("title")
+    if title is not None and not isinstance(title, str):
+        raise ValueError("session 'title' must be a string or null")
+    source = raw.get("source", "")
+    if not isinstance(source, str):
+        raise ValueError("session 'source' must be a string")
+    return HostImportedLocalSession(
+        external_session_id=_required_str(raw, "external_session_id"),
+        workspace=workspace,
+        items=items,
+        title=title,
+        source=source,
+    )
+
+
+def _decode_import_local_session(msg: _JsonObject) -> HostImportLocalSessionFrame:
+    """Decode a host.import_local_session frame (one streamed session)."""
+    return HostImportLocalSessionFrame(
+        request_id=_required_str(msg, "request_id"),
+        total=_required_int(msg, "total"),
+        session=_decode_imported_local_session(msg.get("session")),
+    )
+
+
+def _decode_import_local_done(msg: _JsonObject) -> HostImportLocalDoneFrame:
+    """Decode a host.import_local_done frame."""
+    return HostImportLocalDoneFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        error=_optional_nullable_str(msg, "error"),
+        # Absent on older hosts; default to 0 so decode stays backward-compatible.
+        failed=raw_failed if isinstance(raw_failed := msg.get("failed"), int) else 0,
     )
 
 
 # ── Field validators ─────────────────────────────────────
 
 
-def _required_str(msg: dict[str, Any], key: str) -> str:
+def _required_str(msg: _JsonObject, key: str) -> str:
     """Return a required string field.
 
     :param msg: Decoded frame object.
@@ -1821,7 +2106,7 @@ def _required_str(msg: dict[str, Any], key: str) -> str:
     return val
 
 
-def _required_int(msg: dict[str, Any], key: str) -> int:
+def _required_int(msg: _JsonObject, key: str) -> int:
     """Return a required integer field.
 
     :param msg: Decoded frame object.
@@ -1835,7 +2120,7 @@ def _required_int(msg: dict[str, Any], key: str) -> int:
     return val
 
 
-def _required_bool(msg: dict[str, Any], key: str) -> bool:
+def _required_bool(msg: _JsonObject, key: str) -> bool:
     """Return a required boolean field.
 
     :param msg: Decoded frame object.
@@ -1849,7 +2134,7 @@ def _required_bool(msg: dict[str, Any], key: str) -> bool:
     return val
 
 
-def _optional_str_list(msg: dict[str, Any], key: str) -> list[str]:
+def _optional_str_list(msg: _JsonObject, key: str) -> list[str]:
     """Return an optional list of strings.
 
     :param msg: Decoded frame object.
@@ -1864,7 +2149,7 @@ def _optional_str_list(msg: dict[str, Any], key: str) -> list[str]:
 
 
 def _optional_str_availability_map(
-    msg: dict[str, Any], key: str
+    msg: _JsonObject, key: str
 ) -> dict[str, HarnessAvailability] | None:
     """Return an optional string→availability mapping field.
 
@@ -1884,7 +2169,30 @@ def _optional_str_availability_map(
     return {k: v for k, v in val.items() if isinstance(k, str) and is_harness_availability(v)}
 
 
-def _optional_nullable_str(msg: dict[str, Any], key: str) -> str | None:
+def optional_str_bool_map(msg: _JsonObject, key: str) -> dict[str, bool] | None:
+    """Return an optional string→bool mapping field.
+
+    Tolerant like :func:`_optional_str_availability_map`: absent, null, or
+    non-mapping values decode to ``None`` ("unknown"), and entries whose key
+    isn't a string or whose value isn't a bool are dropped, so a garbled or
+    newer peer's payload never breaks the tunnel.
+
+    Public because the install / credential HTTP routes read the same field
+    straight off an RPC reply body rather than a decoded frame, and a host that
+    answers with a non-mapping must not 500 them either.
+
+    :param msg: Decoded frame object.
+    :param key: Field name, e.g. ``"gateway_inference"``.
+    :returns: The mapping, e.g. ``{"claude-native": True}``, or ``None`` when
+        absent / null / not a JSON object.
+    """
+    val = msg.get(key)
+    if not isinstance(val, dict):
+        return None
+    return {k: v for k, v in val.items() if isinstance(k, str) and isinstance(v, bool)}
+
+
+def _optional_nullable_str(msg: _JsonObject, key: str) -> str | None:
     """Return an optional nullable string field.
 
     :param msg: Decoded frame object.

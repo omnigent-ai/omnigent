@@ -298,6 +298,23 @@ def test_fetch_remote_config_respects_rollout_percentage_boundaries(
     assert (result is not None) is included
 
 
+def test_fetch_remote_config_accepts_default_version() -> None:
+    """A config with omnigent_version='default' is accepted for any client version."""
+    import omnigent.telemetry.client as _mod
+
+    config = {
+        "omnigent_version": "default",
+        "ingestion_url": "https://telemetry.example.test",
+        "rollout_percentage": 100,
+    }
+    with patch("urllib.request.urlopen") as urlopen:
+        response = urlopen.return_value.__enter__.return_value
+        response.read.return_value = json.dumps(config).encode("utf-8")
+        result = _mod._fetch_remote_config()
+
+    assert result is not None
+
+
 # ── get_installation_id ──────────────────────────────────────────────────────
 
 
@@ -472,6 +489,77 @@ def test_host_registry_get_host_installation_id_registered() -> None:
     conn = registry.register(host_id="host_abc", ws=ws, hello=hello, owner=None)
     assert conn is not None
     assert registry.get_host_installation_id("host_abc") == "inst-xyz"
+
+
+# ── PolicyRegisteredEvent ────────────────────────────────────────────────────
+
+
+def test_build_record_policy_registered_event_admin_scope() -> None:
+    """``_build_record`` serialises admin-scope ``PolicyRegisteredEvent`` correctly.
+
+    ``installation_id``, ``session_id``, and ``anon_user_id`` are promoted to
+    top-level ``data`` fields; ``handler``, ``policy_type``, and ``scope`` go
+    into ``params``.  Admin policies have ``session_id=None`` which becomes
+    an empty string in the wire format.
+    """
+    import omnigent.telemetry.client as _mod
+    from omnigent.telemetry.events import PolicyRegisteredEvent
+
+    event = PolicyRegisteredEvent(
+        installation_id="inst-abc",
+        handler="omnigent.policies.builtins.safety.ask_on_os_tools",
+        policy_type="python",
+        scope="admin",
+        session_id=None,
+        anon_user_id="deadbeef01234567",
+    )
+    record = _mod._build_record(event)
+    data = record["data"]
+
+    assert data["event_name"] == "PolicyRegisteredEvent"
+    assert data["installation_id"] == "inst-abc"
+    assert data["anon_user_id"] == "deadbeef01234567"
+    # session_id=None → empty string sentinel in wire format
+    assert data["session_id"] == ""
+    # Event-specific fields live in params, not at top level.
+    params = json.loads(data["params"]) if data["params"] else {}
+    assert params["handler"] == "omnigent.policies.builtins.safety.ask_on_os_tools"
+    assert params["policy_type"] == "python"
+    assert params["scope"] == "admin"
+    # Promoted fields must not leak into params.
+    assert "installation_id" not in params
+    assert "session_id" not in params
+    assert "anon_user_id" not in params
+
+
+def test_build_record_policy_registered_event_session_scope() -> None:
+    """``_build_record`` serialises session-scope ``PolicyRegisteredEvent`` correctly.
+
+    ``session_id`` is a real string for session-scoped policies and must appear
+    as the top-level ``session_id`` field, not inside ``params``.
+    """
+    import omnigent.telemetry.client as _mod
+    from omnigent.telemetry.events import PolicyRegisteredEvent
+
+    event = PolicyRegisteredEvent(
+        installation_id="inst-xyz",
+        handler="https://example.com/policies/eval",
+        policy_type="url",
+        scope="session",
+        session_id="sess_abc123",
+        anon_user_id=None,
+    )
+    record = _mod._build_record(event)
+    data = record["data"]
+
+    assert data["event_name"] == "PolicyRegisteredEvent"
+    assert data["session_id"] == "sess_abc123"
+    assert data["anon_user_id"] is None
+    params = json.loads(data["params"]) if data["params"] else {}
+    assert params["scope"] == "session"
+    assert params["handler"] == "https://example.com/policies/eval"
+    assert params["policy_type"] == "url"
+    assert "session_id" not in params
 
 
 def test_build_record_promotes_host_installation_id() -> None:

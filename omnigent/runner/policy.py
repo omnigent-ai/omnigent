@@ -38,9 +38,10 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
-from typing import Any, Literal
+from dataclasses import dataclass, replace
+from typing import Literal
 
+from omnigent.debug_logging import runner_primary_session_id
 from omnigent.policies import FunctionPolicy, resolve_function_policy
 from omnigent.policies.types import EvaluationContext, PolicyResult
 from omnigent.spec.types import (
@@ -98,7 +99,7 @@ class PolicyVerdict:
     deny_text: str | None = None
     policy_name: str | None = None
     reason: str | None = None
-    data: Any = None
+    data: object | None = None
 
 
 # Singleton ALLOW verdict — frozen dataclass, no state, allocate
@@ -129,7 +130,7 @@ def _unresolved_policy_sentinel(
     """Fail-closed stand-in for a configured policy that failed to resolve."""
     reason = _resolve_failure_diagnostic(ps, exc)
 
-    def _always_deny(_event: Any) -> dict[str, str]:
+    def _always_deny(_event: object) -> dict[str, object]:
         return {"result": "DENY", "reason": reason}
 
     return FunctionPolicy(ps, _always_deny)
@@ -173,7 +174,9 @@ class RunnerToolPolicyGate:
                 policy = resolve_function_policy(ps)
             except Exception as exc:  # noqa: BLE001 - all resolution failures deny
                 diagnostic = _resolve_failure_diagnostic(ps, exc)
-                _logger.error("runner %s", diagnostic)
+                _logger.error(
+                    "runner %s", diagnostic, extra={"session_id": runner_primary_session_id()}
+                )
                 policy = _unresolved_policy_sentinel(ps, exc)
                 phases = frozenset([Phase.TOOL_CALL, Phase.TOOL_RESULT])
             out.append(_GatedPolicy(name=ps.name, policy=policy, phases=phases))
@@ -192,7 +195,7 @@ class RunnerToolPolicyGate:
     async def evaluate_tool_call(
         self,
         tool_name: str,
-        arguments: dict[str, Any],
+        arguments: dict[str, object],
     ) -> PolicyVerdict:
         """
         Run TOOL_CALL policies; return the first non-ALLOW verdict.
@@ -243,8 +246,11 @@ class RunnerToolPolicyGate:
         )
         verdict = await self._evaluate_policies(ctx, Phase.TOOL_RESULT)
         if verdict.action == "allow":
-            # If the policy returned transformed output, use it instead.
-            return verdict.data if verdict.data is not None else output
+            if verdict.data is None:
+                return output
+            if not isinstance(verdict.data, str):
+                raise TypeError("TOOL_RESULT policy replacement data must be a string")
+            return verdict.data
         if verdict.action == "deny":
             assert verdict.deny_text is not None
             return verdict.deny_text
@@ -285,9 +291,9 @@ class RunnerToolPolicyGate:
             denied.
         """
         pending_ask: PolicyVerdict | None = None
-        # Last non-None data from any ALLOW-or-ASK result. Last write
-        # wins — callers that need chained transforms compose in one callable.
-        composed_data: Any = None
+        # Sequentially accumulated data. Each transformed payload becomes the
+        # next policy's input, matching the server-side policy engine.
+        composed_data: object | None = None
         for gated in self._policies:
             if phase not in gated.phases:
                 continue
@@ -301,6 +307,7 @@ class RunnerToolPolicyGate:
                     "runner policy %r raised on %s; treating as DENY",
                     gated.name,
                     phase.value,
+                    extra={"session_id": runner_primary_session_id()},
                 )
                 return PolicyVerdict(
                     action="deny",
@@ -319,6 +326,7 @@ class RunnerToolPolicyGate:
                 )
             if result.data is not None:
                 composed_data = result.data
+                ctx = replace(ctx, content=composed_data)
             if result.action == PolicyAction.ASK and pending_ask is None:
                 pending_ask = PolicyVerdict(
                     action="ask",

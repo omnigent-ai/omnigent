@@ -45,9 +45,16 @@ Configuration via ``POST /mock/configure``::
                     {"call_id": "c1", "name": "grep", "arguments": "{}"}
                 ]
             },
-            {"error": "rate limit exceeded", "status_code": 429}
+            {"error": "rate limit exceeded", "status_code": 429},
+            {"text": "later", "delay": 1.5},
+            {"text": "one two three", "stream": true, "truncate_after": 2}
         ]
     }
+
+``truncate_after`` opens a normal ``200`` SSE stream but emits only that many
+events before ending — dropping the terminal completion event — to simulate a
+stream that dies mid-flight (the mid-stream fault the ``error`` field, an
+open-time HTTP status, cannot express).
 """
 
 from __future__ import annotations
@@ -274,6 +281,20 @@ def sse_tool_call_response(
     return "".join(events)
 
 
+def truncate_sse(body: str, keep_events: int) -> str:
+    """Return the first *keep_events* SSE events of *body*, dropping the rest.
+
+    Events are ``\\n\\n``-delimited. Keeping a prefix drops the terminal
+    completion event (``response.completed`` / ``message_stop``), so a client
+    reading the stream sees deltas start and then the connection end without a
+    completion — the "dropped events mid-stream" fault used to drive the SPA's
+    error/recovery UI. ``keep_events=0`` yields an empty body (immediate EOF).
+    """
+    events = [seg for seg in body.split("\n\n") if seg]
+    kept = events[: max(0, keep_events)]
+    return "".join(f"{seg}\n\n" for seg in kept)
+
+
 def sse_streaming_text(text: str, model: str = "mock-model") -> str:
     """
     Build SSE with text deltas followed by a completed event.
@@ -367,12 +388,18 @@ def sse_text_with_native_items(
 def anthropic_sse_text_response(
     text: str,
     model: str = "mock-model",
+    usage: dict | None = None,
 ) -> str:
     """Build Anthropic Messages API SSE stream for a text response.
 
     Emits: ``message_start``, ``content_block_start``,
     ``content_block_delta`` (text), ``content_block_stop``,
     ``message_delta``, ``message_stop``.
+
+    :param usage: Optional prompt-usage overrides merged into the
+        ``message_start`` event's ``message.usage`` (e.g.
+        ``{"input_tokens": 50000}``), so tests can script the observed
+        context size. Defaults keep the historical fixed values.
     """
     msg_id = f"msg_{_uuid_mod.uuid4().hex[:12]}"
     output_tokens = max(5, len(text.split()))
@@ -394,7 +421,7 @@ def anthropic_sse_text_response(
                 "model": model,
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {"input_tokens": 10, "output_tokens": 0},
+                "usage": {"input_tokens": 10, "output_tokens": 0, **(usage or {})},
             },
         },
     )
@@ -520,6 +547,21 @@ class QueuedResponse:
     :param stream: If True, stream text deltas before completed.
     :param error: If set, return an error response with this message.
     :param status_code: HTTP status code for error responses.
+    :param delay: Seconds to sleep before returning this response.
+        Unlike ``block`` (which waits for an external gate release),
+        this is a fixed wall-clock pause the mock owns — use it to
+        give a server-side side effect (e.g. a cold interactive
+        subprocess booting/evaluating) real time to land before the
+        next scripted tool call fires, without depending on the CI
+        runner being fast enough for a back-to-back agent loop.
+    :param truncate_after: If set, open the SSE stream normally but emit only
+        this many events and then end the connection — dropping the terminal
+        completion event so the client sees a stream that starts and dies
+        mid-flight. Unlike ``error`` (an HTTP status at open time, before any
+        stream), this is a *mid-stream* fault: the response is a ``200`` SSE
+        body that stops early, which is what exercises the SPA's stream
+        error/recovery UI. ``0`` emits an empty body (immediate EOF after the
+        headers).
     """
 
     text: str = "Mock LLM response"
@@ -529,6 +571,12 @@ class QueuedResponse:
     stream: bool = False
     error: str | None = None
     status_code: int = 500
+    delay: float = 0.0
+    truncate_after: int | None = None
+    # Prompt-usage overrides for the Anthropic ``message_start`` event
+    # (``/v1/messages`` only), e.g. {"input_tokens": 50000} — lets a test
+    # script the context size a claude harness observes mid-turn.
+    usage: dict | None = None
     _gate: asyncio.Event = field(default_factory=asyncio.Event)
     _pending: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -761,6 +809,10 @@ async def create_response(
         queue = _state.resolve_queue_for_request(parsed)
         qr = queue.next()
 
+    # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
+    if qr.delay:
+        await asyncio.sleep(qr.delay)
+
     # Error response
     if qr.error is not None:
         return JSONResponse(
@@ -797,6 +849,10 @@ async def create_response(
     else:
         sse_body = sse_text_response(qr.text)
 
+    # Mid-stream fault: emit only a prefix and end, dropping the completion.
+    if qr.truncate_after is not None:
+        sse_body = truncate_sse(sse_body, qr.truncate_after)
+
     async def _generate() -> AsyncIterator[str]:
         yield sse_body
 
@@ -828,6 +884,10 @@ async def create_message(
         queue = _state.resolve_queue_for_request(parsed)
         qr = queue.next()
 
+    # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
+    if qr.delay:
+        await asyncio.sleep(qr.delay)
+
     if qr.error is not None:
         return JSONResponse(
             status_code=qr.status_code,
@@ -845,7 +905,11 @@ async def create_message(
     if qr.tool_calls:
         sse_body = anthropic_sse_tool_call_response(qr.tool_calls)
     else:
-        sse_body = anthropic_sse_text_response(qr.text)
+        sse_body = anthropic_sse_text_response(qr.text, usage=qr.usage)
+
+    # Mid-stream fault: emit only a prefix and end, dropping message_stop.
+    if qr.truncate_after is not None:
+        sse_body = truncate_sse(sse_body, qr.truncate_after)
 
     async def _generate() -> AsyncIterator[str]:
         yield sse_body
@@ -877,6 +941,10 @@ async def create_chat_completion(
         model = parsed.get("model") if isinstance(parsed, dict) else None
         queue = _state.resolve_queue_for_request(parsed)
         qr = queue.next()
+
+    # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
+    if qr.delay:
+        await asyncio.sleep(qr.delay)
 
     if qr.error is not None:
         return JSONResponse(
@@ -948,8 +1016,14 @@ async def create_chat_completion(
             ],
         }
 
+        stream_body = f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
+        # Mid-stream fault: drop the trailing ``[DONE]`` (and, at 0, the chunk
+        # too) so the client sees the stream end without a terminator.
+        if qr.truncate_after is not None:
+            stream_body = truncate_sse(stream_body, qr.truncate_after)
+
         async def _stream() -> AsyncIterator[str]:
-            yield f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
+            yield stream_body
 
         return StreamingResponse(_stream(), media_type="text/event-stream")
     return JSONResponse(content=body_json)
@@ -1001,6 +1075,9 @@ async def configure(request: Request) -> dict[str, object]:
                     stream=entry.get("stream", False),
                     error=entry.get("error"),
                     status_code=entry.get("status_code", 500),
+                    delay=entry.get("delay", 0.0),
+                    truncate_after=entry.get("truncate_after"),
+                    usage=entry.get("usage"),
                 )
             )
         count = len(queue.responses)

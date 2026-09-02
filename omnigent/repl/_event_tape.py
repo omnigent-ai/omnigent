@@ -19,7 +19,7 @@ import pathlib
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import TextIO
+from typing import Protocol, TextIO, runtime_checkable
 
 from rich.console import Group, RenderableType
 from rich.text import Text
@@ -41,6 +41,11 @@ _GAP_THRESHOLD_MS = 1000.0
 # panel is the primary inspection surface.
 _DETAIL_PAYLOAD_MAX_CHARS = 500
 _DETAIL_PAYLOAD_MAX_LINES = 60
+
+
+@runtime_checkable
+class _ModelDumpEvent(Protocol):
+    def model_dump(self) -> dict[str, object]: ...
 
 
 # ── Stage enumeration ─────────────────────────────────────────────────
@@ -83,17 +88,16 @@ def _snapshot_event(event: object) -> dict[str, object] | None:
     :returns: A dict of the event's fields, or ``None`` on failure.
     """
     # Pydantic models (server-side events).
-    model_dump = getattr(event, "model_dump", None)
-    if model_dump is not None and callable(model_dump):
+    if isinstance(event, _ModelDumpEvent):
         try:
-            return model_dump()  # type: ignore[return-value]
+            return event.model_dump()
         except Exception:  # noqa: BLE001 — best-effort snapshot
             pass
 
     # Dataclasses (SDK events).
     if dataclasses.is_dataclass(event) and not isinstance(event, type):
         try:
-            return dataclasses.asdict(event)  # type: ignore[arg-type]
+            return dataclasses.asdict(event)
         except Exception:  # noqa: BLE001 — best-effort snapshot
             pass
 

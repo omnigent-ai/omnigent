@@ -8,7 +8,11 @@
 import { useEffect, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
-import { useWorkspaceServeable } from "@/hooks/useWorkspaceChangedFiles";
+import {
+  browseLocationBase,
+  browseLocationSegment,
+  useWorkspaceServeable,
+} from "@/hooks/useWorkspaceChangedFiles";
 import { useChatStore } from "@/store/chatStore";
 
 // The primary workspace environment is always "default".  This hook targets
@@ -29,11 +33,17 @@ export async function fetchFileContent(
   conversationId: string,
   path: string,
 ): Promise<FileContentResponse> {
-  // Encode each path segment individually so slashes remain structural.
-  const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+  // Reuse the shared browse-location wire form: a per-segment-encoded path with
+  // literal slashes and, for an absolute path (a file opened while browsing
+  // outside the workspace), the base named by `?base=host`. Keeping this on the
+  // shared helpers means the slash-merge-safe contract lives in one place (see
+  // `browseLocationSegment`).
+  const encodedPath = browseLocationSegment(path);
+  const base = browseLocationBase(path);
   const url =
     `/v1/sessions/${encodeURIComponent(conversationId)}` +
-    `/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${encodedPath}`;
+    `/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${encodedPath}` +
+    (base ? `?base=${base}` : "");
   const res = await authenticatedFetch(url);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as FileContentResponse;

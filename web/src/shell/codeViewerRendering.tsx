@@ -29,20 +29,15 @@ function splitAtMatches(text: string, query: string): TextSegment[] {
 }
 
 // Shiki encodes font decorations as bit flags on token.fontStyle.
-// oxlint-disable eslint(no-bitwise)
 const SHIKI_ITALIC = 1;
 const SHIKI_BOLD = 2;
 const SHIKI_UNDERLINE = 4;
-// oxlint-enable eslint(no-bitwise)
 
 function buildTokenStyle(token: ThemedToken): CSSProperties {
   return {
     color: token.color,
-    // oxlint-disable-next-line eslint(no-bitwise)
     fontStyle: token.fontStyle && token.fontStyle & SHIKI_ITALIC ? "italic" : undefined,
-    // oxlint-disable-next-line eslint(no-bitwise)
     fontWeight: token.fontStyle && token.fontStyle & SHIKI_BOLD ? "bold" : undefined,
-    // oxlint-disable-next-line eslint(no-bitwise)
     textDecoration: token.fontStyle && token.fontStyle & SHIKI_UNDERLINE ? "underline" : undefined,
     ...(token.htmlStyle as CSSProperties),
   };

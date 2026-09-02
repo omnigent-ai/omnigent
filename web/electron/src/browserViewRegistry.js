@@ -29,10 +29,38 @@ function createBrowserViewRegistry({
   sendToRenderer, // (channel, payload) => mainWindow.webContents.send(...)
   getHostZoomFactor = () => 1,
   getHostDisplayScaleFactor = () => null,
+  // Desktop affordances for the pane's context menu; injected so the registry
+  // stays Electron-free. No-op defaults keep tests and non-menu hosts simple.
+  openUrlExternal = () => {}, // (url) => shell.openExternal(url)
+  copyTextToClipboard = () => {}, // (text) => clipboard.writeText(text)
+  showContextMenu = () => {}, // (items) => Menu.buildFromTemplate(items).popup(...)
   cap = DEFAULT_CAP,
 } = {}) {
   const entries = new Map(); // conversationId -> BrowserViewEntry
   let activeConversationId = null;
+  // When true, the active view is hidden in place (setVisible(false)) so DOM
+  // overlays (dialogs, menus, tooltips, toasts) aren't covered by the native
+  // layer, which always paints above the renderer regardless of z-index. Sticky
+  // across attaches: a view that becomes active while suppressed stays hidden.
+  let overlaySuppressed = false;
+
+  // Apply the current suppress flag to the active view (no-op with none active).
+  function applyActiveVisibility() {
+    if (activeConversationId === null) return;
+    const entry = entries.get(activeConversationId);
+    if (!entry) return;
+    try {
+      entry.view.setVisible(!overlaySuppressed);
+    } catch {
+      /* view destroyed */
+    }
+  }
+
+  function setSuppressed(suppressed) {
+    overlaySuppressed = !!suppressed;
+    applyActiveVisibility();
+    return { ok: true };
+  }
 
   function makeEntry(conversationId, view) {
     const entry = {
@@ -92,20 +120,82 @@ function createBrowserViewRegistry({
     });
     const entry = makeEntry(conversationId, view);
     entries.set(conversationId, entry);
-    denyChildWindowOpen(entry);
+    installWindowOpenPolicy(entry);
+    attachViewContextMenu(entry);
     attachAgentNavGuard(conversationId, entry);
     return { ok: true, entry, created: true };
   }
 
-  // SECURITY: a visited page must not spawn windows from the desktop shell.
-  // Deny every window.open / target=_blank on the child view (the safe default;
-  // unlike the main shell window we do NOT route to shell.openExternal, since an
-  // agent-visited page popping the user's real browser to an arbitrary URL is
-  // itself an abuse vector).
-  function denyChildWindowOpen(entry) {
+  // SECURITY: a visited page must not spawn windows from the desktop shell, so
+  // window.open / target=_blank still never creates a window here and is never
+  // routed to shell.openExternal (an agent-visited page popping the user's real
+  // browser to an arbitrary URL is itself an abuse vector). Instead an http(s)
+  // target navigates the SAME view in place — nothing the page couldn't already
+  // do with location.href — so a clicked link goes somewhere instead of dying
+  // silently. The agent nav guard cannot see this hop (will-navigate skips
+  // programmatic loadURL), so an agent-locked view is allowlist-checked here.
+  function installWindowOpenPolicy(entry) {
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.setWindowOpenHandler !== "function") return;
-    wc.setWindowOpenHandler(() => ({ action: "deny" }));
+    wc.setWindowOpenHandler(({ url }) => {
+      let parsed;
+      try {
+        parsed = new URL(url);
+      } catch {
+        return { action: "deny" }; // unparseable URL — nothing safe to open
+      }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        return { action: "deny" };
+      }
+      if (entry.agentNavLocked) {
+        const verdict = isAgentNavigationAllowed(url);
+        if (!verdict.ok) {
+          sendToRenderer("browser-nav-blocked", {
+            conversationId: entry.conversationId,
+            url,
+            error: verdict.error,
+          });
+          return { action: "deny" };
+        }
+      }
+      try {
+        wc.loadURL(url);
+      } catch {
+        /* view destroyed mid-click */
+      }
+      return { action: "deny" };
+    });
+  }
+
+  // Right-click menu for the child view — the shell window's own menu covers
+  // only the shell webContents, so without one a pane link can be neither
+  // opened externally nor copied. "Open Link in Browser" is user-chosen, so
+  // shell.openExternal is safe here (unlike the page-initiated path above).
+  // Items are plain data; the host (main.js) builds the actual Electron Menu.
+  function attachViewContextMenu(entry) {
+    const wc = entry.view && entry.view.webContents;
+    if (!wc || typeof wc.on !== "function") return;
+    wc.on("context-menu", (_event, params) => {
+      const items = [];
+      if (params.linkURL) {
+        if (/^https?:\/\//i.test(params.linkURL)) {
+          items.push({
+            label: "Open Link in Browser",
+            click: () => openUrlExternal(params.linkURL),
+          });
+        }
+        items.push({
+          label: "Copy Link Address",
+          click: () => copyTextToClipboard(params.linkURL),
+        });
+      }
+      if (typeof params.selectionText === "string" && params.selectionText.trim() !== "") {
+        if (items.length > 0) items.push({ type: "separator" });
+        items.push({ label: "Copy", click: () => wc.copy() });
+      }
+      if (items.length === 0) return;
+      showContextMenu(items);
+    });
   }
 
   // SECURITY (SSRF): enforce the agent-navigation allowlist on the child view's
@@ -176,6 +266,8 @@ function createBrowserViewRegistry({
       } catch {
         /* host gone */
       }
+      // Honor a live overlay suppression on a just-created active view.
+      applyActiveVisibility();
     }
     // Signal the renderer a view now exists. On a fresh conversation the view is
     // created detached (no host-active-changed fires), so without this the pane
@@ -208,7 +300,9 @@ function createBrowserViewRegistry({
         if (prev) {
           try {
             detachFromHost(prev.view);
-          } catch {}
+          } catch {
+            /* view already detached */
+          }
         }
         activeConversationId = null;
         sendToRenderer("browser-host-active-changed", { conversationId: null });
@@ -224,7 +318,9 @@ function createBrowserViewRegistry({
         if (prev) {
           try {
             detachFromHost(prev.view);
-          } catch {}
+          } catch {
+            /* view already detached */
+          }
         }
         activeConversationId = null;
         sendToRenderer("browser-host-active-changed", { conversationId: null });
@@ -252,6 +348,8 @@ function createBrowserViewRegistry({
     } catch {
       /* host gone */
     }
+    // A view attaching while an overlay is open must stay hidden (sticky flag).
+    applyActiveVisibility();
     next.boundsController.resync();
     sendToRenderer("browser-host-active-changed", { conversationId });
     return { ok: true };
@@ -263,7 +361,9 @@ function createBrowserViewRegistry({
     if (activeConversationId === conversationId) {
       try {
         detachFromHost(entry.view);
-      } catch {}
+      } catch {
+        /* view already detached */
+      }
       activeConversationId = null;
     }
     // Detach any design-mode listeners before closing the webContents, so a
@@ -310,10 +410,12 @@ function createBrowserViewRegistry({
     getOrCreate,
     openOrNavigate,
     setActive,
+    setSuppressed,
     close,
     closeAll,
     // Introspection
     activeConversationId: () => activeConversationId,
+    isSuppressed: () => overlaySuppressed,
     size: () => entries.size,
     has: (conversationId) => entries.has(conversationId),
     forEach: (fn) => entries.forEach(fn),

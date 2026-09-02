@@ -170,11 +170,16 @@ jobs:
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+          DRAFTER_MODEL: ${{ vars.OMNIGENT_CI_FAST_ANTHROPIC_MODEL }}
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           if [ -z "${LLM_API_KEY:-}" ] || [ -z "${GATEWAY_BASE_URL:-}" ]; then
             echo "::warning::No LLM credentials — keeping the CHANGELOG placeholder."
+            exit 0
+          fi
+          if [ -z "${DRAFTER_MODEL:-}" ]; then
+            echo "::warning::Repository variable OMNIGENT_CI_FAST_ANTHROPIC_MODEL is empty — keeping the CHANGELOG placeholder."
             exit 0
           fi
           echo "::add-mask::${LLM_API_KEY}"
@@ -204,7 +209,7 @@ jobs:
 
           url = os.environ["GATEWAY_BASE_URL"].rstrip("/") + "/chat/completions"
           payload = json.dumps({
-              "model": "databricks-claude-sonnet-4-6",
+              "model": os.environ["DRAFTER_MODEL"],
               "max_tokens": 1024,
               "temperature": 0,
               "messages": [

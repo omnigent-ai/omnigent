@@ -1213,20 +1213,23 @@ def test_resolved_workdir_for_spec_prefers_bundle_workdir(tmp_path: Path) -> Non
 
 
 def test_resolved_workdir_for_spec_falls_back_without_bundle(tmp_path: Path) -> None:
-    """Non-bundle specs fall back to ``runner_workspace`` (prior behavior).
+    """Only an UNWRAPPED spec falls back to ``runner_workspace``.
 
-    A bare ``AgentSpec`` (no ResolvedSpec wrapper) or a ``ResolvedSpec``
-    with ``workdir=None`` carries no bundle dir, so dispatch must keep
-    using the CLI launch workspace exactly as base did.
+    A bare ``AgentSpec`` carries no bundle information at all, so dispatch
+    keeps using the CLI launch workspace exactly as base did. A
+    ``ResolvedSpec`` with ``workdir=None`` is different: resolution ran and
+    concluded there is no bundle dir for this agent. Falling back there is
+    what leaked a parent bundle into a sub-agent, so the ``None`` is
+    returned verbatim.
     """
     runner_workspace = tmp_path / "workspace"
     bare_spec = AgentSpec(spec_version=1, name="plain-agent")
 
     # Unwrapped spec → no workdir → fallback.
     assert _resolved_workdir_for_spec(bare_spec, runner_workspace) == runner_workspace
-    # ResolvedSpec with no workdir → fallback.
+    # Wrapped with no workdir → an answered "no bundle", not a fallback.
     wrapped_no_workdir = ResolvedSpec(spec=bare_spec, workdir=None)
-    assert _resolved_workdir_for_spec(wrapped_no_workdir, runner_workspace) == runner_workspace
+    assert _resolved_workdir_for_spec(wrapped_no_workdir, runner_workspace) is None
     # Missing fallback stays None (don't fabricate a path).
     assert _resolved_workdir_for_spec(bare_spec, None) is None
 
@@ -1698,14 +1701,19 @@ async def test_sessions_native_clears_in_flight_on_lazy_spec_error() -> None:
     pm = _FakeProcessManager(harness_client)
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
-        # Before the harness streams response.created the two setup-phase
-        # resolutions run: return None (uncached spec → default harness) so the
-        # turn streams without populating _session_spec_cache. Once streaming
-        # has started the only caller is the lazy dispatch resolution — fail it.
+        # Setup-phase call: return a real spec so _resolve_harness_config picks
+        # the test harness and the turn can start. _resolve_harness_config does
+        # NOT populate _session_spec_cache, so _resolve_turn_spec_lazy still
+        # calls us after response.created — and we raise there to exercise the
+        # error path.
         del agent_id, session_id
         if created.is_set():
             raise RuntimeError("transient lazy spec resolution failure")
-        return None
+        return AgentSpec(
+            spec_version=1,
+            name="t",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "runner-test-default"}),
+        )
 
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]

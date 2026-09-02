@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 
 import click
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.inner import ui
 from omnigent.onboarding.ucode_setup import (
     build_ucode_configure_command,
@@ -40,7 +41,7 @@ from omnigent.onboarding.ucode_setup import (
 if TYPE_CHECKING:
     from omnigent._runner_startup import RunnerStartupProgress
     from omnigent.onboarding.ambient import DetectedProvider
-    from omnigent.onboarding.openclaw_config import OpenClawDiscovery
+    from omnigent.onboarding.openclaw_config import OpenClawDiscovery, SourceKind
     from omnigent.onboarding.provider_config import ProviderEntry
 
 # _INTERNAL_BETA_DEFAULT_SERVER (internal Databricks Apps host) moved to
@@ -53,22 +54,26 @@ if TYPE_CHECKING:
 _CLI_LOGIN_BRAND: dict[str, str] = {"claude": "Claude", "codex": "ChatGPT"}
 
 
-def _load_global_config(*a, **k):  # type: ignore[no-untyped-def]
+def _load_global_config() -> dict[str, Any]:  # type: ignore[explicit-any]
     import omnigent.cli as _cli
 
-    return _cli._load_global_config(*a, **k)
+    return _cli._load_global_config()
 
 
-def _save_global_config(*a, **k):  # type: ignore[no-untyped-def]
+def _save_global_config(  # type: ignore[explicit-any]
+    settings: collections.abc.Mapping[str, Any],
+    unset_keys: tuple[str, ...] = (),
+    deep_merge_keys: tuple[str, ...] = (),
+) -> None:
     import omnigent.cli as _cli
 
-    return _cli._save_global_config(*a, **k)
+    _cli._save_global_config(settings, unset_keys, deep_merge_keys)
 
 
-def _load_effective_config(*a, **k):  # type: ignore[no-untyped-def]
+def _load_effective_config() -> dict[str, Any]:  # type: ignore[explicit-any]
     import omnigent.cli as _cli
 
-    return _cli._load_effective_config(*a, **k)
+    return _cli._load_effective_config()
 
 
 # Node version hint shared by the preflight problem messages and surfaced
@@ -173,7 +178,7 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
     import signal
     import tempfile
 
-    from omnigent.onboarding.internal_beta import DEFAULT_PROFILES
+    import omnigent.onboarding.internal_beta as internal_beta  # type: ignore[import-not-found]
     from omnigent.onboarding.setup import CONFLICTING_ENV_VARS
 
     original_cfg = Path.home() / ".databrickscfg"
@@ -199,7 +204,7 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
     if original_cfg.exists():
         orig_cfg.read(original_cfg)
     cfg = configparser.ConfigParser()
-    for spec in DEFAULT_PROFILES:
+    for spec in internal_beta.DEFAULT_PROFILES:
         if orig_cfg.has_section(spec.name):
             cfg[spec.name] = dict(orig_cfg[spec.name])
 
@@ -241,7 +246,7 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
         orig_cfg = configparser.ConfigParser()
         if original_cfg.exists():
             orig_cfg.read(original_cfg)
-        for spec in DEFAULT_PROFILES:
+        for spec in internal_beta.DEFAULT_PROFILES:
             if tmp_cfg.has_section(spec.name):
                 orig_cfg[spec.name] = dict(tmp_cfg[spec.name])
         write_tmp = original_cfg.with_suffix(".tmp")
@@ -761,54 +766,54 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         )
 
     elif kind == "subscription":
-        cli_name = chosen.cli  # preset by the flat option (claude / codex)
+        cli_name = chosen.cli  # preset by the flat option (claude / codex / pi)
         if cli_name is None:
             raise click.ClickException("internal: subscription option missing a cli login")
-        from omnigent.onboarding.harness_install import harness_install_spec, harness_login
+        from omnigent.onboarding.configure_models import cli_display_name
 
-        login_family = {agent: fam for fam, agent in _FAMILY_UCODE_AGENT.items()}.get(cli_name)
-        if login_family is None:
-            raise click.ClickException(f"internal: no login family for cli {cli_name!r}")
-        spec = harness_install_spec(login_family)
-        disp = spec.display if spec is not None else cli_name
-        # A harness has at most ONE subscription — the CLI's own login. If one
-        # is already configured for this CLI (under any name, including an
-        # ambient login adopted as e.g. ``claude``), adding another just
-        # duplicates it — the ``claude`` + ``claude-subscription`` bug. Offer to
-        # replace the existing one; declining aborts before we touch the login.
+        # A harness has at most ONE subscription. If one is already configured
+        # for this CLI (under any name), offer to replace it — declining aborts
+        # before we touch any login.
         existing_subs = [
             n
             for n, e in load_providers(_load_global_config()).items()
             if e.kind == SUBSCRIPTION_KIND and e.cli == cli_name
         ]
         if existing_subs:
-            brand = _CLI_LOGIN_BRAND.get(cli_name, cli_name)
             replace = select(
-                f"A {brand} subscription is already configured. Replace it?",
+                f"A {cli_display_name(cli_name)} subscription is already configured. Replace it?",
                 ["Replace it", "Keep the current one"],
                 default=0,
                 clear_on_exit=True,
             )
             if replace != 0:  # "Keep the current one" or Esc — abort the add
                 return None
-        # Configure is the single place to sign in: drive the harness's own
-        # login (a no-op if already logged in). Only record the subscription
-        # once the CLI is actually authenticated — otherwise we'd persist a
-        # phantom subscription that strands the user at the harness's own login
-        # screen at run time (the exact bug this whole flow fixes).
-        console.print(f"  [dim]Signing in to {disp} (its login will open)…[/dim]")
-        if not harness_login(login_family):
-            return f"✗ {disp} login not completed — subscription not added"
-        # Login succeeded — drop the existing subscription(s) for this CLI so the
-        # canonical entry is the only one left (clearing the old default lets the
-        # new entry re-claim the family default below). Done AFTER login so a
-        # failed login leaves the existing subscription intact.
+        # CLIs listed in _CLI_LOGIN_BRAND (claude / codex) require a login step.
+        # CLIs not listed (pi) manage their own auth — no login step needed.
+        if cli_name in _CLI_LOGIN_BRAND:
+            from omnigent.onboarding.harness_install import harness_install_spec, harness_login
+
+            login_family = {agent: fam for fam, agent in _FAMILY_UCODE_AGENT.items()}.get(cli_name)
+            if login_family is None:
+                raise click.ClickException(f"internal: no login family for cli {cli_name!r}")
+            spec = harness_install_spec(login_family)
+            disp = spec.display if spec is not None else cli_name
+            # Configure is the single place to sign in: drive the harness's own
+            # login (a no-op if already logged in). Only record the subscription
+            # once the CLI is actually authenticated — otherwise we'd persist a
+            # phantom subscription that strands the user at the harness's own login
+            # screen at run time (the exact bug this whole flow fixes).
+            console.print(f"  [dim]Signing in to {disp} (its login will open)…[/dim]")
+            if not harness_login(login_family):
+                return f"✗ {disp} login not completed — subscription not added"
+        # Drop the existing subscription(s) now that we know we're proceeding.
+        # Done after any login so a failed login leaves the existing entry intact.
         if existing_subs:
             block = _load_global_config().get("providers")
             if isinstance(block, dict):
                 remaining = {k: v for k, v in block.items() if k not in existing_subs}
-                _save_global_config({"providers": remaining})  # wholesale replace
-        # Subscription name is derived from the CLI login — no prompt.
+                _save_global_config({"providers": remaining})
+        # Subscription name is derived from the CLI — no prompt.
         name = f"{cli_name}-subscription"
         entry = build_subscription_provider_entry(cli_name)
 
@@ -905,8 +910,8 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         # usually not enabled on a Bedrock account, so pin an explicit id.
         default_model = (
             prompt_text(
-                "Default model (Bedrock inference-profile id, e.g. "
-                "us.anthropic.claude-opus-4-5-20251101-v1:0)"
+                "Default model (Bedrock inference-profile id or ARN; e.g. "
+                "us.vendor.model-family-YYYYMMDD-v1:0)"
             ).strip()
             or None
         )
@@ -1144,6 +1149,22 @@ def _promote_global_auth_to_provider() -> str | None:
     return name
 
 
+def _claude_managed_gateway_label() -> str | None:
+    """Display label for a Claude credential backed by Claude Code's managed gateway.
+
+    When Claude Code's own settings deliver a gateway credential (enterprise
+    ``ANTHROPIC_BASE_URL`` + ``apiKeyHelper``), the Claude "subscription" the
+    machine really carries is that gateway, so setup names it as such (e.g.
+    ``"Databricks AI Gateway"``) instead of the generic ``"Subscription"``.
+    Purely a display derivation from live managed settings — nothing persisted.
+
+    :returns: The gateway label, or ``None`` when no managed credential is present.
+    """
+    from omnigent.onboarding.ambient import claude_managed_gateway_display_name
+
+    return claude_managed_gateway_display_name()
+
+
 def _compact_credential_label(det: DetectedProvider) -> str:
     """A short, brand-qualified label for an auto-configured credential.
 
@@ -1164,6 +1185,12 @@ def _compact_credential_label(det: DetectedProvider) -> str:
     from omnigent.onboarding.configure_models import credential_label
 
     if det.kind == SUBSCRIPTION_KIND:
+        # A Claude login whose real backing is Claude Code's managed-settings
+        # gateway names that gateway, so the callout matches Codex-Databricks.
+        if det.name == "claude":
+            gateway = _claude_managed_gateway_label()
+            if gateway is not None:
+                return gateway
         # Fallback to the raw CLI name is unreachable for today's detections
         # (see _CLI_LOGIN_BRAND) but keeps an added CLI readable, not crashing.
         brand = _CLI_LOGIN_BRAND.get(det.name, det.name)
@@ -1280,7 +1307,19 @@ def _credential_label(name: str, entry: ProviderEntry) -> str:
     :returns: A human label, e.g. ``"Anthropic API Key"`` or ``"Databricks (oss)"``.
     """
     from omnigent.onboarding.configure_models import credential_label
+    from omnigent.onboarding.provider_config import SUBSCRIPTION_KIND
 
+    # A Claude subscription whose real backing is Claude Code's managed-settings
+    # gateway reads as that gateway (e.g. "Databricks AI Gateway") rather than
+    # the generic "Subscription", so the credential the user recognizes is named
+    # — the Claude analogue of the "Codex-Databricks" row. Display only; the
+    # persisted entry stays a plain subscription (no new shape on disk).
+    if entry.kind == SUBSCRIPTION_KIND and entry.cli == "claude":
+        gateway = _claude_managed_gateway_label()
+        if gateway is not None:
+            return gateway
+    if entry.kind == SUBSCRIPTION_KIND and entry.cli == "pi":
+        return "Pi original auth"
     return credential_label(
         entry.kind, name, profile=entry.profile, display_name=entry.display_name
     )
@@ -1347,13 +1386,13 @@ def _prompt_install_harness(family: str) -> bool:
     from omnigent.onboarding.configure_models import family_label
     from omnigent.onboarding.harness_install import (
         harness_cli_version,
-        harness_install_command,
+        harness_install_display,
         install_harness_cli,
     )
     from omnigent.onboarding.interactive import console, select
 
     label = family_label(family)
-    cmd = " ".join(harness_install_command(family))
+    cmd = harness_install_display(family)
     detected_version, range_str = harness_cli_version(family)
     if detected_version is None:
         prompt = f"{label}'s CLI is missing. Install it now?"
@@ -1371,7 +1410,7 @@ def _prompt_install_harness(family: str) -> bool:
             "I'll run it myself (show the command)",
         ],
         descriptions=[
-            f"Runs `{cmd}` (needs npm), then continues to credential setup.",
+            f"Runs `{cmd}`, then continues to credential setup.",
             "Return to the harness picker without installing.",
             "Print the command so you can install it yourself, then return.",
         ],
@@ -1671,9 +1710,10 @@ def _manage_cursor_harness() -> None:
         from omnigent._platform import resolve_cli_binary
 
         cli_installed = harness_cli_installed(CURSOR_KEY)
+        install_spec = harness_install_spec(CURSOR_KEY)
         if cli_installed:
             cli_status = "logged in" if harness_cli_logged_in(CURSOR_KEY) else "needs login"
-        elif resolve_cli_binary(harness_install_spec(CURSOR_KEY).binary) is not None:
+        elif install_spec is not None and resolve_cli_binary(install_spec.binary) is not None:
             cli_status = "needs upgrade"
         else:
             cli_status = "not installed"
@@ -2131,6 +2171,40 @@ def _launch_goose_configure() -> str | None:
     return "Provider not detected yet"
 
 
+def _show_acp_cli_harness(name: str) -> None:
+    """Show install + sign-in instructions for one builtin ACP CLI harness.
+
+    These harnesses own their credentials (``OWN_AUTH``) and install out-of-band,
+    so there is nothing for Omnigent to store or run on the user's behalf — the
+    drill-in reports what it can and names the two commands. Read-only: it
+    changes no config, which is why it's a display rather than a manage loop.
+
+    :param name: The :data:`ACP_CLI_HARNESSES` row key, e.g. ``"grok"``.
+    """
+    from omnigent._platform import resolve_cli_binary
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+    from omnigent.onboarding.interactive import console
+
+    row = ACP_CLI_HARNESSES.get(name)
+    if row is None:  # defensive: a stale key from a concurrent config change
+        return
+
+    installed = resolve_cli_binary(row.binary) is not None
+    console.print(f"\n  [bold]{row.label}[/bold] — ACP agent (owns its own auth)")
+    if installed:
+        console.print(f"    ✓ `{row.binary}` found on PATH")
+    else:
+        hint = row.install.install_hint or row.binary
+        console.print(
+            f"    ○ `{row.binary}` not found. Install with:\n        [bold]{hint}[/bold]"
+        )
+    if row.login_command:
+        console.print(f"    Sign in with:\n        [bold]{row.login_command}[/bold]")
+    if row.install.auth_hint:
+        console.print(f"    {row.install.auth_hint}")
+    console.print(f"    Launch with: [bold]omnigent run --harness {name}[/bold]\n")
+
+
 def _manage_goose_harness() -> None:
     """Run the level-2 loop for Goose: ensure the CLI, then guide ``goose configure``.
 
@@ -2258,7 +2332,8 @@ def _choose_openclaw_source() -> OpenClawDiscovery | None:
 
     detected: list[OpenClawDiscovery] = []
     options: list[str] = []
-    for source, path in zip(("acpx", "openclaw"), default_config_paths(), strict=True):
+    sources: tuple[SourceKind, SourceKind] = ("acpx", "openclaw")
+    for source, path in zip(sources, default_config_paths(), strict=True):
         try:
             exists = path.exists()
         except OSError:
@@ -2518,56 +2593,89 @@ def _print_kimi_auth_help() -> None:
     """Print Kimi Code's authentication options.
 
     Kimi authenticates against Moonshot AI's backend rather than an Omnigent
-    credential: ``kimi login`` (OAuth or a Moonshot API key) for the default
-    provider, and ``kimi provider add`` to register any other provider (an
-    OpenAI-compatible endpoint, a Databricks gateway, …) in
-    ``~/.kimi/config.toml``. Omnigent has no per-spawn provider override for
-    upstream kimi, so all of this lives in the kimi CLI's own config —
-    Omnigent-side injection remains a deferred follow-up.
+    credential. Membership accounts use ``kimi login`` (OAuth). Pay-per-use
+    accounts are rejected by OAuth ("unable to verify your membership
+    benefits"), so they configure an API-key provider instead — and which one
+    depends on where the credit lives:
+
+    - **Moonshot open platform** (keys from platform.moonshot.ai): import the
+      catalog provider with ``kimi provider catalog add moonshotai --api-key
+      …`` — the catalog supplies the type, base URL, and model.
+    - **Kimi Code coding endpoint** (keys from the Kimi API platform,
+      ``api.kimi.com``): add a ``type = "kimi"`` provider block pointed at
+      ``https://api.kimi.com/coding/v1`` to ``~/.kimi-code/config.toml``.
+
+    Both are covered below so a user on either platform can complete auth.
+    Omnigent stores no kimi credential and cannot thread one per spawn, so all
+    of this lives in the kimi CLI's own config.
     """
     from omnigent.onboarding.interactive import console
 
     console.print(
         "\n  [bold]Authenticate Kimi Code[/bold] (kimi manages its own config in "
-        "~/.kimi/config.toml):\n"
-        "    • Default provider: run [bold]kimi login[/bold] "
-        "(Moonshot OAuth, or paste a Moonshot API key)\n"
-        "    • Other providers: run [bold]kimi provider add[/bold] "
-        "(OpenAI-compatible endpoint, gateway, …), then pin that model id in "
-        "the agent spec\n"
+        "[bold]$KIMI_CODE_HOME/config.toml[/bold], default "
+        "~/.kimi-code/config.toml):\n"
+        "    • [bold]Membership[/bold]: run [bold]kimi login[/bold] "
+        "(OAuth device flow — grants membership benefits)\n"
+        "    • [bold]Pay-per-use[/bold] (API credit, no membership): [bold]kimi "
+        "login[/bold] is rejected — add an API-key provider for whichever "
+        "platform your credit is on:\n"
+        "        [bold]a) Moonshot open platform[/bold] (keys from "
+        "platform.moonshot.ai) — run [bold]kimi provider catalog list[/bold] to "
+        "find the Moonshot provider id (e.g. [dim]moonshotai[/dim]) and a model "
+        "id, then:\n"
+        "            [dim]kimi provider catalog add moonshotai --api-key <key> "
+        "--default-model <model>[/dim]\n"
+        "        [bold]b) Kimi Code coding endpoint[/bold] (keys from the Kimi "
+        "API platform, api.kimi.com) — add this block to your kimi config "
+        "([bold]$KIMI_CODE_HOME/config.toml[/bold], default "
+        "~/.kimi-code/config.toml):\n"
+        # Escape the leading ``[`` so Rich renders the TOML table header verbatim
+        # instead of parsing ``[providers...]`` as a markup tag.
+        '            [dim]\\[providers."kimi-code"]\n'
+        '            type = "kimi"\n'
+        '            base_url = "https://api.kimi.com/coding/v1"\n'
+        '            api_key = "sk-…"[/dim]\n'
         "    • Omnigent stores no kimi credential and cannot thread one per "
         "spawn — configure it once in the kimi CLI\n"
     )
 
 
 def _manage_kimi_harness() -> None:
-    """Run the level-2 loop for Kimi Code: install the CLI and drive ``kimi login``.
+    """Run the level-2 loop for Kimi Code: install the CLI and drive sign-in.
 
-    Unlike Qwen (which has no ``login`` subcommand), Kimi ships a real
-    ``kimi login`` (Moonshot OAuth or API key) and ``kimi logout``, so this
-    drill-in offers sign-in / sign-out directly. Kimi has no first-class
-    "am I logged in?" probe (its install spec sets ``status_args=None``), so
+    Kimi authenticates two ways: ``kimi login`` (OAuth, membership benefits) and
+    a pay-per-use API key in ``~/.kimi-code/config.toml`` (OAuth is rejected for
+    accounts without an active membership). This drill-in offers the membership
+    ``kimi login`` directly and points pay-per-use users at the API-key path,
+    which lives entirely in the kimi CLI's own config.
+
+    It has **no** ``kimi logout`` subcommand (verified against kimi CLI v0.29.1),
+    so there is no sign-out row — the user clears credentials by removing kimi's
+    own credential file. Kimi has no first-class "am I logged in?" exit-code
+    probe (its install spec sets ``status_args=None``), so
     :func:`~omnigent.onboarding.harness_install.harness_cli_logged_in` always
     reports ``False`` for it — meaning ``harness_login`` runs ``kimi login``
     every time it is asked (the interactive flow lets the user cancel if
     already authenticated) and its boolean return is not a reliable success
-    signal. We therefore treat login / logout as best-effort side effects and
-    report that the flow finished rather than asserting an auth state.
+    signal. We therefore treat login as a best-effort side effect and reflect
+    the detected auth state via ``kimi_auth_configured`` rather than asserting
+    the login call succeeded.
 
     Like the other CLI-backed harnesses, a missing CLI gates the drill-in —
     there is nothing to configure for a harness you can't run.
 
     :returns: None. Side effects: may install the kimi CLI and run
-        ``kimi login`` / ``kimi logout`` in the foreground.
+        ``kimi login`` in the foreground.
     """
     from omnigent.onboarding.harness_install import (
         KIMI_KEY,
         harness_cli_installed,
         harness_install_spec,
         harness_login,
-        harness_logout,
     )
     from omnigent.onboarding.interactive import console, select
+    from omnigent.onboarding.kimi_auth import kimi_auth_configured
 
     # Gate on the CLI. Kimi ships a single binary via a curl installer (not
     # npm), so there's no in-process auto-install — name the command and let
@@ -2583,13 +2691,14 @@ def _manage_kimi_harness() -> None:
         )
         return
 
-    # Carry the prior action's confirmation as a transient status line.
-    status: str | None = None
+    # Seed the status line with the detected auth state so a pay-per-use user who
+    # already set an API key isn't nudged to run a login that will be rejected.
+    configured_status = "✓ Kimi is configured (login credential or API key detected)"
+    status: str | None = configured_status if kimi_auth_configured() else None
     while True:
         rows: list[_HarnessMenuRow] = [
-            _HarnessMenuRow("Sign in (kimi login)", action="login"),
-            _HarnessMenuRow("Sign out (kimi logout)", action="logout"),
-            _HarnessMenuRow("Show auth options", action="help"),
+            _HarnessMenuRow("Sign in with membership (kimi login)", action="login"),
+            _HarnessMenuRow("Set up pay-per-use (API key)", action="help"),
             _HarnessMenuRow("← Back", action="back"),
         ]
         idx = select(
@@ -2604,16 +2713,19 @@ def _manage_kimi_harness() -> None:
         if action == "back":
             return
         if action == "login":
-            # ``kimi login`` runs in the foreground (OAuth / API-key prompt);
-            # its boolean return is unreliable for kimi (no status probe), so
-            # don't assert success — just confirm the flow finished.
+            # ``kimi login`` runs in the foreground (OAuth device flow); its
+            # boolean return is unreliable for kimi (no status probe), so
+            # re-derive the auth state from disk instead of asserting success.
             console.print("  [dim]Signing in to Kimi (its login will open)…[/dim]")
             harness_login(KIMI_KEY)
-            status = "kimi login flow finished — kimi stores its own credentials"
-        elif action == "logout":
-            console.print("  [dim]Signing out of Kimi…[/dim]")
-            harness_logout(KIMI_KEY)
-            status = "kimi logout flow finished"
+            status = (
+                configured_status
+                if kimi_auth_configured()
+                else (
+                    "kimi login flow finished — if it reported a membership error,"
+                    " use the pay-per-use API-key option instead"
+                )
+            )
         elif action == "help":
             _print_kimi_auth_help()
             status = None
@@ -2699,9 +2811,12 @@ def _manage_copilot_harness() -> None:
     from omnigent.onboarding.copilot_auth import (
         COPILOT_CONFIG_KEY,
         COPILOT_SECRET_NAME,
+        copilot_github_host,
         copilot_github_token_configured,
         copilot_github_token_ref,
         copilot_sdk_installed,
+        copilot_token_removal_settings,
+        gh_cli_github_token,
     )
     from omnigent.onboarding.interactive import select
 
@@ -2725,11 +2840,26 @@ def _manage_copilot_harness() -> None:
         ]
         if token_set:
             rows.append(_HarnessMenuRow("Remove GitHub token", action="remove_key"))
+        host = copilot_github_host(config)
+        rows.append(
+            _HarnessMenuRow(
+                f"Change GitHub Enterprise host ({host})"
+                if host
+                else "Set GitHub Enterprise host",
+                action="set_host",
+            )
+        )
+        if host:
+            rows.append(_HarnessMenuRow("Clear GitHub Enterprise host", action="clear_host"))
         rows.append(_HarnessMenuRow("← Back", action="back"))
 
-        header = (
-            "Copilot — GitHub token configured" if token_set else "Copilot — no GitHub token yet"
-        )
+        if token_set:
+            header = "Copilot — GitHub token configured"
+        elif gh_cli_github_token(host) is not None:
+            # No stored token, but a ``gh auth login`` session works as one.
+            header = "Copilot — using your GitHub CLI login"
+        else:
+            header = "Copilot — no GitHub token yet"
         idx = select(header, [r.label for r in rows], clear_on_exit=True, status=status)
         if idx < 0:  # Esc / q
             return
@@ -2738,6 +2868,13 @@ def _manage_copilot_harness() -> None:
             return
         if action == "set_key":
             status = _set_copilot_github_token()
+        elif action == "set_host":
+            status = _set_copilot_github_host()
+        elif action == "clear_host":
+            from omnigent.onboarding.copilot_auth import copilot_github_host_settings
+
+            _save_global_config(copilot_github_host_settings(None))
+            status = "✓ Cleared Copilot GitHub Enterprise host"
         elif action == "remove_key":
             ref = copilot_github_token_ref(config)
             # Only the secret we own (``keychain:copilot``) is ours to delete: a
@@ -2746,8 +2883,35 @@ def _manage_copilot_harness() -> None:
             # those cases just drop the config block and leave the secret.
             if ref == f"keychain:{COPILOT_SECRET_NAME}":
                 secret_store.delete_secret(COPILOT_SECRET_NAME)
-            _save_global_config({}, unset_keys=(COPILOT_CONFIG_KEY,))
+            # Keep a configured GHE host: the saver replaces the whole block, so
+            # unsetting it wholesale would discard the host along with the token.
+            if (remaining := copilot_token_removal_settings()) is not None:
+                _save_global_config(remaining)
+            else:
+                _save_global_config({}, unset_keys=(COPILOT_CONFIG_KEY,))
             status = "✓ Removed Copilot GitHub token"
+
+
+def _set_copilot_github_host() -> str | None:
+    """Prompt for and store the Copilot GitHub Enterprise host; return a status line.
+
+    Organizations reaching Copilot through a GHE (data-residency) instance need
+    auth and API calls pointed at their own hostname. Stored as
+    ``copilot.github_host`` and forwarded to the Copilot CLI as
+    ``COPILOT_GH_HOST``.
+
+    :returns: A status string for the menu, or ``None`` if the user aborted.
+    """
+    from omnigent.onboarding.copilot_auth import copilot_github_host_settings
+    from omnigent.onboarding.interactive import prompt_text
+
+    entered = prompt_text("GitHub Enterprise hostname (e.g. acme.ghe.com)").strip()
+    if not entered:
+        return None
+    _save_global_config(copilot_github_host_settings(entered))
+    from omnigent.onboarding.copilot_auth import copilot_github_host
+
+    return f"✓ Copilot GitHub Enterprise host set ({copilot_github_host()})"
 
 
 def _set_copilot_github_token() -> str | None:
@@ -3158,7 +3322,7 @@ def _set_opencode_default_model(current: str | None) -> str | None:
     if current is not None:
         clear_index = len(options)
         options.append("Clear default (use OpenCode's own default)")
-    default = models.index(current) if current in models else 0
+    default = models.index(current) if current is not None and current in models else 0
     # Even filtered to reachable providers the list can exceed the screen, so
     # bound the picker to a scrolling viewport sized to the terminal (leaving
     # room for the title / status / footer / "N more" markers).
@@ -3195,7 +3359,8 @@ def _print_opencode_auth_help() -> None:
         "    • Databricks gateway: set an agent ``profile`` (configured under Claude / Codex);\n"
         "      Omnigent synthesizes opencode's per-session provider config from it.\n"
         "  Omnigent stores no OpenCode credential of its own.\n"
-        "  [dim]Tip:[/dim] 'Set default model' picks which model `omni opencode` launches on\n"
+        f"  [dim]Tip:[/dim] 'Set default model' picks which model "
+        f"`{cli_invocation(name='omni')} opencode` launches on\n"
         "  (otherwise OpenCode uses its built-in default, opencode/big-pickle)."
     )
 
@@ -3353,6 +3518,7 @@ def _run_configure_harnesses_interactive() -> None:
         harness_cli_installed,
         harness_cli_logged_in,
         harness_install_command,
+        harness_install_display,
         harness_install_spec,
     )
     from omnigent.onboarding.interactive import select
@@ -3420,6 +3586,7 @@ def _run_configure_harnesses_interactive() -> None:
     _ACP_IMPORT = "\x00acp-import-openclaw"
     _ACP_ADD = "\x00acp-add"
     _ACP_AGENT_PREFIX = "\x00acp-agent:"
+    _ACP_CLI_PREFIX = "\x00acp-cli:"
     families = [ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE]
 
     # Status glyph + Rich color per readiness kind: "ready" is a configured,
@@ -3482,7 +3649,7 @@ def _run_configure_harnesses_interactive() -> None:
                 name,
                 _cli_absence_label(fam),
                 "missing",
-                _install_hint(" ".join(harness_install_command(fam))),
+                _install_hint(harness_install_display(fam)),
             )
         default = surface_default_provider(config, fam)
         if default is None:
@@ -3697,6 +3864,50 @@ def _run_configure_harnesses_interactive() -> None:
                     (_GOOSE, "Goose", "Not configured", "warn", "Open to run `goose configure`."),
                 )
 
+        # Builtin ACP CLI harnesses (omnigent/acp_cli_harnesses.py) — vendor CLIs
+        # that speak ACP on stdio. Derived from the catalog so adding a row there
+        # surfaces it here too; without this they were addressable via
+        # `--harness <name>` but invisible in setup, making a shipped harness less
+        # discoverable than a user's own `acp:` entry.
+        from omnigent._platform import resolve_cli_binary
+        from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+        from omnigent.onboarding.acp_auth import acp_agents, shadowed_builtin_acp_rows
+
+        # Skip a row a configured `acp:` agent already claims, so the list shows
+        # one "Devin" (the user's, with its command) rather than two identically
+        # labeled rows. A config error is reported by the custom-ACP block below.
+        try:
+            _shadowed_acp_rows: frozenset[str] = shadowed_builtin_acp_rows(acp_agents(config))
+        except ValueError:
+            _shadowed_acp_rows = frozenset()
+
+        for _acp_cli_name, _acp_cli_row in sorted(ACP_CLI_HARNESSES.items()):
+            if _acp_cli_name in _shadowed_acp_rows:
+                continue
+            _acp_cli_key = _ACP_CLI_PREFIX + _acp_cli_name
+            if resolve_cli_binary(_acp_cli_row.binary) is None:
+                rows.append(
+                    (
+                        _acp_cli_key,
+                        _acp_cli_row.label,
+                        "Not installed",
+                        "missing",
+                        _install_hint(_acp_cli_row.install.install_hint or _acp_cli_row.binary),
+                    )
+                )
+            else:
+                # The vendor owns its auth, so we can report the binary is present
+                # but not whether it is signed in.
+                rows.append(
+                    (
+                        _acp_cli_key,
+                        _acp_cli_row.label,
+                        "ACP · own auth",
+                        "ready",
+                        "Select for install and sign-in instructions.",
+                    )
+                )
+
         # Copilot — GitHub token (github-copilot-sdk extra is soft).
         if copilot_github_token_configured(config) or any(
             os.environ.get(v) for v in COPILOT_TOKEN_ENV_VARS
@@ -3741,13 +3952,30 @@ def _run_configure_harnesses_interactive() -> None:
                 (_KIRO, "Kiro", _cli_absence_label(KIRO_KEY), "missing", _install_hint(kiro_hint))
             )
 
-        # Kimi Code — native CLI, own auth via `kimi login`; there is no local
-        # login status probe yet. Curl-installed (no npm package), so use its
-        # install_hint when absent and show "not configured" when present.
+        # Kimi Code — native CLI, own auth via `kimi login` (membership OAuth) or
+        # a Kimi API key in `~/.kimi-code/config.toml` (pay-per-use). There is no
+        # CLI login-status probe, so a subprocess-free check
+        # (`kimi_auth_configured`) distinguishes "signed in / API key set"
+        # (green) from "installed but not configured" (yellow). Curl-installed
+        # (no npm package), so use its install_hint when absent.
         if harness_cli_installed(KIMI_KEY):
-            rows.append(
-                (_KIMI, "Kimi Code", "Not configured", "warn", "Sign in with `kimi login`.")
-            )
+            from omnigent.onboarding.kimi_auth import kimi_auth_configured
+
+            if kimi_auth_configured():
+                rows.append((_KIMI, "Kimi Code", "Signed in", "ready", ""))
+            else:
+                rows.append(
+                    (
+                        _KIMI,
+                        "Kimi Code",
+                        "Not configured",
+                        "warn",
+                        (
+                            "Sign in with `kimi login`, or (pay-per-use) set a Kimi"
+                            " API key in `~/.kimi-code/config.toml`."
+                        ),
+                    )
+                )
         else:
             kimi_spec = harness_install_spec(KIMI_KEY)
             kimi_hint = (kimi_spec.install_hint if kimi_spec else None) or "see Kimi Code docs"
@@ -3772,7 +4000,10 @@ def _run_configure_harnesses_interactive() -> None:
             openclaw_agents_to_acp_entries,
         )
 
-        acp_summary = acp_config_summary()
+        try:
+            acp_summary = acp_config_summary()
+        except ValueError as exc:
+            raise click.ClickException(f"Invalid acp.agents configuration: {exc}") from exc
         for agent in acp_summary.agents:
             rows.append(
                 (
@@ -3832,12 +4063,12 @@ def _run_configure_harnesses_interactive() -> None:
         selectable: list[bool] = []
         row_target: list[str | None] = []
         descriptions: list[str] = []
-        for target, name, status_text, kind, desc in harness_rows:
+        for row_key, name, status_text, kind, desc in harness_rows:
             status_text = _truncate_cells(status_text, max_status_width)
             glyph, color = status_styles[kind]
             options.append(f"{name.ljust(name_col)}[{color}]{glyph} {escape(status_text)}[/]")
             selectable.append(True)
-            row_target.append(target)
+            row_target.append(row_key)
             descriptions.append(desc)
         options.append("Quit")
         selectable.append(True)
@@ -3853,32 +4084,34 @@ def _run_configure_harnesses_interactive() -> None:
         )
         if idx < 0:  # Esc / q — exit
             return
-        target = row_target[idx]
-        if target == CURSOR_KEY:
+        selected_target = row_target[idx]
+        if selected_target == CURSOR_KEY:
             _manage_cursor_harness()
-        elif target == COPILOT_KEY:
+        elif selected_target == COPILOT_KEY:
             _manage_copilot_harness()
-        elif target in families:
-            _manage_harness_providers(target)
-        elif target == _ANTIGRAVITY:
+        elif isinstance(selected_target, str) and selected_target in families:
+            _manage_harness_providers(selected_target)
+        elif selected_target == _ANTIGRAVITY:
             _manage_antigravity_harness()
-        elif target == _QWEN:
+        elif selected_target == _QWEN:
             _manage_qwen_harness()
-        elif target == _OPENCODE:
+        elif selected_target == _OPENCODE:
             _manage_opencode_harness()
-        elif target == _GOOSE:
+        elif selected_target == _GOOSE:
             _manage_goose_harness()
-        elif target == _ACP_IMPORT:
+        elif selected_target == _ACP_IMPORT:
             _import_openclaw_agents()
-        elif target == _ACP_ADD:
+        elif selected_target == _ACP_ADD:
             _add_acp_agent()
-        elif isinstance(target, str) and target.startswith(_ACP_AGENT_PREFIX):
-            _manage_acp_agent(target[len(_ACP_AGENT_PREFIX) :])
-        elif target == _HERMES:
+        elif isinstance(selected_target, str) and selected_target.startswith(_ACP_AGENT_PREFIX):
+            _manage_acp_agent(selected_target[len(_ACP_AGENT_PREFIX) :])
+        elif isinstance(selected_target, str) and selected_target.startswith(_ACP_CLI_PREFIX):
+            _show_acp_cli_harness(selected_target[len(_ACP_CLI_PREFIX) :])
+        elif selected_target == _HERMES:
             _manage_hermes_harness()
-        elif target == _KIRO:
+        elif selected_target == _KIRO:
             _manage_kiro_harness()
-        elif target == _KIMI:
+        elif selected_target == _KIMI:
             _manage_kimi_harness()
         else:  # Quit row (or, defensively, a non-family row)
             return

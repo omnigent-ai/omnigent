@@ -114,18 +114,6 @@ def _request_event(elicitation_id: str, message: str) -> dict[str, Any]:
     }
 
 
-def _resolved_event(elicitation_id: str) -> dict[str, Any]:
-    """
-    Build a ``response.elicitation_resolved`` event dict.
-
-    :param elicitation_id: Correlation id, e.g. ``"elicit_demo"``.
-    """
-    return {
-        "type": "response.elicitation_resolved",
-        "elicitation_id": elicitation_id,
-    }
-
-
 async def test_record_publish_delivers_wake_message_to_parent(
     conv_store: SqlAlchemyConversationStore,
     monkeypatch: pytest.MonkeyPatch,
@@ -203,8 +191,17 @@ async def test_record_publish_delivers_wake_message_to_parent(
 
         # Resolving the block sends the woken parent a follow-up through
         # the same wiring, so it stops acting on the stale block notice.
+        # The resolved event carries the human's verdict, as the server's
+        # approval-dispatch path now publishes it.
         fired.clear()
-        pending_elicitations.record_publish(child.id, _resolved_event("elicit_demo"))
+        pending_elicitations.record_publish(
+            child.id,
+            {
+                "type": "response.elicitation_resolved",
+                "elicitation_id": "elicit_demo",
+                "action": "decline",
+            },
+        )
         await asyncio.wait_for(fired.wait(), timeout=2.0)
     finally:
         uninstall()
@@ -216,6 +213,9 @@ async def test_record_publish_delivers_wake_message_to_parent(
     assert resolution.session_id == parent.id
     assert "codex/demo" in resolution.text
     assert "has been resolved" in resolution.text
+    # The verdict rides the notice verbatim so the parent agent cannot
+    # narrate an approval that did not happen.
+    assert "(action: decline — NOT approved)" in resolution.text
 
 
 async def test_record_publish_no_wake_when_no_runner_bound(

@@ -6,11 +6,11 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-type TodoItem = {
+interface TodoItem {
   content: string;
   status: "pending" | "in_progress" | "completed";
   activeForm: string;
-};
+}
 
 // The store is a selector hook: useChatStore((s) => s.todos). Mock it to feed a
 // controllable todos array per test.

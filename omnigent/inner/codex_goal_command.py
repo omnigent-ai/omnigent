@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
 
-
-def goal_objective_from_content(content: Any) -> str | None:
+def goal_objective_from_content(content: object) -> str | None:
     """Return the objective from a standalone, text-only ``/goal`` command."""
     if isinstance(content, list):
         text_parts: list[str] = []

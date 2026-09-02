@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from omnigent.entities import Conversation
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HostHelloFrame,
     HostLaunchRunnerFrame,
@@ -31,6 +33,7 @@ from omnigent.server.managed_hosts import (
     ManagedHostLaunch,
     ManagedLaunchTracker,
     ManagedSandboxConfig,
+    ManagedSandboxDeployment,
     parse_sandbox_config,
 )
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
@@ -46,6 +49,7 @@ from omnigent.stores.host_store import HostStore
 from tests.server.helpers import (
     FakeSandboxLauncher,
     HostStartInvocation,
+    build_agent_bundle,
     create_test_agent,
     install_fake_modal_launcher,
 )
@@ -557,6 +561,88 @@ async def test_managed_session_create_with_repo_workspace_binds_cloned_dir(
     del tunnels
 
 
+async def test_managed_multipart_bundle_create_end_to_end(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Multipart ``POST /v1/sessions`` with ``host_type="managed"`` uploads
+    a bundle AND provisions a sandbox in one call — the gap this feature
+    closes. The freshly-created session-scoped agent is what the managed
+    runner runs on the sandbox, so the same background launch as the JSON
+    path binds the session to a sandbox host with a runner. Also confirms
+    the caller owns the session (grant happens BEFORE the managed launch
+    is scheduled, so a launch failure can't orphan an unowned row).
+    """
+    env = managed_session_env
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
+    )
+    loop = asyncio.get_running_loop()
+    host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
+
+    def _start_fake_sandbox_host(invocation: HostStartInvocation) -> None:
+        """Spawn the fake sandbox host when the launcher 'starts' it."""
+        future = asyncio.run_coroutine_threadsafe(
+            _fake_sandbox_host(
+                env.app, invocation.host_id, invocation.host_name, invocation.token
+            ),
+            loop,
+        )
+        host_futures.append(asyncio.wrap_future(future, loop=loop))
+
+    fake = FakeSandboxLauncher(on_host_start=_start_fake_sandbox_host)
+    install_fake_modal_launcher(monkeypatch, fake)
+
+    bundle = build_agent_bundle(name="managed-multipart-e2e-agent")
+    resp = await env.client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({"host_type": "managed"})},
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["session_id"]
+
+    # The uploaded bundle's session-scoped agent is what runs on the
+    # provisioned sandbox — the background launch binds the session the
+    # same way the JSON path does.
+    conv = await _wait_for_managed_binding(env, session_id)
+    tunnels = [await future for future in host_futures]
+    assert len(tunnels) == 1
+    assert conv.host_id is not None
+    assert conv.workspace == "/root/workspace"
+    assert conv.runner_id is not None
+    assert conv.runner_id.startswith("runner_token_")
+
+    host = env.host_store.get_host(conv.host_id)
+    assert host is not None
+    assert host.user_id == RESERVED_USER_LOCAL
+    assert host.status == "online"
+    assert host.sandbox_provider == "modal"
+    assert host.sandbox_id == "sb-fake-1"
+    del tunnels
+
+
+async def test_managed_multipart_bundle_create_rejects_path_workspace(
+    managed_session_env: ManagedSessionEnv,
+) -> None:
+    """
+    A multipart managed create with a filesystem-path workspace is
+    rejected at metadata validation — a managed workspace is a git
+    repository URL, mirroring the JSON path's contract — before any
+    sandbox provisioning is scheduled.
+    """
+    bundle = build_agent_bundle(name="managed-multipart-badws-agent")
+    resp = await managed_session_env.client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({"host_type": "managed", "workspace": "/tmp/w"})},
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    assert resp.status_code >= 400, resp.text
+    assert "git repository URL" in resp.text
+
+
 async def test_managed_session_create_validator_errors_serialize_as_422(
     managed_session_env: ManagedSessionEnv,
 ) -> None:
@@ -582,6 +668,25 @@ async def test_managed_session_create_validator_errors_serialize_as_422(
     # describeCreateError picks the message from.
     assert isinstance(detail, list) and len(detail) == 1
     assert "takes a git repository URL" in detail[0]["msg"]
+
+
+async def test_managed_session_create_rejects_unconfigured_provider(
+    managed_session_env: ManagedSessionEnv,
+) -> None:
+    """
+    A create naming a provider the server doesn't offer is a synchronous
+    400 (validated at POST, before the background launch), and the error
+    names what IS available so the user can correct it. This env offers
+    only modal, so 'nope' is rejected with modal listed.
+    """
+    agent = await create_test_agent(managed_session_env.client, name="managed-bad-provider-agent")
+    resp = await managed_session_env.client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_type": "managed", "sandbox_provider": "nope"},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "nope" in resp.text
+    assert "modal" in resp.text
 
 
 async def test_managed_session_create_without_config_fails_clearly(
@@ -1060,7 +1165,7 @@ async def test_resumable_managed_wake_ignores_stale_db_liveness(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A paused Islo host wakes even while its DB liveness row is still fresh."""
+    """A paused Islo host wakes and signals re-address when online cross-replica."""
     from omnigent.server.routes import sessions as sessions_module
 
     host_store = HostStore(db_uri)
@@ -1086,11 +1191,13 @@ async def test_resumable_managed_wake_ignores_stale_db_liveness(
     )
     fake = FakeSandboxLauncher(can_resume=True)
     fake.provider = "islo"  # type: ignore[misc]
-    config = ManagedSandboxConfig(
-        server_url="https://managed-test.example.com",
-        launcher_factory=lambda: fake,
-        token_ttl_s=3600,
-        provider="islo",
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://managed-test.example.com",
+            launcher_factory=lambda: fake,
+            token_ttl_s=3600,
+            provider="islo",
+        )
     )
     tracker = ManagedLaunchTracker()
     calls: list[str] = []
@@ -1110,15 +1217,14 @@ async def test_resumable_managed_wake_ignores_stale_db_liveness(
     )
 
     assert host_store.is_online("40bb7200abc8ed27d5b2fcbfad8e89d2") is True
-    assert (
+    with pytest.raises(OmnigentError) as exc:
         await sessions_module._maybe_relaunch_managed_sandbox(
             session_id=conv.id,
             conv=conv,
             app_state=app_state,
             conversation_store=conv_store,
         )
-        is True
-    )
+    assert exc.value.code == ErrorCode.WRONG_REPLICA
     assert calls == ["wake"]
 
 
@@ -1126,7 +1232,7 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A paused Islo host can wake before local tunnel liveness notices."""
+    """A paused Islo host wakes stale tunnels and signals re-address when online cross-replica."""
     from omnigent.server.routes import sessions as sessions_module
 
     host_store = HostStore(db_uri)
@@ -1158,11 +1264,13 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
     fake = FakeSandboxLauncher(can_resume=True)
     fake.provider = "islo"  # type: ignore[misc]
     fake.is_running = lambda _sandbox_id: False  # type: ignore[method-assign]
-    config = ManagedSandboxConfig(
-        server_url="https://managed-test.example.com",
-        launcher_factory=lambda: fake,
-        token_ttl_s=3600,
-        provider="islo",
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://managed-test.example.com",
+            launcher_factory=lambda: fake,
+            token_ttl_s=3600,
+            provider="islo",
+        )
     )
     tracker = ManagedLaunchTracker()
     calls: list[str] = []
@@ -1198,15 +1306,14 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
         ),
     )
 
-    assert (
+    with pytest.raises(OmnigentError) as exc:
         await sessions_module._maybe_wake_stale_resumable_managed_sandbox(
             session_id=conv.id,
             conv=conv,
             app_state=app_state,
             conversation_store=conv_store,
         )
-        is True
-    )
+    assert exc.value.code == ErrorCode.WRONG_REPLICA
     assert calls == ["wake"]
     assert host_deregistered == ["055e31f38d07908f171ebad4ff5cbe9c"]
     assert runner_deregistered == ["runner_stale_tunnel"]
@@ -1255,10 +1362,12 @@ async def test_managed_wake_fails_when_runner_never_reconnects(
     await sessions_module._run_managed_wake(
         session_id=session_id,
         conv=conv,  # type: ignore[arg-type]
-        sandbox_config=ManagedSandboxConfig(
-            server_url="https://managed-test.example.com",
-            launcher_factory=lambda: FakeSandboxLauncher(),
-            token_ttl_s=3600,
+        sandbox_config=ManagedSandboxDeployment.single(
+            ManagedSandboxConfig(
+                server_url="https://managed-test.example.com",
+                launcher_factory=lambda: FakeSandboxLauncher(),
+                token_ttl_s=3600,
+            )
         ),
         tracker=tracker,
         conversation_store=SimpleNamespace(get_conversation=lambda _sid: conv),
@@ -1310,10 +1419,12 @@ async def test_managed_launch_fails_when_runner_never_connects(
             host_id="3c8cdcdb61903904849174c864620a5c",
             workspace="/root/workspace",
         ),
-        sandbox_config=ManagedSandboxConfig(
-            server_url="https://managed-test.example.com",
-            launcher_factory=lambda: FakeSandboxLauncher(),
-            token_ttl_s=3600,
+        sandbox_config=ManagedSandboxDeployment.single(
+            ManagedSandboxConfig(
+                server_url="https://managed-test.example.com",
+                launcher_factory=lambda: FakeSandboxLauncher(),
+                token_ttl_s=3600,
+            )
         ),
         tracker=tracker,
         conversation_store=SimpleNamespace(

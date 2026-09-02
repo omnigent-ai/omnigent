@@ -6,7 +6,7 @@ import importlib
 import re
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, cast
 
 import yaml
 
@@ -626,7 +626,7 @@ def _parse_executor_spec(data: YamlData | str | bool | None) -> ExecutorSpec | N
             raise ValueError(
                 f"executor: key(s) {', '.join(nested)} belong to the bundle "
                 "config.yaml format; this format spells the executor flat, "
-                "e.g. executor: {harness: codex-native, model: gpt-5.4-mini}"
+                "e.g. executor: {harness: codex-native, model: MODEL_ID}"
             )
         # ``ExecutorSpec.{model,harness,profile}`` are ``str | None``;
         # missing keys map to ``None`` directly. ``data.get`` happens to
@@ -746,21 +746,22 @@ def _parse_terminal_env_spec(data: YamlData | str | bool | None) -> TerminalEnvS
 
 def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandboxSpec:
     if isinstance(data, str):
-        return OSEnvSandboxSpec(type=data)
+        from .sandbox import _resolve_sandbox_type
+
+        return OSEnvSandboxSpec(type=_resolve_sandbox_type(data))
     if data is False:
         return OSEnvSandboxSpec(type="none")
     if not isinstance(data, dict):
         raise TypeError("os_env.sandbox must be a string, false, or mapping")
-    raw_type = data.get("type")
-    if raw_type is None:
-        # No ``type:`` field -- resolve via the platform default
-        # (same behavior as the Omnigent YAML parser, kept in sync so legacy
-        # and Omnigent loaders agree on what an "untyped" sandbox block means).
-        from .sandbox import _default_sandbox_for_platform
+    from .sandbox import _default_sandbox_for_platform, _resolve_sandbox_type
 
+    if "type" not in data:
         sandbox_type = _default_sandbox_for_platform().type
     else:
-        sandbox_type = raw_type
+        raw_type = data["type"]
+        if raw_type is not None and not isinstance(raw_type, str):
+            raise TypeError("os_env.sandbox.type must be a string or null")
+        sandbox_type = _resolve_sandbox_type(raw_type)
     egress_rules = data.get("egress_rules")
     # Mirror the Omnigent parser's hard reject of ``egress_rules`` paired with
     # a backend that cannot enforce them at spawn time. Without this
@@ -842,17 +843,17 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
         cwd_hidden_scan_max_entries=(
             int(max_entries_raw)
             if max_entries_raw is not None
-            else fields["cwd_hidden_scan_max_entries"].default
+            else cast(int, fields["cwd_hidden_scan_max_entries"].default)
         ),
         cwd_hidden_scan_overflow=(
             str(overflow_raw)
             if overflow_raw is not None
-            else fields["cwd_hidden_scan_overflow"].default
+            else cast(str, fields["cwd_hidden_scan_overflow"].default)
         ),
         cwd_hidden_scan_recursive=(
             bool(recursive_raw)
             if recursive_raw is not None
-            else fields["cwd_hidden_scan_recursive"].default
+            else cast(bool, fields["cwd_hidden_scan_recursive"].default)
         ),
         mask_paths=list(mask_paths_raw) if mask_paths_raw is not None else None,
         env_passthrough=data.get("env_passthrough"),

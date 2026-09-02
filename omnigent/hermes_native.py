@@ -24,7 +24,6 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
 
 import click
 import httpx
@@ -40,9 +39,11 @@ from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.host.daemon_launch import (
     error_text,
     launch_or_reuse_daemon_runner,
+    open_daemon_client,
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
@@ -201,7 +202,7 @@ def _materialize_hermes_agent_spec(tmpdir: Path) -> Path:
     :returns: Path to the generated YAML spec.
     """
     yaml_path = tmpdir / "hermes-native-ui.yaml"
-    raw: dict[str, Any] = {
+    raw: _JsonObject = {
         "name": _AGENT_NAME,
         "prompt": (
             "Hermes is running in the session terminal. The user drives the hermes TUI directly."
@@ -244,7 +245,7 @@ def _run_with_remote_server(
     from omnigent.cli import _ensure_host_daemon
     from omnigent.host.identity import load_or_create_host_identity
 
-    headers = _remote_headers(server_url=base_url)
+    headers = _remote_headers(server_url=base_url, host_id=None)
     try:
         resolved_session_id = _resolve_session_id_for_resume(
             base_url=base_url,
@@ -315,17 +316,21 @@ async def _prepare_hermes_terminal_via_daemon(
     """
     persist_args = list(hermes_args)
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         reattached = False
         cold_resumed = False
+        fresh_session = session_id is None
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException("Creating a Hermes session requires a session bundle.")
             _update_startup_progress(startup_progress, "Creating Hermes session...")
-            session_id = await _create_hermes_session(
-                client,
-                session_bundle,
-                terminal_launch_args=persist_args or None,
+            session_id, _ = await asyncio.gather(
+                _create_hermes_session(
+                    client,
+                    session_bundle,
+                    terminal_launch_args=persist_args or None,
+                ),
+                wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
             )
         else:
             _update_startup_progress(startup_progress, "Loading Hermes session...")
@@ -368,13 +373,15 @@ async def _prepare_hermes_terminal_via_daemon(
                         f"({resp.status_code}): {error_text(resp)}"
                     )
 
-        await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
+        if not fresh_session:
+            await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
         _update_startup_progress(startup_progress, "Starting runner...")
         runner_id = await launch_or_reuse_daemon_runner(
             client,
             host_id=host_id,
             session_id=session_id,
             workspace=workspace,
+            fresh=fresh_session,
         )
         _update_startup_progress(startup_progress, "Waiting for runner...")
         await wait_for_runner_online(client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S)
@@ -404,7 +411,7 @@ async def _create_hermes_session(
     terminal_launch_args: list[str] | None = None,
 ) -> str:
     """Create a bundled terminal-first hermes-native session."""
-    metadata: dict[str, Any] = {"labels": dict(_SESSION_LABELS)}
+    metadata: _JsonObject = {"labels": dict(_SESSION_LABELS)}
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
     resp = await client.post(
@@ -424,7 +431,7 @@ async def _create_hermes_session(
     return new_session_id
 
 
-async def _fetch_hermes_session(client: httpx.AsyncClient, session_id: str) -> dict[str, Any]:
+async def _fetch_hermes_session(client: httpx.AsyncClient, session_id: str) -> _JsonObject:
     """Fetch an existing Omnigent session."""
     resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
     if resp.status_code == 404:

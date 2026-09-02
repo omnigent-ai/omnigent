@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import click
 import pytest
 
 from omnigent import cursor_native_bridge
@@ -194,23 +195,52 @@ class TestInjectModelGate:
     ) -> None:
         """A landed filter ("Models matching") commits the selection with Enter."""
         bridge_dir = _prepare_bridge(tmp_path)
+        monkeypatch.setattr(
+            cursor_native_bridge,
+            "_live_cursor_model_options",
+            lambda: pytest.fail("cached display name must avoid a second CLI listing"),
+        )
         captured = _install_fake_tmux(
             monkeypatch, pane_captures=[f'{_IDLE}\nModels matching "gpt-5.2"\n →  GPT-5.2   High']
         )
         monkeypatch.setattr(cursor_native_bridge.time, "sleep", lambda *_a, **_k: None)
 
-        cursor_native_bridge.inject_model_command(bridge_dir, model="gpt-5.2")
+        cursor_native_bridge.inject_model_command(
+            bridge_dir,
+            model="gpt-5.2",
+            expected_display_name="GPT-5.2",
+        )
 
         tails = _send_keys_calls(captured)
         assert ["-t", _TARGET, "-l", "/model gpt-5.2"] in tails  # the filter command
         assert ["-t", _TARGET, "Enter"] in tails  # selection committed
         assert ["-t", _TARGET, "Escape"] not in tails  # no dismiss on a real match
 
+    def test_missing_cli_catalog_raises_clean_runtime_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A cold switch without cursor-agent degrades through the runner's handled error path."""
+
+        def _missing_cli() -> list[dict[str, object]]:
+            raise click.ClickException("cursor-agent missing")
+
+        monkeypatch.setattr(cursor_native_bridge, "_live_cursor_model_options", _missing_cli)
+
+        with pytest.raises(RuntimeError, match="could not verify the live model catalog") as error:
+            cursor_native_bridge.inject_model_command(tmp_path, model="gpt-5.2")
+
+        assert isinstance(error.value.__cause__, click.ClickException)
+
     def test_raises_without_enter_on_no_match(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """ "No matches" fails loudly, dismisses the picker, and never presses Enter."""
         bridge_dir = _prepare_bridge(tmp_path)
+        monkeypatch.setattr(
+            cursor_native_bridge,
+            "_live_cursor_model_options",
+            lambda: [{"id": "bogus-model", "displayName": "Bogus Model"}],
+        )
         captured = _install_fake_tmux(
             monkeypatch, pane_captures=[f"{_IDLE}\n → /model bogus-model\n    No matches"]
         )
@@ -233,6 +263,11 @@ class TestInjectModelGate:
         matching" header the gate must refuse to press Enter.
         """
         bridge_dir = _prepare_bridge(tmp_path)
+        monkeypatch.setattr(
+            cursor_native_bridge,
+            "_live_cursor_model_options",
+            lambda: [{"id": "gpt-5.2", "displayName": "GPT-5.2"}],
+        )
         captured = _install_fake_tmux(
             monkeypatch, pane_captures=[f"{_IDLE}\n → /model gpt-5.2\n    No matches"]
         )
@@ -242,6 +277,49 @@ class TestInjectModelGate:
             cursor_native_bridge.inject_model_command(bridge_dir, model="gpt-5.2")
 
         assert ["-t", _TARGET, "Enter"] not in _send_keys_calls(captured)
+
+    def test_rejects_fuzzy_match_for_a_different_model(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fuzzy top result cannot silently select a different catalog row."""
+        bridge_dir = _prepare_bridge(tmp_path)
+        monkeypatch.setattr(
+            cursor_native_bridge,
+            "_live_cursor_model_options",
+            lambda: [{"id": "requested-model", "displayName": "Requested Model"}],
+        )
+        captured = _install_fake_tmux(
+            monkeypatch,
+            pane_captures=[
+                f'{_IDLE}\nModels matching "requested-model"\n →  Different Model   High'
+            ],
+        )
+        monkeypatch.setattr(cursor_native_bridge.time, "sleep", lambda *_a, **_k: None)
+
+        with pytest.raises(RuntimeError, match="exact picker row"):
+            cursor_native_bridge.inject_model_command(bridge_dir, model="requested-model")
+
+        tails = _send_keys_calls(captured)
+        assert ["-t", _TARGET, "Enter"] not in tails
+        assert ["-t", _TARGET, "Escape"] in tails
+
+
+@pytest.mark.parametrize(
+    ("row", "display_name", "expected"),
+    [
+        ("Provider Model", "Provider Model", True),
+        ("Provider Model   High", "Provider Model", True),
+        ("Provider Modelish High", "Provider Model", False),
+        ("Other Provider Model", "Provider Model", False),
+    ],
+)
+def test_picker_row_matches_complete_display_label(
+    row: str,
+    display_name: str,
+    expected: bool,
+) -> None:
+    """Variant suffixes are allowed, but longer-name prefixes are not."""
+    assert cursor_native_bridge._picker_row_matches_display(row, display_name) is expected
 
 
 class TestHooksConfig:

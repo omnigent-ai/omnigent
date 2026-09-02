@@ -93,6 +93,25 @@ class SysScheduledTaskCreateTool(Tool):
                             "type": "string",
                             "description": "Optional per-run reasoning-effort hint, e.g. 'high'.",
                         },
+                        "permission_mode": {
+                            "type": "string",
+                            "description": (
+                                "Optional permission mode for native coding agents that "
+                                "support one (Claude Code): 'default', 'auto', "
+                                "'acceptEdits', 'plan', 'dontAsk', or 'bypassPermissions'. "
+                                "Runs are unattended, so a prompting mode ('default'/'plan') "
+                                "stalls waiting for approval — prefer an auto-running mode. "
+                                "Omit for the agent default."
+                            ),
+                        },
+                        "max_cost_usd": {
+                            "type": "number",
+                            "description": (
+                                "Optional per-firing cost budget in USD. When set, each "
+                                "fired session is capped at this spend — all models are "
+                                "blocked once the limit is reached. Omit for no cap."
+                            ),
+                        },
                         "workspace": {
                             "type": "string",
                             "description": (
@@ -161,8 +180,9 @@ class SysScheduledTaskUpdateTool(Tool):
         """:returns: Human-readable description of the tool."""
         return (
             "Update a scheduled task's mutable fields. Only the fields you pass "
-            "change; omit the rest. Pass state='paused' to stop it firing "
-            "without deleting it, or state='active' to resume."
+            "change; omit the rest. Pass agent_id to switch which agent/harness "
+            "it runs. Pass state='paused' to stop it firing without deleting it, "
+            "or state='active' to resume."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -182,11 +202,35 @@ class SysScheduledTaskUpdateTool(Tool):
                         "name": {"type": "string", "description": "New task name."},
                         "prompt": {"type": "string", "description": "New prompt."},
                         "rrule": {"type": "string", "description": _RRULE_DESC},
+                        "agent_id": {
+                            "type": "string",
+                            "description": (
+                                "Rebind the task to a different agent, switching the "
+                                "harness its future firings run (e.g. Cursor to Pi) — "
+                                "from sys_agent_list. Past runs keep the agent they "
+                                "ran. Model, effort, and permission mode do not carry "
+                                "across a switch: resend any you want set."
+                            ),
+                        },
                         "timezone": {"type": "string", "description": "New IANA timezone."},
                         "model_override": {"type": "string", "description": "New model override."},
                         "reasoning_effort": {
                             "type": "string",
                             "description": "New reasoning-effort hint.",
+                        },
+                        "permission_mode": {
+                            "type": "string",
+                            "description": (
+                                "New permission mode for native coding agents (Claude "
+                                "Code): 'default', 'auto', 'acceptEdits', 'plan', "
+                                "'dontAsk', or 'bypassPermissions'."
+                            ),
+                        },
+                        "max_cost_usd": {
+                            "type": "number",
+                            "description": (
+                                "New per-firing cost budget in USD. Null clears the cap."
+                            ),
                         },
                         "workspace": {
                             "type": "string",

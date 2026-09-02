@@ -19,9 +19,8 @@ Enumeration is deterministic per provider kind:
 - ``key`` (openai family) / ``gateway`` / ``local`` →
   ``GET <base_url>/v1/models`` with a bearer token (source
   ``"openai-compatible"``).
-- ``subscription`` → a curated static list (source ``"static"``,
-  ``verified: false`` — CLI logins expose no listing API). The cursor
-  harnesses always resolve here: cursor-agent brings its own login.
+- ``subscription`` → live CLI discovery for Cursor; curated static aliases for
+  CLIs without a listing API (source ``"static"``, ``verified: false``).
 - ``cli-config`` → the codex curated static list (source ``"static"``,
   ``verified: false`` — the credential lives in the CLI's own config
   file and is resolved by the CLI at launch).
@@ -35,15 +34,19 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Literal, TypeAlias, cast
 
+import click
 import httpx
 from cachetools import TTLCache
 
 from omnigent._platform import default_shell_argv
+from omnigent.json_types import JsonObject as _JsonObject
+from omnigent.llms.anthropic_model_metadata import parse_anthropic_model_metadata
 from omnigent.model_metadata import (
     ModelCapability,
     ModelCostTier,
@@ -51,7 +54,7 @@ from omnigent.model_metadata import (
     ModelMetadata,
     ModelWireAPI,
 )
-from omnigent.model_override import model_family_mismatch
+from omnigent.model_override import is_codex_compatible_model, model_family_mismatch
 from omnigent.model_resolver import (
     ModelResolution,
     ModelResolutionError,
@@ -67,10 +70,12 @@ from omnigent.onboarding.provider_config import (
     SUBSCRIPTION_KIND,
     ProviderEntry,
 )
+from omnigent.pi_model_compatibility import unsupported_in_pi
 from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
 if TYPE_CHECKING:
     from omnigent.onboarding.providers import ModelInfo
+    from omnigent.spec.types import AgentSpec
 
 _logger = logging.getLogger(__name__)
 
@@ -94,23 +99,28 @@ _LLM_NAME_TOKENS = ("claude", "gpt", "codex", "gemini", "llama", "qwen", "kimi")
 # Chat-capable endpoint tasks ("llm/v1/chat"); embeddings/rerankers don't match.
 _LLM_TASK_TOKENS = ("chat", "completion")
 
-# Subscription CLIs expose no listing API: curated ids matching the bundled
-# catalog pin (claude) and the codex ids the codebase already references.
-_SUBSCRIPTION_STATIC_MODELS: dict[str, tuple[str, ...]] = {
-    "claude": (
-        "claude-fable-5",
-        "claude-opus-5",
-        "claude-opus-4-8",
-        "claude-sonnet-5",
-        "claude-sonnet-4-6",
-        "claude-haiku-4-5",
-    ),
-    "codex": ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini"),
-}
+# DATABRICKS-PATCH(model-services-scoped-listing): scope + page the Unity
+# Catalog model-services listing. Mirrors
+# ``databricks_model_discovery._MODEL_SERVICES_PARENT`` /
+# ``_MODEL_SERVICES_MAX_RESULTS`` — including the parameter *name*, so both
+# callers of this endpoint ask for a page size the API actually honors.
+_MODEL_SERVICES_PARENT = "schemas/system.ai"
+_MODEL_SERVICES_MAX_RESULTS = 100
+_MODEL_SERVICES_MAX_PAGES = 100
+
+_ProviderHarness: TypeAlias = Literal[
+    "claude-sdk",
+    "codex",
+    "pi",
+    "openai-agents-sdk",
+    "antigravity",
+    "kimi",
+    "qwen",
+]
 
 # Harness spellings -> the workflow harness whose provider resolution they
 # share; natives resolve via their SDK sibling (the resolve_native_* rule).
-_PROVIDER_RESOLUTION_HARNESS: dict[str, str] = {
+_PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
     "claude-sdk": "claude-sdk",
     "claude_sdk": "claude-sdk",
     "claude": "claude-sdk",
@@ -141,6 +151,8 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, str] = {
     # mirroring the claude-native -> claude-sdk rule above.
     "antigravity-native": "antigravity",
     "native-antigravity": "antigravity",
+    "agy-native": "antigravity",
+    "native-agy": "antigravity",
 }
 
 # cursor-agent always routes through its own stored login — there is no
@@ -189,8 +201,8 @@ class ModelListing:
     """A worker's enumerated model list plus its provenance.
 
     :param source: Where the list came from — ``"gateway"``,
-        ``"openai-compatible"``, ``"anthropic-api"``, ``"static"``, or
-        ``"none"``.
+        ``"openai-compatible"``, ``"anthropic-api"``, ``"cli"``,
+        ``"static"``, or ``"none"``.
     :param verified: ``True`` when the list was fetched live from the
         provider; ``False`` for static/curated or empty listings.
     :param models: The enumerated models, e.g.
@@ -236,6 +248,16 @@ class ResolvedModelProvider:
     auth_command: str | None = None
     cli: str | None = None
     detail: str = ""
+
+
+def is_direct_openai_provider(provider: ResolvedModelProvider) -> bool:
+    """Return whether *provider* targets OpenAI's canonical models API."""
+    if provider.family != OPENAI_FAMILY or not provider.base_url:
+        return False
+    from omnigent.onboarding.configure_models import default_base_url_for_family
+
+    canonical = default_base_url_for_family(OPENAI_FAMILY)
+    return _models_url(provider.base_url).lower() == _models_url(canonical).lower()
 
 
 # Unfiltered listings keyed by provider identity. TTLCache is not thread-safe
@@ -300,19 +322,20 @@ def clear_model_catalog_cache() -> None:
 
 
 def model_family_token(model_id: str) -> str:
-    """Tag a model id with its vendor family.
+    """Tag a model id with the harness family that can serve it.
 
-    Mirrors the token rule in
+    Shares the token rule with
     :func:`omnigent.model_override.model_family_mismatch`: Claude ids
-    contain ``"claude"``; GPT ids contain ``"gpt"`` or ``"codex"``.
+    contain ``"claude"``; the ``"openai"`` token covers every
+    codex-compatible id (gpt/codex plus the GLM and Kimi families, which
+    serve on the same Responses wire).
 
     :param model_id: Model id, e.g. ``"databricks-claude-opus-4-8"``.
     :returns: ``"claude"``, ``"openai"``, or ``"other"``.
     """
-    lower = model_id.lower()
-    if "claude" in lower:
+    if "claude" in model_id.lower():
         return "claude"
-    if "gpt" in lower or "codex" in lower:
+    if is_codex_compatible_model(model_id):
         return "openai"
     return "other"
 
@@ -355,6 +378,7 @@ def catalog_model_entries(provider_name: str) -> tuple[ModelEntry, ...]:
                     supported_capabilities=frozenset(supported),
                     unsupported_capabilities=frozenset(unsupported),
                     context_window=model.max_input_tokens,
+                    max_output_tokens=model.max_output_tokens,
                     cost_tier=cost_tiers.get(index),
                 ),
             )
@@ -453,7 +477,7 @@ def _catalog_cost_tiers(models: list[ModelInfo]) -> dict[int, ModelCostTier]:
     return tiers
 
 
-def spec_harness(spec: Any) -> str | None:  # type: ignore[explicit-any]  # structural spec stubs in tests
+def spec_harness(spec: object) -> str | None:
     """Resolve the declared harness for a (sub-)agent spec.
 
     Mirrors the runner's harness derivation
@@ -475,7 +499,7 @@ def spec_harness(spec: Any) -> str | None:  # type: ignore[explicit-any]  # stru
     return executor_type if isinstance(executor_type, str) and executor_type else None
 
 
-def resolve_model_provider(spec: Any, harness: str | None) -> ResolvedModelProvider:  # type: ignore[explicit-any]  # structural spec stubs in tests
+def resolve_model_provider(spec: object, harness: str | None) -> ResolvedModelProvider:
     """Resolve the model provider a worker's launch path would use.
 
     Total by contract: callers (the dispatch gate and ``sys_list_models``)
@@ -502,7 +526,7 @@ def resolve_model_provider(spec: Any, harness: str | None) -> ResolvedModelProvi
         )
 
 
-def _resolve_model_provider_unsafe(spec: Any, harness: str | None) -> ResolvedModelProvider:  # type: ignore[explicit-any]  # structural spec stubs in tests
+def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> ResolvedModelProvider:
     """Resolve the provider, propagating failures to the catch-all wrapper.
 
     Step 1 reuses :func:`~omnigent.runtime.workflow._resolve_provider_for_build`
@@ -531,13 +555,16 @@ def _resolve_model_provider_unsafe(spec: Any, harness: str | None) -> ResolvedMo
             detail=f"harness {harness or 'unknown'!r} has no model-provider resolution",
         )
 
-    entry = _resolve_provider_for_build(spec, harness_type=harness_type)  # type: ignore[arg-type]  # AgentHarnessType narrowed by the map above
+    agent_spec = cast("AgentSpec", spec)
+    entry = _resolve_provider_for_build(agent_spec, harness_type=harness_type)
     if entry is not None:
         return _provider_from_entry(entry, harness_type)
-    return _provider_from_legacy_auth(spec, harness_type)
+    return _provider_from_legacy_auth(agent_spec, harness_type)
 
 
-def _provider_from_legacy_auth(spec: Any, harness_type: str) -> ResolvedModelProvider:  # type: ignore[explicit-any]  # structural spec stubs in tests
+def _provider_from_legacy_auth(
+    spec: AgentSpec, harness_type: _ProviderHarness
+) -> ResolvedModelProvider:
     """Mirror the per-harness legacy fallthrough of ``_build_*_spawn_env``.
 
     The builders diverge: claude-sdk consumes spec/global ``auth:``
@@ -563,7 +590,7 @@ def _provider_from_legacy_auth(spec: Any, harness_type: str) -> ResolvedModelPro
     return _legacy_profile_only_provider(spec, harness_type)
 
 
-def _databricks_prefix_provider(spec: Any) -> ResolvedModelProvider | None:  # type: ignore[explicit-any]  # structural spec stubs in tests
+def _databricks_prefix_provider(spec: AgentSpec) -> ResolvedModelProvider | None:
     """Map a ``databricks-*`` spec model to the runner-env-profile gateway.
 
     Mirrors the builders' shared model-prefix heuristic; the native
@@ -583,7 +610,7 @@ def _databricks_prefix_provider(spec: Any) -> ResolvedModelProvider | None:  # t
     return None
 
 
-def _legacy_claude_sdk_provider(spec: Any) -> ResolvedModelProvider:  # type: ignore[explicit-any]  # structural spec stubs in tests
+def _legacy_claude_sdk_provider(spec: AgentSpec) -> ResolvedModelProvider:
     """Mirror ``_build_claude_sdk_spawn_env``'s legacy auth branch.
 
     Spec ``auth:`` (databricks / api_key) → legacy profile
@@ -625,7 +652,7 @@ def _legacy_claude_sdk_provider(spec: Any) -> ResolvedModelProvider:  # type: ig
     return ResolvedModelProvider(kind=NONE_KIND, detail="no model provider configured")
 
 
-def _legacy_openai_agents_provider(spec: Any) -> ResolvedModelProvider:  # type: ignore[explicit-any]  # structural spec stubs in tests
+def _legacy_openai_agents_provider(spec: AgentSpec) -> ResolvedModelProvider:
     """Mirror ``_build_openai_agents_sdk_spawn_env``'s legacy auth branch.
 
     Spec ``auth:`` (api_key with its base_url / databricks) → global
@@ -667,7 +694,9 @@ def _legacy_openai_agents_provider(spec: Any) -> ResolvedModelProvider:  # type:
     return ResolvedModelProvider(kind=NONE_KIND, detail="no model provider configured")
 
 
-def _legacy_profile_only_provider(spec: Any, harness_type: str) -> ResolvedModelProvider:  # type: ignore[explicit-any]  # structural spec stubs in tests
+def _legacy_profile_only_provider(
+    spec: AgentSpec, harness_type: _ProviderHarness
+) -> ResolvedModelProvider:
     """Mirror the codex / pi builders' legacy branch (profile + prefix only).
 
     ``_build_codex_spawn_env`` / ``_build_pi_spawn_env`` never read
@@ -759,7 +788,7 @@ def _provider_from_entry(entry: ProviderEntry, harness_type: str) -> ResolvedMod
 
 
 def list_models_for_worker(
-    spec: Any,  # type: ignore[explicit-any]  # structural spec stubs in tests
+    spec: object,
     harness: str | None,
     *,
     transport: httpx.BaseTransport | None = None,
@@ -788,7 +817,7 @@ def list_models_for_worker(
     if use_uc and provider.kind == DATABRICKS_KIND:
         uc_key = ("uc", *_listing_cache_key(provider))
         with _listing_cache_lock:
-            cached = _listing_cache.get(uc_key)
+            cached = cast(ModelListing | None, _listing_cache.get(uc_key))
         if cached is not None:
             listing = cached
         else:
@@ -810,10 +839,10 @@ def list_models_for_worker(
 
 
 def catalog_for_spec(
-    spec: Any,  # type: ignore[explicit-any]  # structural spec stubs in tests
+    spec: object,
     *,
     transport: httpx.BaseTransport | None = None,
-) -> dict[str, dict[str, Any]]:  # type: ignore[explicit-any]  # JSON-shaped tool payload
+) -> dict[str, _JsonObject]:
     """Build the full ``sys_list_models`` payload for an agent spec.
 
     One row per declared sub-agent, keyed by sub-agent name, plus a
@@ -827,7 +856,7 @@ def catalog_for_spec(
     :returns: Mapping of worker name → row dict with ``source`` /
         ``verified`` / ``models`` / ``note`` keys.
     """
-    rows: dict[str, dict[str, Any]] = {}  # type: ignore[explicit-any]  # JSON-shaped tool payload
+    rows: dict[str, _JsonObject] = {}
     for sub in getattr(spec, "sub_agents", None) or []:
         name = getattr(sub, "name", None)
         if not isinstance(name, str) or not name:
@@ -838,10 +867,10 @@ def catalog_for_spec(
 
 
 def _worker_row(
-    spec: Any,  # type: ignore[explicit-any]  # structural spec stubs in tests
+    spec: object,
     *,
     transport: httpx.BaseTransport | None,
-) -> dict[str, Any]:  # type: ignore[explicit-any]  # JSON-shaped tool payload
+) -> _JsonObject:
     """Build one worker's catalog row, never raising.
 
     :param spec: The worker's (sub-)agent spec.
@@ -863,18 +892,20 @@ def _worker_row(
     return _listing_payload(listing)
 
 
-def _listing_payload(listing: ModelListing) -> dict[str, Any]:  # type: ignore[explicit-any]  # JSON-shaped tool payload
+def _listing_payload(listing: ModelListing) -> _JsonObject:
     """Serialize a :class:`ModelListing` into the tool's JSON row shape.
 
     :param listing: The listing to serialize.
     :returns: Row dict; ``context_window`` appears only when known.
     """
-    models: list[dict[str, Any]] = []  # type: ignore[explicit-any]  # JSON-shaped tool payload
+    models: list[_JsonObject] = []
     for entry in listing.models:
-        row: dict[str, Any] = {"id": entry.id, "family": entry.family}  # type: ignore[explicit-any]
+        row: _JsonObject = {"id": entry.id, "family": entry.family}
         metadata = entry.metadata
         if metadata.context_window is not None:
             row["context_window"] = metadata.context_window
+        if metadata.max_output_tokens is not None:
+            row["max_output_tokens"] = metadata.max_output_tokens
         capabilities = {
             capability.value: supported
             for supported, values in (
@@ -889,13 +920,19 @@ def _listing_payload(listing: ModelListing) -> dict[str, Any]:  # type: ignore[e
             row["cost_tier"] = metadata.cost_tier.value
         if metadata.wire_apis:
             row["wire_apis"] = sorted(wire_api.value for wire_api in metadata.wire_apis)
+        if metadata.reasoning is not None:
+            row["reasoning"] = {
+                "modes": sorted(mode.value for mode in metadata.reasoning.modes),
+                "efforts": sorted(metadata.reasoning.efforts),
+            }
         models.append(row)
-    return {
+    payload: _JsonObject = {
         "source": listing.source,
         "verified": listing.verified,
         "models": models,
         "note": listing.note,
     }
+    return payload
 
 
 def _redacted_failure_reason(exc: Exception) -> str:
@@ -914,6 +951,8 @@ def _redacted_failure_reason(exc: Exception) -> str:
         return "provider auth command timed out"
     if isinstance(exc, subprocess.SubprocessError):
         return "provider auth command failed"
+    if isinstance(exc, click.ClickException):
+        return exc.message
     if isinstance(exc, httpx.HTTPStatusError):
         return f"listing endpoint returned HTTP {exc.response.status_code}"
     if isinstance(exc, httpx.HTTPError):
@@ -954,27 +993,51 @@ def _listing_for_provider(
                 "this worker cannot run here"
             ),
         )
-    if provider.kind == SUBSCRIPTION_KIND:
+    if provider.kind == SUBSCRIPTION_KIND and provider.cli != "cursor-agent":
         return _static_subscription_listing(provider)
     if provider.kind == CLI_CONFIG_KIND:
         return _static_cli_config_listing(provider)
 
     cache_key = _listing_cache_key(provider)
     with _listing_cache_lock:
-        cached = _listing_cache.get(cache_key)
+        cached = cast(ModelListing | None, _listing_cache.get(cache_key))
     if cached is not None:
         return cached
     try:
-        if provider.kind == DATABRICKS_KIND:
+        if provider.kind == SUBSCRIPTION_KIND:
+            listing = _fetch_cursor_cli_listing(provider)
+        elif provider.kind == DATABRICKS_KIND:
             listing = _fetch_databricks_listing(provider, transport=transport)
         elif provider.kind == KEY_KIND and provider.family == ANTHROPIC_FAMILY:
             listing = _fetch_anthropic_listing(provider, transport=transport)
         else:
             listing = _fetch_openai_compatible_listing(provider, transport=transport)
-    except (httpx.HTTPError, OSError, ValueError, subprocess.SubprocessError) as exc:
+    except (
+        click.ClickException,
+        httpx.HTTPError,
+        OSError,
+        ValueError,
+        subprocess.SubprocessError,
+    ) as exc:
         _logger.debug(
             "model enumeration failed for %s", provider.detail or provider.kind, exc_info=True
         )
+        if provider.kind == SUBSCRIPTION_KIND:
+            # A failed cursor-agent listing probe says nothing about
+            # dispatchability: the CLI brings its own stored login, so the
+            # worker still runs. Degrade to the usable pre-launch shape the
+            # other subscription CLI logins report, not the dead-worker
+            # "none" that tells orchestrators the worker cannot run here.
+            return ModelListing(
+                source="static",
+                verified=False,
+                models=(),
+                note=(
+                    f"model listing failed for {provider.detail or provider.kind} "
+                    f"({_redacted_failure_reason(exc)}); the CLI launches with its "
+                    "own stored login, so dispatches to this worker can still run"
+                ),
+            )
         return ModelListing(
             source=NONE_KIND,
             verified=False,
@@ -989,39 +1052,42 @@ def _listing_for_provider(
     return listing
 
 
-def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListing:
-    """Build the curated static listing for a subscription CLI login.
+def _fetch_cursor_cli_listing(provider: ResolvedModelProvider) -> ModelListing:
+    """Build a live listing from the installed Cursor CLI."""
+    from omnigent.cursor_native import list_cursor_cli_model_options
 
-    :param provider: A ``kind="subscription"`` provider descriptor.
-    :returns: A ``source="static"`` listing with ``verified=False``.
-    """
-    ids = _subscription_static_ids(provider.cli or "")
+    options = list_cursor_cli_model_options()
     return ModelListing(
-        source="static",
-        verified=False,
-        models=tuple(ModelEntry(id=i, family=model_family_token(i)) for i in ids),
-        note=(
-            f"curated aliases for the {provider.cli or 'unknown'} CLI login "
-            "(subscription logins expose no model-listing API; availability "
-            "depends on the logged-in plan)"
+        source="cli",
+        verified=True,
+        models=tuple(
+            ModelEntry(id=str(option["id"]), family=model_family_token(str(option["id"])))
+            for option in options
         ),
+        note=f"live models advertised by the {provider.cli or 'cursor-agent'} CLI",
     )
 
 
-def _subscription_static_ids(cli: str) -> tuple[str, ...]:
-    """Return the curated model ids for a subscription CLI.
+def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListing:
+    """Build the (empty) pre-launch listing for a subscription CLI login.
 
-    :param cli: The CLI short-name, e.g. ``"claude"`` or ``"cursor-agent"``.
-    :returns: Curated model ids; empty for an unknown CLI.
+    Subscription logins expose no model-listing API, and the curated
+    stand-ins this used to serve are gone — the live harness probes are the
+    source of truth, so a path that cannot probe reports nothing rather
+    than a plausible-but-stale list.
+
+    :param provider: A ``kind="subscription"`` provider descriptor.
+    :returns: A ``source="static"`` listing with no models.
     """
-    if cli == "cursor-agent":
-        # Reuse the web picker's curated base-model catalog (derived from
-        # ``cursor-agent models``); imported lazily to keep this module off
-        # the TUI launcher's import path.
-        from omnigent.cursor_native import cursor_base_model_options
-
-        return tuple(str(option["id"]) for option in cursor_base_model_options())
-    return _SUBSCRIPTION_STATIC_MODELS.get(cli, ())
+    return ModelListing(
+        source="static",
+        verified=False,
+        models=(),
+        note=(
+            f"the {provider.cli or 'unknown'} CLI login exposes no model-listing "
+            "API before launch; the live listing comes from probing the harness"
+        ),
+    )
 
 
 def _static_cli_config_listing(provider: ResolvedModelProvider) -> ModelListing:
@@ -1034,17 +1100,15 @@ def _static_cli_config_listing(provider: ResolvedModelProvider) -> ModelListing:
     resolve — not a "no credentials" preflight failure.
 
     :param provider: A ``kind="cli-config"`` provider descriptor.
-    :returns: A ``source="static"`` listing with ``verified=False``.
+    :returns: A ``source="static"`` listing with no models.
     """
-    ids = _SUBSCRIPTION_STATIC_MODELS.get(provider.cli or "", ())
     return ModelListing(
         source="static",
         verified=False,
-        models=tuple(ModelEntry(id=i, family=model_family_token(i)) for i in ids),
+        models=(),
         note=(
-            f"curated ids for {provider.detail}; its credential lives in the "
-            "CLI's own config file and is resolved by the CLI at launch, so "
-            "it cannot be verified from here"
+            f"{provider.detail} enumerates its models only from the CLI's own "
+            "config at launch; the live listing comes from probing the harness"
         ),
     )
 
@@ -1134,19 +1198,104 @@ def _fetch_databricks_uc_listing(
     :raises OSError: When the profile resolves no credentials.
     """
     creds = resolve_databricks_workspace(provider.profile)
-    with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
-        resp = client.get(
-            f"{creds.host}/api/2.1/unity-catalog/model-services",
-            headers={"Authorization": f"Bearer {creds.token}"},
+    models = tuple(
+        model
+        for model in fetch_databricks_model_service_entries(
+            creds.host,
+            creds.token,
+            transport=transport,
         )
-        resp.raise_for_status()
-        payload = resp.json()
-    services = payload.get("model_services") if isinstance(payload, dict) else None
+        if not unsupported_in_pi(model.id.lower())
+    )
+    return ModelListing(
+        source="gateway",
+        verified=True,
+        models=models,
+        note=(
+            "LLM model services on the Databricks workspace "
+            f"(profile {provider.profile or 'DEFAULT'!r})"
+        ),
+    )
+
+
+def fetch_databricks_model_service_entries(
+    workspace_url: str,
+    token: str,
+    *,
+    transport: httpx.BaseTransport | None = None,
+) -> tuple[ModelEntry, ...]:
+    """Fetch normalized Unity Catalog model-service metadata.
+
+    This is the shared parser for worker model enumeration and Pi gateway
+    configuration. It reports provider wire surfaces without deciding which
+    one a harness should prefer.
+
+    :param workspace_url: Databricks workspace base URL.
+    :param token: Workspace bearer token.
+    :param transport: Optional httpx transport override for tests.
+    :returns: LLM model-service entries with normalized wire metadata.
+    :raises httpx.HTTPError: On transport or HTTP failures.
+    """
+    # DATABRICKS-PATCH(model-services-scoped-listing)
+    # The listing must be scoped to the `system.ai` schema and paged. Unscoped,
+    # the endpoint walks the WHOLE metastore and returns one page of whatever
+    # schemas sort first — on a busy workspace that is a slice of unrelated user
+    # schemas with a `next_page_token` this call never followed, so a workspace
+    # serving 53 Databricks models reported 2 and zero Claude entries. Same
+    # scoping `databricks_model_discovery._list_model_service_ids` already uses.
+    services: list[object] = []
+    page_token: str | None = None
+    seen_tokens: set[str] = set()
+    with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
+        for _ in range(_MODEL_SERVICES_MAX_PAGES):
+            params = {
+                "parent": _MODEL_SERVICES_PARENT,
+                "max_results": str(_MODEL_SERVICES_MAX_RESULTS),
+            }
+            if page_token is not None:
+                params["page_token"] = page_token
+            resp = client.get(
+                f"{workspace_url.rstrip('/')}/api/2.1/unity-catalog/model-services",
+                headers={"Authorization": f"Bearer {token}"},
+                params=params,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            page = payload.get("model_services") if isinstance(payload, dict) else None
+            if isinstance(page, list):
+                services.extend(page)
+            raw_next = payload.get("next_page_token") if isinstance(payload, dict) else None
+            if not isinstance(raw_next, str) or not raw_next:
+                break
+            if raw_next in seen_tokens:
+                # A repeated token means the endpoint is looping. Keep the pages
+                # already collected instead of raising (which is what the
+                # sibling ``_list_model_service_ids`` does): every caller here
+                # treats an exception as "no listing" and falls back to the
+                # bundled catalog's retired ``databricks-`` ids, so failing loud
+                # would reintroduce the 501 this patch exists to remove. A
+                # partial ``system.ai`` list still launches.
+                _logger.warning(
+                    "Databricks model-services pagination repeated a page token; "
+                    "returning the %d entries collected so far",
+                    len(services),
+                )
+                break
+            seen_tokens.add(raw_next)
+            page_token = raw_next
+        else:
+            _logger.warning(
+                "Databricks model-services listing truncated after %d pages; "
+                "the model list may be incomplete",
+                _MODEL_SERVICES_MAX_PAGES,
+            )
     models: list[ModelEntry] = []
-    for service in services if isinstance(services, list) else []:
+    for service in services:
         if not isinstance(service, dict):
             continue
-        raw_name = service.get("name", "")
+        raw_name = service.get("name")
+        if not isinstance(raw_name, str):
+            continue
         name = (
             raw_name.replace("model-services/", "")
             if raw_name.startswith("model-services/")
@@ -1154,18 +1303,12 @@ def _fetch_databricks_uc_listing(
         )
         if not name:
             continue
-        api_types = service.get("supported_api_types", [])
+        api_types = service.get("supported_api_types")
         normalized_api_types = {
-            api_type.lower() for api_type in api_types if isinstance(api_type, str)
+            api_type.lower()
+            for api_type in (api_types if isinstance(api_types, list) else [])
+            if isinstance(api_type, str)
         }
-        has_chat = any("chat" in api_type for api_type in normalized_api_types)
-        has_embed = any("embed" in api_type for api_type in normalized_api_types)
-        if not has_chat or has_embed:
-            continue
-        from omnigent.pi_native_credentials import _unsupported_in_pi
-
-        if _unsupported_in_pi(name.lower()):
-            continue
         wire_apis: set[ModelWireAPI] = set()
         if any("chat/completions" in api_type for api_type in normalized_api_types):
             wire_apis.add(ModelWireAPI.OPENAI_CHAT)
@@ -1175,6 +1318,8 @@ def _fetch_databricks_uc_listing(
             "anthropic" in api_type and "messages" in api_type for api_type in normalized_api_types
         ):
             wire_apis.add(ModelWireAPI.ANTHROPIC_MESSAGES)
+        if not wire_apis:
+            continue
         models.append(
             ModelEntry(
                 id=name,
@@ -1182,15 +1327,77 @@ def _fetch_databricks_uc_listing(
                 metadata=ModelMetadata(wire_apis=frozenset(wire_apis)),
             )
         )
-    return ModelListing(
-        source="gateway",
-        verified=True,
-        models=tuple(models),
-        note=(
-            "LLM model services on the Databricks workspace "
-            f"(profile {provider.profile or 'DEFAULT'!r})"
-        ),
-    )
+    return tuple(models)
+
+
+# A value no endpoint will honor, so the request trips the output-token
+# validator before the model generates anything.
+_PROBE_OUTPUT_TOKENS = 100_000_000
+
+# Databricks serving endpoints report an exceeded output limit in one of two
+# shapes: "max_tokens (N) cannot exceed CAP" or "max_new_tokens N cannot be
+# greater than max_output_tokens CAP". Capture CAP from either.
+_OUTPUT_CAP_RE = re.compile(r"cannot exceed (\d+)|max_output_tokens\D*?(\d+)")
+
+
+def probe_output_token_cap(
+    base_url: str,
+    token: str,
+    model_id: str,
+    *,
+    api_type: str = "openai-completions",
+    transport: httpx.BaseTransport | None = None,
+) -> int | None:
+    """Discover a serving endpoint's enforced per-request output-token cap.
+
+    The Unity Catalog model-services listing carries no token limits, and a
+    model's native ceiling (its catalog ``max_output_tokens``) can exceed what
+    the Databricks serving endpoint accepts — requesting the native value then
+    fails at runtime. Sending an oversized request trips the endpoint's
+    validator, which names the real cap in its 400 body. The model never
+    generates, so this is a single cheap round-trip that also tracks any future
+    increase to the cap.
+
+    :param base_url: Surface base, e.g. ``https://ws/ai-gateway/mlflow/v1``.
+    :param token: Workspace bearer token.
+    :param model_id: Served model id, e.g. ``system.ai.kimi-k3``.
+    :param api_type: ``"openai-responses"`` or ``"openai-completions"`` —
+        selects the request shape and path.
+    :param transport: Optional httpx transport override for tests.
+    :returns: The cap in tokens, or ``None`` when the endpoint accepts the
+        probe (no cap below it) or the limit cannot be read (network/parse
+        failure). ``None`` means "keep the catalog value".
+    """
+    if api_type == "openai-responses":
+        path = "/responses"
+        body: dict[str, object] = {
+            "model": model_id,
+            "input": "cap probe",
+            "max_output_tokens": _PROBE_OUTPUT_TOKENS,
+        }
+    else:
+        path = "/chat/completions"
+        body = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": "cap probe"}],
+            "max_tokens": _PROBE_OUTPUT_TOKENS,
+        }
+    try:
+        with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
+            resp = client.post(
+                f"{base_url.rstrip('/')}{path}",
+                headers={"Authorization": f"Bearer {token}"},
+                json=body,
+            )
+    except httpx.HTTPError:
+        return None
+    if resp.status_code < 400:
+        return None
+    match = _OUTPUT_CAP_RE.search(resp.text or "")
+    if match is None:
+        return None
+    cap = match.group(1) or match.group(2)
+    return int(cap) if cap else None
 
 
 def _models_url(base_url: str) -> str:
@@ -1319,7 +1526,13 @@ def _fetch_anthropic_listing(
         model_id = item.get("id")
         if not isinstance(model_id, str) or not model_id:
             continue
-        models.append(ModelEntry(id=model_id, family=model_family_token(model_id)))
+        models.append(
+            ModelEntry(
+                id=model_id,
+                family=model_family_token(model_id),
+                metadata=parse_anthropic_model_metadata(item),
+            )
+        )
     return ModelListing(
         source="anthropic-api",
         verified=True,

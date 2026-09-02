@@ -264,6 +264,7 @@ jobs:
           stderr-file: /tmp/format-stderr.log
           gateway-base-url: ${{ secrets.GATEWAY_BASE_URL }}
           llm-api-key: ${{ secrets.LLM_API_KEY }}
+          model: ${{ vars.OMNIGENT_CI_ANTHROPIC_MODEL }}
 
       - name: Extract narrative post (fall back to raw body)
         if: steps.creds.outputs.available == 'true'
@@ -280,6 +281,130 @@ jobs:
               print("Using AI-formatted narrative release post.")
           else:
               print("::warning::No RELEASE_POST block parsed — publishing the raw release body.")
+          PYEOF
+
+      # Reviewer reference table of the PRs behind each feature and whether each
+      # already ships a demo video, so a human filling the `TODO` demo placeholders
+      # can reuse an existing recording instead of re-recording. Grouped to MATCH
+      # THE POST: when the formatter ran it curated the body down to a few headline
+      # features and emitted a per-feature RELEASE_POST_PRS map — group by that so
+      # the table covers only the PRs behind the features that made the post. With
+      # no map (raw-body fallback), the post keeps every feature, so fall back to
+      # the raw `## Major new features` / `## Breaking changes` sections. Runs
+      # unconditionally (helps the fallback too); best-effort, empty table on error.
+      - name: Build demo-video reference table
+        id: demotable
+        continue-on-error: true
+        working-directory: omnigent
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REPO: ${{ env.SOURCE_REPO }}
+        run: |
+          set -euo pipefail
+          python3 -u <<'PYEOF'
+          import json, os, pathlib, re, subprocess
+          repo = os.environ["SOURCE_REPO"]
+          body = pathlib.Path("/tmp/release_body.md").read_text(encoding="utf-8", errors="replace")
+
+          # PR refs from the raw body's FEATURE sections, per section — the set of
+          # PRs the table is allowed to name (bug fixes are dropped from the post,
+          # so from the table too), and the fallback grouping when no formatter map.
+          # Match a feature section by its heading TEXT at any level (the release
+          # body uses ### here, older ones ##) — startswith, so "Bug fixes &
+          # hardening" is excluded but "Major new features" matches.
+          FEATURE = ("major new features", "breaking changes")
+          ref_re = re.compile(r"#(\d+)")
+          raw_sections, current, allowed = [], None, set()
+          for ln in body.splitlines():
+              h = re.match(r"#{2,}\s+(.*\S)", ln)
+              if h:
+                  name = h.group(1).strip()
+                  low = name.lower()
+                  current = (name, []) if any(low.startswith(f) for f in FEATURE) else None
+                  if current:
+                      raw_sections.append(current)
+                  continue
+              if current and ln.lstrip().startswith(("-", "*")):
+                  for n in ref_re.findall(ln):
+                      pr = int(n)
+                      allowed.add(pr)
+                      if pr not in current[1]:
+                          current[1].append(pr)
+
+          # Prefer the formatter's curated feature -> PRs map so the table's groups
+          # match the post's numbered features. The formatter is fed injectable PR
+          # prose, so validate: keep only pr_refs that appear in the harvested body.
+          groups = []  # (feature title, [pr, ...])
+          fmt = pathlib.Path("/tmp/format_out.txt")
+          if fmt.is_file():
+              raw = fmt.read_text(encoding="utf-8", errors="replace")
+              mm = re.search(r"<!--\s*RELEASE_POST_PRS\s*-->(.*?)<!--\s*/RELEASE_POST_PRS\s*-->",
+                             raw, re.DOTALL)
+              if mm:
+                  try:
+                      for feat in json.loads(mm.group(1).strip()):
+                          if not isinstance(feat, dict):
+                              continue
+                          title = str(feat.get("title", "")).strip()
+                          prs, seen = [], set()
+                          for r in feat.get("pr_refs", []):
+                              try:
+                                  n = int(r)
+                              except (TypeError, ValueError):
+                                  continue
+                              if n in allowed and n not in seen:
+                                  seen.add(n)
+                                  prs.append(n)
+                          if title and prs:
+                              groups.append((title, prs))
+                  except json.JSONDecodeError as e:
+                      print(f"::warning::Could not parse RELEASE_POST_PRS — falling back to raw sections: {e}")
+          if not groups:
+              print("::notice::No curated feature map — grouping the table by raw release sections.")
+              groups = [(name, prs) for name, prs in raw_sections if prs]
+
+          # Same demo-VIDEO detection as feature-blog.yml: GitHub uploaded-asset
+          # links, bare video URLs, and <video> tags. Images are NOT counted — the
+          # placeholder asks for a recording (a screenshot is a weaker fallback).
+          video_re = re.compile(
+              r"https?://github\.com/user-attachments/assets/[0-9a-f-]+"
+              r"|https?://github\.com/[^/\s)]+/[^/\s)]+/assets/\d+/[0-9a-f-]+"
+              r"|https?://[^\s)]+\.(?:mp4|mov|webm|m4v)\b"
+              r"|<video\b",
+              re.IGNORECASE)
+          def _cell(t):
+              return (t or "").replace("|", "\\|").replace("\n", " ").strip()
+
+          meta_cache = {}
+          def _meta(pr):
+              if pr in meta_cache:
+                  return meta_cache[pr]
+              m = {"title": "", "url": f"https://github.com/{repo}/pull/{pr}", "video": False}
+              try:
+                  d = json.loads(subprocess.run(
+                      ["gh", "pr", "view", str(pr), "--repo", repo,
+                       "--json", "title,body,url"],
+                      capture_output=True, text=True, timeout=60).stdout or "{}")
+                  m["title"] = _cell(d.get("title", ""))
+                  m["url"] = d.get("url") or m["url"]
+                  m["video"] = bool(video_re.search(d.get("body") or ""))
+              except Exception as e:
+                  print(f"::notice::Could not read metadata for PR #{pr}: {e}")
+              meta_cache[pr] = m
+              return m
+
+          out, total = [], 0
+          for name, prs in groups:
+              out += [f"### {_cell(name)}", "", "| PR | Title | Demo video? |",
+                      "| --- | --- | --- |"]
+              for pr in prs:
+                  total += 1
+                  m = _meta(pr)
+                  cell = f"[✅ video]({m['url']})" if m["video"] else "—"
+                  out.append(f"| [#{pr}]({m['url']}) | {m['title']} | {cell} |")
+              out.append("")
+          pathlib.Path("/tmp/demo_table.md").write_text("\n".join(out).rstrip() + ("\n" if out else ""))
+          print(f"Built demo table for {total} PR(s) across {len(groups)} feature(s).")
           PYEOF
 
       - name: Render the release post to MDX
@@ -305,6 +430,10 @@ jobs:
             echo '```markdown'; cat /tmp/site_body.md; echo '```'
             echo "### Rendered \`app/releases/${VERSION}/page.mdx\`"
             echo '```mdx'; cat /tmp/site_page/page.mdx; echo '```'
+            if [ -s /tmp/demo_table.md ]; then
+              echo "### Source PRs — demo videos (for the \`TODO\` demo placeholders)"
+              cat /tmp/demo_table.md
+            fi
           } | tee -a "$GITHUB_STEP_SUMMARY"
           echo "Dry-run: no token minted, no PR opened."
 
@@ -354,6 +483,11 @@ jobs:
             exit 0
           fi
           body="$(printf 'Publishes the **%s** release post at `/releases/%s` — the curated GitHub Release notes reformatted into the site'"'"'s narrative, prose-driven style.\n\nGenerated by omnigent `.github/workflows/publish-changelog.yml`. Edit the GitHub Release, not this file.' "$TAG" "$VERSION")"
+          # Append the demo-video reference table: which feature PRs already ship a
+          # recording a reviewer can drop into the post'"'"'s `TODO` demo placeholders.
+          if [ -s /tmp/demo_table.md ]; then
+            body="$(printf '%s\n\n### Source PRs — demo videos\nCheck a ✅ PR for a recording to replace a `TODO` demo placeholder in the post.\n\n%s' "$body" "$(cat /tmp/demo_table.md)")"
+          fi
           gh pr create \
             --repo "$SITE_REPO" \
             --base main \
@@ -435,5 +569,6 @@ jobs:
             /tmp/format-stderr.log
             /tmp/format_out.txt
             /tmp/site_body.md
+            /tmp/demo_table.md
           retention-days: 7
           if-no-files-found: ignore

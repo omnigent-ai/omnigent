@@ -40,13 +40,15 @@ _PYPROJECTS = [
 ]
 # The runtime version constant is stamped/verified alongside the pyprojects.
 _VERSION_PY = "omnigent/version.py"
+# The desktop app co-versions via the semver translation of the lockstep version.
+_ELECTRON_PKG = "web/electron/package.json"
 
 
 @pytest.fixture
 def repo_copy(tmp_path: Path) -> Path:
-    """Copy the real pyproject.toml files + version.py into a temp repo root."""
+    """Copy the real version-carrying files into a temp repo root."""
     root = tmp_path / "repo"
-    for rel in (*_PYPROJECTS, _VERSION_PY):
+    for rel in (*_PYPROJECTS, _VERSION_PY, _ELECTRON_PKG):
         dst = root / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_text((_REPO_ROOT / rel).read_text())
@@ -55,8 +57,8 @@ def repo_copy(tmp_path: Path) -> Path:
 
 def test_set_version_rewrites_every_location(repo_copy: Path) -> None:
     changed = update_versions.set_version(repo_copy, "9.9.9")
-    # Four pyprojects plus omnigent/version.py.
-    assert len(changed) == 5
+    # Four pyprojects, omnigent/version.py, and the desktop package.json.
+    assert len(changed) == 6
     # root: version line + three sibling pins (client, ui-sdk, slack);
     # client/ui SDKs: version line + one pin; slack: version line only.
     assert (repo_copy / "pyproject.toml").read_text().count("9.9.9") == 4
@@ -159,3 +161,33 @@ def test_next_dev_version(released: str, expected: str) -> None:
 def test_validate_pep440_rejects_junk() -> None:
     with pytest.raises(SystemExit, match="invalid version"):
         update_versions._validate_pep440("not-a-version")
+
+
+@pytest.mark.parametrize(
+    ("pep440", "semver"),
+    [
+        ("0.8.0", "0.8.0"),
+        ("0.6.0rc1", "0.6.0-rc.1"),
+        ("0.9.0.dev0", "0.9.0-dev.0"),
+        ("0.9.0.dev20260804", "0.9.0-dev.20260804"),
+    ],
+)
+def test_semver_of(pep440: str, semver: str) -> None:
+    assert update_versions.semver_of(pep440) == semver
+
+
+def test_set_version_stamps_desktop_semver(repo_copy: Path) -> None:
+    """The desktop package.json gets the semver translation, not raw PEP 440."""
+    update_versions.set_version(repo_copy, "9.9.9rc1")
+    electron = repo_copy / _ELECTRON_PKG
+    assert '"version": "9.9.9-rc.1",' in electron.read_text()
+    assert update_versions.check(repo_copy, expect="9.9.9rc1") == "9.9.9rc1"
+
+
+def test_check_detects_desktop_drift(repo_copy: Path) -> None:
+    """A hand-edited (or forgotten) desktop version fails check()."""
+    update_versions.set_version(repo_copy, "9.9.9")
+    electron = repo_copy / _ELECTRON_PKG
+    electron.write_text(electron.read_text().replace('"version": "9.9.9",', '"version": "9.9.8",'))
+    with pytest.raises(ValueError, match="desktop version"):
+        update_versions.check(repo_copy)

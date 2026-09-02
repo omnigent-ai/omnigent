@@ -244,9 +244,9 @@ export function ToolGroupSummary({ tools }: { tools: RenderItem[] }) {
     // any ancestor `.group[data-state=open]` and incorrectly rotate
     // chevrons of inner tool cards when this outer group is open).
     <Collapsible defaultOpen={false} className="group/tool-summary not-prose w-full">
-      <CollapsibleTrigger className="flex cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-xs transition-colors hover:text-foreground">
-        <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/tool-summary:rotate-90" />
+      <CollapsibleTrigger className="flex cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-chat transition-colors hover:text-foreground">
         <span>{label}</span>
+        <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/tool-summary:rotate-90" />
       </CollapsibleTrigger>
       <CollapsibleContent className="mt-1 ml-2 space-y-1 border-l pl-3 pt-1 pb-0 data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in">
         {tools.map((item) => {
@@ -318,7 +318,7 @@ function ToolTriggerRow({
   return (
     <CollapsibleTrigger
       title={tooltip}
-      className="flex w-full cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-xs transition-colors hover:text-foreground"
+      className="flex w-full cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-chat transition-colors hover:text-foreground"
     >
       <StatusIcon name={name} nativeToolType={nativeToolType} state={state} />
       <span className="min-w-0 flex-1 truncate">
@@ -438,7 +438,7 @@ function OutputSection({ output }: { output: string }) {
         )}
       </div>
       {canExpand && (
-        <div className="flex flex-col gap-2 rounded-md border bg-muted/30 px-3 py-2 text-muted-foreground text-xs sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex flex-col gap-2 rounded-md border bg-muted/30 px-3 py-2 text-muted-foreground text-sm sm:flex-row sm:items-center sm:justify-between">
           <span className="min-w-0">
             {isExpanded ? "Showing full output" : "Previewing output"} (
             {formatOutputStats(isExpanded ? preview : collapsedPreview)})
@@ -449,6 +449,7 @@ function OutputSection({ output }: { output: string }) {
             size="xs"
             type="button"
             variant="outline"
+            componentId="diagnostics.tool.toggle_expanded"
           >
             {isExpanded ? (
               <Minimize2Icon className="size-3" />
@@ -466,7 +467,7 @@ function OutputSection({ output }: { output: string }) {
 function ToolPendingOutput({ duration }: { duration: number | undefined }) {
   return (
     <div className="rounded-md border border-dashed bg-muted/30 p-3">
-      <div className="flex items-center gap-2 text-muted-foreground text-sm">
+      <div className="flex items-center gap-2 text-muted-foreground text-ui">
         <Loader2Icon className="size-4 animate-spin text-info" />
         <span>
           Waiting for output
@@ -490,7 +491,7 @@ function EmptyOutputState({ state }: { state: "output-error" | "cancelled" | "no
     message = "Tool did not return output before the response failed.";
   }
   return (
-    <div className="rounded-md border border-dashed bg-muted/30 px-3 py-2 text-muted-foreground text-sm">
+    <div className="rounded-md border border-dashed bg-muted/30 px-3 py-2 text-muted-foreground text-ui">
       {message}
     </div>
   );
@@ -544,6 +545,7 @@ function CopyTextButton({ text, label }: CopyTextButtonProps) {
           size="icon-xs"
           type="button"
           variant="ghost"
+          componentId="diagnostics.tool.copy"
         >
           <Icon className="size-3.5" />
         </Button>

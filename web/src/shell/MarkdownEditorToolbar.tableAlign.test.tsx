@@ -49,7 +49,10 @@ const TOOLBAR_DEFAULTS = {
   isCode: false,
 };
 
-type AlignState = { inTable: boolean; align: string | null };
+interface AlignState {
+  inTable: boolean;
+  align: string | null;
+}
 
 function mockEditorState(align: AlignState) {
   vi.mocked(useEditorState).mockReturnValue({ ...TOOLBAR_DEFAULTS, ...align });

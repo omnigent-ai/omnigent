@@ -168,9 +168,11 @@ def _connect_ro(db_path: Path) -> sqlite3.Connection | None:
     read via the ``-shm``; a plain connection is the fallback for the rare window
     where ``-shm`` is momentarily absent. Only SELECTs are issued.
     """
-    for uri, kw in ((f"file:{db_path}?mode=ro", {"uri": True}), (str(db_path), {})):
+    for uri, use_uri in ((f"file:{db_path}?mode=ro", True), (str(db_path), False)):
         try:
-            return sqlite3.connect(uri, timeout=5.0, **kw)
+            if use_uri:
+                return sqlite3.connect(uri, timeout=5.0, uri=True)
+            return sqlite3.connect(uri, timeout=5.0)
         except sqlite3.Error:
             continue
     return None
@@ -646,9 +648,9 @@ async def forward_goose_store_to_session(
     # supervisor) if the replay's idle post hits a transient server error.
     needs_replay = goose_session_id is not None and last_id > 0
 
-    async with httpx.AsyncClient(
-        base_url=base_url, headers=headers, auth=auth, timeout=timeout
-    ) as client:
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:
             try:
                 if needs_replay and goose_session_id is not None:

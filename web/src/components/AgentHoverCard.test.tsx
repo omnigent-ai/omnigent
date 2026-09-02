@@ -30,7 +30,9 @@ describe("AgentHoverCard", () => {
   it("wraps the trigger when the agent has a description", () => {
     render(
       <AgentHoverCard agent={agent({ description: "Plans and splits up the work." })}>
-        <button data-testid="trigger">Some Agent</button>
+        <button type="button" data-testid="trigger">
+          Some Agent
+        </button>
       </AgentHoverCard>,
     );
     expect(screen.getByTestId("trigger")).toHaveAttribute("data-slot", "hover-card-trigger");
@@ -40,7 +42,9 @@ describe("AgentHoverCard", () => {
     // Nothing to show → no wrapper, so an empty flyout can never open.
     render(
       <AgentHoverCard agent={agent({ description: null })}>
-        <button data-testid="trigger">Some Agent</button>
+        <button type="button" data-testid="trigger">
+          Some Agent
+        </button>
       </AgentHoverCard>,
     );
     expect(screen.getByTestId("trigger")).not.toHaveAttribute("data-slot", "hover-card-trigger");
@@ -51,7 +55,9 @@ describe("AgentHoverCard", () => {
     // a flyout with an empty body.
     render(
       <AgentHoverCard agent={agent({ description: "" })}>
-        <button data-testid="trigger">Some Agent</button>
+        <button type="button" data-testid="trigger">
+          Some Agent
+        </button>
       </AgentHoverCard>,
     );
     expect(screen.getByTestId("trigger")).not.toHaveAttribute("data-slot", "hover-card-trigger");

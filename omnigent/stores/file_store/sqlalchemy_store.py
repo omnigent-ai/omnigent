@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import builtins
+
 from sqlalchemy import and_, asc, desc, or_, select
 
 from omnigent.db.db_models import SqlFile, current_workspace_id, normalize_uuid
+from omnigent.db.query_context import query_name_scope
 from omnigent.db.utils import (
     generate_file_id,
     get_or_create_engine,
-    make_managed_session_maker,
+    make_named_managed_session_maker,
     now_epoch,
 )
 from omnigent.entities import PagedList, StoredFile
@@ -49,7 +52,10 @@ class SqlAlchemyFileStore(FileStore):
         """
         super().__init__(storage_location)
         self._engine = get_or_create_engine(storage_location)
-        self._session = make_managed_session_maker(self._engine)
+        self._session = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.file_store",
+        )
 
     def create(
         self,
@@ -76,7 +82,7 @@ class SqlAlchemyFileStore(FileStore):
             content_type=content_type,
             session_id=session_id,
         )
-        with self._session() as session:
+        with self._session("insert_file") as session:
             session.add(row)
             return _to_entity(row)
 
@@ -96,7 +102,7 @@ class SqlAlchemyFileStore(FileStore):
         :returns: The :class:`StoredFile` if found, otherwise
             ``None``.
         """
-        with self._session() as session:
+        with self._session("select_file_by_id") as session:
             row = session.get(SqlFile, (current_workspace_id(), file_id))
             if row is None:
                 return None
@@ -128,7 +134,7 @@ class SqlAlchemyFileStore(FileStore):
             files (``session_id IS NULL``).
         :returns: A :class:`PagedList` of :class:`StoredFile`.
         """
-        with self._session() as session:
+        with self._session("list_files") as session:
             is_desc = order == "desc"
             sort_fn = desc if is_desc else asc
             stmt = select(SqlFile).where(SqlFile.workspace_id == current_workspace_id())
@@ -193,8 +199,9 @@ class SqlAlchemyFileStore(FileStore):
         :param session_id: If set, verify ownership.
         :returns: ``True`` if deleted, ``False`` otherwise.
         """
-        with self._session() as session:
-            row = session.get(SqlFile, (current_workspace_id(), file_id))
+        with self._session("delete_file") as session:
+            with query_name_scope("omnigent.file_store.select_file_by_id"):
+                row = session.get(SqlFile, (current_workspace_id(), file_id))
             if not row:
                 return False
             if session_id is not None and row.session_id != normalize_uuid(session_id):
@@ -202,19 +209,20 @@ class SqlAlchemyFileStore(FileStore):
             session.delete(row)
             return True
 
-    def delete_all_for_session(self, session_id: str) -> list[str]:
+    def delete_all_for_session(self, session_id: str) -> builtins.list[str]:
         """
         Delete all file metadata for a session.
 
         :param session_id: Owning session/conversation id.
         :returns: List of deleted file ids for artifact cleanup.
         """
-        with self._session() as session:
+        with self._session("delete_session_files") as session:
             stmt = select(SqlFile).where(
                 SqlFile.workspace_id == current_workspace_id(),
                 SqlFile.session_id == session_id,
             )
-            rows = list(session.execute(stmt).scalars().all())
+            with query_name_scope("omnigent.file_store.list_session_files_for_delete"):
+                rows = list(session.execute(stmt).scalars().all())
             ids = [row.id for row in rows]
             for row in rows:
                 session.delete(row)

@@ -276,6 +276,39 @@ class TestBridge:
         assert payload["mcpServers"]["omnigent"]["command"] == "python-test"
         assert json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))["token"]
 
+    def test_write_mcp_config_preserves_user_servers(self, tmp_path: Path) -> None:
+        workspace = tmp_path / "workspace"
+        cursor_dir = workspace / ".cursor"
+        cursor_dir.mkdir(parents=True)
+        (cursor_dir / "mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {"atlassian": {"command": "atlassian-mcp"}},
+                    "someOtherKey": {"keep": True},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        path = write_mcp_config(workspace, tmp_path / "bridge", python_executable="python-test")
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["mcpServers"]["atlassian"] == {"command": "atlassian-mcp"}
+        assert payload["mcpServers"]["omnigent"]["command"] == "python-test"
+        assert payload["someOtherKey"] == {"keep": True}
+
+    @pytest.mark.parametrize("body", ["[]", "null", '"text"', '{"mcpServers": null}', "not json"])
+    def test_write_mcp_config_survives_malformed_config(self, tmp_path: Path, body: str) -> None:
+        workspace = tmp_path / "workspace"
+        cursor_dir = workspace / ".cursor"
+        cursor_dir.mkdir(parents=True)
+        (cursor_dir / "mcp.json").write_text(body, encoding="utf-8")
+
+        path = write_mcp_config(workspace, tmp_path / "bridge", python_executable="python-test")
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["mcpServers"]["omnigent"]["command"] == "python-test"
+
     def test_write_mcp_bridge_config_is_idempotent(self, tmp_path: Path) -> None:
         write_mcp_bridge_config(tmp_path)
         first = (tmp_path / "bridge.json").read_text(encoding="utf-8")

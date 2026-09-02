@@ -1,4 +1,5 @@
 import {
+  FolderDotIcon,
   FolderIcon,
   FolderPlusIcon,
   FileIcon,
@@ -10,19 +11,53 @@ import {
   XIcon,
   AlertTriangleIcon,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import { Spinner } from "@/components/ui/spinner";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useCreateHostDirectory, useHostFilesystem } from "@/hooks/useHostFilesystem";
+
+/** True for Windows drive-letter paths such as `C:/Users/me` or `C:\\Users\\me`. */
+export function isWindowsDrivePath(path: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(path);
+}
+
+function sameHostDirectory(a: string, b: string): boolean {
+  if (isWindowsDrivePath(a) && isWindowsDrivePath(b)) {
+    return a.replace(/\\/g, "/").toLowerCase() === b.replace(/\\/g, "/").toLowerCase();
+  }
+  return a === b;
+}
+
+/**
+ * True when the path is already an absolute host path: POSIX ``/…``
+ * or a Windows drive path (``C:\…`` / ``C:/…``).
+ */
+export function isHostAbsolutePath(path: string): boolean {
+  return path.startsWith("/") || isWindowsDrivePath(path);
+}
+
+function lastSeparatorIndex(path: string): number {
+  if (isWindowsDrivePath(path)) {
+    return Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  }
+  return path.lastIndexOf("/");
+}
+
+function separatorOf(path: string): "/" | "\\" {
+  return path.includes("\\") && !path.slice(path.indexOf(":") + 1).includes("/") ? "\\" : "/";
+}
 
 /**
  * Join a directory path and a new child name into an absolute path.
  *
  * Handles the filesystem root (``"/"`` + ``"foo"`` → ``"/foo"`` rather
  * than ``"//foo"``) and trims a trailing slash off the parent so a
- * typed ``"/Users/me/"`` still produces ``"/Users/me/foo"``. The child
- * name is trimmed; surrounding/duplicate slashes in it are left to the
- * host to resolve.
+ * typed ``"/Users/me/"`` still produces ``"/Users/me/foo"``. Windows
+ * drive roots (``C:\``) join with a backslash. The child name is
+ * trimmed; surrounding/duplicate slashes in it are left to the host
+ * to resolve.
  *
  * @param dir Absolute parent directory, e.g. ``"/Users/me"`` or ``"/"``.
  * @param name New child name, e.g. ``"new-app"``.
@@ -33,8 +68,15 @@ export function joinPath(dir: string, name: string): string {
   if (dir === "/") {
     return `/${trimmedName}`;
   }
-  const base = dir.endsWith("/") ? dir.slice(0, -1) : dir;
-  return `${base}/${trimmedName}`;
+  if (/^[A-Za-z]:[\\/]?$/.test(dir)) {
+    const sep = dir.includes("\\") || dir.endsWith("\\") ? "\\" : "/";
+    const root = dir.length === 2 ? `${dir}${sep}` : dir.endsWith(sep) ? dir : `${dir}${sep}`;
+    return `${root}${trimmedName}`;
+  }
+  const sep = separatorOf(dir);
+  const base =
+    dir.endsWith("/") || (isWindowsDrivePath(dir) && dir.endsWith("\\")) ? dir.slice(0, -1) : dir;
+  return `${base}${sep}${trimmedName}`;
 }
 
 /**
@@ -42,7 +84,7 @@ export function joinPath(dir: string, name: string): string {
  *
  * Returns ``null`` when the input is empty (host's home view —
  * has no parent in the picker's UX) or already at the root
- * ``"/"``. Otherwise drops the last segment.
+ * ``"/"`` / ``C:\``. Otherwise drops the last segment.
  *
  * @param absolutePath Absolute path or empty string.
  * @returns Parent path, or ``null`` if there is no further parent.
@@ -51,9 +93,25 @@ export function parentOf(absolutePath: string): string | null {
   if (absolutePath === "" || absolutePath === "/") {
     return null;
   }
-  const stripped = absolutePath.endsWith("/") ? absolutePath.slice(0, -1) : absolutePath;
-  const idx = stripped.lastIndexOf("/");
-  if (idx <= 0) {
+  if (/^[A-Za-z]:[\\/]?$/.test(absolutePath)) {
+    return null;
+  }
+  const stripped =
+    absolutePath.endsWith("/") || (isWindowsDrivePath(absolutePath) && absolutePath.endsWith("\\"))
+      ? absolutePath.slice(0, -1)
+      : absolutePath;
+  if (/^[A-Za-z]:$/.test(stripped)) {
+    return null;
+  }
+  const idx = lastSeparatorIndex(stripped);
+  if (idx < 0) {
+    return null;
+  }
+  // ``C:\Users`` → ``C:\`` (keep the drive root, never POSIX ``/``).
+  if (isWindowsDrivePath(stripped) && idx === 2) {
+    return stripped.slice(0, 3);
+  }
+  if (idx === 0) {
     return "/";
   }
   return stripped.slice(0, idx);
@@ -64,17 +122,10 @@ export function parentOf(absolutePath: string): string | null {
  *
  * Trims whitespace, expands a leading ``~`` against the resolved
  * home directory, collapses runs of slashes, and drops a trailing
- * slash (except on the root ``"/"``). Returns ``null`` for empty
- * or invalid inputs (which the caller treats as "ignore — keep
- * the current path"). The picker never turns a typed path into
- * the empty string; "go home" is its own gesture (clicking the
- * Home breadcrumb).
- *
- * Tilde-only (``"~"``) and ``"~/foo"`` are expanded to
- * ``home`` and ``home + "/foo"`` respectively. If ``home`` is
- * ``null`` (we haven't resolved it yet from the first listing),
- * tilde input is rejected so the user isn't sent to the wrong
- * place. Bare ``~user`` form is not supported.
+ * slash (except on the root ``"/"`` / ``C:\``). Returns ``null`` for
+ * empty or invalid inputs (which the caller treats as "ignore —
+ * keep the current path"). Windows drive-letter paths are accepted
+ * as already-absolute.
  *
  * @param input Whatever the user typed, e.g.
  *   ``"  /Users//corey/  "`` or ``"~/projects"``.
@@ -90,27 +141,28 @@ export function normalizeTypedPath(input: string, home: string | null = null): s
   }
   let absolute: string;
   if (trimmed === "~") {
-    // Bare tilde — go home if we know where that is.
     if (home === null) return null;
     absolute = home;
-  } else if (trimmed.startsWith("~/")) {
-    // ~/foo → <home>/foo. Reject when home isn't resolved yet.
+  } else if (trimmed.startsWith("~/") || (home !== null && trimmed.startsWith("~\\"))) {
     if (home === null) return null;
-    absolute = `${home}/${trimmed.slice(2)}`;
-  } else if (trimmed.startsWith("/")) {
+    absolute = joinPath(home, trimmed.slice(2));
+  } else if (isHostAbsolutePath(trimmed)) {
     absolute = trimmed;
   } else {
-    // Relative paths and ~user forms are not supported — the host
-    // endpoint requires absolute paths.
     return null;
   }
-  // Collapse runs of slashes ("//" → "/") so a typo doesn't
-  // produce a path the host can't list.
+  if (isWindowsDrivePath(absolute) || absolute.startsWith("\\\\")) {
+    const sep = separatorOf(absolute);
+    const collapsed = absolute.replace(/[\\/]+/g, sep);
+    if (/^[A-Za-z]:[\\/]$/.test(collapsed)) {
+      return collapsed;
+    }
+    return collapsed.endsWith(sep) ? collapsed.slice(0, -1) : collapsed;
+  }
   const collapsed = absolute.replace(/\/+/g, "/");
   if (collapsed === "/") {
     return "/";
   }
-  // Drop trailing slash so parent calc stays stable.
   return collapsed.endsWith("/") ? collapsed.slice(0, -1) : collapsed;
 }
 
@@ -130,8 +182,18 @@ export function basename(absolutePath: string): string {
   if (absolutePath === "/") {
     return "/";
   }
-  const parts = absolutePath.split("/").filter((p) => p.length > 0);
-  return parts[parts.length - 1] ?? absolutePath;
+  if (/^[A-Za-z]:[\\/]?$/.test(absolutePath)) {
+    return absolutePath.length >= 3 ? absolutePath.slice(0, 3) : `${absolutePath}\\`;
+  }
+  const stripped =
+    absolutePath.endsWith("/") || (isWindowsDrivePath(absolutePath) && absolutePath.endsWith("\\"))
+      ? absolutePath.slice(0, -1)
+      : absolutePath;
+  const sepIdx = lastSeparatorIndex(stripped);
+  if (sepIdx < 0) {
+    return stripped;
+  }
+  return stripped.slice(sepIdx + 1);
 }
 
 /**
@@ -145,25 +207,14 @@ export function basename(absolutePath: string): string {
  */
 export function isNavigablePath(path: string): boolean {
   const trimmed = path.trim();
-  return trimmed.startsWith("/") || trimmed === "~" || trimmed.startsWith("~/");
+  return (
+    isHostAbsolutePath(trimmed) ||
+    trimmed === "~" ||
+    trimmed.startsWith("~/") ||
+    trimmed.startsWith("~\\")
+  );
 }
 
-/**
- * Live filter for the listing, derived from the path-bar text.
- *
- * Returns the fragment to match the current directory's entries against
- * (case-insensitive prefix), or ``null`` when the text isn't filtering the
- * current directory — it's blank, it's exactly the current path, or it's a
- * path into a *different* directory the user is navigating to (Enter jumps
- * there). Mirrors shell tab-completion: a bare fragment (``"pro"``) or a
- * trailing segment under the current dir (``"/Users/me/pro"``) narrows the
- * list; anything else leaves it whole.
- *
- * @param pathInput Raw path-bar text, e.g. ``"pro"`` or ``"/Users/me/pro"``.
- * @param currentAbsolute Absolute path of the directory currently shown.
- * @param home Resolved home dir (for ``~`` expansion), or ``null``.
- * @returns The fragment to filter by, or ``null`` for no filter.
- */
 export function listingFilter(
   pathInput: string,
   currentAbsolute: string,
@@ -171,7 +222,7 @@ export function listingFilter(
 ): string | null {
   const trimmed = pathInput.trim();
   if (trimmed === "") return null;
-  const slash = trimmed.lastIndexOf("/");
+  const slash = lastSeparatorIndex(trimmed);
   if (slash === -1) {
     // Bare fragment, no directory part → filter the current dir by it.
     return trimmed;
@@ -180,8 +231,75 @@ export function listingFilter(
   if (partial === "") return null; // "<dir>/" — nothing typed past the slash.
   // A fragment only filters when its directory part IS the current directory;
   // otherwise the user is typing a path elsewhere (navigation, not a filter).
-  const dirText = trimmed.slice(0, slash) || "/";
-  return normalizeTypedPath(dirText, home) === currentAbsolute ? partial : null;
+  const dirText =
+    trimmed.slice(0, slash) || (isWindowsDrivePath(trimmed) ? trimmed.slice(0, 3) : "/");
+  const normalizedDir = normalizeTypedPath(dirText, home);
+  if (normalizedDir === null) return null;
+  return sameHostDirectory(normalizedDir, currentAbsolute) ? partial : null;
+}
+
+/**
+ * Icon button in the picker header, with a styled hover tooltip.
+ *
+ * The tooltip hangs off a wrapping span rather than the button so it still
+ * appears while the button is *disabled* — that is exactly when a user is
+ * most likely to hover asking "what is this, and why can't I click it?".
+ * A disabled button receives no pointer events of its own.
+ *
+ * @param label Tooltip text, also the accessible name.
+ * @param icon Rendered glyph.
+ * @param onClick Activation handler.
+ * @param disabled Whether the action is unavailable.
+ * @param testId ``data-testid`` for the button.
+ */
+function PickerIconButton({
+  label,
+  icon,
+  onClick,
+  disabled = false,
+  testId,
+}: {
+  label: string;
+  icon: ReactNode;
+  onClick: () => void;
+  disabled?: boolean;
+  testId: string;
+}) {
+  return (
+    // Provides its own context so the button works wherever it is rendered --
+    // the picker is mounted in dialogs and popovers, and in tests, not only
+    // under the app-root provider. Mirrors FilesPanel's hidden-files toggle.
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger
+          asChild
+          // Opening the picker focuses its first button, and Radix pops a
+          // tooltip on any focus — a label thrown over the listing nobody asked
+          // for. Only a keyboard focus ring reveals it (Radix skips its own
+          // handler once the event's default is prevented).
+          onFocus={(event) => {
+            if (!(event.target as HTMLElement).matches(":focus-visible")) {
+              event.preventDefault();
+            }
+          }}
+        >
+          <span className="shrink-0">
+            <button
+              type="button"
+              onClick={onClick}
+              disabled={disabled}
+              aria-label={label}
+              className="block rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-30"
+              data-testid={testId}
+            >
+              {icon}
+            </button>
+          </span>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">{label}</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
 }
 
 interface WorkspacePickerProps {
@@ -221,6 +339,15 @@ interface WorkspacePickerProps {
    * disables the banner entirely.
    */
   occupancyForPath?: (absolutePath: string) => number;
+  /**
+   * Absolute path of the session's workspace, e.g.
+   * ``"/Users/corey/repo"``. When set, a "back to workspace" button appears
+   * beside Home so a user who has wandered off can return in one click.
+   * Omit where there is no workspace yet — the new-session / fork / project
+   * dialogs are *choosing* one, so for them Home (``~``) is the only
+   * meaningful anchor.
+   */
+  workspacePath?: string;
 }
 
 /**
@@ -251,6 +378,7 @@ export function WorkspacePicker({
   onNavigate,
   initialPath,
   occupancyForPath,
+  workspacePath,
 }: WorkspacePickerProps) {
   // "" means home — the server forwards ~ to list_dir. initialPath
   // seeds the start dir (read once at mount).
@@ -291,29 +419,31 @@ export function WorkspacePicker({
 
   const { data, isLoading, error, isPlaceholderData } = useHostFilesystem(hostId, path);
 
-  // Once the home listing comes back, derive the home dir's
-  // absolute path from the first entry's parent. Only first
-  // entry — they all share the same parent. Skip placeholder data
-  // (the prior directory kept on screen during a load) or we'd
-  // derive home from the wrong directory's entries.
+  // Resolve the host's home dir independently of where the picker is
+  // browsing, so a typed "~"-relative path can be expanded even when the
+  // picker opened straight at an absolute initialPath and thus never visits
+  // the "" home view. The query fires at mount and disables once home
+  // resolves; when the picker IS at the home view it shares the main
+  // listing's query key, so this adds no extra fetch there. An empty home
+  // has no entry to derive from and stays unresolved (the picker still
+  // opens onto it fine, and "~" typing is moot in an empty home).
+  const { data: homeData, isPlaceholderData: homeIsPlaceholder } = useHostFilesystem(
+    hostId,
+    resolvedHome === null ? "" : null,
+  );
+
+  // Derive the home dir's absolute path from the first entry's parent (all
+  // entries share one parent). Skip placeholder data (the prior directory
+  // kept on screen during a load) or we'd derive home from the wrong dir.
   useEffect(() => {
-    if (
-      path === "" &&
-      resolvedHome === null &&
-      !isPlaceholderData &&
-      data &&
-      data.entries.length > 0
-    ) {
-      const first = data.entries[0];
-      // first.path is "/Users/corey/x" → parent is "/Users/corey".
-      const idx = first.path.lastIndexOf("/");
-      if (idx > 0) {
-        setResolvedHome(first.path.slice(0, idx));
-      } else if (idx === 0) {
-        setResolvedHome("/");
-      }
+    if (resolvedHome !== null || homeIsPlaceholder || !homeData || homeData.entries.length === 0) {
+      return;
     }
-  }, [path, resolvedHome, data, isPlaceholderData]);
+    const parent = parentOf(homeData.entries[0].path);
+    if (parent !== null) {
+      setResolvedHome(parent);
+    }
+  }, [resolvedHome, homeData, homeIsPlaceholder]);
 
   // Absolute path of the directory currently shown, derived from the
   // first entry's parent (entries share one parent). This is how a ""
@@ -328,13 +458,13 @@ export function WorkspacePicker({
   // as-is; "" (home) or a "~"-relative path uses the absolute the host
   // resolved it to, falling back to the raw path until the listing
   // arrives (so the breadcrumb stays put rather than flashing empty).
-  const currentAbsolute = path.startsWith("/") ? path : (listedAbsolute ?? path);
+  const currentAbsolute = isHostAbsolutePath(path) ? path : (listedAbsolute ?? path);
 
   // Other live agents working in the directory currently shown. Only a
   // resolved absolute path can match a stored workspace; the home view ("")
   // and unresolved paths report no conflict.
   const occupiedCount =
-    occupancyForPath && currentAbsolute.startsWith("/") ? occupancyForPath(currentAbsolute) : 0;
+    occupancyForPath && isHostAbsolutePath(currentAbsolute) ? occupancyForPath(currentAbsolute) : 0;
 
   // Mirror navigation into the path input so it reflects where the
   // listing came from (the user can still overwrite it). Skip while
@@ -351,7 +481,7 @@ export function WorkspacePicker({
   const onNavigateRef = useRef(onNavigate);
   onNavigateRef.current = onNavigate;
   useEffect(() => {
-    if (currentAbsolute.startsWith("/")) {
+    if (isHostAbsolutePath(currentAbsolute)) {
       onNavigateRef.current?.(currentAbsolute);
     }
   }, [currentAbsolute]);
@@ -416,7 +546,7 @@ export function WorkspacePicker({
   // listing has loaded, otherwise creating the first folder in an empty
   // home would be impossible. Stays null while loading so the button is
   // disabled until we know what home resolves to.
-  const createBaseDir = currentAbsolute.startsWith("/")
+  const createBaseDir = isHostAbsolutePath(currentAbsolute)
     ? currentAbsolute
     : path === "" && !isLoading && !isPlaceholderData
       ? "~"
@@ -458,27 +588,28 @@ export function WorkspacePicker({
       data-testid="workspace-picker"
     >
       <div className="flex shrink-0 items-center gap-1.5 border-b px-2 py-1.5">
-        <button
-          type="button"
+        <PickerIconButton
+          label="Up one level"
+          icon={<ArrowUpIcon className="size-4" />}
           onClick={() => parent !== null && navigateTo(parent)}
           disabled={parent === null}
-          aria-label="Up one level"
-          title="Up one level"
-          className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-30"
-          data-testid="workspace-picker-up"
-        >
-          <ArrowUpIcon className="size-4" />
-        </button>
-        <button
-          type="button"
+          testId="workspace-picker-up"
+        />
+        {workspacePath !== undefined && (
+          <PickerIconButton
+            label="Workspace root"
+            icon={<FolderDotIcon className="size-4" />}
+            onClick={() => navigateTo(workspacePath)}
+            disabled={currentAbsolute === workspacePath}
+            testId="workspace-picker-workspace"
+          />
+        )}
+        <PickerIconButton
+          label="Home"
+          icon={<HomeIcon className="size-4" />}
           onClick={() => navigateTo("")}
-          aria-label="Home"
-          title="Home"
-          className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-          data-testid="workspace-picker-home"
-        >
-          <HomeIcon className="size-4" />
-        </button>
+          testId="workspace-picker-home"
+        />
         <input
           type="text"
           value={pathInput}
@@ -497,31 +628,22 @@ export function WorkspacePicker({
           spellCheck={false}
           autoCapitalize="off"
           autoCorrect="off"
-          className="min-w-0 flex-1 bg-transparent text-xs text-muted-foreground focus:outline-none"
+          className="min-w-0 flex-1 bg-transparent text-sm text-muted-foreground focus:outline-none"
           data-testid="workspace-picker-path-input"
         />
-        <button
-          type="button"
+        <PickerIconButton
+          label={showHidden ? "Hide hidden files" : "Show hidden files"}
+          icon={showHidden ? <EyeIcon className="size-4" /> : <EyeOffIcon className="size-4" />}
           onClick={() => setShowHidden((v) => !v)}
-          aria-label={showHidden ? "Hide hidden" : "Show hidden"}
-          aria-pressed={showHidden}
-          title={showHidden ? "Hide hidden" : "Show hidden"}
-          className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-          data-testid="workspace-picker-show-hidden"
-        >
-          {showHidden ? <EyeIcon className="size-4" /> : <EyeOffIcon className="size-4" />}
-        </button>
-        <button
-          type="button"
+          testId="workspace-picker-show-hidden"
+        />
+        <PickerIconButton
+          label="New folder"
+          icon={<FolderPlusIcon className="size-4" />}
           onClick={openNewFolder}
           disabled={!canCreateFolder}
-          aria-label="New folder"
-          title="New folder"
-          className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-30"
-          data-testid="workspace-picker-new-folder"
-        >
-          <FolderPlusIcon className="size-4" />
-        </button>
+          testId="workspace-picker-new-folder"
+        />
         {onSelect && (
           <Button
             type="button"
@@ -537,16 +659,12 @@ export function WorkspacePicker({
           </Button>
         )}
         {onClose && (
-          <button
-            type="button"
+          <PickerIconButton
+            label="Close"
+            icon={<XIcon className="size-4" />}
             onClick={onClose}
-            aria-label="Close"
-            title="Close"
-            className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-            data-testid="workspace-picker-close"
-          >
-            <XIcon className="size-4" />
-          </button>
+            testId="workspace-picker-close"
+          />
         )}
       </div>
       {newFolderName !== null && (
@@ -558,8 +676,7 @@ export function WorkspacePicker({
             <FolderPlusIcon className="size-4 shrink-0 text-muted-foreground" />
             <input
               type="text"
-              // eslint-disable-next-line jsx-a11y/no-autofocus -- focus belongs on
-              // the field the user just opened; the picker is already a focus trap.
+              // Focus belongs on the field the user just opened; the picker is already a focus trap.
               autoFocus
               value={newFolderName}
               onChange={(e) => {
@@ -579,7 +696,7 @@ export function WorkspacePicker({
               spellCheck={false}
               autoCapitalize="off"
               autoCorrect="off"
-              className="min-w-0 flex-1 bg-transparent text-xs text-foreground focus:outline-none"
+              className="min-w-0 flex-1 bg-transparent text-sm text-foreground focus:outline-none"
               data-testid="workspace-picker-new-folder-input"
             />
             <button
@@ -591,7 +708,11 @@ export function WorkspacePicker({
               className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-30"
               data-testid="workspace-picker-new-folder-create"
             >
-              <CheckIcon className="size-4" />
+              {createDir.isPending ? (
+                <Spinner className="size-4" />
+              ) : (
+                <CheckIcon className="size-4" />
+              )}
             </button>
             <button
               type="button"
@@ -606,7 +727,7 @@ export function WorkspacePicker({
           </div>
           {createError !== null && (
             <span
-              className="text-xs text-destructive"
+              className="text-sm text-destructive"
               data-testid="workspace-picker-new-folder-error"
             >
               {createError}
@@ -616,7 +737,7 @@ export function WorkspacePicker({
       )}
       {occupiedCount > 0 && (
         <div
-          className="flex shrink-0 items-start gap-1.5 border-b bg-warning/10 px-3 py-2 text-xs text-warning"
+          className="flex shrink-0 items-start gap-1.5 border-b bg-warning/10 px-3 py-2 text-sm text-warning"
           data-testid="workspace-picker-conflict"
         >
           <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
@@ -628,14 +749,14 @@ export function WorkspacePicker({
         </div>
       )}
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {isLoading && <div className="px-3 py-3 text-xs text-muted-foreground">Loading…</div>}
+        {isLoading && <div className="px-3 py-3 text-sm text-muted-foreground">Loading…</div>}
         {error !== null && error !== undefined && !isLoading && (
-          <div className="px-3 py-3 text-xs text-destructive" data-testid="workspace-picker-error">
+          <div className="px-3 py-3 text-sm text-destructive" data-testid="workspace-picker-error">
             {error instanceof Error ? error.message : "Failed to load directory"}
           </div>
         )}
         {!isLoading && error === null && entries.length === 0 && (
-          <div className="px-3 py-3 text-xs text-muted-foreground">
+          <div className="px-3 py-3 text-sm text-muted-foreground">
             {activeFilter !== null ? "No matching entries" : "(empty directory)"}
           </div>
         )}
@@ -653,7 +774,7 @@ export function WorkspacePicker({
               onMouseDown={(e) => e.preventDefault()}
               onClick={() => isDir && navigateTo(entry.path)}
               className={
-                "flex w-full items-center gap-2 border-b px-3 py-2 text-left text-xs last:border-b-0 " +
+                "flex w-full items-center gap-2 border-b px-3 py-2 text-left text-sm last:border-b-0 " +
                 (isDir
                   ? "hover:bg-accent hover:text-accent-foreground cursor-pointer"
                   : "text-muted-foreground cursor-not-allowed")
@@ -667,7 +788,7 @@ export function WorkspacePicker({
         })}
         {data?.truncated && (
           <div
-            className="px-3 py-2 text-xs text-muted-foreground"
+            className="px-3 py-2 text-sm text-muted-foreground"
             data-testid="workspace-picker-truncated"
           >
             Too many entries to list fully — type a path above to jump directly.

@@ -25,6 +25,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from omnigent.entities import (
     FunctionCallOutputData,
     MessageData,
@@ -35,6 +37,7 @@ from omnigent.repl._session_log import (
     default_log_path,
     write_session_log_from_store,
 )
+from omnigent.stores.conversation_store import ConversationNotFoundError
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -160,6 +163,22 @@ def test_write_session_log_from_store_dumps_basic_conversation(
     user_item, assistant_item = payload["conversation"]["items"]
     assert user_item["data"]["role"] == "user"
     assert assistant_item["data"]["role"] == "assistant"
+
+
+def test_write_session_log_from_store_rejects_missing_conversation(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    missing_id = "0" * 32
+
+    with pytest.raises(ConversationNotFoundError, match=missing_id):
+        write_session_log_from_store(
+            conv_store,
+            missing_id,
+            agent_name="missing_agent",
+            log_dir=tmp_path,
+        )
 
 
 def test_write_session_log_from_store_pages_long_conversations(

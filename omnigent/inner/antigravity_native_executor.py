@@ -82,6 +82,7 @@ from omnigent.inner.executor import (
     Message,
     ToolSpec,
     TurnComplete,
+    describe_exception,
 )
 from omnigent.llms.errors import PermanentLLMError
 from omnigent.reasoning_effort import ANTIGRAVITY_EFFORTS, validate_effort_or_llm_error
@@ -231,7 +232,7 @@ class AntigravityNativeExecutor(Executor):
             try:
                 validate_effort_or_llm_error(effort, "antigravity", ANTIGRAVITY_EFFORTS)
             except PermanentLLMError as exc:
-                yield ExecutorError(message=str(exc))
+                yield ExecutorError(message=describe_exception(exc))
                 return
         text = _latest_user_text(messages, self._bridge_dir)
         if not text:

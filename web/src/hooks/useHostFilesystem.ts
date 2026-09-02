@@ -55,11 +55,26 @@ export function buildHostFilesystemUrl(hostId: string, absolutePath: string): st
   if (absolutePath === "") {
     return base;
   }
+  if (absolutePath === "/") {
+    // Browsing exactly "/" must hit /filesystem/ (with trailing
+    // slash) to match the {path:path} route. Without the trailing
+    // slash we'd hit the no-path route which forwards ~ instead.
+    return `${base}/`;
+  }
+  // Windows drive and UNC paths are already absolute. Encode each
+  // segment after normalizing backslashes so FastAPI captures
+  // ``C:/Users/me`` (not ``/C:/Users/me``).
+  if (/^[A-Za-z]:[\\/]/.test(absolutePath) || absolutePath.startsWith("\\\\")) {
+    const normalized = absolutePath.replace(/\\/g, "/");
+    const encoded = normalized
+      .split("/")
+      .map((segment) => encodeURIComponent(segment))
+      .join("/");
+    return `${base}/${encoded}`;
+  }
   // Strip the single leading slash; the route handler re-adds it.
   const stripped = absolutePath.startsWith("/") ? absolutePath.slice(1) : absolutePath;
   if (stripped === "") {
-    // The user navigated to "/" exactly. Keep a trailing slash so
-    // the route still matches /filesystem/{path:path}.
     return `${base}/`;
   }
   const encoded = stripped
@@ -71,6 +86,61 @@ export function buildHostFilesystemUrl(hostId: string, absolutePath: string): st
 
 interface FetchError extends Error {
   status?: number;
+}
+
+// The directory listing inherits React Query's default retry count for
+// transient failures; 4xx responses opt out of it (see
+// ``shouldRetryHostFilesystem``).
+const MAX_LIST_RETRIES = 3;
+
+/**
+ * Build a human-readable error for a failed directory listing.
+ *
+ * A 404 means the path doesn't exist (or isn't a directory) — the common case
+ * when a user types a bad path into the picker — so it gets a plain "doesn't
+ * exist" message naming the path instead of a bare status code. Other failures
+ * use the server's ``detail`` when present, else fall back to the status code.
+ *
+ * @param res Non-OK response from a listing request.
+ * @param path The path that was being listed, for the 404 message.
+ * @returns The message to attach to the thrown ``FetchError``.
+ */
+async function describeListError(res: Response, path: string): Promise<string> {
+  if (res.status === 404) {
+    const where = path === "" || path === "~" ? "That directory" : path;
+    return `${where} doesn't exist on this host (or isn't a directory).`;
+  }
+  // Host offline / timed out (409/502/504) or another failure — surface the
+  // server's detail so the user sees why, else fall back to the status code.
+  let detail: string | null;
+  try {
+    const body = (await res.json()) as { detail?: string };
+    detail = typeof body.detail === "string" && body.detail !== "" ? body.detail : null;
+  } catch {
+    detail = null;
+  }
+  return detail ?? `Couldn't list the directory (HTTP ${res.status}).`;
+}
+
+/**
+ * React Query retry predicate for the directory listing.
+ *
+ * 4xx responses are deterministic (missing path, bad path, not the owner), so
+ * retrying them just delays the error behind the stale placeholder listing the
+ * picker keeps on screen while a query is pending. Skip retries for those and
+ * let the error surface immediately; retry only transient failures (5xx,
+ * network) up to the default cap, matching the untuned default's 3 retries.
+ *
+ * @param failureCount Number of failures so far (0 on the first failure).
+ * @param error The thrown error; a ``FetchError`` carries the HTTP ``status``.
+ * @returns Whether React Query should retry the request.
+ */
+export function shouldRetryHostFilesystem(failureCount: number, error: Error): boolean {
+  const status = (error as FetchError).status;
+  if (status !== undefined && status >= 400 && status < 500) {
+    return false;
+  }
+  return failureCount < MAX_LIST_RETRIES;
 }
 
 /**
@@ -126,7 +196,7 @@ async function fetchHostFilesystem(hostId: string, path: string): Promise<HostDi
     const sep = baseUrl.includes("?") ? "&" : "?";
     const res = await authenticatedFetch(`${baseUrl}${sep}${params.toString()}`);
     if (!res.ok) {
-      const err: FetchError = new Error(`host filesystem fetch failed: HTTP ${res.status}`);
+      const err: FetchError = new Error(await describeListError(res, path));
       err.status = res.status;
       throw err;
     }
@@ -174,6 +244,11 @@ export function useHostFilesystem(hostId: string | null, path: string | null) {
     // loads, so navigating up/into a folder doesn't flicker through
     // an empty "Loading…" collapse.
     placeholderData: (prev) => prev,
+    // Don't retry a 4xx (e.g. a typed path that doesn't exist): retries keep
+    // the query pending, so the placeholder above would leave the previous
+    // directory's rows on screen instead of surfacing the error. Transient
+    // failures still retry.
+    retry: shouldRetryHostFilesystem,
   });
 }
 
@@ -208,7 +283,7 @@ export async function checkHostDirectory(hostId: string, path: string): Promise<
   }
   // Host offline / timed out (502/504) or another server failure —
   // surface its detail so the user sees why the check failed.
-  let detail: string | null = null;
+  let detail: string | null;
   try {
     const body = (await res.json()) as { detail?: string };
     detail = typeof body.detail === "string" && body.detail !== "" ? body.detail : null;
@@ -216,6 +291,25 @@ export async function checkHostDirectory(hostId: string, path: string): Promise<
     detail = null;
   }
   return detail ?? `Couldn't verify the working directory (HTTP ${res.status}).`;
+}
+
+/**
+ * Whether a host path is 404-missing, as opposed to every other pre-flight
+ * problem (exists-but-unlistable, host offline, network error).
+ *
+ * The fork dialog uses this to distinguish "the source's worktree directory
+ * was deleted — recreatable at the same path/branch" from problems where
+ * falling back to worktree creation would be wrong.
+ */
+export async function hostDirectoryMissing(hostId: string, path: string): Promise<boolean> {
+  const baseUrl = buildHostFilesystemUrl(hostId, path);
+  const sep = baseUrl.includes("?") ? "&" : "?";
+  try {
+    const res = await authenticatedFetch(`${baseUrl}${sep}limit=1`);
+    return res.status === 404;
+  } catch {
+    return false;
+  }
 }
 
 /** Shape returned by ``POST /v1/hosts/{id}/directories``. */

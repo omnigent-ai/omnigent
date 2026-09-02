@@ -43,6 +43,21 @@ class ModelWireAPI(str, Enum):
     BEDROCK_CONVERSE = "bedrock-converse"
 
 
+class ModelReasoningMode(str, Enum):
+    """Provider-neutral reasoning controls accepted by a model."""
+
+    ADAPTIVE = "adaptive"
+    FIXED_BUDGET = "fixed-budget"
+
+
+@dataclass(frozen=True)
+class ModelReasoningMetadata:
+    """Known reasoning modes and effort levels for one model."""
+
+    modes: frozenset[ModelReasoningMode] = frozenset()
+    efforts: frozenset[str] = frozenset()
+
+
 @dataclass(frozen=True)
 class ModelMetadata:
     """Normalized, provider-neutral facts about one model.
@@ -57,8 +72,10 @@ class ModelMetadata:
     supported_capabilities: frozenset[ModelCapability] = frozenset()
     unsupported_capabilities: frozenset[ModelCapability] = frozenset()
     context_window: int | None = None
+    max_output_tokens: int | None = None
     cost_tier: ModelCostTier | None = None
     wire_apis: frozenset[ModelWireAPI] = frozenset()
+    reasoning: ModelReasoningMetadata | None = None
 
     def __post_init__(self) -> None:
         overlap = self.supported_capabilities & self.unsupported_capabilities
@@ -67,6 +84,8 @@ class ModelMetadata:
             raise ValueError(f"capabilities cannot be both supported and unsupported: {names}")
         if self.context_window is not None and self.context_window <= 0:
             raise ValueError("context_window must be positive")
+        if self.max_output_tokens is not None and self.max_output_tokens <= 0:
+            raise ValueError("max_output_tokens must be positive")
 
     def supports(self, capability: ModelCapability) -> bool | None:
         """Return known support for *capability*, or ``None`` when unknown."""

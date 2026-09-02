@@ -59,6 +59,7 @@ import hashlib
 import json
 import logging
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Protocol
 
 from omnigent.antigravity_native_rpc import (
@@ -137,16 +138,42 @@ class Deliver(Protocol):
 InjectTui = Callable[[list[str]], Awaitable[None]]
 
 
+def tui_injector_for(bridge_dir: Path) -> InjectTui:
+    """
+    Build an :class:`InjectTui` bound to an EXPLICIT bridge directory.
+
+    Preferred over :func:`_inject_via_tui` for any caller that already knows its
+    bridge dir. The runner-hosted reader does: it is handed ``bridge_dir`` and
+    runs inside the RUNNER process, which never carries the harness spawn env var
+    :func:`_inject_via_tui` resolves from — so the env-based default failed every
+    web approval and left agy's own prompt open in the pane.
+
+    :param bridge_dir: Native Antigravity bridge directory holding ``tmux.json``.
+    :returns: An :class:`InjectTui` that types the keys into that bridge's pane.
+    """
+
+    async def _inject(keys: list[str]) -> None:
+        # Lazy import: keep this module importable from the lightweight CLI
+        # process without eagerly pulling the bridge env helpers.
+        from omnigent.antigravity_native_bridge import send_interaction_keys_via_tui
+
+        await asyncio.to_thread(send_interaction_keys_via_tui, bridge_dir, *keys)
+
+    return _inject
+
+
 async def _inject_via_tui(keys: list[str]) -> None:
     """
     Default :class:`InjectTui`: type the verdict keys into the agy TUI pane.
 
+    Resolves the bridge directory from the HARNESS SPAWN ENV, so it only works in
+    a process that carries it. The runner-hosted reader does NOT — use
+    :func:`tui_injector_for` there and pass the bridge dir explicitly.
+
     Offloads the blocking tmux ``send-keys`` (via
     :func:`omnigent.antigravity_native_bridge.send_interaction_keys_via_tui`) to a
     worker thread — the same pattern :func:`_deliver_via_rpc` uses for the RPC —
-    so the async bridge does not stall the event loop. The bridge directory is
-    resolved from the harness spawn env (the reader/CLI both run with it set), so
-    this seam takes only the keys.
+    so the async bridge does not stall the event loop.
 
     A missing tmux target / exited pane raises ``RuntimeError`` from the bridge
     primitive; the caller logs it and proceeds (the RPC delivery already advanced

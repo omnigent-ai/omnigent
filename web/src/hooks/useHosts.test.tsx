@@ -345,7 +345,7 @@ describe("useInstallHarness + useInstallingHarnesses (concurrent installs)", () 
     );
     await waitFor(() => expect(result.current.installing.has("codex-native")).toBe(false));
     expect(result.current.installing.has("pi-native")).toBe(true); // Pi still going
-    const hosts = client.getQueryData<Array<{ configured_harnesses?: Record<string, unknown> }>>([
+    const hosts = client.getQueryData<{ configured_harnesses?: Record<string, unknown> }[]>([
       "hosts",
       { includeSandbox: false },
     ]);
@@ -355,7 +355,7 @@ describe("useInstallHarness + useInstallingHarnesses (concurrent installs)", () 
     // both harnesses' final readiness.
     pi.resolve(installResult("pi-native", { "codex-native": "needs-auth", "pi-native": true }));
     await waitFor(() => expect(result.current.installing.has("pi-native")).toBe(false));
-    const hosts2 = client.getQueryData<Array<{ configured_harnesses?: Record<string, unknown> }>>([
+    const hosts2 = client.getQueryData<{ configured_harnesses?: Record<string, unknown> }[]>([
       "hosts",
       { includeSandbox: false },
     ]);
@@ -462,7 +462,7 @@ describe("useStoreCredential", () => {
     result.current.mutate({ harness: "codex-native", kind: "key", secret: "sk" });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-    const hosts = client.getQueryData<Array<{ configured_harnesses?: Record<string, unknown> }>>([
+    const hosts = client.getQueryData<{ configured_harnesses?: Record<string, unknown> }[]>([
       "hosts",
       { includeSandbox: false },
     ]);

@@ -10,7 +10,7 @@
 #     under cwd but every ``sys_os_write`` / ``sys_os_edit`` /
 #     redirect-via-shell attempt is rejected with EPERM.
 #   - Top-level dotfiles / dotdirs under cwd (and under each
-#     ``read_paths`` root) are masked by default. ``.env``, ``.git/``,
+#     ``read_paths`` / ``write_paths`` root) are masked by default. ``.env``, ``.git/``,
 #     ``.aws/``, ``.ssh/`` at the root are unreadable inside the
 #     sandbox. Scanning is NON-recursive by default — a nested
 #     ``services/api/.env`` stays readable unless you opt into
@@ -140,11 +140,13 @@ os_env:
     # Python project layouts keep working. Matching is by basename at
     # any depth. Entries must be plain names — no ``/``, no ``..``,
     # no absolute paths (validated at spec parse time).
+    # Use ["*"] only for a trusted root that must preserve arbitrary
+    # agent-created dotpaths across helper invocations.
     # cwd_allow_hidden: [".venv", ".git", ".gitignore"]
 
     # Optional: recurse into subdirectories when masking dotfiles /
     # escaping symlinks. Default false — only the top level of cwd and
-    # each read_paths root is scanned, keeping the SBPL profile small
+    # each read_paths / write_paths root is scanned, keeping the SBPL profile small
     # and spawn fast on medium/large projects while still hiding the
     # top-level secrets. Set to true for untrusted trees where a
     # deeply-nested dotfile would be an unacceptable leak.

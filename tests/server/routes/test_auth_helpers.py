@@ -73,7 +73,6 @@ async def test_owner_gets_level_and_conversation(
         "the conversation must be returned so the snapshot can reuse it"
     )
     assert access.conversation.id == conv.id
-    assert access.can_approve is True
 
 
 @pytest.mark.asyncio
@@ -130,7 +129,6 @@ async def test_admin_allowed_and_bypasses_conversation_fetch(
     )
 
     assert access.level == LEVEL_OWNER
-    assert access.can_approve is True
     assert access.conversation is None, (
         "admin path must not fetch the conversation (it bypasses the lookup)"
     )
@@ -162,22 +160,6 @@ async def test_public_grant_allows_but_level_reports_user_grant(
     assert access.level == LEVEL_READ, (
         f"displayed level must be the user's own read grant, got {access.level}"
     )
-    assert access.can_approve is False, "public OWNER access must not confer approval authority"
-
-
-@pytest.mark.asyncio
-async def test_delegated_editor_gets_approval_authority(
-    perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
-) -> None:
-    """An editor's direct approval capability is returned to snapshot callers."""
-    conv = conv_store.create_conversation()
-    perm_store.ensure_user(ALICE)
-    perm_store.grant(ALICE, conv.id, LEVEL_EDIT, can_approve=True)
-
-    access = await require_access_and_level(ALICE, conv.id, LEVEL_EDIT, perm_store, conv_store)
-
-    assert access.level == LEVEL_EDIT
-    assert access.can_approve is True
 
 
 @pytest.mark.asyncio
@@ -205,7 +187,6 @@ async def test_sub_agent_delegates_access_to_parent(
     assert access.conversation.id == child.id, "snapshot reuses the sub-agent row"
     # Displayed level is the direct grant on the sub-agent (none granted).
     assert access.level is None, "displayed level is the sub-agent's own grant, which is None here"
-    assert access.can_approve is True, "sub-agents inherit approval authority from their parent"
 
 
 @pytest.mark.asyncio
@@ -219,7 +200,6 @@ async def test_permissions_disabled_returns_empty_access(
 
     assert access.level is None
     assert access.conversation is None
-    assert access.can_approve is None
 
 
 @pytest.mark.asyncio
@@ -248,3 +228,38 @@ async def test_missing_conversation_raises_404(
         )
 
     assert exc.value.code == ErrorCode.NOT_FOUND
+
+
+@pytest.mark.asyncio
+async def test_access_check_shares_a_single_pool_checkout(
+    perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
+) -> None:
+    """The permission resolve + conversation + metadata reads share one checkout.
+
+    On the per-streamed-event path this check re-runs for a session whose data
+    is stable for the turn, so the pool checkout (plus ``pool_pre_ping``) is the
+    cost that matters. The stores share one engine here, so the read burst must
+    collapse to a single checkout rather than one per store call.
+    """
+    from sqlalchemy import event
+
+    conv = conv_store.create_conversation()
+    perm_store.ensure_user(ALICE)
+    perm_store.grant(ALICE, conv.id, LEVEL_OWNER)
+
+    engine = conv_store._engine
+    checkouts: list[int] = []
+
+    def _on_checkout(_dbapi: object, _record: object, _proxy: object) -> None:
+        checkouts.append(1)
+
+    event.listen(engine, "checkout", _on_checkout)
+    try:
+        access = await require_access_and_level(ALICE, conv.id, LEVEL_READ, perm_store, conv_store)
+    finally:
+        event.remove(engine, "checkout", _on_checkout)
+
+    assert access.conversation is not None and access.conversation.id == conv.id
+    assert len(checkouts) == 1, (
+        f"the access-control read burst must share one checkout, got {len(checkouts)}"
+    )

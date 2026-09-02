@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 from abc import ABC, abstractmethod
 
 from omnigent.entities import PagedList, StoredFile
@@ -122,7 +123,7 @@ class FileStore(ABC):
         ...
 
     @abstractmethod
-    def delete_all_for_session(self, session_id: str) -> list[str]:
+    def delete_all_for_session(self, session_id: str) -> builtins.list[str]:
         """
         Delete all file metadata for a session.
 

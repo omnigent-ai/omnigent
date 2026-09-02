@@ -136,7 +136,7 @@ export function buildTree(
   rootPreview: string | null,
   childrenMap: Map<string, ChildSessionInfo[]>,
   depth: number,
-  visited: Set<string> = new Set(),
+  visited = new Set<string>(),
 ): TreeNode {
   visited.add(rootId);
   const children = childrenMap.get(rootId) ?? [];
@@ -153,7 +153,8 @@ export function buildTree(
             .filter((child) => !visited.has(child.id))
             .map((child) => {
               const status = childActivity(child);
-              const label = child.session_name ?? child.title ?? child.tool ?? child.id;
+              const label =
+                child.task_summary ?? child.session_name ?? child.title ?? child.tool ?? child.id;
               return buildTree(
                 child.id,
                 label,

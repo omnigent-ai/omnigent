@@ -11,6 +11,8 @@
  * viewer mounts (only the HTTP boundary is mocked).
  */
 
+import type * as UseFileContentModule from "@/hooks/useFileContent";
+
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Editor } from "@tiptap/core";
 import { Markdown } from "@tiptap/markdown";
@@ -22,7 +24,7 @@ import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
 import { installMarkdownSerializerPatch } from "./tiptapMarkdownPatches";
 
 vi.mock("@/hooks/useFileContent", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/hooks/useFileContent")>();
+  const actual = await importOriginal<typeof UseFileContentModule>();
   return { ...actual, fetchFileContent: vi.fn().mockResolvedValue(new Promise(() => {})) };
 });
 

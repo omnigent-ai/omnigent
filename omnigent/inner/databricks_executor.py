@@ -15,12 +15,17 @@ Environment:
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import json
 import logging
 import os
+import shlex
+import shutil
+import subprocess
+import time
 from collections.abc import AsyncIterator, Generator
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypeAlias
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
 
 import httpx
 
@@ -54,6 +59,8 @@ OpenAIKwargs: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 _API_CALL_TIMEOUT_SECONDS = 30.0
 _STREAM_IDLE_TIMEOUT_SECONDS = 60.0
+_CLI_TOKEN_REFRESH_MARGIN_SECONDS = 90.0
+_CLI_TOKEN_DEFAULT_TTL_SECONDS = 50 * 60.0
 
 _SESSION_ONLY_EXECUTOR_EXTRA_KEYS = {
     "new_user_messages_flushed",
@@ -229,6 +236,86 @@ def _read_databrickscfg_file_fallback(profile: str | None = None) -> DatabricksC
     return None
 
 
+def databricks_bearer_token_command(
+    host: str,
+    profile: str | None = None,
+    fallback_command: str | None = None,
+) -> str:
+    """Build the shell command a harness runs to mint a workspace bearer token.
+
+    The one definition of the generated helper, so the claude and codex
+    harnesses cannot drift apart on which profile they authenticate as or how
+    they handle a refresh failure.
+
+    **Profile selection.** ``--profile`` when the caller names one, ``--host``
+    only as the fallback. Two profiles can share a host, and ``databricks auth
+    token --host`` then fails ("Use --profile to specify which profile") →
+    empty token → 401. Host lookup is also how a pane and the server end up
+    authenticating as *different* profiles for the same workspace, one of them
+    re-authed and the other not.
+
+    **Refresh.** ``--force-refresh`` is attempted first: it renews a still-valid
+    cached token, which is what keeps a long gateway session from hitting a
+    mid-session 401. But it *fails* when the refresh token itself has gone
+    stale, and unconditionally forcing turned a perfectly usable cached access
+    token into a hard auth failure. So the forced attempt is speculative — its
+    output is captured and its stderr dropped — and an empty result falls back
+    to plain ``auth token``, which serves the cached token and renews it only
+    when it is near expiry. The fallback keeps its stderr so a genuine auth
+    failure is still visible. ``--force-refresh`` only exists in Databricks CLI
+    >= v0.296.0, so it stays behind the ``--help`` capability probe.
+
+    **Fallback command.** The named profile is the identity we *want*, but the
+    user may have authenticated under a different profile on the same host — a
+    config naming a credential-less profile would otherwise 401 every turn.
+    When the caller knows a token command that already worked (the one ucode
+    recorded, say), it runs last, once the named profile has yielded nothing.
+
+    **Ambient bearer.** Prefer the configured profile because
+    ``DATABRICKS_BEARER`` may be stale. Bound and silence that mint attempt so
+    a profile without usable OAuth state quickly falls back to the bearer,
+    preserving deliberately injected credentials in mint-less environments.
+
+    :param host: Databricks workspace host, e.g.
+        ``"https://example.databricks.com"``.
+    :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``, or
+        ``None`` to select the workspace by host.
+    :param fallback_command: Shell command printing a bearer token on stdout,
+        run only when the profile above yields an empty token.
+    :returns: Shell command that prints a bearer token on stdout.
+    """
+    selector = (
+        f"--profile {json.dumps(profile)}" if profile else f"--host {json.dumps(host.rstrip('/'))}"
+    )
+    mint = f"env -u DATABRICKS_CONFIG_PROFILE databricks auth token {selector}"
+    fallback = (
+        # ``eval`` on a quoted string: the recorded command is opaque shell,
+        # and inlining it bare would let its own quoting reshape this script.
+        f'if [ -z "$token" ]; then token=$(eval {shlex.quote(fallback_command)}); fi; '
+        if fallback_command
+        else ""
+    )
+    return (
+        # An ambient bearer may be injected or stale: prefer a bounded,
+        # quiet profile mint, and use the bearer only when it yields nothing.
+        'if [ -n "${DATABRICKS_BEARER:-}" ]; then '
+        f"token=$({mint} --timeout 15s --output json 2>/dev/null "
+        "| jq -r '.access_token // empty'); "
+        'if [ -z "$token" ]; then token="$DATABRICKS_BEARER"; fi; '
+        'printf "%s\\n" "$token"; '
+        "else token=''; "
+        "if databricks auth token --help 2>&1 | grep -q force-refresh; then "
+        f"token=$({mint} --force-refresh --output json 2>/dev/null "
+        "| jq -r '.access_token // empty'); "
+        "fi; "
+        'if [ -z "$token" ]; then '
+        f"token=$({mint} --output json | jq -r '.access_token // empty'); "
+        "fi; "
+        f"{fallback}"
+        'printf "%s\\n" "$token"; fi'
+    )
+
+
 def _read_databrickscfg_host(profile: str | None = None) -> str | None:
     """
     Read only the workspace host from the Databricks config file.
@@ -320,6 +407,95 @@ class DatabricksAuthError(OSError):
     """
 
 
+class _DatabricksAuthConfig(Protocol):
+    def authenticate(self) -> dict[str, str]:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class _DatabricksCliToken:
+    access_token: str
+    expires_at: float
+
+
+@dataclass
+class _DatabricksCliProfileAuthConfig:
+    """Profile-pinned Databricks CLI OAuth token source."""
+
+    profile: str
+    host: str
+    _cached_token: _DatabricksCliToken | None = field(default=None, init=False, repr=False)
+
+    def authenticate(self) -> dict[str, str]:
+        now = time.time()
+        cached = self._cached_token
+        if cached is None or cached.expires_at - now <= _CLI_TOKEN_REFRESH_MARGIN_SECONDS:
+            cached = _databricks_cli_profile_token(self.profile, now=now)
+            self._cached_token = cached
+        return {"Authorization": f"Bearer {cached.access_token}"}
+
+
+def _databricks_cli_profile_token(
+    profile: str, *, now: float | None = None
+) -> _DatabricksCliToken:
+    """Mint a bearer token by profile, avoiding ambiguous host lookup."""
+    databricks_bin = shutil.which("databricks")
+    if databricks_bin is None:
+        raise ValueError("databricks CLI is not installed")
+    try:
+        result = subprocess.run(
+            [databricks_bin, "auth", "token", "--profile", profile, "--output", "json"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30.0,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(f"databricks auth token --profile {profile} timed out") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip()
+        raise ValueError(detail or f"databricks auth token --profile {profile} failed")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"databricks auth token --profile {profile} returned invalid JSON"
+        ) from exc
+    token = payload.get("access_token") if isinstance(payload, dict) else None
+    if not isinstance(token, str) or not token.strip():
+        raise ValueError(f"databricks auth token --profile {profile} returned no access_token")
+    return _DatabricksCliToken(
+        access_token=token.strip(),
+        expires_at=_databricks_cli_token_expires_at(payload, now=now),
+    )
+
+
+def _databricks_cli_token_expires_at(
+    payload: dict[str, Any], *, now: float | None = None
+) -> float:
+    """Return the CLI token expiry timestamp, falling back conservatively."""
+    base = time.time() if now is None else now
+    expires_in = payload.get("expires_in")
+    if isinstance(expires_in, (int, float)):
+        return base + max(float(expires_in), 0.0)
+    if isinstance(expires_in, str):
+        try:
+            return base + max(float(expires_in), 0.0)
+        except ValueError:
+            pass
+    expiry = payload.get("expiry")
+    if isinstance(expiry, str) and expiry:
+        try:
+            normalized = expiry.replace("Z", "+00:00")
+            parsed = dt.datetime.fromisoformat(normalized)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=dt.UTC)
+            return parsed.timestamp()
+        except ValueError:
+            pass
+    return base + _CLI_TOKEN_DEFAULT_TTL_SECONDS
+
+
 class _DatabricksBearerAuth(httpx.Auth):
     """httpx Auth that calls ``Config.authenticate()`` on every HTTP request.
 
@@ -340,7 +516,7 @@ class _DatabricksBearerAuth(httpx.Auth):
 
     def __init__(
         self,
-        config: Any,  # type: ignore[explicit-any]
+        config: _DatabricksAuthConfig,
         profile_name: str | None = None,
         failure_message: str | None = None,
     ) -> None:
@@ -355,6 +531,10 @@ class _DatabricksBearerAuth(httpx.Auth):
         self._config = config
         self._profile_name = profile_name
         self._failure_message = failure_message
+
+    @property
+    def profile_name(self) -> str | None:
+        return self._profile_name
 
     def _authenticate_headers(self) -> dict[str, str]:
         """
@@ -568,8 +748,21 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
             cfg = _sdk_config(profile=profile_name)
             cfg.authenticate()
         except Exception:  # noqa: BLE001 — try the next matching profile
-            logger.debug("profile %r matched host %s but did not authenticate", profile_name, host)
-            continue
+            logger.debug(
+                "profile %r matched host %s but did not authenticate via SDK",
+                profile_name,
+                host,
+            )
+            try:
+                cfg = _DatabricksCliProfileAuthConfig(profile=profile_name, host=host)
+                cfg.authenticate()
+            except Exception:  # noqa: BLE001 — try the next matching profile
+                logger.debug(
+                    "profile %r matched host %s but did not authenticate via CLI",
+                    profile_name,
+                    host,
+                )
+                continue
         return _DatabricksBearerAuth(cfg, profile_name=profile_name), cfg.host or host
     try:
         host_cfg = _sdk_config(host=host, auth_type="databricks-cli")
@@ -617,6 +810,65 @@ def _databrickscfg_profiles_for_host(host: str) -> list[str]:
     if default_host and _norm(default_host) == wanted:
         matches.append("DEFAULT")
     return matches
+
+
+def databrickscfg_workspace_id_for_host(host: str) -> str | None:
+    """Return the ``workspace_id`` the Databricks CLI recorded for *host*.
+
+    ``databricks auth login --host <host>`` resolves a workspace during login
+    (auto-selecting the only accessible one, or the one the user picks) and
+    writes its id into the matching ``~/.databrickscfg`` profile. On an
+    account-fronting host — one hostname over many workspaces — that recorded id
+    is the only trace of which workspace the login chose, and an account token
+    routes to it once the id is replayed as the ``?o=`` selector.
+
+    :param host: Workspace host to match, e.g.
+        ``"https://example.databricks.com"``.
+    :returns: The recorded workspace id, or ``None`` when the file is
+        missing/unparseable or no matching profile carries one.
+    """
+    import configparser
+    from pathlib import Path
+
+    cfg_path = Path(os.environ.get("DATABRICKS_CONFIG_FILE") or (Path.home() / ".databrickscfg"))
+    if not cfg_path.exists():
+        return None
+    config = configparser.ConfigParser()
+    try:
+        config.read(cfg_path)
+    except configparser.Error:
+        return None
+    for section in _databrickscfg_profiles_for_host(host):
+        values = config.defaults() if section == "DEFAULT" else config[section]
+        workspace_id = values.get("workspace_id")
+        if workspace_id:
+            return workspace_id
+    return None
+
+
+def databrickscfg_workspace_id_for_profile(profile: str) -> str | None:
+    """Return the ``workspace_id`` recorded for an exact Databricks profile."""
+    import configparser
+    from pathlib import Path
+
+    cfg_path = Path(os.environ.get("DATABRICKS_CONFIG_FILE") or (Path.home() / ".databrickscfg"))
+    if not cfg_path.exists():
+        return None
+    config = configparser.ConfigParser()
+    try:
+        config.read(cfg_path)
+    except configparser.Error:
+        return None
+    if profile == "DEFAULT":
+        values = config.defaults()
+    elif profile in config:
+        values = config[profile]
+    else:
+        values = None
+    if values is None:
+        return None
+    workspace_id = values.get("workspace_id")
+    return workspace_id if workspace_id else None
 
 
 def _get_openai_client(profile: str | None = None) -> OpenAI:
@@ -785,7 +1037,7 @@ def _convert_messages(
     return result
 
 
-def _extract_stream_text_delta(content: Any) -> str:
+def _extract_stream_text_delta(content: object) -> str:
     """
     Extract assistant-visible text from a Chat Completions stream delta.
 

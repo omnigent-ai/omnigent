@@ -46,13 +46,20 @@ import { Button } from "@/components/ui/button";
 import {
   type AskUserQuestionPayload,
   castAskUserQuestionPayload,
+  exitPlanModePlan,
   parseAskUserQuestionPreview,
 } from "@/lib/askUserQuestion";
+import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/nativeCodingAgents";
 import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
-import type { RememberScope } from "@/lib/types";
+import type { CodexPersistMode, RememberScope } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
 import { AskUserQuestionForm, type AskUserQuestionAnswers } from "./AskUserQuestionForm";
+import {
+  type ElicitationAnswers,
+  ElicitationSchemaForm,
+  schemaFields,
+} from "./ElicitationSchemaForm";
 import { ExitPlanModeReview } from "./ExitPlanModeReview";
 
 /**
@@ -67,6 +74,10 @@ import { ExitPlanModeReview } from "./ExitPlanModeReview";
 function extractOptionLabels(schema: Record<string, unknown>): string[] {
   const properties = schema.properties;
   if (!properties || typeof properties !== "object") return [];
+  // Only when ``answer`` is the whole question. A schema pairing it with, say,
+  // a required ``reason`` renders as buttons that submit the answer and drop
+  // the reason the server said it needed; that shape belongs to the form.
+  if (Object.keys(properties as Record<string, unknown>).length !== 1) return [];
   const answer = (properties as Record<string, unknown>).answer;
   if (!answer || typeof answer !== "object") return [];
   const enumValues = (answer as Record<string, unknown>).enum;
@@ -83,6 +94,7 @@ export type SubmitApprovalFn = (
   elicitationId: string,
   action: "accept" | "decline",
   content?: Record<string, unknown>,
+  meta?: Record<string, unknown>,
 ) => void;
 
 interface ApprovalCardProps {
@@ -102,6 +114,7 @@ interface ApprovalCardProps {
   response: {
     action: "accept" | "decline" | "cancel" | "auto_resolved";
     content?: Record<string, unknown>;
+    _meta?: Record<string, unknown>;
   } | null;
   /**
    * Structured AskUserQuestion payload — set when the server-side
@@ -149,8 +162,8 @@ interface ApprovalCardProps {
    * elicitation (edit tools take the ``allowAllEdits`` path instead).
    */
   rememberScope?: RememberScope | null;
-  /** Whether this viewer may accept the pending action. Rejection stays available. */
-  canApprove?: boolean;
+  /** Codex-native MCP persistence scopes advertised by the request. */
+  codexPersistModes?: CodexPersistMode[];
   /**
    * Verdict submitter override. Defaults to `chatStore.submitApproval`
    * (the in-chat path: optimistic block flip + resolve POST + rollback).
@@ -159,6 +172,8 @@ interface ApprovalCardProps {
    */
   onSubmit?: SubmitApprovalFn;
 }
+
+const EMPTY_CODEX_PERSIST_MODES: CodexPersistMode[] = [];
 
 export function ApprovalCard({
   elicitationId,
@@ -175,19 +190,27 @@ export function ApprovalCard({
   codexCommand,
   allowAllEdits,
   rememberScope,
-  canApprove = true,
+  codexPersistModes = EMPTY_CODEX_PERSIST_MODES,
   onSubmit,
 }: ApprovalCardProps) {
   const submit: SubmitApprovalFn =
     onSubmit ??
-    ((id, action, content) => {
-      void useChatStore.getState().submitApproval(id, action, content);
+    ((id, action, content, meta) => {
+      const store = useChatStore.getState();
+      if (meta === undefined) {
+        void store.submitApproval(id, action, content);
+      } else {
+        void store.submitApproval(id, action, content, meta);
+      }
     });
   const submitBinary = (action: "accept" | "decline") => {
     submit(elicitationId, action);
   };
   const submitOption = (label: string) => {
     submit(elicitationId, "accept", { answer: label });
+  };
+  const submitSchemaAnswers = (content: ElicitationAnswers) => {
+    submit(elicitationId, "accept", content);
   };
   const submitAnswers = (answers: AskUserQuestionAnswers) => {
     // ``content`` is MCP's ``ElicitResult.content``: a flat
@@ -218,6 +241,9 @@ export function ApprovalCard({
     // permission update back to the PermissionRequest hook.
     submit(elicitationId, "accept", { remember: true });
   };
+  const submitCodexPersist = (mode: CodexPersistMode) => {
+    submit(elicitationId, "accept", undefined, { persist: mode });
+  };
   const submitPlanRejection = (feedback: string) => {
     // The typed feedback rides on `content.feedback`; the server
     // forwards it to Claude as the deny `message`, so Claude stays in
@@ -235,19 +261,34 @@ export function ApprovalCard({
   // ExitPlanMode plan review: the server stamps the full tool_input
   // as `exit_plan_mode`; a usable plan card needs the `plan` markdown
   // string. Anything else falls back to the binary card.
-  const exitPlanModePlan =
-    exitPlanMode && typeof exitPlanMode.plan === "string" && exitPlanMode.plan
-      ? exitPlanMode.plan
-      : null;
-  const isExitPlanMode = exitPlanModePlan !== null;
+  const planMarkdown = exitPlanModePlan(exitPlanMode);
+  const isExitPlanMode = planMarkdown !== null;
   const optionLabels = askPayload === null ? extractOptionLabels(requestedSchema) : [];
   const isAskUserQuestion = askPayload !== null;
   const isMultiChoice = optionLabels.length > 0;
+  // Any other schema that names fields: a free-form string, several
+  // properties, an enum under a name other than ``answer``. These used to
+  // fall through to Approve / Reject, which cannot answer them.
+  const schemaFormFields =
+    askPayload === null && !isMultiChoice ? schemaFields(requestedSchema) : [];
+  const isSchemaForm = schemaFormFields.length > 0;
   const isCodexCommandApproval = codexCommand !== null && codexCommand !== undefined;
   // External URL: the elicitation points to a third-party page (OAuth,
   // external MCP server, etc.) — show a link. Our own /approve/...
   // paths are handled inline with approve/reject buttons.
   const isExternalUrl = typeof url === "string" && url.length > 0 && !url.startsWith("/approve/");
+  // What the header's "· <tag>" slot shows. Native bridges stamp a synthetic
+  // `policy_name` (provenance, not a policy anyone wrote), so name the product
+  // that asked — and show nothing when the stamp names no vendor. A real policy
+  // name renders verbatim so users can tell which of their policies asked.
+  const isNativePolicy = isNativePolicyName(policyName);
+  const policyLabel = isNativePolicy
+    ? (nativeCodingAgentForPolicyName(policyName)?.displayName ?? "")
+    : policyName;
+  // Native prompts also stamp a constant, internal-sounding phase
+  // ("pre_tool_use", "codex_command_approval", ...). It carries no
+  // information the card doesn't already show, so hide it for them.
+  const showPhase = phase !== "" && !isNativePolicy;
   const askUserQuestionTitle =
     policyName.startsWith("agy_") || phase.startsWith("agy_")
       ? "Antigravity needs your input"
@@ -263,7 +304,7 @@ export function ApprovalCard({
   // approvals get a dedicated command render below, so showing the
   // transport JSON would expose unrelated ids and duplicate details.
   const formattedPreview =
-    isAskUserQuestion || isExitPlanMode || isMultiChoice || isCodexCommandApproval
+    isAskUserQuestion || isExitPlanMode || isMultiChoice || isSchemaForm || isCodexCommandApproval
       ? ""
       : formatPreview(contentPreview);
   const execPolicyAmendment =
@@ -275,6 +316,7 @@ export function ApprovalCard({
     response.content.execpolicy_amendment.every((entry) => typeof entry === "string");
   const acceptedAllEdits = response?.content?.allow_all_edits === true;
   const acceptedRemember = response?.content?.remember === true;
+  const acceptedCodexPersist = response?.["_meta"]?.persist;
   // Persistent "don't ask again" affordance: label by the WebFetch
   // domain when present, else the tool name. Drives the third binary
   // button and the responded-state pill.
@@ -289,12 +331,39 @@ export function ApprovalCard({
     : undefined;
   const binaryButtons = (
     <div className="flex flex-wrap gap-2 pt-1">
-      <Button size="sm" onClick={() => submitBinary("accept")} disabled={!canApprove}>
+      <Button size="sm" onClick={() => submitBinary("accept")} componentId="approval.approve">
         <CheckIcon className="mr-1 size-3.5" />
         Approve
       </Button>
+      {codexPersistModes.includes("session") && (
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => submitCodexPersist("session")}
+          componentId="approval.approve_session"
+        >
+          <CheckIcon className="mr-1 size-3.5" />
+          Approve for this session
+        </Button>
+      )}
+      {codexPersistModes.includes("always") && (
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => submitCodexPersist("always")}
+          componentId="approval.approve_always"
+        >
+          <CheckIcon className="mr-1 size-3.5" />
+          Always allow
+        </Button>
+      )}
       {allowAllEdits && (
-        <Button size="sm" variant="outline" onClick={submitAllowAllEdits} disabled={!canApprove}>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={submitAllowAllEdits}
+          componentId="approval.approve_allow_edits"
+        >
           <CheckIcon className="mr-1 size-3.5" />
           Accept & allow all edits
         </Button>
@@ -304,15 +373,20 @@ export function ApprovalCard({
           size="sm"
           variant="outline"
           onClick={submitRemember}
-          disabled={!canApprove}
           title={rememberTitle}
           data-testid="approval-card-remember"
+          componentId="approval.approve_remember"
         >
           <CheckIcon className="mr-1 size-3.5" />
           Approve &amp; don't ask again for {rememberTarget}
         </Button>
       )}
-      <Button size="sm" variant="outline" onClick={() => submitBinary("decline")}>
+      <Button
+        size="sm"
+        variant="outline"
+        onClick={() => submitBinary("decline")}
+        componentId="approval.reject"
+      >
         <XIcon className="mr-1 size-3.5" />
         Reject
       </Button>
@@ -320,7 +394,11 @@ export function ApprovalCard({
   );
   const codexCommandButtons = (
     <div className="flex flex-wrap items-center gap-2 pt-1" data-testid="codex-command-actions">
-      <Button size="sm" onClick={() => submitBinary("accept")} disabled={!canApprove}>
+      <Button
+        size="sm"
+        onClick={() => submitBinary("accept")}
+        componentId="approval.approve_command"
+      >
         <CheckIcon className="mr-1 size-3.5" />
         Approve
       </Button>
@@ -329,7 +407,7 @@ export function ApprovalCard({
           size="sm"
           variant="outline"
           onClick={() => submitExecPolicyAmendment(execPolicyAmendment)}
-          disabled={!canApprove}
+          componentId="approval.approve_command_remember"
         >
           <CheckIcon className="mr-1 size-3.5" />
           Approve and remember
@@ -401,10 +479,29 @@ export function ApprovalCard({
       label = rememberTarget
         ? `Approved · won't ask again for ${rememberTarget}`
         : "Approved · won't ask again";
+    } else if (acceptedCodexPersist === "session") {
+      icon = <CheckIcon className="size-4 text-success" />;
+      label = "Approved for this session";
+    } else if (acceptedCodexPersist === "always") {
+      icon = <CheckIcon className="size-4 text-success" />;
+      label = "Always allowed";
     } else if (accepted) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = isExitPlanMode ? "Plan approved" : "Approved";
     }
+
+    // The gating message ("Claude wants to call **AskUserQuestion**") is
+    // written in pending tense. On a question or plan card the ask has
+    // already happened and the user answered it, so echoing it reads as
+    // if the prompt were still outstanding — the answers below and the
+    // verdict label already say what happened. The pending card omits it
+    // for the same reason: purposeful content instead of the raw ask.
+    const showGatingMessage = !isCodexCommandApproval && !isAskUserQuestion && !isExitPlanMode;
+    const hasBody =
+      showGatingMessage ||
+      isCodexCommandApproval ||
+      submittedAnswers !== null ||
+      planRejectionFeedback !== null;
 
     return (
       <Alert
@@ -412,46 +509,50 @@ export function ApprovalCard({
         data-state="responded"
         className="flex flex-col gap-1 border-muted"
       >
-        <AlertTitle className="flex items-center gap-2 text-sm">
+        <AlertTitle className="flex items-center gap-2 text-ui">
           {icon}
           {label}
-          {policyName && <span className="text-muted-foreground text-xs">· {policyName}</span>}
+          {policyLabel && <span className="text-muted-foreground text-sm">· {policyLabel}</span>}
         </AlertTitle>
-        <AlertDescription className="flex flex-col gap-1 text-xs">
-          {isCodexCommandApproval ? (
-            <>
-              {codexCommand.reason && <span>{codexCommand.reason}</span>}
-              <pre className="overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-xs whitespace-pre-wrap">
-                {codexCommand.command}
-              </pre>
-              {codexCommand.cwd && (
-                <span>
-                  <span className="text-muted-foreground">cwd: </span>
-                  <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">
-                    {codexCommand.cwd}
-                  </code>
-                </span>
-              )}
-            </>
-          ) : (
-            <span>{message}</span>
-          )}
-          {submittedAnswers !== null && (
-            <ul className="flex flex-col gap-0.5 pl-3">
-              {Object.entries(submittedAnswers).map(([q, ans]) => (
-                <li key={q}>
-                  <span className="text-muted-foreground">{q}: </span>
-                  {Array.isArray(ans) ? ans.join(", ") : String(ans)}
-                </li>
-              ))}
-            </ul>
-          )}
-          {planRejectionFeedback !== null && (
-            <span className="italic" data-testid="plan-rejection-feedback">
-              “{planRejectionFeedback}”
-            </span>
-          )}
-        </AlertDescription>
+        {hasBody && (
+          <AlertDescription className="flex flex-col gap-1 text-sm">
+            {isCodexCommandApproval ? (
+              <>
+                {codexCommand.reason && <span>{codexCommand.reason}</span>}
+                <pre className="overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap">
+                  {codexCommand.command}
+                </pre>
+                {codexCommand.cwd && (
+                  <span>
+                    <span className="text-muted-foreground">cwd: </span>
+                    <code className="rounded bg-muted px-1 py-0.5 font-mono text-sm">
+                      {codexCommand.cwd}
+                    </code>
+                  </span>
+                )}
+              </>
+            ) : showGatingMessage ? (
+              <span>{message}</span>
+            ) : null}
+            {submittedAnswers !== null && (
+              <ul className="flex flex-col gap-0.5">
+                {Object.entries(submittedAnswers).map(([q, ans]) => (
+                  <li key={q} className="flex flex-wrap items-baseline gap-x-1.5">
+                    <span className="text-muted-foreground">{q}</span>
+                    <span className="font-medium">
+                      {Array.isArray(ans) ? ans.join(", ") : String(ans)}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {planRejectionFeedback !== null && (
+              <span className="italic" data-testid="plan-rejection-feedback">
+                “{planRejectionFeedback}”
+              </span>
+            )}
+          </AlertDescription>
+        )}
       </Alert>
     );
   }
@@ -463,7 +564,7 @@ export function ApprovalCard({
       data-state="pending"
       className="flex flex-col gap-2 py-3 px-4"
     >
-      <AlertTitle className="flex items-center gap-2 text-sm">
+      <AlertTitle className="flex items-center gap-2 text-ui">
         {isCodexCommandApproval ? (
           <TerminalIcon className="size-4 text-yellow-600 dark:text-yellow-400" />
         ) : isExitPlanMode ? (
@@ -480,28 +581,22 @@ export function ApprovalCard({
               : isMultiChoice
                 ? "Choose an option"
                 : "Approval required"}
-        {policyName && !isAskUserQuestion && !isExitPlanMode && (
-          <span className="text-muted-foreground text-xs">· {policyName}</span>
+        {policyLabel && !isAskUserQuestion && !isExitPlanMode && (
+          <span className="text-muted-foreground text-sm">· {policyLabel}</span>
         )}
-        {phase && !isMultiChoice && !isAskUserQuestion && !isExitPlanMode && (
-          <span className="text-muted-foreground text-xs">({phase})</span>
+        {showPhase && !isMultiChoice && !isAskUserQuestion && !isExitPlanMode && (
+          <span className="text-muted-foreground text-sm">({phase})</span>
         )}
       </AlertTitle>
       <AlertDescription className="flex flex-col gap-2">
-        {!canApprove && (
-          <span className="text-xs text-muted-foreground" role="note">
-            Only the session owner or a delegated approver can approve. You can still reject.
-          </span>
-        )}
         {isExitPlanMode ? (
           <>
             <span>Claude finished planning and wants to proceed.</span>
             <ExitPlanModeReview
-              plan={exitPlanModePlan}
+              plan={planMarkdown}
               onAcceptAuto={submitAllowAllEdits}
               onAccept={() => submitBinary("accept")}
               onReject={submitPlanRejection}
-              canApprove={canApprove}
             />
           </>
         ) : isAskUserQuestion ? (
@@ -509,17 +604,16 @@ export function ApprovalCard({
             questions={askPayload.questions}
             onSubmit={submitAnswers}
             onReject={() => submitBinary("decline")}
-            canSubmit={canApprove}
           />
         ) : isCodexCommandApproval ? (
           <>
             <span>Codex wants to run this command.</span>
             {codexCommand.reason && <span className="text-foreground">{codexCommand.reason}</span>}
-            <pre className="overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-xs text-foreground whitespace-pre-wrap">
+            <pre className="overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-sm text-foreground whitespace-pre-wrap">
               {codexCommand.command}
             </pre>
             {codexCommand.cwd && (
-              <span className="text-xs">
+              <span className="text-sm">
                 cwd:{" "}
                 <code className="rounded bg-muted px-1 py-0.5 font-mono">{codexCommand.cwd}</code>
               </span>
@@ -530,7 +624,7 @@ export function ApprovalCard({
           <>
             <span>{message}</span>
             {formattedPreview && (
-              <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-xs whitespace-pre-wrap break-words">
+              <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap break-words">
                 {formattedPreview}
               </pre>
             )}
@@ -543,6 +637,12 @@ export function ApprovalCard({
                   </a>
                 </Button>
               </div>
+            ) : isSchemaForm ? (
+              <ElicitationSchemaForm
+                fields={schemaFormFields}
+                onSubmit={submitSchemaAnswers}
+                onReject={() => submitBinary("decline")}
+              />
             ) : isMultiChoice ? (
               <div className="flex flex-wrap gap-2 pt-1" data-testid="approval-card-options">
                 {optionLabels.map((optLabel) => (
@@ -551,7 +651,6 @@ export function ApprovalCard({
                     size="sm"
                     variant="outline"
                     onClick={() => submitOption(optLabel)}
-                    disabled={!canApprove}
                   >
                     {optLabel}
                   </Button>
@@ -577,11 +676,9 @@ export function ApprovalCard({
 export function ElicitationCard({
   item,
   onSubmit,
-  canApprove,
 }: {
   item: Extract<RenderItem, { kind: "elicitation" }>;
   onSubmit?: SubmitApprovalFn;
-  canApprove?: boolean;
 }) {
   return (
     <ApprovalCard
@@ -599,7 +696,7 @@ export function ElicitationCard({
       codexCommand={item.codexCommand}
       allowAllEdits={item.allowAllEdits}
       rememberScope={item.rememberScope}
-      canApprove={canApprove}
+      codexPersistModes={item.codexPersistModes}
       onSubmit={onSubmit}
     />
   );

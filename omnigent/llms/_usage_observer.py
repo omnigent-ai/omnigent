@@ -48,9 +48,9 @@ import json
 import logging
 import os
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Protocol, TypedDict
 
 logger = logging.getLogger(__name__)
 
@@ -68,8 +68,20 @@ class UsageObserver(Protocol):
     ) -> None: ...
 
 
+class _ModelUsage(TypedDict):
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    calls: int
+
+
+class _UsageBucket(_ModelUsage):
+    models: list[str]
+    by_model: dict[str, _ModelUsage]
+
+
 _OBSERVERS: list[UsageObserver] = []
-_RECORDS: dict[str, dict[str, Any]] = {}  # type: ignore[explicit-any]
+_RECORDS: dict[str, _UsageBucket] = {}
 _CURRENT_NODEID: str | None = None
 # Serializes mutations of ``_RECORDS`` so notify() calls from concurrent
 # threads (or asyncio executors backed by threads) don't lose updates on
@@ -129,7 +141,7 @@ def add_observer(callback: UsageObserver) -> Callable[[], None]:
 def notify_from_dict(
     *,
     model: str | None,
-    usage: dict[str, Any] | None,  # type: ignore[explicit-any]
+    usage: Mapping[str, object] | None,
 ) -> None:
     """Convenience wrapper for callers that already have a ``usage`` dict.
 
@@ -138,14 +150,20 @@ def notify_from_dict(
     standard keys and calls :func:`notify`. ``None`` and empty dicts are
     no-ops.
     """
-    if not isinstance(usage, dict):
+    if not isinstance(usage, Mapping):
         return
     notify(
         model=model,
-        input_tokens=int(usage.get("input_tokens") or 0),
-        output_tokens=int(usage.get("output_tokens") or 0),
-        total_tokens=int(usage.get("total_tokens") or 0),
+        input_tokens=_usage_int(usage.get("input_tokens")),
+        output_tokens=_usage_int(usage.get("output_tokens")),
+        total_tokens=_usage_int(usage.get("total_tokens")),
     )
+
+
+def _usage_int(value: object) -> int:
+    if isinstance(value, (int, float, str)):
+        return int(value or 0)
+    return 0
 
 
 def notify(
@@ -290,13 +308,15 @@ def _write_records() -> None:
             totals["output_tokens"] += bucket["output_tokens"]
             totals["total_tokens"] += bucket["total_tokens"]
             totals["calls"] += bucket["calls"]
-            for model, per_model in bucket.get("by_model", {}).items():
+            for model, per_model in bucket["by_model"].items():
                 model_totals = totals_by_model.setdefault(
                     model,
                     {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "calls": 0},
                 )
-                for k in model_totals:
-                    model_totals[k] += per_model[k]
+                model_totals["input_tokens"] += per_model["input_tokens"]
+                model_totals["output_tokens"] += per_model["output_tokens"]
+                model_totals["total_tokens"] += per_model["total_tokens"]
+                model_totals["calls"] += per_model["calls"]
         payload = json.dumps(
             {"totals": totals, "totals_by_model": totals_by_model, "by_test": _RECORDS},
             indent=2,

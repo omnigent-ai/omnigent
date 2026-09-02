@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import TypeAlias
 
 import yaml
+
+_Config: TypeAlias = dict[str, object]
 
 _CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
 _GLOBAL_CONFIG_PATH = Path.home() / ".omnigent" / "config.yaml"
@@ -20,30 +22,30 @@ def global_config_path(default_path: Path | None = None) -> Path:
     return default_path or _GLOBAL_CONFIG_PATH
 
 
-def load_global_config(path: Path | None = None) -> dict[str, Any]:  # type: ignore[explicit-any]
+def load_global_config(path: Path | None = None) -> _Config:
     """Load the user-level config, returning an empty mapping when absent."""
     resolved_path = path or global_config_path()
     if not resolved_path.exists():
         return {}
     with resolved_path.open() as config_file:
-        raw: dict[str, Any] = yaml.safe_load(config_file) or {}  # type: ignore[explicit-any]
+        raw: _Config = yaml.safe_load(config_file) or {}
         return raw
 
 
-def load_local_config(path: Path | None = None) -> dict[str, Any]:  # type: ignore[explicit-any]
+def load_local_config(path: Path | None = None) -> _Config:
     """Load the project-level config, returning an empty mapping when absent."""
     resolved_path = path or Path.cwd() / _LOCAL_CONFIG_RELPATH
     if not resolved_path.exists():
         return {}
     with resolved_path.open() as config_file:
-        raw: dict[str, Any] = yaml.safe_load(config_file) or {}  # type: ignore[explicit-any]
+        raw: _Config = yaml.safe_load(config_file) or {}
         return raw
 
 
 def _merge_effective_config(
-    global_cfg: dict[str, Any],  # type: ignore[explicit-any]
-    local_cfg: dict[str, Any],  # type: ignore[explicit-any]
-) -> dict[str, Any]:  # type: ignore[explicit-any]
+    global_cfg: _Config,
+    local_cfg: _Config,
+) -> _Config:
     """Merge global+local config, deep-merging the ``harness`` mapping.
 
     A flat ``{**global, **local}`` would make a local ``harness`` mapping
@@ -57,7 +59,7 @@ def _merge_effective_config(
     :param local_cfg: Project-level config (``.omnigent/config.yaml``).
     :returns: The merged effective config dict.
     """
-    merged: dict[str, Any] = {**global_cfg, **local_cfg}  # type: ignore[explicit-any]
+    merged: _Config = {**global_cfg, **local_cfg}
     g_harness = global_cfg.get("harness")
     l_harness = local_cfg.get("harness")
     # Only deep-merge when BOTH are mappings. A scalar on either side is
@@ -65,7 +67,7 @@ def _merge_effective_config(
     # that intentionally pins the whole harness key), so the shallow
     # ``{**global, **local}`` result already in ``merged`` is correct.
     if isinstance(g_harness, dict) and isinstance(l_harness, dict):
-        combined: dict[str, Any] = {**g_harness, **l_harness}  # type: ignore[explicit-any]
+        combined: _Config = {**g_harness, **l_harness}
         # Per-harness sub-keys (anything but ``default``): merge one level
         # deep so a local per-harness entry augments rather than replaces
         # the global one (local fields win per-field).
@@ -80,7 +82,7 @@ def _merge_effective_config(
     return merged
 
 
-def load_effective_config() -> dict[str, Any]:  # type: ignore[explicit-any]
+def load_effective_config() -> _Config:
     """Merge user and project config, with project values taking precedence.
 
     The ``harness`` mapping is deep-merged (per-harness sub-keys, local

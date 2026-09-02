@@ -3,7 +3,13 @@ import { RunnerOfflineError, type WorkspaceChangedFile } from "@/hooks/useWorksp
 import { RunnerAsleepHint } from "./RunnerAsleepHint";
 import { cn } from "@/lib/utils";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { gitStatusLabel, gitStatusLetter } from "./fileStatusUtils";
+import {
+  ROW_ACTION_SIZE_CLASS,
+  ROW_META_SLOT_CLASS,
+  gitStatusLabel,
+  gitStatusLetter,
+} from "./fileStatusUtils";
+import { CopyPathButton } from "./CopyPathButton";
 import { FileDownloadButton } from "./FileDownloadButton";
 import { useCursorTooltip } from "./useCursorTooltip";
 
@@ -96,37 +102,45 @@ function FileListItem({
         >
           <FileIcon className="size-3.5 shrink-0 self-center text-muted-foreground" />
           <span
-            className={cn("truncate font-mono text-sm md:text-xs", isDeleted && "line-through")}
+            className={cn("truncate font-mono text-ui md:text-sm", isDeleted && "line-through")}
             {...handlers}
           >
             {file.name}
           </span>
-          {dir && <span className="truncate text-muted-foreground text-[11px]">{dir}</span>}
+          {dir && <span className="truncate text-muted-foreground text-sm">{dir}</span>}
         </button>
-        {((file.lines_added ?? 0) !== 0 || (file.lines_removed ?? 0) !== 0) && (
-          <span
-            className="shrink-0 font-mono text-[10px]"
-            aria-label={[
-              file.lines_added !== null && `${file.lines_added} lines added`,
-              file.lines_removed !== null && `${file.lines_removed} removed`,
-            ]
-              .filter(Boolean)
-              .join(", ")}
-          >
-            {file.lines_added !== null && (
-              <span className="text-green-600 dark:text-green-400">+{file.lines_added}</span>
-            )}
-            {file.lines_added !== null && file.lines_removed !== null && " "}
-            {file.lines_removed !== null && (
-              <span className="text-destructive">&minus;{file.lines_removed}</span>
-            )}
-          </span>
-        )}
-        <span className="relative flex shrink-0 items-center justify-center">
+        {/* Fixed-width and always rendered: a variable diffstat ("+7 −1" vs
+            "+1204 −318") would otherwise shift the copy button and status
+            letter to a different x on every row. */}
+        <span className={cn("flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}>
+          {((file.lines_added ?? 0) !== 0 || (file.lines_removed ?? 0) !== 0) && (
+            <span
+              className="font-mono text-[10px]"
+              aria-label={[
+                file.lines_added !== null && `${file.lines_added} lines added`,
+                file.lines_removed !== null && `${file.lines_removed} removed`,
+              ]
+                .filter(Boolean)
+                .join(", ")}
+            >
+              {file.lines_added !== null && (
+                <span className="text-green-600 dark:text-green-400">+{file.lines_added}</span>
+              )}
+              {file.lines_added !== null && file.lines_removed !== null && " "}
+              {file.lines_removed !== null && (
+                <span className="text-destructive">&minus;{file.lines_removed}</span>
+              )}
+            </span>
+          )}
+        </span>
+        {/* Status letter at rest, the copy/download pair on hover — the same
+            trailing column the tree rows use, so the two tabs match. */}
+        <span
+          className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
+        >
           <span
             className={cn(
-              "rounded px-1 py-0.5 font-mono text-[10px]",
-              hasDownload && "group-hover:invisible",
+              "rounded px-1 py-0.5 font-mono text-[10px] group-hover:invisible",
               isDeleted
                 ? "bg-destructive/10 text-destructive"
                 : file.status === "created"
@@ -137,11 +151,14 @@ function FileListItem({
           >
             {gitStatusLetter(file.status)}
           </span>
-          {hasDownload && conversationId && (
-            <span className="absolute inset-0 flex items-center justify-center">
+          <span className="absolute inset-0 flex items-center justify-end gap-0.5">
+            {hasDownload && conversationId ? (
               <FileDownloadButton conversationId={conversationId} path={file.path} />
-            </span>
-          )}
+            ) : (
+              <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
+            )}
+            <CopyPathButton path={file.path} revealOnHover />
+          </span>
         </span>
       </div>
       {tooltip}
@@ -182,7 +199,7 @@ export function FlatFileList({
   runnerWentOffline?: boolean;
 }) {
   if (isLoading) {
-    return <p className="px-2 py-1 text-muted-foreground text-xs">Loading…</p>;
+    return <p className="px-2 py-1 text-muted-foreground text-sm">Loading…</p>;
   }
   if (isError) {
     // Runner not connected. If it went offline after being up (host
@@ -191,16 +208,16 @@ export function FlatFileList({
     // state rather than alarm the user.
     if (error instanceof RunnerOfflineError) {
       if (runnerWentOffline) return <RunnerAsleepHint />;
-      return <p className="px-2 py-1 text-muted-foreground text-xs">No workspace changes yet</p>;
+      return <p className="px-2 py-1 text-muted-foreground text-sm">No workspace changes yet</p>;
     }
     return (
-      <p className="px-2 py-1 text-destructive text-xs">
+      <p className="px-2 py-1 text-destructive text-sm">
         Failed to load: {error instanceof Error ? error.message : String(error)}
       </p>
     );
   }
   if (!files || files.length === 0) {
-    return <p className="px-2 py-1 text-muted-foreground text-xs">No workspace changes yet</p>;
+    return <p className="px-2 py-1 text-muted-foreground text-sm">No workspace changes yet</p>;
   }
   const normalizedSearchQuery = normalizeSearchQuery(searchQuery);
   const visibleFiles = files.filter(
@@ -217,7 +234,7 @@ export function FlatFileList({
   const hiddenCount = files.length - visibleFiles.length;
   if (visibleFiles.length === 0) {
     return (
-      <p className="px-2 py-1 text-muted-foreground text-xs">
+      <p className="px-2 py-1 text-muted-foreground text-sm">
         All changes are in hidden files.{" "}
         <button
           type="button"
@@ -231,7 +248,7 @@ export function FlatFileList({
   }
   if (sorted.length === 0) {
     return (
-      <p className="px-2 py-1 text-muted-foreground text-xs">
+      <p className="px-2 py-1 text-muted-foreground text-sm">
         No changed files match "{searchQuery.trim()}"
       </p>
     );
@@ -239,7 +256,7 @@ export function FlatFileList({
   return (
     <>
       {hiddenCount > 0 && (
-        <p className="px-2 py-1 text-muted-foreground text-xs">
+        <p className="px-2 py-1 text-muted-foreground text-sm">
           {hiddenCount} file{hiddenCount === 1 ? "" : "s"} hidden.{" "}
           <button
             type="button"

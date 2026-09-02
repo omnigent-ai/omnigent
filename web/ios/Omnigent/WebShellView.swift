@@ -5,11 +5,12 @@ struct WebShellView: View {
   let connectToNewServer: () -> Void
   let switchToServer: (URL) -> Void
   let loadFailed: (URL, String) -> Void
-  let loadSucceeded: (URL) -> Void
+  let loadSucceeded: () -> Void
 
   @Environment(\.colorScheme) private var colorScheme
   @EnvironmentObject private var settings: SettingsStore
   @EnvironmentObject private var router: AppRouter
+  @EnvironmentObject private var managedConfiguration: ManagedConfigurationProvider
   @StateObject private var model = WebViewModel()
   /// A deep-link path that arrived while the page was still loading — emitted
   /// to the SPA once `isLoading` flips false, so a cold-start / mid-load deep
@@ -25,13 +26,17 @@ struct WebShellView: View {
           model: model,
           settings: settings,
           loadFailed: loadFailed,
-          loadSucceeded: loadSucceeded
+          loadSucceeded: loadSucceeded,
+          pushServerPicker: pushServerPicker,
+          requestSwitchServer: switchServerIfListed,
+          openServerSetup: connectToNewServer
         )
         .ignoresSafeArea()
 
         ServerSwitcher(
           currentURL: model.currentURL ?? initialURL,
-          recents: settings.recentServers,
+          recents: ManagedServers.merged(
+            managed: managedConfiguration.serverURLs, recents: settings.recentServers),
           isLoading: model.isLoading,
           maxWidth: ServerSwitcherMetrics.maxWidth(for: geometry.size.width),
           switchServer: switchServer,
@@ -93,15 +98,41 @@ struct WebShellView: View {
       }
     }
     .onChange(of: model.isLoading) { _, loading in
-      // Re-push the native bar footprints once each load completes; the JS
-      // bridge caches the value so a later-mounting subscriber still gets it.
+      // Re-push the native bar footprints and the server-picker payload once
+      // each load completes; the JS bridge caches both so later-mounting
+      // subscribers still get them.
       if !loading {
         model.emitInsets(
           topBar: InsetMetrics.topBarFootprint,
           bottomBar: InsetMetrics.bottomBarFootprint
         )
+        pushServerPicker()
       }
     }
+  }
+
+  /// Every server the picker may offer or switch to — administrator-preset
+  /// ones first, then recents. Doubles as the switch allow list.
+  private var pickerServers: [String] {
+    ManagedServers.merged(
+      managed: managedConfiguration.serverURLs, recents: settings.recentServers)
+  }
+
+  private func pushServerPicker() {
+    model.emitServerPicker(
+      currentOrigin: (model.currentURL ?? initialURL).omnigentOrigin,
+      managedServers: managedConfiguration.serverURLs.map(\.absoluteString),
+      recentServers: ManagedServers.recents(
+        settings.recentServers, excludingManaged: managedConfiguration.serverURLs)
+    )
+  }
+
+  /// Switch only to a server the picker itself offered — the same allow-list
+  /// gate the desktop shell applies, so page script can't steer the shell to
+  /// an arbitrary origin through the bridge.
+  private func switchServerIfListed(_ urlString: String) {
+    guard pickerServers.contains(urlString) else { return }
+    switchServer(urlString)
   }
 
   private func switchServer(_ urlString: String) {

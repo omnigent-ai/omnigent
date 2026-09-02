@@ -238,6 +238,16 @@ def test_chat_conversation_matches_baseline(
         "requestAnimationFrame(() => requestAnimationFrame(resolve)))"
     )
 
+    # Hide the "Jump to top" pill for the capture. It's transient, time-dependent
+    # chrome: the initial layout settle (LatestTurnSpacer + StickToBottom pinning
+    # to the bottom) fires a scroll that reveals it for a ~2s window, so whether
+    # it's on screen at capture time is a race the baseline shouldn't encode.
+    # Force it out the same way settle kills the caret, so the resting state is
+    # deterministic regardless of when the scroll settles.
+    page.add_style_tag(
+        content='[aria-label="Jump to the first message"] { display: none !important; }'
+    )
+
     # Settle web fonts + kill the blinking caret (both time-dependent).
     settle_for_snapshot(page)
 

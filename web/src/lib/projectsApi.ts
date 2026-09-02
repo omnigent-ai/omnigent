@@ -25,15 +25,31 @@ export interface ProjectConfig {
   workspace?: string;
   /** Default agent id for new sessions. */
   agent_id?: string;
+  /** Chosen emoji icon (a unicode grapheme, e.g. "🔥"). Unset → default folder. */
+  icon?: string;
   /**
-   * Opt-in worktree default: only `true` is meaningful. When `true`, a new
-   * session in a git workspace starts in a fresh randomly-named worktree; unset
-   * (the only other value the dialog stores) starts directly in the workspace.
-   * `false` is never written and is treated the same as unset. The base branch a
-   * worktree forks from stays a global preference (Settings › Git), not a
-   * project default.
+   * Per-project worktree default. When `true`, a new session in a git workspace
+   * starts in a fresh randomly-named worktree; when `false`, it starts directly
+   * in the workspace. Both are meaningful: a set value overrides the user-global
+   * "always use a worktree" default (Settings › Git). An unset key falls through
+   * to that global default.
    */
   use_worktree?: boolean;
+  /**
+   * Default base branch a new worktree forks from, pre-filled into the
+   * composer's base-branch field. Takes precedence over the user-global default
+   * (Settings › Git); an unset key falls through to that global default. Blank
+   * is never stored (treated the same as unset).
+   */
+  base_branch?: string;
+  /**
+   * Default model for new sessions when the default agent is a native coding
+   * harness with a model choice (e.g. Claude Code's version-agnostic "opus"
+   * alias, or a Codex model id resolved on the host). Only meaningful
+   * alongside an `agent_id` whose harness takes a model override; unset =
+   * the harness's own configured default.
+   */
+  model?: string;
 }
 
 /** A first-class project. Mirrors the `ProjectObject` response shape. */
@@ -41,7 +57,7 @@ export interface Project {
   id: string;
   name: string;
   /** Owner user id; `null` in single-user / OSS mode. */
-  owner_user_id?: string | null;
+  user_id?: string | null;
   created_at?: number;
   updated_at?: number | null;
   /** Stored default session settings; `{}` when the project has none. */

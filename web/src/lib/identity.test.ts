@@ -207,6 +207,113 @@ describe("authenticatedFetch", () => {
     expect(init.method).toBe("DELETE");
     expect(init.signal).toBe(controller.signal);
   });
+
+  describe("slice-key routing (host sharding)", () => {
+    it("stamps X-Databricks-Omnigent-Slice-Key on host-scoped URLs", async () => {
+      // Mock sessionHost module before importing identity
+      vi.doMock("./sessionHost", () => ({
+        getSessionHost: vi.fn(() => "host_123"),
+        setSessionHost: vi.fn(),
+        isHostKeyless: vi.fn(() => false),
+        markHostKeyless: vi.fn(),
+        clearHostKeyless: vi.fn(),
+        modalHostId: vi.fn(() => null),
+        resolveModalHost: vi.fn(),
+        isModalHostResolved: vi.fn(() => true),
+      }));
+      vi.doMock("./host", () => ({
+        getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+        hostFetch: fetchMock,
+        isDatabricksWorkspace: vi.fn(() => true),
+      }));
+
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+      const { authenticatedFetch } = await import("./identity");
+
+      await authenticatedFetch("/v1/hosts/host_123/runners");
+
+      const init = fetchMock.mock.calls[0][1] as RequestInit;
+      const headers = new Headers(init.headers);
+      expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_123");
+    });
+
+    it("stamps the slice-key header in standalone dev against a workspace", async () => {
+      // `npm run dev` pointed at a workspace URL installs no fetcher, but it's
+      // still a Databricks workspace (sharded) — the VITE_DATABRICKS_WORKSPACE
+      // build flag drives the key so dev traffic reaches the right replica (no
+      // manual step).
+      vi.stubEnv("VITE_DATABRICKS_WORKSPACE", "true");
+      vi.doMock("./sessionHost", () => ({
+        getSessionHost: vi.fn(() => null),
+        setSessionHost: vi.fn(),
+        isHostKeyless: vi.fn(() => false),
+        markHostKeyless: vi.fn(),
+        clearHostKeyless: vi.fn(),
+        modalHostId: vi.fn(() => null),
+        resolveModalHost: vi.fn(),
+        isModalHostResolved: vi.fn(() => true),
+      }));
+      vi.doMock("./host", () => ({
+        getOmnigentHostConfig: vi.fn(() => ({})),
+        hostFetch: fetchMock,
+        isDatabricksWorkspace: vi.fn(() => true),
+      }));
+
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+      const { authenticatedFetch } = await import("./identity");
+
+      await authenticatedFetch("/v1/hosts/host_abc/runners", { method: "POST" });
+
+      const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+      expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_abc");
+    });
+
+    it("retries keyless on wrong_replica 400 response", async () => {
+      vi.doMock("./sessionHost", () => ({
+        getSessionHost: vi.fn(() => "host_789"),
+        setSessionHost: vi.fn(),
+        isHostKeyless: vi.fn(() => false),
+        markHostKeyless: vi.fn(),
+        clearHostKeyless: vi.fn(),
+        modalHostId: vi.fn(() => null),
+        resolveModalHost: vi.fn(),
+        isModalHostResolved: vi.fn(() => true),
+      }));
+      vi.doMock("./host", () => ({
+        getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+        hostFetch: fetchMock,
+        isDatabricksWorkspace: vi.fn(() => true),
+      }));
+
+      const wrongReplicaResponse = {
+        ok: false,
+        status: 400,
+        statusText: "Bad Request",
+        json: async () => ({ error: { code: "wrong_replica" } }),
+        clone: function () {
+          return this;
+        },
+      } as unknown as Response;
+
+      fetchMock.mockResolvedValueOnce(wrongReplicaResponse);
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+
+      const { authenticatedFetch } = await import("./identity");
+      const response = await authenticatedFetch("/v1/sessions/sess_xyz/resources/terminals");
+
+      // Should retry after the wrong_replica response
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      // First call should have the slice key
+      const firstInit = fetchMock.mock.calls[0][1] as RequestInit;
+      const firstHeaders = new Headers(firstInit.headers);
+      expect(firstHeaders.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_789");
+      // Second call (retry) should NOT have the slice key
+      const secondInit = fetchMock.mock.calls[1][1] as RequestInit;
+      const secondHeaders = new Headers(secondInit.headers);
+      expect(secondHeaders.get("X-Databricks-Omnigent-Slice-Key")).toBeNull();
+      expect(response.status).toBe(200);
+    });
+  });
 });
 
 describe("getCurrentAuthorId", () => {
@@ -230,5 +337,110 @@ describe("getCurrentAuthorId", () => {
     const { getCurrentAuthorId } = await import("./identity");
     // No resolveIdentity() call: cache is still null, so no label.
     expect(getCurrentAuthorId()).toBeNull();
+  });
+});
+
+// The login redirect is a once-per-document side effect. An unauthenticated
+// page load produces a BURST of 401s (the shell mounts ~8 ungated queries) and
+// every one reaches the redirect branch in `authenticatedFetch`. Re-assigning
+// `location.href` per failure piled up navigations to a page the browser was
+// already headed to; these tests pin it at exactly one.
+describe("login redirect", () => {
+  const ORIGIN = "https://app.example.com";
+  let hrefWrites: string[];
+  let originalLocation: Location;
+
+  function stubLocation(pathname: string, search: string) {
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: {
+        origin: ORIGIN,
+        pathname,
+        search,
+        set href(value: string) {
+          hrefWrites.push(value);
+        },
+        get href() {
+          return hrefWrites[hrefWrites.length - 1] ?? `${ORIGIN}${pathname}`;
+        },
+      },
+    });
+  }
+
+  beforeEach(() => {
+    // The slice-key tests above `vi.doMock("./host")` with a truthy `fetcher`,
+    // and doMock registrations outlive `vi.resetModules()`. Left in place, the
+    // embedded-host guard short-circuits the entire 401 redirect branch and
+    // these tests pass no matter what the code does. Same for ./sessionHost,
+    // and for the workspace env stub that turns on slice-key routing.
+    vi.doUnmock("./host");
+    vi.doUnmock("./sessionHost");
+    vi.unstubAllEnvs();
+
+    hrefWrites = [];
+    originalLocation = window.location;
+    stubLocation("/", "");
+  });
+
+  afterEach(() => {
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: originalLocation,
+    });
+  });
+
+  it("redirects once for a whole burst of 401s", async () => {
+    // /v1/me 401s with a login page (accounts / OIDC), then eight queries land
+    // 401 behind it — the shape of a real logged-out page load.
+    fetchMock.mockResolvedValue(
+      mockJsonResponse({ user_id: null, login_url: "/login" }, { ok: false, status: 401 }),
+    );
+    const { resolveIdentity, authenticatedFetch, isLoginRedirectPending } =
+      await import("./identity");
+
+    await resolveIdentity();
+    await Promise.all(
+      Array.from({ length: 8 }, () => authenticatedFetch("/v1/sessions?limit=100")),
+    );
+
+    expect(hrefWrites).toEqual(["/login?return_to=%2F"]);
+    expect(isLoginRedirectPending()).toBe(true);
+  });
+
+  it("preserves the originating path in return_to", async () => {
+    stubLocation("/c/abc", "?tab=diff");
+    fetchMock.mockResolvedValue(
+      mockJsonResponse({ user_id: null, login_url: "/auth/login" }, { ok: false, status: 401 }),
+    );
+    const { resolveIdentity } = await import("./identity");
+
+    await resolveIdentity();
+
+    expect(hrefWrites).toEqual(["/auth/login?return_to=%2Fc%2Fabc%3Ftab%3Ddiff"]);
+  });
+
+  it("never redirects in header mode, where there is no login page", async () => {
+    // login_url null → the proxy owns identity, so a stray 401 must surface to
+    // the caller instead of bouncing the user to a phantom form.
+    fetchMock.mockResolvedValue(mockJsonResponse({ user_id: null }, { ok: false, status: 401 }));
+    const { resolveIdentity, authenticatedFetch, isLoginRedirectPending } =
+      await import("./identity");
+
+    await resolveIdentity();
+    const res = await authenticatedFetch("/v1/hosts");
+
+    expect(hrefWrites).toEqual([]);
+    expect(isLoginRedirectPending()).toBe(false);
+    expect(res.status).toBe(401);
+  });
+
+  it("reports no pending redirect for an authenticated load", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ user_id: "alice" }));
+    const { resolveIdentity, isLoginRedirectPending } = await import("./identity");
+
+    await resolveIdentity();
+
+    expect(isLoginRedirectPending()).toBe(false);
+    expect(hrefWrites).toEqual([]);
   });
 });

@@ -5,9 +5,9 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
 
 from omnigent.inner.executor import (
+    EnqueuedContent,
     Executor,
     ExecutorConfig,
     ExecutorError,
@@ -56,7 +56,7 @@ class PiNativeExecutor(Executor):
         """:returns: ``True`` because messages can be queued for the extension."""
         return True
 
-    async def enqueue_session_message(self, session_key: str, content: Any) -> bool:
+    async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:
         """
         Queue a live steering message for the resident Pi extension.
 
@@ -178,7 +178,7 @@ def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
     return ""
 
 
-def _content_to_text(content: Any, bridge_dir: Path) -> str:
+def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
     """
     Normalize executor content into plain text for Pi.
 

@@ -1,3 +1,5 @@
+import type * as ReactRouterDomModule from "react-router-dom";
+
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
@@ -9,7 +11,7 @@ import { createSession } from "@/lib/sessionsApi";
 
 const navigateMock = vi.fn();
 vi.mock("react-router-dom", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("react-router-dom")>();
+  const actual = await importOriginal<typeof ReactRouterDomModule>();
   return { ...actual, useNavigate: () => navigateMock };
 });
 vi.mock("@/hooks/useAvailableAgents", () => ({

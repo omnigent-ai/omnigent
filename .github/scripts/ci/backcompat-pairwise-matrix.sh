@@ -109,7 +109,7 @@ done
 # The integration suite runs a single openai-agents leg in mock mode (matches
 # integration-matrix.sh); the model name is unused under the mock LLM.
 integ_harness="openai-agents"
-integ_model="databricks-gpt-5-4-mini"
+integ_model="mock-model"
 integ_workers="4"
 
 e2e_items=()

@@ -16,6 +16,7 @@ import logging
 import secrets
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, cast
 from urllib.parse import urlencode
 
 import httpx
@@ -29,6 +30,7 @@ from omnigent.server.auth import (
     _RESERVED_USERS,
     UnifiedAuthProvider,
 )
+from omnigent.server.device_grant_store import DeviceGrantStore
 from omnigent.server.oidc import (
     _GITHUB_EMAILS_ENDPOINT,
     derive_code_challenge,
@@ -36,6 +38,7 @@ from omnigent.server.oidc import (
     mint_session_cookie,
 )
 from omnigent.server.oidc_access import OidcAdmissionPolicy, resolve_allowed_domains_path
+from omnigent.server.routes.device_auth import issue_login_grant
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
@@ -50,6 +53,9 @@ _CLI_TICKET_TTL_SECONDS = 300  # 5 minutes
 # out-of-band, short enough to bound exposure of an unused link.
 _OIDC_INVITE_TTL_SECONDS = 72 * 3600
 
+if TYPE_CHECKING:
+    from omnigent.server.oidc import OIDCConfig
+
 
 @dataclass
 class _CliTicket:
@@ -63,11 +69,16 @@ class _CliTicket:
         fulfills the ticket. ``None`` while pending.
     :param user_id: The authenticated user's email, set when
         fulfilled. ``None`` while pending.
+    :param refresh_token: Login-issued refresh grant material, set at
+        fulfillment when a grant store is wired. ``None`` while pending
+        or when grants are unavailable. Handed to the CLI exactly once
+        by the poll response.
     """
 
     created_at: float = field(default_factory=time.time)
     token: str | None = None
     user_id: str | None = None
+    refresh_token: str | None = None
 
 
 def create_auth_router(
@@ -76,6 +87,7 @@ def create_auth_router(
     admin_list: AdminList,
     account_store: SqlAlchemyAccountStore | None = None,
     allowed_domains: frozenset[str] | None = None,
+    device_grant_store: DeviceGrantStore | None = None,
 ) -> APIRouter:
     """Create an :class:`APIRouter` with OIDC login/callback/logout routes.
 
@@ -96,14 +108,23 @@ def create_auth_router(
         ``allowed_domains:`` key, union'd with
         ``OMNIGENT_OIDC_ALLOWED_DOMAINS`` and the runtime-editable file
         in the admission policy.
+    :param device_grant_store: When set, a CLI-ticket login also issues
+        a refresh grant (see
+        :func:`omnigent.server.routes.device_auth.issue_login_grant`)
+        so hosts and CLIs can renew without a human re-running
+        ``omnigent login``. ``None`` keeps the legacy
+        session-JWT-only response.
     :returns: A FastAPI router with ``/login``, ``/callback``,
         ``/logout`` (and ``/invite`` when invites are enabled).
     """
     router = APIRouter()
     config = auth_provider._oidc_config
+    if config is None:
+        raise ValueError("OIDC auth router requires an OIDC-configured auth provider")
 
     # Invites are opt-in AND require the token store. Both must hold.
-    _invites_enabled = config.allow_invites and account_store is not None
+    invite_store = account_store if config.allow_invites else None
+    _invites_enabled = invite_store is not None
 
     # Admission policy: domain allowlist (env ∪ runtime-editable file)
     # with admin-list and (when enabled) invite bypasses. One place
@@ -112,7 +133,7 @@ def create_auth_router(
         env_allowed_domains=config.allowed_domains,
         domains_file_path=resolve_allowed_domains_path(),
         admin_list=admin_list,
-        invited_lookup=account_store if _invites_enabled else None,
+        invited_lookup=invite_store,
         config_allowed_domains=allowed_domains,
     )
 
@@ -279,11 +300,21 @@ def create_auth_router(
                     content={"error": "Token exchange failed"},
                 )
 
-            token_json = token_resp.json()
+            token_json = _json_object(_response_json(token_resp))
+            if token_json is None:
+                _logger.error("Token exchange returned a non-object JSON response")
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "Token exchange returned an invalid response"},
+                )
 
             # Extract user email.
             if config.provider_type == "github":
-                email = await _resolve_github_email(client, token_json.get("access_token", ""))
+                access_token = token_json.get("access_token")
+                email = await _resolve_github_email(
+                    client,
+                    access_token if isinstance(access_token, str) else "",
+                )
             else:
                 email = _resolve_oidc_email(token_json, config)
 
@@ -303,10 +334,10 @@ def create_auth_router(
         # account_tokens row, which doubles as the durable pre-auth that
         # admits the email on subsequent logins. Reserved-name emails are
         # rejected below regardless, so binding one here is harmless.
-        if _invites_enabled:
+        if invite_store is not None:
             invite_token = state_payload.get("invite")
             if invite_token:
-                account_store.redeem_oidc_invite(
+                invite_store.redeem_oidc_invite(
                     str(invite_token), email, now_epoch_seconds=int(time.time())
                 )
 
@@ -350,6 +381,19 @@ def create_auth_router(
             ticket = _cli_tickets[ticket_id]
             ticket.token = session_jwt
             ticket.user_id = email
+            # A CLI login is a long-lived unattended credential holder
+            # (hosts especially) — issue a refresh grant so it can renew
+            # instead of dying at session-JWT expiry. Best-effort: a
+            # grant-store failure must not break login itself.
+            if device_grant_store is not None:
+                try:
+                    ticket.refresh_token = issue_login_grant(
+                        device_grant_store,
+                        user_id=email,
+                        cookie_secret=config.cookie_secret,
+                    )
+                except Exception:
+                    _logger.exception("cli-login: refresh grant issuance failed")
             # Return a simple HTML page — the CLI is polling
             # /auth/cli-poll and will pick up the token.
             import html as _html
@@ -407,7 +451,7 @@ def create_auth_router(
         )
         return response
 
-    if _invites_enabled:
+    if invite_store is not None:
 
         @router.post("/invite")
         async def oidc_invite(request: Request) -> Response:
@@ -440,7 +484,7 @@ def create_auth_router(
 
             token_id = secrets.token_urlsafe(32)
             now = int(time.time())
-            account_store.create_token(
+            invite_store.create_token(
                 token_id,
                 kind="invite",
                 user_id=None,
@@ -543,15 +587,18 @@ def create_auth_router(
         # Fulfilled — return the token and clean up.
         token = ticket.token
         user_id = ticket.user_id
+        refresh_token = ticket.refresh_token
         del _cli_tickets[ticket_id]
-        return JSONResponse(
-            status_code=200,
-            content={
-                "token": token,
-                "user_id": user_id,
-                "expires_in": config.session_ttl_hours * 3600,
-            },
-        )
+        content: dict[str, object] = {
+            "token": token,
+            "user_id": user_id,
+            "expires_in": config.session_ttl_hours * 3600,
+        }
+        # Only present when a grant store is wired — old CLIs ignore the
+        # extra key, new CLIs against old servers see it absent.
+        if refresh_token is not None:
+            content["refresh_token"] = refresh_token
+        return JSONResponse(status_code=200, content=content)
 
     # ── Admin: read-only user list ────────────────────────────────
 
@@ -711,9 +758,17 @@ async def _resolve_github_email(
         timeout=10.0,
     )
     if emails_resp.status_code == 200:
-        for entry in emails_resp.json():
+        payload = _response_json(emails_resp)
+        if not isinstance(payload, list):
+            return None
+        for raw_entry in payload:
+            entry = _json_object(raw_entry)
+            if entry is None:
+                continue
             if entry.get("primary") and entry.get("verified"):
-                return entry.get("email")
+                email = entry.get("email")
+                if isinstance(email, str) and email:
+                    return email
 
     # No primary, verified address. Deliberately do NOT fall back to the
     # ``/user.email`` profile field: it is unverified and attacker-settable,
@@ -743,7 +798,7 @@ def _claim_is_verified_true(value: object) -> bool:
 
 
 def _resolve_oidc_email(
-    token_json: dict,
+    token_json: dict[str, object],
     config: OIDCConfig,
 ) -> str | None:
     """Extract the verified email from the OIDC ``id_token``.
@@ -781,7 +836,10 @@ def _resolve_oidc_email(
         skipped via config).
     """
     id_token = token_json.get("id_token")
-    if not id_token:
+    if not isinstance(id_token, str) or not id_token:
+        return None
+    if config.jwks_uri is None:
+        _logger.warning("Rejecting id_token: OIDC configuration has no JWKS URI")
         return None
 
     try:
@@ -790,7 +848,7 @@ def _resolve_oidc_email(
         claims = jwt.decode(
             id_token,
             signing_key.key,
-            algorithms=["RS256", "ES256"],
+            algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
             audience=config.client_id,
             issuer=config.issuer,
         )
@@ -856,6 +914,17 @@ def _resolve_oidc_email(
     return email
 
 
-# Forward ref for type annotation.
-if False:  # TYPE_CHECKING
-    from omnigent.server.oidc import OIDCConfig
+def _json_object(value: object) -> dict[str, object] | None:
+    """Return a string-keyed JSON object, or ``None`` for other shapes."""
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        return None
+    return cast("dict[str, object]", value)
+
+
+def _response_json(response: httpx.Response) -> object | None:
+    """Decode a JSON response, returning ``None`` when decoding fails."""
+    try:
+        value: object = response.json()
+    except ValueError:
+        return None
+    return value

@@ -39,7 +39,7 @@ type LastSeenMap = Record<string, number>;
 // The browser-durable read-state, hydrated from localStorage at module
 // load, raised (never lowered) by the server seed, and updated
 // optimistically on each mutation before the best-effort PUT lands.
-const lastSeenMap: LastSeenMap = {};
+let lastSeenMap: LastSeenMap = {};
 const explicitlyUnread = new Set<string>();
 
 // localStorage persistence. Best-effort everywhere: storage can be
@@ -199,7 +199,7 @@ export function useSeedReadState(conversations: readonly ReadStateSeed[] | undef
  * Not used in production.
  */
 export function resetReadStateForTests(): void {
-  for (const id of Object.keys(lastSeenMap)) delete lastSeenMap[id];
+  lastSeenMap = {};
   explicitlyUnread.clear();
   seeded.clear();
   hydrated = false;
@@ -367,7 +367,11 @@ export function useMarkConversationSeen(
   useEffect(() => {
     if (!conversationId || updatedAt === undefined) return;
     const markIfFocused = () => {
-      if (windowHasFocus()) markConversationSeen(conversationId);
+      // Anchor at or above the updated_at being viewed: a server clock that
+      // leads the client must not leave a just-read turn reading as unseen
+      // (updated_at > client wall clock). Wall clock still wins when it's
+      // ahead, capturing an update the poll hasn't picked up yet.
+      if (windowHasFocus()) markConversationSeen(conversationId, Math.max(nowSeconds(), updatedAt));
     };
     markIfFocused();
     window.addEventListener("focus", markIfFocused);

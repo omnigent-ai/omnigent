@@ -9,14 +9,9 @@ import {
   useSensor,
   useSensors,
 } from "@dnd-kit/core";
-import {
-  ClockIcon,
-  CornerDownRightIcon,
-  GripVerticalIcon,
-  PencilIcon,
-  Trash2Icon,
-} from "lucide-react";
+import { ArrowUpIcon, ClockIcon, GripVerticalIcon, PencilIcon, Trash2Icon } from "lucide-react";
 
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { QueuedMessage } from "@/store/chatStore";
 import { cn } from "@/lib/utils";
 
@@ -75,7 +70,7 @@ function QueuedRow({
     <div
       ref={setDropRef}
       className={cn(
-        "flex items-center gap-1.5 text-xs text-muted-foreground",
+        "flex items-center gap-1.5 text-sm text-muted-foreground",
         isDragging && "opacity-40",
         isOver && "rounded bg-foreground/5",
       )}
@@ -98,15 +93,19 @@ function QueuedRow({
       {/* Always visible (not hover-gated) so the actions are discoverable;
           they brighten on hover/focus. */}
       {onSteer ? (
-        <button
-          type="button"
-          aria-label="Send queued message now"
-          className="flex shrink-0 items-center gap-1 rounded px-1 py-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
-          onClick={() => onSteer(message.queueId)}
-        >
-          <CornerDownRightIcon className="size-3.5" aria-hidden="true" />
-          Steer
-        </button>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              aria-label="Send queued message now"
+              className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
+              onClick={() => onSteer(message.queueId)}
+            >
+              <ArrowUpIcon className="size-3.5" aria-hidden="true" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="top">Send now</TooltipContent>
+        </Tooltip>
       ) : null}
       <button
         type="button"

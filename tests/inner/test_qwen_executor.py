@@ -21,7 +21,16 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from omnigent.inner.executor import ExecutorError, TextChunk, TurnComplete
+from omnigent.inner.executor import (
+    ExecutorConfig,
+    ExecutorError,
+    ReasoningChunk,
+    TextChunk,
+    ToolCallComplete,
+    ToolCallRequest,
+    ToolCallStatus,
+    TurnComplete,
+)
 from omnigent.inner.qwen_executor import QwenExecutor
 
 # ---------------------------------------------------------------------------
@@ -423,6 +432,78 @@ async def test_ensure_session_uses_server_assigned_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ensure_session_records_config_options_without_legacy_model_param() -> None:
+    """Qwen model selection uses session config, not session/new.model."""
+    executor = QwenExecutor(model="qwen-plus")
+    captured: dict = {}
+
+    async def fake_rpc(method: str, params: dict, timeout: float = 30.0) -> dict:
+        captured.update(params)
+        return {
+            "result": {
+                "sessionId": "s1",
+                "configOptions": [{"id": "model", "currentValue": "qwen-turbo"}],
+            }
+        }
+
+    executor._rpc = fake_rpc  # type: ignore[method-assign]
+    await executor._ensure_session()
+
+    assert "model" not in captured
+    assert executor._active_model == "qwen-turbo"
+
+
+@pytest.mark.asyncio
+async def test_model_override_uses_standard_session_config() -> None:
+    executor = QwenExecutor()
+    executor._config_option_ids.add("model")
+    executor._active_model = "qwen-turbo"
+    executor._rpc = AsyncMock(
+        return_value={"result": {"configOptions": [{"id": "model", "currentValue": "qwen-plus"}]}}
+    )  # type: ignore[method-assign]
+
+    await executor._apply_model_override("s1", "qwen-plus")
+
+    executor._rpc.assert_awaited_once_with(
+        "session/set_config_option",
+        {"sessionId": "s1", "configId": "model", "value": "qwen-plus"},
+    )
+    assert executor._active_model == "qwen-plus"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_applies_configured_model_without_per_turn_override() -> None:
+    """An empty per-turn config must not discard HARNESS_QWEN_MODEL."""
+    executor = QwenExecutor(model="qwen-plus")
+    executor._initialized = True
+    executor._session_id = "s1"
+    executor._system_prompt_sent = True
+    executor._proc = MagicMock(returncode=None)
+    executor._apply_model_override = AsyncMock()  # type: ignore[method-assign]
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            executor._pending[msg["id"]].set_result(
+                {"id": msg["id"], "result": {"stopReason": "end_turn"}}
+            )
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    events = [
+        event
+        async for event in executor.run_turn(
+            [{"role": "user", "content": "hello"}],
+            [],
+            "",
+            ExecutorConfig(model=None),
+        )
+    ]
+
+    executor._apply_model_override.assert_awaited_once_with("s1", "qwen-plus")
+    assert any(isinstance(event, TurnComplete) for event in events)
+
+
+@pytest.mark.asyncio
 async def test_ensure_session_cached_after_first_call() -> None:
     """_ensure_session does not make a second RPC call once session is set."""
     executor = QwenExecutor()
@@ -514,6 +595,117 @@ async def test_run_turn_yields_text_chunks_and_turn_complete() -> None:
     assert text_chunks[0].text == "Hello!"
     assert len(turn_completes) == 1
     assert turn_completes[0].response == "Hello!"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_forwards_reasoning_and_structured_tool_updates() -> None:
+    executor = QwenExecutor()
+    executor._initialized = True
+    executor._session_id = "sess-events"
+    executor._system_prompt_sent = True
+    executor._proc = MagicMock(returncode=None)
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") != "session/prompt":
+            return
+        for update in (
+            {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "text", "text": "checking"},
+            },
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc1",
+                "title": "shell",
+                "rawInput": {"command": "pwd"},
+            },
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc1",
+                "status": "completed",
+                "rawOutput": "ok",
+            },
+        ):
+            await executor._queue.put(
+                {
+                    "method": "session/update",
+                    "params": {"sessionId": "sess-events", "update": update},
+                }
+            )
+        executor._pending[msg["id"]].set_result(
+            {"id": msg["id"], "result": {"stopReason": "end_turn"}}
+        )
+
+    executor._send = fake_send  # type: ignore[method-assign]
+    events = [
+        event
+        async for event in executor.run_turn(
+            [{"role": "user", "content": "inspect"}],
+            [],
+            "",
+            ExecutorConfig(),
+        )
+    ]
+
+    assert executor.handles_tools_internally() is True
+    assert [(e.delta, e.event_type) for e in events if isinstance(e, ReasoningChunk)] == [
+        ("checking", "reasoning_text")
+    ]
+    requests = [e for e in events if isinstance(e, ToolCallRequest)]
+    assert requests == [
+        ToolCallRequest(name="shell", args={"command": "pwd"}, metadata={"call_id": "tc1"})
+    ]
+    completes = [e for e in events if isinstance(e, ToolCallComplete)]
+    assert completes[0].name == "shell"
+    assert completes[0].status is ToolCallStatus.SUCCESS
+    assert completes[0].result == "ok"
+    assert completes[0].metadata == {"call_id": "tc1"}
+
+
+@pytest.mark.asyncio
+async def test_interrupt_sends_session_cancel_notification() -> None:
+    executor = QwenExecutor()
+    executor._session_id = "s1"
+    proc = MagicMock(returncode=None)
+    executor._proc = proc
+    executor._notify = AsyncMock()  # type: ignore[method-assign]
+
+    assert await executor.interrupt_session("ignored") is True
+    executor._notify.assert_awaited_once_with("session/cancel", {"sessionId": "s1"})
+    proc.terminate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_terminates_before_session_setup() -> None:
+    executor = QwenExecutor()
+    proc = MagicMock(returncode=None)
+    executor._proc = proc
+
+    assert await executor.interrupt_session("ignored") is True
+    proc.terminate.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_terminates_when_session_cancel_fails() -> None:
+    executor = QwenExecutor()
+    executor._session_id = "s1"
+    proc = MagicMock(returncode=None)
+    executor._proc = proc
+    executor._notify = AsyncMock(side_effect=OSError("closed"))  # type: ignore[method-assign]
+
+    assert await executor.interrupt_session("ignored") is True
+    proc.terminate.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_noops_without_live_process() -> None:
+    executor = QwenExecutor()
+    assert await executor.interrupt_session("ignored") is False
+
+    proc = MagicMock(returncode=0)
+    executor._proc = proc
+    assert await executor.interrupt_session("ignored") is False
+    proc.terminate.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1457,6 +1649,325 @@ async def test_fs_write_rejects_missing_args() -> None:
     )
 
     assert sent[0]["error"]["code"] == -32602
+
+
+# ---------------------------------------------------------------------------
+# fs delegation — event recording + TOOL_RESULT-phase content policy
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fs_read_records_tool_call_events() -> None:
+    """A delegated read buffers a paired ToolCallRequest + ToolCallComplete."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
+        read_result={"content": "hello", "encoding": "utf-8"}
+    )
+    executor._send = AsyncMock()  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {"jsonrpc": "2.0", "id": 3, "method": "fs/read_text_file", "params": {"path": "a.txt"}}
+    )
+
+    req, done = executor._fs_events
+    assert isinstance(req, ToolCallRequest)
+    assert req.name == "read_text_file"
+    assert req.args == {"path": "a.txt"}
+    assert isinstance(done, ToolCallComplete)
+    assert done.status is ToolCallStatus.SUCCESS
+    assert done.result == {"content": "hello"}
+    assert req.metadata["call_id"] == done.metadata["call_id"]
+
+
+@pytest.mark.asyncio
+async def test_fs_write_records_tool_call_events() -> None:
+    """A delegated write buffers a paired ToolCallRequest + ToolCallComplete."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    write_result = {"bytes": 3}
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor._os_environment = _FakeOSEnv(write_result=write_result)  # type: ignore[assignment]
+    executor._send = AsyncMock()  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "fs/write_text_file",
+            "params": {"path": "out.txt", "content": "abc"},
+        }
+    )
+
+    req, done = executor._fs_events
+    assert req.name == "write_text_file"
+    assert req.args == {"path": "out.txt", "content": "abc"}
+    assert done.status is ToolCallStatus.SUCCESS
+    assert done.result == write_result
+    assert req.metadata["call_id"] == done.metadata["call_id"]
+
+
+@pytest.mark.asyncio
+async def test_fs_read_blocked_by_call_policy() -> None:
+    """A TOOL_CALL-phase DENY refuses the read by path before it runs."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    fake = _FakeOSEnv(read_result={"content": "secret", "encoding": "utf-8"})
+    executor._os_environment = fake  # type: ignore[assignment]
+    policy = AsyncMock(return_value=MagicMock(action="POLICY_ACTION_DENY"))
+    executor._policy_evaluator = policy  # type: ignore[assignment]
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {"jsonrpc": "2.0", "id": 5, "method": "fs/read_text_file", "params": {"path": "a.txt"}}
+    )
+
+    assert policy.await_args.args == (
+        "PHASE_TOOL_CALL",
+        {"name": "read_text_file", "arguments": {"path": "a.txt"}},
+    )
+    assert fake.read_calls == []  # denied before the read ran
+    assert "error" in sent[0]
+    assert executor._fs_events[-1].status is ToolCallStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_fs_read_blocked_by_result_policy() -> None:
+    """A TOOL_RESULT-phase DENY on read content refuses delivery and records BLOCKED."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
+        read_result={"content": "secret", "encoding": "utf-8"}
+    )
+
+    async def _policy(phase: str, data: dict) -> MagicMock:  # type: ignore[type-arg]
+        # Allow the path at the call phase; deny the content at the result phase.
+        action = "POLICY_ACTION_DENY" if phase == "PHASE_TOOL_RESULT" else "POLICY_ACTION_ALLOW"
+        return MagicMock(action=action)
+
+    policy = AsyncMock(side_effect=_policy)
+    executor._policy_evaluator = policy  # type: ignore[assignment]
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {"jsonrpc": "2.0", "id": 5, "method": "fs/read_text_file", "params": {"path": "a.txt"}}
+    )
+
+    assert policy.await_args.args == ("PHASE_TOOL_RESULT", {"result": "secret"})
+    assert "error" in sent[0]
+    assert executor._fs_events[-1].status is ToolCallStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_fs_write_blocked_by_result_policy() -> None:
+    """A TOOL_RESULT-phase DENY on the write result records BLOCKED."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    write_result = {"path": "out.txt", "bytes": 3, "marker": "actual"}
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor._os_environment = _FakeOSEnv(write_result=write_result)  # type: ignore[assignment]
+
+    async def _policy(phase: str, data: dict) -> MagicMock:  # type: ignore[type-arg]
+        action = "POLICY_ACTION_DENY" if phase == "PHASE_TOOL_RESULT" else "POLICY_ACTION_ALLOW"
+        return MagicMock(action=action)
+
+    policy = AsyncMock(side_effect=_policy)
+    executor._policy_evaluator = policy  # type: ignore[assignment]
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "fs/write_text_file",
+            "params": {"path": "out.txt", "content": "abc"},
+        }
+    )
+
+    assert policy.await_args_list[-1].args == ("PHASE_TOOL_RESULT", {"result": write_result})
+    assert "error" in sent[0]
+    assert executor._fs_events[-1].status is ToolCallStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_fs_write_blocked_by_call_policy_prevents_write() -> None:
+    """A TOOL_CALL-phase DENY (path + content) prevents the write."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    fake = _FakeOSEnv(write_result={})
+    executor._os_environment = fake  # type: ignore[assignment]
+    policy = AsyncMock(return_value=MagicMock(action="POLICY_ACTION_DENY"))
+    executor._policy_evaluator = policy  # type: ignore[assignment]
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "fs/write_text_file",
+            "params": {"path": "out.txt", "content": "secret"},
+        }
+    )
+
+    assert policy.await_args.args == (
+        "PHASE_TOOL_CALL",
+        {"name": "write_text_file", "arguments": {"path": "out.txt", "content": "secret"}},
+    )
+    assert fake.write_calls == []  # the write never happened
+    assert "error" in sent[0]
+    assert executor._fs_events[-1].status is ToolCallStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_fs_write_call_policy_fails_closed() -> None:
+    """A TOOL_CALL-phase eval error prevents the write (fail closed for side effects)."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    fake = _FakeOSEnv(write_result={})
+    executor._os_environment = fake  # type: ignore[assignment]
+    executor._policy_evaluator = AsyncMock(  # type: ignore[assignment]
+        side_effect=RuntimeError("policy server unreachable")
+    )
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "fs/write_text_file",
+            "params": {"path": "out.txt", "content": "secret"},
+        }
+    )
+
+    assert fake.write_calls == []  # an eval failure blocks the write, it does not allow it
+    assert "error" in sent[0]
+    assert executor._fs_events[-1].status is ToolCallStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_fs_write_call_policy_ask_blocks() -> None:
+    """A TOOL_CALL-phase ASK blocks the write (delegated fs has no elicitation path)."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    fake = _FakeOSEnv(write_result={})
+    executor._os_environment = fake  # type: ignore[assignment]
+    executor._policy_evaluator = AsyncMock(  # type: ignore[assignment]
+        return_value=MagicMock(action="POLICY_ACTION_ASK")
+    )
+    executor._send = AsyncMock()  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "fs/write_text_file",
+            "params": {"path": "out.txt", "content": "secret"},
+        }
+    )
+
+    assert fake.write_calls == []  # ASK with no elicitation blocks the write
+    assert executor._fs_events[-1].status is ToolCallStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_run_turn_surfaces_delegated_fs_ops() -> None:
+    """run_turn drains recorded fs ops onto the turn stream as ToolCall events."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor._initialized = True
+    executor._session_id = "s"
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+    executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
+        read_result={"content": "hi", "encoding": "utf-8"}
+    )
+    loop = asyncio.get_event_loop()
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            req_id = msg["id"]
+            await executor._queue.put(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 77,
+                    "method": "fs/read_text_file",
+                    "params": {"path": "a.txt"},
+                }
+            )
+
+            def _resolve() -> None:
+                fut = executor._pending.get(req_id)
+                if fut and not fut.done():
+                    fut.set_result(
+                        {"jsonrpc": "2.0", "id": req_id, "result": {"stopReason": "end_turn"}}
+                    )
+
+            loop.call_soon(_resolve)
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    events = [e async for e in executor.run_turn([{"role": "user", "content": "go"}], [], "")]
+
+    assert [e.name for e in events if isinstance(e, ToolCallRequest)] == ["read_text_file"]
+    assert [e.status for e in events if isinstance(e, ToolCallComplete)] == [
+        ToolCallStatus.SUCCESS
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_records_stale_fs_op_from_prior_turn() -> None:
+    """A stale server fs request answered at turn start is still audited, not dropped."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor._initialized = True
+    executor._session_id = "s"
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+    executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
+        read_result={"content": "hi", "encoding": "utf-8"}
+    )
+    loop = asyncio.get_event_loop()
+
+    # A leftover fs request from a prior turn, sitting on the queue before this
+    # turn starts. It runs real I/O when answered, so its audit events must survive.
+    await executor._queue.put(
+        {"jsonrpc": "2.0", "id": 77, "method": "fs/read_text_file", "params": {"path": "a.txt"}}
+    )
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            req_id = msg["id"]
+
+            def _resolve() -> None:
+                fut = executor._pending.get(req_id)
+                if fut and not fut.done():
+                    fut.set_result(
+                        {"jsonrpc": "2.0", "id": req_id, "result": {"stopReason": "end_turn"}}
+                    )
+
+            loop.call_soon(_resolve)
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    events = [e async for e in executor.run_turn([{"role": "user", "content": "go"}], [], "")]
+
+    assert [e.name for e in events if isinstance(e, ToolCallRequest)] == ["read_text_file"]
+    assert [e.status for e in events if isinstance(e, ToolCallComplete)] == [
+        ToolCallStatus.SUCCESS
+    ]
 
 
 @pytest.mark.asyncio

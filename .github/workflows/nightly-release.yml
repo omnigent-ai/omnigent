@@ -1,0 +1,259 @@
+# Cut the nightly prerelease build: a stamped, tagged snapshot of main.
+#
+# Every night (or on manual dispatch) this picks the newest commit on main
+# with green CI, stamps the lockstep version to `X.Y.Z.devYYYYMMDD` (today's
+# UTC date appended to main's `X.Y.Z.dev0` line), commits that stamp DETACHED
+# on top of the base commit, tags it `vX.Y.Z.devYYYYMMDD`, and pushes ONLY the
+# tag with the omnigent-ci App token (GITHUB_TOKEN-pushed tags fire no
+# workflows; the image build hangs off the tag push).
+#
+# Deliberately NOT the release.yml flow: no release/vX.Y branch is created,
+# bump-version.yml is never dispatched (a nightly must not walk main's
+# version), and there is no benchmark gate (benchmark.yml already measures
+# main nightly). Downstream is already quiet for dev tags: github-release.yml
+# and draft-release-notes.yml skip `*dev[0-9]*` tags, update-check ignores
+# dev releases, a default `pip install` never resolves them, and
+# oss-publish-images.yml publishes the immutable
+# `:vX.Y.Z.devYYYYMMDD` image (only `:latest-rc` follows it, by design).
+#
+# The datestamp is FIXED-WIDTH (YYYYMMDD, one nightly per UTC day): PEP 440
+# compares the dev segment as a plain integer, so a longer stamp would sort
+# above every shorter one forever. A same-day re-run finds the tag and no-ops.
+#
+# Nightlies are NOT published to PyPI. Consumers install straight from the
+# tag with uv (scripts/update_nightly.sh resolves and installs the newest
+# one), which pins all lockstep packages to the tagged commit.
+name: Nightly Release
+
+on:
+  schedule:
+    # 04:30 UTC: after the 00:00 UTC scheduled suites drain, well before the
+    # 07:00 UTC image rebuild (its concurrency is per-SHA, so a tag build
+    # racing it would cold-race the layer cache).
+    - cron: "30 4 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Plan only: print the base commit and version, push nothing."
+        required: false
+        type: boolean
+        default: true
+
+# Nothing here writes with GITHUB_TOKEN; the tag push uses the App token.
+permissions:
+  contents: read
+
+# Share release.yml's group: a nightly cut must never interleave with a real
+# release dispatch.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    if: github.repository == 'omnigent-ai/omnigent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      base_sha: ${{ steps.resolve.outputs.base_sha }}
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      should_cut: ${{ steps.resolve.outputs.should_cut }}
+    steps:
+      # Manual dispatches are maintainer-only, same rule as release.yml.
+      # Scheduled runs have no meaningful actor and skip the check.
+      - name: Require admin/maintain role (dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          role="$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${ACTOR}/permission" --jq .role_name)"
+          case "$role" in
+            admin|maintain)
+              echo "Dispatcher ${ACTOR} has role ${role} — authorized." | tee -a "$GITHUB_STEP_SUMMARY" ;;
+            *)
+              echo "::error::Nightly dispatches require the admin or maintain role (dispatcher ${ACTOR} has '${role}')."
+              exit 1 ;;
+          esac
+
+      - name: Checkout main history and tags
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve base commit, version, and whether to cut
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          # Boolean inputs arrive as strings on CLI dispatches and are empty
+          # on schedule — gate in shell, not in `if:` expressions. A schedule
+          # fire is always a real run; a dispatch is dry unless explicitly not.
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$DRY_RUN_INPUT" != "false" ]; then
+            dry_run=true
+          else
+            dry_run=false
+          fi
+
+          # Walk main newest-first to the first commit whose CI is complete
+          # and green. A fixed-hour cron can't demand HEAD be green (the last
+          # merge of the day is often mid-CI); walking back keeps the nightly
+          # cadence without ever building a red commit. Check runs from this
+          # workflow's own runs are excluded (a schedule run parks a pending
+          # check on the HEAD it triggered from — it must not mask HEAD).
+          base_sha=""
+          for sha in $(git rev-list -n 20 origin/main); do
+            own_runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/nightly-release.yml/runs?head_sha=${sha}&per_page=100" \
+              --jq '.workflow_runs[].id' 2>/dev/null | paste -sd, -)"
+            runs="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}/check-runs?per_page=100" \
+              --paginate --jq '.check_runs[] | [.name, .status, .conclusion // "-", .details_url] | @tsv')"
+            runs="$(printf '%s' "$runs" | awk -F'\t' -v rel="$own_runs" '
+              BEGIN { n=split(rel, a, ","); for (i=1; i<=n; i++) if (a[i]!="") own[a[i]]=1 }
+              { o=0; for (r in own) if (index($4, "/runs/" r "/")) { o=1; break }
+                if (!o) print $1 "\t" $2 "\t" $3 }')"
+            total="$(printf '%s' "$runs" | grep -c . || true)"
+            pending="$(printf '%s' "$runs" | awk -F'\t' '$2 != "completed"' || true)"
+            bad="$(printf '%s' "$runs" | awk -F'\t' '$3 ~ /^(failure|timed_out|action_required|startup_failure)$/' || true)"
+            if [ "$total" -gt 0 ] && [ -z "$bad" ] && [ -z "$pending" ]; then
+              base_sha="$sha"
+              break
+            fi
+            echo "skipping ${sha}: $([ "$total" -eq 0 ] && echo 'no check runs' || { [ -n "$bad" ] && echo 'failing checks' || echo 'checks still running'; })"
+          done
+
+          should_cut=false
+          version=""
+          tag=""
+          reason=""
+          if [ -z "$base_sha" ]; then
+            reason="no commit with completed green CI in the newest 20 on main"
+          else
+            # Main must carry the `X.Y.Z.dev0` marker (the repo's versioning
+            # invariant). The nightly replaces the dev segment with today's
+            # UTC date; anything else on main is a broken state to fail loudly on.
+            main_version="$(git show "${base_sha}:pyproject.toml" | sed -n 's/^version = "\(.*\)"$/\1/p' | head -1)"
+            if ! [[ "$main_version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.dev0$ ]]; then
+              echo "::error::main's version at ${base_sha} is '${main_version}', expected X.Y.Z.dev0 — refusing to derive a nightly version."
+              exit 1
+            fi
+            version="${BASH_REMATCH[1]}.dev$(date -u +%Y%m%d)"
+            tag="v${version}"
+
+            if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+              reason="tag ${tag} already exists (nightly already cut today)"
+            else
+              # Skip quiet nights: the newest nightly tag's commit is the
+              # stamp on top of its base, so parent = the base it built. If
+              # our base is that commit (or older, after a red-HEAD walk),
+              # there is nothing new to ship.
+              last_tag="$(git for-each-ref --sort=-creatordate --format='%(refname:short)' 'refs/tags/v[0-9]*' \
+                | grep -E '\.dev[0-9]{8}$' | head -1 || true)"
+              if [ -n "$last_tag" ] && { [ "$base_sha" = "$(git rev-parse "${last_tag}^")" ] \
+                  || git merge-base --is-ancestor "$base_sha" "$(git rev-parse "${last_tag}^")"; }; then
+                reason="no new commits on main since ${last_tag}"
+              elif [ "$dry_run" = "true" ]; then
+                reason="dry run — would cut ${tag} from ${base_sha}"
+              else
+                should_cut=true
+              fi
+            fi
+          fi
+
+          {
+            echo "## Nightly plan"
+            echo ""
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Base commit | \`${base_sha:-—}\` |"
+            echo "| Version | \`${version:-—}\` |"
+            echo "| Cutting | ${should_cut} |"
+            [ -n "$reason" ] && echo "| Reason | ${reason} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          {
+            echo "base_sha=${base_sha}"
+            echo "version=${version}"
+            echo "tag=${tag}"
+            echo "should_cut=${should_cut}"
+          } >> "$GITHUB_OUTPUT"
+
+  cut:
+    needs: plan
+    if: needs.plan.outputs.should_cut == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Clean public resolution for `uv lock` — the committed lockfile must
+      # reference https://pypi.org/simple (never a proxy).
+      UV_INDEX_URL: https://pypi.org/simple
+      PIP_INDEX_URL: https://pypi.org/simple
+    steps:
+      - name: Mint App token (omnigent)
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: omnigent
+
+      - name: Checkout base commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.plan.outputs.base_sha }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: false
+
+      - name: Stamp the lockstep version
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          uv run --no-project --python 3.12 --with packaging \
+            python scripts/update_versions.py pre-release --new-version "$VERSION"
+          uv lock
+          # uv may emit non-canonical lockfile fields (e.g. size on file
+          # entries); normalize like the pre-commit fixer, then hard-verify.
+          python3 scripts/normalize_uv_lock_registry.py uv.lock || true
+          python3 scripts/normalize_uv_lock_registry.py --check uv.lock
+          uv run --no-project --python 3.12 --with packaging \
+            python scripts/update_versions.py check --expect "$VERSION"
+
+      - name: Commit, tag, and push the tag
+        env:
+          PUSH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "omnigent-ci[bot]"
+          git config user.email "294685417+omnigent-ci[bot]@users.noreply.github.com"
+
+          # Stage everything the stamp touched: update_versions.py owns the
+          # file set (same staging as release.yml and bump-version.yml).
+          git add -A
+          git commit -s -m "nightly: ${TAG}"
+          git tag "$TAG"
+
+          # Tag only — the stamp commit stays off every branch, reachable via
+          # the tag. The App token push fires the tag-triggered workflows.
+          push_url="https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push "$push_url" "refs/tags/${TAG}"
+          echo "Pushed ${TAG} at $(git rev-parse HEAD) (base $(git rev-parse HEAD^))." \
+            | tee -a "$GITHUB_STEP_SUMMARY"

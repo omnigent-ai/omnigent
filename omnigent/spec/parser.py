@@ -7,7 +7,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal, TypedDict, cast
 
 import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
@@ -134,7 +134,7 @@ def _parse_int_field(raw: object, field_name: str) -> int:
             code=ErrorCode.INVALID_INPUT,
         )
     try:
-        return int(raw)
+        return int(cast(str | bytes | bytearray | int | float, raw))
     except (TypeError, ValueError) as exc:
         raise OmnigentError(
             f"{field_name} must be an integer, got {raw!r}",
@@ -155,7 +155,7 @@ def _parse_float_field(raw: object, field_name: str) -> float:
             code=ErrorCode.INVALID_INPUT,
         )
     try:
-        return float(raw)
+        return float(cast(str | bytes | bytearray | int | float, raw))
     except (TypeError, ValueError) as exc:
         raise OmnigentError(
             f"{field_name} must be a number, got {raw!r}",
@@ -218,6 +218,12 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
             executor.model = llm.model
         if executor.connection is None and llm.connection is not None:
             executor.connection = llm.connection
+        if executor.reasoning_effort is None:
+            llm_effort = llm.extra.get("reasoning_effort")
+            if llm_effort is not None:
+                executor.reasoning_effort = str(llm_effort)
+        elif "reasoning_effort" in llm.extra:
+            llm.extra["reasoning_effort"] = executor.reasoning_effort
     # Ensure spec.llm is populated from executor fields when only the
     # executor: block declares model/connection (the common case for
     # user-authored YAML). Internal consumers (policy builder,
@@ -313,7 +319,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
 
 
 def _parse_llm(
-    raw: dict[str, Any] | None,
+    raw: dict[str, object] | None,
     *,
     expand_env: bool = True,
 ) -> LLMConfig | None:
@@ -392,7 +398,7 @@ def _parse_llm(
 
 
 def _parse_interaction(
-    raw: dict[str, Any] | None,
+    raw: dict[str, object] | None,
 ) -> InteractionConfig:
     """
     Parse the ``interaction:`` block from config.yaml into an
@@ -423,7 +429,7 @@ def _parse_interaction(
 
 
 def _parse_tools_config(
-    raw: dict[str, Any] | None,
+    raw: dict[str, object] | None,
     *,
     expand_env: bool = True,
 ) -> ToolsConfig:
@@ -444,8 +450,14 @@ def _parse_tools_config(
     retry = _parse_retry(raw.get("retry"))
     builtins = _parse_builtin_tools(raw.get("builtins", []), expand_env=expand_env)
     sandbox = _parse_sandbox_config(raw.get("sandbox"))
+    raw_agents = raw.get("agents", [])
+    if not isinstance(raw_agents, list):
+        raise OmnigentError(
+            f"tools.agents must be a list, got {type(raw_agents).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
     return ToolsConfig(
-        agents=raw.get("agents", []),
+        agents=[str(agent) for agent in raw_agents],
         builtins=builtins,
         timeout=timeout,
         retry=retry,
@@ -454,7 +466,7 @@ def _parse_tools_config(
 
 
 def _parse_sandbox_config(
-    raw: dict[str, Any] | None,
+    raw: object,
 ) -> SandboxConfig:
     """
     Parse the ``tools.sandbox`` block from config.yaml.
@@ -474,21 +486,26 @@ def _parse_sandbox_config(
     """
     if raw is None or not isinstance(raw, dict):
         return SandboxConfig()
-    image = raw.get("container_image") or raw.get("docker_image")
-    kwargs: dict[str, Any] = {"container_image": image}
-    if "container_runtime" in raw:
-        runtime = raw["container_runtime"]
-        if runtime not in SandboxConfig.ALLOWED_RUNTIMES:
-            raise ValueError(
-                f"Unsupported container_runtime {runtime!r}; "
-                f"expected one of {sorted(SandboxConfig.ALLOWED_RUNTIMES)}."
-            )
-        kwargs["container_runtime"] = runtime
-    return SandboxConfig(**kwargs)
+    raw_image = raw.get("container_image") or raw.get("docker_image")
+    image = str(raw_image) if raw_image is not None else None
+    raw_runtime = raw.get("container_runtime")
+    runtime: Literal["docker", "podman"] | None
+    if "container_runtime" not in raw:
+        runtime = None
+    elif raw_runtime == "docker":
+        runtime = "docker"
+    elif raw_runtime == "podman":
+        runtime = "podman"
+    else:
+        raise ValueError(
+            f"Unsupported container_runtime {raw_runtime!r}; "
+            f"expected one of {sorted(SandboxConfig.ALLOWED_RUNTIMES)}."
+        )
+    return SandboxConfig(container_image=image, container_runtime=runtime)
 
 
 def _parse_builtin_tools(
-    raw: list[str | dict[str, Any]],
+    raw: object,
     *,
     expand_env: bool = True,
 ) -> list[BuiltinToolConfig]:
@@ -511,6 +528,11 @@ def _parse_builtin_tools(
     :returns: A list of :class:`BuiltinToolConfig` instances.
     :raises OmnigentError: If a dict entry is missing ``name``.
     """
+    if not isinstance(raw, list):
+        raise OmnigentError(
+            f"tools.builtins must be a list, got {type(raw).__name__}.",
+            code=ErrorCode.INVALID_INPUT,
+        )
     result: list[BuiltinToolConfig] = []
     for entry in raw:
         if isinstance(entry, str):
@@ -540,7 +562,7 @@ def _parse_builtin_tools(
 
 
 def _parse_retry(
-    raw: dict[str, Any] | None,
+    raw: object,
 ) -> RetryPolicy:
     """
     Parse a ``retry:`` block into a :class:`RetryPolicy`.
@@ -553,7 +575,22 @@ def _parse_retry(
     """
     if not raw:
         return RetryPolicy()
+    if not isinstance(raw, dict):
+        raise OmnigentError(
+            f"retry must be a mapping, got {type(raw).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
     defaults = RetryPolicy()
+    retryable_status_codes = raw.get(
+        "retryable_status_codes",
+        defaults.retryable_status_codes,
+    )
+    if not isinstance(retryable_status_codes, list | tuple):
+        raise OmnigentError(
+            "retry.retryable_status_codes must be a list or tuple, "
+            f"got {type(retryable_status_codes).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
     return RetryPolicy(
         max_retries=_parse_int_field(
             raw.get("max_retries", defaults.max_retries),
@@ -574,14 +611,13 @@ def _parse_retry(
             else defaults.timeout_per_request_s
         ),
         retryable_status_codes=tuple(
-            _parse_int_field(c, "retry.retryable_status_codes")
-            for c in raw.get("retryable_status_codes", defaults.retryable_status_codes)
+            _parse_int_field(c, "retry.retryable_status_codes") for c in retryable_status_codes
         ),
     )
 
 
 def _parse_executor(
-    raw: dict[str, Any] | None,
+    raw: dict[str, object] | None,
     *,
     expand_env: bool = True,
 ) -> ExecutorSpec:
@@ -609,7 +645,7 @@ def _parse_executor(
     # numbers round-trip as their string form (the omnigent
     # harness/profile fields are both strings in the source YAML).
     raw_config = raw.get("config")
-    config: dict[str, Any] = {}
+    config: dict[str, object] = {}
     if isinstance(raw_config, dict):
         config = {
             str(k): (v if k in _STRUCTURED_EXECUTOR_CONFIG_KEYS else str(v))
@@ -632,6 +668,8 @@ def _parse_executor(
     )
     raw_model = raw.get("model")
     model: str | None = str(raw_model) if raw_model is not None else None
+    raw_effort = raw.get("reasoning_effort")
+    reasoning_effort: str | None = str(raw_effort) if raw_effort is not None else None
     # Parse ``executor.connection:`` — same shape as ``llm.connection:``
     # (a flat dict of string key-value pairs with optional ${VAR}
     # expansion). Lifted from the ``executor:`` block so connection
@@ -652,6 +690,7 @@ def _parse_executor(
         profile=profile,
         config=config,
         model=model,
+        reasoning_effort=reasoning_effort,
         connection=connection,
         context_window=context_window,
         auth=auth,
@@ -659,7 +698,7 @@ def _parse_executor(
 
 
 def _parse_executor_auth(
-    raw: dict[str, Any],  # type: ignore[explicit-any]
+    raw: dict[str, object],
     *,
     expand_env: bool = True,
 ) -> ApiKeyAuth | DatabricksAuth | ProviderAuth | None:
@@ -918,18 +957,19 @@ def _parse_os_env_sandbox(
     mask_paths = _parse_mask_paths(raw.get("mask_paths"))
     env_passthrough = _parse_env_passthrough(raw.get("env_passthrough"))
     egress_rules = _parse_egress_rules(raw.get("egress_rules"))
-    raw_type = raw.get("type")
-    if raw_type is None:
-        # No ``type:`` field in the sandbox block -- resolve via the
-        # platform default (the same logic that fires when ``sandbox:``
-        # is omitted entirely). On Linux this picks ``linux_bwrap``
-        # when bwrap is on PATH, else ``none``; on macOS it
-        # picks ``darwin_seatbelt``.
-        from omnigent.inner.sandbox import _default_sandbox_for_platform
+    from omnigent.inner.sandbox import _default_sandbox_for_platform, _resolve_sandbox_type
 
+    if "type" not in raw:
         sandbox_type = _default_sandbox_for_platform().type
     else:
-        sandbox_type = str(raw_type)
+        raw_type = raw["type"]
+        if raw_type is not None and not isinstance(raw_type, str):
+            raise OmnigentError(
+                "os_env.sandbox.type must be a string or null, "
+                f"got {type(raw_type).__name__}: {raw_type!r}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        sandbox_type = _resolve_sandbox_type(raw_type)
     if egress_rules and sandbox_type not in ("linux_bwrap", "darwin_seatbelt"):
         raise OmnigentError(
             "os_env.sandbox.egress_rules requires sandbox.type=linux_bwrap "
@@ -992,11 +1032,9 @@ def _parse_cwd_allow_hidden(raw: object) -> list[str] | None:
     ``os_env.sandbox``.
 
     Each entry must be a single path component (no ``/``, ``\\``,
-    or ``.`` / ``..`` traversal) so a misconfigured spec can't punch
-    a hole through arbitrary subdirectories of cwd. The bwrap backend
-    looks each entry up in ``cwd.iterdir()`` directly; sanitising
-    here keeps the resolver simple and the failure mode loud at
-    parse time rather than at runtime.
+    or ``.`` / ``..`` traversal). The special entry ``"*"`` explicitly
+    disables dotpath masking for trusted roots while preserving escaping-
+    symlink masking.
 
     :param raw: Raw value from the YAML, e.g. ``[".venv", ".git"]``,
         or ``None`` when the field is absent.
@@ -1060,7 +1098,10 @@ def _parse_cwd_hidden_scan_max_entries(raw: object) -> int:
         strictly positive.
     """
     if raw is None:
-        return OSEnvSandboxSpec.__dataclass_fields__["cwd_hidden_scan_max_entries"].default
+        return cast(
+            int,
+            OSEnvSandboxSpec.__dataclass_fields__["cwd_hidden_scan_max_entries"].default,
+        )
     if isinstance(raw, bool) or not isinstance(raw, int):
         raise OmnigentError(
             "os_env.sandbox.cwd_hidden_scan_max_entries must be an integer, "
@@ -1092,7 +1133,10 @@ def _parse_cwd_hidden_scan_overflow(raw: object) -> str:
         modes.
     """
     if raw is None:
-        return OSEnvSandboxSpec.__dataclass_fields__["cwd_hidden_scan_overflow"].default
+        return cast(
+            str,
+            OSEnvSandboxSpec.__dataclass_fields__["cwd_hidden_scan_overflow"].default,
+        )
     if not isinstance(raw, str) or raw not in _CWD_HIDDEN_SCAN_OVERFLOW_MODES:
         raise OmnigentError(
             "os_env.sandbox.cwd_hidden_scan_overflow must be one of "
@@ -1115,7 +1159,10 @@ def _parse_cwd_hidden_scan_recursive(raw: object) -> bool:
     :raises OmnigentError: If ``raw`` is not a boolean.
     """
     if raw is None:
-        return OSEnvSandboxSpec.__dataclass_fields__["cwd_hidden_scan_recursive"].default
+        return cast(
+            bool,
+            OSEnvSandboxSpec.__dataclass_fields__["cwd_hidden_scan_recursive"].default,
+        )
     if not isinstance(raw, bool):
         raise OmnigentError(
             "os_env.sandbox.cwd_hidden_scan_recursive must be a boolean, "
@@ -1282,7 +1329,7 @@ _GH_BASIC_DEFAULT_TARGETS = ("github.com", "api.github.com")
 _GH_TOKEN_ENV_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
 
 
-class _CredentialSourceModel(BaseModel):
+class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
     """Pydantic boundary model for a ``credential_proxy[*].source`` mapping.
 
     The secret origin is a structured single-key mapping —
@@ -1346,7 +1393,7 @@ class _CredentialSourceModel(BaseModel):
         return CredentialSourceSpec(kind="command", command=self.command.strip())
 
 
-class _CredentialProxyItemModel(BaseModel):
+class _CredentialProxyItemModel(BaseModel):  # type: ignore[explicit-any]
     """Pydantic boundary model for one raw ``credential_proxy`` entry.
 
     Validates the entry's *shape* — ``type``, ``source``, ``target`` /
@@ -1960,7 +2007,7 @@ def _parse_credential_proxy_host(raw: str, *, field_path: str) -> str:
 
 
 def _parse_compaction(
-    raw: dict[str, Any] | None,
+    raw: dict[str, object] | None,
 ) -> CompactionConfig | None:
     """
     Parse the ``compaction:`` block from config.yaml into a
@@ -2098,7 +2145,7 @@ def _parse_skills_filter(raw: object) -> str | list[str]:
     Parse the top-level YAML ``skills:`` field into a host-skill
     filter string or list of names.
 
-    Distinct from the bundle-side ``skills/<name>/SKILL.md`` files
+    Distinct from the bundle-side ``skills/<dir>/SKILL.md`` files
     discovered by :func:`_discover_skills` — that's the agent's own
     bundled skills, always loaded. This filter only controls
     HOST-scope skills that the harness picks up from the user's
@@ -2231,16 +2278,24 @@ def discover_host_skills(
     return skills
 
 
+# How many grouping levels ``_discover_skills`` descends below ``skills/``:
+# ``skills/<namespace>/<skill>/SKILL.md`` is found, deeper nesting is not.
+_SKILL_NAMESPACE_MAX_DEPTH = 1
+
+
 def _discover_skills(
     skills_dir: Path,
     *,
     skipped: list[str] | None = None,
+    _depth: int = 0,
 ) -> list[SkillSpec]:
     """
     Discover and parse all skills under the ``skills/`` directory.
 
     Each subdirectory containing a ``SKILL.md`` file is parsed via
-    :func:`_parse_skill`.
+    :func:`_parse_skill`. A subdirectory without one is a namespace
+    folder and is scanned one level deeper, so
+    ``skills/<namespace>/<skill>/SKILL.md`` is discovered too.
 
     :param skills_dir: Path to the ``skills/`` directory, e.g.
         ``root / "skills"``.
@@ -2251,7 +2306,10 @@ def _discover_skills(
         Pass ``None`` (the default) to fail loud on the first
         error — used for bundled skills that the agent author
         controls.
-    :returns: A sorted list of parsed :class:`SkillSpec` objects.
+    Namespace folders only group skills; they do not alter the skill name
+    declared in ``SKILL.md``.
+
+    :returns: Parsed :class:`SkillSpec` objects in deterministic path order.
         Returns an empty list if *skills_dir* does not exist.
     """
     if not skills_dir.is_dir():
@@ -2269,10 +2327,13 @@ def _discover_skills(
         return []
     skills: list[SkillSpec] = []
     for skill_dir in entries:
-        if not skill_dir.is_dir():
+        if not skill_dir.is_dir() or skill_dir.name.startswith("."):
             continue
         skill_md = skill_dir / "SKILL.md"
         if not skill_md.exists():
+            # Namespace folder: group skills one level deeper.
+            if _depth < _SKILL_NAMESPACE_MAX_DEPTH:
+                skills.extend(_discover_skills(skill_dir, skipped=skipped, _depth=_depth + 1))
             continue
         try:
             skill = _parse_skill(skill_md)
@@ -2489,8 +2550,8 @@ def _parse_inline_mcp_servers(
         in config.yaml. ``None`` or a non-dict value returns an empty
         list without raising.
     :param expand_env: Whether to expand ``${VAR}`` references in
-        ``headers`` and ``env`` values. ``True`` (default) for
-        deploy/runtime; ``False`` for scaffolding/validation.
+        ``url``, ``headers`` and ``env`` values. ``True`` (default)
+        for deploy/runtime; ``False`` for scaffolding/validation.
     :returns: A list of :class:`MCPServerConfig` objects, one per
         inline MCP entry, in YAML key order.
     """
@@ -2508,7 +2569,7 @@ def _parse_inline_mcp_servers(
         command = val.get("command")
         url = val.get("url")
         if command is not None:
-            transport: str = "stdio"
+            transport: Literal["http", "stdio"] = "stdio"
         elif url is not None:
             transport = "http"
         else:
@@ -2524,6 +2585,8 @@ def _parse_inline_mcp_servers(
                 code=ErrorCode.INVALID_INPUT,
             )
         headers = expand_env_vars(raw_headers) if expand_env and raw_headers else raw_headers
+        if url is not None:
+            url = expand_env_vars({"url": str(url)})["url"] if expand_env else str(url)
         raw_env = val.get("env", {})
         if raw_env and not isinstance(raw_env, dict):
             raise OmnigentError(
@@ -2563,7 +2626,7 @@ def _parse_inline_mcp_servers(
                 description=str(raw_desc)
                 if (raw_desc := val.get("description")) is not None
                 else None,
-                url=str(url) if url is not None else None,
+                url=url if url is not None else None,
                 command=str(command) if command is not None else None,
                 args=args,
                 headers=headers,
@@ -2635,7 +2698,7 @@ def _discover_mcp_servers(
 
 def _parse_http_mcp_server(
     name: object,
-    raw: dict[str, Any],  # type: ignore[explicit-any]
+    raw: dict[str, object],
     yaml_file: Path,
     *,
     expand_env: bool,
@@ -2655,7 +2718,7 @@ def _parse_http_mcp_server(
         ``{"name": "github", "transport": "http", "url": "..."}``.
     :param yaml_file: Path to the source file — used in error messages.
     :param expand_env: Whether to expand ``${VAR}`` references in
-        ``headers``.
+        ``url`` and ``headers``.
     :returns: A fully populated :class:`MCPServerConfig` with
         ``transport == "http"``.
     :raises OmnigentError: If ``url`` is missing or a stdio-only
@@ -2674,14 +2737,23 @@ def _parse_http_mcp_server(
             f"MCP server {name!r} missing required field 'url': {yaml_file}",
             code=ErrorCode.INVALID_INPUT,
         )
+    url_str = str(url)
+    if expand_env:
+        url_str = expand_env_vars({"url": url_str})["url"]
+    raw_headers = raw.get("headers", {})
+    if not isinstance(raw_headers, dict):
+        raise OmnigentError(
+            f"MCP server {name!r} (transport='http') 'headers' must be a mapping: {yaml_file}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    headers = {str(key): str(value) for key, value in raw_headers.items()}
+    raw_description = raw.get("description")
     return MCPServerConfig(
         name=str(name),
         transport="http",
-        url=str(url),
-        headers=(
-            expand_env_vars(raw.get("headers", {})) if expand_env else raw.get("headers", {})
-        ),
-        description=raw.get("description"),
+        url=url_str,
+        headers=expand_env_vars(headers) if expand_env else headers,
+        description=str(raw_description) if raw_description is not None else None,
         timeout=(
             _parse_int_field(raw["timeout"], f"MCP server {name!r}.timeout")
             if "timeout" in raw
@@ -2693,7 +2765,7 @@ def _parse_http_mcp_server(
 
 def _parse_stdio_mcp_server(
     name: object,
-    raw: dict[str, Any],  # type: ignore[explicit-any]
+    raw: dict[str, object],
     yaml_file: Path,
     *,
     expand_env: bool,
@@ -2752,7 +2824,8 @@ def _parse_stdio_mcp_server(
             f"MCP server {name!r} (transport='stdio') 'env' must be a mapping: {yaml_file}",
             code=ErrorCode.INVALID_INPUT,
         )
-    env = expand_env_vars(raw_env) if expand_env else raw_env
+    string_env = {str(key): str(value) for key, value in raw_env.items()}
+    env = expand_env_vars(string_env) if expand_env else string_env
     if "sandbox" in raw:
         # Step 7: ``sandbox: <bool>`` was an AP-only no-op that
         # wrapped the stdio spawn with ``srt``. srt's default
@@ -2771,13 +2844,14 @@ def _parse_stdio_mcp_server(
             f"per-MCP outbound-host allowlist with a different schema.",
             code=ErrorCode.INVALID_INPUT,
         )
+    raw_description = raw.get("description")
     return MCPServerConfig(
         name=str(name),
         transport="stdio",
         command=str(command),
         args=[str(a) for a in raw_args],
-        env={str(k): str(v) for k, v in env.items()},
-        description=raw.get("description"),
+        env=env,
+        description=str(raw_description) if raw_description is not None else None,
         timeout=(
             _parse_int_field(raw["timeout"], f"MCP server {name!r}.timeout")
             if "timeout" in raw
@@ -2789,7 +2863,7 @@ def _parse_stdio_mcp_server(
 
 def _reject_wrong_transport_keys(
     name: object,
-    raw: dict[str, Any],  # type: ignore[explicit-any]
+    raw: dict[str, object],
     yaml_file: Path,
     *,
     disallowed: tuple[str, ...],
@@ -2883,7 +2957,12 @@ def _discover_sub_agents(
         config_yaml = agent_dir / "config.yaml"
         if not config_yaml.exists():
             continue
-        sub_agents.append(parse(agent_dir, expand_env=expand_env))
+        sub_spec = parse(agent_dir, expand_env=expand_env)
+        # Provenance for bundle-dir resolution: the directory name, never
+        # the YAML ``name``. A child's skills and local tools live under
+        # ``<parent bundle>/agents/<dir>``, and the two can differ.
+        sub_spec.source_rel_dir = agent_dir.name
+        sub_agents.append(sub_spec)
     return sub_agents
 
 
@@ -2897,8 +2976,15 @@ def _discover_sub_agents(
 # parity for label values — see §14 of the audit).
 
 
+class _PolicyBaseFields(TypedDict):
+    name: str
+    on: list[PhaseSelector] | None
+    condition: dict[str, str | list[str]] | None
+    ask_timeout: int | None
+
+
 def _parse_guardrails(
-    raw: dict[str, Any] | None,
+    raw: dict[str, object] | None,
     *,
     expand_env: bool = True,
 ) -> GuardrailsSpec | None:
@@ -2940,7 +3026,7 @@ def _parse_guardrails(
     )
 
 
-def _parse_guardrails_ask_timeout(raw: Any) -> int:
+def _parse_guardrails_ask_timeout(raw: object) -> int:
     """
     Validate and coerce the spec-wide ``ask_timeout`` value.
 
@@ -2967,7 +3053,7 @@ def _parse_guardrails_ask_timeout(raw: Any) -> int:
 
 
 def _parse_label_defs(
-    raw: dict[str, Any] | None,
+    raw: object,
 ) -> dict[str, LabelDef] | None:
     """
     Parse the ``guardrails.labels:`` block into a dict of
@@ -3001,7 +3087,7 @@ def _parse_label_defs(
     return defs
 
 
-def _parse_single_label_def(key: str, entry: Any) -> LabelDef:
+def _parse_single_label_def(key: str, entry: object) -> LabelDef:
     """
     Parse one label definition entry.
 
@@ -3039,12 +3125,12 @@ def _parse_single_label_def(key: str, entry: Any) -> LabelDef:
     return LabelDef(initial=initial, values=values)
 
 
-def _coerce_label_initial(raw: Any) -> str | None:
+def _coerce_label_initial(raw: object) -> str | None:
     """Coerce an ``initial:`` value to ``str | None``."""
     return None if raw is None else str(raw)
 
 
-def _coerce_label_values(key: str, raw: Any) -> list[str] | None:
+def _coerce_label_values(key: str, raw: object) -> list[str] | None:
     """
     Coerce a ``values:`` list to ``list[str]`` or ``None``.
 
@@ -3091,7 +3177,7 @@ def _validate_label_def_cross_fields(
 
 
 def _parse_policies(
-    raw: dict[str, Any] | list[Any] | None,
+    raw: object,
     *,
     expand_env: bool = True,
 ) -> list[PolicySpec] | None:
@@ -3128,7 +3214,7 @@ def _parse_policies(
 
 def _parse_policy_spec(
     name: str,
-    data: Any,
+    data: object,
     *,
     expand_env: bool = True,
 ) -> PolicySpec:
@@ -3179,10 +3265,10 @@ def _parse_policy_spec(
 
 def _parse_policy_base_fields(
     name: str,
-    data: dict[str, Any],
+    data: dict[str, object],
     *,
     is_function: bool = False,
-) -> dict[str, Any]:
+) -> _PolicyBaseFields:
     """
     Parse the fields every policy type shares.
 
@@ -3221,8 +3307,8 @@ def _parse_policy_base_fields(
 
 def _parse_function_policy(
     name: str,
-    data: dict[str, Any],
-    base_kwargs: dict[str, Any],
+    data: dict[str, object],
+    base_kwargs: _PolicyBaseFields,
 ) -> FunctionPolicySpec:
     """
     Parse a ``type: function`` policy block.
@@ -3266,7 +3352,7 @@ def _parse_function_policy(
 
 
 def _parse_on(
-    raw: Any,
+    raw: object,
     *,
     policy_name: str,
 ) -> list[PhaseSelector]:
@@ -3309,7 +3395,7 @@ def _parse_on(
 
 
 def _parse_on_entry(
-    entry: Any,
+    entry: object,
     *,
     policy_name: str,
 ) -> PhaseSelector:
@@ -3384,7 +3470,7 @@ def _resolve_phase(
 
 
 def _parse_condition(
-    raw: Any,
+    raw: object,
     *,
     policy_name: str,
 ) -> dict[str, str | list[str]] | None:
@@ -3433,7 +3519,7 @@ def _parse_condition(
 
 
 def _parse_writable_labels(
-    raw: Any,
+    raw: object,
     *,
     policy_name: str,
 ) -> list[str] | None:
@@ -3461,7 +3547,7 @@ def _parse_writable_labels(
 
 
 def _parse_function_ref(
-    raw: Any,
+    raw: object,
     *,
     policy_name: str,
 ) -> FunctionRef:
@@ -3515,7 +3601,7 @@ def _parse_function_ref(
 
 
 def _parse_policy_ask_timeout(
-    raw: Any,
+    raw: object,
     *,
     policy_name: str,
 ) -> int | None:
@@ -3546,7 +3632,7 @@ def _parse_policy_ask_timeout(
 
 
 def parse_default_policies(
-    raw: dict[str, Any] | None,
+    raw: dict[str, object] | None,
     *,
     expand_env: bool = True,
 ) -> list[PolicySpec]:
@@ -3594,7 +3680,7 @@ def parse_default_policies(
 
 
 def parse_server_llm(
-    raw: dict[str, Any] | None,
+    raw: dict[str, object] | None,
     *,
     expand_env: bool = True,
 ) -> LLMConfig | None:

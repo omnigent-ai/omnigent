@@ -19,6 +19,7 @@ import type {
   SessionInputConsumedEvent,
   SessionInterruptedEvent,
   SessionModelEvent,
+  SessionPermissionModeEvent,
   SessionPresenceEvent,
   SessionReasoningEffortEvent,
   SessionResourceCreatedEvent,
@@ -28,6 +29,7 @@ import type {
   SessionStatusEvent,
   SessionTerminalActivityEvent,
   SessionTerminalPendingEvent,
+  SessionTitleEvent,
   SessionTodosEvent,
   SessionUsageEvent,
   SlashCommand,
@@ -873,6 +875,29 @@ describe("response.elicitation_request (FLAT envelope)", () => {
     const ev = out[0] as ElicitationRequest;
     expect(ev.rememberScope).toBeNull();
   });
+
+  it("lifts Codex MCP persistence modes from approval metadata", () => {
+    const out = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_codex_mcp",
+      params: {
+        mode: "form",
+        message: 'Allow the omnigent MCP server to run tool "sys_read_inbox"?',
+        phase: "codex_mcp_elicitation",
+        policy_name: "codex_native_mcp_elicitation",
+        content_preview: "{}",
+        requestedSchema: {},
+        _meta: {
+          codex_approval_kind: "mcp_tool_call",
+          persist: ["session", "always", "unsupported", "session"],
+        },
+      },
+    });
+
+    expect(out).toHaveLength(1);
+    const ev = out[0] as ElicitationRequest;
+    expect(ev.codexPersistModes).toEqual(["session", "always"]);
+  });
 });
 
 describe("response.elicitation_resolved (FLAT envelope)", () => {
@@ -1353,6 +1378,32 @@ describe("session.model (FLAT envelope)", () => {
   });
 });
 
+describe("session.title (FLAT envelope)", () => {
+  it("lifts conversation_id and title", () => {
+    const events = parse("session.title", {
+      conversation_id: "conv_abc",
+      title: "auth-refactor",
+    });
+    expect(events).toHaveLength(1);
+    const ev = events[0] as SessionTitleEvent;
+    expect(ev.type).toBe("session_title");
+    expect(ev.conversationId).toBe("conv_abc");
+    expect(ev.title).toBe("auth-refactor");
+  });
+
+  it("rejects missing title", () => {
+    expect(parse("session.title", { conversation_id: "conv_abc" })).toEqual([]);
+  });
+
+  it("rejects an empty title", () => {
+    expect(parse("session.title", { conversation_id: "conv_abc", title: "" })).toEqual([]);
+  });
+
+  it("rejects missing conversation_id", () => {
+    expect(parse("session.title", { title: "auth-refactor" })).toEqual([]);
+  });
+});
+
 describe("session.reasoning_effort (FLAT envelope)", () => {
   it("lifts conversation_id and effort", () => {
     const events = parse("session.reasoning_effort", {
@@ -1400,6 +1451,28 @@ describe("session.collaboration_mode (FLAT envelope)", () => {
 
   it("rejects missing conversation_id", () => {
     expect(parse("session.collaboration_mode", { mode: "plan" })).toEqual([]);
+  });
+});
+
+describe("session.permission_mode (FLAT envelope)", () => {
+  it("lifts conversation_id and permission_mode string", () => {
+    const events = parse("session.permission_mode", {
+      conversation_id: "conv_abc",
+      permission_mode: "auto",
+    });
+    expect(events).toHaveLength(1);
+    const ev = events[0] as SessionPermissionModeEvent;
+    expect(ev.type).toBe("session_permission_mode");
+    expect(ev.conversationId).toBe("conv_abc");
+    expect(ev.permissionMode).toBe("auto");
+  });
+
+  it("rejects missing permission_mode", () => {
+    expect(parse("session.permission_mode", { conversation_id: "conv_abc" })).toEqual([]);
+  });
+
+  it("rejects missing conversation_id", () => {
+    expect(parse("session.permission_mode", { permission_mode: "auto" })).toEqual([]);
   });
 });
 

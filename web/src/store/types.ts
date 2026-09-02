@@ -21,4 +21,9 @@ export interface ActiveResponse {
   /** Free-form error message (HTTP error, parse error, abort). Empty
    *  for non-failure states. */
   error: string | null;
+  /** Epoch ms when a terminal edge finalized the turn. Bounds the
+   *  stray-idle revive: deltas shortly after a finalize contradict it
+   *  (revive); a scheduled wake's deltas arrive minutes later and
+   *  belong to the NEXT turn (no revive). */
+  completedAt?: number;
 }

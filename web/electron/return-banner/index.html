@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Return to server</title>
+    <style>
+      /* Same design tokens as setup/index.html and find/index.html. */
+      :root {
+        color-scheme: light dark;
+        --background: #fff;
+        --foreground: #11171c;
+        --muted-foreground: #6f6f6f;
+        --border: #e8ecf0;
+        --accent: #2557d6;
+        --accent-foreground: #ffffff;
+        --radius-lg: 0.5rem;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --background: #1e1927;
+          --foreground: oklch(0.965 0.003 240);
+          --muted-foreground: #92a4b3;
+          --border: oklch(0.28 0.005 240);
+          --accent: #7aa2ff;
+          --accent-foreground: #10131a;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        height: 100vh;
+        /* The transparent window clips painting at its square bounds, so the
+           card sits inside an 8px gutter (matches BANNER_WIDTH/HEIGHT in
+           src/return_banner.js) where its radius and shadow can render. */
+        padding: 8px;
+        background: transparent;
+        font-family: ui-sans-serif, system-ui, sans-serif;
+        font-size: 13px;
+      }
+      #card {
+        height: 100%;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 0 12px;
+        /* Accent-tinted card so the banner reads as a call-to-action, not
+           page UI. */
+        background: color-mix(in srgb, var(--accent) 6%, var(--background));
+        color: var(--foreground);
+        border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+        border-radius: var(--radius-lg);
+        overflow: hidden;
+      }
+      #msg {
+        flex: 1;
+        min-width: 0;
+        line-height: 1.35;
+      }
+      button {
+        border: none;
+        background: transparent;
+        color: var(--foreground);
+        font: inherit;
+        cursor: pointer;
+        padding: 5px 12px;
+        border-radius: 6px;
+        white-space: nowrap;
+      }
+      #go {
+        flex-shrink: 0;
+        background: var(--accent);
+        color: var(--accent-foreground);
+        font-weight: 600;
+      }
+      #go:hover {
+        filter: brightness(1.1);
+      }
+      #dismiss {
+        flex-shrink: 0;
+        color: var(--muted-foreground);
+        padding: 5px 8px;
+      }
+      #dismiss:hover {
+        background: color-mix(in srgb, var(--foreground) 8%, transparent);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="card">
+      <span id="msg">If you are stuck, return to Omnigent here.</span>
+      <button id="go">Go back</button>
+      <button id="dismiss" title="Dismiss">&#10005;</button>
+    </div>
+    <script>
+      // Uses the banner preload bridge (electron/src/return_banner_preload.js).
+      document.getElementById("go").addEventListener("click", () => {
+        window.omnigentReturnBanner.goBack();
+      });
+      document.getElementById("dismiss").addEventListener("click", () => {
+        window.omnigentReturnBanner.dismiss();
+      });
+    </script>
+  </body>
+</html>

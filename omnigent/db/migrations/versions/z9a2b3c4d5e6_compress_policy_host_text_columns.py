@@ -91,13 +91,19 @@ def _decode(value: object) -> str:
     if isinstance(value, str):
         return value
     if isinstance(value, memoryview):
-        value = value.tobytes()
-    data = bytes(value)
+        data = value.tobytes()
+    elif isinstance(value, bytes):
+        data = value
+    elif isinstance(value, bytearray):
+        data = bytes(value)
+    else:
+        raise TypeError(f"expected binary compressed text, got {type(value).__name__}")
     if not data or data[0] != 0x00:
         return data.decode("utf-8")  # legacy unframed text
     codec, payload = data[1], data[2:]
     if codec == 0x01:  # zstd
-        return zstandard.ZstdDecompressor().decompress(payload).decode("utf-8")
+        decompressed: bytes = zstandard.ZstdDecompressor().decompress(payload)
+        return decompressed.decode("utf-8")
     return payload.decode("utf-8")  # framed, uncompressed
 
 

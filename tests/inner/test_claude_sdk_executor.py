@@ -59,6 +59,69 @@ class TestPromptExtraction(unittest.TestCase):
             "Second question",
         )
 
+    def test_resumed_session_includes_all_trailing_user_messages(self):
+        """Batched buffered steers: all trailing user messages must reach the SDK.
+
+        When the runner collapses several buffered steered messages into one
+        continuation turn, history ends in >1 consecutive user message the SDK
+        has never seen. Sending only the last silently drops the earlier ones
+        (the two-steer "second message ignored" bug). All trailing user
+        messages must be concatenated into the prompt.
+        """
+        executor = self._make_executor()
+        messages = [
+            {"role": "user", "content": "First question"},
+            {"role": "assistant", "content": "First answer"},
+            {"role": "user", "content": "steer one"},
+            {"role": "user", "content": "steer two"},
+        ]
+        prompt = executor._build_prompt(messages, resume_session=True)
+        self.assertIn("steer one", prompt)
+        self.assertIn("steer two", prompt)
+        # Prior turns are SDK-cached on resume — not replayed.
+        self.assertNotIn("First question", prompt)
+
+    def test_resumed_session_trailing_run_stops_at_assistant(self):
+        """Only the trailing run of user messages (after the last non-user) is sent."""
+        executor = self._make_executor()
+        messages = [
+            {"role": "user", "content": "old one"},
+            {"role": "user", "content": "old two"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "new one"},
+            {"role": "user", "content": "new two"},
+        ]
+        prompt = executor._build_prompt(messages, resume_session=True)
+        self.assertIn("new one", prompt)
+        self.assertIn("new two", prompt)
+        self.assertNotIn("old one", prompt)
+        self.assertNotIn("old two", prompt)
+
+    def test_resumed_session_multimodal_trailing_run_preserves_blocks(self):
+        """A multimodal message in the trailing run keeps structured blocks for all."""
+        executor = self._make_executor()
+        messages = [
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "describe this"},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,aGVsbG8=",
+                    },
+                    {"type": "input_text", "text": "and this too"},
+                ],
+            },
+        ]
+        prompt = executor._build_prompt(messages, resume_session=True)
+        self.assertIsInstance(prompt, list)
+        types = [b.get("type") for b in prompt]
+        self.assertIn("image", types)
+        joined = " ".join(b.get("text", "") for b in prompt if b.get("type") == "text")
+        self.assertIn("describe this", joined)
+        self.assertIn("and this too", joined)
+
     def test_empty_messages(self):
         executor = self._make_executor()
         self.assertEqual(executor._build_prompt([], resume_session=False), "")
@@ -223,6 +286,33 @@ class TestPromptExtraction(unittest.TestCase):
         self.assertNotIn("file_id", text)
         self.assertIn("two attachments", text)
 
+    def test_historical_image_source_block_is_replaced_with_compact_placeholder(self):
+        # The ``Read`` tool returns an image file as an Anthropic content block
+        # ``{"type": "image", "source": {"type": "base64", ...}}`` — raw base64
+        # with no ``data:`` URI prefix. Redaction must catch this shape too, or a
+        # replayed image tool result flattens hundreds of KB into prompt text.
+        from omnigent.inner.claude_sdk_executor import _render_prior_content_blocks
+
+        image_payload = base64.b64encode(b"synthetic png bytes").decode("ascii")
+        content = [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": image_payload,
+                },
+            }
+        ]
+
+        rendered = self._text_of(_render_prior_content_blocks(content))
+
+        self.assertNotIn(image_payload, rendered)
+        self.assertIn(
+            f"[image: image/png, {len(image_payload)} base64 chars]",
+            rendered,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: Constructor and properties
@@ -244,9 +334,14 @@ class TestConstructor(unittest.TestCase):
         self.assertEqual(executor._clients, {})
         self.assertEqual(executor._crashed_sessions, {})
         self.assertFalse(executor._gateway)
-        # _extra_env carries the default RetryPolicy's CLI env vars
-        # (ANTHROPIC_MAX_RETRIES + ANTHROPIC_REQUEST_TIMEOUT_SECONDS).
-        self.assertEqual(executor._extra_env, RetryPolicy().claude_cli.env())
+        # _extra_env carries Tool Search plus the default RetryPolicy's CLI env.
+        self.assertEqual(
+            executor._extra_env,
+            {
+                "ENABLE_TOOL_SEARCH": "true",
+                **RetryPolicy().claude_cli.env(),
+            },
+        )
 
     def test_os_env_spec_with_no_sandbox_keeps_native_tools_enabled(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
@@ -462,12 +557,14 @@ class TestConstructor(unittest.TestCase):
         self.assertIn('databricks auth token --profile "oss"', helper)
         self.assertNotIn("--host", helper)
         # `--force-refresh` only exists in Databricks CLI >= v0.296.0, so it
-        # must be applied via a `--help` capability probe ($force), never
-        # passed unconditionally — an older CLI rejects the unknown flag and
-        # yields an empty token → silent 401.
+        # stays behind a `--help` capability probe — an older CLI rejects the
+        # unknown flag and yields an empty token → silent 401.
         self.assertIn("databricks auth token --help", helper)
-        self.assertIn("force=--force-refresh", helper)
-        self.assertNotIn('oss" --force-refresh', helper)
+        # And even where it exists it is only ATTEMPTED: it fails outright on a
+        # stale refresh token, so an empty result must fall back to the cached
+        # token rather than turning a usable credential into an auth failure.
+        self.assertIn("--force-refresh", helper)
+        self.assertIn('if [ -z "$token" ]; then', helper)
 
     def test_databricks_flag_no_creds_raises(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
@@ -503,6 +600,7 @@ class TestConstructor(unittest.TestCase):
             executor._extra_env["OMNIGENT_CLAUDE_API_KEY_HELPER"],
             "printf token",
         )
+        self.assertEqual(executor._extra_env["ENABLE_TOOL_SEARCH"], "true")
 
     def test_databricks_flag_with_host_override_requires_base_url(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
@@ -535,9 +633,15 @@ class TestConstructor(unittest.TestCase):
         from omnigent.spec.types import RetryPolicy
 
         executor = ClaudeSDKExecutor(gateway=False)
-        # gateway=False → no Databricks env, but RetryPolicy CLI env
-        # is always merged in. Verify the only entries are the retry env.
-        self.assertEqual(executor._extra_env, RetryPolicy().claude_cli.env())
+        # gateway=False → no Databricks env, but Tool Search and RetryPolicy
+        # CLI env are always merged in.
+        self.assertEqual(
+            executor._extra_env,
+            {
+                "ENABLE_TOOL_SEARCH": "true",
+                **RetryPolicy().claude_cli.env(),
+            },
+        )
 
     def test_databricks_profile_default_model_used_when_unset(self):
         """gateway=True (profile-derived) + no model → Databricks default.
@@ -547,6 +651,10 @@ class TestConstructor(unittest.TestCase):
         model falls back to the Databricks default. The neutral
         generic-provider gateway path never does this (see
         ``test_neutral_gateway_no_model_does_not_inject_databricks_default``).
+
+        Live model discovery is stubbed unavailable here so the resolver drops
+        to the bundled catalog — its documented last resort; the discovery-first
+        path is covered by ``test_databricks_profile_uses_discovered_model``.
         """
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
         from omnigent.inner.databricks_executor import DatabricksCredentials
@@ -575,6 +683,10 @@ class TestConstructor(unittest.TestCase):
 
             with (
                 patch(
+                    "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+                    side_effect=RuntimeError("live listing unavailable"),
+                ),
+                patch(
                     "omnigent.model_catalog.resolve_catalog_model",
                     side_effect=_resolve_model,
                 ),
@@ -589,6 +701,64 @@ class TestConstructor(unittest.TestCase):
                         pass
 
             self.assertEqual(captured["model"], "catalog-databricks-claude-default")
+
+        _run(_t())
+
+    def test_databricks_profile_uses_discovered_model(self):
+        """gateway=True (profile-derived) + no model → the workspace's live model.
+
+        The resolver prefers the live Unity Catalog listing over the bundled
+        catalog, walking the ``opus > sonnet > haiku > fable`` precedence
+        claude-native falls back to; the bundled ``databricks-*`` catalog is
+        only the last resort (see ``..._default_model_used_when_unset``).
+        """
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+        from omnigent.inner.databricks_executor import DatabricksCredentials
+
+        async def _t():
+            with patch(
+                "omnigent.inner.databricks_executor._read_databrickscfg",
+                return_value=DatabricksCredentials(
+                    host="https://example.cloud.databricks.com",
+                    token="dapi_test_token",
+                ),
+            ):
+                executor = ClaudeSDKExecutor(gateway=True)
+
+            captured: dict[str, str | None] = {}
+
+            async def fake_get_or_create_client(sdk, *, session_key, options, model):
+                captured["model"] = model
+                raise RuntimeError("stop after model resolution")
+
+            with (
+                patch(
+                    "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+                    return_value=SimpleNamespace(
+                        host="https://example.cloud.databricks.com", token="dapi_test_token"
+                    ),
+                ),
+                patch(
+                    "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+                    return_value=SimpleNamespace(
+                        families={
+                            "sonnet": "system.ai.claude-sonnet-5",
+                            "opus": "system.ai.claude-opus-5",
+                        }
+                    ),
+                ),
+                patch.object(
+                    executor,
+                    "_get_or_create_client",
+                    side_effect=fake_get_or_create_client,
+                ),
+            ):
+                with self.assertRaises(RuntimeError):
+                    async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                        pass
+
+            # opus outranks sonnet in the family precedence.
+            self.assertEqual(captured["model"], "system.ai.claude-opus-5")
 
         _run(_t())
 
@@ -1073,7 +1243,59 @@ class TestResolveGatewayEnv(unittest.TestCase):
                 'databricks auth token --host "https://example.databricks.com"',
                 env["OMNIGENT_CLAUDE_API_KEY_HELPER"],
             )
+            self.assertEqual(
+                env["ANTHROPIC_CUSTOM_HEADERS"],
+                "x-databricks-use-coding-agent-mode: true",
+            )
             self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
+
+    def test_databricks_gateway_negotiates_betas(self):
+        """A real Databricks AI Gateway base URL negotiates betas, not disables them.
+
+        Blanket-disabling betas makes Claude Code strip ``interleaved-thinking``,
+        which the Databricks gateway then rejects with a thinking-block 400. On a
+        genuine gateway we set ``CLAUDE_CODE_USE_GATEWAY`` and leave the disable
+        flag off (matching claude-native).
+        """
+        from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
+        from omnigent.inner.databricks_executor import DatabricksCredentials
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "omnigent.inner.databricks_executor._read_databrickscfg",
+                return_value=DatabricksCredentials(
+                    host="https://wkspc.cloud.databricks.com",
+                    token="dapi_abc123",
+                ),
+            ),
+        ):
+            env = _resolve_gateway_env()
+        self.assertEqual(env["CLAUDE_CODE_USE_GATEWAY"], "1")
+        self.assertNotIn("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", env)
+
+    def test_non_databricks_gateway_keeps_beta_disable(self):
+        """A gateway host outside the trusted Databricks domains keeps the workaround.
+
+        A generic gateway (or a mock server) can't negotiate betas, so the
+        original ``CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`` behavior is preserved.
+        """
+        from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
+        from omnigent.inner.databricks_executor import DatabricksCredentials
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "omnigent.inner.databricks_executor._read_databrickscfg",
+                # Not under a trusted Databricks parent domain.
+                return_value=DatabricksCredentials(
+                    host="https://example.databricks.com", token="t"
+                ),
+            ),
+        ):
+            env = _resolve_gateway_env()
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "1")
+        self.assertNotIn("CLAUDE_CODE_USE_GATEWAY", env)
 
     def test_strips_trailing_slash(self):
         from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
@@ -1117,6 +1339,20 @@ class TestResolveGatewayEnv(unittest.TestCase):
             "https://example.databricks.com/ai-gateway/anthropic",
         )
         self.assertEqual(env["OMNIGENT_CLAUDE_API_KEY_HELPER"], "printf token")
+        self.assertEqual(
+            env["ANTHROPIC_CUSTOM_HEADERS"],
+            "x-databricks-use-coding-agent-mode: true",
+        )
+
+    def test_generic_provider_gateway_omits_databricks_header(self):
+        """Non-Databricks gateways must not receive the Databricks mode header."""
+        from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
+
+        env = _resolve_gateway_env(
+            base_url_override="https://mock-llm.example/v1",
+            auth_command_override="printf sk-test",
+        )
+        self.assertNotIn("ANTHROPIC_CUSTOM_HEADERS", env)
 
     def test_host_override_requires_base_url(self):
         from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
@@ -1215,14 +1451,6 @@ class TestSystemMessages(unittest.TestCase):
         shim_upstream: dict[str, str] = {}
 
         async def _t():
-            executor = ClaudeSDKExecutor()
-            executor._gateway = True
-            executor._databricks_profile = "oss"
-            executor._base_url_override = "https://host/ai-gateway/anthropic"
-            executor._extra_env = _resolve_gateway_env(
-                profile="oss",
-                base_url_override="https://host/ai-gateway/anthropic",
-            )
             with (
                 patch(
                     "omnigent.inner.claude_sdk_executor._resolve_gateway_env",
@@ -1230,6 +1458,12 @@ class TestSystemMessages(unittest.TestCase):
                 ),
                 patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK),
             ):
+                executor = ClaudeSDKExecutor(
+                    gateway=True,
+                    gateway_host="https://host",
+                    base_url_override="https://host/ai-gateway/anthropic",
+                    gateway_auth_command="printf token",
+                )
                 events = [
                     e
                     async for e in executor.run_turn(
@@ -1265,6 +1499,7 @@ class TestSystemMessages(unittest.TestCase):
         self.assertTrue(shim_upstream["base_url"].startswith("http://127.0.0.1:"))
         self.assertEqual(shim_upstream["upstream"], "https://host/ai-gateway/anthropic")
         self.assertEqual(captured_options[0].env["CLAUDE_CODE_API_KEY_HELPER_TTL_MS"], "900000")
+        self.assertEqual(captured_options[0].env["ENABLE_TOOL_SEARCH"], "true")
         self.assertNotIn("OMNIGENT_CLAUDE_API_KEY_HELPER", captured_options[0].env)
         self.assertNotIn("ANTHROPIC_AUTH_TOKEN", captured_options[0].env)
 
@@ -1432,6 +1667,106 @@ class TestSystemMessages(unittest.TestCase):
         _run(_t())
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "claude-sdk is COMPOSED_SESSION_SNAPSHOT: the cached persistent "
+        "client does not rebuild when late-bound framework instructions "
+        "change after client creation, so a live session stays pinned to "
+        "the prompt it was created with. Deferred, with its follow-up "
+        "recorded in docs/AGENT_YAML_SPEC.md. If this test starts passing, "
+        "the client refresh landed — flip claude-sdk's registry row to "
+        "COMPOSED_PER_TURN in the same commit that removes this xfail, do "
+        "not let the two drift apart."
+    ),
+)
+def test_client_does_not_refresh_late_framework_instructions() -> None:
+    """Desired conformance, not the current bug: a framework instruction
+    that activates mid-conversation (e.g. ``shared_message_attribution_
+    enabled()`` flips on between turns) must reach the SDK client on the
+    very next turn. Today the client is constructed once and cached; only
+    ``model`` is refreshed on reuse (see ``_get_or_create_client``), so the
+    composed text a later turn actually sees is turn 1's stale value. This
+    asserts the fix's intended behavior, so it correctly XFAILs now and
+    would XPASS (failing the suite, per ``strict=True``) the moment someone
+    rebuilds the client on a changed composed prompt.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.runtime.prompt import SHARED_SESSION_AUTHORSHIP_INSTRUCTION
+
+    class _ResultMessage:
+        def __init__(self, subtype, result):
+            self.subtype = subtype
+            self.result = result
+
+    captured_options = []
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = type("SystemMessage", (), {})
+        ResultMessage = _ResultMessage
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                captured_options.append(options)
+
+            async def connect(self):
+                return None
+
+            async def query(self, prompt, session_id="default"):
+                return None
+
+            async def receive_response(self):
+                yield _ResultMessage("default", "ok")
+
+            async def disconnect(self):
+                return None
+
+            async def set_model(self, model):
+                return None
+
+    turn1_instructions = "Base authored instructions."
+    turn2_instructions = f"{turn1_instructions}\n\n{SHARED_SESSION_AUTHORSHIP_INSTRUCTION}"
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+            [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hello"}],
+                    [],
+                    turn1_instructions,
+                )
+            ]
+            # A framework instruction activates between turns; the runner
+            # recomposes and passes the new value on the next call.
+            [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "follow-up"}],
+                    [],
+                    turn2_instructions,
+                )
+            ]
+
+    _run(_t())
+
+    # The contract is over the second-turn options the SDK sees. Client count
+    # is unconstrained: reusing one client and rebuilding it on a changed
+    # composed prompt both satisfy it, so an exact count is an implementation
+    # choice rather than part of the contract.
+    assert len(captured_options) >= 1
+    assert captured_options[-1].system_prompt == turn2_instructions
+
+
 # ---------------------------------------------------------------------------
 # Tests: skills_filter → SDK skills option translation + plugin manifest
 # ---------------------------------------------------------------------------
@@ -1556,6 +1891,7 @@ class TestStreamEventStreaming(unittest.TestCase):
                             "extra_args": getattr(self.options, "extra_args", {}),
                             "tools": getattr(self.options, "tools", None),
                             "allowed_tools": getattr(self.options, "allowed_tools", None),
+                            "env": getattr(self.options, "env", None),
                         }
                     )
                     result_session_id = (
@@ -1591,12 +1927,10 @@ class TestStreamEventStreaming(unittest.TestCase):
                 query_calls[0]["extra_args"],
                 {"no-session-persistence": None},
             )
-            # Skill is always in the base tool set so the Skill tool is
-            # actually exposed to the model when ``skills="all"`` (the
-            # SDK only adds Skill to ``allowedTools`` — without listing
-            # it in ``tools`` the CLI passes ``--tools ""`` and zeros
-            # the base set).
-            self.assertEqual(query_calls[0]["tools"], ["Skill"])
+            # Skill remains available for configured skills; ToolSearch
+            # keeps large MCP definitions deferred until they are needed.
+            self.assertEqual(query_calls[0]["tools"], ["Skill", "ToolSearch"])
+            self.assertEqual(query_calls[0]["env"]["ENABLE_TOOL_SEARCH"], "true")
             self.assertEqual(query_calls[0]["allowed_tools"], [])
             self.assertEqual(query_calls[1]["session_id"], "session-b")
             self.assertEqual(query_calls[2]["session_id"], "session-a")
@@ -1699,15 +2033,15 @@ class TestStreamEventStreaming(unittest.TestCase):
                     )
                 ]
             # OS operations route through sys_os_* MCP tools, not SDK
-            # built-ins. Only Skill remains in the native base set.
-            self.assertEqual(captured_options["tools"], ["Skill"])
+            # built-ins. Skill and ToolSearch do not widen OS access.
+            self.assertEqual(captured_options["tools"], ["Skill", "ToolSearch"])
             self.assertIn("mcp__omnigent__sleep", captured_options["allowed_tools"])
             self.assertNotIn("Bash", captured_options["allowed_tools"])
             self.assertIsInstance(events[-1], TurnComplete)
 
         _run(_t())
 
-    def test_mcp_only_session_disables_native_tool_base_set(self):
+    def test_mcp_only_session_keeps_discovery_tools_without_native_os_tools(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
         captured_options = {}
@@ -1785,14 +2119,13 @@ class TestStreamEventStreaming(unittest.TestCase):
                         "",
                     )
                 ]
-            # Default ``skills_filter="all"`` exposes the ``Skill``
-            # tool so the model can invoke discovered skills via
-            # the Claude SDK plugin mechanism. The OS tools
+            # Default ``skills_filter="all"`` exposes the ``Skill`` tool
+            # through the Claude SDK plugin mechanism. ToolSearch defers
+            # MCP definitions until needed. The OS tools
             # (Bash/Read/Edit/Write/Glob/Grep) stay absent — that's
-            # what this test pins. ``Skill`` itself doesn't widen
-            # the FS attack surface; it only loads pre-approved
-            # SKILL.md content.
-            self.assertEqual(captured_options["tools"], ["Skill"])
+            # what this test pins. Neither base tool widens the FS attack
+            # surface.
+            self.assertEqual(captured_options["tools"], ["Skill", "ToolSearch"])
             self.assertEqual(captured_options["allowed_tools"], ["mcp__omnigent__sleep"])
             self.assertIsInstance(events[-1], TurnComplete)
 
@@ -4287,10 +4620,568 @@ def test_precompact_hook_emits_compaction_complete_with_session_messages() -> No
         assert ce.compacted_messages[0]["role"] == "user"
         assert ce.compacted_messages[1]["role"] == "assistant"
         mock_get_msgs.assert_called_once_with("claude-uuid-123", directory=None)
-        # CompactionComplete before TurnComplete
+        # CompactionStarted before CompactionComplete before TurnComplete
+        from omnigent.inner.executor import CompactionStarted
+
+        started_events = [e for e in events if isinstance(e, CompactionStarted)]
+        assert len(started_events) == 1
         turn_completes = [e for e in events if isinstance(e, TurnComplete)]
         assert len(turn_completes) == 1
+        assert events.index(started_events[0]) < events.index(compaction_events[0])
         assert events.index(compaction_events[0]) < events.index(turn_completes[0])
+
+    _run(_t())
+
+
+def test_precompact_exception_persists_compaction_before_executor_error(tmp_path: Path) -> None:
+    """A stream failure after PreCompact still emits the durable boundary."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete, CompactionStarted
+
+    class _SystemMessage:
+        def __init__(self, subtype, data, hook_event_name=None, session_id=None):
+            self.subtype = subtype
+            self.data = data
+            self.hook_event_name = hook_event_name
+            self.session_id = session_id
+
+    class _FakeSessionMessage:
+        def __init__(self, type, message):
+            self.type = type
+            self.message = message
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = _SystemMessage
+        ResultMessage = type("ResultMessage", (), {})
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return
+
+            async def query(self, prompt, session_id="default"):
+                return
+
+            async def receive_response(self):
+                yield _SystemMessage(
+                    subtype="hook_started",
+                    data={
+                        "hook_event": "PreCompact",
+                        "session_id": "claude-uuid-error",
+                        "transcript_path": str(transcript_path),
+                    },
+                    hook_event_name="PreCompact",
+                    session_id="claude-uuid-error",
+                )
+                with transcript_path.open("a", encoding="utf-8") as transcript:
+                    transcript.write(
+                        json.dumps(
+                            {
+                                "type": "user",
+                                "uuid": "compact-summary-1",
+                                "isCompactSummary": True,
+                                "message": {
+                                    "role": "user",
+                                    "content": "compacted summary",
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+                raise RuntimeError("Autocompact is thrashing: the context refilled to the limit")
+
+            async def disconnect(self):
+                return None
+
+    fake_session_msgs = [
+        _FakeSessionMessage(
+            "assistant",
+            {"content": [{"type": "text", "text": "compacted summary"}]},
+        )
+    ]
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "precompact-1",
+                "message": {"role": "user", "content": "continue"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with (
+            patch(
+                "omnigent.inner.claude_sdk_executor._ensure_sdk",
+                return_value=_FakeSDK,
+            ),
+            patch(
+                "claude_agent_sdk.get_session_messages",
+                return_value=fake_session_msgs,
+            ) as mock_get_msgs,
+        ):
+            events = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "continue", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+        started = [event for event in events if isinstance(event, CompactionStarted)]
+        completed = [event for event in events if isinstance(event, CompactionComplete)]
+        errors = [event for event in events if isinstance(event, ExecutorError)]
+
+        assert len(started) == 1
+        assert len(completed) == 1
+        assert len(errors) == 1
+        assert not [event for event in events if isinstance(event, TurnComplete)]
+        assert events.index(started[0]) < events.index(completed[0])
+        assert events.index(completed[0]) < events.index(errors[0])
+        assert completed[0].compacted_messages == [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "compacted summary"}],
+            }
+        ]
+        mock_get_msgs.assert_called_once_with("claude-uuid-error", directory=None)
+
+    _run(_t())
+
+
+@pytest.mark.parametrize(
+    ("transcript_location", "expect_checkpoint"),
+    [("top_level", True), ("nested", False)],
+)
+def test_precompact_exception_sdk_wire_payload_contract(
+    tmp_path: Path,
+    transcript_location: str,
+    expect_checkpoint: bool,
+) -> None:
+    """The SDK-decoded hook payload exposes a safe transcript boundary."""
+    import claude_agent_sdk as real_sdk
+    from claude_agent_sdk._internal.message_parser import parse_message
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete
+
+    class _FakeSessionMessage:
+        def __init__(self, type, message):
+            self.type = type
+            self.message = message
+
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "precompact-wire-1",
+                "message": {"role": "user", "content": "continue"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    raw_hook_payload = {
+        "type": "system",
+        "subtype": "hook_started",
+        "hook_id": "hook-precompact-wire-1",
+        "hook_name": "PreCompact:auto",
+        "hook_event": "PreCompact",
+        "uuid": "hook-event-precompact-wire-1",
+        "session_id": "claude-uuid-wire",
+        "cwd": str(tmp_path),
+        "trigger": "auto",
+        "custom_instructions": None,
+    }
+    if transcript_location == "top_level":
+        raw_hook_payload["transcript_path"] = str(transcript_path)
+    else:
+        raw_hook_payload["input"] = {"transcript_path": str(transcript_path)}
+
+    hook_message = parse_message(raw_hook_payload)
+    assert isinstance(hook_message, real_sdk.HookEventMessage)
+
+    class _FakeSDK:
+        AssistantMessage = real_sdk.AssistantMessage
+        UserMessage = real_sdk.UserMessage
+        SystemMessage = real_sdk.SystemMessage
+        ResultMessage = real_sdk.ResultMessage
+        StreamEvent = real_sdk.StreamEvent
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return
+
+            async def query(self, prompt, session_id="default"):
+                return
+
+            async def receive_response(self):
+                yield hook_message
+                with transcript_path.open("a", encoding="utf-8") as transcript:
+                    transcript.write(
+                        json.dumps(
+                            {
+                                "type": "user",
+                                "uuid": "compact-summary-wire-1",
+                                "isCompactSummary": True,
+                                "message": {
+                                    "role": "user",
+                                    "content": "compacted summary",
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+                raise RuntimeError("Autocompact refilled the context")
+
+            async def disconnect(self):
+                return None
+
+    fake_session_msgs = [
+        _FakeSessionMessage(
+            "assistant",
+            {"content": [{"type": "text", "text": "compacted summary"}]},
+        )
+    ]
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with (
+            patch(
+                "omnigent.inner.claude_sdk_executor._ensure_sdk",
+                return_value=_FakeSDK,
+            ),
+            patch(
+                "claude_agent_sdk.get_session_messages",
+                return_value=fake_session_msgs,
+            ) as mock_get_messages,
+        ):
+            events = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "continue", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+        checkpoints = [event for event in events if isinstance(event, CompactionComplete)]
+        assert len(checkpoints) == int(expect_checkpoint)
+        if expect_checkpoint:
+            mock_get_messages.assert_called_once_with("claude-uuid-wire", directory=None)
+        else:
+            mock_get_messages.assert_not_called()
+
+    _run(_t())
+
+
+@pytest.mark.parametrize("session_read", [[], RuntimeError("transcript not flushed")])
+def test_precompact_exception_preserves_history_without_exportable_checkpoint(
+    tmp_path: Path,
+    session_read: list[object] | Exception,
+) -> None:
+    """An empty or failed export never replaces full history with a placeholder."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete
+
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+
+    class _SystemMessage:
+        def __init__(self, subtype, data, hook_event_name=None, session_id=None):
+            self.subtype = subtype
+            self.data = data
+            self.hook_event_name = hook_event_name
+            self.session_id = session_id
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = _SystemMessage
+        ResultMessage = type("ResultMessage", (), {})
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return
+
+            async def query(self, prompt, session_id="default"):
+                return
+
+            async def receive_response(self):
+                yield _SystemMessage(
+                    subtype="hook_started",
+                    data={
+                        "hook_event": "PreCompact",
+                        "session_id": "claude-uuid-error",
+                        "transcript_path": str(transcript_path),
+                    },
+                    hook_event_name="PreCompact",
+                    session_id="claude-uuid-error",
+                )
+                with transcript_path.open("a", encoding="utf-8") as transcript:
+                    transcript.write(
+                        json.dumps(
+                            {
+                                "type": "user",
+                                "uuid": "compact-summary-1",
+                                "isCompactSummary": True,
+                                "message": {
+                                    "role": "user",
+                                    "content": "compacted summary",
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+                raise RuntimeError("Autocompact is thrashing: the context refilled to the limit")
+
+            async def disconnect(self):
+                return None
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        get_messages = (
+            patch("claude_agent_sdk.get_session_messages", side_effect=session_read)
+            if isinstance(session_read, Exception)
+            else patch("claude_agent_sdk.get_session_messages", return_value=session_read)
+        )
+        with (
+            patch(
+                "omnigent.inner.claude_sdk_executor._ensure_sdk",
+                return_value=_FakeSDK,
+            ),
+            get_messages,
+        ):
+            events = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "continue", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+        assert not [event for event in events if isinstance(event, CompactionComplete)]
+        assert len([event for event in events if isinstance(event, ExecutorError)]) == 1
+
+    _run(_t())
+
+
+def test_precompact_exception_without_new_summary_preserves_history(tmp_path: Path) -> None:
+    """PreCompact alone is not evidence that Claude finished compaction."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete
+
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+
+    class _SystemMessage:
+        def __init__(self, subtype, data, hook_event_name=None, session_id=None):
+            self.subtype = subtype
+            self.data = data
+            self.hook_event_name = hook_event_name
+            self.session_id = session_id
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = _SystemMessage
+        ResultMessage = type("ResultMessage", (), {})
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return
+
+            async def query(self, prompt, session_id="default"):
+                return
+
+            async def receive_response(self):
+                yield _SystemMessage(
+                    subtype="hook_started",
+                    data={
+                        "hook_event": "PreCompact",
+                        "session_id": "claude-uuid-error",
+                        "transcript_path": str(transcript_path),
+                    },
+                    hook_event_name="PreCompact",
+                    session_id="claude-uuid-error",
+                )
+                raise RuntimeError("stream failed before compaction completed")
+
+            async def disconnect(self):
+                return None
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with (
+            patch(
+                "omnigent.inner.claude_sdk_executor._ensure_sdk",
+                return_value=_FakeSDK,
+            ),
+            patch("claude_agent_sdk.get_session_messages") as mock_get_messages,
+        ):
+            events = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "continue", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+        assert not [event for event in events if isinstance(event, CompactionComplete)]
+        assert len([event for event in events if isinstance(event, ExecutorError)]) == 1
+        mock_get_messages.assert_not_called()
+
+    _run(_t())
+
+
+def test_precompact_hook_emits_compaction_started_before_complete() -> None:
+    """CompactionStarted is yielded when PreCompact fires, before CompactionComplete.
+
+    This ensures clients see the in-progress signal while compaction is
+    still happening, rather than both events arriving back-to-back after
+    the turn ends.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete, CompactionStarted
+
+    class _ResultMessage:
+        def __init__(self, session_id, result):
+            self.session_id = session_id
+            self.result = result
+            self.content = []
+            self.model = "claude-test"
+            self.usage = type(
+                "U",
+                (),
+                {"input_tokens": 500, "output_tokens": 100},
+            )()
+
+    class _SystemMessage:
+        def __init__(self, subtype, data, hook_event_name=None):
+            self.subtype = subtype
+            self.data = data
+            self.hook_event_name = hook_event_name
+
+    class _FakeSessionMessage:
+        def __init__(self, type, message):
+            self.type = type
+            self.message = message
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = _SystemMessage
+        ResultMessage = _ResultMessage
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+        messages: list = []
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return
+
+            async def query(self, prompt, session_id="default"):
+                _FakeSDK.messages = [
+                    _SystemMessage(
+                        subtype="hook_started",
+                        data={"hook_event": "PreCompact"},
+                        hook_event_name="PreCompact",
+                    ),
+                    _ResultMessage("claude-uuid-456", "compacted result"),
+                ]
+
+            async def receive_response(self):
+                for message in _FakeSDK.messages:
+                    yield message
+
+            async def disconnect(self):
+                return None
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with (
+            patch(
+                "omnigent.inner.claude_sdk_executor._ensure_sdk",
+                return_value=_FakeSDK,
+            ),
+            patch(
+                "claude_agent_sdk.get_session_messages",
+                return_value=[
+                    _FakeSessionMessage(
+                        "user",
+                        {"content": [{"type": "text", "text": "compacted summary"}]},
+                    )
+                ],
+            ),
+        ):
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+        started = [e for e in events if isinstance(e, CompactionStarted)]
+        completed = [e for e in events if isinstance(e, CompactionComplete)]
+        assert len(started) == 1, "expected exactly one CompactionStarted"
+        assert len(completed) == 1, "expected exactly one CompactionComplete"
+        assert events.index(started[0]) < events.index(completed[0]), (
+            "CompactionStarted must precede CompactionComplete"
+        )
 
     _run(_t())
 
@@ -4380,3 +5271,151 @@ def test_find_system_claude_delegates_to_shared_resolver(monkeypatch) -> None:
     monkeypatch.setattr(cse, "resolve_cli_binary", fake_resolve)
     assert cse._find_system_claude() == "/opt/homebrew/bin/claude"
     assert captured == {"name": "claude", "env_var": "OMNIGENT_CLAUDE_PATH"}
+
+
+def test_claude_sdk_does_not_claim_live_message_queue() -> None:
+    """ClaudeSDKExecutor must not advertise live message queue support.
+
+    query() queues a new turn on stdin rather than injecting into the active
+    turn, so returning True from enqueue_session_message caused a permanent
+    one-turn-behind desync (issue #3472). The executor must return False from
+    both methods so the adapter keeps the message buffered and delivers it as
+    a continuation turn after the active turn ends.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    executor = ClaudeSDKExecutor()
+    assert executor.supports_live_message_queue() is False
+
+
+@pytest.mark.asyncio
+async def test_enqueue_session_message_returns_false_without_queuing() -> None:
+    """enqueue_session_message must return False and never call query().
+
+    Calling query() while a turn is active queues a new turn, not an
+    in-turn injection, which produces the desync from issue #3472.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    executor = ClaudeSDKExecutor()
+    query_called = False
+
+    class _FakeClient:
+        async def query(self, *args, **kwargs):
+            nonlocal query_called
+            query_called = True
+
+    # Inject a fake client state so the session key is known.
+    executor._clients["s1"] = SimpleNamespace(client=_FakeClient())
+
+    result = await executor.enqueue_session_message("s1", "hello")
+
+    assert result is False
+    assert not query_called, "query() must not be called during enqueue"
+
+
+@pytest.mark.asyncio
+async def test_terminal_error_carries_observed_usage() -> None:
+    """A terminal-error turn still reports the usage it observed mid-turn.
+
+    A turn can fail AFTER the model call started — the stream dies and the
+    CLI's retries are rejected (auth failure), or the ``ResultMessage``
+    arrives with ``is_error=True``. The prompt size was already observed
+    from ``message_start``, and discarding it froze the context-occupancy
+    meter at the previous successful turn's value exactly when the session
+    was in trouble.
+
+    Regression guard: pre-fix the ``terminal_error`` path yielded
+    ``ExecutorError`` with no usage, so nothing downstream could update
+    the meter on a failed turn.
+    """
+    from unittest.mock import patch
+
+    from claude_agent_sdk.types import (
+        ClaudeAgentOptions as SDKClaudeAgentOptions,
+    )
+    from claude_agent_sdk.types import ResultMessage as SDKResultMessage
+    from claude_agent_sdk.types import StreamEvent as SDKStreamEvent
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import ExecutorError
+
+    class _Sentinel:
+        pass
+
+    # The model call opens (message_start carries the prompt usage), then the
+    # harness reports a terminal failure via ResultMessage(is_error=True).
+    message_start = SDKStreamEvent(
+        uuid="u1",
+        session_id="s1",
+        event={
+            "type": "message_start",
+            "message": {
+                "usage": {
+                    "input_tokens": 400,
+                    "cache_read_input_tokens": 99_000,
+                    "cache_creation_input_tokens": 600,
+                }
+            },
+        },
+    )
+    sdk_result = SDKResultMessage(
+        subtype="success",
+        session_id="s1",
+        result="authentication failed",
+        total_cost_usd=0.0,
+        duration_ms=10,
+        duration_api_ms=8,
+        is_error=True,
+        num_turns=1,
+        usage=None,
+    )
+
+    class _FakeSDK:
+        AssistantMessage = _Sentinel
+        UserMessage = _Sentinel
+        SystemMessage = _Sentinel
+        StreamEvent = SDKStreamEvent
+        ResultMessage = SDKResultMessage
+        ClaudeAgentOptions = SDKClaudeAgentOptions
+        messages = [message_start, sdk_result]
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return None
+
+            async def query(self, prompt, session_id="default"):
+                return None
+
+            async def receive_response(self):
+                for message in _FakeSDK.messages:
+                    yield message
+
+            async def disconnect(self):
+                return None
+
+    executor = ClaudeSDKExecutor()
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+        events = [
+            e
+            async for e in executor.run_turn(
+                [{"role": "user", "content": "hi"}],
+                [],
+                "",
+            )
+        ]
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert errors, "Expected an ExecutorError for the terminal failure"
+    usage = errors[0].usage
+    assert usage is not None, (
+        "ExecutorError.usage is None — the observed message_start usage was "
+        "discarded on the terminal-error path, so the context meter freezes."
+    )
+    # Window fill = input + cache_creation + cache_read from the last call.
+    assert usage["context_tokens"] == 100_000
+    # output_tokens is unknown on an incomplete turn — reported as 0.
+    assert usage["output_tokens"] == 0

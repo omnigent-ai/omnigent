@@ -66,7 +66,7 @@ export function ToolbarBtn({
       onMouseDown={(e) => e.preventDefault()}
       onClick={onClick}
       className={cn(
-        "min-w-[1.75rem] rounded px-1.5 py-0.5 text-xs transition-colors",
+        "min-w-[1.75rem] rounded px-1.5 py-0.5 text-sm transition-colors",
         active
           ? "bg-accent text-accent-foreground"
           : "text-muted-foreground hover:bg-muted hover:text-foreground",
@@ -94,7 +94,7 @@ function TableBtn({ editor }: { editor: Editor | null }) {
         aria-label="Insert table"
         disabled={!editor}
         onMouseDown={(e) => e.preventDefault()}
-        className="min-w-[1.75rem] rounded px-1.5 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+        className="min-w-[1.75rem] rounded px-1.5 py-0.5 text-sm text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
       >
         <Table2 className="size-3.5" />
       </PopoverTrigger>
@@ -103,7 +103,7 @@ function TableBtn({ editor }: { editor: Editor | null }) {
         align="start"
         onMouseLeave={() => setHovered({ rows: 0, cols: 0 })}
       >
-        <p className="mb-1.5 text-xs text-muted-foreground">
+        <p className="mb-1.5 text-sm text-muted-foreground">
           {hovered.rows > 0 ? `${hovered.rows} × ${hovered.cols} table` : "Insert table"}
         </p>
         <div className="flex flex-col gap-0.5">
@@ -466,7 +466,7 @@ export function ToolbarPlugin({
           onClick={saveClickable ? handleSave : undefined}
           disabled={!saveClickable}
           className={cn(
-            "flex items-center gap-1 rounded px-2 py-0.5 text-xs transition-colors",
+            "flex items-center gap-1 rounded px-2 py-0.5 text-sm transition-colors",
             saveStatus.tone === "error" &&
               "text-destructive hover:bg-destructive/10 cursor-pointer",
             saveStatus.tone === "offline" && "text-warning cursor-default",

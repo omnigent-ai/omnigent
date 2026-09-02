@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, TypeAlias, cast
 import pydantic
 
 from omnigent import model_catalog
+from omnigent.json_types import JsonValue
 from omnigent.llms.adapters._content import redact_inline_data_uris
 from omnigent.spec.types import RetryPolicy
 
@@ -55,9 +56,6 @@ logger = logging.getLogger(__name__)
 # duplicate OpenAI's own SDK types.
 ResponsesItem: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 OpenAIKwargs: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
-
-# Plain JSON value — recursive union used by ``_to_plain_data``.
-JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 
 
 def _redact_inline_base64(value: Any) -> Any:  # type: ignore[explicit-any]
@@ -187,10 +185,10 @@ def _convert_tools_to_responses(tools: list[ToolSpec]) -> list[ResponsesItem]:
 
 
 def _normalize_message_content(
-    content: Any,  # type: ignore[explicit-any]
+    content: object,
     *,
     empty_placeholder: str,
-) -> str | list[dict[str, Any]]:
+) -> str | list[dict[str, object]]:
     """
     Normalize a message ``content`` field for the Responses API.
 
@@ -367,13 +365,13 @@ def _normalize_response_output_items(items: list[ResponseOutputItem]) -> list[Re
 
         item_type = plain.get("type")
         if item_type == "message":
-            replay_item = {
+            message_item: ResponsesItem = {
                 "type": "message",
                 "role": plain.get("role", "assistant"),
             }
             if "content" in plain:
-                replay_item["content"] = plain["content"]
-            result.append(replay_item)
+                message_item["content"] = plain["content"]
+            result.append(message_item)
             continue
 
         if item_type == "function_call":
@@ -387,13 +385,13 @@ def _normalize_response_output_items(items: list[ResponseOutputItem]) -> list[Re
                 continue
             raw_args = plain.get("arguments")
             arg_str: str = raw_args if isinstance(raw_args, str) else ""
-            replay_item = {
+            function_call_item: ResponsesItem = {
                 "type": "function_call",
                 "call_id": raw_call_id,
                 "name": raw_name,
                 "arguments": arg_str,
             }
-            result.append(replay_item)
+            result.append(function_call_item)
             continue
 
         if item_type == "reasoning":
@@ -402,13 +400,13 @@ def _normalize_response_output_items(items: list[ResponseOutputItem]) -> list[Re
             # summary parts, otherwise the next turn 400s with
             # "Missing required parameter: 'input[N].summary'".
             raw_summary = plain.get("summary")
-            replay_item: ResponsesItem = {
+            reasoning_item: ResponsesItem = {
                 "type": "reasoning",
                 "summary": raw_summary if isinstance(raw_summary, list) else [],
             }
             if plain.get("encrypted_content"):
-                replay_item["encrypted_content"] = plain["encrypted_content"]
-            result.append(replay_item)
+                reasoning_item["encrypted_content"] = plain["encrypted_content"]
+            result.append(reasoning_item)
             continue
 
     return result
@@ -603,7 +601,7 @@ class OpenResponsesExecutor(Executor):
                         ]
                         _last_user_msg = " ".join(_parts)[:500]
                     break
-            _req_data: dict[str, Any] = {
+            _req_data: dict[str, object] = {
                 "model": model,
                 "messages_count": len(request_input),
                 "tools_count": len(tools),
@@ -827,7 +825,7 @@ class OpenResponsesExecutor(Executor):
             if not _resp_text_preview:
                 _resp_text_preview = _extract_response_text(response) or ""
             _fc_count = sum(1 for item in response.output if item.type == "function_call")
-            _resp_data: dict[str, Any] = {
+            _resp_data: dict[str, object] = {
                 "model": model,
                 "text_preview": _resp_text_preview[:500],
                 "tool_calls_count": _fc_count,

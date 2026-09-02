@@ -26,8 +26,9 @@ How agy exposes a control surface (verified end-to-end; see
   ``verify=False``.
 * The ports are ephemeral and not configurable
   (``ANTIGRAVITY_SIDECAR_WEB_PORT`` is a sidecar-plugin no-op), so they are
-  discovered from the loopback socket table — ``lsof`` per agy pid, falling back
-  to ``/proc/net/tcp`` on hosts where ``lsof`` cannot attribute the socket.
+  discovered from the loopback socket table — psutil per agy pid (cross-platform
+  and already a hard dependency), falling back to ``lsof`` and then to
+  ``/proc/net/tcp`` on hosts where the socket cannot be attributed to a pid.
 * Ownership probe: ``POST .../GetConversationMetadata`` with REQUEST body
   ``{"conversationId": "<id>"}`` returns HTTP 200 whose RESPONSE echoes that id at
   ``metadata.rootConversationId`` for a hosted conversation, and HTTP 500
@@ -65,6 +66,7 @@ from typing import NamedTuple
 from urllib.parse import urlparse
 
 import httpx
+import psutil
 
 _logger = logging.getLogger(__name__)
 
@@ -252,7 +254,9 @@ def _run_lsof_listen_ports(pid: int) -> str:
 
     Isolated as a seam so tests can stub the subprocess. A non-zero exit (e.g.
     the process is gone) or a missing ``lsof`` yields ``""`` rather than raising
-    — discovery treats "no ports" the same as "lsof unavailable".
+    — discovery treats "no ports" the same as "lsof unavailable". Only a
+    fallback: :func:`_pid_listen_ports` prefers psutil, so agy discovery does
+    not require ``lsof`` to be installed.
 
     :param pid: agy process id, e.g. ``72753``.
     :returns: ``lsof`` stdout, or ``""`` on any failure.
@@ -269,6 +273,59 @@ def _run_lsof_listen_ports(pid: int) -> str:
         _logger.warning("lsof failed for agy pid=%s", pid, exc_info=True)
         return ""
     return completed.stdout
+
+
+def _is_loopback_ip(host: str) -> bool:
+    """
+    Whether *host* is a loopback literal (``127.0.0.1`` / ``::1``).
+
+    :param host: The address a socket is bound to, e.g. ``"127.0.0.1"``.
+    :returns: ``True`` for loopback; ``False`` for anything else or unparseable.
+    """
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _pid_listen_ports(pid: int) -> list[int]:
+    """
+    Return a pid's loopback TCP LISTEN ports, lowest first.
+
+    agy advertises its ephemeral connect-RPC port nowhere, so omnigent has to
+    attribute the listener back to the process. psutil is the primary source:
+    it is already a hard dependency and works on Linux, macOS and Windows, so
+    discovery needs no external binary. ``lsof`` remains a fallback for hosts
+    where psutil cannot read the process (``AccessDenied``) but lsof can.
+
+    ``AttributeError`` is caught alongside psutil's own errors because
+    ``net_connections`` is the 6.0 rename of ``connections`` and the floor still
+    admits 5.9: there the attribute is simply absent, and an ``AttributeError``
+    is neither a ``psutil.Error`` nor an ``OSError``, so without it discovery
+    would fail outright on a host where lsof would have answered.
+
+    Both blind — a restricted ``/proc`` where agy's listener is held in a
+    backend the agy process does not own as an fd — yields ``[]``, which callers
+    already treat as "cannot attribute" and handle without guessing a port.
+
+    :param pid: The agy process id, e.g. ``72753``.
+    :returns: Sorted loopback LISTEN ports, or ``[]`` when none is attributable.
+    """
+    try:
+        conns = psutil.Process(pid).net_connections(kind="tcp")
+    except (psutil.Error, OSError, AttributeError):
+        conns = None
+    if conns is not None:
+        ports = {
+            conn.laddr.port
+            for conn in conns
+            if conn.status == psutil.CONN_LISTEN
+            and conn.laddr
+            and _is_loopback_ip(getattr(conn.laddr, "ip", ""))
+        }
+        if ports:
+            return sorted(ports)
+    return _parse_loopback_listen_ports(_run_lsof_listen_ports(pid))
 
 
 def _parse_loopback_listen_ports(lsof_output: str) -> list[int]:
@@ -1055,7 +1112,7 @@ def discover_language_server_port(pid: int) -> int | None:
         no loopback listeners or none answer ``Heartbeat`` (e.g. agy has exited
         or has not finished binding).
     """
-    ports = _parse_loopback_listen_ports(_run_lsof_listen_ports(pid))
+    ports = _pid_listen_ports(pid)
     for port in ports:
         if _heartbeat_ok(port):
             _logger.debug("agy connect-RPC port resolved: pid=%s port=%s", pid, port)
@@ -1330,10 +1387,17 @@ def resolve_cold_start_agy_rpc_port(
     (:func:`resolve_pane_agy_rpc_port_state`), distinguishing three outcomes:
 
     1. **Pane present, our agy found, port resolved** → that scoped port.
-    2. **Pane present, our agy found, port not resolvable** (e.g. restricted
-       ``/proc`` where lsof cannot attribute the listener) → the lowest candidate
-       (:func:`_candidate_agy_rpc_ports`). agy IS up in this pane, and the hosts
-       where this happens run one agy per pod, so the lone candidate is ours.
+    2. **Pane present, our agy found, port not resolvable** → depends on WHY, via
+       :func:`_can_attribute_any_agy_port`. When lsof cannot attribute a port
+       for any agy (restricted ``/proc``, one agy per pod) the lone candidate is
+       ours → the lowest candidate. When lsof CAN attribute ports for other agy
+       processes, ours simply has not bound its listener yet (a cold-start fires
+       ~250ms after launch, while agy takes seconds to boot) → ``None``, keep
+       polling. Scanning in that window returns a FOREIGN agy and durably
+       cross-binds the session: the conversation is created inside another
+       session's agy, the reader then adopts that agy's active cascade, and the
+       user sees an existing conversation duplicated while their own agy is
+       orphaned (its replies never arrive).
     3. **Pane present, NO agy found yet** (the CLI ``tmux_start_on_attach``
        early-poll window: the pane is still the shell, agy not yet ``exec``-ed) →
        ``None``, so the caller keeps polling. It must NOT fall back to candidates
@@ -1361,12 +1425,28 @@ def resolve_cold_start_agy_rpc_port(
             # NOT fall back to candidates, where a foreign agy could be the only
             # one and would cross-bind this session.
             return None
-        # state 2: our agy IS up but its port is not lsof-attributable (restricted
-        # /proc; one-agy-per-pod) — the candidate scan below is safe and necessary.
-        _logger.debug(
-            "agy cold-start: pane agy found for target=%s but its port is not "
-            "lsof-attributable; using the host-wide candidate scan (safe — agy is "
-            "up in this pane)",
+        # state 2: our agy IS up in the pane but has no attributable port. Two
+        # very different causes, and only one makes the candidate scan safe:
+        #
+        #   * lsof CANNOT attribute for any agy (restricted /proc, one agy per
+        #     pod) — the lone candidate is ours; scan.
+        #   * lsof CAN attribute (it found a port for some other agy) — then our
+        #     agy simply has not bound its listener yet, ~250ms into its boot.
+        #     Scanning here returns a FOREIGN agy and durably cross-binds this
+        #     session, so keep polling instead.
+        if _can_attribute_any_agy_port():
+            _logger.info(
+                "agy cold-start: pane agy for target=%s has not bound its "
+                "connect-RPC port yet (lsof attributes ports for other agy "
+                "processes, so attribution works here); polling rather than "
+                "binding a foreign agy",
+                tmux_target,
+            )
+            return None
+        _logger.warning(
+            "agy cold-start: pane agy found for target=%s but no source attributes a "
+            "port for ANY agy (restricted /proc); falling back to the host-wide "
+            "candidate scan — safe only while this host runs a single agy",
             tmux_target,
         )
     candidates = _candidate_agy_rpc_ports()
@@ -1374,13 +1454,33 @@ def resolve_cold_start_agy_rpc_port(
         return None
     port = candidates[0]
     if tmux_socket is None or tmux_target is None:
-        _logger.debug(
+        _logger.warning(
             "agy cold-start: no local tmux pane to scope to; using the lowest "
             "candidate connect-RPC port %s (single-agy hosts and remote runners "
             "are unaffected; a multi-agy host risks a wrong-agy bind)",
             port,
         )
     return port
+
+
+def _can_attribute_any_agy_port() -> bool:
+    """
+    Whether a listening port is attributable to ANY running agy process.
+
+    The discriminator for the cold-start's state 2. Attribution
+    (:func:`_pid_listen_ports`) returning nothing for one agy is ambiguous — it
+    means either that attribution is impossible here (restricted ``/proc``,
+    where agy holds its listener in a backend the process does not own as an
+    fd) or simply that this agy has not
+    bound its listener yet. Asking whether attribution works for any OTHER agy
+    separates the two: if lsof can name a port for some agy, attribution works
+    on this host, so a missing port means still-booting.
+
+    :returns: ``True`` when at least one running agy pid has an attributable
+        loopback LISTEN port. ``False`` when no agy is running, or when no
+        source can attribute a port to any of them.
+    """
+    return any(_pid_listen_ports(pid) for pid in _list_agy_pids())
 
 
 def _candidate_agy_rpc_ports() -> list[int]:
@@ -1411,7 +1511,7 @@ def _candidate_agy_rpc_ports() -> list[int]:
     agy_pids = _list_agy_pids()
     ports: set[int] = set()
     for pid in agy_pids:
-        ports.update(_parse_loopback_listen_ports(_run_lsof_listen_ports(pid)))
+        ports.update(_pid_listen_ports(pid))
     if agy_pids and not ports:
         loopback = _list_loopback_listen_ports()
         if len(loopback) > _MAX_FALLBACK_PROBE_PORTS:

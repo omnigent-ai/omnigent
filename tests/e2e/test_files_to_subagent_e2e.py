@@ -19,7 +19,7 @@ live server + runner + mock LLM, mirroring ``test_subagent_autowake_e2e``.
 Excluded from default ``pytest`` runs via ``--ignore=tests/e2e``. Invoke
 with::
 
-    uv run --extra dev python -m pytest \\
+    uv run --group test python -m pytest \\
         tests/e2e/test_files_to_subagent_e2e.py -p no:cacheprovider
 """
 

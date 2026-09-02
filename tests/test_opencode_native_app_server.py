@@ -31,9 +31,11 @@ def test_parse_opencode_version() -> None:
 def test_check_version_in_range() -> None:
     check_opencode_version("1.17.7")
     check_opencode_version("1.17.99")
+    check_opencode_version("1.18.0")
+    check_opencode_version("1.18.16")
 
 
-@pytest.mark.parametrize("version", ["1.16.0", "1.18.0", "2.0.0"])
+@pytest.mark.parametrize("version", ["1.16.0", "1.19.0", "2.0.0"])
 def test_check_version_out_of_range_raises(version: str) -> None:
     with pytest.raises(OpenCodeVersionError):
         check_opencode_version(version)
@@ -101,6 +103,22 @@ def test_filtered_server_env_sets_xdg_and_password(
     assert "RANDOM_UNRELATED" not in env  # unrelated env filtered out
 
 
+def test_filtered_server_env_honors_runner_passthrough(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "GH_TOKEN, GH_CONFIG_DIR, MISSING")
+    monkeypatch.setenv("GH_TOKEN", "ghp_example")
+    monkeypatch.setenv("GH_CONFIG_DIR", "/home/user/.config/gh")
+    monkeypatch.setenv("UNLISTED_SECRET", "nope")
+
+    env = filtered_server_env(bridge_dir=tmp_path, auth_secret="pw")
+
+    assert env["GH_TOKEN"] == "ghp_example"
+    assert env["GH_CONFIG_DIR"] == "/home/user/.config/gh"
+    assert "MISSING" not in env
+    assert "UNLISTED_SECRET" not in env
+
+
 def test_filtered_server_env_drops_global_opencode_config(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -115,6 +133,9 @@ def test_filtered_server_env_drops_global_opencode_config(
     monkeypatch.setenv("OPENCODE_CONFIG", "/home/user/.config/opencode/opencode.json")
     monkeypatch.setenv("OPENCODE_CONFIG_CONTENT", '{"model": "evil/model"}')
     monkeypatch.setenv("OPENCODE_DISABLE_AUTOUPDATE", "1")
+    monkeypatch.setenv(
+        "OMNIGENT_RUNNER_ENV_PASSTHROUGH", "OPENCODE_CONFIG,OPENCODE_CONFIG_CONTENT"
+    )
     env = filtered_server_env(bridge_dir=tmp_path, auth_secret="pw")
     assert "OPENCODE_CONFIG" not in env
     assert "OPENCODE_CONFIG_CONTENT" not in env
@@ -186,7 +207,7 @@ async def test_start_raises_on_unsupported_version_without_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(appsrv, "resolve_opencode_version", lambda _path: "1.18.0")
+    monkeypatch.setattr(appsrv, "resolve_opencode_version", lambda _path: "1.19.0")
     monkeypatch.delenv("OMNIGENT_OPENCODE_SKIP_VERSION_CHECK", raising=False)
     server = OpenCodeNativeServer(
         bridge_dir=tmp_path,
@@ -214,7 +235,7 @@ async def test_start_skips_version_gate_when_env_set(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(appsrv, "resolve_opencode_version", lambda _path: "1.18.0")
+    monkeypatch.setattr(appsrv, "resolve_opencode_version", lambda _path: "1.19.0")
     monkeypatch.setenv("OMNIGENT_OPENCODE_SKIP_VERSION_CHECK", "1")
     server = OpenCodeNativeServer(
         bridge_dir=tmp_path,
@@ -235,7 +256,7 @@ async def test_start_skips_version_gate_when_env_set(
     monkeypatch.setattr(appsrv.subprocess, "Popen", lambda argv, **kwargs: _FakeProc())
     monkeypatch.setattr(OpenCodeNativeServer, "_wait_until_ready", fake_wait)
     await server.start()
-    assert server.version == "1.18.0"
+    assert server.version == "1.19.0"
     assert server.process is not None
 
 

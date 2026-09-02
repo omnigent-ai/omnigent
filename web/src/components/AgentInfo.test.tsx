@@ -1,3 +1,5 @@
+import type * as IdentityModule from "@/lib/identity";
+
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -50,7 +52,7 @@ vi.mock("@/hooks/usePermissions", () => ({
   usePermissions: () => ({ data: grantsData.current }),
 }));
 vi.mock("@/lib/identity", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/identity")>()),
+  ...(await importOriginal<typeof IdentityModule>()),
   getCurrentUserId: () => viewerData.current,
 }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));

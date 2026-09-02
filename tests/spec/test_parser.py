@@ -90,6 +90,7 @@ def test_parse_full_config(tmp_path: Path) -> None:
     assert spec.llm.model == "openai/gpt-5.4"
     # executor.model is the canonical source — verify consolidation
     assert spec.executor.model == "openai/gpt-5.4"
+    assert spec.executor.reasoning_effort == "medium"
     assert spec.llm.extra == {
         "max_completion_tokens": 4096,
         "reasoning_effort": "medium",
@@ -99,6 +100,44 @@ def test_parse_full_config(tmp_path: Path) -> None:
     assert spec.interaction.modalities.output == ["text"]
     assert spec.tools.agents == ["researcher", "critic"]
     assert spec.params == {"max_results": 10, "prefer_recent": True}
+
+
+def test_parse_llm_reasoning_effort_lifted_to_executor(tmp_path: Path) -> None:
+    """The deprecated ``llm.reasoning_effort`` lifts to the canonical field.
+
+    Mirrors the model/connection consolidation: ``executor.reasoning_effort``
+    is the source of truth, populated from the ``llm:`` block for back-compat.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "eff-llm",
+        "llm": {"model": "openai/gpt-5.4", "reasoning_effort": "xhigh"},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.executor.reasoning_effort == "xhigh"
+    assert spec.llm is not None
+    assert spec.llm.extra.get("reasoning_effort") == "xhigh"
+
+
+def test_parse_executor_reasoning_effort_supersedes_llm(tmp_path: Path) -> None:
+    """When both are set, executor.reasoning_effort wins and llm is synced to it."""
+    config = {
+        "spec_version": 1,
+        "name": "eff-both",
+        "executor": {
+            "type": "omnigent",
+            "config": {"harness": "claude-sdk"},
+            "model": "openai/gpt-5.4",
+            "reasoning_effort": "high",
+        },
+        "llm": {"model": "openai/gpt-5.4", "reasoning_effort": "low"},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.executor.reasoning_effort == "high"
+    assert spec.llm is not None
+    assert spec.llm.extra.get("reasoning_effort") == "high"
 
 
 def test_parse_llm_missing_model(tmp_path: Path) -> None:
@@ -771,6 +810,41 @@ def test_discover_host_skills_skips_unreadable_skill_file(
     msg = skip_records[0].message
     assert str(bad_md) in msg
     assert "could not be read" in msg
+
+
+def _write_skill(skill_dir: Path, name: str) -> None:
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(f"---\nname: {name}\ndescription: d\n---\nBody.")
+
+
+def test_discover_skills_in_namespace_directories(agent_dir: Path) -> None:
+    """
+    A folder under ``skills/`` without its own ``SKILL.md`` groups
+    skills one level deeper: ``skills/<ns>/<skill>/SKILL.md`` must be
+    discovered alongside flat ``skills/<skill>/SKILL.md`` entries.
+    """
+    skills = agent_dir / "skills"
+    _write_skill(skills / "flat", "flat")
+    _write_skill(skills / "ops" / "deploy", "deploy")
+    _write_skill(skills / "ops" / "rollback", "rollback")
+
+    assert [s.name for s in parse(agent_dir).skills] == ["flat", "deploy", "rollback"]
+
+
+def test_discover_skills_namespace_depth_is_bounded(agent_dir: Path) -> None:
+    """
+    Namespace descent stops after one level and never enters dot-dirs,
+    so a cloned skill pack's ``.git`` tree or a deeply nested layout
+    cannot be walked (host skill dirs are user-managed).
+    """
+    skills = agent_dir / "skills"
+    _write_skill(skills / "ops" / "deploy", "deploy")
+    _write_skill(skills / "ops" / "too" / "deep", "deep")
+    _write_skill(skills / ".git" / "hidden", "hidden")
+    _write_skill(skills / ".direct-hidden", "direct-hidden")
+    _write_skill(skills / "ops" / ".nested-hidden", "nested-hidden")
+
+    assert [s.name for s in parse(agent_dir).skills] == ["deploy"]
 
 
 # ── top-level ``skills:`` field (host-skill filter) ──────────────
@@ -1456,6 +1530,27 @@ def test_parse_inline_mcp_headers_and_env_expanded(
     assert stdio_srv.env == {"MY_KEY": "val-456"}
 
 
+def test_parse_inline_mcp_url_expanded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Inline ``type: mcp`` entries expand ``${VAR}`` in ``url``, same
+    as the directory-config path."""
+    monkeypatch.setenv("MCP_HOST", "internal.example.com")
+    config = {
+        "spec_version": 1,
+        "name": "inline-url-expand",
+        "tools": {
+            "svc": {
+                "type": "mcp",
+                "url": "https://${MCP_HOST}/mcp",
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    http_srv = next(s for s in spec.mcp_servers if s.name == "svc")
+    assert http_srv.url == "https://internal.example.com/mcp"
+
+
 def test_parse_inline_mcp_rejects_non_dict_headers(tmp_path: Path) -> None:
     """
     Non-dict ``headers`` on an inline MCP entry raises
@@ -1699,6 +1794,69 @@ def test_parse_os_env_with_sandbox(tmp_path: Path) -> None:
     assert sandbox.allow_network is False
 
 
+def test_parse_os_env_sandbox_auto_uses_platform_default(tmp_path: Path) -> None:
+    """``sandbox.type: auto`` explicitly selects the platform default."""
+    from omnigent.inner.sandbox import _default_sandbox_for_platform
+
+    config = {
+        "spec_version": 1,
+        "name": "auto-sandbox",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {"type": "auto", "write_paths": ["."]},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(tmp_path)
+
+    assert spec.os_env is not None
+    assert spec.os_env.sandbox is not None
+    assert spec.os_env.sandbox.type == _default_sandbox_for_platform().type
+    assert spec.os_env.sandbox.write_paths == ["."]
+
+
+def test_parse_os_env_sandbox_omitted_type_uses_platform_default(tmp_path: Path) -> None:
+    """An omitted ``sandbox.type`` selects the platform default."""
+    from omnigent.inner.sandbox import _default_sandbox_for_platform
+
+    config = {
+        "spec_version": 1,
+        "name": "default-sandbox",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {"write_paths": ["."]},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(tmp_path)
+
+    assert spec.os_env is not None
+    assert spec.os_env.sandbox is not None
+    assert spec.os_env.sandbox.type == _default_sandbox_for_platform().type
+    assert spec.os_env.sandbox.write_paths == ["."]
+
+
+def test_parse_os_env_sandbox_null_type_disables_sandbox(tmp_path: Path) -> None:
+    """``sandbox.type: null`` explicitly disables sandboxing."""
+    config = {
+        "spec_version": 1,
+        "name": "null-sandbox",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {"type": None},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(tmp_path)
+
+    assert spec.os_env is not None
+    assert spec.os_env.sandbox is not None
+    assert spec.os_env.sandbox.type == "none"
+
+
 def test_parse_os_env_non_mapping_raises(tmp_path: Path) -> None:
     """A scalar/list under ``os_env:`` raises OmnigentError —
     fail loud rather than silently dropping the malformed block.
@@ -1752,6 +1910,25 @@ def test_parse_os_env_sandbox_with_cwd_allow_hidden(tmp_path: Path) -> None:
     assert spec.os_env is not None
     assert spec.os_env.sandbox is not None
     assert spec.os_env.sandbox.cwd_allow_hidden == [".venv", ".cache"]
+
+
+def test_parse_os_env_sandbox_cwd_allow_hidden_wildcard(tmp_path: Path) -> None:
+    """The explicit wildcard survives parsing for trusted workspaces."""
+    config = {
+        "spec_version": 1,
+        "name": "allow-all-hidden",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {"type": "linux_bwrap", "cwd_allow_hidden": ["*"]},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(tmp_path)
+
+    assert spec.os_env is not None
+    assert spec.os_env.sandbox is not None
+    assert spec.os_env.sandbox.cwd_allow_hidden == ["*"]
 
 
 def test_parse_os_env_sandbox_cwd_allow_hidden_empty_list_preserved(
@@ -2079,6 +2256,48 @@ def test_mcp_headers_expanded_from_environment(
     assert spec.mcp_servers[0].headers == {
         "Authorization": "Bearer key-abc",
     }
+
+
+def test_mcp_url_expanded_from_environment(
+    agent_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``${VAR}`` references in the MCP ``url`` field are expanded at
+    parse time, same as ``headers`` — this is what lets a directory
+    MCP config be committed to version control without hardcoding
+    the endpoint.
+    """
+    monkeypatch.setenv("MCP_HOST", "internal.example.com")
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "templated-url",
+        "transport": "http",
+        "url": "https://${MCP_HOST}/mcp",
+    }
+    (mcp_dir / "templated.yaml").write_text(yaml.dump(mcp_config))
+    spec = parse(agent_dir)
+    assert spec.mcp_servers[0].url == "https://internal.example.com/mcp"
+
+
+def test_mcp_url_unresolved_var_raises(
+    agent_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unresolved ``${VAR}`` in ``url`` raises rather than connecting
+    to a literal placeholder string."""
+    monkeypatch.delenv("MISSING_HOST", raising=False)
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "bad-url",
+        "transport": "http",
+        "url": "https://${MISSING_HOST}/mcp",
+    }
+    (mcp_dir / "bad.yaml").write_text(yaml.dump(mcp_config))
+    with pytest.raises(OmnigentError, match=r"Unresolved environment variable"):
+        parse(agent_dir)
 
 
 def test_mcp_env_expansion_mixed_set_and_unset_raises(
@@ -3853,3 +4072,86 @@ def test_config_loader_does_not_mutate_shared_safeloader_resolvers() -> None:
     # The subclass still narrows bools: ``on`` is a plain string, ``false`` a bool.
     assert yaml.load("on", loader) == "on"
     assert yaml.load("false", loader) is False
+
+
+# ── Sub-agent bundle provenance (``source_rel_dir``) ──────────
+
+
+def _write_agent(directory: Path, name: str) -> Path:
+    """Create a minimal agent bundle at *directory* named *name*."""
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "config.yaml").write_text(yaml.dump({"spec_version": 1, "name": name}))
+    return directory
+
+
+def test_sub_agent_source_rel_dir_stamped_at_each_depth(tmp_path: Path) -> None:
+    """Every parsed sub-agent records the directory it came from.
+
+    The child's skills and local tools live under
+    ``<parent bundle>/agents/<dir>``; without this stamp the runner has
+    no way to walk down to them and falls back to the parent's bundle
+    root, exposing the parent's assets to the child.
+    """
+    root = _write_agent(tmp_path / "root", "root")
+    manager = _write_agent(root / "agents" / "manager", "manager")
+    _write_agent(manager / "agents" / "researcher", "researcher")
+
+    spec = parse(root)
+
+    assert spec.source_rel_dir is None  # root has no parent bundle
+    (child,) = spec.sub_agents
+    assert child.source_rel_dir == "manager"
+    (grandchild,) = child.sub_agents
+    assert grandchild.source_rel_dir == "researcher"
+
+
+def test_sub_agent_source_rel_dir_uses_directory_not_yaml_name(tmp_path: Path) -> None:
+    """The stamp is the directory name even when the YAML name differs.
+
+    Using the YAML ``name`` would build a path that does not exist on
+    disk, so the workdir gate would reject it and the child would
+    silently inherit the parent's bundle root again.
+    """
+    root = _write_agent(tmp_path / "root", "root")
+    _write_agent(root / "agents" / "web-researcher", "Deep Researcher")
+
+    spec = parse(root)
+
+    (child,) = spec.sub_agents
+    assert child.name == "Deep Researcher"
+    assert child.source_rel_dir == "web-researcher"
+
+
+def test_parse_executor_reasoning_effort(tmp_path: Path) -> None:
+    """``executor.reasoning_effort`` is lifted onto the concrete field.
+
+    It sits beside ``executor.model`` in the YAML because it is the same
+    kind of setting — a harness-level default for the agent — and a spec
+    that declares one must not have it silently dropped the way a stray
+    key under ``executor.config`` would be.
+    """
+    config = {
+        "spec_version": 1,
+        "executor": {
+            "type": "omnigent",
+            "model": "claude-opus-5",
+            "reasoning_effort": "high",
+            "config": {"harness": "claude-native"},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert spec.executor.reasoning_effort == "high"
+    assert spec.executor.model == "claude-opus-5"
+    # It is a concrete field, not smuggled into the free-form config bag.
+    assert "reasoning_effort" not in spec.executor.config
+
+
+def test_parse_executor_reasoning_effort_absent(tmp_path: Path) -> None:
+    """A spec that declares no effort leaves the field ``None``."""
+    config = {"spec_version": 1, "executor": {"type": "omnigent"}}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert spec.executor.reasoning_effort is None

@@ -14,14 +14,15 @@ that shared decode-and-write step.
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import logging
 import re
 import urllib.parse
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import httpx
 
@@ -78,7 +79,7 @@ def parse_data_uri(uri: str) -> DataUri:
     return DataUri(mime_type=mime_part, base64_payload=payload)
 
 
-def materialize_attachment(block: dict[str, Any], bridge_dir: Path) -> Path | None:
+def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Path | None:
     """
     Decode a base64 data URI from a content block and write it to disk.
 
@@ -106,13 +107,13 @@ def materialize_attachment(block: dict[str, Any], bridge_dir: Path) -> Path | No
     try:
         parsed = parse_data_uri(data_uri)
         raw_bytes = base64.b64decode(parsed.base64_payload)
-    except (ValueError, base64.binascii.Error):
+    except (ValueError, binascii.Error):
         _logger.warning("Failed to decode data URI for attachment", exc_info=True)
         return None
 
     ext = MIME_TO_EXT.get(parsed.mime_type, "")
     filename = block.get("filename")
-    if not filename:
+    if not isinstance(filename, str) or not filename:
         filename = f"attachment_{uuid.uuid4().hex[:8]}{ext}"
     else:
         filename = Path(filename).name or f"attachment_{uuid.uuid4().hex[:8]}{ext}"
@@ -157,7 +158,7 @@ UNRESOLVED_ATTACHMENT_MARKER_PATTERN = r"\[Attachment [^\]]+ could not be loaded
 ATTACHMENT_MARKER_STRIP_PATTERN = rf"\[Attached:[^\]]*\]|{UNRESOLVED_ATTACHMENT_MARKER_PATTERN}"
 
 
-def unresolved_attachment_marker(block: dict[str, Any]) -> str:
+def unresolved_attachment_marker(block: Mapping[str, object]) -> str:
     """
     Visible placeholder for an attachment that could not be loaded.
 
@@ -177,7 +178,7 @@ def unresolved_attachment_marker(block: dict[str, Any]) -> str:
     return f"[Attachment {_MARKER_UNSAFE.sub('_', name)} could not be loaded]"
 
 
-def attachment_reference_line(block: dict[str, Any], bridge_dir: Path) -> str:
+def attachment_reference_line(block: Mapping[str, object], bridge_dir: Path) -> str:
     """
     Materialize *block* and return the transcript line referencing it.
 
@@ -197,7 +198,7 @@ def attachment_reference_line(block: dict[str, Any], bridge_dir: Path) -> str:
     return unresolved_attachment_marker(block)
 
 
-def has_unresolved_file_id(block: dict[str, Any]) -> bool:
+def has_unresolved_file_id(block: Mapping[str, object]) -> bool:
     """
     True if *block* carries a ``file_id`` no resolver has inlined yet.
 
@@ -212,11 +213,11 @@ def has_unresolved_file_id(block: dict[str, Any]) -> bool:
 
 
 async def resolve_file_id_block(
-    block: dict[str, Any],
+    block: Mapping[str, object],
     *,
     session_id: str,
     client: httpx.AsyncClient,
-) -> dict[str, Any] | None:
+) -> dict[str, object] | None:
     """
     Fetch a ``file_id`` attachment's bytes and inline them as a data URI.
 

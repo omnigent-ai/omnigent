@@ -10,7 +10,11 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from omnigent.entities.conversation import synthesize_conversation_title
+from omnigent.entities.conversation import (
+    DEFAULT_GENERATED_TITLE_MAX_CHARS,
+    USER_SESSION_TITLE_MAX_CHARS,
+    synthesize_conversation_title,
+)
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_plugins import background_title_generators
 from omnigent.stores.conversation_store import ConversationStore
@@ -41,22 +45,34 @@ class BackgroundTitleRequest:
     harness_override: str | None = None
     model_override: str | None = None
     sub_agent_name: str | None = None
+    additional_instructions: str | None = None
 
 
 BackgroundTitleGenerator = Callable[[BackgroundTitleRequest], Awaitable[str | None]]
 
 _TITLE_WRAPPERS = "'\"`“”‘’"
 _TRAILING_PUNCTUATION = re.compile(r"[.!?;:,]+$")
+BACKGROUND_TITLE_MAX_CHARS = DEFAULT_GENERATED_TITLE_MAX_CHARS
+CUSTOM_BACKGROUND_TITLE_MAX_CHARS = USER_SESSION_TITLE_MAX_CHARS
 
 
-def normalize_background_title(value: str | None) -> str | None:
+def normalize_background_title(
+    value: str | None,
+    *,
+    max_chars: int = BACKGROUND_TITLE_MAX_CHARS,
+    truncate_overflow: bool = False,
+) -> str | None:
     """Return a compact title or ``None`` when model output is unusable."""
     if not value:
         return None
     first_line = next((line.strip() for line in value.splitlines() if line.strip()), "")
     title = " ".join(first_line.strip(_TITLE_WRAPPERS).split())
     title = _TRAILING_PUNCTUATION.sub("", title).strip()
-    if len(title) < 2 or len(title) > 60:
+    if len(title) > max_chars:
+        if not truncate_overflow:
+            return None
+        title = title[: max_chars - 1].rstrip() + "…"
+    if len(title) < 2:
         return None
     return title
 
@@ -72,15 +88,18 @@ class RunnerBackgroundTitleGenerator:
         routed = self._runner_router.client_for_existing_conversation(request.session_id)
         if routed is None:
             return None
+        body = {
+            "prompt": request.prompt,
+            "agent_id": request.agent_id,
+            "harness_override": request.harness_override,
+            "model_override": request.model_override,
+            "sub_agent_name": request.sub_agent_name,
+        }
+        if request.additional_instructions is not None:
+            body["additional_instructions"] = request.additional_instructions
         response = await routed.client.post(
             f"/v1/sessions/{request.session_id}/background-title",
-            json={
-                "prompt": request.prompt,
-                "agent_id": request.agent_id,
-                "harness_override": request.harness_override,
-                "model_override": request.model_override,
-                "sub_agent_name": request.sub_agent_name,
-            },
+            json=body,
             timeout=self._timeout_seconds,
         )
         response.raise_for_status()
@@ -102,6 +121,7 @@ class BackgroundSessionTitleCoordinator:
         timeout_seconds: float = 70.0,
         seed_wait_seconds: float = 15.0,
         max_concurrency: int = 4,
+        additional_instructions: str | None = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be at least 1")
@@ -109,9 +129,11 @@ class BackgroundSessionTitleCoordinator:
         self._generator = generator
         self._timeout_seconds = timeout_seconds
         self._seed_wait_seconds = seed_wait_seconds
+        self._additional_instructions = additional_instructions
         self._generation_slots = asyncio.Semaphore(max_concurrency)
         self._pending: set[asyncio.Task[None]] = set()
         self._scheduled_session_ids: set[str] = set()
+        self._scheduled_task_summary_ids: set[str] = set()
 
     def schedule(
         self,
@@ -137,6 +159,7 @@ class BackgroundSessionTitleCoordinator:
                     harness_override=harness_override,
                     model_override=model_override,
                     sub_agent_name=sub_agent_name,
+                    additional_instructions=self._additional_instructions,
                 ),
                 expected_seed_title=expected_seed_title,
             ),
@@ -147,6 +170,41 @@ class BackgroundSessionTitleCoordinator:
         def _discard(completed: asyncio.Task[None]) -> None:
             self._pending.discard(completed)
             self._scheduled_session_ids.discard(session_id)
+
+        task.add_done_callback(_discard)
+
+    def schedule_task_summary(
+        self,
+        *,
+        session_id: str,
+        prompt: str,
+        agent_id: str | None = None,
+        harness_override: str | None = None,
+        model_override: str | None = None,
+        sub_agent_name: str | None = None,
+    ) -> None:
+        """Schedule a task-summary attempt for a child session."""
+        if session_id in self._scheduled_task_summary_ids:
+            return
+        self._scheduled_task_summary_ids.add(session_id)
+        task = asyncio.create_task(
+            self._run_task_summary(
+                request=BackgroundTitleRequest(
+                    session_id=session_id,
+                    prompt=prompt,
+                    agent_id=agent_id,
+                    harness_override=harness_override,
+                    model_override=model_override,
+                    sub_agent_name=sub_agent_name,
+                ),
+            ),
+            name=f"background-task-summary-{session_id}",
+        )
+        self._pending.add(task)
+
+        def _discard(completed: asyncio.Task[None]) -> None:
+            self._pending.discard(completed)
+            self._scheduled_task_summary_ids.discard(session_id)
 
         task.add_done_callback(_discard)
 
@@ -182,19 +240,33 @@ class BackgroundSessionTitleCoordinator:
                         "reason=seed_unavailable elapsed_ms=%.1f",
                         request.session_id,
                         (time.perf_counter() - started) * 1000,
+                        extra={"session_id": request.session_id},
                     )
                     return
                 generated = await asyncio.wait_for(
                     self._generator(request),
                     timeout=self._timeout_seconds,
                 )
-            title = normalize_background_title(generated)
+            has_custom_instructions = bool(
+                request.additional_instructions and request.additional_instructions.strip()
+            )
+            max_chars = (
+                CUSTOM_BACKGROUND_TITLE_MAX_CHARS
+                if has_custom_instructions
+                else BACKGROUND_TITLE_MAX_CHARS
+            )
+            title = normalize_background_title(
+                generated,
+                max_chars=max_chars,
+                truncate_overflow=has_custom_instructions,
+            )
             if title is None:
                 _logger.info(
                     "background session title skipped session=%s "
                     "reason=invalid_title elapsed_ms=%.1f",
                     request.session_id,
                     (time.perf_counter() - started) * 1000,
+                    extra={"session_id": request.session_id},
                 )
                 return
             updated = await asyncio.to_thread(
@@ -208,18 +280,70 @@ class BackgroundSessionTitleCoordinator:
                 request.session_id,
                 updated is not None,
                 (time.perf_counter() - started) * 1000,
+                extra={"session_id": request.session_id},
             )
         except TimeoutError:
             _logger.info(
                 "background session title timed out session=%s elapsed_ms=%.1f",
                 request.session_id,
                 (time.perf_counter() - started) * 1000,
+                extra={"session_id": request.session_id},
             )
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - background metadata must never fail the user turn
             _logger.warning(
                 "background session title failed session=%s elapsed_ms=%.1f",
+                request.session_id,
+                (time.perf_counter() - started) * 1000,
+                exc_info=True,
+                extra={"session_id": request.session_id},
+            )
+
+    async def _run_task_summary(
+        self,
+        *,
+        request: BackgroundTitleRequest,
+    ) -> None:
+        """Generate a task summary for a child session and write it to task_summary."""
+        started = time.perf_counter()
+        try:
+            async with self._generation_slots:
+                generated = await asyncio.wait_for(
+                    self._generator(request),
+                    timeout=self._timeout_seconds,
+                )
+            title = normalize_background_title(generated)
+            if title is None:
+                _logger.info(
+                    "background task summary skipped session=%s "
+                    "reason=invalid_title elapsed_ms=%.1f",
+                    request.session_id,
+                    (time.perf_counter() - started) * 1000,
+                )
+                return
+            updated = await asyncio.to_thread(
+                self._conversation_store.set_task_summary,
+                request.session_id,
+                title,
+            )
+            _logger.info(
+                "background task summary completed session=%s set=%s elapsed_ms=%.1f",
+                request.session_id,
+                updated is not None,
+                (time.perf_counter() - started) * 1000,
+            )
+        except TimeoutError:
+            _logger.info(
+                "background task summary timed out session=%s elapsed_ms=%.1f",
+                request.session_id,
+                (time.perf_counter() - started) * 1000,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "background task summary failed session=%s elapsed_ms=%.1f",
                 request.session_id,
                 (time.perf_counter() - started) * 1000,
                 exc_info=True,
@@ -284,11 +408,13 @@ def prepare_background_session_title(
     ):
         return None
 
-    prompt = _background_title_prompt(event)
+    prompt = background_title_prompt(event)
     if not prompt:
         return None
 
     expected_seed_title = synthesize_conversation_title([{"type": "input_text", "text": prompt}])
+    if expected_seed_title is None:
+        return None
     return PendingBackgroundSessionTitle(
         coordinator=coordinator,
         request=BackgroundTitleRequest(
@@ -303,7 +429,26 @@ def prepare_background_session_title(
     )
 
 
-def _background_title_prompt(event: SessionEventInput) -> str:
+def schedule_background_child_task_summary(
+    *,
+    coordinator: BackgroundSessionTitleCoordinator | None,
+    session_id: str,
+    prompt: str,
+    agent_id: str | None = None,
+    sub_agent_name: str | None = None,
+) -> None:
+    """Schedule a background task-summary attempt for a child session."""
+    if coordinator is None or not prompt:
+        return
+    coordinator.schedule_task_summary(
+        session_id=session_id,
+        prompt=prompt,
+        agent_id=agent_id,
+        sub_agent_name=sub_agent_name,
+    )
+
+
+def background_title_prompt(event: SessionEventInput) -> str:
     if event.type == "slash_command":
         name = event.data.get("name")
         arguments = event.data.get("arguments", "")

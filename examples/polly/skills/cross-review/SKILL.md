@@ -22,10 +22,10 @@ anyone needs to read through.
    cases, and misses parametrized case expansion.
 3. Dispatch a DIFFERENT-vendor sub-agent as reviewer: pick any AVAILABLE worker
    whose vendor differs from the implementer's — `claude_code`, `codex`,
-   `opencode`, `cursor`, `hermes`, or `pi` (e.g. Claude built it → any of
-   `codex` / `opencode` / `cursor` / `hermes` / `pi`, and so on). Use a
+   `opencode`, `cursor`, `hermes`, `agy`, or `pi` (e.g. Claude built it → any of
+   `codex` / `opencode` / `cursor` / `hermes` / `agy` / `pi`, and so on). Use a
    task-based title such as `review-auth-refactor`, never the raw vendor name:
-   `sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"pi", title="review-<task_slug>",
+   `sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"agy"|"pi", title="review-<task_slug>",
    args={purpose: "review", input: "<the diff> + <the acceptance contract>.
    Review ONLY against the contract. Report blocking / non-blocking /
    suggestions. Do not edit code."})`. Give it the diff as text — do NOT point
@@ -60,7 +60,7 @@ anyone needs to read through.
   human at the plan gate.
 - Give the reviewer ONLY the diff + contract — never the implementer's
   transcript or worktree. The cross-vendor independence is the whole point.
-- Review is a coding sub-agent (`claude_code`/`codex`/`opencode`/`cursor`/`hermes`/`pi`) dispatched with
+- Review is a coding sub-agent (`claude_code`/`codex`/`opencode`/`cursor`/`hermes`/`agy`/`pi`) dispatched with
   `purpose: "review"` — a DIFFERENT vendor from the one that built the diff. It
   reports issues and never edits; only the implementer opens a PR, so a stray
   reviewer edit never reaches the deliverable.
