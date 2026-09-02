@@ -41,6 +41,7 @@ from omnigent.server.managed_hosts import (
     ISLO_MANAGED_TOKEN_TTL_S,
     KUBERNETES_MANAGED_TOKEN_TTL_S,
     MODAL_MANAGED_TOKEN_TTL_S,
+    ONLINE_TIMEOUT_ENV_VAR,
     OPENSHELL_MANAGED_TOKEN_TTL_S,
     ManagedLaunch,
     ManagedLaunchTracker,
@@ -2168,9 +2169,8 @@ async def test_launch_online_timeout_terminates_and_deletes_host(
     # No on_host_start → the host never registers.
     fake = FakeSandboxLauncher()
     # Shrink the polling budget so the timeout path runs in
-    # milliseconds; production values are module constants read at
-    # call time.
-    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 0.05)
+    # milliseconds; production values are read at call time.
+    monkeypatch.setenv(ONLINE_TIMEOUT_ENV_VAR, "0.05")
     monkeypatch.setattr("omnigent.server.managed_hosts._ONLINE_POLL_INTERVAL_S", 0.01)
     host_store = HostStore(db_uri)
 
@@ -2179,7 +2179,9 @@ async def test_launch_online_timeout_terminates_and_deletes_host(
             config=_injected_config(fake), owner=_OWNER, host_store=host_store
         )
     assert exc.value.status_code == 502
-    assert "did not come online" in exc.value.detail
+    # The RESOLVED budget is quoted, not the default — an operator who
+    # raised it must not be told the launch gave up at 120s.
+    assert "did not come online within 0.05s" in exc.value.detail
     assert fake.terminated == ["sb-fake-1"]
     assert host_store.list_hosts(_OWNER) == []
     # The start command DID run (the failure was registration, not
