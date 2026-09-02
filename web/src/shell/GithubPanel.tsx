@@ -672,7 +672,7 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
                 >
                   <span className="truncate">{pr.title}</span>
                   <span className="shrink-0 text-muted-foreground">#{pr.number}</span>
-                  <ExternalLinkIcon className="size-3 shrink-0 text-muted-foreground opacity-0 group-hover:opacity-100" />
+                  <ExternalLinkIcon className="size-3 shrink-0 text-muted-foreground" />
                 </a>
               </div>
               {/* CI status checks (from the PR's statusCheckRollup), on their own
