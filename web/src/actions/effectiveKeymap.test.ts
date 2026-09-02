@@ -146,7 +146,7 @@ describe("effective keymap", () => {
 
   it("reports overlaps but allows the same key in disjoint modes and contexts", () => {
     expect(keybindingModesMayOverlap("global", "composer")).toBe(true);
-    expect(keybindingModesMayOverlap("fileViewer", "codeEditor")).toBe(true);
+    expect(keybindingModesMayOverlap("fileViewer", "markdownToc")).toBe(true);
     expect(keybindingModesMayOverlap("filesPanel", "fileViewer")).toBe(true);
     expect(keybindingModesMayOverlap("composer", "terminal")).toBe(false);
 
@@ -208,7 +208,7 @@ describe("effective keymap", () => {
     ]);
   });
 
-  it("reports active-mode and chord-prefix conflicts with the static winner", () => {
+  it("reports active-mode conflicts with the static winner", () => {
     const rules = [
       {
         ...defaultRule("files", "panel.action.closeFiles", "escape", "filesPanel", {
@@ -219,33 +219,35 @@ describe("effective keymap", () => {
       defaultRule("terminals", "panel.action.closeTerminals", "escape", "terminalsPanel", {
         activation: "active",
       }),
-      {
-        ...defaultRule("chord", "session.action.new", "mod+k mod+n"),
-        origin: "user" as const,
-      },
-      defaultRule("single", "workbench.action.showCommands", "mod+k"),
     ];
-    const conflicts = analyzeKeybindingConflicts(rules);
-    expect(conflicts).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          kind: "exact",
-          first: expect.objectContaining({ id: "files" }),
-          second: expect.objectContaining({ id: "terminals" }),
-          resolution: "ambiguous",
-          winner: expect.objectContaining({ id: "files" }),
-          reason: "user",
-        }),
-        expect.objectContaining({
-          kind: "chordPrefix",
-          sequence: "mod+k",
-          resolution: "ambiguous",
-          winner: expect.objectContaining({ id: "chord" }),
-          loser: expect.objectContaining({ id: "single" }),
-          reason: "chordPrefix",
-        }),
-      ]),
-    );
+    expect(analyzeKeybindingConflicts(rules)).toEqual([
+      expect.objectContaining({
+        kind: "exact",
+        first: expect.objectContaining({ id: "files" }),
+        second: expect.objectContaining({ id: "terminals" }),
+        resolution: "ambiguous",
+        winner: expect.objectContaining({ id: "files" }),
+        reason: "user",
+      }),
+    ]);
+  });
+
+  it("detects platform-overlapping mod and legacy primary bindings", () => {
+    const conflicts = analyzeKeybindingConflicts([
+      defaultRule("legacy", "workbench.action.showCommands", "primary+k"),
+      { ...defaultRule("user", "session.action.new", "mod+k"), origin: "user" },
+    ]);
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0]).toMatchObject({ kind: "exact", resolution: "ambiguous" });
+  });
+
+  it("detects logical keys that overlap physical-code defaults", () => {
+    const conflicts = analyzeKeybindingConflicts([
+      defaultRule("physical", "composer.action.toggleDictation", "primary+alt+[KeyV]"),
+      { ...defaultRule("logical", "session.action.new", "mod+alt+v"), origin: "user" },
+    ]);
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0]).toMatchObject({ kind: "exact", resolution: "ambiguous" });
   });
 
   it("marks the same-mode user binding as the static winner", () => {
@@ -359,13 +361,29 @@ describe("effective keymap", () => {
     expect(effective.conflicts).toEqual([]);
   });
 
-  it("ignores hand-built empty sequences during public conflict analysis", () => {
-    const empty = { ...defaultRule("empty", "session.action.new", "mod+n"), sequence: [] };
-    const userRule = {
-      ...defaultRule("user", "workbench.action.showCommands", "mod+n"),
-      origin: "user" as const,
-    };
-    expect(analyzeKeybindingConflicts([empty, userRule])).toEqual([]);
+  it("inherits action routing policy without key-specific when conditions", () => {
+    const send = resolveEffectiveKeymap(DEFAULT_KEYBINDINGS, [
+      user("user.send", "composer.action.send", "mod+m", "composer"),
+    ]).rules.find((rule) => rule.id === "user.send")!;
+    expect(send.when).toBeUndefined();
+
+    const terminal = resolveEffectiveKeymap(DEFAULT_KEYBINDINGS, [
+      user("user.terminal", "terminal.action.sendSequence", "mod+enter", "terminal", {
+        data: "custom",
+      }),
+    ]).rules.find((rule) => rule.id === "user.terminal")!;
+    expect(terminal).toMatchObject({ phase: "capture", stopPropagation: true });
+  });
+
+  it("defaults cross-action bindings in open-surface modes to active", () => {
+    const defaults = [defaultRule("session.new", "session.action.new", "mod+n")];
+    const effective = resolveEffectiveKeymap(defaults, [
+      user("user.session.files", "session.action.new", "mod+j", "filesPanel"),
+    ]);
+    expect(effective.rules.find((rule) => rule.id === "user.session.files")).toMatchObject({
+      mode: "filesPanel",
+      activation: "active",
+    });
   });
 
   it("uses the last hand-edited duplicate override deterministically", () => {

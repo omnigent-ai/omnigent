@@ -34,12 +34,12 @@ describe("keybinding preferences", () => {
     const rules = parseUserKeybindingPreferences(
       stored([
         { ...known, sequence: "SHIFT+CTRL+N" },
-        { id: "future", action: "future.action.run", sequence: null, mode: "dialog" },
+        { id: "future", action: "future.action.run", sequence: null, mode: "global" },
       ]),
     );
     expect(rules).toEqual([
       known,
-      { id: "future", action: "future.action.run", sequence: null, mode: "dialog" },
+      { id: "future", action: "future.action.run", sequence: null, mode: "global" },
     ]);
     expect(Object.isFrozen(rules)).toBe(true);
   });

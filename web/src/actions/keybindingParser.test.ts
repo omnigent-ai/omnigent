@@ -20,9 +20,8 @@ describe("keybinding parser", () => {
     expect(() => parseKeybinding("mod+[Foo]")).toThrow("Unknown physical key code");
   });
 
-  it("round-trips two-stroke chords", () => {
-    const source = "mod+k mod+s";
-    expect(serializeKeybinding(parseKeybinding(source))).toBe(source);
+  it("rejects multi-stroke shortcuts", () => {
+    expect(() => parseKeybinding("mod+k mod+s")).toThrow("one key combination");
   });
 
   it("normalizes named, plus, and function keys", () => {
@@ -47,6 +46,7 @@ describe("keybinding parser", () => {
     "k+v",
     "mod+[bad-code",
     "mod+DefinitelyNotAKey",
+    "mod+k mod+s",
     "mod+k mod+s mod+p",
   ])("rejects invalid binding %j", (source) => {
     expect(() => parseKeybinding(source)).toThrow();

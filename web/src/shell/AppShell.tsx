@@ -1337,18 +1337,21 @@ export function AppShell() {
     },
   });
   useRegisterAction("workbench.action.navigateInbox", {
+    acceptsKeybindings: true,
     run: () => {
       navigate("/inbox");
       return HANDLED;
     },
   });
   useRegisterAction("workbench.action.navigateAutomations", {
+    acceptsKeybindings: true,
     run: () => {
       navigate("/tasks");
       return HANDLED;
     },
   });
   useRegisterAction("workbench.action.navigateSettings", {
+    acceptsKeybindings: true,
     run: () => {
       navigate("/settings");
       return HANDLED;

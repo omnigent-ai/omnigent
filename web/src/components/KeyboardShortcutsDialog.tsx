@@ -1,23 +1,17 @@
-// A read-only "Keyboard shortcuts" overlay listing the shortcuts that already
-// exist in the chat surface. It is intentionally a mirror of the live
-// behavior — every row here corresponds to behavior that ships today, whether
-// routed through centralized actions or a not-yet-migrated local handler. The
-// dialog owns the centralized action handler for
-// its opener; the default key itself lives in actions/defaultKeybindings.ts.
-//
-// Self-contained: it owns its open state and also keeps a temporary custom
-// event bridge for menu callers that have not migrated to actions yet.
-
-import { useEffect, useState } from "react";
-
+// Compact, read-only reference for the live effective keymap. Editing lives in Settings.
+import { useEffect, useMemo, useState } from "react";
 import {
-  ALT_KEY,
-  composerNewLineShortcutKeys,
-  composerSendShortcutKeys,
-  ENTER_KEY,
-  Kbd,
-  MOD_KEY,
-} from "@/components/KeyboardShortcut";
+  ACTION_CATALOG,
+  HANDLED,
+  contextsMayOverlap,
+  isMacKeyboardPlatform,
+  isReservedEscapeSequence,
+  keybindingEnvironmentExpression,
+  useKeybindingSnapshot,
+  useRegisterAction,
+  type ActionId,
+  type KeybindingRule,
+} from "@/actions";
 import {
   Dialog,
   DialogContent,
@@ -25,14 +19,10 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
-import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
+import { useIsEmbedded } from "@/lib/embedded";
 import { isNativeShell } from "@/lib/nativeBridge";
-import { HANDLED, useRegisterAction } from "@/actions";
+import { KEYBINDING_MODE_LABELS, KeybindingSequence } from "./keybindings/KeybindingSequence";
 
-// Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
-// account menu) can open it without threading state through the tree.
 export const KEYBOARD_SHORTCUTS_EVENT = "omnigent:open-keyboard-shortcuts";
 
 /** Dispatch the open event — used by menu entries that can't reach the state. */
@@ -41,145 +31,72 @@ export function openKeyboardShortcuts(): void {
   window.dispatchEvent(new Event(KEYBOARD_SHORTCUTS_EVENT));
 }
 
-// Glyphs match the in-app tooltips (e.g. UserMessageNav's "⌘⌥↑").
-const UP = "↑";
-const DOWN = "↓";
-
-interface Shortcut {
-  label: string;
-  /** Keys rendered left→right as chips. A chord (held together) or, for the
-   *  arrow-pairs, the two interchangeable keys for that action. */
-  keys: string[];
-}
-
-interface ShortcutGroup {
-  title: string;
-  /** Optional qualifier shown next to the group title. */
-  note?: string;
-  items: Shortcut[];
-}
-
-// ONLY shortcuts that exist today (see file header). Keep in sync with the
-// composer's `handleKeyDown` and the global hotkey hooks.
-const SHORTCUT_GROUPS: ShortcutGroup[] = [
-  {
-    title: "General",
-    items: [
-      { label: "Start a new session", keys: [MOD_KEY, "N"] },
-      { label: "Open command palette", keys: [MOD_KEY, "K"] },
-      { label: "Show keyboard shortcuts", keys: [MOD_KEY, "/"] },
-    ],
-  },
-  {
-    title: "In chats",
-    items: [
-      { label: "Recall previous prompt", keys: [UP] },
-      { label: "Recall next prompt", keys: [DOWN] },
-      { label: "Accept approval prompt", keys: [MOD_KEY, ENTER_KEY] },
-      { label: "Toggle voice dictation", keys: [MOD_KEY, ALT_KEY, "V"] },
-      { label: "Stop response", keys: ["Esc"] },
-    ],
-  },
-  {
-    title: "Navigation",
-    items: [
-      { label: "Previous session", keys: [MOD_KEY, UP] },
-      { label: "Next session", keys: [MOD_KEY, DOWN] },
-    ],
-  },
-  {
-    title: "View",
-    items: [
-      { label: "Toggle conversations sidebar", keys: [MOD_KEY, ALT_KEY, "["] },
-      { label: "Toggle workspace sidebar", keys: [MOD_KEY, ALT_KEY, "]"] },
-    ],
-  },
-  {
-    title: "Slash commands",
-    note: "while the suggestions menu is open",
-    items: [
-      { label: "Navigate suggestions", keys: [UP, DOWN] },
-      { label: "Apply highlighted command", keys: ["Tab"] },
-      { label: "Dismiss menu", keys: ["Esc"] },
-    ],
-  },
-];
-
-// Numeric pinned-session jump. The chord is platform-aware (see
-// actions/defaultKeybindings.ts): plain Cmd/Ctrl+digit in the native shell, but
-// Cmd/Ctrl+Alt+digit in a browser tab, where plain Cmd+digit is reserved for
-// native tab-switching. Shown in both, with the matching glyphs.
-function pinnedSessionShortcut(native: boolean): Shortcut {
-  return {
-    label: "Jump to pinned session (1–10)",
-    keys: native ? [MOD_KEY, "1…0"] : [MOD_KEY, ALT_KEY, "1…0"],
-  };
-}
-
-/** Shortcut groups for the current runtime and composer preference. */
-function shortcutGroupsFor(
-  native: boolean,
-  submitWithModEnter: boolean,
-  preventsKeyboardSubmit: boolean,
-): ShortcutGroup[] {
-  return SHORTCUT_GROUPS.map((group) => {
-    if (group.title === "In chats" && !preventsKeyboardSubmit) {
-      return {
-        ...group,
-        items: [
-          { label: "Send message", keys: composerSendShortcutKeys(submitWithModEnter) },
-          {
-            label: "New line in message",
-            keys: composerNewLineShortcutKeys(submitWithModEnter),
-          },
-          ...group.items,
-        ],
-      };
+function useCompactEffectiveBindings() {
+  const snapshot = useKeybindingSnapshot();
+  const native = isNativeShell();
+  const embedded = useIsEmbedded();
+  const isMac = isMacKeyboardPlatform();
+  return useMemo(() => {
+    const environment = keybindingEnvironmentExpression({
+      isMac,
+      isNativeShell: native,
+      isEmbedded: embedded,
+    });
+    const firstByAction = new Map<ActionId, KeybindingRule>();
+    const customizedActions = new Set<ActionId>();
+    for (const rule of snapshot.effectiveRules) {
+      if (isReservedEscapeSequence(rule.sequence) || !contextsMayOverlap(rule.when, environment))
+        continue;
+      if (!firstByAction.has(rule.action)) firstByAction.set(rule.action, rule);
+      if (rule.origin === "user") customizedActions.add(rule.action);
     }
-    if (group.title === "Navigation") {
-      return { ...group, items: [...group.items, pinnedSessionShortcut(native)] };
-    }
-    return group;
-  });
+    return ACTION_CATALOG.flatMap((definition) => {
+      const rule = firstByAction.get(definition.id);
+      if (!rule || (!definition.shortcutReference && !customizedActions.has(definition.id))) {
+        return [];
+      }
+      return [{ definition, rule }];
+    });
+  }, [embedded, isMac, native, snapshot.effectiveRules]);
 }
 
-/**
- * The shortcut reference, grouped, as plain inline content (no dialog
- * chrome). Shared by the {@link KeyboardShortcutsDialog} overlay and the
- * Settings page, which embeds it directly instead of behind a trigger.
- */
+/** Effective shortcut reference grouped by catalog category. */
 export function KeyboardShortcutsList() {
-  // Feature-based, stable per session; computed at render so tests can vary it.
-  const isMobileViewport = useIsMobileViewport();
-  const isCoarsePointer = useIsCoarsePointer();
-  const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
-  const groups = shortcutGroupsFor(
-    isNativeShell(),
-    readSubmitWithModEnter(),
-    preventsKeyboardSubmit,
-  );
+  const bindings = useCompactEffectiveBindings();
+  const groups = useMemo(() => {
+    const grouped = new Map<string, typeof bindings>();
+    for (const binding of bindings) {
+      grouped.set(binding.definition.category, [
+        ...(grouped.get(binding.definition.category) ?? []),
+        binding,
+      ]);
+    }
+    return [...grouped];
+  }, [bindings]);
   return (
     <>
-      {groups.map((group) => (
-        <section key={group.title} className="mb-4 last:mb-0">
-          <h3 className="mb-1 text-sm font-medium text-muted-foreground">
-            {group.title}
-            {group.note ? (
-              <span className="ml-1.5 font-normal text-muted-foreground/70">· {group.note}</span>
-            ) : null}
-          </h3>
+      {groups.map(([category, rows]) => (
+        <section key={category} className="mb-4 last:mb-0">
+          <h3 className="mb-1 text-sm font-medium text-muted-foreground">{category}</h3>
           <ul>
-            {group.items.map((item) => (
+            {rows.map(({ definition, rule }) => (
               <li
-                key={item.label}
+                key={definition.id}
+                data-action-id={definition.id}
                 className="flex items-center justify-between gap-4 border-b border-border/60 py-2.5 last:border-b-0"
               >
-                <span className="text-ui text-foreground">{item.label}</span>
-                <span className="flex shrink-0 items-center gap-1">
-                  {item.keys.map((key) => (
-                    <Kbd key={`${item.label}-${key}`}>{key}</Kbd>
-                  ))}
+                <span className="min-w-0 text-ui text-foreground">
+                  {definition.title}
+                  {rule.action === "session.action.openPinned" && (
+                    <span className="text-muted-foreground"> · Slots 1–10</span>
+                  )}
+                  {rule.mode !== "global" && (
+                    <span className="ml-1.5 text-xs text-muted-foreground">
+                      {KEYBINDING_MODE_LABELS[rule.mode]}
+                    </span>
+                  )}
                 </span>
+                <KeybindingSequence sequence={rule.sequence} />
               </li>
             ))}
           </ul>
@@ -195,7 +112,7 @@ export function KeyboardShortcutsDialog() {
   useRegisterAction("workbench.action.openKeyboardShortcuts", {
     acceptsKeybindings: true,
     run: ({ source }) => {
-      setOpen((prev) => (source === "keyboard" ? !prev : true));
+      setOpen((previous) => (source === "keyboard" ? !previous : true));
       return HANDLED;
     },
   });
@@ -212,7 +129,7 @@ export function KeyboardShortcutsDialog() {
         <DialogHeader>
           <DialogTitle>Keyboard shortcuts</DialogTitle>
           <DialogDescription className="sr-only">
-            The keyboard shortcuts available in the chat.
+            The active keyboard shortcuts available in the application.
           </DialogDescription>
         </DialogHeader>
         <div className="max-h-[70vh] overflow-y-auto pr-1">

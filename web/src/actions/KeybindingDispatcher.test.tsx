@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { EmbeddedProvider } from "@/lib/embedded";
-import { ActionScope, ActionsProvider } from "./ActionProvider";
+import { ActionScope, ActionsProvider, useSuspendKeybindingDispatch } from "./ActionProvider";
 import { KeybindingDispatcher } from "./KeybindingDispatcher";
 import { when } from "./context";
 import { parseKeybinding } from "./keybindingParser";
@@ -32,6 +32,16 @@ function Handler({
 }) {
   useRegisterAction(action, { run, acceptsKeybindings: true });
   return null;
+}
+
+function SuspensionToggle() {
+  const [suspended, setSuspended] = useState(false);
+  useSuspendKeybindingDispatch(suspended);
+  return (
+    <button type="button" onClick={() => setSuspended((value) => !value)}>
+      {suspended ? "Resume keys" : "Suspend keys"}
+    </button>
+  );
 }
 
 function renderActions(children: React.ReactNode, rules?: readonly KeybindingRule[]) {
@@ -105,6 +115,22 @@ describe("KeybindingDispatcher", () => {
     window.dispatchEvent(event);
     expect(run).not.toHaveBeenCalled();
     expect(event.defaultPrevented).toBe(false);
+  });
+
+  it("suspends keyboard dispatch without disabling action handlers", () => {
+    const run = vi.fn(() => HANDLED);
+    renderActions(
+      <>
+        <SuspensionToggle />
+        <Handler action="workbench.action.showCommands" run={run} />
+      </>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Suspend keys" }));
+    expect(fireEvent.keyDown(window, { key: "k", ctrlKey: true })).toBe(true);
+    expect(run).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Resume keys" }));
+    expect(fireEvent.keyDown(window, { key: "k", ctrlKey: true })).toBe(false);
+    expect(run).toHaveBeenCalledOnce();
   });
 
   it("dispatches a capture binding and consumes it only when handled", () => {
@@ -511,101 +537,5 @@ describe("KeybindingDispatcher", () => {
     expect(run).toHaveBeenCalledOnce();
     expect(event.defaultPrevented).toBe(false);
     expect(downstream).not.toHaveBeenCalled();
-  });
-
-  it("supports two-stroke chords and clears the pending prefix", () => {
-    const run = vi.fn(() => HANDLED);
-    const rules: readonly KeybindingRule[] = [
-      {
-        id: "test.chord",
-        action: "workbench.action.showCommands",
-        sequence: parseKeybinding("primary+k primary+s"),
-        mode: "global",
-      },
-    ];
-    renderActions(<Handler action="workbench.action.showCommands" run={run} />, rules);
-    const first = new KeyboardEvent("keydown", {
-      key: "k",
-      ctrlKey: true,
-      bubbles: true,
-      cancelable: true,
-    });
-    window.dispatchEvent(first);
-    expect(first.defaultPrevented).toBe(true);
-    expect(run).not.toHaveBeenCalled();
-    window.dispatchEvent(
-      new KeyboardEvent("keydown", {
-        key: "s",
-        ctrlKey: true,
-        bubbles: true,
-        cancelable: true,
-      }),
-    );
-    expect(run).toHaveBeenCalledOnce();
-  });
-
-  it("cancels a chord on an invalid continuation, Escape, or focus change", () => {
-    const run = vi.fn(() => HANDLED);
-    const rules: readonly KeybindingRule[] = [
-      {
-        id: "test.chord.cancel",
-        action: "workbench.action.showCommands",
-        sequence: parseKeybinding("primary+k primary+s"),
-        mode: "global",
-      },
-    ];
-    renderActions(<Handler action="workbench.action.showCommands" run={run} />, rules);
-    const key = (value: string, ctrlKey = false) =>
-      window.dispatchEvent(
-        new KeyboardEvent("keydown", {
-          key: value,
-          ctrlKey,
-          bubbles: true,
-          cancelable: true,
-        }),
-      );
-
-    key("k", true);
-    key("x");
-    key("s", true);
-    key("k", true);
-    key("Escape");
-    key("s", true);
-    key("k", true);
-    window.dispatchEvent(new FocusEvent("focusin"));
-    key("s", true);
-    expect(run).not.toHaveBeenCalled();
-  });
-
-  it("expires a pending chord", () => {
-    vi.useFakeTimers();
-    const run = vi.fn(() => HANDLED);
-    const rules: readonly KeybindingRule[] = [
-      {
-        id: "test.chord.timeout",
-        action: "workbench.action.showCommands",
-        sequence: parseKeybinding("primary+k primary+s"),
-        mode: "global",
-      },
-    ];
-    renderActions(<Handler action="workbench.action.showCommands" run={run} />, rules);
-    window.dispatchEvent(
-      new KeyboardEvent("keydown", {
-        key: "k",
-        ctrlKey: true,
-        bubbles: true,
-        cancelable: true,
-      }),
-    );
-    vi.advanceTimersByTime(1_501);
-    window.dispatchEvent(
-      new KeyboardEvent("keydown", {
-        key: "s",
-        ctrlKey: true,
-        bubbles: true,
-        cancelable: true,
-      }),
-    );
-    expect(run).not.toHaveBeenCalled();
   });
 });

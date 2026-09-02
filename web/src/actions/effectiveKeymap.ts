@@ -2,6 +2,7 @@ import { ACTIONS_BY_ID } from "./catalog";
 import { contextSpecificity, contextsMayOverlap } from "./context";
 import type { UserKeybindingRule } from "./keybindingPreferences";
 import { parseKeybinding, serializeKeybinding } from "./keybindingParser";
+import { isReservedEscapeSequence } from "./keybindingPolicy";
 import type { ActionArgsById, ActionId, JsonValue, KeybindingMode, KeybindingRule } from "./types";
 
 export interface KeybindingConflictRule {
@@ -11,12 +12,12 @@ export interface KeybindingConflictRule {
   origin: "default" | "user";
 }
 
-type KeybindingConflictReason = "chordPrefix" | "priority" | "specificity" | "user" | "later";
+type KeybindingConflictReason = "priority" | "specificity" | "user" | "later";
 
 interface KeybindingConflictBase {
-  /** The exact sequence or shared chord prefix that collides. */
+  /** The key combination that collides. */
   sequence: string;
-  kind: "exact" | "chordPrefix";
+  kind: "exact";
   first: KeybindingConflictRule;
   second: KeybindingConflictRule;
 }
@@ -44,8 +45,16 @@ export interface EffectiveKeymap {
   conflicts: readonly KeybindingConflict[];
 }
 
+const ACTIVE_KEYBINDING_MODES = new Set<KeybindingMode>([
+  "fileViewer",
+  "filesPanel",
+  "terminalsPanel",
+  "executionLogs",
+  "markdownToc",
+]);
+
 const NESTED_MODE_GROUPS: readonly ReadonlySet<KeybindingMode>[] = [
-  new Set(["filesPanel", "fileViewer", "codeEditor", "markdownEditor", "markdownToc"]),
+  new Set(["filesPanel", "fileViewer", "markdownToc"]),
   new Set(["terminalsPanel", "terminal"]),
 ];
 
@@ -152,7 +161,6 @@ function ruleArgs(rule: KeybindingRule): JsonValue | undefined {
 
 const ROUTING_FIELDS = [
   "activation",
-  "when",
   "phase",
   "priority",
   "allowRepeat",
@@ -200,6 +208,7 @@ function effectiveUserRule(
   } catch {
     return null;
   }
+  if (isReservedEscapeSequence(sequence)) return null;
   const candidateArgs = Object.hasOwn(user, "args")
     ? user.args
     : target
@@ -208,14 +217,12 @@ function effectiveUserRule(
   if (!validArgs(user.action, candidateArgs)) return null;
   const matchingTemplates = target
     ? [target]
-    : defaults.filter(
-        (rule) =>
-          rule.action === user.action &&
-          rule.mode === user.mode &&
-          jsonEqual(ruleArgs(rule), candidateArgs),
-      );
+    : defaults.filter((rule) => rule.action === user.action && rule.mode === user.mode);
+  const routingTemplate = target ?? sharedRoutingTemplate(matchingTemplates);
   return {
-    ...(target ?? sharedRoutingTemplate(matchingTemplates)),
+    ...(matchingTemplates.length === 0 && ACTIVE_KEYBINDING_MODES.has(user.mode)
+      ? { activation: "active" as const }
+      : routingTemplate),
     id: user.id,
     action: user.action,
     mode: user.mode,
@@ -234,21 +241,81 @@ function conflictRule(rule: KeybindingRule): KeybindingConflictRule {
   });
 }
 
+function modifierVariants(
+  modifiers: KeybindingRule["sequence"][number]["modifiers"],
+  isMac: boolean,
+): readonly string[] {
+  let variants: string[][] = [[]];
+  for (const modifier of modifiers) {
+    const concrete =
+      modifier === "primary"
+        ? ["ctrl", "meta"]
+        : modifier === "mod"
+          ? [isMac ? "meta" : "ctrl"]
+          : [modifier];
+    variants = variants.flatMap((variant) => concrete.map((value) => [...variant, value]));
+  }
+  return variants.map((variant) => [...new Set(variant)].sort().join("+"));
+}
+
+const CODE_TO_LOGICAL_KEY: Readonly<Record<string, string>> = {
+  BracketLeft: "[",
+  BracketRight: "]",
+  Equal: "=",
+  Minus: "-",
+  Slash: "/",
+  Backslash: "\\",
+  Semicolon: ";",
+  Quote: "'",
+  Comma: ",",
+  Period: ".",
+  Backquote: "`",
+  Space: " ",
+  Enter: "Enter",
+  Tab: "Tab",
+  Backspace: "Backspace",
+  Delete: "Delete",
+  ArrowUp: "ArrowUp",
+  ArrowDown: "ArrowDown",
+  ArrowLeft: "ArrowLeft",
+  ArrowRight: "ArrowRight",
+};
+
+export function logicalKeyForCode(code: string): string | undefined {
+  if (/^Key[A-Z]$/.test(code)) return code.slice(3).toLowerCase();
+  if (/^Digit[0-9]$/.test(code)) return code.slice(5);
+  return CODE_TO_LOGICAL_KEY[code];
+}
+
+function keysMayOverlap(
+  left: KeybindingRule["sequence"][number]["key"],
+  right: KeybindingRule["sequence"][number]["key"],
+): boolean {
+  if (left.kind === right.kind) return left.value === right.value;
+  const code = left.kind === "code" ? left.value : right.value;
+  const key = left.kind === "key" ? left.value : right.value;
+  return logicalKeyForCode(code) === key;
+}
+
+/** Conservative across platforms: a portable map may conflict after syncing to another OS. */
+function strokesMayOverlap(
+  left: KeybindingRule["sequence"][number],
+  right: KeybindingRule["sequence"][number],
+): boolean {
+  if (!keysMayOverlap(left.key, right.key)) return false;
+  return [false, true].some((isMac) => {
+    const leftVariants = new Set(modifierVariants(left.modifiers, isMac));
+    return modifierVariants(right.modifiers, isMac).some((variant) => leftVariants.has(variant));
+  });
+}
+
 function collision(
   left: KeybindingRule,
   right: KeybindingRule,
 ): Pick<KeybindingConflict, "sequence" | "kind"> | null {
-  if (left.sequence.length === 0 || right.sequence.length === 0) return null;
-  const leftSequence = serializeKeybinding(left.sequence);
-  const rightSequence = serializeKeybinding(right.sequence);
-  if (leftSequence === rightSequence) return { sequence: leftSequence, kind: "exact" };
-  const leftFirst = serializeKeybinding([left.sequence[0]!]);
-  const rightFirst = serializeKeybinding([right.sequence[0]!]);
-  if (leftFirst !== rightFirst) return null;
-  if (left.sequence.length === 1 || right.sequence.length === 1) {
-    return { sequence: leftFirst, kind: "chordPrefix" };
-  }
-  return null;
+  return strokesMayOverlap(left.sequence[0], right.sequence[0])
+    ? { sequence: serializeKeybinding(left.sequence), kind: "exact" }
+    : null;
 }
 
 function staticWinner(
@@ -256,12 +323,7 @@ function staticWinner(
   right: KeybindingRule,
   leftIndex: number,
   rightIndex: number,
-  kind: KeybindingConflict["kind"],
 ): { winner: KeybindingRule; loser: KeybindingRule; reason: KeybindingConflictReason } {
-  if (kind === "chordPrefix") {
-    const winner = left.sequence.length > 1 ? left : right;
-    return { winner, loser: winner === left ? right : left, reason: "chordPrefix" };
-  }
   const comparisons: readonly [number, KeybindingConflictReason][] = [
     [(left.priority ?? 0) - (right.priority ?? 0), "priority"],
     [contextSpecificity(left.when) - contextSpecificity(right.when), "specificity"],
@@ -304,7 +366,7 @@ export function analyzeKeybindingConflicts(
       if (left.mode !== right.mode && !activeTie) {
         conflicts.push(Object.freeze({ ...base, resolution: "focusResolved" }));
       } else {
-        const ranked = staticWinner(left, right, leftIndex, rightIndex, overlap.kind);
+        const ranked = staticWinner(left, right, leftIndex, rightIndex);
         conflicts.push(
           Object.freeze({
             ...base,

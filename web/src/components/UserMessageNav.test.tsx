@@ -4,7 +4,9 @@
 //   to catch a regression to aria-disabled, which wouldn't block clicks).
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setUserKeybindingRule } from "@/actions";
+import { resetKeybindingStoreForTesting } from "@/actions/KeybindingStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { UserMessageNav } from "./UserMessageNav";
 
@@ -25,7 +27,16 @@ function renderNav(props: Partial<React.ComponentProps<typeof UserMessageNav>>) 
   return merged;
 }
 
-afterEach(cleanup);
+beforeEach(() => {
+  localStorage.clear();
+  resetKeybindingStoreForTesting();
+});
+
+afterEach(() => {
+  cleanup();
+  localStorage.clear();
+  resetKeybindingStoreForTesting();
+});
 
 describe("UserMessageNav", () => {
   it("renders nothing when hidden", () => {
@@ -62,6 +73,20 @@ describe("UserMessageNav", () => {
     fireEvent.click(screen.getByLabelText("Next user message"));
     expect(props.goPrev).toHaveBeenCalledOnce();
     expect(props.goNext).toHaveBeenCalledOnce();
+  });
+
+  it("derives the live message-navigation hint without a rule-id dependency", async () => {
+    expect(
+      setUserKeybindingRule({
+        id: "chat.openPreviousMessage",
+        action: "chat.action.openPreviousMessage",
+        sequence: null,
+        mode: "global",
+      }),
+    ).toEqual({ ok: true, changed: true });
+    renderNav({});
+    fireEvent.focus(screen.getByLabelText("Previous user message"));
+    expect(await screen.findByText("Previous message (Ctrl+Alt+Shift+↑)")).toBeInTheDocument();
   });
 
   it("forwards className to the control container", () => {

@@ -50,7 +50,7 @@ describe("ActionRegistry", () => {
     registry.registerScope({
       id: "editor",
       parentId: "file",
-      mode: "codeEditor",
+      mode: "markdownToc",
       active: true,
       context: { monacoFocus: true },
     });

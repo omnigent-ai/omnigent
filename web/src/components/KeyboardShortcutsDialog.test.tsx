@@ -1,14 +1,15 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
-import { ActionsProvider, KeybindingDispatcher } from "@/actions";
-import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import {
-  KeyboardShortcutsDialog,
-  KeyboardShortcutsList,
-  openKeyboardShortcuts,
-} from "./KeyboardShortcutsDialog";
-
+  ActionsProvider,
+  KeybindingDispatcher,
+  getKeybindingSnapshot,
+  setUserKeybindingRule,
+  unbindDefaultKeybinding,
+} from "@/actions";
+import { resetKeybindingStoreForTesting } from "@/actions/KeybindingStore";
+import { EmbeddedProvider } from "@/lib/embedded";
+import { KeyboardShortcutsDialog, openKeyboardShortcuts } from "./KeyboardShortcutsDialog";
 // The pinned-session row shows in both shells; only its chord differs (Alt in
 // the browser). Default the mock to browser (false); flip per-test for native.
 const isNativeShell = vi.fn(() => false);
@@ -23,61 +24,28 @@ vi.mock("@/lib/nativeBridge", () => ({
 beforeEach(() => {
   isNativeShell.mockReturnValue(false);
   localStorage.clear();
+  resetKeybindingStoreForTesting();
 });
 afterEach(() => {
   cleanup();
   localStorage.clear();
-  vi.restoreAllMocks();
+  resetKeybindingStoreForTesting();
 });
 
-function renderDialog() {
-  return render(
+function renderDialog(embedded = false) {
+  const content = (
     <ActionsProvider>
       <KeybindingDispatcher />
       <KeyboardShortcutsDialog />
-    </ActionsProvider>,
+    </ActionsProvider>
   );
+  return render(embedded ? <EmbeddedProvider>{content}</EmbeddedProvider> : content);
 }
 
 // jsdom's navigator is non-mac, so the modifier glyph renders as "Ctrl".
 function toggleViaHotkey() {
   return fireEvent.keyDown(window, { key: "/", ctrlKey: true });
 }
-
-function keysFor(label: string): string[] {
-  const row = screen.getByText(label).closest("li");
-  expect(row).toBeTruthy();
-  return Array.from(row!.querySelectorAll('[data-slot="kbd"]')).map((key) => key.textContent ?? "");
-}
-
-describe("KeyboardShortcutsList composer rows", () => {
-  it("shows Enter to send and Shift+Enter for a new line by default", () => {
-    render(<KeyboardShortcutsList />);
-
-    expect(keysFor("Send message")).toEqual(["↵"]);
-    expect(keysFor("New line in message")).toEqual(["⇧", "↵"]);
-  });
-
-  it("shows Ctrl+Enter to send and Enter for a new line in alternate mode", () => {
-    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
-    render(<KeyboardShortcutsList />);
-
-    expect(keysFor("Send message")).toEqual(["Ctrl", "↵"]);
-    expect(keysFor("New line in message")).toEqual(["↵"]);
-  });
-
-  it("does not advertise inactive composer chords on touch-primary devices", () => {
-    const matchMedia = window.matchMedia;
-    vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
-      ...matchMedia(query),
-      matches: query.includes("pointer: coarse"),
-    }));
-    render(<KeyboardShortcutsList />);
-
-    expect(screen.queryByText("Send message")).toBeNull();
-    expect(screen.queryByText("New line in message")).toBeNull();
-  });
-});
 
 describe("KeyboardShortcutsDialog", () => {
   it("renders nothing until opened", () => {
@@ -91,14 +59,14 @@ describe("KeyboardShortcutsDialog", () => {
 
     expect(screen.getByText("Keyboard shortcuts")).toBeTruthy();
     // General / In chats / Navigation / View / Slash commands — one each.
-    expect(screen.getByText("Start a new session")).toBeTruthy();
+    expect(screen.getByText("New chat")).toBeTruthy();
     expect(screen.getByText("Open command palette")).toBeTruthy();
-    expect(screen.getByText("Show keyboard shortcuts")).toBeTruthy();
+    expect(screen.getByText("Open keyboard shortcuts")).toBeTruthy();
     expect(screen.getByText("Send message")).toBeTruthy();
     expect(screen.getByText("Recall previous prompt")).toBeTruthy();
-    expect(screen.getByText("Previous session")).toBeTruthy();
+    expect(screen.getByText("Open previous session")).toBeTruthy();
     expect(screen.getByText("Toggle conversations sidebar")).toBeTruthy();
-    expect(screen.getByText("Navigate suggestions")).toBeTruthy();
+    expect(screen.getByText("Select previous suggestion")).toBeTruthy();
   });
 
   it("toggles closed on a second hotkey press", async () => {
@@ -117,23 +85,83 @@ describe("KeyboardShortcutsDialog", () => {
     expect(await screen.findByText("Send message")).toBeTruthy();
   });
 
-  it("shows the pinned-session shortcut with the Alt chord in a plain browser", () => {
+  it("shows the active pinned-session chord for the current shell", () => {
     renderDialog();
     toggleViaHotkey();
-    const row = screen.getByText("Jump to pinned session (1–10)").closest("li");
-    expect(row).toBeTruthy();
-    // Browser chord adds Alt (jsdom navigator is non-mac → "Alt") + the 1…0 chip.
-    expect(within(row!).getByText("Alt")).toBeTruthy();
-    expect(within(row!).getByText("1…0")).toBeTruthy();
-  });
+    let row = screen.getByText(/Open pinned session/).closest("li");
+    expect(within(row!).getByText("Ctrl+Alt+1")).toBeTruthy();
 
-  it("shows the pinned-session shortcut without Alt in the Electron shell", () => {
+    cleanup();
     isNativeShell.mockReturnValue(true);
     renderDialog();
     toggleViaHotkey();
-    const row = screen.getByText("Jump to pinned session (1–10)").closest("li");
-    expect(row).toBeTruthy();
-    expect(within(row!).queryByText("Alt")).toBeNull();
-    expect(within(row!).getByText("1…0")).toBeTruthy();
+    row = screen.getByText(/Open pinned session/).closest("li");
+    expect(within(row!).getByText("Ctrl+1")).toBeTruthy();
+    expect(screen.getAllByRole("listitem")).toHaveLength(16);
+    expect(screen.queryByText("Stop response")).toBeNull();
+  });
+
+  it("includes a newly customized action outside the default compact set", () => {
+    expect(
+      setUserKeybindingRule({
+        id: "user.navigateInbox",
+        action: "workbench.action.navigateInbox",
+        sequence: "ctrl+i",
+        mode: "global",
+      }),
+    ).toEqual({ ok: true, changed: true });
+    renderDialog();
+    toggleViaHotkey();
+    expect(screen.getByText("Go to Inbox")).toBeInTheDocument();
+  });
+
+  it("includes a user alternate even when the action also has an intact default", () => {
+    expect(
+      setUserKeybindingRule({
+        id: "user.file.save",
+        action: "file.action.save",
+        sequence: "ctrl+alt+s",
+        mode: "fileViewer",
+      }),
+    ).toEqual({ ok: true, changed: true });
+    renderDialog();
+    toggleViaHotkey();
+    const row = screen.getByText("Save file").closest("li")!;
+    expect(within(row).getByText("Ctrl+S")).toBeInTheDocument();
+    expect(within(row).queryByText("Ctrl+Alt+S")).toBeNull();
+  });
+
+  it("does not advertise standalone-only shortcuts when embedded", () => {
+    renderDialog(true);
+    toggleViaHotkey();
+    expect(screen.queryByText("New chat")).toBeNull();
+    expect(screen.getByText("Open command palette")).toBeInTheDocument();
+  });
+
+  it("updates and removes compact hints live from the effective keymap", () => {
+    renderDialog();
+    toggleViaHotkey();
+    const paletteRow = screen.getByText("Open command palette").closest("li")!;
+    expect(within(paletteRow).getByText("Ctrl+K")).toBeTruthy();
+
+    act(() => {
+      expect(
+        setUserKeybindingRule({
+          id: "workbench.showCommands",
+          action: "workbench.action.showCommands",
+          sequence: "ctrl+shift+k",
+          mode: "global",
+        }),
+      ).toEqual({ ok: true, changed: true });
+    });
+    expect(within(paletteRow).getByText("Ctrl+Shift+K")).toBeTruthy();
+
+    const defaultRule = getKeybindingSnapshot().defaultRules.find(
+      (rule) => rule.id === "workbench.showCommands",
+    )!;
+    act(() => {
+      expect(unbindDefaultKeybinding(defaultRule)).toEqual({ ok: true, changed: true });
+    });
+    expect(screen.queryByText("Open command palette")).toBeNull();
   });
 });

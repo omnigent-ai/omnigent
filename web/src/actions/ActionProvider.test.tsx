@@ -216,7 +216,7 @@ describe("ActionsProvider", () => {
       <ActionsProvider>
         <ActionScope mode="fileViewer" context={{ fileSearchOpen: true }}>
           <div>
-            <ActionScope mode="codeEditor" context={{ monacoFocus: true }}>
+            <ActionScope mode="markdownToc" context={{ monacoFocus: true }}>
               <div>
                 <ScopedProbe />
               </div>

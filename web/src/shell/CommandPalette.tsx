@@ -31,8 +31,20 @@ import {
   XIcon,
 } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
-import { usePaletteActions, type ActionIconName, type AvailablePaletteAction } from "@/actions";
+import {
+  contextsMayOverlap,
+  formatKeybinding,
+  formatKeybindingForAria,
+  isMacKeyboardPlatform,
+  keybindingEnvironmentExpression,
+  useKeybindingSnapshot,
+  usePaletteActions,
+  type ActionIconName,
+  type AvailablePaletteAction,
+} from "@/actions";
 import { useConversations } from "@/hooks/useConversations";
+import { useIsEmbedded } from "@/lib/embedded";
+import { isNativeShell } from "@/lib/nativeBridge";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -44,6 +56,7 @@ import {
   CommandInput,
   CommandItem,
   CommandList,
+  CommandShortcut,
 } from "@/components/ui/command";
 import { conversationDisplayLabel, getConversationAgentType } from "./sidebarNav";
 
@@ -101,7 +114,9 @@ const IDLE_SESSION_LIMIT = 5;
 export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
   const navigate = useNavigate();
   const { actions, executeAction } = usePaletteActions(open);
+  const keymap = useKeybindingSnapshot();
   const isMobile = useIsMobileViewport();
+  const embedded = useIsEmbedded();
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
 
@@ -119,6 +134,29 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
   }, [query]);
 
   const close = (): void => onOpenChange(false);
+
+  const shortcutByAction = useMemo(() => {
+    const shortcuts = new Map<string, { display: string; aria: string }>();
+    const environment = keybindingEnvironmentExpression({
+      isMac: isMacKeyboardPlatform(),
+      isNativeShell: isNativeShell(),
+      isEmbedded: embedded,
+    });
+    for (const rule of keymap.effectiveRules) {
+      if (
+        rule.mode !== "global" ||
+        shortcuts.has(rule.action) ||
+        !contextsMayOverlap(rule.when, environment)
+      )
+        continue;
+      const isMac = isMacKeyboardPlatform();
+      shortcuts.set(rule.action, {
+        display: formatKeybinding(rule.sequence, { isMac }),
+        aria: formatKeybindingForAria(rule.sequence, { isMac }),
+      });
+    }
+    return shortcuts;
+  }, [embedded, keymap.effectiveRules]);
 
   const filteredActions = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -281,7 +319,16 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
                       onSelect={() => runAction(a)}
                     >
                       <Icon />
-                      <span className="flex-1 truncate text-left">{a.title}</span>
+                      <span data-action-title={a.id} className="flex-1 truncate text-left">
+                        {a.title}
+                      </span>
+                      {shortcutByAction.has(a.id) && (
+                        <CommandShortcut
+                          aria-label={`Shortcut ${shortcutByAction.get(a.id)!.aria}`}
+                        >
+                          {shortcutByAction.get(a.id)!.display}
+                        </CommandShortcut>
+                      )}
                     </CommandItem>
                   );
                 })}

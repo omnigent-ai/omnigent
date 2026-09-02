@@ -235,6 +235,24 @@ describe("KeybindingStore", () => {
     ]);
   });
 
+  it("rejects interactive Escape overrides while preserving inert imported rows", () => {
+    expect(
+      setUserKeybindingRule({
+        id: "session.new",
+        action: "session.action.new",
+        sequence: "escape",
+        mode: "global",
+      }),
+    ).toEqual({ ok: false, reason: "unusableRule" });
+    expect(
+      replaceAllUserKeybindings([
+        { id: "future", action: "future.action.run", sequence: "escape", mode: "global" },
+      ]),
+    ).toEqual({ ok: true, changed: true });
+    expect(getKeybindingSnapshot().userRules[0]?.id).toBe("future");
+    expect(getKeybindingSnapshot().effectiveRules.some((rule) => rule.id === "future")).toBe(false);
+  });
+
   it("diagnoses the cap when dormant rows fill storage", () => {
     localStorage.setItem(
       KEYBINDINGS_STORAGE_KEY,

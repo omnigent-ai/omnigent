@@ -5,7 +5,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
   MemoryRouter,
   Route,
@@ -20,7 +20,13 @@ import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
-import { ActionsProvider, KeybindingDispatcher, useActions } from "@/actions";
+import {
+  ActionsProvider,
+  KeybindingDispatcher,
+  setUserKeybindingRule,
+  useActions,
+} from "@/actions";
+import { resetKeybindingStoreForTesting } from "@/actions/KeybindingStore";
 
 const runnerHealthState = vi.hoisted(() => ({
   runnerOnline: undefined as boolean | undefined,
@@ -552,6 +558,8 @@ function withWindowOrigin(origin: string, run: () => void) {
 }
 
 beforeEach(() => {
+  localStorage.clear();
+  resetKeybindingStoreForTesting();
   runnerHealthState.runnerOnline = undefined;
   useConvMock.mockReset();
   useTerminalsMock.mockReset();
@@ -607,7 +615,11 @@ beforeEach(() => {
   });
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  localStorage.clear();
+  resetKeybindingStoreForTesting();
+});
 
 describe("AppShell header", () => {
   it("accepts the most recent plain approval through the centralized capture action", () => {
@@ -715,6 +727,23 @@ describe("AppShell header", () => {
     renderShell("/");
     fireEvent.click(screen.getByTestId(testId));
     expect(screen.getByText(destination)).toBeInTheDocument();
+  });
+
+  it("runs a customized shortcut for a palette navigation action", () => {
+    mockConversations([]);
+    renderShell("/");
+    act(() => {
+      expect(
+        setUserKeybindingRule({
+          id: "user.navigateInbox",
+          action: "workbench.action.navigateInbox",
+          sequence: "ctrl+i",
+          mode: "global",
+        }),
+      ).toEqual({ ok: true, changed: true });
+    });
+    fireEvent.keyDown(window, { key: "i", ctrlKey: true });
+    expect(screen.getByText("inbox route")).toBeInTheDocument();
   });
 
   it("registers the new-session API action", () => {

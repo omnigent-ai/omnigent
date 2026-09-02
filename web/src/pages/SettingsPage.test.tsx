@@ -171,6 +171,7 @@ vi.mock("@/pages/PoliciesPage", () => ({
   PoliciesPage: () => <div>policies-page-stub</div>,
 }));
 
+import { resetKeybindingStoreForTesting } from "@/actions/KeybindingStore";
 import { SettingsPage } from "./SettingsPage";
 
 function conv(id: string, partial: Partial<Conversation> = {}): Conversation {
@@ -203,6 +204,8 @@ function renderPage(path = "/settings") {
 }
 
 beforeEach(() => {
+  localStorage.clear();
+  resetKeybindingStoreForTesting();
   mocks.setTheme.mockReset();
   mocks.archiveMutate.mockReset();
   mocks.deleteMutate.mockReset();
@@ -224,6 +227,7 @@ afterEach(() => {
   // Reset the font-size preference + applied desktop size so the Appearance
   // tests don't leak state into each other.
   localStorage.clear();
+  resetKeybindingStoreForTesting();
   document.documentElement.style.removeProperty("--desktop-ui-font-size");
   // The palette picker sets data-theme on <html>; clear it so a palette
   // selected in one test doesn't leak into the next.
@@ -292,6 +296,17 @@ describe("SettingsPage", () => {
     ).toBeInTheDocument();
     expect(toggle).toHaveAttribute("aria-labelledby");
     expect(toggle).toHaveAccessibleName(/Submit with (?:⌘|Ctrl) \+ Enter on desktop/);
+  });
+
+  it("renders the interactive keyboard shortcut editor", () => {
+    renderPage("/settings/shortcuts");
+    expect(screen.getByRole("heading", { name: "Keyboard shortcuts" })).toBeInTheDocument();
+    expect(screen.getByTestId("keybinding-editor")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Search keyboard shortcuts" })).toBeInTheDocument();
+    expect(screen.getByText("session.action.new")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Rebind session.action.new mod+n" }),
+    ).toBeInTheDocument();
   });
 
   it("renders the Appearance section and applies a theme on card click", () => {

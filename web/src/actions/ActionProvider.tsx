@@ -18,6 +18,7 @@ import { useIsEmbedded } from "@/lib/embedded";
 import { isElectronShell, isNativeShell } from "@/lib/nativeBridge";
 import { ActionRegistry, type ActionResolution, type AvailableAction } from "./actionRegistry";
 import { EMPTY_ACTION_CONTEXT } from "./context";
+import { isMacKeyboardPlatform } from "./keybindingEnvironment";
 import type {
   ActionId,
   ActionInvocation,
@@ -32,13 +33,6 @@ import type {
 import { NOT_HANDLED } from "./types";
 
 const ACTION_SCOPE_ATTRIBUTE = "data-action-scope";
-
-function isMacPlatform(): boolean {
-  if (typeof navigator === "undefined") return false;
-  const withData = navigator as Navigator & { userAgentData?: { platform?: string } };
-  const platform = withData.userAgentData?.platform ?? navigator.platform ?? navigator.userAgent;
-  return /Mac|iPhone|iPad|iPod/i.test(platform);
-}
 
 function eventElement(event?: KeyboardEvent): Element | null {
   if (event) {
@@ -84,8 +78,34 @@ export interface ActionsApi {
   executeAction: (action: ArglessActionId, source: ActionSource) => ActionResult;
 }
 
+class KeybindingDispatchSuspension {
+  private count = 0;
+  private listeners = new Set<() => void>();
+
+  readonly getSnapshot = (): boolean => this.count > 0;
+  readonly subscribe = (listener: () => void): (() => void) => {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  };
+  acquire(): () => void {
+    this.count += 1;
+    this.emit();
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.count = Math.max(0, this.count - 1);
+      this.emit();
+    };
+  }
+  private emit(): void {
+    this.listeners.forEach((listener) => listener());
+  }
+}
+
 interface ActionsRuntime extends ActionsApi {
   registry: ActionRegistry;
+  dispatchSuspension: KeybindingDispatchSuspension;
   getResolution: (event?: KeyboardEvent) => ActionResolution;
 }
 
@@ -98,10 +118,15 @@ export function ActionsProvider({ children }: { children: ReactNode }) {
   const registryRef = useRef<ActionRegistry | null>(null);
   if (!registryRef.current) registryRef.current = new ActionRegistry();
   const registry = registryRef.current;
+  const dispatchSuspensionRef = useRef<KeybindingDispatchSuspension | null>(null);
+  if (!dispatchSuspensionRef.current) {
+    dispatchSuspensionRef.current = new KeybindingDispatchSuspension();
+  }
+  const dispatchSuspension = dispatchSuspensionRef.current;
   const environment = useMemo<ContextSnapshot>(
     () => ({
       ...EMPTY_ACTION_CONTEXT,
-      isMac: isMacPlatform(),
+      isMac: isMacKeyboardPlatform(),
       isNativeShell: isNativeShell(),
       isElectron: isElectronShell(),
       isEmbedded: embedded,
@@ -120,12 +145,13 @@ export function ActionsProvider({ children }: { children: ReactNode }) {
     };
     return {
       registry,
+      dispatchSuspension,
       getResolution,
       execute: (invocation) => registry.execute(invocation, getResolution(invocation.event)),
       executeAction: (action, source) =>
         registry.execute({ action, source } as ActionInvocation, getResolution()),
     };
-  }, [environment, registry]);
+  }, [dispatchSuspension, environment, registry]);
 
   useEffect(() => {
     const invalidate = () => registry.invalidate();
@@ -145,6 +171,7 @@ export function ActionsProvider({ children }: { children: ReactNode }) {
 const INERT_REGISTRY = new ActionRegistry(true);
 const INERT_ACTIONS: ActionsRuntime = {
   registry: INERT_REGISTRY,
+  dispatchSuspension: new KeybindingDispatchSuspension(),
   getResolution: () => ({ context: EMPTY_ACTION_CONTEXT, focusedScopeIds: [] }),
   execute: () => NOT_HANDLED,
   executeAction: () => NOT_HANDLED,
@@ -152,6 +179,23 @@ const INERT_ACTIONS: ActionsRuntime = {
 
 function useActionRuntime(): ActionsRuntime {
   return useContext(ActionsContext) ?? INERT_ACTIONS;
+}
+
+export function useSuspendKeybindingDispatch(active: boolean): void {
+  const { dispatchSuspension } = useActionRuntime();
+  useLayoutEffect(() => {
+    if (!active) return;
+    return dispatchSuspension.acquire();
+  }, [active, dispatchSuspension]);
+}
+
+export function useKeybindingDispatchSuspended(): boolean {
+  const { dispatchSuspension } = useActionRuntime();
+  return useSyncExternalStore(
+    dispatchSuspension.subscribe,
+    dispatchSuspension.getSnapshot,
+    dispatchSuspension.getSnapshot,
+  );
 }
 
 export function useActions(): ActionsApi {

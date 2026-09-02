@@ -5,7 +5,14 @@
 // editor.storage.markdown.getMarkdown() for copy / save.
 
 import { useCallback, useRef, useState } from "react";
-import { HANDLED, useRegisterAction } from "@/actions";
+import {
+  HANDLED,
+  formatKeybinding,
+  isMacKeyboardPlatform,
+  parseKeybinding,
+  useRegisterAction,
+} from "@/actions";
+import { useFormattedActionKeybinding } from "@/hooks/useFormattedActionKeybinding";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useEditorState } from "@tiptap/react";
 import {
@@ -246,6 +253,9 @@ export function ToolbarPlugin({
   // picking Keep mine / Load latest.
   hasExternalUpdate: boolean;
 }) {
+  const saveKey = useFormattedActionKeybinding("file.action.save", { mode: "fileViewer" });
+  const keyLabel = (binding: string) =>
+    formatKeybinding(parseKeybinding(binding), { isMac: isMacKeyboardPlatform() });
   // Re-render only when the values that drive the toolbar UI actually change.
   const editorState = useEditorState({
     editor,
@@ -339,7 +349,7 @@ export function ToolbarPlugin({
         : isDirty
           ? {
               label: "Unsaved",
-              title: "Unsaved changes — ⌘S to save now",
+              title: `Unsaved changes${saveKey ? ` — ${saveKey} to save now` : ""}`,
               tone: "pending" as const,
             }
           : { label: "Saved", title: "All changes saved", tone: "saved" as const };
@@ -350,14 +360,14 @@ export function ToolbarPlugin({
   return (
     <div className="flex flex-wrap items-center gap-0.5 border-b border-border bg-card px-2 py-1 shrink-0">
       <ToolbarBtn
-        title="Undo (⌘Z)"
+        title={`Undo (${keyLabel("mod+z")})`}
         onClick={() => editor?.chain().focus().undo().run()}
         className={!canUndo ? "opacity-30 cursor-default" : ""}
       >
         <Undo2 className="size-3.5" />
       </ToolbarBtn>
       <ToolbarBtn
-        title="Redo (⌘⇧Z)"
+        title={`Redo (${keyLabel("mod+shift+z")})`}
         onClick={() => editor?.chain().focus().redo().run()}
         className={!canRedo ? "opacity-30 cursor-default" : ""}
       >
@@ -402,14 +412,14 @@ export function ToolbarPlugin({
       <Divider />
       <ToolbarBtn
         active={isBold}
-        title="Bold (⌘B)"
+        title={`Bold (${keyLabel("mod+b")})`}
         onClick={() => editor?.chain().focus().toggleBold().run()}
       >
         <Bold className="size-3.5" />
       </ToolbarBtn>
       <ToolbarBtn
         active={isItalic}
-        title="Italic (⌘I)"
+        title={`Italic (${keyLabel("mod+i")})`}
         onClick={() => editor?.chain().focus().toggleItalic().run()}
       >
         <Italic className="size-3.5" />

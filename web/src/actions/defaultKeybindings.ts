@@ -62,7 +62,7 @@ const fileCommandFocusAllowed = or(
   when(CONTEXT_KEYS.markdownEditorFocus),
 );
 
-// Native shells own plain primary+digit. Browser tabs reserve that chord, so
+// Native shells own plain primary+digit. Browser tabs reserve that shortcut, so
 // web adds Alt and matches physical DigitN (Alt rewrites e.key on macOS).
 // Legacy pinned handlers also ran after preventDefault, so these rules opt out
 // of the dispatcher's normal focused-widget handoff.

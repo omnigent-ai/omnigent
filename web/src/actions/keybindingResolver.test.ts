@@ -70,7 +70,7 @@ describe("keybinding resolver", () => {
     expect(
       ruleModeMatches(
         focused,
-        new Set(["global", "codeEditor", "fileViewer"]),
+        new Set(["global", "markdownToc", "fileViewer"]),
         new Set(["global", "fileViewer"]),
       ),
     ).toBe(true);
