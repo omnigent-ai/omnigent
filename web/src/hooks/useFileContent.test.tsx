@@ -200,18 +200,21 @@ describe("triggerBrowserDownload", () => {
 // downloadWorkspaceFile
 // ---------------------------------------------------------------------------
 
+function blobResponse(blob: Blob): Response {
+  return {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    blob: async () => blob,
+  } as unknown as Response;
+}
+
 describe("downloadWorkspaceFile", () => {
-  it("fetches the correct URL and triggers a download with the filename from the path", async () => {
-    fetchMock.mockResolvedValueOnce(
-      jsonResponse({
-        object: "session.environment.filesystem.file_content",
-        path: "src/main.py",
-        content_type: "text/x-python",
-        encoding: "utf-8",
-        content: "print('hi')",
-        bytes: 11,
-      }),
-    );
+  it("fetches the raw file with download=true and downloads it under the path's filename", async () => {
+    // The raw-download response is the file itself, not the JSON envelope, so
+    // the bytes reach the browser untouched however large the file is.
+    const file = new Blob(["print('hi')"], { type: "text/x-python" });
+    fetchMock.mockResolvedValueOnce(blobResponse(file));
     const clickedLinks: string[] = [];
     const origCreateElement = document.createElement.bind(document);
     vi.spyOn(document, "createElement").mockImplementation((tag: string) => {
@@ -222,17 +225,19 @@ describe("downloadWorkspaceFile", () => {
         });
       return el;
     });
-    vi.stubGlobal("URL", { createObjectURL: vi.fn(() => "blob:x"), revokeObjectURL: vi.fn() });
+    const createObjectURL = vi.fn(() => "blob:x");
+    vi.stubGlobal("URL", { createObjectURL, revokeObjectURL: vi.fn() });
 
     await downloadWorkspaceFile("sess_123", "src/main.py");
 
-    // fetchFileContent goes through authenticatedFetch, which adds auth headers
+    // The request goes through authenticatedFetch, which adds auth headers
     // and `cache: "no-store"` (see lib/identity.ts) — assert the URL plus that
     // cache-bypass init rather than a bare single-arg call.
     expect(fetchMock).toHaveBeenCalledWith(
-      "/v1/sessions/sess_123/resources/environments/default/filesystem/src/main.py",
+      "/v1/sessions/sess_123/resources/environments/default/filesystem/src/main.py?download=true",
       expect.objectContaining({ cache: "no-store" }),
     );
+    expect(createObjectURL).toHaveBeenCalledWith(file);
     // The download filename is derived from the last path segment.
     expect(clickedLinks).toEqual(["main.py"]);
 
@@ -240,19 +245,8 @@ describe("downloadWorkspaceFile", () => {
     vi.unstubAllGlobals();
   });
 
-  it("logs a console warning when the server returns truncated: true", async () => {
-    fetchMock.mockResolvedValueOnce(
-      jsonResponse({
-        object: "session.environment.filesystem.file_content",
-        path: "big.txt",
-        content_type: "text/plain",
-        encoding: "utf-8",
-        content: "partial content",
-        bytes: 15,
-        truncated: true,
-      }),
-    );
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+  it("names the host base for an absolute path alongside download=true", async () => {
+    fetchMock.mockResolvedValueOnce(blobResponse(new Blob(["x"])));
     const origCreateElement = document.createElement.bind(document);
     vi.spyOn(document, "createElement").mockImplementation((tag: string) => {
       const el = origCreateElement(tag);
@@ -261,10 +255,12 @@ describe("downloadWorkspaceFile", () => {
     });
     vi.stubGlobal("URL", { createObjectURL: vi.fn(() => "blob:x"), revokeObjectURL: vi.fn() });
 
-    await downloadWorkspaceFile("sess_abc", "big.txt");
+    await downloadWorkspaceFile("sess_abc", "/Users/me/reports/q3.pdf");
 
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("big.txt"));
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("truncated"));
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/sessions/sess_abc/resources/environments/default/filesystem/Users/me/reports/q3.pdf?download=true&base=host",
+      expect.objectContaining({ cache: "no-store" }),
+    );
 
     vi.restoreAllMocks();
     vi.unstubAllGlobals();

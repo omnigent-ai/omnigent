@@ -41,7 +41,7 @@ import click
 import httpcore
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.debug_logging import runner_primary_session_id
@@ -9465,8 +9465,11 @@ def create_runner_app(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
-    ) -> JSONResponse:
+        download: bool = False,
+    ) -> Response:
         await _require_os_env(session_id)
+        if download:
+            return await _fs_download(session_id, environment_id, relative_path)
         return await _fs_list_or_read(
             session_id,
             environment_id,
@@ -10040,6 +10043,45 @@ def create_runner_app(
         return JSONResponse(
             status_code=200,
             content={"meta_text": format_skill_meta_text(skill, arguments)},
+        )
+
+    async def _fs_download(
+        session_id: str,
+        environment_id: str,
+        path: str,
+    ) -> FileResponse:
+        """Serve a file's complete bytes as an attachment.
+
+        The read path inlines content in a JSON envelope, so it caps at
+        ``_MAX_READ_BYTES``. A download streams straight from disk and
+        needs no cap. Authorization is the same ``_resolve`` gate the read
+        path applies before reading.
+
+        :param session_id: Session identifier.
+        :param environment_id: Environment resource id.
+        :param path: Path within the environment, or an absolute path.
+        :returns: The file streamed with ``Content-Disposition: attachment``.
+        :raises InvalidPath: If the path names a directory.
+        :raises FilesystemPathNotFound: If nothing exists at the path.
+        """
+        from omnigent.entities.environment_filesystem import (
+            FilesystemPathNotFound,
+            InvalidPath,
+        )
+        from omnigent.runner.environment_filesystem import CallerProcessFilesystem
+
+        await _ensure_session_registered(session_id)
+        agent_spec = await _resolve_session_agent_spec(session_id)
+        env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
+        resolved = CallerProcessFilesystem(env)._resolve(path)
+        if resolved.is_dir():
+            raise InvalidPath(f"Path {path!r} is a directory")
+        if not resolved.is_file():
+            raise FilesystemPathNotFound(f"Path {path!r} not found")
+        return FileResponse(
+            resolved,
+            filename=resolved.name,
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
         )
 
     async def _fs_list_or_read(

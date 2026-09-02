@@ -6,12 +6,13 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import AsyncIterator, Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
 from omnigent.errors import ErrorCode, OmnigentError
@@ -3012,6 +3013,131 @@ async def test_filesystem_read_proxies_to_runner(
     )
     assert resp.status_code == 200
     assert resp.json()["content"] == "hello world"
+
+
+@contextlib.asynccontextmanager
+async def _runner_app_client(runner: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    """Route session resources to a stub runner app over a real httpx client.
+
+    The download proxy streams through ``build_request``/``send`` rather
+    than the canned ``get`` the fake client answers, so it needs a client
+    with real transport semantics.
+
+    :param runner: Stub runner app serving the filesystem route.
+    :returns: The client bound to the stub, installed as the runner router.
+    """
+    transport = httpx.ASGITransport(app=runner)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as runner_http:
+        set_runner_router(_FakeRunnerRouter(runner_http))  # type: ignore[arg-type]
+        yield runner_http
+
+
+_FS_ROUTE = (
+    "/v1/sessions/{session_id}/resources/environments/{environment_id}"
+    "/filesystem/{relative_path:path}"
+)
+_DOWNLOAD_URL = (
+    "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+    "/filesystem/data/big.bin?download=true"
+)
+
+
+@pytest.mark.asyncio
+async def test_filesystem_download_streams_runner_attachment(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """``?download=true`` forwards the runner's attachment and headers verbatim."""
+    payload = bytes(range(256)) * 64
+    (tmp_path / "big.bin").write_bytes(payload)
+    runner = FastAPI()
+    seen: list[tuple[str, bool]] = []
+
+    @runner.get(_FS_ROUTE)
+    async def _serve(
+        session_id: str,
+        environment_id: str,
+        relative_path: str,
+        download: bool = False,
+    ) -> FileResponse:
+        del session_id, environment_id
+        seen.append((relative_path, download))
+        return FileResponse(
+            tmp_path / "big.bin",
+            filename="big.bin",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async with _runner_app_client(runner):
+        resp = await client.get(_DOWNLOAD_URL)
+
+    assert resp.status_code == 200
+    assert resp.content == payload
+    assert resp.headers["content-disposition"] == 'attachment; filename="big.bin"'
+    assert resp.headers["content-length"] == str(len(payload))
+    assert resp.headers["cache-control"] == "no-store"
+    assert seen == [("data/big.bin", True)]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_download_rejects_runner_without_download_support(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner that ignores ``download`` answers the capped JSON envelope.
+
+    Serving that would truncate silently, so the proxy fails loudly instead.
+    """
+    runner = FastAPI()
+
+    @runner.get(_FS_ROUTE)
+    async def _serve(session_id: str, environment_id: str, relative_path: str) -> JSONResponse:
+        del session_id, environment_id, relative_path
+        return JSONResponse(
+            {
+                "object": "session.environment.filesystem.file_content",
+                "content": "partial",
+                "truncated": True,
+            }
+        )
+
+    async with _runner_app_client(runner):
+        resp = await client.get(_DOWNLOAD_URL)
+
+    assert resp.status_code == 503
+    assert resp.json()["error"]["code"] == "runner_unavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("runner_status", "runner_code", "expected_code"),
+    [
+        (404, "path_not_found", "not_found"),
+        (400, "invalid_path", "invalid_path"),
+        (403, "path_unreachable", "path_unreachable"),
+    ],
+)
+async def test_filesystem_download_forwards_runner_errors(
+    client: httpx.AsyncClient,
+    runner_status: int,
+    runner_code: str,
+    expected_code: str,
+) -> None:
+    """A missing, directory, or out-of-grant path keeps the runner's status."""
+    runner = FastAPI()
+
+    @runner.get(_FS_ROUTE)
+    async def _serve(session_id: str, environment_id: str, relative_path: str) -> JSONResponse:
+        del session_id, environment_id, relative_path
+        return JSONResponse(
+            status_code=runner_status,
+            content={"error": {"code": runner_code, "message": "nope"}},
+        )
+
+    async with _runner_app_client(runner):
+        resp = await client.get(_DOWNLOAD_URL)
+
+    assert resp.status_code == runner_status
+    assert resp.json()["error"] == {"code": expected_code, "message": "nope"}
 
 
 @pytest.mark.asyncio

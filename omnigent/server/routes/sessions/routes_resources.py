@@ -21,7 +21,8 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
 
 from omnigent.entities import (
     Conversation,
@@ -245,6 +246,95 @@ def register_resources_routes(
         if conv is None:
             raise _session_not_found()
         return conv
+
+    # Per-chunk read budget for a streamed download, mirroring the event
+    # relay: a stall this long means the tunnel is dead, while a large file
+    # legitimately outlives any total timeout.
+    _download_timeout = httpx.Timeout(connect=5.0, read=45.0, write=None, pool=None)
+
+    async def _stream_download_from_runner(
+        request: Request,
+        session_id: str,
+        conversation: Conversation,
+        runner_path: str,
+    ) -> Response:
+        """Stream a file download from the runner without buffering it.
+
+        The runner serves the bytes straight from disk; forwarding them
+        chunk by chunk keeps the server's memory flat however large the
+        file is. There is no host fallback: the host tunnel's filesystem
+        op answers in a single message, so it cannot stream a file.
+
+        :param request: The incoming request, for the gzip opt-out.
+        :param session_id: Session/conversation identifier.
+        :param conversation: Conversation loaded during authorization.
+        :param runner_path: Runner-relative URL carrying ``download=true``.
+        :returns: The attachment, streamed as the runner sends it, or the
+            runner's own error body for a directory or out-of-grant path.
+        :raises OmnigentError: ``not_found`` when the file is missing;
+            ``runner_unavailable`` when the runner predates downloads.
+        :raises HTTPException: 502 when no runner can be reached.
+        """
+        runner_client = await _get_runner_client_for_resource_access(
+            session_id,
+            conversation=conversation,
+        )
+        if runner_client is None:
+            raise HTTPException(
+                status_code=502,
+                detail="no runner available for resource access",
+            )
+        try:
+            resp = await runner_client.send(
+                runner_client.build_request("GET", runner_path, timeout=_download_timeout),
+                stream=True,
+            )
+        except (httpx.HTTPError, ConnectionError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="runner download endpoint unavailable",
+            ) from exc
+        if resp.status_code == 200 and "content-disposition" in resp.headers:
+            skip_gzip(request)
+            forwarded = {
+                name: resp.headers[name]
+                for name in (
+                    "content-type",
+                    "content-length",
+                    "content-encoding",
+                    "content-disposition",
+                    "cache-control",
+                    "x-content-type-options",
+                )
+                if name in resp.headers
+            }
+            return StreamingResponse(
+                resp.aiter_raw(),
+                headers=forwarded,
+                background=BackgroundTask(resp.aclose),
+            )
+        await resp.aread()
+        await resp.aclose()
+        if resp.status_code == 200:
+            # A runner that predates ``download=true`` ignores it and answers
+            # the capped JSON envelope; serving that would truncate silently.
+            raise OmnigentError(
+                "Session runner does not support file downloads; restart the session",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = None
+        error = payload.get("error") if isinstance(payload, dict) else None
+        if not isinstance(error, dict):
+            raise HTTPException(status_code=502, detail="runner download failed")
+        if resp.status_code == 404:
+            raise OmnigentError(
+                str(error.get("message") or "File not found"),
+                code=ErrorCode.NOT_FOUND,
+            )
+        return JSONResponse(status_code=resp.status_code, content=payload)
 
     async def _proxy_get_to_runner(
         session_id: str,
@@ -2090,6 +2180,19 @@ def register_resources_routes(
         "/sessions/{session_id}/resources/environments"
         "/{environment_id}/filesystem/{relative_path:path}",
         response_model=None,
+        responses={
+            200: {
+                "description": (
+                    "File content or directory listing as JSON; the raw file "
+                    "as an attachment when `download=true`."
+                ),
+                "content": {
+                    "application/octet-stream": {
+                        "schema": {"type": "string", "format": "binary"},
+                    },
+                },
+            },
+        },
     )
     async def read_or_list_environment_path(
         request: Request,
@@ -2100,6 +2203,9 @@ def register_resources_routes(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
+        # A plain default, not ``Query(...)``: the root listing calls this
+        # function directly, and a ``Query`` object is truthy.
+        download: bool = False,
     ) -> Any:
         """
         Read a file or list a directory in an environment.
@@ -2113,7 +2219,10 @@ def register_resources_routes(
         :param after: Cursor entry id for forward pagination.
         :param before: Cursor entry id for backward pagination.
         :param order: Sort order, ``"asc"`` or ``"desc"``.
-        :returns: File content or directory listing.
+        :param download: When ``True``, stream the complete file as an
+            attachment with no size cap instead of the capped JSON
+            envelope. A directory rejects it with 400.
+        :returns: File content or directory listing, or the raw file.
         """
         params: dict[str, str] = {"limit": str(limit), "order": order}
         if after is not None:
@@ -2137,6 +2246,14 @@ def register_resources_routes(
         runner_rel = (
             "%2F" + urllib.parse.quote(relative_path.lstrip("/")) if absolute else relative_path
         )
+        if download:
+            return await _stream_download_from_runner(
+                request,
+                session_id,
+                conv,
+                f"/v1/sessions/{session_id}/resources/environments"
+                f"/{environment_id}/filesystem/{runner_rel}?download=true",
+            )
         path = (
             f"/v1/sessions/{session_id}/resources/environments"
             f"/{environment_id}/filesystem/{runner_rel}?{qs}"

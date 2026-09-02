@@ -496,6 +496,55 @@ async def test_read_nonexistent_file_returns_404(
 
 
 @pytest.mark.asyncio
+async def test_download_returns_complete_file_past_read_cap(
+    client: httpx.AsyncClient,
+    workspace: Path,
+) -> None:
+    """``?download=true`` streams the whole file where the read path truncates."""
+    from omnigent.runner.environment_filesystem import _MAX_READ_BYTES
+
+    payload = os.urandom(_MAX_READ_BYTES + 1)
+    (workspace / "big.bin").write_bytes(payload)
+    url = (
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/big.bin"
+    )
+
+    read = await client.get(url)
+    assert read.status_code == 200
+    assert read.json()["truncated"] is True
+
+    resp = await client.get(url, params={"download": "true"})
+    assert resp.status_code == 200
+    assert resp.content == payload
+    assert resp.headers["content-length"] == str(len(payload))
+    assert resp.headers["content-type"] == "application/octet-stream"
+    assert resp.headers["content-disposition"] == 'attachment; filename="big.bin"'
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    assert resp.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "status", "code"),
+    [("src", 400, "invalid_path"), ("nope.bin", 404, "path_not_found")],
+)
+async def test_download_rejects_directory_and_missing_path(
+    client: httpx.AsyncClient,
+    path: str,
+    status: int,
+    code: str,
+) -> None:
+    """A directory has no raw bytes to serve, and a missing path stays a 404."""
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem/{path}",
+        params={"download": "true"},
+    )
+    assert resp.status_code == status
+    assert resp.json()["error"]["code"] == code
+
+
+@pytest.mark.asyncio
 async def test_filesystem_session_without_agent_id_returns_typed_404(
     registry: SessionResourceRegistry,
 ) -> None:

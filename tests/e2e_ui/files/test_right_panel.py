@@ -8,6 +8,7 @@ unreachable on the desktop viewport these tests run at.
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -164,3 +165,45 @@ def test_right_panel_terminals_and_file_viewer(
     finally:
         if test_file.exists():
             test_file.unlink()
+
+
+def test_changes_row_download_saves_the_complete_file(
+    page: Page,
+    seeded_session: tuple[str, str],
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+) -> None:
+    """The row download button saves the whole file, past the viewer's read cap.
+
+    The viewer's JSON read truncates at the server's cap, and the download
+    button used to reuse it, so anything larger came back cut off with no
+    warning. Drop a file one byte over the cap into the workspace, download
+    it through the real server and runner, and compare every byte.
+    """
+    from omnigent.runner.environment_filesystem import _MAX_READ_BYTES
+
+    base_url, session_id = seeded_session
+    env = page.request.get(f"{base_url}/v1/sessions/{session_id}/resources/environments/default")
+    assert env.status == 200, env.text()
+    target = Path(env.json()["metadata"]["root"]) / "big-download.bin"
+    payload = os.urandom(_MAX_READ_BYTES + 1)
+    target.write_bytes(payload)
+    # The workspace is a real checkout shared with every other test in the
+    # shard, so the file must not outlive the test.
+    request.addfinalizer(lambda: target.unlink(missing_ok=True))
+
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+    rail.get_by_role("tab", name=re.compile("^Changes")).click()
+    row = rail.get_by_role("button", name=re.compile(r"^big-download\.bin"))
+    expect(row).to_be_visible(timeout=30_000)
+    # The download icon is hover-revealed on its row.
+    row.hover()
+    with page.expect_download() as download_info:
+        rail.get_by_role("button", name="Download big-download.bin").click()
+    download = download_info.value
+    assert download.suggested_filename == "big-download.bin"
+    saved = tmp_path / "big-download.bin"
+    download.save_as(saved)
+    assert saved.read_bytes() == payload

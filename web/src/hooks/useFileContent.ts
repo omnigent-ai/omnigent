@@ -29,22 +29,38 @@ export interface FileContentResponse {
   truncated?: boolean;
 }
 
+/**
+ * Build the filesystem URL for a workspace file.
+ *
+ * Reuses the shared browse-location wire form: a per-segment-encoded path with
+ * literal slashes and, for an absolute path (a file opened while browsing
+ * outside the workspace), the base named by `?base=host`. Keeping this on the
+ * shared helpers means the slash-merge-safe contract lives in one place (see
+ * `browseLocationSegment`).
+ *
+ * :param conversationId: The session/conversation ID, e.g. ``"sess_abc123"``.
+ * :param path: Workspace-relative or host-absolute file path.
+ * :param query: Extra query parameters, e.g. ``{ download: "true" }``.
+ */
+function workspaceFileUrl(
+  conversationId: string,
+  path: string,
+  query: Record<string, string> = {},
+): string {
+  const base = browseLocationBase(path);
+  const params = new URLSearchParams(base ? { ...query, base } : query).toString();
+  return (
+    `/v1/sessions/${encodeURIComponent(conversationId)}` +
+    `/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${browseLocationSegment(path)}` +
+    (params ? `?${params}` : "")
+  );
+}
+
 export async function fetchFileContent(
   conversationId: string,
   path: string,
 ): Promise<FileContentResponse> {
-  // Reuse the shared browse-location wire form: a per-segment-encoded path with
-  // literal slashes and, for an absolute path (a file opened while browsing
-  // outside the workspace), the base named by `?base=host`. Keeping this on the
-  // shared helpers means the slash-merge-safe contract lives in one place (see
-  // `browseLocationSegment`).
-  const encodedPath = browseLocationSegment(path);
-  const base = browseLocationBase(path);
-  const url =
-    `/v1/sessions/${encodeURIComponent(conversationId)}` +
-    `/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${encodedPath}` +
-    (base ? `?base=${base}` : "");
-  const res = await authenticatedFetch(url);
+  const res = await authenticatedFetch(workspaceFileUrl(conversationId, path));
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as FileContentResponse;
 }
@@ -92,23 +108,21 @@ export function triggerBrowserDownload(blob: Blob, filename: string): void {
 }
 
 /**
- * Fetch a workspace file and trigger a browser download of its contents.
+ * Fetch a workspace file's complete bytes and trigger a browser download.
  *
- * Logs a console warning when the server indicates the file was truncated
- * (``truncated: true``) so callers know the downloaded content may be
- * incomplete.
+ * Asks the filesystem endpoint for the raw file (`download=true`), which the
+ * server streams with no size cap, rather than the viewer's JSON envelope,
+ * which is truncated past the server's read cap.
  *
  * :param conversationId: The session/conversation ID, e.g. ``"sess_abc123"``.
  * :param path: Workspace-relative file path, e.g. ``"src/main.py"``.
  */
 export async function downloadWorkspaceFile(conversationId: string, path: string): Promise<void> {
-  const data = await fetchFileContent(conversationId, path);
-  if (data.truncated) {
-    console.warn(
-      `[web] File "${path}" was truncated by the server — downloaded content may be incomplete.`,
-    );
-  }
-  triggerBrowserDownload(fileContentToBlob(data), path.split("/").pop() ?? path);
+  const res = await authenticatedFetch(
+    workspaceFileUrl(conversationId, path, { download: "true" }),
+  );
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  triggerBrowserDownload(await res.blob(), path.split("/").pop() ?? path);
 }
 
 /**

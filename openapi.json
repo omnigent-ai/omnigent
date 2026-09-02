@@ -12305,7 +12305,7 @@
         ]
       },
       "get": {
-        "description": "Read a file or list a directory in an environment.\n\n**Returns:** File content or directory listing.",
+        "description": "Read a file or list a directory in an environment.\n\n**Returns:** File content or directory listing, or the raw file.",
         "operationId": "read_or_list_environment_path_v1_sessions__session_id__resources_environments__environment_id__filesystem__relative_path__get",
         "parameters": [
           {
@@ -12396,6 +12396,17 @@
               "title": "Order",
               "type": "string"
             }
+          },
+          {
+            "description": "When `True`, stream the complete file as an attachment with no size cap instead of the capped JSON envelope. A directory rejects it with 400.",
+            "in": "query",
+            "name": "download",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Download",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -12403,9 +12414,15 @@
             "content": {
               "application/json": {
                 "schema": {}
+              },
+              "application/octet-stream": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "File content or directory listing as JSON; the raw file as an attachment when `download=true`."
           },
           "422": {
             "content": {
