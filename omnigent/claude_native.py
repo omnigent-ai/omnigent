@@ -421,6 +421,12 @@ class ClaudeNativeUcodeConfig:
     routable_models: tuple[str, ...] = ()
 
 
+def _anthropic_api_host(base_url: str) -> bool:
+    """Whether *base_url* points at the first-party Anthropic API."""
+    host = (urlparse(base_url).hostname or "").lower()
+    return host == "anthropic.com" or host.endswith(".anthropic.com")
+
+
 def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> bool:
     """Whether the config's endpoint accepts canonical Anthropic ids and aliases.
 
@@ -433,8 +439,36 @@ def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> b
     base_url = claude_config.env.get(_UCODE_CLAUDE_BASE_URL_ENV)
     if not base_url:
         return True
-    host = (urlparse(base_url).hostname or "").lower()
-    return host == "anthropic.com" or host.endswith(".anthropic.com")
+    return _anthropic_api_host(base_url)
+
+
+def endpoint_disallowed_claude_tools(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> tuple[str, ...]:
+    """Claude tools to withhold because the configured endpoint cannot serve them.
+
+    A launch that pins ``ANTHROPIC_BASE_URL`` at a non-Anthropic gateway reads
+    as first-party to Claude Code, so it keeps WebSearch enabled — but the tool
+    executes through a nested ``/v1/messages`` request carrying the server-side
+    ``web_search`` tool, which follows the same base URL, and a gateway that
+    does not serve that tool rejects it with a region restriction that surfaces
+    to the user as the search outcome. Withholding the tool at launch lets the
+    model answer without it instead. Bedrock launches need no entry here:
+    Claude Code detects that provider path itself and disables WebSearch.
+
+    :param claude_config: The resolved native launch config, or ``None`` for
+        Claude Code's own native auth (first-party, serves web search).
+    :returns: Tool names to merge into ``--disallowedTools``, e.g.
+        ``("WebSearch",)``, or ``()`` when the endpoint serves them all.
+    """
+    if claude_config is None:
+        return ()
+    if claude_config.env.get(_ANTHROPIC_BEDROCK_BASE_URL_ENV):
+        return ()
+    base_url = claude_config.env.get(_UCODE_CLAUDE_BASE_URL_ENV)
+    if not base_url or _anthropic_api_host(base_url):
+        return ()
+    return ("WebSearch",)
 
 
 def _claude_family(token: str) -> str | None:
@@ -5910,6 +5944,7 @@ def _claude_terminal_request(
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
         append_system_prompt=append_system_prompt,
         allowed_tools=allowed_tools,
+        disallowed_tools=endpoint_disallowed_claude_tools(claude_config),
     )
     # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the
     # command/args to wrap the same fully-augmented Claude launch. Identity by
