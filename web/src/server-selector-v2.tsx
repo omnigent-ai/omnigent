@@ -28,6 +28,7 @@ interface OmnigentSetup {
   setServerSelectorV2?: (enabled: boolean) => Promise<unknown>;
   getCliStatus: () => Promise<{ installed?: boolean }>;
   startLocalServer: () => Promise<{ ok?: boolean; url?: string; error?: string }>;
+  onLocalServerSetupLog?: (cb: (line: string) => void) => () => void;
 }
 
 function setupBridge(): OmnigentSetup | undefined {
@@ -107,6 +108,11 @@ function SetupApp() {
         return { ok: false, error: e instanceof Error ? e.message : String(e) };
       }
     },
+    // Live startup-log stream from the shell, if this shell exposes it (older
+    // shells / browser preview omit it → the terminal step shows phases only).
+    onSetupLog: setupBridge()?.onLocalServerSetupLog
+      ? (cb) => setupBridge()?.onLocalServerSetupLog?.(cb) ?? (() => {})
+      : undefined,
     // Only offered when the shell exposes the forget method (newer shells).
     onRemoveServer: setupBridge()?.forgetRecentServer
       ? (url) => {

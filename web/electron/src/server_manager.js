@@ -383,10 +383,15 @@ function stopChild(child) {
  * *we* actually start it — a server that was already running is left to its
  * own lifecycle.
  *
+ * When `onLine` is given, forward the fresh server's startup log lines to it
+ * while it boots (Option B: tail the daemon's own logfile — we don't own the
+ * process). A reused server has no fresh startup, so it gets one status line.
+ *
  * @param {string} cliPath
+ * @param {(line: string) => void} [onLine]
  * @returns {Promise<{ ok: boolean, url?: string, alreadyRunning?: boolean, error?: string }>}
  */
-async function startLocalServer(cliPath) {
+async function startLocalServer(cliPath, onLine) {
   // Reuse a server that's already running — but health-verify it (pidfile +
   // pid + /health), not just pid-liveness, since we're about to navigate the
   // window to this URL: a stale pidfile (dead/reused pid, hung server) must NOT
@@ -395,9 +400,17 @@ async function startLocalServer(cliPath) {
   // ownership claim.
   const existing = await cli.localServerHealthy();
   if (existing) {
+    if (onLine) onLine("Server already running — connecting…");
     return { ok: true, url: existing.url, alreadyRunning: true };
   }
+  // Tail the daemon's logfile alongside the start so lines stream as it boots.
+  // The tail stops itself on /health-ready or timeout; a tail failure must not
+  // fail the start, so it's fire-and-forget and awaited only for cleanup.
+  const tail = onLine
+    ? cli.tailLocalServerLog(onLine).catch(() => {})
+    : Promise.resolve();
   const res = await cli.startLocalServer(cliPath);
+  await tail;
   if (res.ok) {
     ownedLocalServer = { url: res.url, port: res.port, pid: res.pid };
     return { ok: true, url: res.url };

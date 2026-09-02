@@ -461,4 +461,15 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
    * caller then connects to `url` via setServerUrl.
    */
   startLocalServer: () => ipcRenderer.invoke("omnigent:start-local-server"),
+  /**
+   * Subscribe to the local server's startup log lines (streamed while it boots
+   * during startLocalServer). Returns an unsubscribe function. Absent on older
+   * shells → the setup page falls back to phase-only display.
+   * @param {(line: string) => void} callback
+   */
+  onLocalServerSetupLog: (callback) => {
+    const listener = (_event, payload) => callback(payload?.line ?? "");
+    ipcRenderer.on("omnigent:local-server-setup-log", listener);
+    return () => ipcRenderer.removeListener("omnigent:local-server-setup-log", listener);
+  },
 });

@@ -551,6 +551,140 @@ async function startLocalServer(cliPath) {
   };
 }
 
+/** Path of the log-path sidecar the background server writes on startup. */
+function localServerLogRefPath() {
+  return path.join(localDataDir(), "local_server.logpath");
+}
+
+/**
+ * Read the absolute logfile path the background server recorded, or null. The
+ * detached child writes this *after* it starts, so callers must retry until it
+ * appears. Mirrors `_read_local_server_log_path()` in local_server.py.
+ *
+ * @returns {string | null}
+ */
+function readLocalServerLogPath() {
+  try {
+    const p = fs.readFileSync(localServerLogRefPath(), "utf8").trim();
+    return p || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Strip ANSI SGR/escape sequences so log lines render as plain text in the
+ * setup terminal (uvicorn/app logs may be colorized).
+ *
+ * @param {string} s
+ * @returns {string}
+ */
+// eslint-disable-next-line no-control-regex
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
+function stripAnsi(s) {
+  return s.replace(ANSI_RE, "");
+}
+
+/**
+ * Split a growing byte stream into whole lines across chunk boundaries. Feed
+ * each chunk to `push`; complete lines (newline-terminated) are emitted via
+ * `onLine`, and a trailing partial line is buffered until its newline arrives.
+ * The classic bug this avoids: emitting a half line when a chunk splits mid-line.
+ *
+ * @param {(line: string) => void} onLine
+ * @returns {{ push: (chunk: string) => void }}
+ */
+function makeLineSplitter(onLine) {
+  let buf = "";
+  return {
+    push(chunk) {
+      buf += chunk;
+      let nl;
+      while ((nl = buf.indexOf("\n")) !== -1) {
+        // Trim a trailing \r for CRLF logs; keep other content verbatim.
+        onLine(buf.slice(0, nl).replace(/\r$/, ""));
+        buf = buf.slice(nl + 1);
+      }
+    },
+  };
+}
+
+/**
+ * Tail the background server's logfile, forwarding each new line to `onLine`,
+ * until `/health` is ready (or a timeout). Does NOT own the server process — it
+ * only reads the logfile the detached daemon writes, keeping the daemon model
+ * intact. The logfile appears late (the child writes the sidecar after it
+ * starts), so we poll for the sidecar+file before tailing. Naive read-from-
+ * offset on `fs.watch` change events — no tail library, no external deps.
+ *
+ * @param {(line: string) => void} onLine
+ * @param {{ readyTimeoutMs?: number, sidecarTimeoutMs?: number, pollMs?: number }} [opts]
+ * @returns {Promise<void>} resolves when tailing stops (ready or timed out).
+ */
+async function tailLocalServerLog(onLine, opts = {}) {
+  const { readyTimeoutMs = 60000, sidecarTimeoutMs = 15000, pollMs = 200 } = opts;
+  const emit = makeLineSplitter((line) => onLine(stripAnsi(line)));
+  const deadline = Date.now() + readyTimeoutMs;
+  const sidecarDeadline = Date.now() + sidecarTimeoutMs;
+  const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+
+  // 1. Wait for the sidecar + logfile to exist (detached child writes them).
+  let logPath = null;
+  while (Date.now() < sidecarDeadline) {
+    const p = readLocalServerLogPath();
+    if (p && fs.existsSync(p)) {
+      logPath = p;
+      break;
+    }
+    // eslint-disable-next-line no-await-in-loop -- sequential poll for a file that appears over time
+    await sleep(pollMs);
+  }
+  if (!logPath) return; // No logfile to tail — the caller still reports ready/fail via status.
+
+  // 2. Read the file from the start, then follow appended bytes. fs.watch can
+  //    miss rapid writes, so we also re-check on each poll tick until ready.
+  let offset = 0;
+  const readNew = () => {
+    try {
+      const size = fs.statSync(logPath).size;
+      if (size <= offset) return;
+      const fd = fs.openSync(logPath, "r");
+      try {
+        const buf = Buffer.alloc(size - offset);
+        fs.readSync(fd, buf, 0, buf.length, offset);
+        offset = size;
+        emit.push(buf.toString("utf8"));
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      // File rotated/removed mid-tail — stop reading; readiness poll still runs.
+    }
+  };
+
+  let watcher = null;
+  try {
+    watcher = fs.watch(logPath, { persistent: false }, readNew);
+  } catch {
+    // fs.watch unsupported here — the poll loop below still drains new bytes.
+  }
+  try {
+    readNew();
+    while (Date.now() < deadline) {
+      // eslint-disable-next-line no-await-in-loop -- sequential poll: tick, drain new bytes, re-check readiness
+      await sleep(pollMs);
+      readNew();
+      // eslint-disable-next-line no-await-in-loop -- must await this tick's health before the next
+      if (await localServerHealthy(1000)) {
+        readNew(); // final drain of the readiness lines
+        return;
+      }
+    }
+  } finally {
+    if (watcher) watcher.close();
+  }
+}
+
 /**
  * Stop the local background server (and its attached host daemon).
  *
@@ -946,6 +1080,10 @@ module.exports = {
   getCliStatus,
   getServerStatus,
   startLocalServer,
+  readLocalServerLogPath,
+  makeLineSplitter,
+  stripAnsi,
+  tailLocalServerLog,
   stopLocalServer,
   stopHost,
   serverAuthed,

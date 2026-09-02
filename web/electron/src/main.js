@@ -2782,7 +2782,15 @@ function registerIpc() {
     if (!cliPath) {
       return { ok: false, error: "The omnigent CLI was not found. Install it or set its path." };
     }
-    return serverManager.startLocalServer(cliPath);
+    // Stream the server's startup log lines to the setup page as it boots.
+    const onLine = (line) => {
+      try {
+        event.sender.send("omnigent:local-server-setup-log", { line });
+      } catch {
+        /* window torn down mid-start */
+      }
+    };
+    return serverManager.startLocalServer(cliPath, onLine);
   });
 
   // SPA → this machine's identity: is the CLI installed, and its host id. Both

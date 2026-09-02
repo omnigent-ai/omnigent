@@ -49,6 +49,10 @@ export interface ServerSelectorV2Setup {
    *  outcome so the terminal step can show ready/failed (on success the window
    *  navigates away, so it resolves only on failure in practice). */
   onStartLocal: () => Promise<{ ok: boolean; error?: string }>;
+  /** Subscribe to the local server's startup log lines while it boots; returns
+   *  an unsubscribe. Absent on older shells / browser preview → the terminal
+   *  step shows the coarse phases only. */
+  onSetupLog?: (cb: (line: string) => void) => () => void;
   /** Remove a recent server from the saved list, if the shell supports it. */
   onRemoveServer?: (url: string) => void;
   /** Copy text to the clipboard via the shell's native bridge. */
@@ -74,7 +78,7 @@ const CARD: Record<Step, { height: number; panelHeight: number }> = {
   landing: { height: 560, panelHeight: 308 },
   mode: { height: 560, panelHeight: 96 },
   server: { height: 600, panelHeight: 64 },
-  terminal: { height: 560, panelHeight: 96 },
+  terminal: { height: 560, panelHeight: 240 },
 };
 
 export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
@@ -125,7 +129,11 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
           />
         )}
         {step === "terminal" && (
-          <SetupTerminalStep onStartLocal={setup.onStartLocal} onBack={() => setStep("mode")} />
+          <SetupTerminalStep
+            onStartLocal={setup.onStartLocal}
+            onSetupLog={setup.onSetupLog}
+            onBack={() => setStep("mode")}
+          />
         )}
         {step === "server" && (
           <ServerSelectStep
