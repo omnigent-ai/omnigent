@@ -2495,6 +2495,18 @@ function historyLoadThreshold(el: HTMLElement): number {
 /** Finger travel before a touch drag counts as "show me what's above". */
 const TOUCH_DRAG_SLOP_PX = 8;
 
+/**
+ * Follow-up pages one gesture may chain beyond the page it fetched itself.
+ *
+ * Settled tool-heavy turns mount folded behind "Worked for" rows, so a fetched
+ * page can land with near-zero height: scrollTop never crosses the load
+ * threshold and the moved cursor would otherwise re-feed the next fetch until
+ * history ran out — one small drag used to page in the entire transcript. A
+ * fresh gesture grants a fresh budget, so older history stays reachable at a
+ * reader-paced rate instead of a runaway loop.
+ */
+const PREPEND_CHAIN_PAGES_PER_GESTURE = 2;
+
 export function HistoryAutoLoader({
   scrollElement,
 }: {
@@ -2531,6 +2543,8 @@ export function HistoryAutoLoader({
   const scrolledUpRef = useRef(false);
   const lastScrollTopRef = useRef<number | null>(null);
   const touchStartYRef = useRef<number | null>(null);
+  // Prepend-fed fetches left before the chain must wait for a fresh gesture.
+  const chainBudgetRef = useRef(PREPEND_CHAIN_PAGES_PER_GESTURE);
 
   // Position across a prepend is held by native scroll anchoring, not by this
   // component. Writing scrollTop here instead used to interrupt the reader's
@@ -2544,11 +2558,13 @@ export function HistoryAutoLoader({
     // Baseline from where the pane currently sits, so the reader's very first
     // upward scroll already has something to compare against.
     lastScrollTopRef.current = el.scrollTop;
-    // Arming has to re-run the paging effect itself: a pane with no scroll
-    // range fires no scroll event, so nothing else would notice the gesture.
-    const armScrollUp = () => {
-      if (scrolledUpRef.current) return;
+    // A gesture has to re-run the paging effect itself: a pane with no scroll
+    // range fires no scroll event, so nothing else would notice it. It also
+    // refills the chain budget — every fresh ask for what's above buys a
+    // bounded amount of prepend-fed follow-up, never the whole history.
+    const noteUpwardGesture = () => {
       scrolledUpRef.current = true;
+      chainBudgetRef.current = PREPEND_CHAIN_PAGES_PER_GESTURE;
       setScrollRevision((revision) => revision + 1);
     };
     const handleScroll = () => {
@@ -2557,7 +2573,10 @@ export function HistoryAutoLoader({
       // Only an upward move counts. The open's scroll-to-bottom and a
       // prepend's native anchor correction both move scrollTop DOWN the
       // document (larger), so neither can arm paging on its own.
-      if (previous !== null && el.scrollTop < previous - 0.5) scrolledUpRef.current = true;
+      if (previous !== null && el.scrollTop < previous - 0.5) {
+        scrolledUpRef.current = true;
+        chainBudgetRef.current = PREPEND_CHAIN_PAGES_PER_GESTURE;
+      }
       // Every scroll re-runs the paging effect, armed or not: staying near the
       // top has to keep paging, not just the moment the reader arrives there.
       setScrollRevision((revision) => revision + 1);
@@ -2565,7 +2584,7 @@ export function HistoryAutoLoader({
     // Wheel/trackpad up, and a touch drag downward (which reveals what is
     // above). These fire whether or not the pane has anywhere to scroll.
     const handleWheel = (event: WheelEvent) => {
-      if (event.deltaY < 0) armScrollUp();
+      if (event.deltaY < 0) noteUpwardGesture();
     };
     const handleTouchStart = (event: TouchEvent) => {
       touchStartYRef.current = event.touches[0]?.clientY ?? null;
@@ -2574,7 +2593,7 @@ export function HistoryAutoLoader({
       const start = touchStartYRef.current;
       const current = event.touches[0]?.clientY;
       if (start !== null && current !== undefined && current > start + TOUCH_DRAG_SLOP_PX) {
-        armScrollUp();
+        noteUpwardGesture();
       }
     };
     el.addEventListener("scroll", handleScroll, { passive: true });
@@ -2606,6 +2625,7 @@ export function HistoryAutoLoader({
       generationRef.current = historyGeneration;
       // A new window is a new open: require a fresh upward scroll.
       scrolledUpRef.current = false;
+      chainBudgetRef.current = PREPEND_CHAIN_PAGES_PER_GESTURE;
       lastScrollTopRef.current = el.scrollTop;
     }
 
@@ -2625,6 +2645,14 @@ export function HistoryAutoLoader({
       el.scrollTop >= historyLoadThreshold(el)
     ) {
       return;
+    }
+
+    // A prepend re-feeding the chain spends gesture budget: folded pages land
+    // height-neutral, so without a bound one drag would page in everything.
+    // Once it's spent, older history waits for the reader's next gesture.
+    if (itemsChanged && !scrollPositionChanged) {
+      if (chainBudgetRef.current <= 0) return;
+      chainBudgetRef.current -= 1;
     }
 
     void state.loadMoreHistory();
