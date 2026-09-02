@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import shutil
 import subprocess
+import sys
 import tempfile
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -55,9 +56,10 @@ def build_packages(package_names: Sequence[str], out_dir: Path, *, wheel_only: b
     output.mkdir(parents=True, exist_ok=True)
     for package_name in package_names:
         with staged_package(PACKAGE_DIRS[package_name]) as staged:
-            command = ["uv", "build", str(staged), "--out-dir", str(output)]
+            command = [sys.executable, "-m", "build", "--outdir", str(output)]
             if wheel_only:
                 command.append("--wheel")
+            command.append(str(staged))
             subprocess.run(command, cwd=REPO_ROOT, check=True)
 
 

@@ -444,6 +444,20 @@ wheels = [
 ]
 
 [[package]]
+name = "build"
+version = "1.5.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama", marker = "os_name == 'nt' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "packaging" },
+    { name = "pyproject-hooks" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/78/e0/df5e171f685f82f37b12e1f208064e24244911079d7b767447d1af7e0d70/build-1.5.0.tar.gz", hash = "sha256:302c22c3ba2a0fd5f3911918651341ebb3896176cbdec15bd421f80b1afc7647", size = 89796, upload-time = "2026-04-30T03:18:25.17Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0d/fe/6bea5c9162869c5beba5d9c8abbed835ec85bf1ec1fba05a3822325c45f3/build-1.5.0-py3-none-any.whl", hash = "sha256:13f3eecb844759ab66efec90ca17639bbf14dc06cb2fdf37a9010322d9c50a6f", size = 26018, upload-time = "2026-04-30T03:18:23.644Z" },
+]
+
+[[package]]
 name = "cachetools"
 version = "6.2.6"
 source = { registry = "https://pypi.org/simple" }
@@ -3274,6 +3288,7 @@ vertex = [
 [package.dev-dependencies]
 dev = [
     { name = "boto3" },
+    { name = "build" },
     { name = "filelock" },
     { name = "grpcio-tools" },
     { name = "hindsight-client" },
@@ -3302,6 +3317,7 @@ lint = [
 ]
 test = [
     { name = "boto3" },
+    { name = "build" },
     { name = "filelock" },
     { name = "hindsight-client" },
     { name = "moto", extra = ["s3"] },
@@ -3415,6 +3431,7 @@ provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "kms", "s3",
 [package.metadata.requires-dev]
 dev = [
     { name = "boto3", specifier = ">=1.30,<2" },
+    { name = "build", specifier = ">=1.2" },
     { name = "filelock", specifier = ">=3.0" },
     { name = "grpcio-tools", specifier = ">=1.68,<=1.81.1" },
     { name = "hindsight-client", specifier = ">=0.4.0" },
@@ -3443,6 +3460,7 @@ lint = [
 ]
 test = [
     { name = "boto3", specifier = ">=1.30,<2" },
+    { name = "build", specifier = ">=1.2" },
     { name = "filelock", specifier = ">=3.0" },
     { name = "hindsight-client", specifier = ">=0.4.0" },
     { name = "moto", extras = ["s3"], specifier = ">=5,<6" },
@@ -4641,6 +4659,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/f3/91/9c6ee907786a473bf81c5f53cf703ba0957b23ab84c264080fb5a450416f/pyparsing-3.3.2.tar.gz", hash = "sha256:c777f4d763f140633dcb6d8a3eda953bf7a214dc4eff598413c070bcdc117cbc", size = 6851574, upload-time = "2026-01-21T03:57:59.36Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/10/bd/c038d7cc38edc1aa5bf91ab8068b63d4308c66c4c8bb3cbba7dfbc049f9c/pyparsing-3.3.2-py3-none-any.whl", hash = "sha256:850ba148bd908d7e2411587e247a1e4f0327839c40e2e5e6d05a007ecc69911d", size = 122781, upload-time = "2026-01-21T03:57:55.912Z" },
+]
+
+[[package]]
+name = "pyproject-hooks"
+version = "1.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/e7/82/28175b2414effca1cdac8dc99f76d660e7a4fb0ceefa4b4ab8f5f6742925/pyproject_hooks-1.2.0.tar.gz", hash = "sha256:1e859bd5c40fae9448642dd871adf459e5e2084186e8d2c2a79a824c970da1f8", size = 19228, upload-time = "2024-09-29T09:24:13.293Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bd/24/12818598c362d7f300f18e74db45963dbcb85150324092410c8b49405e42/pyproject_hooks-1.2.0-py3-none-any.whl", hash = "sha256:9e5c6bfa8dcc30091c74b0cf803c81fdd29d94f01992a7707bc97babb1141913", size = 10216, upload-time = "2024-09-29T09:24:11.978Z" },
 ]
 
 [[package]]

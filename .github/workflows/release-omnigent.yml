@@ -127,7 +127,7 @@ jobs:
       - name: Build sdists + wheels
         run: |
           uv build --out-dir dist
-          uv run --no-project python scripts/build_subpackages.py \
+          uv run --no-project --with build python scripts/build_subpackages.py \
             --out-dir dist omnigent-client omnigent-ui-sdk
           ls -la dist/
 
