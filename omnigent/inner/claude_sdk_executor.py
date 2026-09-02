@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 import time
@@ -41,6 +42,7 @@ from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Protocol, TypeAlias, cast
+from urllib.parse import urlparse
 
 from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary, stable_user_id
@@ -1017,6 +1019,97 @@ def _resolve_databricks_claude_model(profile: str | None) -> str:
     return model_catalog.resolve_catalog_model("databricks", family="claude").model_id
 
 
+# Seconds to wait for the gateway auth command to print a bearer token when
+# minting one for served-model discovery. The command is either a trivial
+# ``printf`` (CI) or a ``databricks auth token`` call; 30s covers a cold CLI.
+_GATEWAY_TOKEN_TIMEOUT_S = 30.0
+
+# The Databricks AI Gateway's Anthropic Messages surface. A base URL carrying
+# this path routes to a gateway whose Claude endpoints are ``databricks-``
+# spelled, so its family aliases need the served-id pins below even when the
+# host is not under a trusted Databricks domain (e.g. a local test gateway).
+_ANTHROPIC_GATEWAY_PATH_MARKER = "/ai-gateway/anthropic"
+
+
+def _wants_alias_model_pins(base_url: str, model: str | None) -> bool:
+    """Return ``True`` when this gateway needs ``ANTHROPIC_DEFAULT_*_MODEL`` pins.
+
+    Claude Code resolves a family alias — ``opus`` / ``sonnet`` / ``haiku`` /
+    ``fable`` — to a concrete id through ``ANTHROPIC_DEFAULT_<FAMILY>_MODEL``.
+    The refusal-fallback, ``/model``, and ``Agent``-tool spawns all speak
+    aliases. Unpinned, an alias resolves to a bare canonical id (e.g.
+    ``claude-opus-4-8``) that the Databricks gateway does not serve — it serves
+    only ``databricks-`` spelled ids — so a cyber/bio refusal that swaps to
+    Opus fails ``model_not_found``. Pin only when the gateway is a Databricks
+    Anthropic gateway (by trusted host, by path shape, or by a ``databricks-``
+    launch model), never a neutral endpoint whose served ids we do not know.
+    """
+    if is_databricks_ai_gateway_url(base_url):
+        return True
+    if urlparse(base_url).path.rstrip("/").endswith(_ANTHROPIC_GATEWAY_PATH_MARKER):
+        return True
+    return isinstance(model, str) and model.startswith(("databricks-", "databricks/"))
+
+
+def _mint_gateway_bearer(auth_command: str | None) -> str | None:
+    """Run the gateway ``apiKeyHelper`` command and return its bearer token.
+
+    The same command Claude Code invokes for the gateway (a ``printf`` of a
+    forwarded token, or ``databricks auth token``). Returns ``None`` when no
+    command is configured or it prints nothing.
+    """
+    if not auth_command:
+        return None
+    result = subprocess.run(
+        auth_command,
+        shell=True,
+        capture_output=True,
+        text=True,
+        timeout=_GATEWAY_TOKEN_TIMEOUT_S,
+    )
+    token = result.stdout.strip()
+    return token or None
+
+
+def _discover_alias_model_pins(base_url: str, auth_command: str | None) -> dict[str, str]:
+    """Map each Claude family alias to the gateway's newest served id.
+
+    Discovers the workspace's served Claude catalog and returns the
+    ``ANTHROPIC_DEFAULT_<FAMILY>_MODEL`` env each alias needs so Claude Code's
+    refusal-fallback (and every other alias surface) routes to a servable id.
+    Returns an empty dict — leaving the gateway untouched — when discovery
+    yields no Claude models or fails for any reason.
+
+    :param base_url: The resolved ``ANTHROPIC_BASE_URL`` (may carry a path);
+        the workspace origin is its scheme + host.
+    :param auth_command: The gateway ``apiKeyHelper`` command used to mint a
+        bearer token for the discovery listing.
+    :returns: ``{env_var: served_model_id}`` for every discovered family.
+    """
+    from omnigent.claude_model_vocabulary import ALIAS_MODEL_ENV_VARS
+    from omnigent.databricks_model_discovery import discover_databricks_claude_catalog
+
+    try:
+        parsed = urlparse(base_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        token = _mint_gateway_bearer(auth_command)
+        if not token:
+            return {}
+        families = discover_databricks_claude_catalog(origin, token).families
+    except Exception:  # noqa: BLE001 — discovery is best-effort; unpinned is the safe default
+        logger.warning(
+            "claude-sdk: served-model discovery for alias pins failed; "
+            "leaving ANTHROPIC_DEFAULT_*_MODEL unset",
+            exc_info=True,
+        )
+        return {}
+    return {
+        ALIAS_MODEL_ENV_VARS[family]: model_id
+        for family, model_id in families.items()
+        if family in ALIAS_MODEL_ENV_VARS
+    }
+
+
 def _resolve_gateway_env(
     profile: str | None = None,
     *,
@@ -1634,6 +1727,13 @@ class ClaudeSDKExecutor(Executor):
         # Started on the first gateway turn — __init__ has no event loop.
         self._gateway_shim: ClaudeGatewayShim | None = None
 
+        # Cached ``ANTHROPIC_DEFAULT_*_MODEL`` pins for Claude Code's family
+        # aliases, discovered from the gateway's served catalog on the first
+        # qualifying turn (see :meth:`_apply_alias_model_pins`). ``None`` until
+        # resolved; the resolved value may be empty (discovery found nothing).
+        self._alias_model_pins: dict[str, str] | None = None
+        self._alias_model_pins_resolved = False
+
         # Eagerly resolve the gateway transport env so errors surface at
         # construction time.
         self._extra_env: dict[str, str] = {}
@@ -2024,6 +2124,45 @@ class ClaudeSDKExecutor(Executor):
                 return str(metadata["session_id"])
         return "default"
 
+    async def _apply_alias_model_pins(
+        self,
+        env: dict[str, str],
+        model: str | None,
+        auth_command: str | None,
+    ) -> None:
+        """
+        Inject ``ANTHROPIC_DEFAULT_*_MODEL`` alias pins into the child env.
+
+        On a Databricks Anthropic gateway, discover the served Claude families
+        once and pin each of Claude Code's family aliases to a servable id, so
+        the CLI's refusal-fallback / ``/model`` / ``Agent``-tool spawns resolve
+        an alias to a model the gateway actually serves instead of a bare
+        canonical id it rejects. A no-op off the Databricks gateway, when every
+        alias is already pinned, or when discovery finds nothing.
+
+        :param env: The child-process env dict, mutated in place.
+        :param model: The resolved launch model (a ``databricks-`` id marks a
+            Databricks gateway even when the base URL host does not).
+        :param auth_command: The gateway ``apiKeyHelper`` command, used to mint
+            a bearer token for the served-model discovery listing.
+        """
+        base_url = env.get("ANTHROPIC_BASE_URL")
+        if not base_url or not _wants_alias_model_pins(base_url, model):
+            return
+        from omnigent.claude_model_vocabulary import ALIAS_MODEL_ENV_VARS
+
+        if all(var in env for var in ALIAS_MODEL_ENV_VARS.values()):
+            # Every alias already pinned (e.g. by a ucode launch config);
+            # respect the explicit values rather than re-deriving them.
+            return
+        if not self._alias_model_pins_resolved:
+            self._alias_model_pins = await run_sync_on_thread(
+                _discover_alias_model_pins, base_url, auth_command
+            )
+            self._alias_model_pins_resolved = True
+        for var, model_id in (self._alias_model_pins or {}).items():
+            env.setdefault(var, model_id)
+
     def _install_subagent_router_hook(
         self,
         sdk: _ClaudeSDK,
@@ -2370,6 +2509,10 @@ class ClaudeSDKExecutor(Executor):
         # ``""`` here would still leave an empty key in the child env.
         env = dict(self._extra_env)
         api_key_helper = env.pop(_CLAUDE_API_KEY_HELPER_ENV_KEY, None)
+        # Pin Claude Code's family aliases to the gateway's served ids so a
+        # refusal-fallback (or any alias surface) never routes to a canonical
+        # id the Databricks gateway rejects. No-op off the Databricks gateway.
+        await self._apply_alias_model_pins(env, model, api_key_helper)
         settings_payload = (
             json.dumps({"apiKeyHelper": api_key_helper}, separators=(",", ":"))
             if api_key_helper
