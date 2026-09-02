@@ -798,27 +798,26 @@ class TestConstructor(unittest.TestCase):
 
         _run(_t())
 
-    def test_databricks_gateway_pins_family_aliases_to_served_ids(self):
-        """A Databricks gateway turn pins every discovered family alias.
+    def test_gateway_pins_family_aliases_to_served_ids(self):
+        """A gateway turn pins every family alias to an id the gateway serves.
 
         Claude Code's refusal-fallback resolves the ``opus`` alias through
-        ``ANTHROPIC_DEFAULT_OPUS_MODEL``; unpinned it lands on a bare canonical
-        id the Databricks gateway rejects (``model_not_found``). The executor
-        discovers the served families and pins each alias so the fallback
-        routes to a servable id. See ``_apply_alias_model_pins``.
+        ``ANTHROPIC_DEFAULT_OPUS_MODEL``; unpinned it lands on a canonical
+        vendor id a gateway serving its own ids rejects (``model_not_found``).
+        The executor lists the gateway's models and pins each alias to a
+        served id. See ``_apply_alias_model_pins``.
         """
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
-        from omnigent.inner.databricks_executor import DatabricksCredentials
+        from omnigent.model_catalog import ModelEntry, ModelListing
 
         async def _t():
-            with patch(
-                "omnigent.inner.databricks_executor._read_databrickscfg",
-                return_value=DatabricksCredentials(
-                    host="https://example.cloud.databricks.com",
-                    token="dapi_test_token",
-                ),
-            ):
-                executor = ClaudeSDKExecutor(gateway=True, model="databricks-claude-fable-5")
+            executor = ClaudeSDKExecutor(
+                gateway=True,
+                gateway_host="https://gateway.example.com",
+                base_url_override="https://gateway.example.com/anthropic",
+                gateway_auth_command="printf token",
+                model="gw-claude-fable-5",
+            )
 
             captured: dict[str, dict[str, str]] = {}
 
@@ -826,22 +825,21 @@ class TestConstructor(unittest.TestCase):
                 captured["env"] = dict(options.env or {})
                 raise RuntimeError("stop after env assembly")
 
+            listing = ModelListing(
+                source="openai-compatible",
+                verified=True,
+                models=(
+                    ModelEntry(id="gw-claude-fable-5", family="claude"),
+                    ModelEntry(id="gw-claude-opus-4-7", family="claude"),
+                    ModelEntry(id="gw-claude-opus-4-8", family="claude"),
+                    ModelEntry(id="gw-claude-sonnet-5", family="claude"),
+                    ModelEntry(id="gw-claude-haiku-4-5", family="claude"),
+                    ModelEntry(id="gw-gpt-5-6", family="openai"),
+                ),
+                note="",
+            )
             with (
-                patch(
-                    "omnigent.inner.claude_sdk_executor._mint_gateway_bearer",
-                    return_value="dapi_test_token",
-                ),
-                patch(
-                    "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
-                    return_value=SimpleNamespace(
-                        families={
-                            "fable": "databricks-claude-fable-5",
-                            "opus": "databricks-claude-opus-4-8",
-                            "sonnet": "databricks-claude-sonnet-5",
-                            "haiku": "databricks-claude-haiku-4-5",
-                        }
-                    ),
-                ),
+                patch("omnigent.model_catalog.listing_for_provider", return_value=listing),
                 patch.object(
                     executor,
                     "_get_or_create_client",
@@ -853,20 +851,22 @@ class TestConstructor(unittest.TestCase):
                         pass
 
             env = captured["env"]
-            self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "databricks-claude-opus-4-8")
-            self.assertEqual(env["ANTHROPIC_DEFAULT_FABLE_MODEL"], "databricks-claude-fable-5")
-            self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "databricks-claude-sonnet-5")
-            self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "databricks-claude-haiku-4-5")
+            # Newest served generation per family; the non-Claude id is ignored.
+            self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "gw-claude-opus-4-8")
+            self.assertEqual(env["ANTHROPIC_DEFAULT_FABLE_MODEL"], "gw-claude-fable-5")
+            self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "gw-claude-sonnet-5")
+            self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "gw-claude-haiku-4-5")
 
         _run(_t())
 
-    def test_neutral_gateway_does_not_pin_family_aliases(self):
-        """A neutral (non-Databricks) gateway is never given databricks pins.
+    def test_gateway_listing_without_claude_models_pins_nothing(self):
+        """A gateway that lists no Claude models leaves the aliases unpinned.
 
-        The served ids of a neutral endpoint are unknown, so the executor must
-        not inject ``databricks-`` aliases or run served-model discovery there.
+        The served ids are unknown, so the executor must not invent pins;
+        an unpinned alias is today's behavior, not a regression.
         """
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+        from omnigent.model_catalog import ModelEntry, ModelListing
 
         async def _t():
             executor = ClaudeSDKExecutor(
@@ -883,12 +883,14 @@ class TestConstructor(unittest.TestCase):
                 captured["env"] = dict(options.env or {})
                 raise RuntimeError("stop after env assembly")
 
-            discover = Mock()
+            listing = ModelListing(
+                source="openai-compatible",
+                verified=True,
+                models=(ModelEntry(id="gpt-5", family="openai"),),
+                note="",
+            )
             with (
-                patch(
-                    "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
-                    discover,
-                ),
+                patch("omnigent.model_catalog.listing_for_provider", return_value=listing),
                 patch.object(
                     executor,
                     "_get_or_create_client",
@@ -899,30 +901,26 @@ class TestConstructor(unittest.TestCase):
                     async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
                         pass
 
-            env = captured["env"]
-            self.assertNotIn("ANTHROPIC_DEFAULT_OPUS_MODEL", env)
-            discover.assert_not_called()
+            self.assertFalse({k for k in captured["env"] if k.startswith("ANTHROPIC_DEFAULT_")})
 
         _run(_t())
 
     def test_explicit_family_pins_are_not_overwritten(self):
-        """Pre-set ``ANTHROPIC_DEFAULT_*_MODEL`` pins win over discovery.
+        """Pre-set ``ANTHROPIC_DEFAULT_*_MODEL`` pins win over the listing.
 
-        A ucode launch config that already pins every alias must be respected
-        verbatim; the executor neither re-derives nor runs discovery.
+        A launch config that already pins every alias must be respected
+        verbatim; the executor neither re-derives them nor lists the gateway.
         """
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
-        from omnigent.inner.databricks_executor import DatabricksCredentials
 
         async def _t():
-            with patch(
-                "omnigent.inner.databricks_executor._read_databrickscfg",
-                return_value=DatabricksCredentials(
-                    host="https://example.cloud.databricks.com",
-                    token="dapi_test_token",
-                ),
-            ):
-                executor = ClaudeSDKExecutor(gateway=True, model="databricks-claude-fable-5")
+            executor = ClaudeSDKExecutor(
+                gateway=True,
+                gateway_host="https://gateway.example.com",
+                base_url_override="https://gateway.example.com/anthropic",
+                gateway_auth_command="printf token",
+                model="gw-claude-fable-5",
+            )
             executor._extra_env["ANTHROPIC_DEFAULT_FABLE_MODEL"] = "pinned-fable"
             executor._extra_env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = "pinned-opus"
             executor._extra_env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = "pinned-sonnet"
@@ -934,12 +932,9 @@ class TestConstructor(unittest.TestCase):
                 captured["env"] = dict(options.env or {})
                 raise RuntimeError("stop after env assembly")
 
-            discover = Mock()
+            listing = Mock()
             with (
-                patch(
-                    "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
-                    discover,
-                ),
+                patch("omnigent.model_catalog.listing_for_provider", listing),
                 patch.object(
                     executor,
                     "_get_or_create_client",
@@ -951,7 +946,7 @@ class TestConstructor(unittest.TestCase):
                         pass
 
             self.assertEqual(captured["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"], "pinned-opus")
-            discover.assert_not_called()
+            listing.assert_not_called()
 
         _run(_t())
 
@@ -1536,62 +1531,22 @@ class TestResolveGatewayEnv(unittest.TestCase):
 
 
 class TestAliasModelPins(unittest.TestCase):
-    def test_wants_pins_on_trusted_databricks_gateway(self):
-        from omnigent.inner.claude_sdk_executor import _wants_alias_model_pins
+    def test_pins_map_served_families_to_env_vars(self):
+        from omnigent.inner.claude_sdk_executor import _gateway_alias_model_pins
+        from omnigent.model_catalog import ModelEntry, ModelListing
 
-        self.assertTrue(
-            _wants_alias_model_pins(
-                "https://wkspc.cloud.databricks.com/ai-gateway/anthropic", None
-            )
-        )
-
-    def test_wants_pins_on_anthropic_gateway_path_shape(self):
-        """A non-trusted host with the gateway path shape still qualifies.
-
-        A local test gateway is ``http://127.0.0.1:PORT/ai-gateway/anthropic`` —
-        not https, not a trusted domain — but its Claude endpoints are still
-        ``databricks-`` spelled, so its aliases need pinning.
-        """
-        from omnigent.inner.claude_sdk_executor import _wants_alias_model_pins
-
-        self.assertTrue(
-            _wants_alias_model_pins("http://127.0.0.1:8123/ai-gateway/anthropic", None)
-        )
-
-    def test_wants_pins_on_databricks_launch_model(self):
-        from omnigent.inner.claude_sdk_executor import _wants_alias_model_pins
-
-        self.assertTrue(
-            _wants_alias_model_pins("http://127.0.0.1:8123", "databricks-claude-fable-5")
-        )
-
-    def test_no_pins_on_neutral_gateway(self):
-        from omnigent.inner.claude_sdk_executor import _wants_alias_model_pins
-
-        self.assertFalse(_wants_alias_model_pins("https://gateway.example.com/v1", "gpt-5"))
-        self.assertFalse(_wants_alias_model_pins("https://gateway.example.com/v1", None))
-
-    def test_discover_maps_families_to_env_vars(self):
-        from omnigent.inner.claude_sdk_executor import _discover_alias_model_pins
-
-        with (
-            patch(
-                "omnigent.inner.claude_sdk_executor._mint_gateway_bearer",
-                return_value="tok",
+        listing = ModelListing(
+            source="openai-compatible",
+            verified=True,
+            models=(
+                ModelEntry(id="databricks-claude-opus-4-8", family="claude"),
+                ModelEntry(id="databricks-claude-fable-5", family="claude"),
+                ModelEntry(id="databricks-gpt-5-6", family="openai"),
             ),
-            patch(
-                "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
-                return_value=SimpleNamespace(
-                    families={
-                        "opus": "databricks-claude-opus-4-8",
-                        "fable": "databricks-claude-fable-5",
-                    }
-                ),
-            ),
-        ):
-            pins = _discover_alias_model_pins(
-                "https://wkspc.cloud.databricks.com/ai-gateway/anthropic", "printf tok"
-            )
+            note="",
+        )
+        with patch("omnigent.model_catalog.listing_for_provider", return_value=listing) as lister:
+            pins = _gateway_alias_model_pins("https://gw.example.com/anthropic", "printf tok")
         self.assertEqual(
             pins,
             {
@@ -1599,38 +1554,46 @@ class TestAliasModelPins(unittest.TestCase):
                 "ANTHROPIC_DEFAULT_FABLE_MODEL": "databricks-claude-fable-5",
             },
         )
+        # The listing is fetched as a gateway transport: the base URL and the
+        # auth command the CLI itself uses, not a Databricks profile.
+        provider = lister.call_args.args[0]
+        self.assertEqual(provider.base_url, "https://gw.example.com/anthropic")
+        self.assertEqual(provider.auth_command, "printf tok")
+        self.assertIsNone(provider.profile)
 
-    def test_discover_returns_empty_without_token(self):
-        from omnigent.inner.claude_sdk_executor import _discover_alias_model_pins
+    def test_no_pins_when_the_listing_has_no_claude_models(self):
+        from omnigent.inner.claude_sdk_executor import _gateway_alias_model_pins
+        from omnigent.model_catalog import ModelListing
+
+        listing = ModelListing(source="openai-compatible", verified=True, models=(), note="")
+        with patch("omnigent.model_catalog.listing_for_provider", return_value=listing):
+            self.assertEqual(
+                _gateway_alias_model_pins("https://gw.example.com/anthropic", "printf tok"), {}
+            )
+
+    def test_no_pins_when_the_listing_fails(self):
+        """A failed listing is swallowed — unpinned aliases are the safe default."""
+        from omnigent.inner.claude_sdk_executor import _gateway_alias_model_pins
 
         with patch(
-            "omnigent.inner.claude_sdk_executor._mint_gateway_bearer",
-            return_value=None,
+            "omnigent.model_catalog.listing_for_provider",
+            side_effect=RuntimeError("listing unavailable"),
         ):
             self.assertEqual(
-                _discover_alias_model_pins("https://wkspc.cloud.databricks.com", None), {}
+                _gateway_alias_model_pins("https://gw.example.com/anthropic", "printf tok"), {}
             )
 
-    def test_discover_returns_empty_on_failure(self):
-        """Discovery failure is swallowed — an unpinned gateway is the safe default."""
-        from omnigent.inner.claude_sdk_executor import _discover_alias_model_pins
+    def test_direct_endpoint_never_lists_or_pins(self):
+        """Off the gateway transport the CLI resolves aliases itself."""
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
-        with (
-            patch(
-                "omnigent.inner.claude_sdk_executor._mint_gateway_bearer",
-                return_value="tok",
-            ),
-            patch(
-                "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
-                side_effect=RuntimeError("listing unavailable"),
-            ),
-        ):
-            self.assertEqual(
-                _discover_alias_model_pins(
-                    "https://wkspc.cloud.databricks.com/ai-gateway/anthropic", "printf tok"
-                ),
-                {},
-            )
+        executor = ClaudeSDKExecutor()
+        env = {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}
+        listing = Mock()
+        with patch("omnigent.model_catalog.listing_for_provider", listing):
+            _run(executor._apply_alias_model_pins(env, None))
+        self.assertEqual(env, {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"})
+        listing.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

@@ -703,6 +703,8 @@ class MockState:
         self.captured_requests: list[dict] = []
         self.request_count: int = 0
         self.pending_gates: list[QueuedResponse] = []
+        # Ids ``GET /v1/models`` reports; see ``POST /mock/served_models``.
+        self.served_models: list[str] = []
         self._lock = asyncio.Lock()
 
     def get_queue(self, key: str) -> _ResponseQueue:
@@ -846,6 +848,7 @@ class MockState:
                 del self.queues[key]
         self.captured_requests.clear()
         self.request_count = 0
+        self.served_models = []
 
 
 _state = MockState()
@@ -1102,30 +1105,28 @@ async def create_chat_completion(
 
 @app.get("/v1/models")
 async def list_models() -> dict:
-    """Return an empty model list (satisfies SDK preflight checks)."""
-    return {"object": "list", "data": []}
+    """List the models the mock gateway serves.
 
-
-# Served Claude families the mock advertises on the Databricks Anthropic-gateway
-# model listing. Lets the claude-sdk executor's served-model discovery resolve
-# family aliases to ``databricks-`` ids, so a refusal-fallback routes to a
-# servable model instead of a bare canonical id.
-SERVED_CLAUDE_MODELS: list[str] = [
-    "databricks-claude-fable-5",
-    "databricks-claude-opus-4-8",
-    "databricks-claude-sonnet-5",
-    "databricks-claude-haiku-4-5",
-]
-
-
-@app.get("/ai-gateway/anthropic/v1/models")
-async def list_gateway_models() -> dict:
-    """List the Databricks Anthropic-gateway Claude models (for discovery).
-
-    Mirrors the shape ``discover_databricks_claude_catalog`` reads so the
-    claude-sdk executor can pin ``ANTHROPIC_DEFAULT_*_MODEL`` to served ids.
+    Empty unless a test sets them via ``POST /mock/served_models`` — the
+    claude-sdk executor reads this to pin Claude Code's family aliases to the
+    ids the gateway actually serves.
     """
-    return {"object": "list", "data": [{"id": m, "object": "model"} for m in SERVED_CLAUDE_MODELS]}
+    return {"object": "list", "data": [{"id": m, "object": "model"} for m in _state.served_models]}
+
+
+@app.post("/mock/served_models")
+async def set_served_models(request: Request) -> dict[str, object]:
+    """Set the model ids ``GET /v1/models`` reports (cleared by ``/mock/reset``).
+
+    Body::
+
+        {"models": ["gw-claude-fable-5", "gw-claude-opus-4-8"]}
+    """
+    body = await request.json()
+    models = body.get("models", [])
+    async with _state._lock:
+        _state.served_models = [m for m in models if isinstance(m, str) and m]
+    return {"configured": True, "count": len(_state.served_models)}
 
 
 @app.post("/mock/configure")

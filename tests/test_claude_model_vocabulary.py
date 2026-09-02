@@ -7,6 +7,7 @@ from omnigent.claude_model_vocabulary import (
     claude_model_command_arg,
     model_vocabulary_env,
     normalized_model_id,
+    served_alias_pins,
 )
 
 # A ucode-style launch pinning: each family alias mapped to a gateway id,
@@ -188,3 +189,25 @@ def test_bracket_marker_on_a_non_alias_is_not_an_argument() -> None:
     # A dangling bracket is not a marker; on a pinned env nothing else
     # claims it either (the bare-login segment fallback is separate).
     assert claude_model_alias("sonnet[", _PINNED_ENV) is None
+
+
+def test_served_alias_pins_pick_the_newest_served_id_per_family() -> None:
+    served = [
+        "databricks-claude-opus-4-7",
+        "databricks-claude-opus-4-8",
+        "anthropic/claude-sonnet-5",
+        "gw-claude-haiku-4-5",
+        "databricks-gpt-5-6",
+        "claude-opus-5[1m]",
+    ]
+    assert served_alias_pins(served) == {
+        # ``claude-opus-5`` outranks ``4-8``; the [1m] marker is not a
+        # different model, so the spelling the gateway listed is kept.
+        "opus": "claude-opus-5[1m]",
+        "sonnet": "anthropic/claude-sonnet-5",
+        "haiku": "gw-claude-haiku-4-5",
+    }
+
+
+def test_served_alias_pins_ignore_ids_of_no_claude_family() -> None:
+    assert served_alias_pins(["databricks-gpt-5-6", "gemini-3-pro", ""]) == {}

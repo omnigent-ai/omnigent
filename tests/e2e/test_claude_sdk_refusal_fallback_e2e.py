@@ -4,21 +4,23 @@ Claude Code's safeguards can flag a message (e.g. a security-reproduction
 prompt) and return an API *refusal*. On a refusal the CLI arms its
 refusal-fallback and re-issues the turn on a different family — Opus for the
 ``cyber`` category — resolving that family through
-``ANTHROPIC_DEFAULT_OPUS_MODEL``. On the Databricks gateway that env is only
-set if Omnigent pins it: unpinned, the alias resolves to a **bare** canonical
-id (``claude-opus-4-8``) the gateway does not serve (it serves only
-``databricks-`` spelled ids), so the fallback request fails
-``model_not_found`` and the whole turn dies with
+``ANTHROPIC_DEFAULT_OPUS_MODEL``. On a gateway that serves Claude under its own
+ids, that env is only set if Omnigent pins it: unpinned, the alias resolves to
+a **canonical** vendor id (``claude-opus-4-8``) the gateway does not serve, so
+the fallback request fails ``model_not_found`` and the whole turn dies with
 ``inner executor error: There's an issue with the selected model
-(claude-opus-4-8)`` while the UI shows ``<synthetic>`` for the model.
+(claude-opus-4-8)`` while the UI shows ``<synthetic>`` for the model. (Reported
+on the Databricks gateway, whose ids are ``databricks-claude-*``; any gateway
+with its own spellings has the same failure.)
 
-The fix pins each family alias to the workspace's served id, so the fallback
-re-issues on ``databricks-claude-opus-4-8`` (servable) and the turn completes.
+The fix lists the gateway's models and pins each family alias to a served id,
+so the fallback re-issues on the gateway's Opus and the turn completes.
 
-This drives the real journey — register a claude-sdk agent, create a
-runner-bound session (real ``claude`` CLI subprocess), send a turn the mock
-LLM refuses — and asserts the fallback landed on the served Opus id (visible
-on the Anthropic wire via the mock's request capture) and the turn completed.
+This drives the real journey — register a claude-sdk agent on the mock
+gateway, create a runner-bound session (real ``claude`` CLI subprocess), send
+a turn the mock refuses — and asserts the fallback landed on the served Opus
+id (visible on the Anthropic wire via the mock's request capture) and the turn
+completed.
 
 Usage::
 
@@ -43,13 +45,20 @@ from tests.e2e.conftest import (
     poll_session_until_terminal,
     reset_mock_llm,
     send_user_message_to_session,
+    set_mock_served_models,
 )
 
-# The workspace's served Claude ids the mock advertises on its gateway model
-# listing (see ``SERVED_CLAUDE_MODELS`` in the mock server). The launch model
-# and the Opus the refusal-fallback must route to.
-_LAUNCH_MODEL = "databricks-claude-fable-5"
-_SERVED_FALLBACK_MODEL = "databricks-claude-opus-4-8"
+# The Claude ids the mock gateway serves under its own spelling — the launch
+# model and the Opus the refusal-fallback must route to. Deliberately not a
+# real vendor's spelling: the fix must work for any gateway's ids.
+_LAUNCH_MODEL = "gw-claude-fable-5"
+_SERVED_FALLBACK_MODEL = "gw-claude-opus-4-8"
+_SERVED_MODELS = [
+    _LAUNCH_MODEL,
+    _SERVED_FALLBACK_MODEL,
+    "gw-claude-sonnet-5",
+    "gw-claude-haiku-4-5",
+]
 
 
 def _register_claude_sdk_agent(
@@ -61,10 +70,8 @@ def _register_claude_sdk_agent(
 ) -> str:
     """Register a minimal claude-sdk agent bound to the mock gateway.
 
-    ``executor.auth`` is an ``api_key`` with the mock base URL — the wiring a
-    Databricks AI Gateway provider produces — and the model is a
-    ``databricks-`` id, which marks the gateway as one whose family aliases
-    need served-id pins.
+    ``executor.auth`` is an ``api_key`` with the mock base URL — the wiring
+    any Anthropic-compatible gateway provider produces.
     """
     config = {
         "spec_version": 1,
@@ -108,10 +115,13 @@ def test_claude_sdk_refusal_fallback_routes_to_served_model(
 
     The mock refuses the launch-model (Fable) turn with a ``cyber`` refusal.
     With the alias pins the fix injects, Claude Code re-issues the turn on the
-    servable ``databricks-claude-opus-4-8`` and completes — instead of dying on
-    a bare ``claude-opus-4-8`` the gateway rejects.
+    gateway's own Opus id and completes — instead of dying on a canonical
+    ``claude-opus-4-8`` the gateway rejects.
     """
     reset_mock_llm(mock_llm_server_url)
+    # What the gateway serves: the executor lists this once per session and
+    # pins each family alias to it.
+    set_mock_served_models(mock_llm_server_url, _SERVED_MODELS)
     agent_name = _register_claude_sdk_agent(
         http_client,
         name=f"refusal-fb-{uuid.uuid4().hex[:6]}",

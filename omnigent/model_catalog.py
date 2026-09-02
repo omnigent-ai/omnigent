@@ -968,6 +968,20 @@ def _redacted_failure_reason(exc: Exception) -> str:
     return type(exc).__name__
 
 
+def listing_for_provider(provider: ResolvedModelProvider) -> ModelListing:
+    """Enumerate one provider's model listing (cached, failures not cached).
+
+    The public face of :func:`_listing_for_provider` for callers that already
+    hold a :class:`ResolvedModelProvider` — e.g. a harness executor asking
+    what its gateway transport serves — rather than an agent spec.
+
+    :param provider: The resolved provider descriptor.
+    :returns: The provider's :class:`ModelListing`; ``verified`` is ``False``
+        with a ``note`` when the fetch failed.
+    """
+    return _listing_for_provider(provider, transport=None)
+
+
 def _listing_for_provider(
     provider: ResolvedModelProvider,
     *,
