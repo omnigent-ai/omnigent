@@ -163,13 +163,11 @@ function GithubFileSection({
   );
 }
 
-// How many job names to list in a pill's hover card before collapsing the rest.
-const CHECK_NAMES_SHOWN = 25;
-
 /**
  * A CI-status pill (e.g. "✓ 66 passed"); hovering it reveals the individual job
  * names in that bucket, each with the status icon and a divider between rows.
- * Renders nothing when the bucket is empty.
+ * Renders nothing when the bucket is empty. The full list shows — the card is
+ * height-capped and scrolls.
  */
 function CheckPill({
   label,
@@ -188,8 +186,6 @@ function CheckPill({
 }) {
   if (count === 0) return null;
   const names = runs.filter((r) => r.name);
-  const shown = names.slice(0, CHECK_NAMES_SHOWN);
-  const overflow = names.length - shown.length;
   return (
     <HoverCard openDelay={100} closeDelay={100}>
       <HoverCardTrigger asChild>
@@ -213,7 +209,7 @@ function CheckPill({
           <p className="px-1.5 py-1 text-muted-foreground">No job details.</p>
         ) : (
           <ul className="divide-y divide-border">
-            {shown.map((r) => (
+            {names.map((r) => (
               <li key={r.url ?? r.name} className="flex items-center gap-2 px-1.5 py-1.5">
                 <span className="shrink-0">{icon}</span>
                 <span className="truncate" title={r.name}>
@@ -221,9 +217,6 @@ function CheckPill({
                 </span>
               </li>
             ))}
-            {overflow > 0 && (
-              <li className="px-1.5 py-1.5 text-muted-foreground">+{overflow} more</li>
-            )}
           </ul>
         )}
       </HoverCardContent>
