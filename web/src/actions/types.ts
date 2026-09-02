@@ -124,6 +124,7 @@ export const KEYBINDING_MODES = [
 ] as const;
 
 export type KeybindingMode = (typeof KEYBINDING_MODES)[number];
+export type ActionScopeId = string & { readonly __actionScopeId: unique symbol };
 
 /**
  * `mod` is the conventional platform modifier (Meta on Apple, Ctrl elsewhere).
@@ -147,13 +148,13 @@ export interface ActionContextValues {
   inputFocus: boolean;
   terminalFocus: boolean;
   monacoFocus: boolean;
+  markdownEditorFocus: boolean;
   eventMeta: boolean;
   composerStreaming: boolean;
   composerSuggestionsOpen: boolean;
   composerEnterInserts: boolean;
   composerSubmitWithModEnter: boolean;
   fileSearchOpen: boolean;
-  shikiSourceView: boolean;
 }
 
 export type ContextKey = keyof ActionContextValues;
@@ -185,7 +186,7 @@ export type KeybindingRule<A extends ActionId = ActionId> = A extends ActionId
       activation?: "focused" | "active";
       when?: ContextExpression;
       phase?: "capture" | "bubble";
-      /** Higher values win among otherwise equally specific matching rules. */
+      /** Higher values win among rules in the same focus/activation class. */
       priority?: number;
       allowRepeat?: boolean;
       /** Preserve legacy globals that ran after a widget called preventDefault. */

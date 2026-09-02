@@ -4,7 +4,8 @@
 // formatting commands, editor.isActive() for active-state badges, and
 // editor.storage.markdown.getMarkdown() for copy / save.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
+import { HANDLED, useRegisterAction } from "@/actions";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useEditorState } from "@tiptap/react";
 import {
@@ -293,17 +294,14 @@ export function ToolbarPlugin({
     onSave(getMarkdown());
   }, [getMarkdown, onSave, isDirty, saveDisabled, hasExternalUpdate]);
 
-  // Cmd/Ctrl+S to save.
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "s") {
-        e.preventDefault();
-        handleSave();
-      }
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [handleSave]);
+  useRegisterAction("file.action.save", {
+    acceptsKeybindings: true,
+    run: () => {
+      // Claim browser Save even when there is currently nothing writable.
+      handleSave();
+      return HANDLED;
+    },
+  });
 
   const {
     canUndo,

@@ -73,6 +73,7 @@ export function KeybindingDispatcher({
         context: actions.registry.contextForResolution(resolution),
         focusedModes: actions.registry.getFocusedModes(resolution.focusedScopeIds),
         activeModes: actions.registry.getActiveModes(),
+        focusedModeRanks: actions.registry.getFocusedModeRanks(resolution.focusedScopeIds),
         contextsForRule: (rule) => actions.registry.contextsForRule(rule, resolution),
       };
 

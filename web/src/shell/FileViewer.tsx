@@ -46,6 +46,13 @@ import {
   Trash2Icon,
   WrapTextIcon,
 } from "lucide-react";
+import {
+  ActionScopeProvider,
+  HANDLED,
+  NOT_HANDLED,
+  useActionScopeRegistration,
+  useRegisterAction,
+} from "@/actions";
 import { useSearchParams } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import {
@@ -297,6 +304,8 @@ interface FileViewerProps {
    * when the viewer is embedded inside the inline right panel.
    */
   frameless?: boolean;
+  /** Explicitly gate keyboard ownership when a CSS-mounted viewer is hidden. */
+  actionActive?: boolean;
   /** Called when the user presses Escape to close the active file tab. */
   onCloseTab?: () => void;
   /** Called when the comments panel opens or closes inside the viewer. */
@@ -337,6 +346,7 @@ function FileViewerBody({
   onNavigateTo,
   permissionLevel,
   frameless,
+  actionActive,
   onCommentsOpenChange,
   sort = "recent",
 }: FileViewerProps) {
@@ -586,52 +596,69 @@ function FileViewerBody({
       return true;
     });
   }, [searchInputRef]);
-
-  // Keyboard shortcut: Alt+← / Alt+→ to navigate between changed files.
-  useEffect(() => {
-    if (!open || !onNavigateTo || currentNavIdx === -1) return;
-    const handler = (e: KeyboardEvent) => {
-      if (!e.altKey) return;
-      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
-      // Don't hijack word-navigation when the user is typing in an input.
-      const target = e.target;
+  const showSearch = useCallback(() => {
+    setSearchOpen(true);
+    setTimeout(() => searchInputRef.current?.focus(), 0);
+  }, [searchInputRef]);
+  const fileScope = useActionScopeRegistration({
+    mode: "fileViewer",
+    active: actionActive ?? (open && (frameless ? isDesktop : !isDesktop)),
+    context: { fileSearchOpen: searchOpen },
+  });
+  useRegisterAction("file.action.find", {
+    scope: fileScope.id,
+    acceptsKeybindings: true,
+    run: ({ source, event }) => {
+      if (!open) return NOT_HANDLED;
+      const target = event?.target;
       if (
-        target instanceof HTMLElement &&
-        target.closest('textarea, input, [contenteditable="true"]')
+        source === "keyboard" &&
+        searchOpen &&
+        target instanceof Element &&
+        target.closest(".monaco-editor")
       ) {
-        return;
+        return NOT_HANDLED;
       }
-      if (e.key === "ArrowLeft" && prevPath) {
-        e.preventDefault();
-        guardDirty(() => onNavigateTo(prevPath));
-      } else if (e.key === "ArrowRight" && nextPath) {
-        e.preventDefault();
-        guardDirty(() => onNavigateTo(nextPath));
-      }
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [open, onNavigateTo, currentNavIdx, prevPath, nextPath, guardDirty]);
-
-  // Escape closes the active file tab (when search is not open).
-  useEffect(() => {
-    if (!open || !onCloseTab) return;
-    const handler = (e: KeyboardEvent) => {
-      if (e.key !== "Escape" || e.defaultPrevented) return;
-      if (searchOpen) return;
-      const target = e.target;
-      if (
-        target instanceof HTMLElement &&
-        target.closest('textarea, input, [contenteditable="true"]')
-      ) {
-        return;
-      }
-      e.preventDefault();
+      showSearch();
+      return HANDLED;
+    },
+  });
+  useRegisterAction("file.action.closeSearch", {
+    scope: fileScope.id,
+    acceptsKeybindings: true,
+    run: () => {
+      if (!searchOpen) return NOT_HANDLED;
+      setSearchOpen(false);
+      return HANDLED;
+    },
+  });
+  useRegisterAction("file.action.openPreviousChanged", {
+    scope: fileScope.id,
+    acceptsKeybindings: true,
+    run: () => {
+      if (!open || !onNavigateTo || !prevPath) return NOT_HANDLED;
+      guardDirty(() => onNavigateTo(prevPath));
+      return HANDLED;
+    },
+  });
+  useRegisterAction("file.action.openNextChanged", {
+    scope: fileScope.id,
+    acceptsKeybindings: true,
+    run: () => {
+      if (!open || !onNavigateTo || !nextPath) return NOT_HANDLED;
+      guardDirty(() => onNavigateTo(nextPath));
+      return HANDLED;
+    },
+  });
+  useRegisterAction("file.action.close", {
+    scope: fileScope.id,
+    acceptsKeybindings: true,
+    run: () => {
+      if (!open || !onCloseTab || searchOpen) return NOT_HANDLED;
       guardDirty(onCloseTab);
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [open, onCloseTab, searchOpen, guardDirty]);
+      return HANDLED;
+    },
+  });
 
   // View mode toggle — markdown defaults to the rich-text editor, HTML and
   // notebooks to their rendered preview, and everything else to source.
@@ -1580,16 +1607,18 @@ function FileViewerBody({
   if (frameless) {
     return (
       <div
+        {...fileScope.rootProps}
         data-testid="file-viewer"
         className="flex flex-col flex-1 min-h-0 overflow-hidden bg-card"
       >
-        {innerContent}
+        <ActionScopeProvider scope={fileScope}>{innerContent}</ActionScopeProvider>
       </div>
     );
   }
 
   return (
     <aside
+      {...fileScope.rootProps}
       data-testid="file-viewer"
       style={{ width: panelWidth, paddingBottom: keyboardInset || undefined }}
       className={cn(
@@ -1612,7 +1641,7 @@ function FileViewerBody({
           className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
         />
       )}
-      {open && innerContent}
+      {open && <ActionScopeProvider scope={fileScope}>{innerContent}</ActionScopeProvider>}
     </aside>
   );
 }

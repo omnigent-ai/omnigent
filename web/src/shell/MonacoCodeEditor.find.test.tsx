@@ -12,7 +12,8 @@
 // onFindReplaceStateChange). The comment layer and save wiring are irrelevant
 // here, so they're mocked out.
 
-import { act, render } from "@testing-library/react";
+import { act, fireEvent, render } from "@testing-library/react";
+import { ActionScope, ActionsProvider, KeybindingDispatcher } from "@/actions";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Mock } from "vitest";
 
@@ -162,9 +163,17 @@ function makeEditor(props: { searchOpen?: boolean; onSearchHandled?: () => void 
 
 // Render and flush the ready promise so <Editor> mounts and onMount fires.
 async function renderMounted(el: React.ReactElement) {
-  const utils = render(el);
+  const wrap = (child: React.ReactElement) => (
+    <ActionsProvider>
+      <KeybindingDispatcher />
+      <ActionScope mode="fileViewer">
+        <div>{child}</div>
+      </ActionScope>
+    </ActionsProvider>
+  );
+  const utils = render(wrap(el));
   await act(async () => {});
-  return utils;
+  return { ...utils, rerender: (next: React.ReactElement) => utils.rerender(wrap(next)) };
 }
 
 beforeEach(() => {
@@ -187,6 +196,13 @@ afterEach(() => {
 });
 
 describe("MonacoCodeEditor find toggle", () => {
+  it("runs native find on every centralized shortcut invocation", async () => {
+    await renderMounted(makeEditor());
+    fireEvent.keyDown(window, { key: "f", metaKey: true });
+    fireEvent.keyDown(window, { key: "f", metaKey: true });
+    expect(fakeController.run).toHaveBeenCalledTimes(2);
+  });
+
   it("opens Monaco's native find when searchOpen is set", async () => {
     await renderMounted(makeEditor({ searchOpen: true }));
     // The toolbar Find button (searchOpen=true) runs Monaco's find action.

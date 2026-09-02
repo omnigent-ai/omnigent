@@ -22,6 +22,7 @@ import type {
   ActionId,
   ActionInvocation,
   ActionResult,
+  ActionScopeId,
   ActionSource,
   ArglessActionId,
   ContextPatch,
@@ -46,12 +47,12 @@ function eventElement(event?: KeyboardEvent): Element | null {
   return document.activeElement instanceof Element ? document.activeElement : null;
 }
 
-export function actionScopeIdsFromElement(element: Element | null): string[] {
-  const ids: string[] = [];
+export function actionScopeIdsFromElement(element: Element | null): ActionScopeId[] {
+  const ids: ActionScopeId[] = [];
   let current: Element | null = element;
   while (current) {
     const id = current.getAttribute(ACTION_SCOPE_ATTRIBUTE);
-    if (id) ids.push(id);
+    if (id) ids.push(id as ActionScopeId);
     current = current.parentElement;
   }
   return ids;
@@ -73,6 +74,7 @@ function actionContext(
     inputFocus: isInputLike(element),
     terminalFocus: Boolean(element?.closest(".xterm")),
     monacoFocus: Boolean(element?.closest(".monaco-editor")),
+    markdownEditorFocus: Boolean(element?.closest(".ProseMirror")),
     eventMeta: event?.metaKey ?? false,
   };
 }
@@ -88,7 +90,7 @@ interface ActionsRuntime extends ActionsApi {
 }
 
 const ActionsContext = createContext<ActionsRuntime | null>(null);
-const ScopeContext = createContext<string | null>(null);
+const ScopeContext = createContext<ActionScopeId | null>(null);
 
 export function ActionsProvider({ children }: { children: ReactNode }) {
   const embedded = useIsEmbedded();
@@ -203,7 +205,7 @@ export interface ActionScopeOptions {
 }
 
 export interface ActionScopeHandle {
-  id: string;
+  id: ActionScopeId;
   rootProps: ScopeElementProps;
 }
 
@@ -228,7 +230,7 @@ export function useActionScopeRegistration({
   const actions = useActionRuntime();
   const parentId = useContext(ScopeContext);
   const reactId = useId();
-  const id = `action-scope-${reactId}`;
+  const id = `action-scope-${reactId}` as ActionScopeId;
   const latest = useRef({ mode, active, context });
   const focusGeneration = useRef(0);
   latest.current = { mode, active, context };
@@ -300,7 +302,7 @@ export function ActionScope({ children, ...options }: ActionScopeProps) {
   return <ActionScopeProvider scope={scope}>{scopedChild}</ActionScopeProvider>;
 }
 
-export function useCurrentActionScopeId(): string | null {
+export function useCurrentActionScopeId(): ActionScopeId | null {
   return useContext(ScopeContext);
 }
 

@@ -95,6 +95,29 @@ describe("keybinding resolver", () => {
     expect(matchingKeybindingRules(rules, repeated, 0, "capture", environment)).toEqual([]);
   });
 
+  it("ranks focused and global ownership ahead of active background modes", () => {
+    const rules = [
+      testRule("active-file", "escape", {
+        mode: "fileViewer",
+        activation: "active",
+        priority: 100,
+      }),
+      testRule("global", "escape"),
+      testRule("focused-composer", "escape", { mode: "composer" }),
+    ];
+    expect(
+      matchingKeybindingRules(rules, event("Escape"), 0, "bubble", {
+        ...environment,
+        focusedModes: new Set(["global", "composer"]),
+        activeModes: new Set(["global", "composer", "fileViewer"]),
+        focusedModeRanks: new Map([
+          ["global", 0],
+          ["composer", 1],
+        ]),
+      }).map((rule) => rule.id),
+    ).toEqual(["focused-composer", "global", "active-file"]);
+  });
+
   it("sorts by priority, context specificity, then later rule", () => {
     const context = { ...EMPTY_ACTION_CONTEXT, terminalFocus: true };
     const rules = [

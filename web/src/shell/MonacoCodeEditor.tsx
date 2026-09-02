@@ -16,6 +16,7 @@
 // (offsets must match the saved server content).
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { HANDLED, NOT_HANDLED, useRegisterAction } from "@/actions";
 import { Editor, type EditorProps, type OnChange, type OnMount } from "@monaco-editor/react";
 import { AlertTriangleIcon, MessageSquareOffIcon } from "lucide-react";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
@@ -280,10 +281,26 @@ function MonacoCodeEditorInner({
     getContent: () => latestContentRef.current,
     isEditorDirty,
   });
-  // Stable ref so the Monaco Cmd+S command + blur listener (registered once in
-  // handleMount) always call the latest flush.
+  // Stable ref so the save action + blur listener always call the latest flush.
   const flushRef = useRef(autoSave.flush);
   flushRef.current = autoSave.flush;
+  useRegisterAction("file.action.save", {
+    acceptsKeybindings: true,
+    run: () => {
+      flushRef.current();
+      return HANDLED;
+    },
+  });
+  useRegisterAction("file.action.find", {
+    acceptsKeybindings: true,
+    priority: 10, // native Monaco find overrides FileViewer's generic fallback
+    run: () => {
+      const action = editorInstanceRef.current?.getAction("actions.find");
+      if (!action) return NOT_HANDLED;
+      void action.run();
+      return HANDLED;
+    },
+  });
 
   // Monaco scrolls internally, so its offset is cached per conversation + file
   // rather than via the DOM scroll-restore hook. Held in a ref so the mount-time
@@ -306,13 +323,6 @@ function MonacoCodeEditorInner({
             ? monaco.editor.EndOfLineSequence.CRLF
             : monaco.editor.EndOfLineSequence.LF,
         );
-      // Route ⌘S through the same single-flight + trailing-save engine as
-      // auto-save, so a manual save during an in-flight/debounced auto-save can't
-      // start an overlapping PUT.
-      // Monaco keybindings are bitwise OR'd flags.
-      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
-        flushRef.current();
-      });
       // Flush a pending debounce when focus leaves the editor (snappier than
       // waiting out the timer). Disposed with the editor on unmount.
       editor.onDidBlurEditorWidget(() => {
@@ -350,8 +360,9 @@ function MonacoCodeEditorInner({
     [setContentRef],
   );
 
-  // Mirror Monaco's native find widget to the toolbar toggle. Gated on `mounted`
-  // so a Find pressed while the lazy chunk was still loading isn't dropped — when
+  // Mirror Monaco's native find widget to the toolbar toggle. Keyboard actions
+  // run Monaco find directly; this path handles toolbar requests and lazy load.
+  // Gated on `mounted` so a request made while loading isn't dropped — when
   // the editor mounts, `mounted` flips and this re-runs with the current flag.
   // `searchOpen` true opens find; false closes it (so re-clicking the toolbar
   // button, which toggles the flag, hides the widget). The controller drives the

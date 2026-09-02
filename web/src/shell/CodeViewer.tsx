@@ -10,6 +10,7 @@
 //   Existing comments highlight the lines they span. Clicking inside a
 //   highlighted range navigates to that comment in CommentsPanel.
 
+import { HANDLED, NOT_HANDLED, useRegisterAction } from "@/actions";
 import { createPortal } from "react-dom";
 import {
   isValidElement,
@@ -560,59 +561,25 @@ export function CodeViewer({
 
   const isMarkdownEditor = viewMode === "editor" && lang === "markdown";
 
-  // Markdown editor mode has its own find bar (MarkdownSearchBar), driven by the
-  // shared `searchOpen` toggle. Cmd+F opens it and Escape closes it; the bar
-  // also handles Escape while its input is focused, but this covers the case
-  // where focus is in the editor body.
-  useEffect(() => {
-    if (!panelOpen || !isMarkdownEditor) return;
-    const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "f") {
-        e.preventDefault();
-        setSearchOpen(true);
-        setTimeout(() => searchInputRef.current?.focus(), 0);
-      } else if (e.key === "Escape" && searchOpen) {
-        e.preventDefault();
-        setSearchOpen(false);
-      }
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [panelOpen, isMarkdownEditor, searchOpen, setSearchOpen, searchInputRef]);
-
-  // Open search on Cmd+F / Ctrl+F in the Shiki source view.
-  useEffect(() => {
-    // Skip in Monaco mode (Monaco owns Cmd+F) and markdown editor mode (handled
-    // above with its own find bar).
-    if (!panelOpen || isMarkdownEditor || showMonaco) return;
-    const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "f") {
-        e.preventDefault();
-        setSearchOpen(true);
-        setTimeout(() => searchInputRef.current?.focus(), 0);
-      } else if ((e.metaKey || e.ctrlKey) && e.key === "a") {
+  useRegisterAction(
+    "file.action.selectAllContent",
+    {
+      acceptsKeybindings: true,
+      isEnabled: () => panelOpen && !isMarkdownEditor && !showMonaco,
+      run: () => {
         const container = codeContainerRef.current;
-        if (!container) return;
-        // Don't intercept when an input or textarea has focus (let the browser handle it).
-        const active = document.activeElement;
-        if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) return;
-        e.preventDefault();
         const selection = window.getSelection();
-        if (!selection) return;
+        if (!container || !selection) return NOT_HANDLED;
         const range = document.createRange();
         range.selectNodeContents(container);
         selection.removeAllRanges();
         selection.addRange(range);
         selectAllPendingRef.current = true;
-      } else if (e.key === "Escape" && searchOpen) {
-        e.preventDefault();
-        setSearchOpen(false);
-        setSearchQuery("");
-      }
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [panelOpen, isMarkdownEditor, showMonaco, searchOpen, setSearchOpen, searchInputRef]);
+        return HANDLED;
+      },
+    },
+    `${panelOpen}:${isMarkdownEditor}:${showMonaco}`,
+  );
 
   // In Monaco mode the custom search bar isn't rendered; the editor mirrors its
   // native find widget to `searchOpen` (open when set, close when cleared). This

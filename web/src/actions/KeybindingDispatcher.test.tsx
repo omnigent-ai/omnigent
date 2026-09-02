@@ -21,6 +21,8 @@ function Handler({
     | "composer.action.send"
     | "composer.action.acceptSuggestion"
     | "composer.action.commitDictation"
+    | "composer.action.dismissSuggestions"
+    | "file.action.closeSearch"
     | "panel.action.closeFiles"
     | "session.action.new"
     | "workbench.action.toggleConversationsSidebar"
@@ -237,6 +239,31 @@ describe("KeybindingDispatcher", () => {
     });
     expect(accept).toHaveBeenCalledOnce();
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it("prefers a focused composer rule over an active file rule", () => {
+    const dismiss = vi.fn(() => HANDLED);
+    const closeSearch = vi.fn(() => HANDLED);
+    renderActions(
+      <>
+        <ActionScope mode="fileViewer" context={{ fileSearchOpen: true }}>
+          <div>
+            <Handler action="file.action.closeSearch" run={closeSearch} />
+          </div>
+        </ActionScope>
+        <ActionScope mode="composer" context={{ composerSuggestionsOpen: true }}>
+          <div>
+            <Handler action="composer.action.dismissSuggestions" run={dismiss} />
+            <textarea aria-label="focused composer" />
+          </div>
+        </ActionScope>
+      </>,
+    );
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "focused composer" }), {
+      key: "Escape",
+    });
+    expect(dismiss).toHaveBeenCalledOnce();
+    expect(closeSearch).not.toHaveBeenCalled();
   });
 
   it("falls through a notHandled capture action to a composer bubble action", () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ACTION_CATALOG, getActionDefinition } from "./catalog";
-import { contextsMayOverlap } from "./context";
+import { contextsMayOverlap, EMPTY_ACTION_CONTEXT, evaluateContext } from "./context";
 import { DEFAULT_KEYBINDINGS } from "./defaultKeybindings";
 import { parseKeybinding, serializeKeybinding } from "./keybindingParser";
 import { ACTION_IDS } from "./types";
@@ -131,10 +131,32 @@ describe("default keybindings", () => {
         "chat.action.acceptApproval",
         "composer.action.commitDictation",
         "composer.action.cancelDictation",
+        "file.action.find",
         "file.action.save",
         "terminal.action.sendSequence",
       ]),
     );
+  });
+
+  it("models file rules as active while keeping commands out of unrelated inputs", () => {
+    const fileRules = DEFAULT_KEYBINDINGS.filter((rule) => rule.action.startsWith("file.action"));
+    expect(fileRules.every((rule) => rule.activation === "active")).toBe(true);
+    const find = fileRules.find((rule) => rule.action === "file.action.find")!;
+    expect(evaluateContext(find.when, { ...EMPTY_ACTION_CONTEXT, inputFocus: true })).toBe(false);
+    expect(
+      evaluateContext(find.when, {
+        ...EMPTY_ACTION_CONTEXT,
+        inputFocus: true,
+        monacoFocus: true,
+      }),
+    ).toBe(true);
+    expect(
+      evaluateContext(find.when, {
+        ...EMPTY_ACTION_CONTEXT,
+        inputFocus: true,
+        markdownEditorFocus: true,
+      }),
+    ).toBe(true);
   });
 
   it("models open panels as active rather than focus-only modes", () => {
