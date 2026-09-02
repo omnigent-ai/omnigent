@@ -5691,13 +5691,14 @@ async def _run_dismiss_stranded_spinner(
     *,
     bridge_dir: Path,
     status: int = 200,
-) -> list[_CapturedRequest]:
+) -> tuple[list[_CapturedRequest], bool]:
     """
     Drive ``_maybe_dismiss_stranded_compaction_spinner`` against a mock AP.
 
     :param bridge_dir: Bridge dir holding the compaction state.
     :param status: HTTP status the mock endpoint returns.
-    :returns: Every request the helper issued, in order.
+    :returns: ``(captured requests in order, dismissed)`` where ``dismissed``
+        is the helper's return — ``True`` when a pending token was found.
     """
     captured: list[_CapturedRequest] = []
 
@@ -5709,10 +5710,10 @@ async def _run_dismiss_stranded_spinner(
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
-        await forwarder._maybe_dismiss_stranded_compaction_spinner(
+        dismissed = await forwarder._maybe_dismiss_stranded_compaction_spinner(
             client, session_id="conv_x", bridge_dir=bridge_dir
         )
-    return captured
+    return captured, dismissed
 
 
 async def test_compact_refusal_dismisses_stranded_spinner(tmp_path: Path) -> None:
@@ -5730,8 +5731,9 @@ async def test_compact_refusal_dismisses_stranded_spinner(tmp_path: Path) -> Non
         bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
     )
 
-    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir)
+    captured, dismissed = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir)
 
+    assert dismissed is True
     assert captured == [
         _CapturedRequest(
             method="POST",
@@ -5745,17 +5747,54 @@ async def test_compact_refusal_dismisses_stranded_spinner(tmp_path: Path) -> Non
 
 async def test_compact_refusal_without_pending_token_no_ops(tmp_path: Path) -> None:
     """
-    A refusal with no in-flight ``PreCompact`` posts nothing.
+    A refusal with no in-flight ``PreCompact`` posts nothing and stays armed.
 
-    No pending token means the spinner was never raised (or already
-    resolved), so a ``failed`` post would be spurious.
+    No pending token means the ``PreCompact`` has not been observed yet, so a
+    ``failed`` post would be spurious. The helper returns ``False`` so the
+    caller keeps its deferred-dismiss flag armed for a later poll.
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
 
-    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir)
+    captured, dismissed = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir)
 
+    assert dismissed is False
     assert captured == [], f"expected no POST without a pending token, got {captured!r}"
+
+
+async def test_compact_refusal_dismisses_when_precompact_arrives_later(tmp_path: Path) -> None:
+    """
+    A refusal seen before its ``PreCompact`` stays armed, then dismisses.
+
+    Guards the cross-poll inversion: if the refusal transcript item is read
+    in a poll BEFORE the ``PreCompact`` hook becomes visible, the first
+    dismissal attempt finds no token and returns ``False`` (caller keeps the
+    flag armed). Once the ``PreCompact`` mints the token, a later attempt
+    posts ``failed`` — so the spinner is never stranded.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    # Poll N: refusal observed first, no PreCompact token yet.
+    captured, dismissed = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir)
+    assert dismissed is False
+    assert captured == []
+
+    # Poll N+k: PreCompact finally lands and mints the pending token.
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
+    )
+    captured, dismissed = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir)
+
+    assert dismissed is True
+    assert captured == [
+        _CapturedRequest(
+            method="POST",
+            path="/v1/sessions/conv_x/events",
+            body={"type": "external_compaction_status", "data": {"status": "failed"}},
+        )
+    ], f"expected the deferred failed POST once the token appeared, got {captured!r}"
+    assert forwarder._read_compaction_state(bridge_dir).pending is None
 
 
 async def test_compact_refusal_swallows_post_failure(tmp_path: Path) -> None:
@@ -5766,10 +5805,12 @@ async def test_compact_refusal_swallows_post_failure(tmp_path: Path) -> None:
         bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
     )
 
-    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir, status=503)
+    captured, dismissed = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir, status=503)
 
-    # Attempted once, the 503 swallowed. The token is still cleared (the
-    # spinner-owning PreCompact will never complete regardless).
+    # Attempted once, the 503 swallowed. Returns True (token consumed, no
+    # point retrying) and the token is cleared (the spinner-owning PreCompact
+    # will never complete regardless).
+    assert dismissed is True
     assert len(captured) == 1
     assert captured[0].method == "POST"
     assert forwarder._read_compaction_state(bridge_dir).pending is None

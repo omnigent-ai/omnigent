@@ -1006,14 +1006,20 @@ async def forward_claude_transcript_to_session(
                         # Deferred ``/compact``-refusal dismissal: runs AFTER
                         # the hook phase so the ``failed`` post always follows
                         # the ``PreCompact`` ``in_progress`` that raised the
-                        # spinner, even when both land in this same poll.
+                        # spinner, even when both land in this same poll. The
+                        # flag stays ARMED across polls until a pending token is
+                        # actually found and dismissed, so a ``PreCompact`` that
+                        # only becomes visible in a LATER poll than the refusal
+                        # transcript item still gets dismissed rather than
+                        # stranding the spinner.
                         if dedupe.pending_compaction_dismiss:
-                            dedupe.pending_compaction_dismiss = False
-                            await _maybe_dismiss_stranded_compaction_spinner(
+                            dismissed = await _maybe_dismiss_stranded_compaction_spinner(
                                 client,
                                 session_id=current_session_id,
                                 bridge_dir=bridge_dir,
                             )
+                            if dismissed:
+                                dedupe.pending_compaction_dismiss = False
                         subagent_state = await _forward_available_subagents(
                             client=client,
                             parent_session_id=current_session_id,
@@ -5275,7 +5281,7 @@ async def _maybe_dismiss_stranded_compaction_spinner(
     *,
     session_id: str,
     bridge_dir: Path,
-) -> None:
+) -> bool:
     """
     Dismiss the "Compacting…" spinner when Claude declines to compact.
 
@@ -5292,14 +5298,19 @@ async def _maybe_dismiss_stranded_compaction_spinner(
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
     :param bridge_dir: Native Claude bridge directory.
-    :returns: None.
+    :returns: ``True`` when a pending token was found and the ``failed``
+        dismissal was posted; ``False`` when there was no pending token yet
+        (the ``PreCompact`` has not been observed) so the caller keeps the
+        deferred-dismiss flag armed for a later poll. Also ``True`` on a
+        failed POST — the token is consumed and retrying is pointless.
     """
     # Only dismiss when there is actually an in-flight PreCompact token — the
     # refusal spinner we raised. A refusal with no pending token means the
-    # spinner was never raised (or already resolved), so a ``failed`` post
-    # would be spurious.
+    # ``PreCompact`` has not been observed yet (or the spinner already
+    # resolved), so a ``failed`` post would be spurious; signal the caller to
+    # keep the flag armed and retry next poll.
     if not await _discard_pending_compaction(bridge_dir):
-        return
+        return False
     try:
         await _post_external_compaction_status(
             client,
@@ -5315,6 +5326,7 @@ async def _maybe_dismiss_stranded_compaction_spinner(
             exc_info=True,
             extra={"session_id": session_id},
         )
+    return True
 
 
 async def _claim_standalone_completion(bridge_dir: Path) -> int | None:
