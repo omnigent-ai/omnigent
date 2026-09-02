@@ -54,7 +54,6 @@ import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from types import ModuleType
 from typing import Any, cast
 
 from omnigent.process_logging import LOG_TTY_FD_ENV_VAR, env_truthy
@@ -87,11 +86,10 @@ _ZYGOTE_TEST_CHILD_SLEEP_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_SLEEP"
 
 @dataclass(frozen=True)
 class _SourceFileStamp:
-    """Metadata identifying one imported package file."""
+    """Metadata identifying one package source file."""
 
     path: Path
     modified_ns: int
-    changed_ns: int
     size: int
     inode: int
 
@@ -101,7 +99,7 @@ class _GraphStamp:
     """Build and source state backing the zygote's imported graph."""
 
     build: tuple[float, str] | None
-    sources: tuple[_SourceFileStamp, ...]
+    sources: tuple[_SourceFileStamp, ...] | None
 
 
 def _disk_build_stamp(package_dir: Path | None = None) -> tuple[float, str] | None:
@@ -137,19 +135,22 @@ def _disk_build_stamp(package_dir: Path | None = None) -> tuple[float, str] | No
         return None
 
 
-def _source_file_stamps(paths: Iterable[Path]) -> tuple[_SourceFileStamp, ...]:
-    """Capture stable metadata for existing source files in *paths*."""
+def _source_file_stamps(paths: Iterable[Path]) -> tuple[_SourceFileStamp, ...] | None:
+    """Capture file metadata, returning ``None`` if the baseline is incomplete."""
     stamps: list[_SourceFileStamp] = []
-    for path in sorted(set(paths)):
+    try:
+        unique_paths = sorted(set(paths))
+    except OSError:
+        return None
+    for path in unique_paths:
         try:
             stat = path.stat()
         except OSError:
-            continue
+            return None
         stamps.append(
             _SourceFileStamp(
                 path=path,
                 modified_ns=stat.st_mtime_ns,
-                changed_ns=stat.st_ctime_ns,
                 size=stat.st_size,
                 inode=stat.st_ino,
             )
@@ -157,40 +158,18 @@ def _source_file_stamps(paths: Iterable[Path]) -> tuple[_SourceFileStamp, ...]:
     return tuple(stamps)
 
 
-def _module_file(module: ModuleType) -> Path | None:
-    """Return a module's source path, preferring ``.py`` over cached bytecode."""
-    raw_path = getattr(module, "__file__", None)
-    if not isinstance(raw_path, str):
-        return None
-    path = Path(raw_path)
-    if path.suffix in {".pyc", ".pyo"}:
-        with contextlib.suppress(ValueError):
-            source = Path(importlib.util.source_from_cache(str(path)))
-            if source.exists():
-                path = source
-    with contextlib.suppress(OSError):
-        return path.resolve()
-    return None
-
-
-def _loaded_source_stamps(package_dir: Path | None = None) -> tuple[_SourceFileStamp, ...]:
-    """Fingerprint imported ``omnigent`` files inside the active package tree."""
+def _package_source_stamps(
+    package_dir: Path | None = None,
+) -> tuple[_SourceFileStamp, ...] | None:
+    """Fingerprint all Python sources, including modules imported lazily later."""
     package_root = (package_dir or Path(__file__).resolve().parents[1]).resolve()
-    paths: set[Path] = set()
-    for name, module in tuple(sys.modules.items()):
-        if name != "omnigent" and not name.startswith("omnigent."):
-            continue
-        if not isinstance(module, ModuleType):
-            continue
-        path = _module_file(module)
-        if path is None or not path.is_relative_to(package_root):
-            continue
-        paths.add(path)
-    return _source_file_stamps(paths)
+    return _source_file_stamps(package_root.rglob("*.py"))
 
 
-def _source_files_match(stamps: tuple[_SourceFileStamp, ...]) -> bool:
-    """Return whether every imported package file still matches its boot metadata."""
+def _source_files_match(stamps: tuple[_SourceFileStamp, ...] | None) -> bool:
+    """Return whether every package source still matches its boot metadata."""
+    if stamps is None:
+        return False
     if not stamps:
         return True
     return _source_file_stamps(stamp.path for stamp in stamps) == stamps
@@ -388,8 +367,8 @@ class _ZygoteServer:
     thread per connection.
 
     :param control_sock: The daemon control socket (role ``"daemon"``).
-    :param graph_stamp: Build and imported-source state captured after the
-        zygote imported its graph. Both runner and harness forks are refused
+    :param graph_stamp: Build and package-source state captured before the
+        zygote imports its graph. Both runner and harness forks are refused
         once either changes on disk: the child would otherwise resolve lazy
         imports from new files against the old in-memory graph.
     """
@@ -602,7 +581,7 @@ class _ZygoteServer:
             conn,
             {
                 "error": (
-                    "omnigent was upgraded on disk after the zygote imported its "
+                    "omnigent changed on disk after the zygote imported its "
                     f"graph; refusing to fork a mixed-version {kind}"
                 )
             },
@@ -749,11 +728,12 @@ def main() -> None:
 
     control_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, fileno=control_fd)
 
-    _import_runner_graph()
+    # A source update during graph import must make later forks fail closed.
     graph_stamp = _GraphStamp(
         build=_disk_build_stamp(),
-        sources=_loaded_source_stamps(),
+        sources=_package_source_stamps(),
     )
+    _import_runner_graph()
     # The import graph is now static; move it out of GC's tracked set so cyclic
     # collections stay cheap and don't dirty shared pages in forked children.
     gc.freeze()
