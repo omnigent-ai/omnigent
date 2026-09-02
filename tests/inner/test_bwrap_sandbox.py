@@ -520,6 +520,70 @@ def test_wrap_launcher_argv_cwd_read_only_by_default(tmp_path: Path) -> None:
     assert "--bind" not in bind_verbs
 
 
+def test_wrap_launcher_argv_read_root_on_cwd_does_not_overmount_writable_bind(
+    tmp_path: Path,
+) -> None:
+    """
+    A ``read_roots`` entry that equals the writable cwd must be emitted
+    BEFORE the cwd's ``--bind``: bwrap layers later mounts on top of
+    earlier ones, so a read-only bind emitted after the writable one
+    would silently remount the whole workspace read-only.
+    """
+    backend = _make_backend()
+    cwd_resolved = tmp_path.resolve(strict=False)
+    policy = _make_policy(
+        tmp_path,
+        write_roots=[cwd_resolved],
+        read_roots=[cwd_resolved],
+    )
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    mounts = [
+        argv[i]
+        for i in range(len(argv) - 2)
+        if argv[i] in {"--bind", "--bind-try", "--ro-bind", "--ro-bind-try"}
+        and argv[i + 2] == str(cwd_resolved)
+    ]
+    assert mounts, f"cwd {cwd_resolved} is never bind-mounted: {argv}"
+    assert mounts[-1] in {"--bind", "--bind-try"}, (
+        "the last mount layered on the writable cwd must be the writable "
+        f"bind, not a read-only one (mounts in emit order: {mounts})"
+    )
+
+
+def test_wrap_launcher_argv_read_root_containing_write_root_keeps_it_writable(
+    tmp_path: Path,
+) -> None:
+    """
+    A ``read_roots`` entry that CONTAINS a non-cwd ``write_root``
+    (e.g. a read grant on a parent dir with a writable subdir) must be
+    emitted before that write root's bind so the subdir stays writable.
+    """
+    backend = _make_backend()
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+    parent = (tmp_path / "data").resolve(strict=False)
+    parent.mkdir()
+    writable_sub = parent / "out"
+    writable_sub.mkdir()
+    policy = _make_policy(
+        cwd,
+        write_roots=[cwd.resolve(strict=False), writable_sub],
+        read_roots=[parent],
+    )
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, cwd)
+
+    ro_idx = _index_of_triple(argv, "--ro-bind-try", str(parent), str(parent))
+    rw_idx = _index_of_triple(argv, "--bind-try", str(writable_sub), str(writable_sub))
+    assert ro_idx is not None, f"read root {parent} was never bound: {argv}"
+    assert rw_idx is not None, f"write root {writable_sub} was never bound: {argv}"
+    assert ro_idx < rw_idx, (
+        "the read root covering a writable subdir was bound after it; "
+        "bwrap last-wins layering would remount the subdir read-only "
+        f"(ro at {ro_idx}, rw at {rw_idx})"
+    )
+
+
 def test_wrap_launcher_argv_masks_denied_unix_socket_after_write_root(
     tmp_path: Path,
 ) -> None:

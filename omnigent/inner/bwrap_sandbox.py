@@ -470,6 +470,16 @@ class BwrapSandboxBackend(SandboxBackend):
         if target is not None:
             bwrap_args += _ensure_executable_visible([target], cwd_resolved)
 
+        # Extra read roots beyond the default toolchain bind set.
+        # Emitted BEFORE the cwd / write-root binds: bwrap layers later
+        # mounts on top of earlier ones, so a read root that equals or
+        # contains a writable path would otherwise remount that path
+        # read-only. Binding read roots first keeps writable-wins
+        # layering for every overlap shape.
+        if policy.read_roots is not None:
+            for root in policy.read_roots:
+                bwrap_args += ["--ro-bind-try", str(root), str(root)]
+
         # cwd bind: writable iff a write_root resolves to cwd.
         cwd_writable = any(_is_same_path(root, cwd_resolved) for root in policy.write_roots)
         bwrap_args += [
@@ -491,11 +501,6 @@ class BwrapSandboxBackend(SandboxBackend):
         # caller also added the parent to read_paths or write_paths).
         for fpath in policy.write_files:
             bwrap_args += ["--bind-try", str(fpath), str(fpath)]
-
-        # Extra read roots beyond the default toolchain bind set.
-        if policy.read_roots is not None:
-            for root in policy.read_roots:
-                bwrap_args += ["--ro-bind-try", str(root), str(root)]
 
         # Mask dotfiles anywhere under cwd OR under any ``read_paths`` /
         # ``write_paths`` root that aren't on the allowlist, plus any
