@@ -330,10 +330,18 @@ reproduction test is your objective instrument.
    un-stripped env, not a blocker: re-run with the `env -u` prefix from
    `dev/recording-lanes.md` first. A missing upstream before-clip is never that
    blocker. Never drop it silently.
-4. **Review the diff** for quality, not just green: does it address the **root
-   cause** or only mask the symptom? Does it miss facets or obvious adjacent edge
-   cases? Does it introduce a regression in the surrounding code (run the touched
-   area's tests)?
+4. **Review the diff** for quality, not just green. Decide whether this is the
+   **best practical approach** for the repository, not merely an approach that
+   makes the reproduction pass. Identify the plausible alternatives suggested by
+   the surrounding architecture and compare them briefly: does this PR fix the
+   root cause at the correct layer, follow the established abstraction, minimize
+   special cases and long-term maintenance cost, and preserve security,
+   compatibility, and performance? Does it miss facets or obvious adjacent edge
+   cases, or introduce a regression in the surrounding code (run the touched
+   area's tests)? Record why the selected approach is preferable in the review.
+   "Best" means the strongest maintainable fit for this codebase and bug, not a
+   license to replace a sound, idiomatic contribution with a theoretically purer
+   rewrite or a personal style preference.
 5. **Report on the existing PR.** Post your fail→pass (or fail→still-fails) result
    and any diff concerns now as a `gh pr comment` / `gh pr review --comment`, and
    record its `pr_url` in your output. The `outcome` reflects what you found
@@ -393,7 +401,8 @@ base — its approach is fundamentally incorrect (masks the symptom, wrong layer
 doesn't address the root cause), needlessly complex, or so low-quality that
 correcting it in review would be more work than a clean fix — don't force a
 comment-only outcome. Say precisely why the existing approach won't do (in a
-review comment on that PR, so the author knows), then **switch to the author path
+review comment on that PR, so the author knows), identify the preferable approach
+and its concrete advantages, then **switch to the author path
 (Step 2B) and open your own PR** that resolves the bug correctly. In your PR,
 reference the existing one and summarize why a fresh approach was warranted.
 Record `mode: "authored_fix"`, put `Supersedes #<old>` on its own line in the new
