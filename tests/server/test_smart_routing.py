@@ -193,13 +193,14 @@ def test_substitute_model_falls_back_within_family() -> None:
     assert substitute_model("claude-opus-4-8", claude_catalog, prefixes=prefixes) == (
         "databricks-claude-sonnet-5"
     )
-    # gpt and glm both fall back to luna (glm reads as the gpt family).
+    # gpt and glm both fall back to sol (glm reads as the gpt family); luna is
+    # never the fallback — its endpoint is decommissioned on some workspaces.
     gpt_catalog = ["databricks-gpt-5-6-luna", "databricks-gpt-5-6-sol"]
     assert substitute_model("gpt-5-6-terra", gpt_catalog, prefixes=prefixes) == (
-        "databricks-gpt-5-6-luna"
+        "databricks-gpt-5-6-sol"
     )
     assert substitute_model("glm-5-2", gpt_catalog, prefixes=prefixes) == (
-        "databricks-gpt-5-6-luna"
+        "databricks-gpt-5-6-sol"
     )
 
 
@@ -240,8 +241,11 @@ def test_substitute_model_declines_when_no_fallback_is_servable() -> None:
     from omnigent.server.smart_routing import substitute_model
 
     prefixes = ("databricks-",)
-    # The family fallback (luna) is absent from the catalog → honest decline.
-    assert substitute_model("gpt-5-6-terra", ["databricks-gpt-5-6-sol"], prefixes=prefixes) is None
+    # The family fallback (sol) is absent from the catalog → honest decline;
+    # a served luna never substitutes for a different unservable arm.
+    assert (
+        substitute_model("gpt-5-6-terra", ["databricks-gpt-5-6-luna"], prefixes=prefixes) is None
+    )
     # A barred fallback is skipped, not applied.
     assert (
         substitute_model(
@@ -1969,23 +1973,23 @@ async def test_task_v1_partial_menu_error_surfaces_last_error() -> None:
 
 @pytest.mark.asyncio
 async def test_task_v1_unservable_arm_maps_to_servable_id() -> None:
-    """gpt-5-6-sol has no endpoint here; the pick lands on the gpt family fallback."""
+    """gpt-5-6-luna has no endpoint here; the pick lands on the gpt family fallback."""
     import httpx
 
     captured: dict[str, Any] = {}
     client = _task_v1_client()
     with _patch_httpx(
         httpx.MockTransport(
-            _capturing_handler(captured, {"model": "gpt-5-6-sol", "harness": "codex"})
+            _capturing_handler(captured, {"model": "gpt-5-6-luna", "harness": "codex"})
         )
     ):
         result = await client.route(
-            "hi", {"codex": ["databricks-gpt-5-4", "databricks-gpt-5-6-luna"]}
+            "hi", {"codex": ["databricks-gpt-5-4", "databricks-gpt-5-6-sol"]}
         )
 
     assert result is not None
-    assert result.model == "databricks-gpt-5-6-luna"  # the gpt family fallback
-    assert result.raw_model == "gpt-5-6-sol"  # what the router actually said
+    assert result.model == "databricks-gpt-5-6-sol"  # the gpt family fallback
+    assert result.raw_model == "gpt-5-6-luna"  # what the router actually said
     assert result.harness == "codex"
 
 
@@ -2828,8 +2832,8 @@ _DOTTED_CODEX_CATALOG: list[str] = ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.5", "g
     [
         ("gpt-5-6-sol", "gpt-5.6-sol"),
         ("gpt-5-6-luna", "gpt-5.6-luna"),
-        # glm has no local endpoint; it falls back to luna, which this pane serves.
-        ("glm-5-2", "gpt-5.6-luna"),
+        # glm has no local endpoint; it falls back to sol, which this pane serves.
+        ("glm-5-2", "gpt-5.6-sol"),
     ],
 )
 def test_dot_spelled_picker_rows_match_the_router_arms(arm: str, expected: str) -> None:
