@@ -405,6 +405,13 @@ function FileViewerBody({
   // null = not yet measured (or zero, e.g. jsdom) — treat as "wide enough" so
   // the toggle shows by default and only hides once a real narrow width lands.
   const contentAreaRef = useRef<HTMLDivElement | null>(null);
+  // The viewer's outer element, used to scope Cmd+F to when focus is inside the
+  // file viewer (vs the chat/composer, which owns find-in-page). Callback ref so
+  // one handle serves both the framed <aside> and the frameless <div> root.
+  const viewerRootRef = useRef<HTMLElement | null>(null);
+  const setViewerRoot = useCallback((el: HTMLElement | null) => {
+    viewerRootRef.current = el;
+  }, []);
   const [contentWidth, setContentWidth] = useState<number | null>(null);
   // Tracks the in-progress comment textarea body. Used by MarkdownCommentPlugin
   // to decide whether to preserve the pending mark when the user clicks away.
@@ -738,6 +745,66 @@ function FileViewerBody({
   const viewMode: "editor" | "preview" | "source" | "diff" =
     diffActive && isDiffAvailable ? "diff" : fileViewMode;
   const diffViewActive = viewMode === "diff";
+
+  // Cmd/Ctrl+F opens find-in-file on the Monaco-backed surfaces (code
+  // source/editor and the diff view). Those surfaces would otherwise rely on
+  // Monaco's own Cmd+F keybinding, which needs editor DOM focus and does not
+  // fire inside the managed (same-root embed) host — so cmd+f silently did
+  // nothing there. Driving `searchOpen` runs Monaco's find action imperatively
+  // instead, matching how the Shiki/markdown surfaces (handled by their own
+  // window listeners in CodeViewer) already open find. Gated to the Monaco
+  // surfaces so it never double-handles the CodeViewer-owned ones.
+  const isMonacoFindSurface = diffViewActive || (lang !== "markdown" && viewMode !== "preview");
+  // Cmd+F must open find-in-file only while the file viewer is the surface the
+  // user is working in. The viewer stays mounted beside the chat, so `open`
+  // alone can't tell them apart, and reading `document.activeElement` at
+  // keypress time is unreliable — clicking a non-focusable chat area drops focus
+  // to <body>, which reads the same as "nothing focused yet". Instead we track
+  // the last surface the user interacted with: seeded to the viewer (opening a
+  // file makes it active) and flipped by clicks / focus moves. When the user
+  // works in the chat/composer, Cmd+F falls through to the browser's find.
+  const viewerIsActiveSurfaceRef = useRef(true);
+  useEffect(() => {
+    // Opening (or switching to) a file makes the viewer the active surface.
+    viewerIsActiveSurfaceRef.current = true;
+  }, [path]);
+  useEffect(() => {
+    if (!open) return;
+    const track = (e: Event) => {
+      const root = viewerRootRef.current;
+      const target = e.target;
+      if (root !== null && target instanceof Node) {
+        viewerIsActiveSurfaceRef.current = root.contains(target);
+      }
+    };
+    window.addEventListener("mousedown", track, true);
+    window.addEventListener("focusin", track, true);
+    return () => {
+      window.removeEventListener("mousedown", track, true);
+      window.removeEventListener("focusin", track, true);
+    };
+  }, [open]);
+  useEffect(() => {
+    if (!open || !isMonacoFindSurface) return;
+    const handler = (e: KeyboardEvent) => {
+      if (!((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key === "f")) return;
+      if (!viewerIsActiveSurfaceRef.current) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setSearchOpen(true);
+    };
+    // Capture phase so the embed claims Cmd+F ahead of the host page's own
+    // listeners and the browser's native find (which would search the whole
+    // host page, not the file).
+    window.addEventListener("keydown", handler, true);
+    return () => window.removeEventListener("keydown", handler, true);
+  }, [open, isMonacoFindSurface, setSearchOpen]);
+
+  // Reset the toggle when find is closed from inside Monaco (Escape or the
+  // widget's ✕) so the next Cmd+F re-opens it instead of no-opping. Shared by
+  // the diff view; the non-diff CodeViewer resets its own copy internally.
+  const handleSearchHandled = useCallback(() => setSearchOpen(false), [setSearchOpen]);
+
   // Persist where the reader was in the content area (markdown source, plain
   // text). The view mode is part of the key because each mode renders a
   // different height, so sharing one offset across modes would drop the reader
@@ -1455,6 +1522,8 @@ function FileViewerBody({
                   activeSelection={activeSelection}
                   onSetActiveSelection={handleSetActiveSelection}
                   pendingBodyRef={pendingBodyRef}
+                  searchOpen={searchOpen}
+                  onSearchHandled={handleSearchHandled}
                 />
               </Suspense>
             )
@@ -1580,6 +1649,7 @@ function FileViewerBody({
   if (frameless) {
     return (
       <div
+        ref={setViewerRoot}
         data-testid="file-viewer"
         className="flex flex-col flex-1 min-h-0 overflow-hidden bg-card"
       >
@@ -1590,6 +1660,7 @@ function FileViewerBody({
 
   return (
     <aside
+      ref={setViewerRoot}
       data-testid="file-viewer"
       style={{ width: panelWidth, paddingBottom: keyboardInset || undefined }}
       className={cn(
