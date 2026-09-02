@@ -188,6 +188,26 @@ describe("TerminalExtraKeys pointer semantics", () => {
     expect(typeof installedTransform(target)).toBe("function");
   });
 
+  it("pointercancel does not re-arm a modifier that typing consumed during the press", () => {
+    // WHY: the press only owns the long-press transition; an armed Ctrl spent
+    // by a keystroke while the finger was down must stay off after a cancel.
+    const target = makeTarget();
+    render(<TerminalExtraKeys target={target} />);
+    const ctrl = key("Control");
+
+    tap(ctrl);
+    expect(ctrl).toHaveAttribute("data-modifier-state", "armed");
+    pointerDown(ctrl);
+    act(() => vi.advanceTimersByTime(LONG_PRESS_MS / 2));
+    expect(typeThrough(target, "c")).toBe("\x03");
+    expect(ctrl).toHaveAttribute("data-modifier-state", "off");
+
+    fireEvent.pointerCancel(ctrl, { pointerId: 1 });
+    act(() => vi.advanceTimersByTime(LONG_PRESS_MS));
+    expect(ctrl).toHaveAttribute("data-modifier-state", "off");
+    expect(installedTransform(target)).toBeNull();
+  });
+
   it("activates from a keyboard/AT click (detail 0) without pointer events", () => {
     const target = makeTarget();
     render(<TerminalExtraKeys target={target} />);
