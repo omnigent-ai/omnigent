@@ -283,6 +283,21 @@ export interface Session {
    */
   hostId?: string | null;
   /**
+   * Friendly name of the bound host, e.g. ``"corey-laptop"``, resolved
+   * server-side on the snapshot. The host list (`GET /v1/hosts`) is
+   * owner-scoped, so a shared session's viewer can't resolve the owner's
+   * host from it — this field is what lets the host badge show the
+   * machine's name instead of the raw id. `null` when not host-bound or
+   * on older servers.
+   */
+  hostName?: string | null;
+  /**
+   * Sandbox provider backing a server-managed bound host (e.g. "modal");
+   * `null` for external hosts. Pairs with `hostName` so a viewer without
+   * host-list access renders the provider label like the owner does.
+   */
+  hostSandboxProvider?: string | null;
+  /**
    * Whether this session's host is a dormant resumable managed host the
    * server can wake on the next message. Carried on the snapshot so the open
    * view shows a wakeable "asleep" state instead of the terminal host_offline

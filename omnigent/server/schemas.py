@@ -1879,6 +1879,18 @@ class SessionResponse(BaseModel):
     :param host_id: Host that launched (or should launch) the
         runner for this session, e.g. ``"host_a1b2c3d4..."``.
         ``None`` for CLI-initiated sessions.
+    :param host_name: Friendly name of the bound host, e.g.
+        ``"corey-laptop"``, resolved server-side from the host store.
+        Carried on the snapshot because ``GET /v1/hosts`` is
+        owner-scoped: a shared session's viewer cannot list the
+        owner's host, so without this field the UI can only show the
+        raw ``host_id``. ``None`` when the session is not host-bound
+        or the host row no longer exists.
+    :param host_sandbox_provider: Sandbox provider backing a
+        server-managed bound host, e.g. ``"modal"``; ``None`` for
+        external (user-connected) hosts. Lets a viewer who cannot
+        list the host render the provider label instead of the
+        machine name, mirroring the owner's view.
     :param runner_online: Strict runner liveness — ``True`` iff a
         runner tunnel is currently registered for this session.
         This is the sole reachability signal: ``True`` means the
@@ -2103,6 +2115,8 @@ class SessionResponse(BaseModel):
     labels: dict[str, str] = Field(default_factory=dict)
     runner_id: str | None = None
     host_id: str | None = None
+    host_name: str | None = None
+    host_sandbox_provider: str | None = None
     runner_online: bool | None = None
     host_online: bool | None = None
     host_resumable: bool = False

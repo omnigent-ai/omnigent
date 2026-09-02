@@ -2564,3 +2564,127 @@ async def test_persist_error_labels_clears_stale_structured_fields() -> None:
         "code": "runner_error",
         "message": "turn setup failed",
     }
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_carries_bound_host_display_identity() -> None:
+    """The snapshot resolves the bound host's name for ANY reader.
+
+    ``GET /v1/hosts`` is owner-scoped, so a shared session's viewer can
+    never resolve the owner's host record from the host list. The snapshot
+    itself must therefore carry the bound host's friendly name (and sandbox
+    provider), or the UI's host badge can only show the raw host_id hex.
+    """
+    from types import SimpleNamespace
+
+    session_id = "cc11dd22ee33ff4455667788990011aa"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="ag_test",
+        host_id="7788990011aabbccddeeff0011223344",
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={session_id: conv},
+    )
+    host_reads: list[str] = []
+
+    def _get_host(host_id: str) -> SimpleNamespace:
+        host_reads.append(host_id)
+        return SimpleNamespace(
+            host_id=host_id,
+            name="alices-macbook",
+            sandbox_provider=None,
+            sandbox_id=None,
+        )
+
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+        host_store=SimpleNamespace(get_host=_get_host),  # type: ignore[arg-type]
+    )
+
+    assert host_reads == ["7788990011aabbccddeeff0011223344"]
+    assert snapshot.host_name == "alices-macbook"
+    assert snapshot.host_sandbox_provider is None
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_carries_sandbox_provider_for_managed_host() -> None:
+    """A managed host's snapshot identity names the provider, not managed-*."""
+    from types import SimpleNamespace
+
+    session_id = "dd22ee33ff445566778899001122bbcc"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="ag_test",
+        host_id="8899001122aabbccddeeff0011223344",
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={session_id: conv},
+    )
+    host = SimpleNamespace(
+        host_id="8899001122aabbccddeeff0011223344",
+        name="managed-88990011",
+        sandbox_provider="modal",
+        sandbox_id="sb-1",
+    )
+
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+        host_store=SimpleNamespace(get_host=lambda host_id: host),  # type: ignore[arg-type]
+    )
+
+    assert snapshot.host_name == "managed-88990011"
+    assert snapshot.host_sandbox_provider == "modal"
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_host_identity_none_when_unresolvable() -> None:
+    """No host binding, or a vanished host row, leaves the identity None."""
+    from types import SimpleNamespace
+
+    # Not host-bound: the host store must not even be consulted.
+    unbound_id = "ee33ff44556677889900112233ccddee"
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+    reads: list[str] = []
+    store = SimpleNamespace(get_host=lambda host_id: reads.append(host_id))
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        unbound_id,
+        host_store=store,  # type: ignore[arg-type]
+    )
+    assert reads == []
+    assert snapshot.host_name is None
+    assert snapshot.host_sandbox_provider is None
+
+    # Host-bound but the row is gone (deregistered host): identity stays
+    # None and the response still builds.
+    bound_id = "ff445566778899001122334455ddeeff"
+    conv = Conversation(
+        id=bound_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=bound_id,
+        agent_id="ag_test",
+        host_id="9900112233aabbccddeeff0011223344",
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={bound_id: conv},
+    )
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        bound_id,
+        host_store=SimpleNamespace(get_host=lambda host_id: None),  # type: ignore[arg-type]
+    )
+    assert snapshot.host_name is None
+    assert snapshot.host_sandbox_provider is None

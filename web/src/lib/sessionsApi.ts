@@ -117,6 +117,20 @@ interface SessionResponseWire {
    */
   host_id?: string | null;
   /**
+   * Friendly name of the bound host, e.g. ``"corey-laptop"``, resolved
+   * server-side. Carried on the snapshot because ``GET /v1/hosts`` is
+   * owner-scoped — a shared session's viewer can't list the owner's host,
+   * so this is their only way to render a name instead of the raw id.
+   * Absent/`null` when not host-bound or on older servers.
+   */
+  host_name?: string | null;
+  /**
+   * Sandbox provider backing a server-managed bound host (e.g. "modal");
+   * `null`/absent for external hosts. Lets a viewer who can't list the
+   * host render the provider label, mirroring the owner's view.
+   */
+  host_sandbox_provider?: string | null;
+  /**
    * Whether this session is bound to a dormant managed host the server can
    * wake in place (its sandbox provider supports resume). Read only when the
    * host is offline, to tell a recoverable "asleep" state (send a message —
@@ -312,6 +326,8 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     agentName: wire.agent_name ?? null,
     runnerId: wire.runner_id,
     hostId: wire.host_id ?? null,
+    hostName: wire.host_name ?? null,
+    hostSandboxProvider: wire.host_sandbox_provider ?? null,
     hostResumable: wire.host_resumable ?? false,
     status: wire.status,
     backgroundTaskCount: wire.background_task_count ?? undefined,
