@@ -12,6 +12,7 @@ from datetime import timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from cachetools import TTLCache
 from mcp.shared.exceptions import McpError
@@ -33,6 +34,7 @@ from omnigent.tools.mcp import (
     _discovery_cache,
     _format_call_result,
     _is_connection_error,
+    _is_dead_session_timeout,
     _normalize_input_schema,
     clear_discovery_cache,
 )
@@ -867,6 +869,72 @@ def test_is_connection_error_value_error() -> None:
     assert _is_connection_error(ValueError("bad")) is False
 
 
+def test_is_connection_error_httpx_network_error() -> None:
+    """
+    httpx transport-level network failures (connection reset,
+    read error mid-call) are transient and worth a reconnect-retry,
+    matching the LLM retry path's classification.
+    """
+    assert _is_connection_error(httpx.ReadError("connection reset")) is True
+    assert _is_connection_error(httpx.ConnectError("refused")) is True
+    assert _is_connection_error(httpx.WriteError("broken")) is True
+
+
+def test_is_connection_error_httpx_timeout_not_transient() -> None:
+    """
+    An httpx timeout is a slow server, not a dead connection —
+    it must not trigger a reconnect-retry by itself.
+    """
+    assert _is_connection_error(httpx.ReadTimeout("slow")) is False
+
+
+# ── _is_dead_session_timeout ─────────────────────────────
+
+
+def _request_timeout_error() -> McpError:
+    """Build the SDK's request-timeout McpError shape (code 408)."""
+    return McpError(
+        ErrorData(
+            code=int(httpx.codes.REQUEST_TIMEOUT),
+            message="Timed out while waiting for response to ClientRequest. Waited 8.0 seconds.",
+        )
+    )
+
+
+def test_dead_session_timeout_detected_when_session_dead() -> None:
+    """
+    A request-timeout McpError with no live session means the
+    transport died mid-call (the network error was swallowed by the
+    lifecycle task) — classified as reconnectable.
+    """
+    conn = McpServerConnection(config=_make_http_config())
+    conn._session = None
+    assert _is_dead_session_timeout(_request_timeout_error(), conn) is True
+
+
+def test_dead_session_timeout_not_detected_when_session_live() -> None:
+    """
+    The same request-timeout with a live session is a genuinely
+    slow server — NOT retried, so a slow tool doesn't get invoked
+    multiple times.
+    """
+    conn = McpServerConnection(config=_make_http_config())
+    conn._session = MagicMock()
+    assert _is_dead_session_timeout(_request_timeout_error(), conn) is False
+
+
+def test_dead_session_timeout_ignores_other_mcp_errors() -> None:
+    """
+    Non-timeout McpErrors (e.g. invalid params) never classify as a
+    dead-session timeout, session state notwithstanding.
+    """
+    conn = McpServerConnection(config=_make_http_config())
+    conn._session = None
+    exc = McpError(ErrorData(code=-32602, message="Invalid params"))
+    assert _is_dead_session_timeout(exc, conn) is False
+    assert _is_dead_session_timeout(ValueError("bad"), conn) is False
+
+
 # ── _backoff_delay ────────────────────────────────────────
 
 
@@ -935,6 +1003,168 @@ async def test_call_tool_reconnects_on_connection_error() -> None:
 
         assert result == "recovered"
         mock_reconnect.assert_awaited_once()
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_call_tool_reconnects_on_httpx_network_error() -> None:
+    """
+    An httpx transport failure mid-call (connection reset by a
+    transient network blip) triggers a reconnect-retry, just like
+    the classic dead-pipe errors.
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        ok_result = MagicMock()
+        ok_result.content = [TextContent(type="text", text="recovered")]
+        ok_result.isError = False
+
+        mock_session.call_tool.side_effect = [
+            httpx.ReadError("connection reset by peer"),
+            ok_result,
+        ]
+
+        with patch.object(conn, "_reconnect", new_callable=AsyncMock) as mock_reconnect:
+            with patch("omnigent.tools.mcp._sleep", new_callable=AsyncMock):
+                result = await conn.call_tool("test_tool", {"query": "hi"})
+
+        assert result == "recovered"
+        mock_reconnect.assert_awaited_once()
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_call_tool_reconnects_on_dead_session_timeout() -> None:
+    """
+    When the transport dies mid-call, the SDK surfaces a
+    request-timeout McpError while the lifecycle task clears the
+    session. That shape must reconnect-retry rather than fail the
+    call.
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        ok_result = MagicMock()
+        ok_result.content = [TextContent(type="text", text="recovered")]
+        ok_result.isError = False
+
+        def _die_mid_call(*args: object, **kwargs: object) -> MagicMock:
+            if not mock_session.call_tool.await_count > 1:
+                # Lifecycle task death: session cleared, request
+                # times out with no response.
+                conn._session = None
+                raise McpError(
+                    ErrorData(
+                        code=int(httpx.codes.REQUEST_TIMEOUT),
+                        message=(
+                            "Timed out while waiting for response to "
+                            "ClientRequest. Waited 8.0 seconds."
+                        ),
+                    )
+                )
+            return ok_result
+
+        mock_session.call_tool.side_effect = _die_mid_call
+
+        async def _restore_session() -> None:
+            conn._session = mock_session
+
+        with patch.object(conn, "_reconnect", side_effect=_restore_session) as mock_reconnect:
+            with patch("omnigent.tools.mcp._sleep", new_callable=AsyncMock):
+                result = await conn.call_tool("test_tool", {"query": "hi"})
+
+        assert result == "recovered"
+        assert mock_reconnect.call_count == 1
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_call_tool_timeout_with_live_session_not_retried() -> None:
+    """
+    A request timeout while the session is still live is a slow
+    server, not a dead connection — it must propagate without a
+    reconnect-retry so slow tools aren't invoked twice.
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        mock_session.call_tool.side_effect = McpError(
+            ErrorData(
+                code=int(httpx.codes.REQUEST_TIMEOUT),
+                message=(
+                    "Timed out while waiting for response to "
+                    "ClientRequest. Waited 8.0 seconds."
+                ),
+            )
+        )
+
+        with patch.object(conn, "_reconnect", new_callable=AsyncMock) as mock_reconnect:
+            with pytest.raises(McpError, match="Timed out"):
+                await conn.call_tool("test_tool", {"query": "hi"})
+
+        mock_reconnect.assert_not_awaited()
+        assert mock_session.call_tool.await_count == 1
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_call_tool_retries_when_reconnect_itself_fails() -> None:
+    """
+    A reconnect attempted while the network is still down fails
+    with a connection error; that failure must consume a retry and
+    be re-attempted, not abort the whole call.
+    """
+    config = MCPServerConfig(
+        name="test-reconnect-blip",
+        url="http://localhost:9000/mcp",
+        retry=RetryPolicy(max_retries=3, backoff_base_s=0.1, backoff_max_s=1.0),
+    )
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        ok_result = MagicMock()
+        ok_result.content = [TextContent(type="text", text="recovered")]
+        ok_result.isError = False
+
+        mock_session.call_tool.side_effect = [
+            httpx.ReadError("blip starts"),
+            ok_result,
+        ]
+
+        # First reconnect lands inside the outage window and fails;
+        # the second succeeds.
+        reconnect_results: list[Exception | None] = [
+            httpx.ConnectError("still refusing"),
+            None,
+        ]
+
+        async def _flaky_reconnect() -> None:
+            outcome = reconnect_results.pop(0)
+            if outcome is not None:
+                raise outcome
+
+        with patch.object(conn, "_reconnect", side_effect=_flaky_reconnect) as mock_reconnect:
+            with patch("omnigent.tools.mcp._sleep", new_callable=AsyncMock):
+                result = await conn.call_tool("test_tool", {"query": "hi"})
+
+        assert result == "recovered"
+        assert mock_reconnect.call_count == 2
 
     await conn.close()
 
