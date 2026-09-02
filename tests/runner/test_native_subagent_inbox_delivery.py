@@ -20,7 +20,6 @@ import asyncio
 from collections.abc import Iterator
 from typing import Any
 
-import httpx
 import pytest
 
 from omnigent.runner import app as runner_app
@@ -178,16 +177,6 @@ class _RecoveryServerClient(NullServerClient):
         def json(self) -> dict[str, Any]:
             """Return the configured JSON payload."""
             return self._payload
-
-        def raise_for_status(self) -> None:
-            """Raise the httpx status error production code catches."""
-            if self.status_code >= 400:
-                request = httpx.Request("GET", "http://server/")
-                raise httpx.HTTPStatusError(
-                    str(self.status_code),
-                    request=request,
-                    response=httpx.Response(self.status_code, request=request),
-                )
 
     async def get(self, url: str, **kwargs: Any) -> Any:
         """

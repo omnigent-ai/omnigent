@@ -2071,11 +2071,7 @@ async def test_create_session_envelope_is_single_flight_and_skips_metadata_callb
                 return type(
                     "Response",
                     (),
-                    {
-                        "status_code": 200,
-                        "json": lambda self: {"data": []},
-                        "raise_for_status": lambda self: None,
-                    },
+                    {"status_code": 200, "json": lambda self: {"data": []}},
                 )()
             if path.endswith("/child_sessions"):
                 # Restart recovery lists the session's children; an empty
@@ -2086,7 +2082,6 @@ async def test_create_session_envelope_is_single_flight_and_skips_metadata_callb
                     {
                         "status_code": 200,
                         "json": lambda self: {"data": [], "has_more": False},
-                        "raise_for_status": lambda self: None,
                     },
                 )()
             raise AssertionError(f"unexpected metadata callback: {path}")

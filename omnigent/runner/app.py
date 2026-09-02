@@ -1742,6 +1742,28 @@ def undelivered_subagent_dispatch_id(labels: Mapping[str, object]) -> str | None
     return dispatch_id
 
 
+class _SubagentRecoveryReadError(Exception):
+    """A sessions API read needed by restart recovery returned a non-200."""
+
+
+async def _get_recovery_page(
+    server_client: httpx.AsyncClient, path: str, params: dict[str, str]
+) -> Any:
+    """
+    Read one page of a sessions API listing for restart recovery.
+
+    :param server_client: HTTP client connected to the Omnigent server.
+    :param path: Sessions API path, e.g. ``"/v1/sessions/conv_p/child_sessions"``.
+    :param params: Query parameters, e.g. ``{"limit": "1000"}``.
+    :returns: The decoded JSON page.
+    :raises _SubagentRecoveryReadError: When the server returns a non-200.
+    """
+    response = await server_client.get(path, params=params, timeout=10.0)
+    if response.status_code != 200:
+        raise _SubagentRecoveryReadError(f"{path} returned {response.status_code}")
+    return response.json()
+
+
 async def _list_child_sessions(
     server_client: httpx.AsyncClient, parent_id: str
 ) -> list[_JsonObject]:
@@ -1751,16 +1773,14 @@ async def _list_child_sessions(
     :param server_client: HTTP client connected to the Omnigent server.
     :param parent_id: Parent session id, e.g. ``"conv_parent123"``.
     :returns: Child summaries as returned by the sessions API.
-    :raises httpx.HTTPError: When a page read fails.
+    :raises _SubagentRecoveryReadError: When a page read fails.
     """
     children: list[_JsonObject] = []
     params: dict[str, str] = {"limit": "1000"}
     while True:
-        response = await server_client.get(
-            f"/v1/sessions/{parent_id}/child_sessions", params=params, timeout=10.0
+        page = await _get_recovery_page(
+            server_client, f"/v1/sessions/{parent_id}/child_sessions", params
         )
-        response.raise_for_status()
-        page = response.json()
         children.extend(page.get("data", []))
         if not page.get("has_more") or not page.get("last_id"):
             return children
@@ -1777,15 +1797,11 @@ async def _fetch_latest_assistant_text(
     :param session_id: Session to read, e.g. ``"conv_child456"``.
     :returns: Joined text blocks of the newest assistant message, or
         ``None`` when the transcript holds no assistant text.
-    :raises httpx.HTTPError: When a page read fails.
+    :raises _SubagentRecoveryReadError: When a page read fails.
     """
     params: dict[str, str] = {"limit": "100", "order": "desc"}
     while True:
-        response = await server_client.get(
-            f"/v1/sessions/{session_id}/items", params=params, timeout=10.0
-        )
-        response.raise_for_status()
-        page = response.json()
+        page = await _get_recovery_page(server_client, f"/v1/sessions/{session_id}/items", params)
         for item in page.get("data", []):
             if item.get("type") != "message" or item.get("role") != "assistant":
                 continue
@@ -1820,7 +1836,8 @@ async def _recover_subagent_results_from_server(
     :param parent_id: Parent session whose inbox was recreated, e.g.
         ``"conv_parent123"``.
     :param schedule_wake: Callback that posts the parent wake notice.
-    :raises httpx.HTTPError: When a server read fails; the caller retries.
+    :raises _SubagentRecoveryReadError: When a server read returns a
+        non-200; the caller retries on the next drain.
     """
     for child in await _list_child_sessions(server_client, parent_id):
         child_id = child.get("id")
@@ -4674,7 +4691,7 @@ def create_runner_app(
                     parent_id=parent_id,
                     schedule_wake=_schedule_subagent_wake,
                 )
-            except (httpx.HTTPError, ValueError):
+            except (httpx.HTTPError, _SubagentRecoveryReadError, ValueError):
                 _logger.warning(
                     "Failed to recover undrained sub-agent results for %s",
                     parent_id,
