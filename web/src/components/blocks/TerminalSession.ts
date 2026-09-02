@@ -867,11 +867,7 @@ export class TerminalSession {
       // the CSI-u sequence once, on keydown.
       if (e.type === "keydown") {
         e.preventDefault();
-        onInput?.();
-        this.lastUserInputAt = performance.now();
-        if (this.ws.readyState === WebSocket.OPEN) {
-          this.ws.send(INPUT_ENCODER.encode(payload));
-        }
+        this.sendInput(payload);
       }
       return false;
     });

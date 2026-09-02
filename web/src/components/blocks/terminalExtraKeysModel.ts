@@ -9,16 +9,16 @@ export type ModifierId = "ctrl" | "alt" | "shift";
 export type PlainKeyId =
   "esc" | "shift-tab" | "tab" | "home" | "up" | "end" | "pgup" | "left" | "down" | "right" | "pgdn";
 
-export type ExtraKeyId = PlainKeyId | ModifierId;
-
-export interface ExtraKeyDef {
-  id: ExtraKeyId;
+interface ExtraKeyBase {
   /** Glyph shown on the key. */
   label: string;
   /** Accessible name (glyphs alone read poorly to screen readers). */
   name: string;
-  kind: "key" | "modifier";
 }
+
+export type ExtraKeyDef =
+  | (ExtraKeyBase & { id: PlainKeyId; kind: "key" })
+  | (ExtraKeyBase & { id: ModifierId; kind: "modifier" });
 
 /** Fixed Termux-style 2×7 grid; positions never move across widths. */
 export const EXTRA_KEY_ROWS: readonly (readonly ExtraKeyDef[])[] = [
