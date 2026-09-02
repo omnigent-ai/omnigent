@@ -696,10 +696,21 @@ async function tailLocalServerLog(onLine, opts = {}) {
       if (size <= offset) return;
       const fd = fs.openSync(logPath, "r");
       try {
+        // readSync may return fewer bytes than requested (large append, pipe-
+        // backed fs); loop until the range up to `size` is drained, advancing
+        // `offset` only by bytes actually read so a short read can't emit
+        // uninitialized buffer or skip content.
         const buf = Buffer.alloc(size - offset);
-        fs.readSync(fd, buf, 0, buf.length, offset);
-        offset = size;
-        emit.push(buf.toString("utf8"));
+        let filled = 0;
+        while (offset + filled < size) {
+          const n = fs.readSync(fd, buf, filled, buf.length - filled, offset + filled);
+          if (n <= 0) break; // EOF (file truncated since stat) — emit what we have
+          filled += n;
+        }
+        if (filled > 0) {
+          offset += filled;
+          emit.push(buf.toString("utf8", 0, filled));
+        }
       } finally {
         fs.closeSync(fd);
       }
