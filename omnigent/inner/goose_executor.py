@@ -35,6 +35,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
@@ -131,9 +132,29 @@ _UPDATE_TOOL_CALL = "tool_call"
 _UPDATE_TOOL_CALL_UPDATE = "tool_call_update"
 _UPDATE_USAGE = "usage_update"
 
-# Idle (time-without-progress) timeouts in seconds.
-_PROMPT_TIMEOUT_SECONDS = 300.0
-_INIT_TIMEOUT_SECONDS = 30.0
+# Idle (time-without-progress) timeouts in seconds. Thinking-mode models emit
+# reasoning tokens that never reach us as ACP notifications, so a turn can look
+# idle for minutes; both deadlines are configurable. Parsing is import-time and
+# fail-loud: a malformed, non-positive, or non-finite value aborts goose at
+# startup.
+_PROMPT_TIMEOUT_ENV = "HARNESS_GOOSE_PROMPT_TIMEOUT_S"
+_INIT_TIMEOUT_ENV = "HARNESS_GOOSE_INIT_TIMEOUT_S"
+
+
+def _timeout_from_env(name: str, default: str) -> float:
+    """Read a positive, finite timeout in seconds from *name*, or *default*."""
+    err = f"{name} must be a positive finite number of seconds"
+    try:
+        value = float(os.environ.get(name, default))
+    except ValueError as exc:
+        raise ValueError(err) from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(err)
+    return value
+
+
+_PROMPT_TIMEOUT_SECONDS = _timeout_from_env(_PROMPT_TIMEOUT_ENV, "300")
+_INIT_TIMEOUT_SECONDS = _timeout_from_env(_INIT_TIMEOUT_ENV, "30")
 
 # ACP protocol version this executor targets (Goose 1.38 → 1).
 _PROTOCOL_VERSION = 1

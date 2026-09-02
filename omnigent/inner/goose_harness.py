@@ -32,6 +32,12 @@ Env vars read at startup:
   (``--with-builtin``). ``None`` defaults to ``developer`` (shell + editor).
 - ``HARNESS_GOOSE_OS_ENV``: JSON-encoded :class:`OSEnvSpec`. When unset, falls
   back to ``caller_process`` + ``sandbox=none``.
+- ``HARNESS_GOOSE_PROMPT_TIMEOUT_S``: idle (time-without-progress) deadline for
+  a prompt turn, in seconds. Defaults to ``300``. Raise it for thinking-mode
+  models that deliberate for minutes before their first ACP notification.
+- ``HARNESS_GOOSE_INIT_TIMEOUT_S``: idle deadline for the ACP handshake
+  (``initialize`` / ``session/new``), in seconds. Defaults to ``30``. Raise it
+  when many MCP servers are bridged.
 """
 
 from __future__ import annotations
