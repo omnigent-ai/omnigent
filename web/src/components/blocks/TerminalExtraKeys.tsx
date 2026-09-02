@@ -56,6 +56,8 @@ interface PressState {
   longPressFired: boolean;
   /** Modifier state before this press, restored if the gesture is cancelled. */
   previous: ModifierState | null;
+  /** Input (typed or row key) went out while held; an armed one-shot is spent. */
+  inputSent: boolean;
 }
 
 export const TerminalExtraKeys = memo(function TerminalExtraKeys({
@@ -84,6 +86,7 @@ export const TerminalExtraKeys = memo(function TerminalExtraKeys({
     (data) => {
       const state = modsRef.current;
       const out = encodeModifiedInput(data, activeModifiers(state));
+      if (pressRef.current) pressRef.current.inputSent = true;
       commit(reduceModifiers(state, { type: "consume" }));
       return out;
     },
@@ -120,6 +123,7 @@ export const TerminalExtraKeys = memo(function TerminalExtraKeys({
         applicationCursor: targetRef.current.applicationCursor(),
       });
       targetRef.current.send(seq);
+      if (pressRef.current) pressRef.current.inputSent = true;
       commit(reduceModifiers(state, { type: "consume" }));
     },
     [commit],
@@ -139,6 +143,7 @@ export const TerminalExtraKeys = memo(function TerminalExtraKeys({
         timer: null,
         longPressFired: false,
         previous: key.kind === "modifier" ? modsRef.current[key.id] : null,
+        inputSent: false,
       };
       if (key.kind === "modifier") {
         // WKWebView honors a programmatic focus only inside the trusted
@@ -171,9 +176,10 @@ export const TerminalExtraKeys = memo(function TerminalExtraKeys({
       if (!press || press.pointerId !== e.pointerId) return;
       clearPress();
       // A cancelled gesture (scroll, palm) undoes the lock this press set —
-      // and only that; a modifier consumed by typing meanwhile stays spent.
+      // and only that; an armed one-shot that input already spent stays off.
       if (press.longPressFired && press.key.kind === "modifier" && press.previous !== null) {
-        commit({ ...modsRef.current, [press.key.id]: press.previous });
+        const restored = press.previous === "armed" && press.inputSent ? "off" : press.previous;
+        commit({ ...modsRef.current, [press.key.id]: restored });
       }
     },
     [clearPress, commit],
