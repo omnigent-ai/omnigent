@@ -376,23 +376,67 @@ function resolveCliPath(configuredPath, deps = {}) {
 }
 
 /**
- * Run an `omnigent` subcommand and resolve with its captured output. Never
+ * Normalize a CLI invocation. Public paths pass a string (`/path/omnigent`);
+ * Databricks-internal host enrollment passes an executable + fixed argv prefix
+ * (`/usr/local/bin/isaac`, `["omni"]`). Both stay shell-free.
+ *
+ * @param {string | {
+ *   executable: string,
+ *   prefixArgs?: string[],
+ *   displayName?: string,
+ * }} command
+ * @returns {{ executable: string, prefixArgs: string[], displayName: string }}
+ */
+function cliCommandParts(command) {
+  if (typeof command === "string" && command !== "") {
+    return { executable: command, prefixArgs: [], displayName: "omnigent" };
+  }
+  if (
+    command &&
+    typeof command === "object" &&
+    typeof command.executable === "string" &&
+    command.executable !== "" &&
+    (command.prefixArgs === undefined ||
+      (Array.isArray(command.prefixArgs) &&
+        command.prefixArgs.every((arg) => typeof arg === "string")))
+  ) {
+    const prefixArgs = command.prefixArgs ?? [];
+    return {
+      executable: command.executable,
+      prefixArgs,
+      displayName:
+        typeof command.displayName === "string" && command.displayName !== ""
+          ? command.displayName
+          : [path.basename(command.executable), ...prefixArgs].join(" "),
+    };
+  }
+  throw new TypeError("invalid CLI command");
+}
+
+/**
+ * Run an Omnigent CLI subcommand and resolve with its captured output. Never
  * rejects — a failure surfaces as a non-zero `code` plus stderr so callers can
  * decide. `execFile` (no shell) avoids quoting pitfalls.
  *
- * @param {string} cliPath
+ * @param {Parameters<typeof cliCommandParts>[0]} command
  * @param {string[]} args
  * @param {{ timeoutMs?: number }} [opts]
  * @returns {Promise<{ code: number, stdout: string, stderr: string }>}
  */
-function runCli(cliPath, args, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+function runCli(command, args, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+  const { executable, prefixArgs } = cliCommandParts(command);
   return new Promise((resolve) => {
-    execFile(cliPath, args, { timeout: timeoutMs, encoding: "utf8" }, (err, stdout, stderr) => {
-      // execFile sets err.code to the numeric exit code on a normal non-zero
-      // exit, or a string errno (e.g. "ENOENT") when the spawn itself failed.
-      const code = err ? (typeof err.code === "number" ? err.code : 1) : 0;
-      resolve({ code, stdout: stdout || "", stderr: stderr || "" });
-    });
+    execFile(
+      executable,
+      [...prefixArgs, ...args],
+      { timeout: timeoutMs, encoding: "utf8" },
+      (err, stdout, stderr) => {
+        // execFile sets err.code to the numeric exit code on a normal non-zero
+        // exit, or a string errno (e.g. "ENOENT") when the spawn itself failed.
+        const code = err ? (typeof err.code === "number" ? err.code : 1) : 0;
+        resolve({ code, stdout: stdout || "", stderr: stderr || "" });
+      },
+    );
   });
 }
 
@@ -941,6 +985,7 @@ module.exports = {
   isExecutableFile,
   whichOmnigent,
   resolveCliPath,
+  cliCommandParts,
   runCli,
   parseJsonLoose,
   getCliStatus,

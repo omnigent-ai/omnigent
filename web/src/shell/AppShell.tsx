@@ -325,6 +325,12 @@ export function AppShell() {
   const [selectedTerminalKey, setSelectedTerminalKey] = useState<string | null>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).selectedTerminalKey ?? null) : null,
   );
+  // The one shell key the user just opened by an explicit gesture (clicking a
+  // tab / creating a "+"→Shell). Its rail xterm may grab keyboard focus when it
+  // connects; a shell merely *restored* on a session switch may not — switching
+  // sessions keeps focus in the chat composer. Cleared once consumed and on
+  // every session switch.
+  const autoFocusTerminalKeyRef = useRef<string | null>(null);
   // Whether the workspace rail is maximized (covers the full content region,
   // hiding the chat column). Session-transient — a fresh visit starts docked.
   const [rightPanelMaximized, setRightPanelMaximized] = useState(false);
@@ -944,6 +950,7 @@ export function AppShell() {
       setRightRailTab("files");
       setSelectedFilePath(null);
       setOpenFiles([]);
+      autoFocusTerminalKeyRef.current = null;
       setSelectedTerminalKey(null);
       setPanelInitialKeyState(null);
       stateConvRef.current = null;
@@ -989,6 +996,7 @@ export function AppShell() {
     // effect clears that selection if its terminal no longer exists once this
     // session's list loads. A restored shell selection must not coexist with a
     // file selection (one content slot).
+    autoFocusTerminalKeyRef.current = null;
     setSelectedTerminalKey(nextSelected ? null : (persisted.selectedTerminalKey ?? null));
     // A maximized rail is transient too — the incoming session starts docked.
     // If we were maximized, restore the sidebar we collapsed on entry (the
@@ -1431,6 +1439,7 @@ export function AppShell() {
       // just focuses it and reveals the rail. The selection is sticky (never
       // pruned off the list), so a fresh create that's still landing stays
       // selected and its xterm surfaces the instant the terminal appears.
+      autoFocusTerminalKeyRef.current = key;
       setSelectedTerminalKey(key);
       setSelectedFilePath(null);
       setFileViewerCommentsOpen(false);
@@ -1653,10 +1662,10 @@ export function AppShell() {
       freshOnlineGrace);
   // A rail-opened shell (any open terminal key other than the agent's
   // own terminal) takes over the main view chrome-free:
-  // ConnectionIndicator hides the Chat/Terminal pill while this is
-  // true, and MainTerminalView renders the shell with its own close
+  // ViewModeToggle hides the header Chat/Terminal switcher while this
+  // is true, and MainTerminalView renders the shell with its own close
   // affordance. The PANEL_NO_TERMINAL_KEY sentinel ("") is falsy, so
-  // "open with no target" stays a pill view.
+  // "open with no target" keeps the switcher.
   const isShellView = terminalFirst && !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
   const shellViewTargetAvailable =
     isShellView && terminals.some((terminal) => terminalTabKey(terminal) === panelInitialKey);
@@ -1875,6 +1884,7 @@ export function AppShell() {
                     }
                   }}
                   isChildSession={isChildSession}
+                  subAgentName={activeSession?.subAgentName ?? null}
                   conversationId={conversationId}
                   actionConversation={actionConversation}
                   conversationTitle={headerConversationTitle}
@@ -1971,6 +1981,10 @@ export function AppShell() {
                     openTerminalTab={openTerminalTab}
                     openTerminals={openTerminals}
                     selectedTerminalKey={selectedTerminalKey}
+                    autoFocusSelectedTerminal={
+                      autoFocusTerminalKeyRef.current !== null &&
+                      autoFocusTerminalKeyRef.current === selectedTerminalKey
+                    }
                     closingTerminalKey={closingTerminalKey}
                     onCloseTerminal={requestCloseTerminal}
                     maximized={rightPanelMaximized}

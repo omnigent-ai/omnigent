@@ -6,6 +6,8 @@
 // field for future compatibility, plus one entry per localStorage key that
 // holds a non-default value.
 
+import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
+
 /** localStorage keys that constitute exportable user preferences. */
 const EXPORTABLE_KEYS = [
   "omnigent:ui-font-size",
@@ -21,6 +23,7 @@ const EXPORTABLE_KEYS = [
   "omnigent:hide-unconfigured-harnesses",
   "omnigent:default-base-branch",
   "omnigent:always-use-worktree",
+  COMPOSER_SEND_SHORTCUT_STORAGE_KEY,
   "web-theme",
 ] as const;
 

@@ -676,6 +676,21 @@ def write_bridge_startup_error(bridge_dir: Path, message: str) -> None:
         return  # best-effort; the real failure is already logged
 
 
+def clear_bridge_startup_error(bridge_dir: Path) -> None:
+    """
+    Remove a recorded startup-failure message once startup has succeeded.
+
+    A login-gated launch records its failure up front so pending turns fail
+    fast; when the user then signs in from the terminal and the thread does
+    start, the stale error must not shadow the now-working bridge state.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: None.
+    """
+    with _bridge_state_lock(bridge_dir), contextlib.suppress(FileNotFoundError):
+        (bridge_dir / _STARTUP_ERROR_FILE).unlink()
+
+
 def read_bridge_startup_error(bridge_dir: Path) -> str | None:
     """
     Read a recorded native Codex startup-failure message, if any.

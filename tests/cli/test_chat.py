@@ -28,6 +28,7 @@ from omnigent.chat import (
     _is_url,
     _materialize_override_bundle,
     _persisted_turn_text,
+    _pick_agent,
     _prepare_chat_session_via_daemon,
     _query_sessions_once,
     _raise_server_failed,
@@ -252,9 +253,11 @@ def test_wait_for_server_uses_fast_poll_before_backoff(
         """Record each poll interval the helper chooses."""
         sleep_calls.append(seconds)
 
-    def _fake_get(url: str, timeout: float) -> _Resp:
+    def _fake_get(url: str, timeout: float, trust_env: bool = True) -> _Resp:
         """Fail twice, then report ready on the third probe."""
         del url, timeout
+        # Loopback readiness probes must bypass the env proxy config.
+        assert trust_env is False
         http_calls["count"] += 1
         if http_calls["count"] < 3:
             raise __import__("httpx").ConnectError("not ready")
@@ -385,9 +388,11 @@ def test_wait_for_server_waits_for_runner_tunnel_status(
         """Record the poll interval chosen while runner is offline."""
         sleep_calls.append(seconds)
 
-    def _fake_get(url: str, timeout: float) -> _Resp:
+    def _fake_get(url: str, timeout: float, trust_env: bool = True) -> _Resp:
         """Report server readiness immediately but runner online later."""
         del timeout
+        # Loopback readiness probes must bypass the env proxy config.
+        assert trust_env is False
         requested_urls.append(url)
         if url.endswith("/health"):
             return _Resp(200)
@@ -1544,6 +1549,56 @@ def test_prepare_chat_session_via_daemon_reports_unreachable_server_as_click_err
     assert expected_hint in message
     # No runner is launched against a server we could not reach.
     assert "launch" not in captured
+
+
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        httpx.ConnectError("[Errno 8] nodename nor servname provided, or not known"),
+        httpx.ConnectTimeout("timed out establishing a connection"),
+        httpx.ProxyError("proxy refused the tunnel"),
+    ],
+    ids=["connect-error", "connect-timeout", "proxy-error"],
+)
+@pytest.mark.parametrize(
+    ("server_url", "expected_hint"),
+    [
+        # A local server that stopped — the user restarts it.
+        ("http://127.0.0.1:6767", "omnigent stop"),
+        # A remote target — the URL, the network, or a proxy is at fault.
+        ("https://example.databricksapps.com", "proxy"),
+    ],
+)
+def test_pick_agent_reports_unreachable_server_as_click_error(
+    server_url: str,
+    expected_hint: str,
+    transport_error: httpx.HTTPError,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreachable server in ``_pick_agent`` is a ``ClickException``.
+
+    ``_pick_agent`` runs the session-listing ``httpx.get`` on the direct
+    server-URL chat path (``omnigent run --server <url>`` and headless
+    prompts). Without a transport-error guard, a stale/unreachable server
+    URL escaped as a raw ``httpx.ConnectError`` all the way to the crash
+    handler — a crash screen and a file-an-issue prompt for what is an
+    environment problem. It must produce the same clean, actionable
+    message as the daemon path.
+    """
+
+    def _refused(*_args: object, **_kwargs: object) -> object:
+        raise transport_error
+
+    monkeypatch.setattr(chat_module.httpx, "get", _refused)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        _pick_agent(server_url)
+
+    message = str(excinfo.value)
+    # The URL identifies which server was unreachable.
+    assert server_url in message
+    # The advice differs for a stopped local server vs a bad remote target.
+    assert expected_hint in message
 
 
 # ── OMNIGENT_MODEL env-var fallback ───────────────────
@@ -3180,7 +3235,7 @@ def test_await_accounts_setup_noop_for_header_mode(
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
     monkeypatch.setattr(
         "omnigent.chat.httpx.get",
-        lambda _url, timeout=5.0: _info_response(
+        lambda _url, timeout=5.0, trust_env=True: _info_response(
             {"accounts_enabled": False, "needs_setup": False}
         ),
     )
@@ -3213,7 +3268,9 @@ def test_await_accounts_setup_waits_then_continues(
     monkeypatch.setattr("omnigent.cli_auth.load_token", _load)
     monkeypatch.setattr(
         "omnigent.chat.httpx.get",
-        lambda _url, timeout=5.0: _info_response({"accounts_enabled": True, "needs_setup": True}),
+        lambda _url, timeout=5.0, trust_env=True: _info_response(
+            {"accounts_enabled": True, "needs_setup": True}
+        ),
     )
     monkeypatch.setattr("omnigent.chat.time.sleep", lambda _s: None)
 
@@ -3229,12 +3286,192 @@ def test_await_accounts_setup_times_out(
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
     monkeypatch.setattr(
         "omnigent.chat.httpx.get",
-        lambda _url, timeout=5.0: _info_response({"accounts_enabled": True, "needs_setup": True}),
+        lambda _url, timeout=5.0, trust_env=True: _info_response(
+            {"accounts_enabled": True, "needs_setup": True}
+        ),
     )
     monkeypatch.setattr("omnigent.chat.time.sleep", lambda _s: None)
 
     with pytest.raises(click.ClickException, match="Timed out"):
         chat_module._await_accounts_first_run_setup("http://127.0.0.1:8000", timeout_s=0.0)
+
+
+def test_await_accounts_setup_tolerates_unparseable_proxy_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proxy env httpx cannot parse must not crash the accounts probe.
+
+    With e.g. ``NO_PROXY=fe80::/10`` in the shell, httpx raises
+    ``httpx.InvalidURL: Invalid port: ':'`` at client construction — before
+    any request is sent. ``InvalidURL`` is NOT an ``HTTPError`` subclass, so
+    an ``except (httpx.HTTPError, ValueError)`` guard misses it and the
+    launch used to die on the crash handler. The probe must swallow it and
+    return, letting the normal path continue.
+    """
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+
+    def _invalid_proxy_env(*_a: object, **_k: object) -> object:
+        raise httpx.InvalidURL("Invalid port: ':'")
+
+    monkeypatch.setattr("omnigent.chat.httpx.get", _invalid_proxy_env)
+
+    # Must not raise — the crash-handler path is exactly this escaping.
+    chat_module._await_accounts_first_run_setup("http://127.0.0.1:8000")
+
+
+def test_await_accounts_setup_probe_bypasses_env_proxy_for_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The loopback ``/v1/info`` probe must pass ``trust_env=False``.
+
+    Building an env-trusting client both routes loopback traffic through any
+    configured proxy and can crash outright on a proxy value httpx cannot
+    parse, so the probe must not read the proxy environment at all.
+    """
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    seen: dict[str, object] = {}
+
+    def _fake_get(url: str, **kwargs: object) -> SimpleNamespace:
+        seen["url"] = url
+        seen.update(kwargs)
+        return _info_response({"accounts_enabled": False, "needs_setup": False})
+
+    monkeypatch.setattr("omnigent.chat.httpx.get", _fake_get)
+
+    chat_module._await_accounts_first_run_setup("http://127.0.0.1:8000")
+
+    assert seen.get("trust_env") is False, (
+        f"loopback /v1/info probe must bypass the environment proxy config (got kwargs {seen!r})"
+    )
+
+
+def test_server_get_keeps_env_proxy_for_remote_targets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-loopback requests keep httpx's default env-proxy handling.
+
+    Only loopback traffic is proxy-exempt; a corporate proxy must still
+    apply to a real remote server, so ``_server_get`` must not force
+    ``trust_env=False`` there.
+    """
+    seen: dict[str, object] = {}
+
+    def _fake_get(url: str, **kwargs: object) -> SimpleNamespace:
+        seen["url"] = url
+        seen.update(kwargs)
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr("omnigent.chat.httpx.get", _fake_get)
+
+    chat_module._server_get("https://example.databricksapps.com/v1/info", timeout=5.0)
+
+    assert "trust_env" not in seen, (
+        f"remote requests must keep httpx's default proxy handling; got kwargs {seen!r}"
+    )
+
+
+def test_prepare_chat_session_via_daemon_reports_unparseable_proxy_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``httpx.InvalidURL`` from the daemon prep path is a ``ClickException``.
+
+    A remote ``--server`` target keeps ``trust_env`` on, so building the SDK /
+    daemon clients parses the proxy environment and raises ``InvalidURL``
+    (not an ``HTTPError``) on a value like ``NO_PROXY=fe80::/10`` — an
+    environment problem that must not reach the crash handler.
+    """
+    captured: dict[str, object] = {}
+    _patch_daemon_launch(monkeypatch, captured)
+
+    async def _invalid_proxy_env(
+        _self: object, _bundle: bytes, *, filename: str, workspace: str
+    ) -> object:
+        raise httpx.InvalidURL("Invalid port: ':'")
+
+    monkeypatch.setattr(_FakeSessionsApi, "create", _invalid_proxy_env)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        asyncio.run(
+            _prepare_chat_session_via_daemon(
+                base_url="https://example.databricksapps.com",
+                headers={},
+                auth=None,
+                host_id="host_x",
+                bundle=b"bundle-bytes",
+                resume_conversation_id=None,
+                fork_session_id=None,
+                workspace="/tmp/proj",
+            )
+        )
+
+    # Exact match: proves the error names the target server and the parse
+    # failure (a substring URL probe here trips CodeQL's url-sanitization rule).
+    assert str(excinfo.value) == (
+        "Could not connect to the Omnigent server at "
+        "https://example.databricksapps.com. "
+        "Check the URL, your network connection, and any HTTP proxy settings. "
+        "(the proxy environment could not be parsed: Invalid port: ':')"
+    )
+    # No runner is launched against a server we could not reach.
+    assert "launch" not in captured
+
+
+def test_pick_agent_reports_unparseable_proxy_env_as_click_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``httpx.InvalidURL`` from a bad proxy env is a ``ClickException``.
+
+    ``InvalidURL`` is raised at client construction (not a transport error),
+    so the ConnectError/ConnectTimeout/ProxyError guard alone misses it and
+    it used to escape to the crash handler.
+    """
+
+    def _invalid_proxy_env(*_args: object, **_kwargs: object) -> object:
+        raise httpx.InvalidURL("Invalid port: ':'")
+
+    monkeypatch.setattr(chat_module.httpx, "get", _invalid_proxy_env)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        _pick_agent("https://example.databricksapps.com")
+
+    # Same actionable message as an unreachable server: check URL/proxy.
+    assert "proxy" in str(excinfo.value)
+
+
+def test_wait_for_remote_runner_surfaces_unparseable_proxy_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The remote runner-status poll fails fast on an unparseable proxy env.
+
+    A remote base_url keeps ``trust_env`` on, so a proxy value httpx cannot
+    parse raises ``InvalidURL`` at client construction on every poll. That
+    failure is deterministic, so the poll must raise the actionable
+    ClickException on the first attempt instead of burning the timeout
+    (or escaping to the crash handler).
+    """
+    proc = SimpleNamespace(poll=lambda: None, returncode=None)
+    sleeps: list[float] = []
+
+    def _invalid_proxy_env(*_args: object, **_kwargs: object) -> object:
+        raise httpx.InvalidURL("Invalid port: ':'")
+
+    monkeypatch.setattr("omnigent.chat.time.sleep", sleeps.append)
+    monkeypatch.setattr("omnigent.chat.httpx.get", _invalid_proxy_env)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        _wait_for_remote_runner(
+            "https://example.databricksapps.com",
+            "runner_remote_test",
+            {"Authorization": "Bearer tok-test"},
+            proc,
+            timeout=5.0,
+        )
+
+    message = str(excinfo.value)
+    assert "proxy environment could not be parsed" in message
+    assert "Invalid port" in message
+    # Deterministic construction-time failure: no retry sleeps, no timeout burn.
+    assert sleeps == []
 
 
 def test_run_attach_errors_loud_when_host_offline(monkeypatch: pytest.MonkeyPatch) -> None:

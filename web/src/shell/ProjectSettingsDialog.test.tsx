@@ -117,6 +117,27 @@ describe("ProjectSettingsDialog", () => {
     expect(updateMock).toHaveBeenCalledWith("p_1", { use_worktree: true });
   });
 
+  it("preserves the project icon when saving settings", async () => {
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { icon: "🔥", use_worktree: true },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-worktree")).toHaveAttribute(
+        "data-state",
+        "checked",
+      ),
+    );
+
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", { icon: "🔥", use_worktree: true }),
+    );
+  });
+
   it("stores nothing for the worktree toggle when left at its default (OFF)", async () => {
     getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
     renderDialog();

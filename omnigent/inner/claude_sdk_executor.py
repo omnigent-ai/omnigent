@@ -698,6 +698,42 @@ _NO_SANDBOX_ENV = "OMNIGENT_CLAUDE_SDK_NO_SANDBOX"
 _CLAUDE_PATH_ENV = "OMNIGENT_CLAUDE_PATH"
 
 
+def _usage_from_observed_call(
+    last_call_usage: dict[str, Any] | None,  # type: ignore[explicit-any]
+    model: str | None,
+) -> dict[str, Any] | None:  # type: ignore[explicit-any]
+    """Synthesize turn usage from the last observed ``message_start`` call.
+
+    Used when a turn ends without ``ResultMessage`` usage (early stream
+    close, terminal error, executor exception): the per-call prompt size
+    from the most recent ``message_start`` is the best available window
+    fill, so the context-occupancy meter can still advance.
+
+    :param last_call_usage: The last ``message_start`` event's
+        ``message.usage`` dict, or ``None`` when no API call started.
+    :param model: Harness-reported model for cost pricing, e.g.
+        ``"claude-sonnet-4-20250514"``.
+    :returns: A usage dict shaped like ``TurnComplete.usage``
+        (``output_tokens`` reports 0 — unknown on an incomplete turn),
+        or ``None`` when nothing was observed.
+    """
+    if last_call_usage is None:
+        return None
+    ctx_in = last_call_usage.get("input_tokens") or 0
+    ctx_cc = last_call_usage.get("cache_creation_input_tokens") or 0
+    ctx_cr = last_call_usage.get("cache_read_input_tokens") or 0
+    # ``total_tokens`` is billing-shaped (non-cache input only, no output on
+    # an incomplete turn); ``context_tokens`` is window fill, so it includes
+    # the cache buckets. The two intentionally differ.
+    return {
+        "input_tokens": ctx_in,
+        "output_tokens": 0,
+        "total_tokens": ctx_in,
+        "context_tokens": ctx_in + ctx_cc + ctx_cr,
+        "model": model,
+    }
+
+
 def _sandbox_disabled_by_env() -> bool:
     """``True`` when the diagnostic bypass env var is set to a truthy
     value. Emits a WARNING on activation so CI output unambiguously
@@ -2507,6 +2543,8 @@ class ClaudeSDKExecutor(Executor):
         terminal_error: str | None = None
         compaction_occurred: bool = False
         claude_session_id: str | None = None
+        compaction_transcript_path: pathlib.Path | None = None
+        compaction_transcript_offset: int | None = None
 
         # Track in-flight tool calls so we can emit ToolCallComplete
         # with the tool name and duration when results arrive.
@@ -2531,6 +2569,98 @@ class ClaudeSDKExecutor(Executor):
         # mirroring how the openai-agents executor uses ``raw_responses[-1]``
         # for ``context_tokens``. ``None`` until the first call starts.
         last_call_usage: dict[str, Any] | None = None  # type: ignore[explicit-any]
+
+        def _new_compact_summary_visible() -> bool:
+            if compaction_transcript_path is None or compaction_transcript_offset is None:
+                logger.warning(
+                    "Skipping Claude compaction checkpoint after stream failure: "
+                    "PreCompact did not provide a readable transcript boundary "
+                    "(session=%s).",
+                    claude_session_id,
+                )
+                return False
+
+            try:
+                with compaction_transcript_path.open("rb") as transcript:
+                    transcript.seek(compaction_transcript_offset)
+                    appended = transcript.read()
+            except OSError:
+                logger.warning(
+                    "Skipping Claude compaction checkpoint after stream failure: "
+                    "could not read appended transcript records (session=%s, path=%s).",
+                    claude_session_id,
+                    compaction_transcript_path,
+                    exc_info=True,
+                )
+                return False
+
+            for raw_line in appended.splitlines():
+                try:
+                    entry = json.loads(raw_line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if isinstance(entry, dict) and entry.get("isCompactSummary") is True:
+                    return True
+
+            logger.warning(
+                "Skipping Claude compaction checkpoint after stream failure: "
+                "no post-PreCompact summary record is visible yet (session=%s, path=%s).",
+                claude_session_id,
+                compaction_transcript_path,
+            )
+            return False
+
+        def _build_compaction_complete_event(
+            *, require_new_compact_summary: bool = False
+        ) -> ExecutorEvent | None:
+            from omnigent.inner.executor import CompactionComplete
+
+            assert claude_session_id is not None
+            if require_new_compact_summary and not _new_compact_summary_visible():
+                return None
+
+            compaction_tokens = 0
+            if turn_usage is not None:
+                compaction_tokens = turn_usage.get("context_tokens", 0) or 0
+
+            try:
+                from claude_agent_sdk import get_session_messages
+
+                messages = get_session_messages(claude_session_id, directory=self._cwd)
+                compacted_messages = [
+                    {
+                        "type": "message",
+                        "role": message.type,
+                        "content": message.message.get("content", []),
+                    }
+                    for message in messages
+                    if isinstance(message.message, dict)
+                ]
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "Failed to read Claude post-compaction session messages "
+                    "(session=%s); preserving full server history instead of "
+                    "persisting an empty checkpoint.",
+                    claude_session_id,
+                    exc_info=True,
+                )
+                return None
+
+            if not compacted_messages:
+                logger.warning(
+                    "Claude post-compaction read returned no messages "
+                    "(session=%s); preserving full server history instead of "
+                    "persisting an empty checkpoint.",
+                    claude_session_id,
+                )
+                return None
+
+            return CompactionComplete(
+                summary="[Claude Code compaction — context was automatically compacted]",
+                token_count=compaction_tokens,
+                model=observed_model or model,
+                compacted_messages=compacted_messages,
+            )
 
         client = await self._get_or_create_client(
             sdk,
@@ -2910,6 +3040,22 @@ class ClaudeSDKExecutor(Executor):
                                 break
                         elif getattr(system_msg, "hook_event_name", None) == "PreCompact":
                             compaction_occurred = True
+                            hook_session_id = getattr(system_msg, "session_id", None)
+                            if hook_session_id is None and isinstance(data, dict):
+                                hook_session_id = data.get("session_id")
+                            if hook_session_id:
+                                claude_session_id = str(hook_session_id)
+                            hook_transcript_path = getattr(system_msg, "transcript_path", None)
+                            if hook_transcript_path is None and isinstance(data, dict):
+                                hook_transcript_path = data.get("transcript_path")
+                            if isinstance(hook_transcript_path, str) and hook_transcript_path:
+                                compaction_transcript_path = pathlib.Path(hook_transcript_path)
+                                try:
+                                    compaction_transcript_offset = (
+                                        compaction_transcript_path.stat().st_size
+                                    )
+                                except OSError:
+                                    compaction_transcript_offset = None
                             logger.info("Claude SDK compaction detected (PreCompact hook)")
                             from omnigent.inner.executor import CompactionStarted
 
@@ -2946,41 +3092,45 @@ class ClaudeSDKExecutor(Executor):
                 stderr_text,
                 diagnostics_text,
             )
+            if compaction_occurred and claude_session_id:
+                compaction_event = _build_compaction_complete_event(
+                    require_new_compact_summary=True
+                )
+                if compaction_event is not None:
+                    yield compaction_event
             yield ExecutorError(
                 message=(
                     f"Claude SDK error: {exc}\n"
                     f"CLI stderr:\n{stderr_text}\n"
                     f"CLI system diagnostics:\n{diagnostics_text}"
-                )
+                ),
+                usage=turn_usage
+                if turn_usage is not None
+                else _usage_from_observed_call(last_call_usage, observed_model or model),
             )
             return
-        if terminal_error:
-            yield ExecutorError(message=terminal_error)
-            return
+        # A turn can end without ``ResultMessage`` usage — the CLI can close
+        # the stream early, fail terminally (auth failure, rejected retries),
+        # or be cut short before its final usage is reported. In all of those
+        # cases ``turn_usage`` is None and the context-occupancy meter would
+        # freeze at the previous successful turn's value, hiding real window
+        # fill exactly when a session is in trouble. The latest prompt size
+        # was already observed from ``message_start`` (``last_call_usage``),
+        # so synthesize a usage dict from it — for the failure return below
+        # AND the completion path — and let the terminal event carry it.
+        # ``output_tokens`` is unknown on an incomplete turn, so it reports 0
+        # rather than guess. The full ``ResultMessage`` path above still wins
+        # whenever it runs.
+        if turn_usage is None:
+            turn_usage = _usage_from_observed_call(last_call_usage, observed_model or model)
 
-        # A turn can finish the stream without ever yielding a
-        # ``ResultMessage`` — the CLI can close the stream early, or the
-        # turn can be cut short before its final usage is reported. In
-        # that case ``turn_usage`` is None and the context-occupancy
-        # meter freezes at the previous successful turn's value, hiding
-        # real window fill exactly when a session is in trouble (#1533).
-        # We already observed the latest prompt size from ``message_start``
-        # (``last_call_usage``), so synthesize a usage dict from it and let
-        # ``TurnComplete`` carry it. ``context_tokens`` (window fill) is the
-        # meaningful field here; ``output_tokens`` is unknown on an
-        # incomplete turn, so report 0 rather than guess. The full
-        # ``ResultMessage`` path above still wins whenever it runs.
-        if turn_usage is None and last_call_usage is not None:
-            ctx_in = last_call_usage.get("input_tokens") or 0
-            ctx_cc = last_call_usage.get("cache_creation_input_tokens") or 0
-            ctx_cr = last_call_usage.get("cache_read_input_tokens") or 0
-            turn_usage = {
-                "input_tokens": ctx_in,
-                "output_tokens": 0,
-                "total_tokens": ctx_in,
-                "context_tokens": ctx_in + ctx_cc + ctx_cr,
-                "model": observed_model or model,
-            }
+        if terminal_error:
+            if compaction_occurred and claude_session_id:
+                compaction_event = _build_compaction_complete_event()
+                if compaction_event is not None:
+                    yield compaction_event
+            yield ExecutorError(message=terminal_error, usage=turn_usage)
+            return
 
         # ── LLM_RESPONSE policy evaluation ───────────────────────
         # Evaluate after the stream completes but before TurnComplete
@@ -2996,56 +3146,19 @@ class ClaudeSDKExecutor(Executor):
             _resp_verdict = await _policy_eval("PHASE_LLM_RESPONSE", _resp_data)
             if _resp_verdict.action == "POLICY_ACTION_DENY":
                 _deny_reason = _resp_verdict.reason or "no reason given"
+                if compaction_occurred and claude_session_id:
+                    compaction_event = _build_compaction_complete_event()
+                    if compaction_event is not None:
+                        yield compaction_event
                 yield ExecutorError(message=(f"LLM response denied by policy: {_deny_reason}"))
                 return
 
         _notify_usage_from_dict(model=model, usage=turn_usage)
 
         if compaction_occurred and claude_session_id:
-            from omnigent.inner.executor import CompactionComplete
-
-            _compaction_tokens = 0
-            if turn_usage is not None:
-                _compaction_tokens = turn_usage.get("context_tokens", 0) or 0
-            # Read the post-compaction session messages so the runner
-            # can persist them for session resume in ephemeral
-            # environments where the CLI's own transcript is lost.
-            _compacted: list[_JsonObject] | None = None
-            try:
-                from claude_agent_sdk import get_session_messages
-
-                _msgs = get_session_messages(claude_session_id, directory=self._cwd)
-                _compacted = [
-                    {"type": "message", "role": m.type, "content": m.message.get("content", [])}
-                    for m in _msgs
-                    if isinstance(m.message, dict)
-                ]
-                if not _compacted:
-                    logger.warning(
-                        "Claude post-compaction read returned no messages "
-                        "(session=%s); resume will fall back to the synthetic "
-                        "summary instead of the harness's real compacted state.",
-                        claude_session_id,
-                    )
-            except Exception:  # noqa: BLE001
-                # WARNING, not DEBUG: a swallowed read here silently degrades
-                # EVERY later resume of this conversation. The runner persists a
-                # compaction item with no ``compacted_messages``, so resume
-                # replays the lossy synthetic-summary pair instead of the
-                # harness's real post-compaction context. Surface it.
-                logger.warning(
-                    "Failed to read Claude post-compaction session messages "
-                    "(session=%s); resume fidelity for this conversation will "
-                    "degrade to the synthetic summary.",
-                    claude_session_id,
-                    exc_info=True,
-                )
-            yield CompactionComplete(
-                summary="[Claude Code compaction — context was automatically compacted]",
-                token_count=_compaction_tokens,
-                model=observed_model or model,
-                compacted_messages=_compacted,
-            )
+            compaction_event = _build_compaction_complete_event()
+            if compaction_event is not None:
+                yield compaction_event
 
         yield TurnComplete(response=response_text, usage=turn_usage)
 

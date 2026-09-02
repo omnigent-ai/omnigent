@@ -27,17 +27,25 @@ const vm = require("node:vm");
 const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
 const preloadSource = readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
 const setupSource = readFileSync(path.join(__dirname, "../setup/index.html"), "utf8");
+const urlHelpers = require("../src/url");
 
 // Strip block comments, then line comments (leaving `://` in URLs intact).
 const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 
 function loadNavigationHarness({
   serverUrl = "https://host.example/ml/omnigents",
+  savedServerUrl,
   registerFallbacks = true,
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
+  if (savedServerUrl) {
+    fs.writeFileSync(
+      path.join(userData, "settings.json"),
+      JSON.stringify({ server_url: savedServerUrl }),
+    );
+  }
   const listeners = new Map();
-  const calls = { loadFile: [] };
+  const calls = { loadFile: [], loadURL: [] };
   const bannerCalls = { show: [], hide: 0 };
   let currentUrl = serverUrl;
   const appEvents = new Map();
@@ -68,7 +76,10 @@ function loadNavigationHarness({
       calls.loadFile.push(args);
       return Promise.resolve();
     },
-    loadURL: () => Promise.resolve(),
+    loadURL: (...args) => {
+      calls.loadURL.push(args);
+      return Promise.resolve();
+    },
   };
 
   function createDesktopUpdater() {
@@ -130,6 +141,7 @@ function loadNavigationHarness({
     },
     "./localhost_cors": { registerLocalhostCors: () => {} },
     "./url": {
+      ...urlHelpers,
       normalizeUrl: (url) => url,
       expandDatabricksWorkspaceUrl: async (url) => url,
       fetchServerManifest: async () => ({}),
@@ -256,6 +268,16 @@ describe("setup clipboard IPC wiring", () => {
   });
 });
 
+describe("macOS activation wiring", () => {
+  it("counts tracked shell windows instead of utility windows", () => {
+    assert.match(liveCode, /app\.on\("activate"[\s\S]{0,500}windows\.size === 0/);
+    assert.doesNotMatch(
+      liveCode,
+      /app\.on\("activate"[\s\S]{0,500}BrowserWindow\.getAllWindows\(\)\.length === 0/,
+    );
+  });
+});
+
 describe("managed server preference wiring", () => {
   it("exposes managed servers only through the setup-page bridge", () => {
     assert.match(
@@ -292,6 +314,47 @@ describe("managed server preference wiring", () => {
   it("renders organization-provided servers separately on setup", () => {
     assert.match(setupSource, /Provided by your organization/);
     assert.match(setupSource, /setup\s*\.getManagedServers\(\)/);
+  });
+});
+
+describe("Databricks-internal local-host CLI wiring", () => {
+  it("selects isaac omni only behind the internal flag and Databricks server gate", () => {
+    assert.match(
+      liveCode,
+      /function hostCliCommand\(serverUrl\)[\s\S]{0,300}databricksInternalFeaturesEnabled\(\)[\s\S]{0,120}isDatabricksManagedServerUrl\(serverUrl\)[\s\S]{0,300}prefixArgs:\s*\["omni"\]/,
+    );
+  });
+
+  it("uses the selected command for identity availability and every host action", () => {
+    assert.match(
+      liveCode,
+      /host-get-identity[\s\S]{0,350}Boolean\(hostCliCommand\(senderServerUrl\(event\)\)\)/,
+    );
+    assert.match(
+      liveCode,
+      /host-control[\s\S]{0,450}const cliCommand = hostCliCommand\(serverUrl\)[\s\S]{0,1400}ensureServerAuth\(cliCommand, serverUrl\)[\s\S]{0,400}ensureHostConnected\(cliCommand, serverUrl\)[\s\S]{0,300}disconnectHost\(cliCommand, serverUrl\)/,
+    );
+  });
+
+  it("disables CLI customization in main and explains managed policy in the setup dialog", () => {
+    assert.match(
+      liveCode,
+      /omnigent:set-cli-path[\s\S]{0,300}databricksInternalFeaturesEnabled\(\)[\s\S]{0,250}customizationDisabled:\s*true[\s\S]{0,80}accepted:\s*false/,
+    );
+    assert.match(
+      liveCode,
+      /omnigent:browse-cli-path[\s\S]{0,250}databricksInternalFeaturesEnabled\(\)\) return null/,
+    );
+    assert.match(
+      liveCode,
+      /omnigent:cli-reset-path[\s\S]{0,250}databricksInternalFeaturesEnabled\(\)[\s\S]{0,250}customizationDisabled:\s*true/,
+    );
+    assert.match(setupSource, /cliGear\.hidden = false/);
+    assert.match(setupSource, /cliManaged\.hidden = !cliCustomizationDisabled/);
+    assert.match(setupSource, /cliPathInput\.disabled = cliCustomizationDisabled/);
+    assert.match(setupSource, /cliBrowse\.disabled = cliCustomizationDisabled/);
+    assert.match(setupSource, /cliRedetect\.disabled = cliCustomizationDisabled/);
+    assert.match(setupSource, /Managed by your organization/);
   });
 });
 
@@ -441,6 +504,22 @@ describe("workspace chrome injection wiring (src/main.js)", () => {
 });
 
 describe("navigation fallback wiring (src/main.js)", () => {
+  it("boots a saved Databricks API URL on the UI mount without losing URL state", () => {
+    const saved = "https://workspace.cloud.databricks.com/api/2.0/omnigent/?o=123#conversation";
+    const harness = loadNavigationHarness({
+      savedServerUrl: saved,
+      registerFallbacks: false,
+    });
+
+    harness.api.createWindow();
+
+    assert.equal(
+      harness.calls.loadURL[0][0],
+      "https://workspace.cloud.databricks.com/omnigent?o=123#conversation",
+    );
+    harness.cleanup();
+  });
+
   it("registers navigation fallbacks when createWindow builds a window", () => {
     const harness = loadNavigationHarness({ registerFallbacks: false });
 

@@ -122,24 +122,29 @@ function ownsLiveHost(key) {
  * (or fails / times out). On success the child keeps running; the caller
  * registers it. Never rejects.
  *
- * @param {string} cliPath
+ * @param {Parameters<typeof cli.cliCommandParts>[0]} cliCommand
  * @param {string} serverUrl
  * @returns {Promise<{ ok: boolean, child: import("child_process").ChildProcess, holder: {text: string}, error?: string }>}
  */
-function spawnHostChild(cliPath, serverUrl) {
+function spawnHostChild(cliCommand, serverUrl) {
   return new Promise((resolve) => {
     const holder = { text: "" };
     let child;
     try {
+      const { executable, prefixArgs } = cli.cliCommandParts(cliCommand);
       // `--non-interactive`: the desktop owns the sign-in step (ensureServerAuth
       // runs `omnigent login` first), so the host daemon must never try its own
       // interactive login. Without the flag, an unauthed connect relies on the
       // spawned child's stdin not being a TTY to bail — with it, the CLI raises a
       // deterministic "run `omnigent login`" error that `isAuthError` classifies,
       // so any residual auth gap becomes a fast, surfaced authError, not a hang.
-      child = spawn(cliPath, ["host", "--server", serverUrl, "--non-interactive"], {
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+      child = spawn(
+        executable,
+        [...prefixArgs, "host", "--server", serverUrl, "--non-interactive"],
+        {
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
     } catch (err) {
       resolve({ ok: false, child: null, holder, error: err.message });
       return;
@@ -191,11 +196,11 @@ function spawnHostChild(cliPath, serverUrl) {
  * error on the conflict, and we must not kill a daemon we didn't start. Adopted
  * connections report ownedByDesktop:false.
  *
- * @param {string} cliPath
+ * @param {Parameters<typeof cli.cliCommandParts>[0]} cliCommand
  * @param {string} serverUrl
  * @returns {Promise<{ ok: boolean, ownedByDesktop: boolean, adopted?: boolean, error?: string }>}
  */
-async function ensureHostConnected(cliPath, serverUrl) {
+async function ensureHostConnected(cliCommand, serverUrl) {
   const key = cli.normalizeServerUrl(serverUrl);
   if (key === "") return { ok: false, ownedByDesktop: false, error: "missing server URL" };
   if (ownsLiveHost(key)) return { ok: true, ownedByDesktop: true };
@@ -204,7 +209,7 @@ async function ensureHostConnected(cliPath, serverUrl) {
   // two `omnigent host` processes for one target.
   const inflight = connectingHosts.get(key);
   if (inflight) return inflight;
-  const op = connectHost(cliPath, serverUrl, key);
+  const op = connectHost(cliCommand, serverUrl, key);
   connectingHosts.set(key, op);
   // Ping the renderer right away so it re-reads (e.g. refetches the server's
   // host list), then again once the connect settles.
@@ -221,12 +226,12 @@ async function ensureHostConnected(cliPath, serverUrl) {
  * The actual connect: adopt a daemon already serving this target, else spawn
  * and track one. Serialized per target by ensureHostConnected.
  *
- * @param {string} cliPath
+ * @param {Parameters<typeof cli.cliCommandParts>[0]} cliCommand
  * @param {string} serverUrl
  * @param {string} key Normalized server URL.
  * @returns {Promise<{ ok: boolean, ownedByDesktop: boolean, adopted?: boolean, error?: string }>}
  */
-async function connectHost(cliPath, serverUrl, key) {
+async function connectHost(cliCommand, serverUrl, key) {
   // Adopt only a daemon we can VERIFY is connected (live process + an online
   // tunnel, via the fast disk-read + single HTTP probe — not the slow `omnigent
   // host status` subprocess). PID-liveness alone is not enough: a stale registry
@@ -239,7 +244,7 @@ async function connectHost(cliPath, serverUrl, key) {
     return { ok: true, ownedByDesktop: false, adopted: true };
   }
 
-  const spawned = await spawnHostChild(cliPath, serverUrl);
+  const spawned = await spawnHostChild(cliCommand, serverUrl);
   if (!spawned.ok) {
     // Connect failed or timed out. Await the child's termination — escalating to
     // SIGKILL after the grace period — rather than firing a single SIGTERM and
@@ -280,11 +285,11 @@ async function connectHost(cliPath, serverUrl, key) {
  * daemon we merely adopted is asked to stop via the CLI (the user explicitly
  * toggled off, so honoring that is correct even for an adopted daemon).
  *
- * @param {string} cliPath
+ * @param {Parameters<typeof cli.cliCommandParts>[0]} cliCommand
  * @param {string} serverUrl
  * @returns {Promise<{ ok: boolean, error?: string }>}
  */
-async function disconnectHost(cliPath, serverUrl) {
+async function disconnectHost(cliCommand, serverUrl) {
   const key = cli.normalizeServerUrl(serverUrl);
   const entry = hostChildren.get(key);
   if (entry) {
@@ -295,7 +300,7 @@ async function disconnectHost(cliPath, serverUrl) {
     return { ok: true };
   }
   // No desktop-owned child: ask the CLI to stop a daemon we'd adopted.
-  const res = await cli.stopHost(cliPath, serverUrl);
+  const res = await cli.stopHost(cliCommand, serverUrl);
   return { ok: res.ok, error: res.ok ? undefined : res.output };
 }
 
@@ -315,17 +320,17 @@ async function disconnectHost(cliPath, serverUrl) {
  * login failure returns `{ ok:false, authError:true, error }` so the UI can
  * offer a sign-in/retry affordance instead of a generic failure.
  *
- * @param {string} cliPath
+ * @param {Parameters<typeof cli.cliCommandParts>[0]} cliCommand
  * @param {string} serverUrl
  * @returns {Promise<{ ok: boolean, authError?: boolean, error?: string }>}
  */
-async function ensureServerAuth(cliPath, serverUrl) {
+async function ensureServerAuth(cliCommand, serverUrl) {
   if (cli.isLoopbackServer(serverUrl)) return { ok: true };
   const probe = await cli.probeServerAuth(serverUrl);
   // Already authed, or unreachable — in the unreachable case skip a doomed login
   // and let the connect attempt surface the real (connectivity) error.
   if (probe.authed || !probe.reachable) return { ok: true };
-  const res = await cli.loginServer(cliPath, serverUrl);
+  const res = await cli.loginServer(cliCommand, serverUrl);
   if (res.ok) return { ok: true };
   // Deliberately a fixed, generic message — NOT `res.output`. `omnigent login`
   // stdout on the OIDC path contains the login-ticket URL
@@ -335,7 +340,7 @@ async function ensureServerAuth(cliPath, serverUrl) {
   return {
     ok: false,
     authError: true,
-    error: `Sign-in to ${serverUrl} didn't complete. A browser window should have opened — finish signing in and try again (or run \`omnigent login ${serverUrl}\` in a terminal).`,
+    error: `Sign-in to ${serverUrl} didn't complete. A browser window should have opened — finish signing in and try again (or run \`${cli.cliCommandParts(cliCommand).displayName} login ${serverUrl}\` in a terminal).`,
   };
 }
 
@@ -343,13 +348,13 @@ async function ensureServerAuth(cliPath, serverUrl) {
  * Restart this machine's host connection: stop (awaiting the daemon down), then
  * reconnect.
  *
- * @param {string} cliPath
+ * @param {Parameters<typeof cli.cliCommandParts>[0]} cliCommand
  * @param {string} serverUrl
  * @returns {Promise<{ ok: boolean, ownedByDesktop: boolean, error?: string }>}
  */
-async function restartHost(cliPath, serverUrl) {
-  await disconnectHost(cliPath, serverUrl);
-  return ensureHostConnected(cliPath, serverUrl);
+async function restartHost(cliCommand, serverUrl) {
+  await disconnectHost(cliCommand, serverUrl);
+  return ensureHostConnected(cliCommand, serverUrl);
 }
 
 /**

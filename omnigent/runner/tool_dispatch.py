@@ -300,6 +300,12 @@ _SESSION_QUERY_TOOLS = frozenset(
 
 _SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name()})
 
+# The title bound the rename tool advertises to the LLM — read once from the
+# tool schema so the dispatcher can never drift from the published contract.
+_SESSION_RENAME_TITLE_MAX_CHARS: int = SysSessionRenameTool().get_schema()["function"][
+    "parameters"
+]["properties"]["title"]["maxLength"]
+
 # Grantee sentinel for an anonymous, public read-only share. Mirrors the
 # server's RESERVED_USER_PUBLIC; only specs with
 # ``agent_session_sharing: public`` may grant it (enforced in
@@ -321,12 +327,11 @@ _SHARE_PUBLIC_POLICY = "public"
 _WEB_FETCH_TOOLS = frozenset({"web_fetch"})
 
 # Priority 5f.1b: web_search — the first-party search builtin. Runner-local
-# so a non-OpenAI model's web_search function call resolves to the spec's
-# configured backend (google / perplexity / nimble) via WebSearchTool.invoke.
-# (OpenAI models use the native web_search_preview passthrough and never reach
-# this path.) Without this entry the call fell through to the spec-callable
-# branch and errored "tool unavailable" — the gap behind the non-OpenAI
-# web_search known-failure.
+# so non-OpenAI-harness web_search calls resolve to the spec's configured
+# backend (google / perplexity / nimble) via WebSearchTool.invoke.
+# (OpenAI Responses-compatible harnesses use the native web_search_preview
+# passthrough and never reach this path.) Without this entry the call fell
+# through to the spec-callable branch and errored "tool unavailable".
 _WEB_SEARCH_TOOLS = frozenset({"web_search"})
 
 # nimble_research — Nimble Agent API v2 research runs (start → poll → result).
@@ -1428,6 +1433,75 @@ def _subagent_model_from_args(args: _JsonObject) -> str | None:
     return validate_model_override(raw_model)
 
 
+async def _inherited_parent_model(
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    sub_agent_name: str,
+    agent_spec: AgentSpec | None,
+    child_harness: str | None,
+) -> str | None:
+    """
+    Resolve the parent session's model for a dispatch that names none.
+
+    A user who selects a model for a session expects the whole session —
+    including the sub-agents it fans out to — to run on it; without
+    inheritance a dispatch that omits ``args.model`` silently lands on the
+    worker/provider default. Inheritance is best-effort and skips quietly
+    (unlike the explicit ``args.model`` path, which fails loud) because the
+    caller asked for nothing:
+
+    - a sub-agent spec that pins its own ``executor.model`` keeps it — the
+      worker's author chose that model deliberately;
+    - a child harness without model-override plumbing runs its default;
+    - a parent model outside the child harness's family (e.g. a Claude
+      selection dispatched to a codex worker) is not forced across vendors.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: The parent session id.
+    :param sub_agent_name: Name of the sub-agent being dispatched.
+    :param agent_spec: Parent agent's spec.
+    :param child_harness: The child's resolved harness, e.g. ``"claude-sdk"``.
+    :returns: The parent's effective model to inherit, or ``None`` when
+        inheritance does not apply.
+    """
+    sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
+    spec_model = getattr(getattr(sub_spec, "executor", None), "model", None)
+    if isinstance(spec_model, str) and spec_model:
+        return None
+    if not harness_supports_model_override(child_harness):
+        return None
+    try:
+        resp = await server_client.get(f"/v1/sessions/{conversation_id}", timeout=10.0)
+    except (httpx.HTTPError, RuntimeError):
+        return None
+    if resp.status_code != 200:
+        return None
+    snap = _string_object_dict(resp.json())
+    if snap is None:
+        return None
+    # Effective selection: an explicit per-session override wins over the
+    # spec/CLI-resolved model; both may be absent.
+    raw_model = snap.get("model_override") or snap.get("llm_model")
+    if not isinstance(raw_model, str) or not raw_model:
+        return None
+    try:
+        parent_model = validate_model_override(raw_model)
+    except ValueError:
+        return None
+    if child_harness is not None and model_family_mismatch(child_harness, parent_model):
+        _logger.debug(
+            "sys_session_send: not inheriting parent model %r for sub-agent %r "
+            "(family mismatch with harness %s); child runs its default",
+            parent_model,
+            sub_agent_name,
+            child_harness,
+            extra={"session_id": runner_primary_session_id()},
+        )
+        return None
+    return parent_model
+
+
 def _subagent_reasoning_effort_from_args(args: _JsonObject) -> str | None:
     """
     Extract the optional ``reasoning_effort`` from
@@ -2296,6 +2370,26 @@ async def _execute_subagent_tool(
                 agent_spec=agent_spec,
                 harness=child_harness,
             )
+        else:
+            # No explicit per-dispatch model: inherit the parent session's
+            # selection so the user's chosen model governs the whole session
+            # tree. Best-effort — skipped when the sub-agent spec pins its
+            # own model, the harness has no override plumbing, or the parent
+            # model's family cannot run on the child harness.
+            inherited = await _inherited_parent_model(
+                server_client=server_client,
+                conversation_id=conversation_id,
+                sub_agent_name=str(sub_agent_name),
+                agent_spec=agent_spec,
+                child_harness=child_harness,
+            )
+            if inherited is not None:
+                create_body["model_override"] = _normalize_subagent_model(
+                    inherited,
+                    sub_agent_name=str(sub_agent_name),
+                    agent_spec=agent_spec,
+                    harness=child_harness,
+                )
         # A dispatch that names no effort inherits the sub-agent spec's
         # ``executor.reasoning_effort``, so a worker's default is declared
         # once in its config instead of depending on the orchestrator
@@ -2325,23 +2419,66 @@ async def _execute_subagent_tool(
         # (parent, title) check is SELECT-then-INSERT with no DB unique
         # constraint, so truly concurrent creates can still race past it.
         _max_ordinal_retries = 5 if _auto_ordinal else 0
-        for _ordinal_attempt in range(_max_ordinal_retries + 1):
-            resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
-            if (
-                resp.status_code == 409
-                and _auto_ordinal
-                and _ordinal_attempt < _max_ordinal_retries
-            ):
-                ordinal = _runner_app.next_subagent_ordinal(
-                    conversation_id,
-                    str(sub_agent_name),
+        _create_timeout_exc: httpx.ReadTimeout | None = None
+        resp: httpx.Response | None = None
+        try:
+            for _ordinal_attempt in range(_max_ordinal_retries + 1):
+                resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
+                if (
+                    resp.status_code == 409
+                    and _auto_ordinal
+                    and _ordinal_attempt < _max_ordinal_retries
+                ):
+                    ordinal = _runner_app.next_subagent_ordinal(
+                        conversation_id,
+                        str(sub_agent_name),
+                    )
+                    session_name = f"{sub_agent_name}-{ordinal}"
+                    create_body["title"] = f"{sub_agent_name}:{session_name}"
+                    continue
+                break
+        except httpx.ReadTimeout as _exc:
+            _create_timeout_exc = _exc
+        if _create_timeout_exc is not None:
+            # The read deadline elapsed after the server may have committed the
+            # child session — child_session_id is unknown to us, but the
+            # (parent, agent, title) triple is. Reconcile: look up the created
+            # child by its expected title so we can reap its process cluster.
+            # Guard the entire reconcile path against further transport errors
+            # (the server may still be wedged) so any failure still returns
+            # the descriptive string instead of propagating.
+            _reap_warning: str = ""
+            try:
+                _leaked = await _find_existing_child_session(
+                    server_client=server_client,
+                    conversation_id=conversation_id,
+                    agent=str(sub_agent_name),
+                    title=str(session_name),
                 )
-                session_name = f"{sub_agent_name}-{ordinal}"
-                create_body["title"] = f"{sub_agent_name}:{session_name}"
-                continue
-            break
-        if resp.status_code >= 400:
-            return f"Error: failed to create child session: {resp.status_code} {resp.text[:200]}"
+                if isinstance(_leaked, dict):
+                    _leaked_id = _leaked.get("id") or _leaked.get("session_id")
+                    if isinstance(_leaked_id, str) and _leaked_id:
+                        _reap_warning = (
+                            await _teardown_failed_child(
+                                server_client,
+                                _leaked_id,
+                                created_child=True,
+                            )
+                            or ""
+                        )
+            except Exception:  # noqa: BLE001 — reconcile is best-effort; any transport error still returns the descriptive string
+                pass
+            _suffix = f" {_reap_warning}" if _reap_warning else ""
+            return (
+                f"Error: timed out waiting for child session create response "
+                f"({sub_agent_name!r} / {session_name!r}); the server may have "
+                f"committed the session — reaping any orphaned cluster.{_suffix} "
+                "Retry the same send to continue in a fresh child."
+            )
+        if resp is None or resp.status_code >= 400:
+            status = resp.status_code if resp is not None else 0
+            text = resp.text[:200] if resp is not None else "(no response)"
+            return f"Error: failed to create child session: {status} {text}"
         child_data = _string_object_dict(resp.json())
         if child_data is None:
             return "Error: server returned malformed child session data"
@@ -3237,16 +3374,13 @@ async def _execute_web_search_tool(
     runs its synchronous ``invoke`` off the event loop (the backend makes a
     blocking HTTP call).
 
-    ``llm_provider`` is inferred exactly as ``ToolManager._create_web_search``
-    does, so the dispatch path preserves the same invariants as session setup:
-
-    - **OpenAI models** keep the native ``web_search_preview`` passthrough; if a
-      ``web_search`` function call ever reached this path, ``invoke()`` raises
-      (its built-in fence) and the third-party backend is never run. In normal
-      operation OpenAI models never emit a ``web_search`` function call, so this
-      is defensive — but it keeps the promise rather than silently weakening it.
-    - **``databricks-*`` models** skip provider inference (they don't support
-      ``web_search_preview``) and run in function-tool mode.
+    ``llm_provider`` comes from the same helper session setup uses
+    (:func:`~omnigent.llms.routing.web_search_native_passthrough_provider`),
+    so dispatch preserves the session-setup invariants: on OpenAI
+    Responses-compatible harnesses the native ``web_search_preview``
+    passthrough is kept (``invoke()`` raises its fence if a function call
+    ever reaches this path — defensive, the provider executes server-side);
+    every other harness/model runs in function-tool mode.
 
     :param args: Parsed LLM arguments — ``query`` (required).
     :param agent_spec: Parent agent's spec; carries the web_search config + model.
@@ -3259,14 +3393,14 @@ async def _execute_web_search_tool(
     from omnigent.tools.builtins.web_search import WebSearchTool
 
     config = _web_search_config_from_spec(agent_spec)
-    # Mirror ToolManager._create_web_search's provider inference (same skip for
-    # databricks-*, same OpenAI passthrough fence) so dispatch honors session-setup invariants.
-    llm_provider: str | None = None
-    model = getattr(getattr(agent_spec, "executor", None), "model", None)
-    if model and not model.startswith("databricks-"):
-        from omnigent.llms.routing import parse_model_string
+    # Same helper as ToolManager._create_web_search, so dispatch and
+    # session-setup advertisement cannot drift.
+    from omnigent.llms.routing import web_search_native_passthrough_provider
 
-        llm_provider = parse_model_string(model).provider
+    executor = getattr(agent_spec, "executor", None)
+    llm_provider = web_search_native_passthrough_provider(
+        getattr(executor, "model", None), getattr(executor, "harness_kind", None)
+    )
     tool = WebSearchTool(config=config, llm_provider=llm_provider)
     ctx = ToolContext(
         task_id=task_id or "web_search",
@@ -4133,8 +4267,8 @@ async def _execute_session_query_tool(
 
     - ``sys_session_list`` → ``GET /v1/sessions/{caller}/child_sessions``
     - ``sys_session_get_history`` → ``GET /v1/sessions/{target}/items``
-    - ``sys_session_get_info`` → ``GET /v1/sessions/{target}`` (plus a
-      best-effort ``GET /v1/runners/{id}/status`` for connectivity)
+    - ``sys_session_get_info`` → ``GET /v1/sessions/{target}`` (plus
+      best-effort runner connectivity and host readiness lookups)
     - ``sys_session_close`` → ``GET`` the target snapshot then ``PATCH
       /v1/sessions/{target}`` with a tombstoned title
     - ``sys_session_share`` → ``PUT /v1/sessions/{target}/permissions``
@@ -4228,6 +4362,23 @@ async def _runner_online_or_none(
     return online if isinstance(online, bool) else None
 
 
+async def _host_harnesses_or_none(
+    host_id: str | None,
+    server_client: httpx.AsyncClient,
+) -> _JsonObject | None:
+    """Return the bound host's reported harness readiness, best-effort."""
+    if not host_id:
+        return None
+    try:
+        resp = await server_client.get(f"/v1/hosts/{host_id}", timeout=30.0)
+        if resp.status_code != 200:
+            return None
+        readiness = resp.json().get("configured_harnesses")
+    except Exception:  # noqa: BLE001
+        return None
+    return readiness if isinstance(readiness, dict) else None
+
+
 async def _session_get_info_via_rest(
     args: _JsonObject,
     conversation_id: str,
@@ -4239,13 +4390,15 @@ async def _session_get_info_via_rest(
     Resolves the target from ``args["session_id"]`` (falling back to the
     caller's own ``conversation_id`` when omitted), fetches the session
     snapshot, and projects the metadata fields — status, title, agent
-    binding, runner binding, host, reasoning effort, effective model,
+    binding, runner binding, host and its reported harness readiness,
+    reasoning effort, effective model,
     parent linkage, workspace / git branch, persisted last-activity time,
     and the outstanding approval prompts (the prompts themselves plus a
     count). Runner connectivity
     is resolved best-effort via
     ``GET /v1/runners/{id}/status`` (``runner_online`` is ``None`` when
-    the lookup fails or no runner is bound). The full transcript is
+    the lookup fails or no runner is bound); host readiness is likewise
+    best-effort via ``GET /v1/hosts/{id}``. The full transcript is
     intentionally omitted — that is what ``sys_session_get_history`` returns.
 
     Maps a 404 to ``session_not_found`` and 401/403 to ``access_denied``
@@ -4282,6 +4435,11 @@ async def _session_get_info_via_rest(
     pending = pending_value if isinstance(pending_value, list) else []
     snap_agent_name = _optional_string(snap.get("agent_name"))
     snap_runner_id = _optional_string(snap.get("runner_id"))
+    snap_host_id = _optional_string(snap.get("host_id"))
+    runner_online, configured_harnesses = await asyncio.gather(
+        _runner_online_or_none(snap_runner_id, server_client),
+        _host_harnesses_or_none(snap_host_id, server_client),
+    )
     return json.dumps(
         {
             "session_id": snap.get("id"),
@@ -4299,8 +4457,9 @@ async def _session_get_info_via_rest(
             # unchanged.
             "agent_name": public_agent_name(snap_agent_name),
             "runner_id": snap.get("runner_id"),
-            "runner_online": await _runner_online_or_none(snap_runner_id, server_client),
+            "runner_online": runner_online,
             "host_id": snap.get("host_id"),
+            "configured_harnesses": configured_harnesses,
             "parent_session_id": snap.get("parent_session_id"),
             "sub_agent_name": snap.get("sub_agent_name"),
             "reasoning_effort": snap.get("reasoning_effort"),
@@ -5090,12 +5249,11 @@ async def _rename_current_session_via_rest(
     conversation_id: str | None,
     server_client: httpx.AsyncClient | None,
 ) -> str:
-    """Conditionally rename the calling session through the server API.
+    """Rename the calling session through the server API.
 
-    Automatic naming is framework metadata, never a prerequisite for the
-    user's turn. Every failure therefore becomes a tool-result envelope so a
-    missing route, unavailable server, or malformed response cannot abort the
-    harness session.
+    Session naming is metadata, never a prerequisite for the user's turn.
+    Every failure therefore becomes a tool-result envelope so a missing route,
+    unavailable server, or malformed response cannot abort the harness session.
     """
     if server_client is None:
         return json.dumps({"error": "sys_session_rename requires server access"})
@@ -5104,10 +5262,60 @@ async def _rename_current_session_via_rest(
     title = args.get("title")
     if not isinstance(title, str):
         return json.dumps({"error": "sys_session_rename requires a string 'title'"})
+    # Enforce exactly the bounds the tool schema advertises to the LLM.
+    max_chars = _SESSION_RENAME_TITLE_MAX_CHARS
+    if len(title) < 2 or len(title) > max_chars:
+        return json.dumps({"error": f"sys_session_rename title must be 2-{max_chars} characters"})
+    if "\n" in title or "\r" in title:
+        return json.dumps({"error": "sys_session_rename title must be a single line"})
+    normalized_title = " ".join(title.split())
+    if len(normalized_title) < 2:
+        return json.dumps({"error": f"sys_session_rename title must be 2-{max_chars} characters"})
+    # Only a top-level session may rename itself: a sub-agent's title is its
+    # (parent, title) continuation address for sys_session_send, so a child
+    # rename would corrupt sibling addressing. Refuse explicitly, matching
+    # the old seed-gated endpoint's response for child sessions.
     try:
-        response = await server_client.post(
-            f"/v1/sessions/{conversation_id}/auto-title",
-            json={"title": title},
+        info_response = await server_client.get(
+            f"/v1/sessions/{conversation_id}",
+            # Skip the transcript and the runner/host liveness lookup — the
+            # probe only needs parent_session_id.
+            params={"include_items": "false", "include_liveness": "false"},
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_session_rename failed: {exc}"})
+    if info_response.status_code >= 400:
+        return json.dumps(
+            {
+                "error": f"sys_session_rename returned {info_response.status_code}",
+                "detail": info_response.text[:200],
+            }
+        )
+    try:
+        info_payload = info_response.json()
+    except ValueError as exc:
+        return json.dumps({"error": f"sys_session_rename returned invalid JSON: {exc}"})
+    # Fail closed: only a payload that positively shows a parentless session
+    # may proceed — a malformed or version-skewed snapshot must not let a
+    # child rename slip through and corrupt its continuation address. Exactly
+    # None means top-level; a non-empty string means child; anything else
+    # (empty string, wrong type) is malformed and blocks the rename.
+    if not isinstance(info_payload, dict) or "parent_session_id" not in info_payload:
+        return json.dumps(
+            {"error": "sys_session_rename could not verify the session is top-level"}
+        )
+    parent_session_id = info_payload["parent_session_id"]
+    if parent_session_id is not None:
+        if isinstance(parent_session_id, str) and parent_session_id:
+            return json.dumps({"renamed": False, "title": None, "reason": "not_top_level"})
+        return json.dumps(
+            {"error": "sys_session_rename could not verify the session is top-level"}
+        )
+    try:
+        response = await server_client.patch(
+            f"/v1/sessions/{conversation_id}",
+            json={"title": normalized_title},
             timeout=30.0,
         )
     except Exception as exc:  # noqa: BLE001
@@ -5125,7 +5333,10 @@ async def _rename_current_session_via_rest(
         return json.dumps({"error": f"sys_session_rename returned invalid JSON: {exc}"})
     if not isinstance(payload, dict):
         return json.dumps({"error": "sys_session_rename returned a non-object response"})
-    return json.dumps(payload)
+    updated_title = payload.get("title")
+    if not isinstance(updated_title, str):
+        return json.dumps({"error": "sys_session_rename response omitted the updated title"})
+    return json.dumps({"renamed": True, "title": updated_title, "reason": None})
 
 
 async def _collect_sub_agents(
@@ -5551,6 +5762,10 @@ async def _session_close_via_rest(
             json={
                 "title": new_title,
                 "labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+                # archived=True triggers the server's _spawn_archive_stop reaper,
+                # which stops the child's harness / tmux / bridge cluster.
+                # Without this the child's OS-process cluster is never reaped.
+                "archived": True,
             },
             timeout=30.0,
         )
@@ -5728,7 +5943,7 @@ async def execute_tool(
                 args,
                 session_inbox=session_inbox,
                 session_async_tasks=session_async_tasks,
-                harness_client=harness_client or httpx.AsyncClient(),
+                harness_client=harness_client,
                 server_client=server_client,
                 terminal_registry=terminal_registry,
                 resource_registry=resource_registry,

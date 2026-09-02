@@ -5,7 +5,8 @@ only_testing(["OmnigentUITests/OmnigentUITests/testLocalServerSnapshot"])
 configuration("Debug")
 
 devices([
-  "iPhone 17 Pro Max"
+  "iPhone 17 Pro Max",
+  "iPad Pro 13-inch (M5)"
 ])
 
 languages([

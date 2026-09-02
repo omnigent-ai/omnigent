@@ -275,6 +275,25 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
 }
 
 describe("SettingsPage", () => {
+  it("renders composer shortcut guidance as two accessible lines", () => {
+    renderPage("/settings/general");
+    const toggle = screen.getByTestId("composer-submit-with-mod-enter-toggle");
+    const descriptionId = toggle.getAttribute("aria-describedby");
+    const description = descriptionId ? document.getElementById(descriptionId) : null;
+
+    expect(description).toBeTruthy();
+    if (description === null) throw new Error("Missing composer shortcut description");
+    expect(Array.from(description.children).map((line) => line.tagName)).toEqual(["P", "P"]);
+    expect(
+      within(description).getByText("Off: Enter submits and Shift+Enter inserts a newline."),
+    ).toBeInTheDocument();
+    expect(
+      within(description).getByText(/On: Enter inserts a newline and (?:⌘|Ctrl)\+Enter submits\./),
+    ).toBeInTheDocument();
+    expect(toggle).toHaveAttribute("aria-labelledby");
+    expect(toggle).toHaveAccessibleName(/Submit with (?:⌘|Ctrl) \+ Enter on desktop/);
+  });
+
   it("renders the Appearance section and applies a theme on card click", () => {
     renderPage("/settings/appearance");
     expect(screen.getByRole("heading", { name: "Appearance" })).toBeInTheDocument();
@@ -747,18 +766,15 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("heavier-code-text-toggle")).toHaveAttribute("aria-checked", "false");
   });
 
-  it("defaults bare /settings to Account when a login session exists, else Appearance", async () => {
-    // Login session (accounts OR OIDC) → Account leads, so /settings lands on it.
+  it("defaults bare /settings to General regardless of login mode", () => {
     renderPage("/settings");
-    await waitFor(() => expect(screen.getByText("alice")).toBeInTheDocument());
+    expect(screen.getByRole("heading", { name: "General" })).toBeInTheDocument();
 
-    // Header single-user (no login_url) → no Account section; falls back to
-    // Appearance.
     cleanup();
     mocks.accountsEnabled = false;
     mocks.loginUrl = null;
     renderPage("/settings");
-    expect(screen.getByRole("heading", { name: "Appearance" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "General" })).toBeInTheDocument();
   });
 
   it("renders the Account section at /settings/account for any login session", async () => {

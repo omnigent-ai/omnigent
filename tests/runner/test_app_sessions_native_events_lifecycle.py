@@ -1179,8 +1179,12 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
     )
     release = asyncio.Event()
 
+    probe_calls = 0
+
     async def _slow_probe(claude_config: object) -> object:
         del claude_config
+        nonlocal probe_calls
+        probe_calls += 1
         await release.wait()
         from omnigent.claude_native import ClaudeModelProbe
 
@@ -1232,6 +1236,10 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
         assert pending.status_code == 503
         assert pending.json()["error"] == "claude_native_model_options_pending"
         release.set()
+        # The 0.01s wait above exists only to make the first read time out.
+        # Keep it that tight here and a loaded machine answers 503 again
+        # before the woken probe is even scheduled.
+        monkeypatch.setattr(runner_app_module, "_CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S", 5.0)
         resolved = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
         cached = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
 
@@ -1252,6 +1260,9 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
         ]
     }
     assert cached.json() == resolved.json()
+    # Single-flight: the read that timed out joined the in-flight probe
+    # instead of starting a second one, and the cached read probed nothing.
+    assert probe_calls == 1
 
 
 @pytest.mark.asyncio

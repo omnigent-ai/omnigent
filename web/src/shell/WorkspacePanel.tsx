@@ -12,7 +12,14 @@ import {
   TerminalIcon,
   XIcon,
 } from "lucide-react";
-import { type ReactElement, useCallback, useEffect, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  type ReactElement,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { cn } from "@/lib/utils";
 import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
@@ -503,10 +510,15 @@ function RailTerminalView({
   conversationId,
   terminalKey,
   readOnly,
+  autoFocus,
 }: {
   conversationId: string;
   terminalKey: string;
   readOnly: boolean;
+  /** Grab keyboard focus when the WS connects. Only for a shell the user just
+   *  opened by hand — a shell restored on a session switch leaves focus in the
+   *  chat composer. */
+  autoFocus: boolean;
 }) {
   const { terminals } = useTerminals(conversationId);
   const { setTerminalConnectionState, markTerminalActive } = useTerminalStatuses(terminals);
@@ -524,6 +536,7 @@ function RailTerminalView({
         sessionId={conversationId}
         terminalId={terminal.id}
         readOnly={readOnly}
+        focusOnConnect={autoFocus}
         directAttachUrl={terminal.directAttachUrl}
         onStateChange={(state) => setTerminalConnectionState(terminal.id, state)}
         onActivity={() => markTerminalActive(terminal.id)}
@@ -597,6 +610,11 @@ interface WorkspacePanelProps {
   openTerminals: string[];
   /** Active shell tab key, or null when no shell tab is selected. */
   selectedTerminalKey: string | null;
+  /** Whether the selected shell was just opened by an explicit user gesture
+   *  (clicking a tab / "+"→Shell) and so may grab keyboard focus on connect.
+   *  False when the shell is merely restored on a session switch — then focus
+   *  stays in the chat composer. */
+  autoFocusSelectedTerminal?: boolean;
   /** Tab key whose close (terminal kill) is in flight — rendered greyed and
    *  non-interactive until it disappears. Null when no close is pending. */
   closingTerminalKey?: string | null;
@@ -665,6 +683,7 @@ export function WorkspacePanel({
   openTerminalTab,
   openTerminals,
   selectedTerminalKey,
+  autoFocusSelectedTerminal = false,
   closingTerminalKey,
   onCloseTerminal,
   maximized,
@@ -699,6 +718,10 @@ export function WorkspacePanel({
     <aside
       aria-label="Workspace"
       inert={inert}
+      // The resize hook can starve the rail to width 0 while it stays mounted;
+      // marking it collapsed keeps index.css's safe-area padding off it so a
+      // zero-width rail can't paint a ghost bg-card strip on native shells.
+      data-collapsed={width === 0 || undefined}
       // Full-height desktop surface flush to the window edge, separated from
       // the main content by a left divider — no outer margin, rounding, or
       // shadow (mirrors the left sidebar). AppShell reserves the panel width
@@ -719,8 +742,13 @@ export function WorkspacePanel({
         maximized ? "md:absolute md:inset-0" : "md:shrink-0",
       )}
       // Width is fixed by the resize handle normally; maximized ignores it and
-      // stretches to the absolute inset instead.
-      style={maximized ? undefined : { width }}
+      // stretches to the absolute inset instead. The width doubles as the
+      // reservation index.css caps the rail's lateral safe-area insets to.
+      style={
+        maximized
+          ? undefined
+          : ({ width, "--omnigent-reserved-width": `${width}px` } as CSSProperties)
+      }
     >
       {/* Left-edge horizontal resize handle — suppressed while maximized. */}
       {!maximized && (
@@ -918,6 +946,7 @@ export function WorkspacePanel({
             conversationId={conversationId}
             terminalKey={selectedTerminalKey}
             readOnly={!isOwnerLevel(permissionLevel)}
+            autoFocus={autoFocusSelectedTerminal}
           />
         ) : selectedFilePath !== null ? (
           <FileViewer

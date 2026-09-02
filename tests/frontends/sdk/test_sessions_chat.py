@@ -54,6 +54,8 @@ from omnigent.server.schemas import (
     ReasoningTextDeltaEvent,
     ResponseObject,
     ServerStreamEvent,
+    SessionChildSessionUpdatedEvent,
+    SessionCreatedEvent,
     SessionHeartbeatEvent,
     SessionStatusEvent,
 )
@@ -1865,3 +1867,207 @@ async def test_tree_busy_forwards_max_depth_and_false_verdict() -> None:
 
     assert await chat.tree_busy(max_depth=5) is False
     assert ns.subtree_busy_calls == [("conv_parent", 5)]
+
+
+# ── sub-agent lifecycle hooks ─────────────────────────────────────────
+
+
+def _child_created_event(
+    child_id: str = "conv_child_1",
+    agent_id: str | None = "ag_child",
+) -> SessionCreatedEvent:
+    """Build the discrete child-spawn event that rides the parent stream."""
+    return SessionCreatedEvent(
+        type="session.created",
+        conversation_id="conv_abc",
+        child_session_id=child_id,
+        agent_id=agent_id,
+        parent_session_id="conv_abc",
+    )
+
+
+def _child_updated_event(
+    child_id: str = "conv_child_1",
+    *,
+    busy: bool = False,
+    status: str | None = "completed",
+    tool: str | None = "summarizer",
+    preview: str | None = None,
+) -> SessionChildSessionUpdatedEvent:
+    """Build a partial child status delta as the runner fan-out emits it."""
+    child: dict[str, Any] = {"id": child_id, "busy": busy}
+    if status is not None:
+        child["current_task_status"] = status
+    if tool is not None:
+        child["tool"] = tool
+    if preview is not None:
+        child["last_message_preview"] = preview
+    return SessionChildSessionUpdatedEvent(
+        type="session.child_session.updated",
+        conversation_id="conv_abc",
+        child_session_id=child_id,
+        child=child,
+    )
+
+
+async def _run_turn_with_subagent_hooks(
+    events: list[ServerStreamEvent],
+) -> tuple[list[Any], list[Any]]:
+    """Drive one ``send()`` turn and collect the sub-agent hook calls."""
+    session = _make_session()
+    spawned: list[Any] = []
+    completed: list[Any] = []
+    ns = _FakeNamespace(
+        stream_scripts=[_StreamScript(events=events)],
+        session_obj=session,
+    )
+    chat = SessionsChat(
+        namespace=ns,
+        files_uploader=None,
+        files_getter=None,
+        session=session,
+        hooks=StreamHooks(
+            on_sub_agent_spawned=spawned.append,
+            on_sub_agent_completed=completed.append,
+        ),
+    )
+    async for _ in chat.send("hi"):
+        pass
+    return spawned, completed
+
+
+@pytest.mark.asyncio
+async def test_sub_agent_hooks_fire_on_spawn_and_terminal_update() -> None:
+    """
+    A ``session.created`` + terminal child delta must dispatch both
+    declared sub-agent lifecycle hooks — the public ``StreamHooks``
+    surface an observability adapter registers to trace sub-agents.
+    """
+    spawned, completed = await _run_turn_with_subagent_hooks(
+        [
+            _created_event(),
+            _child_created_event(),
+            _child_updated_event(busy=True, status="in_progress"),
+            _child_updated_event(status="completed", preview="the summary"),
+            _completed_event(),
+        ]
+    )
+
+    assert [
+        (c.parent_response_id, [(s.response_id, s.agent_name) for s in c.sub_agents])
+        for c in spawned
+    ] == [("resp_1", [("conv_child_1", "ag_child")])]
+    assert [(c.response_id, c.agent_name, c.status, c.output_summary) for c in completed] == [
+        ("conv_child_1", "summarizer", "completed", "the summary")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sub_agent_completed_requires_observed_spawn() -> None:
+    """
+    A child delta for a child whose spawn this stream never saw (the
+    snapshot-on-connect row for a pre-existing child) must not fire
+    ``on_sub_agent_completed`` — hooks stay paired per observed spawn.
+    """
+    spawned, completed = await _run_turn_with_subagent_hooks(
+        [
+            _created_event(),
+            _child_updated_event(child_id="conv_preexisting", status="completed"),
+            _completed_event(),
+        ]
+    )
+
+    assert spawned == []
+    assert completed == []
+
+
+@pytest.mark.asyncio
+async def test_sub_agent_hooks_fire_once_per_child() -> None:
+    """
+    A relayed duplicate ``session.created`` and repeated terminal deltas
+    must not re-fire either hook for the same child.
+    """
+    spawned, completed = await _run_turn_with_subagent_hooks(
+        [
+            _created_event(),
+            _child_created_event(),
+            _child_created_event(),
+            _child_updated_event(status="failed"),
+            _child_updated_event(status="failed"),
+            _completed_event(),
+        ]
+    )
+
+    assert len(spawned) == 1
+    assert [(c.response_id, c.status) for c in completed] == [("conv_child_1", "failed")]
+
+
+@pytest.mark.asyncio
+async def test_sub_agent_completed_skips_busy_and_non_terminal_updates() -> None:
+    """
+    Busy / launching / in-progress child deltas must not fire the
+    completion hook — only the first terminal (non-busy) status does.
+    """
+    spawned, completed = await _run_turn_with_subagent_hooks(
+        [
+            _created_event(),
+            _child_created_event(),
+            _child_updated_event(busy=False, status="launching"),
+            _child_updated_event(busy=True, status="in_progress"),
+            _child_updated_event(busy=False, status=None),
+            _completed_event(),
+        ]
+    )
+
+    assert len(spawned) == 1
+    assert completed == []
+
+
+@pytest.mark.asyncio
+async def test_sub_agent_completed_uses_preview_from_earlier_delta() -> None:
+    """
+    Child deltas are partial: the preview may arrive in a separate delta
+    from the terminal status. Completion must carry the last preview seen
+    for the child, not just one riding the terminal delta itself.
+    """
+    spawned, completed = await _run_turn_with_subagent_hooks(
+        [
+            _created_event(),
+            _child_created_event(),
+            _child_updated_event(busy=False, status="in_progress", preview="partial answer"),
+            _child_updated_event(status="completed"),
+            _completed_event(),
+        ]
+    )
+
+    assert len(spawned) == 1
+    assert [(c.response_id, c.status, c.output_summary) for c in completed] == [
+        ("conv_child_1", "completed", "partial answer")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sub_agent_spawned_ignores_other_parents_children() -> None:
+    """
+    A relayed ``session.created`` whose ``parent_session_id`` is another
+    session (e.g. a grandchild spawn) must not fire the spawn hook — the
+    hook announces this session's direct children only.
+    """
+    grandchild = SessionCreatedEvent(
+        type="session.created",
+        conversation_id="conv_abc",
+        child_session_id="conv_grandchild",
+        agent_id="ag_grandchild",
+        parent_session_id="conv_child_1",
+    )
+    spawned, completed = await _run_turn_with_subagent_hooks(
+        [
+            _created_event(),
+            grandchild,
+            _child_updated_event(child_id="conv_grandchild", status="completed"),
+            _completed_event(),
+        ]
+    )
+
+    assert spawned == []
+    assert completed == []

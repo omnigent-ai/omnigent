@@ -62,6 +62,37 @@ describe("effortLevelsForConv", () => {
     ]);
   });
 
+  it("returns Codex efforts for a custom agent using the codex-native harness", () => {
+    const conv = { labels: {}, harness: "codex-native" };
+    expect(effortLevelsForConv(conv, CODEX_MODEL_OPTIONS, "gpt-5.4-mini")).toEqual([
+      "minimal",
+      "low",
+      "medium",
+    ]);
+  });
+
+  it("keeps the default set for codex sub-agent children (wrapper label wins)", () => {
+    // WHY: sub-agent children report the parent's resolved harness but cannot
+    // honor mid-session overrides; the wrapper label stays authoritative.
+    const conv = {
+      labels: { "omnigent.wrapper": "codex-native-ui-subagent" },
+      harness: "codex-native",
+    };
+    expect(effortLevelsForConv(conv, CODEX_MODEL_OPTIONS, "gpt-5.4-mini")).toEqual([
+      "low",
+      "medium",
+      "high",
+    ]);
+  });
+
+  it("keeps the default set for label-less sessions on other harnesses", () => {
+    expect(effortLevelsForConv({ labels: {}, harness: "claude-sdk" })).toEqual([
+      "low",
+      "medium",
+      "high",
+    ]);
+  });
+
   it("returns an empty Codex-native effort set until Codex options load", () => {
     const conv = { labels: { "omnigent.wrapper": "codex-native-ui" } };
     expect(effortLevelsForConv(conv, [], null)).toEqual([]);
@@ -88,6 +119,24 @@ describe("shouldShowModelPicker", () => {
   it("returns true for codex-native-ui wrapper", () => {
     const conv = { labels: { "omnigent.wrapper": "codex-native-ui" } };
     expect(shouldShowModelPicker(conv)).toBe(true);
+  });
+
+  it("returns true for a custom agent using the codex-native harness", () => {
+    expect(shouldShowModelPicker({ labels: {}, harness: "codex-native" })).toBe(true);
+  });
+
+  it("returns false for codex sub-agent children despite the resolved harness", () => {
+    expect(
+      shouldShowModelPicker({
+        labels: { "omnigent.wrapper": "codex-native-ui-subagent" },
+        harness: "codex-native",
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false for label-less sessions on other harnesses", () => {
+    expect(shouldShowModelPicker({ labels: {}, harness: "claude-sdk" })).toBe(false);
+    expect(shouldShowModelPicker({ labels: {}, harness: "codex" })).toBe(false);
   });
 
   it("returns false for the old terminal-ui gate that was rejected on review", () => {
@@ -137,6 +186,24 @@ describe("shouldShowEffortPicker", () => {
         },
       }),
     ).toBe(true);
+  });
+
+  it("returns true for custom agents using the codex-native harness", () => {
+    expect(shouldShowEffortPicker({ labels: {}, harness: "codex-native" })).toBe(true);
+  });
+
+  it("returns false for codex sub-agent children despite the resolved harness", () => {
+    expect(
+      shouldShowEffortPicker({
+        labels: { "omnigent.wrapper": "codex-native-ui-subagent" },
+        harness: "codex-native",
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false for label-less sessions on other harnesses", () => {
+    expect(shouldShowEffortPicker({ labels: {}, harness: "claude-sdk" })).toBe(false);
+    expect(shouldShowEffortPicker({ labels: {}, harness: "codex" })).toBe(false);
   });
 
   it("returns false for custom agents and missing labels", () => {

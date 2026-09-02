@@ -218,6 +218,12 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
             executor.model = llm.model
         if executor.connection is None and llm.connection is not None:
             executor.connection = llm.connection
+        if executor.reasoning_effort is None:
+            llm_effort = llm.extra.get("reasoning_effort")
+            if llm_effort is not None:
+                executor.reasoning_effort = str(llm_effort)
+        elif "reasoning_effort" in llm.extra:
+            llm.extra["reasoning_effort"] = executor.reasoning_effort
     # Ensure spec.llm is populated from executor fields when only the
     # executor: block declares model/connection (the common case for
     # user-authored YAML). Internal consumers (policy builder,
@@ -1026,11 +1032,9 @@ def _parse_cwd_allow_hidden(raw: object) -> list[str] | None:
     ``os_env.sandbox``.
 
     Each entry must be a single path component (no ``/``, ``\\``,
-    or ``.`` / ``..`` traversal) so a misconfigured spec can't punch
-    a hole through arbitrary subdirectories of cwd. The bwrap backend
-    looks each entry up in ``cwd.iterdir()`` directly; sanitising
-    here keeps the resolver simple and the failure mode loud at
-    parse time rather than at runtime.
+    or ``.`` / ``..`` traversal). The special entry ``"*"`` explicitly
+    disables dotpath masking for trusted roots while preserving escaping-
+    symlink masking.
 
     :param raw: Raw value from the YAML, e.g. ``[".venv", ".git"]``,
         or ``None`` when the field is absent.

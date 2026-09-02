@@ -494,6 +494,13 @@ export class TerminalSession {
   private readonly onClipboardRequest?: TerminalClipboardListener;
   /** Whether this visible, interactive attach may write the local clipboard. */
   private clipboardEnabled: boolean;
+  /**
+   * Whether to grab keyboard focus when the WS opens. True for a primary
+   * interactive surface the user is looking at; false for a secondary attach
+   * (the workspace-rail shell) so a background connect never yanks focus off
+   * the chat composer. See {@link focus} for the explicit-focus path.
+   */
+  private focusOnConnect: boolean;
   /** ``performance.now()`` of the last keystroke; gates clipboard writes. */
   private lastUserInputAt = 0;
   /** Guards {@link dispose} so calling it twice is a safe no-op. */
@@ -524,6 +531,7 @@ export class TerminalSession {
    * :param onInput: Called when user input is sent to the terminal.
    * :param clipboardEnabled: Whether tmux copies may write the local clipboard.
    * :param onClipboardRequest: Receives validated tmux copy-mode text.
+   * :param focusOnConnect: Whether to grab keyboard focus on WS-open.
    */
   constructor(
     container: HTMLElement,
@@ -534,8 +542,10 @@ export class TerminalSession {
     onInput?: TerminalInputListener,
     clipboardEnabled = true,
     onClipboardRequest?: TerminalClipboardListener,
+    focusOnConnect = true,
   ) {
     this.clipboardEnabled = clipboardEnabled;
+    this.focusOnConnect = focusOnConnect;
     this.onClipboardRequest = onClipboardRequest;
     // Read the user's code-font preference (Settings → Appearance) at
     // construction; a mid-session change is applied live via setFont(). The
@@ -608,7 +618,7 @@ export class TerminalSession {
         // dimensions before the user sees the default 80×24 followed
         // by a reflow.
         this.sendResize();
-        this.term.focus();
+        if (this.focusOnConnect) this.term.focus();
         onState({ kind: "connected" });
       },
       { signal },

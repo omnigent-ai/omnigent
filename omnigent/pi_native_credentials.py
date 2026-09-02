@@ -37,6 +37,7 @@ from omnigent.databricks_ai_gateway import (
     DATABRICKS_TRUSTED_HOST_SUFFIXES,
     is_databricks_ai_gateway_url,
 )
+from omnigent.databricks_model_discovery import preferred_served_claude_model
 from omnigent.model_metadata import ModelWireAPI
 from omnigent.model_override import normalize_model_for_provider
 from omnigent.onboarding.provider_config import (
@@ -432,6 +433,31 @@ def _default_claude_model_from(entries: list[_PiModelEntry]) -> str | None:
     return ids[0] if ids else None
 
 
+def _select_databricks_claude_model(model: str | None, claude_models: list[_PiModelEntry]) -> str:
+    """Resolve an implicit Databricks default to an equivalent served Claude id."""
+    selected_model = (
+        model or model_catalog.resolve_catalog_model("databricks", family="claude").model_id
+    )
+    if model is not None or not claude_models:
+        return selected_model
+    served_model = preferred_served_claude_model(
+        (model_id for item in claude_models if isinstance((model_id := item.get("id")), str)),
+        preferred_model_id=selected_model,
+    )
+    if served_model is None:
+        # No family match among the served ids: still prefer a live-served id
+        # over a catalog default the workspace may answer with 501.
+        served_model = _default_claude_model_from(claude_models)
+    if served_model is None or served_model == selected_model:
+        return selected_model
+    _LOGGER.warning(
+        "pi-native: resolved default model %s to workspace-served model %s",
+        selected_model,
+        served_model,
+    )
+    return served_model
+
+
 def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiProviderConfig | None:
     """Resolve a Databricks-profile provider into Pi gateway config.
 
@@ -483,6 +509,7 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
             _LOGGER.info(
                 "pi-native: could not fetch workspace model list; showing default model only"
             )
+    selected_model = _select_databricks_claude_model(model, claude_models)
     additional: dict[str, _PiProviderPayload] = {}
     if gpt_models:
         additional[_PI_OPENAI_PROVIDER_ID] = _databricks_openai_provider(
@@ -502,9 +529,7 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         api="anthropic-messages",
         # DATABRICKS-PATCH(pi-live-model-discovery): prefer what the workspace
         # actually serves (fetched above) over the bundled catalog.
-        model=model
-        or _default_claude_model_from(claude_models)
-        or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
+        model=selected_model,
         # Pi resolves a "!command" apiKey at request time, so the gateway
         # bearer token is re-read per request (the auth command attempts a
         # refresh), matching codex-native's refresh semantics.
@@ -872,9 +897,15 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     if real_workspace_url and transport.auth_command:
         token = _run_auth_command(transport.auth_command)
         if token:
-            claude_models, gpt_models, completions_models, gemini_models = _fetch_pi_model_lists(
-                real_workspace_url, token
-            )
+            try:
+                claude_models, gpt_models, completions_models, gemini_models = (
+                    _fetch_pi_model_lists(real_workspace_url, token)
+                )
+            except Exception:  # noqa: BLE001 — network failure must not break launch
+                _LOGGER.info(
+                    "pi-native: could not fetch workspace model list; showing default model only",
+                    exc_info=True,
+                )
         else:
             _LOGGER.info(
                 "pi-native: auth command produced no token; Pi will show only the selected model"
@@ -920,7 +951,7 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         provider_id=_PI_PROVIDER_ID,
         base_url=_gateway_anthropic_base_url(transport.base_url),
         api="anthropic-messages",
-        model=model or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
+        model=_select_databricks_claude_model(model, claude_models),
         # Pi resolves a "!command" apiKey at request time, so the gateway
         # bearer token (the codex auth command prints it) is refreshed per
         # request — matching codex-native's refresh semantics.

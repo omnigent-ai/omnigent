@@ -474,6 +474,11 @@ struct OmnigentWebView: UIViewRepresentable {
       parent.model.isLoading = true
       parent.model.currentURL = webView.url ?? parent.model.currentURL
       parent.model.serverSwitcherHidden = true
+      // Hide the Chat/Terminal bar for the load too: the incoming page pushes
+      // its own truth via setViewMode once it mounts (current SPAs keep it
+      // hidden — the switcher lives in their header), so a stale visible bar
+      // from the previous page must not float over the new one while it boots.
+      parent.model.bottomBarVisible = false
       parent.model.armServerSwitcherWatchdog()
     }
 

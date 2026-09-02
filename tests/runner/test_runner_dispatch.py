@@ -2821,6 +2821,29 @@ async def test_runner_read_inbox_continues_after_malformed_terminal_idle_item() 
     assert session_inbox.empty()
 
 
+@pytest.mark.asyncio
+async def test_async_inbox_dispatch_does_not_create_unused_harness_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct async-inbox dispatch must not allocate an unused HTTP client."""
+    from omnigent.runner import tool_dispatch
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    def unexpected_client(*args: object, **kwargs: object) -> None:
+        raise AssertionError("async-inbox dispatch created an unused HTTP client")
+
+    monkeypatch.setattr(tool_dispatch.httpx, "AsyncClient", unexpected_client)
+
+    output = await execute_tool(
+        tool_name="sys_read_inbox",
+        arguments="{}",
+        session_inbox=asyncio.Queue(),
+        harness_client=None,
+    )
+
+    assert output == "Inbox is empty — no completed tasks."
+
+
 @pytest.mark.parametrize(
     ("arguments", "expected_error"),
     [
@@ -7334,7 +7357,8 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     """
     ``sys_session_get_info`` projects ``GET /v1/sessions/{id}`` metadata
     and folds in live runner connectivity from ``GET
-    /v1/runners/{id}/status``.
+    /v1/runners/{id}/status`` and host harness readiness from ``GET
+    /v1/hosts/{id}``.
 
     Proves the full runner-dispatch path: read the session snapshot,
     derive the effective model (a per-session ``model_override`` wins
@@ -7362,7 +7386,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
                     "updated_at": 84,
                     "title": "auth flow",
                     "runner_id": "runner_1",
-                    "host_id": None,
+                    "host_id": "host_1",
                     "reasoning_effort": "high",
                     "parent_session_id": "conv_parent",
                     "sub_agent_name": "researcher",
@@ -7375,6 +7399,11 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
             )
         if request.method == "GET" and request.url.path == "/v1/runners/runner_1/status":
             return httpx.Response(200, json={"runner_id": "runner_1", "online": True})
+        if request.method == "GET" and request.url.path == "/v1/hosts/host_1":
+            return httpx.Response(
+                200,
+                json={"configured_harnesses": {"codex-native": True, "cursor-native": False}},
+            )
         return httpx.Response(404, json={"error": str(request.url)})
 
     async with httpx.AsyncClient(
@@ -7399,6 +7428,11 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     # Live connectivity folded in from the runners status endpoint —
     # None here would mean the best-effort status call was skipped.
     assert info["runner_online"] is True
+    assert info["host_id"] == "host_1"
+    assert info["configured_harnesses"] == {
+        "codex-native": True,
+        "cursor-native": False,
+    }
     assert info["parent_session_id"] == "conv_parent"
     # Effective model: the per-session override wins over the spec
     # default. "anthropic/claude-sonnet-4-6" here would mean the
@@ -7412,6 +7446,64 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     assert info["pending_elicitations"] == [{"id": "el_1"}, {"id": "el_2"}]
     # Metadata-only: the full transcript is never embedded.
     assert "items" not in info
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("host_response", [httpx.Response(503), httpx.Response(200, text="bad")])
+async def test_sys_session_get_info_tolerates_host_readiness_failure(
+    host_response: httpx.Response,
+) -> None:
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "host_id": "host_1"})
+        if request.url.path == "/v1/hosts/host_1":
+            return host_response
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_target"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert json.loads(output)["configured_harnesses"] is None
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_reports_null_readiness_without_host() -> None:
+    """Skip the host lookup when the session has no bound host."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    host_calls: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "host_id": None})
+        if request.url.path.startswith("/v1/hosts/"):
+            host_calls.append(request.url.path)
+            return httpx.Response(404)
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_target"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert json.loads(output)["configured_harnesses"] is None
+    assert host_calls == []
 
 
 @pytest.mark.asyncio
@@ -10543,3 +10635,33 @@ async def test_cross_path_resolution_contract(
             f"because their transports report differently, not because they "
             f"answer the same question differently."
         )
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _response_failed_event source propagation
+# ---------------------------------------------------------------------------
+
+
+def test_response_failed_event_default_source_is_execution() -> None:
+    """``_response_failed_event`` without explicit source encodes ``"execution"``."""
+    import json as _json
+
+    from omnigent.runner.app import _response_failed_event
+
+    raw = _response_failed_event({"code": "connection_error", "message": "dropped"})
+    payload = _json.loads(raw.decode().split("data: ", 1)[1])
+    assert payload["source"] == "execution"
+
+
+def test_response_failed_event_llm_source_is_preserved() -> None:
+    """``_response_failed_event(source="llm")`` encodes ``"llm"`` for inference faults."""
+    import json as _json
+
+    from omnigent.runner.app import _response_failed_event
+
+    raw = _response_failed_event(
+        {"code": "context_length_exceeded", "message": "too long"},
+        source="llm",
+    )
+    payload = _json.loads(raw.decode().split("data: ", 1)[1])
+    assert payload["source"] == "llm"

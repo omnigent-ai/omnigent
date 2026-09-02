@@ -693,9 +693,6 @@ _RUNNER_SESSION_INIT_TIMEOUT_S = 10.0
 _STOP_RUNNER_RESULT_TIMEOUT_S = 10.0
 
 
-_COMPACT_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
-
-
 # Derived from the fork_history capability axis (see harness_capabilities). A
 # harness declaring fork_history=REBUILD rebuilds its resumable session file
 # from the copied items (e.g. qwen rebuilds its on-disk chat recording via
@@ -869,7 +866,6 @@ __all__ = [
     "_CODEX_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY",
     "_CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",
     "_CODEX_NATIVE_WRAPPER_LABEL_VALUE",
-    "_COMPACT_LOCKS",
     "_COMPACT_TYPE",
     "_CURSOR_FORK_HISTORY_HARNESSES",
     "_CURSOR_NATIVE_HARNESS",

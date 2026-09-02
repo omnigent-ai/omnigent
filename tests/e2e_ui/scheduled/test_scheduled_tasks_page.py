@@ -22,7 +22,6 @@ from datetime import datetime, timedelta
 
 import httpx
 from playwright.sync_api import Page, expect
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 
 def _builtin_agent_id(base_url: str, name: str) -> str:
@@ -103,13 +102,16 @@ def _row_by_name(page: Page, name: str):
 
 
 def _pick_minute(page: Page, minute: int) -> None:
-    """Open the time picker and click a minute cell, tolerating a flickered open.
+    """Open the time picker and click a minute cell.
 
-    The picker is a Radix popover nested inside the create-task dialog; under
-    load the dialog's focus management can fire a focus/interaction-outside that
-    closes it the moment it mounts, so the minute cells unmount between a
-    visibility check and the click. Re-open from a known-closed state and retry
-    until the cell is present, then click it.
+    The time input opens the picker on focus, so by the time a caller reaches the
+    clock button the picker is already open and being dismissed by whatever the
+    caller clicked last. Radix keeps the popover mounted through its exit
+    animation, and toggling the clock mid-exit re-opens it only to have Radix
+    dismiss it again immediately — leaving the minute cells alive just until the
+    animation ends, long enough for a visibility check to pass and the click
+    after it to miss. Waiting for the exit to finish means the toggle acts on a
+    genuinely closed picker, so no re-open-and-retry is needed.
 
     Selecting a minute does not close the popover, and an open floating-ui
     popover keeps recomputing its position — leaving the dialog's submit button
@@ -129,29 +131,20 @@ def _pick_minute(page: Page, minute: int) -> None:
     :param page: Playwright page with the create/edit task dialog open.
     :param minute: Minute of the hour to select (0-59).
     """
-    trigger = page.get_by_test_id("schedule-time-picker-trigger")
-    cell = page.get_by_test_id(f"schedule-minute-{minute:02d}")
-    picker = page.get_by_test_id("schedule-time-picker")
     name_input = page.get_by_test_id("task-name-input")
-    for _ in range(5):
-        # force=True skips the actionability "stable" wait: the trigger is a
-        # tiny translate-positioned button, so a busy render loop can leave it
-        # never-quite-stable even though the toggle is a no-arg click.
-        trigger.click(force=True)
-        try:
-            expect(cell).to_be_visible(timeout=3_000)
-            cell.click(force=True)
-            break
-        except (AssertionError, PlaywrightTimeoutError):
-            # The popover flickered shut before the click landed; dismiss any
-            # partial-open state (click-outside, not Escape) and try again.
-            name_input.click(force=True)
-    else:
-        expect(cell).to_be_visible(timeout=3_000)
-        cell.click(force=True)
+    # The popover content element: it carries data-state (open/closed) and
+    # unmounts only after the exit animation finishes, so its count/state are
+    # the reliable signals for both waits below.
+    popover_content = page.locator('[data-slot="popover-content"]').filter(
+        has=page.get_by_test_id("schedule-time-picker")
+    )
+    expect(popover_content).to_have_count(0)
+    page.get_by_test_id("schedule-time-picker-trigger").click()
+    expect(popover_content).to_have_attribute("data-state", "open")
+    page.get_by_test_id(f"schedule-minute-{minute:02d}").click()
     # Dismiss the picker so its floating position stops churning the layout.
     name_input.click(force=True)
-    expect(picker).to_be_hidden(timeout=5_000)
+    expect(popover_content).to_have_count(0)
 
 
 def test_scheduled_task_rows_show_schedule_summary_and_relative_next_run(
@@ -298,15 +291,17 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     # forced click still blurs the input and closes the picker.
     page.get_by_test_id("task-name-input").click(force=True)
     expect(time_input).to_have_value("09:37 AM")
-    _pick_minute(page, 37)
-    expect(time_input).to_have_value("09:37 AM")
+    # Pick a minute the typed input did NOT already produce, so this proves the
+    # picker applied the click rather than re-reading the value typing had set.
+    _pick_minute(page, 45)
+    expect(time_input).to_have_value("09:45 AM")
     page.get_by_test_id("create-scheduled-task-submit").click()
 
     created_row = _row_by_name(page, "Typed time daily")
     expect(created_row).to_be_visible(timeout=30_000)
     # `to_contain_text`: the line may also carry the server next-run suffix.
     expect(created_row.get_by_test_id("task-schedule-line")).to_contain_text(
-        "Every day at 9:37 AM",
+        "Every day at 9:45 AM",
         timeout=30_000,
     )
 

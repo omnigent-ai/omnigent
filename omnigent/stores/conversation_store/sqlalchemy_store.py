@@ -65,6 +65,7 @@ from omnigent.db.utils import (
     insert_fts_bulk,
     make_named_managed_session_maker,
     now_epoch,
+    shared_read_scope,
     strip_nul_bytes,
 )
 from omnigent.entities import (
@@ -81,6 +82,7 @@ from omnigent.session_import.models import (
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     _INSTANCE_SCOPED_LABEL_KEYS,
+    ARCHIVED_AT_LABEL_KEY,
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
@@ -303,6 +305,7 @@ def _new_session_metadata_row(
     runner_id: str | None = None,
     workspace: str | None = None,
     terminal_launch_args: list[str] | None = None,
+    project_id: str | None = None,
 ) -> SqlConversationMetadata:
     """
     Build the Omnigent metadata row paired with a new session conversation.
@@ -322,6 +325,7 @@ def _new_session_metadata_row(
         id=conversation_id,
         kind=encode_conversation_kind("sub_agent" if parent_conversation_id else "default"),
         runner_id=runner_id,
+        project_id=project_id,
         workspace=workspace,
         terminal_launch_args=(
             json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
@@ -795,11 +799,15 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
         ensure_fts_table(self._conv_engine)
 
-    def _get_meta(
-        self, _unused_session: Session, conversation_id: str
-    ) -> SqlConversationMetadata | None:
+    def _get_meta(self, conversation_id: str) -> SqlConversationMetadata | None:
         """
         Fetch the metadata row for a conversation from the Omnigent DB.
+
+        Always goes through the Omnigent-DB session maker: in split-DB mode
+        ``omnigent_conversation_metadata`` lives on a different engine than the
+        caller's AP session, so the caller's session cannot serve it. A caller
+        inside :func:`shared_read_scope` pays no second pool checkout for it
+        when both logical databases share one engine.
         """
         with self._session("select_conversation_metadata_by_id") as meta_sess:
             return meta_sess.get(
@@ -877,6 +885,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
         conversation_id: str | None = None,
+        project_id: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation in the database.
@@ -1008,6 +1017,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 terminal_launch_args=(
                     json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
                 ),
+                project_id=project_id,
             )
             with self._session("insert_conversation_metadata") as meta_sess:
                 meta_sess.add(meta)
@@ -1044,20 +1054,24 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         Fetch a conversation by its unique ID.
 
-        Issues two queries inside one session: the conversation row
-        (which carries the agent binding + per-session override blob) and
-        a label fetch on ``conversation_labels``.
+        Issues three queries: the conversation row (which carries the agent
+        binding + per-session override blob), the Omnigent-DB metadata row, and
+        a label fetch on ``conversation_labels``. They run inside a
+        :func:`shared_read_scope` so the whole read costs one pool checkout per
+        engine — one in single-DB mode, where the metadata table would otherwise
+        force a second checkout (and, with ``pool_pre_ping``, a second network
+        round trip) for every session read in the product.
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
         :returns: The :class:`Conversation` if found, otherwise
             ``None``.
         """
-        with self._conv_session("select_conversation_by_id") as session:
+        with shared_read_scope(), self._conv_session("select_conversation_by_id") as session:
             row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             if row is None:
                 return None
-            meta = self._get_meta(session, conversation_id)
+            meta = self._get_meta(conversation_id)
             return _to_conversation(row, meta, _fetch_labels(session, conversation_id))
 
     def find_imported_conversation(
@@ -2816,6 +2830,22 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ap_changed = True
             if archived is not None:
                 # archived lives on the AP conversations row; a visible state change.
+                # Record the archive time as a label on the false->true transition
+                # only, so a redundant re-archive PATCH can't reset the retention
+                # clock; unarchiving clears it. Same transaction as the flag, and
+                # ahead of the _fetch_labels below, so the response carries it.
+                if archived and not row.archived:
+                    _upsert_labels(
+                        ap_sess, conversation_id, {ARCHIVED_AT_LABEL_KEY: str(now)}, now
+                    )
+                elif not archived:
+                    ap_sess.execute(
+                        delete(SqlConversationLabel).where(
+                            SqlConversationLabel.workspace_id == current_workspace_id(),
+                            SqlConversationLabel.conversation_id == conversation_id,
+                            SqlConversationLabel.key == ARCHIVED_AT_LABEL_KEY,
+                        )
+                    )
                 row.archived = archived
                 ap_changed = True
             if ap_changed:
@@ -2843,7 +2873,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     meta_sess.add(meta)
                 meta.terminal_launch_args = json.dumps(terminal_launch_args)
         else:
-            meta = self._get_meta(ap_sess, conversation_id)
+            meta = self._get_meta(conversation_id)
         return _to_conversation(row, meta, labels)
 
     def rename_conversation_if_title_matches(
@@ -3047,7 +3077,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
-            ap_row.updated_at = now_epoch()
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
@@ -3074,7 +3103,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
-            ap_row.updated_at = now_epoch()
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
@@ -3109,7 +3137,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
-            ap_row.updated_at = now_epoch()
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
@@ -3219,7 +3246,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
-            ap_row.updated_at = now_epoch()
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
@@ -3287,6 +3313,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
+        project_id: str | None = None,
     ) -> CreatedSession:
         """
         Atomically insert a conversation row and session-scoped agent.
@@ -3353,6 +3380,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             terminal_launch_args=terminal_launch_args,
             parent_conversation_id=parent_conversation_id,
             runner_id=runner_id,
+            project_id=project_id,
         )
 
     def _create_session_with_agent_with_id(
@@ -3370,6 +3398,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
+        project_id: str | None = None,
     ) -> CreatedSession:
         """Body of :meth:`create_session_with_agent` under a caller-supplied
         ``conversation_id``. The public method generates a fresh id; this seam
@@ -3417,6 +3446,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             conversation_id,
             parent_conversation_id=parent_conversation_id,
             runner_id=runner_id,
+            project_id=project_id,
             workspace=workspace,
             terminal_launch_args=terminal_launch_args,
         )
