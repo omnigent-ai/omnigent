@@ -1,6 +1,5 @@
-# resolve-agent (local) — take a reproduced bug to resolution and prove it with a
-# fail→pass test transition: review an existing fix PR if one exists, else author
-# the fix and open a PR.
+# resolve-agent (local) — take a reproduced bug to resolution, or remediate
+# requested changes on an existing Resolve-managed PR.
 #
 # This is the step AFTER repro-agent. It consumes repro-agent's handoff (the
 # live-confirmed reproduction and its e2e test). It first checks whether an open
@@ -55,7 +54,9 @@ description: >-
   live facet goes fail→pass, re-records the repro drivers on the fixed tree so
   the before/after footage pair lands in the PR's Demo section (and on the
   Linear ticket when a key is available), then commits, pushes, and opens a
-  ready-for-review pull request. It does not merge.
+  ready-for-review pull request. It can also remediate trusted human change
+  requests on an existing Resolve-managed PR, including its CI and automated
+  review failures. It does not merge.
 
 # Runs on the Claude Agent SDK. No model is pinned, so the configured provider's
 # default model is used. The large context window holds the repro session
