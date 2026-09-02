@@ -634,6 +634,40 @@ async def test_launch_disables_tmux_mouse_mode(
 
 
 @pytest.mark.asyncio
+async def test_launch_binds_page_up_scrollback_entry_point(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Managed terminals keep one route into tmux scrollback for attached users.
+
+    The lockdown removes every default copy-mode entry point (``mouse off``,
+    ``prefix None``, emptied prefix table) and native clients attach with
+    ``-f /dev/null``, so without a root-table Page Up binding the formatted
+    output above the viewport is unreachable. The binding must pass Page Up
+    through on the alternate screen so full-screen programs keep the key.
+
+    :param tmp_path: Temporary directory for the fake tmux socket.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    cmd = await _capture_launch_argv(tmp_path, monkeypatch, keep_alive_after_exit=False)
+    assert contains_subsequence(
+        cmd,
+        [
+            "bind-key",
+            "-T",
+            "root",
+            "PPage",
+            "if-shell",
+            "-F",
+            "#{alternate_on}",
+            "send-keys PPage",
+            "copy-mode -eu",
+        ],
+    )
+
+
+@pytest.mark.asyncio
 async def test_launch_enables_csi_u_extended_keys_quietly(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
