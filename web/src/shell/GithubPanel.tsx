@@ -9,7 +9,14 @@
 // rather than an error.
 
 import { Suspense, lazy, useEffect, useMemo, useState } from "react";
-import { ExternalLinkIcon, Loader2Icon, RefreshCwIcon } from "lucide-react";
+import {
+  CircleCheckIcon,
+  CircleDotIcon,
+  CircleXIcon,
+  ExternalLinkIcon,
+  Loader2Icon,
+  RefreshCwIcon,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { useQueryClient } from "@tanstack/react-query";
@@ -220,16 +227,30 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
               <span className="shrink-0 text-muted-foreground">#{pr.number}</span>
               <ExternalLinkIcon className="size-3 shrink-0 text-muted-foreground opacity-0 group-hover:opacity-100" />
             </a>
+            {/* CI status checks (from the PR's statusCheckRollup) — icons + a
+                tooltip so this reads as "checks", not a line diffstat. */}
             {checks && checks.total > 0 && (
-              <span className="flex shrink-0 items-center gap-1.5 font-mono text-xs tabular-nums">
+              <span
+                className="flex shrink-0 items-center gap-1.5 text-xs tabular-nums"
+                title={`Checks: ${checks.passing} passing, ${checks.failing} failing, ${checks.pending} pending`}
+              >
                 {checks.passing > 0 && (
-                  <span className="text-green-600 dark:text-green-400">✓{checks.passing}</span>
+                  <span className="flex items-center gap-0.5 text-green-600 dark:text-green-400">
+                    <CircleCheckIcon className="size-3" />
+                    {checks.passing}
+                  </span>
                 )}
                 {checks.failing > 0 && (
-                  <span className="text-red-600 dark:text-red-400">✗{checks.failing}</span>
+                  <span className="flex items-center gap-0.5 text-red-600 dark:text-red-400">
+                    <CircleXIcon className="size-3" />
+                    {checks.failing}
+                  </span>
                 )}
                 {checks.pending > 0 && (
-                  <span className="text-amber-600 dark:text-amber-400">•{checks.pending}</span>
+                  <span className="flex items-center gap-0.5 text-amber-600 dark:text-amber-400">
+                    <CircleDotIcon className="size-3" />
+                    {checks.pending}
+                  </span>
                 )}
               </span>
             )}

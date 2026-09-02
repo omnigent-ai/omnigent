@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DiffEditor, type DiffEditorProps, type DiffOnMount } from "@monaco-editor/react";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import { cn } from "@/lib/utils";
 import {
   codeFontFamilyForEditor,
   readCodeFont,
@@ -104,6 +105,12 @@ export function MonacoDiffViewer({
   // panes (per-pane updateOptions would only re-font one side).
   const diffEditorRef = useRef<Parameters<DiffOnMount>[0] | null>(null);
   const [mounted, setMounted] = useState(false);
+  // Monaco paints the whole file first, then collapses unchanged regions once
+  // the diff is computed — a visible expand→collapse flicker. Keep the editor
+  // hidden until that first collapse settles, then fade it in.
+  const [diffSettled, setDiffSettled] = useState(false);
+  const updateDiffSubRef = useRef<{ dispose: () => void } | null>(null);
+  const revealRafRef = useRef<number | null>(null);
 
   // The diff scrolls inside Monaco, so its offset is cached per conversation +
   // file rather than via the DOM scroll-restore hook. Kept in its own namespace
@@ -132,6 +139,19 @@ export function MonacoDiffViewer({
         () => scrollKeyRef.current,
         () => modifiedEditorRef.current === modified,
       );
+      // Reveal once the diff is computed (and its region collapse has painted),
+      // deferred a frame so the collapsed layout lands before we fade in. The
+      // API is absent in the jsdom test mock, so guard it; a fallback timeout
+      // below reveals regardless.
+      const withDiffUpdate = diffEditor as unknown as {
+        onDidUpdateDiff?: (cb: () => void) => { dispose: () => void };
+      };
+      if (typeof withDiffUpdate.onDidUpdateDiff === "function") {
+        updateDiffSubRef.current = withDiffUpdate.onDidUpdateDiff(() => {
+          if (revealRafRef.current !== null) cancelAnimationFrame(revealRafRef.current);
+          revealRafRef.current = requestAnimationFrame(() => setDiffSettled(true));
+        });
+      }
       setMounted(true);
     },
     [after],
@@ -141,9 +161,21 @@ export function MonacoDiffViewer({
     () => () => {
       modifiedEditorRef.current = null;
       diffEditorRef.current = null;
+      updateDiffSubRef.current?.dispose();
+      updateDiffSubRef.current = null;
+      if (revealRafRef.current !== null) cancelAnimationFrame(revealRafRef.current);
     },
     [],
   );
+
+  // Fallback reveal: if the diff-update event never arrives (e.g. an identical
+  // before/after that fires nothing, or a slow compute), don't leave the diff
+  // hidden — fade it in after a short grace period.
+  useEffect(() => {
+    if (!mounted || diffSettled) return;
+    const timer = setTimeout(() => setDiffSettled(true), 600);
+    return () => clearTimeout(timer);
+  }, [mounted, diffSettled]);
 
   // Apply live code-font changes to both diff panes. Monaco is a fixed-pixel
   // widget with no CSS-variable path like the chrome font, so the new
@@ -207,26 +239,39 @@ export function MonacoDiffViewer({
   return (
     <div className="flex h-full flex-col">
       <div className="relative min-h-0 flex-1">
-        {loadError && (
+        {loadError ? (
           <div className="flex items-center justify-center p-8 text-destructive text-ui">
             Failed to load the diff.
           </div>
-        )}
-        {!loadError && !ready && (
-          <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
-            Loading diff…
-          </div>
-        )}
-        {!loadError && ready && (
-          <DiffEditor
-            height="100%"
-            theme={monacoTheme}
-            language={monacoLanguageId(lang)}
-            original={before ?? ""}
-            modified={after ?? ""}
-            options={options}
-            onMount={handleMount}
-          />
+        ) : (
+          <>
+            {/* Mount once the grammar is ready so Monaco can compute the diff,
+                but keep it hidden (opacity, not display — automaticLayout still
+                needs to measure) until the unchanged-region collapse settles. */}
+            {ready && (
+              <div
+                className={cn(
+                  "h-full transition-opacity duration-150",
+                  diffSettled ? "opacity-100" : "opacity-0",
+                )}
+              >
+                <DiffEditor
+                  height="100%"
+                  theme={monacoTheme}
+                  language={monacoLanguageId(lang)}
+                  original={before ?? ""}
+                  modified={after ?? ""}
+                  options={options}
+                  onMount={handleMount}
+                />
+              </div>
+            )}
+            {(!ready || !diffSettled) && (
+              <div className="absolute inset-0 flex items-center justify-center p-8 text-muted-foreground text-ui">
+                Loading diff…
+              </div>
+            )}
+          </>
         )}
       </div>
       {commentButton}
