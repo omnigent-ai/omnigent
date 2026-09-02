@@ -514,7 +514,7 @@ aside[aria-label="Workspace"][data-maximized] {
   }
   /* The sidebar's own cluster is hidden here because an identical one renders in
    * the title-bar strip (AppShell), where it survives the sidebar collapsing to
-   * w-0/inert and the peek card's inset-2 offset. Scoped to
+   * w-0/inert and the peek card's floating offset. Scoped to
    * .conversations-sidebar so it can never match the AppShell copy. Hidden
    * rather than removed from the JSX so every other platform keeps the
    * in-sidebar cluster untouched. */
@@ -537,12 +537,11 @@ aside[aria-label="Workspace"][data-maximized] {
   [data-electron-mac] .chat-header-sidebar-toggle {
     display: none;
   }
-  /* The peek card floats at inset-2 (8px from the top), which on this shell puts
-   * its first row level with the traffic lights and the title-bar cluster — the
-   * card slides up UNDER the window controls and collides with them. Drop its
-   * top edge below the 2.25rem strip so it floats in beneath the controls
-   * instead, keeping the same 0.5rem breathing room the other edges use.
-   * The docked sidebar is unaffected: only the floating card is offset. */
+  /* The peek card's default top edge clears the chat header, but on this shell
+   * the toggle lives in the 2.25rem title-bar strip instead — float the card in
+   * just beneath the window controls, keeping the same 0.5rem breathing room
+   * the other edges use. The docked sidebar is unaffected: only the floating
+   * card is offset. */
   [data-electron-mac] .conversations-sidebar.is-peek {
     top: 2.75rem;
   }
