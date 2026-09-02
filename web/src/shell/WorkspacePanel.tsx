@@ -4,7 +4,6 @@ import {
   FileIcon,
   FolderTreeIcon,
   FileDiffIcon,
-  GitPullRequestIcon,
   GlobeIcon,
   Loader2Icon,
   MaximizeIcon,
@@ -41,6 +40,7 @@ import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { terminalTabKey, useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
+import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { FilesPanel } from "./FilesPanel";
 import { FileViewer } from "./FileViewer";
 import { GithubPanel } from "./GithubPanel";
@@ -830,7 +830,7 @@ export function WorkspacePanel({
                   aria-label="GitHub"
                   className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
                 >
-                  <GitPullRequestIcon />
+                  <GithubMono size={16} />
                   <span className="sr-only">GitHub</span>
                 </TabsTrigger>
               </WorkspaceTabTooltip>

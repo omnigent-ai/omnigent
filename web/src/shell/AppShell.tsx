@@ -1130,6 +1130,21 @@ export function AppShell() {
     [setPanelInitialKey, terminalFirst, setSearchParams, conversationId],
   );
 
+  // Reveal the rail on the GitHub tab (from the composer's PR link). Mirrors
+  // openFileViewer's rail-reveal, but deselects any file/shell so the tab's
+  // own content (the stacked diff) shows rather than the FileViewer.
+  const openGithubTab = useCallback(() => {
+    setSelectedFilePath(null);
+    setSelectedTerminalKey(null);
+    if (!terminalFirst) setPanelInitialKey(null);
+    setExecutionLogsKey(null);
+    setFilesPanelOpen(false);
+    setSubagentsPanelOpen(false);
+    setRightRailTab("github");
+    setRightPanelOpen(true);
+    if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
+  }, [conversationId, terminalFirst, setPanelInitialKey]);
+
   // Strip the file-viewer URL params (file/diff/comment). Memoized on
   // ``setSearchParams`` so it always closes over react-router's *current*
   // ``navigate`` — which is bound to the live ``locationPathname`` — rather
@@ -1575,12 +1590,13 @@ export function AppShell() {
   const fileViewerContextValue = useMemo(
     () => ({
       openFile: openFileViewer,
+      openGithubTab,
       isChangedPath,
       conversationId,
       workspaceRoot,
       workspaceHome,
     }),
-    [openFileViewer, isChangedPath, conversationId, workspaceRoot, workspaceHome],
+    [openFileViewer, openGithubTab, isChangedPath, conversationId, workspaceRoot, workspaceHome],
   );
 
   // Context for descendants — ChatPage's ConnectionIndicator reads
