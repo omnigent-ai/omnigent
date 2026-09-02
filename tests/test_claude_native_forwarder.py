@@ -5690,15 +5690,16 @@ async def test_effort_sync_swallows_patch_failure() -> None:
 async def _run_dismiss_stranded_spinner(
     *,
     bridge_dir: Path,
+    seq: int,
     status: int = 200,
-) -> tuple[list[_CapturedRequest], bool]:
+) -> list[_CapturedRequest]:
     """
     Drive ``_maybe_dismiss_stranded_compaction_spinner`` against a mock AP.
 
     :param bridge_dir: Bridge dir holding the compaction state.
+    :param seq: The refused compaction's ``PreCompact`` seq to dismiss.
     :param status: HTTP status the mock endpoint returns.
-    :returns: ``(captured requests in order, dismissed)`` where ``dismissed``
-        is the helper's return — ``True`` when a pending token was found.
+    :returns: Every request the helper issued, in order.
     """
     captured: list[_CapturedRequest] = []
 
@@ -5710,30 +5711,30 @@ async def _run_dismiss_stranded_spinner(
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
-        dismissed = await forwarder._maybe_dismiss_stranded_compaction_spinner(
-            client, session_id="conv_x", bridge_dir=bridge_dir
+        await forwarder._maybe_dismiss_stranded_compaction_spinner(
+            client, session_id="conv_x", bridge_dir=bridge_dir, seq=seq
         )
-    return captured, dismissed
+    return captured
 
 
 async def test_compact_refusal_dismisses_stranded_spinner(tmp_path: Path) -> None:
     """
-    A ``/compact`` refusal posts ``failed`` and drops the pending token.
+    A ``/compact`` refusal posts ``failed`` and drops the refused token.
 
     Claude fired ``PreCompact`` (raising the spinner) but declined to
     compact, so no completion signal follows. The forwarder must dismiss
     the "Compacting…" spinner with ``external_compaction_status: failed``
-    and clear the dangling ``PreCompact`` token.
+    and clear the dangling ``PreCompact`` token for that seq.
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     await forwarder._note_precompact(
         bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
     )
+    seq = forwarder._read_compaction_state(bridge_dir).pending.seq
 
-    captured, dismissed = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir)
+    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir, seq=seq)
 
-    assert dismissed is True
     assert captured == [
         _CapturedRequest(
             method="POST",
@@ -5747,54 +5748,41 @@ async def test_compact_refusal_dismisses_stranded_spinner(tmp_path: Path) -> Non
 
 async def test_compact_refusal_without_pending_token_no_ops(tmp_path: Path) -> None:
     """
-    A refusal with no in-flight ``PreCompact`` posts nothing and stays armed.
+    A refusal whose ``PreCompact`` was missed posts nothing.
 
-    No pending token means the ``PreCompact`` has not been observed yet, so a
-    ``failed`` post would be spurious. The helper returns ``False`` so the
-    caller keeps its deferred-dismiss flag armed for a later poll.
+    No pending token means the ``PreCompact`` was never observed, so no
+    spinner is up and a ``failed`` post would be spurious.
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
 
-    captured, dismissed = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir)
+    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir, seq=1)
 
-    assert dismissed is False
     assert captured == [], f"expected no POST without a pending token, got {captured!r}"
 
 
-async def test_compact_refusal_dismisses_when_precompact_arrives_later(tmp_path: Path) -> None:
+async def test_compact_refusal_does_not_dismiss_a_different_compaction(tmp_path: Path) -> None:
     """
-    A refusal seen before its ``PreCompact`` stays armed, then dismisses.
+    A stale refusal seq never dismisses a later genuine compaction's token.
 
-    Guards the cross-poll inversion: if the refusal transcript item is read
-    in a poll BEFORE the ``PreCompact`` hook becomes visible, the first
-    dismissal attempt finds no token and returns ``False`` (caller keeps the
-    flag armed). Once the ``PreCompact`` mints the token, a later attempt
-    posts ``failed`` — so the spinner is never stranded.
+    Regression for the flag-leak hazard: a refusal armed for seq N must not
+    fire against a fresh seq N+1 minted by a subsequent real ``/compact`` —
+    doing so would clear that live spinner and discard its boundary token.
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-
-    # Poll N: refusal observed first, no PreCompact token yet.
-    captured, dismissed = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir)
-    assert dismissed is False
-    assert captured == []
-
-    # Poll N+k: PreCompact finally lands and mints the pending token.
+    # A genuine, later compaction is pending (seq 1); the refusal we're
+    # flushing was armed for a missed earlier compaction (seq 0).
     await forwarder._note_precompact(
         bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
     )
-    captured, dismissed = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir)
+    live_seq = forwarder._read_compaction_state(bridge_dir).pending.seq
 
-    assert dismissed is True
-    assert captured == [
-        _CapturedRequest(
-            method="POST",
-            path="/v1/sessions/conv_x/events",
-            body={"type": "external_compaction_status", "data": {"status": "failed"}},
-        )
-    ], f"expected the deferred failed POST once the token appeared, got {captured!r}"
-    assert forwarder._read_compaction_state(bridge_dir).pending is None
+    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir, seq=live_seq - 1)
+
+    assert captured == [], f"a stale refusal seq must post nothing, got {captured!r}"
+    # The genuine compaction's token is untouched.
+    assert forwarder._read_compaction_state(bridge_dir).pending.seq == live_seq
 
 
 async def test_compact_refusal_swallows_post_failure(tmp_path: Path) -> None:
@@ -5804,13 +5792,12 @@ async def test_compact_refusal_swallows_post_failure(tmp_path: Path) -> None:
     await forwarder._note_precompact(
         bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
     )
+    seq = forwarder._read_compaction_state(bridge_dir).pending.seq
 
-    captured, dismissed = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir, status=503)
+    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir, seq=seq, status=503)
 
-    # Attempted once, the 503 swallowed. Returns True (token consumed, no
-    # point retrying) and the token is cleared (the spinner-owning PreCompact
-    # will never complete regardless).
-    assert dismissed is True
+    # Attempted once, the 503 swallowed. The token is still cleared (the
+    # spinner-owning PreCompact will never complete regardless).
     assert len(captured) == 1
     assert captured[0].method == "POST"
     assert forwarder._read_compaction_state(bridge_dir).pending is None

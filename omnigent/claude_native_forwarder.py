@@ -579,13 +579,19 @@ class _ForwardDedupeState:
     # prevents the limiter from recovering.
     cost_retry_not_before: float = 0.0
     cost_retry_failures: int = 0
-    # Set when the transcript phase sees a ``/compact`` refusal
-    # (``is_compact_noop``). The spinner dismissal is DEFERRED until after the
-    # hook phase runs, because the ``PreCompact`` hook (which raises the
-    # spinner via ``in_progress``) can land in the SAME poll as the refusal
-    # and is forwarded after transcript items — dismissing first would clear
-    # nothing and then the hook would strand a fresh spinner.
-    pending_compaction_dismiss: bool = False
+    # The ``PreCompact`` ``seq`` to dismiss when the transcript phase sees a
+    # ``/compact`` refusal (``is_compact_noop``), else ``None``. The dismissal
+    # is DEFERRED until after the hook phase, because the ``PreCompact`` hook
+    # (which raises the spinner via ``in_progress``) is forwarded after
+    # transcript items in the same poll — dismissing first would clear nothing
+    # and then the hook would strand a fresh spinner. Scoped to the specific
+    # seq (not a bare flag) and cleared every poll: the prescan mints the
+    # token before the transcript phase and Claude writes ``PreCompact``
+    # before the refusal stdout, so the refused compaction's token is already
+    # pending when the refusal is seen. Keying to that seq stops a refusal
+    # whose ``PreCompact`` was missed from later hijacking an unrelated
+    # genuine compaction's token.
+    pending_compaction_dismiss_seq: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1006,20 +1012,20 @@ async def forward_claude_transcript_to_session(
                         # Deferred ``/compact``-refusal dismissal: runs AFTER
                         # the hook phase so the ``failed`` post always follows
                         # the ``PreCompact`` ``in_progress`` that raised the
-                        # spinner, even when both land in this same poll. The
-                        # flag stays ARMED across polls until a pending token is
-                        # actually found and dismissed, so a ``PreCompact`` that
-                        # only becomes visible in a LATER poll than the refusal
-                        # transcript item still gets dismissed rather than
-                        # stranding the spinner.
-                        if dedupe.pending_compaction_dismiss:
-                            dismissed = await _maybe_dismiss_stranded_compaction_spinner(
+                        # spinner, even when both land in this same poll. Scoped
+                        # to the refused compaction's own seq and consumed here
+                        # (one-shot, cleared unconditionally) so a stale arm can
+                        # never dismiss a later genuine compaction's spinner or
+                        # discard its boundary token.
+                        if dedupe.pending_compaction_dismiss_seq is not None:
+                            dismiss_seq = dedupe.pending_compaction_dismiss_seq
+                            dedupe.pending_compaction_dismiss_seq = None
+                            await _maybe_dismiss_stranded_compaction_spinner(
                                 client,
                                 session_id=current_session_id,
                                 bridge_dir=bridge_dir,
+                                seq=dismiss_seq,
                             )
-                            if dismissed:
-                                dedupe.pending_compaction_dismiss = False
                         subagent_state = await _forward_available_subagents(
                             client=client,
                             parent_session_id=current_session_id,
@@ -3448,13 +3454,19 @@ async def _forward_available_items(
         # ``/compact`` refusal ("Not enough messages to compact."). Claude
         # fired ``PreCompact`` (raising the spinner) but declined to compact,
         # so no completion signal follows and the spinner is stranded. Defer
-        # the dismissal (see ``pending_compaction_dismiss``) — the raising
+        # the dismissal (see ``pending_compaction_dismiss_seq``) — the raising
         # ``PreCompact`` hook can land in the SAME poll and is forwarded AFTER
         # this transcript phase, so dismissing now would clear nothing and
-        # leave a fresh spinner. The item itself still forwards below as a
-        # normal ``slash_command`` bubble carrying the refusal text.
+        # leave a fresh spinner. Scope it to the refused compaction's OWN
+        # pending seq (already minted by the prescan, since Claude writes
+        # ``PreCompact`` before the refusal stdout) so it can never dismiss a
+        # later genuine compaction. If no token is pending the ``PreCompact``
+        # was missed and no spinner is up — nothing to dismiss. The item still
+        # forwards below as a ``slash_command`` bubble carrying the text.
         if item.is_compact_noop:
-            dedupe.pending_compaction_dismiss = True
+            refused = _read_compaction_state(bridge_dir).pending
+            if refused is not None:
+                dedupe.pending_compaction_dismiss_seq = refused.seq
         if skip_user_messages and item.item_type == "message" and item.data.get("role") == "user":
             seen_source_ids.append(item.source_id)
             seen.add(item.source_id)
@@ -5241,9 +5253,9 @@ async def _note_transcript_summary_without_token(bridge_dir: Path) -> None:
     await asyncio.to_thread(_mutate)
 
 
-async def _discard_pending_compaction(bridge_dir: Path) -> bool:
+async def _discard_pending_compaction(bridge_dir: Path, seq: int) -> bool:
     """
-    Drop an in-flight ``PreCompact`` token that will never complete.
+    Drop the in-flight ``PreCompact`` token for ``seq`` that will never complete.
 
     Called when a ``/compact`` refusal ("Not enough messages to compact.")
     is observed: Claude fired ``PreCompact`` (raising the spinner) but then
@@ -5251,14 +5263,20 @@ async def _discard_pending_compaction(bridge_dir: Path) -> bool:
     pending token so a later, genuine compaction reconciles cleanly, and
     closes any completion-ack window.
 
+    Scoped to ``seq``: only the token the refusal belongs to is dropped. A
+    later, genuine compaction (a higher seq) is left untouched, so a stale or
+    mis-paired refusal can never discard a live compaction's boundary token.
+
     :param bridge_dir: Native Claude bridge directory.
-    :returns: ``True`` when a pending token was cleared, ``False`` when
-        there was nothing pending (so the caller skips the dismissal post).
+    :param seq: The refused compaction's ``PreCompact`` seq to drop.
+    :returns: ``True`` when the pending token for ``seq`` was cleared,
+        ``False`` when no such token is pending (so the caller skips the
+        dismissal post).
     """
 
     def _mutate() -> bool:
         state = _read_compaction_state(bridge_dir)
-        if state.pending is None:
+        if state.pending is None or state.pending.seq != seq:
             return False
         _write_compaction_state(
             bridge_dir,
@@ -5281,13 +5299,14 @@ async def _maybe_dismiss_stranded_compaction_spinner(
     *,
     session_id: str,
     bridge_dir: Path,
-) -> bool:
+    seq: int,
+) -> None:
     """
     Dismiss the "Compacting…" spinner when Claude declines to compact.
 
-    Called for the flagged ``is_compact_noop`` transcript item (the
-    ``/compact`` "Not enough messages to compact." refusal). Claude fired
-    ``PreCompact`` first, so the forwarder already posted
+    Called after the hook phase for a ``/compact`` refusal
+    (``is_compact_noop``) whose own ``PreCompact`` seq is ``seq``. Claude
+    fired ``PreCompact`` first, so the forwarder already posted
     ``external_compaction_status: in_progress`` and the web UI is showing
     the spinner. No ``isCompactSummary`` record or ``SessionStart
     source=compact`` hook follows a refusal, so without this the spinner is
@@ -5295,22 +5314,19 @@ async def _maybe_dismiss_stranded_compaction_spinner(
     ``response.compaction.failed`` → remove the loading block) and drop the
     dangling ``PreCompact`` token. Best-effort — logged, not raised.
 
+    No-op when ``seq`` is no longer the pending token (the ``PreCompact`` was
+    missed so no spinner is up, or an unrelated compaction has since
+    superseded it) — that's the guard against dismissing a genuine
+    compaction's spinner or discarding its boundary token.
+
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
     :param bridge_dir: Native Claude bridge directory.
-    :returns: ``True`` when a pending token was found and the ``failed``
-        dismissal was posted; ``False`` when there was no pending token yet
-        (the ``PreCompact`` has not been observed) so the caller keeps the
-        deferred-dismiss flag armed for a later poll. Also ``True`` on a
-        failed POST — the token is consumed and retrying is pointless.
+    :param seq: The refused compaction's own ``PreCompact`` seq.
+    :returns: None.
     """
-    # Only dismiss when there is actually an in-flight PreCompact token — the
-    # refusal spinner we raised. A refusal with no pending token means the
-    # ``PreCompact`` has not been observed yet (or the spinner already
-    # resolved), so a ``failed`` post would be spurious; signal the caller to
-    # keep the flag armed and retry next poll.
-    if not await _discard_pending_compaction(bridge_dir):
-        return False
+    if not await _discard_pending_compaction(bridge_dir, seq):
+        return
     try:
         await _post_external_compaction_status(
             client,
@@ -5326,7 +5342,6 @@ async def _maybe_dismiss_stranded_compaction_spinner(
             exc_info=True,
             extra={"session_id": session_id},
         )
-    return True
 
 
 async def _claim_standalone_completion(bridge_dir: Path) -> int | None:
