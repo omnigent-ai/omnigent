@@ -170,12 +170,10 @@ export const TerminalExtraKeys = memo(function TerminalExtraKeys({
       const press = pressRef.current;
       if (!press || press.pointerId !== e.pointerId) return;
       clearPress();
-      // A cancelled gesture (scroll, palm) undoes a lock the timer already set.
-      if (press.key.kind === "modifier" && press.previous !== null) {
-        const state = modsRef.current;
-        if (state[press.key.id] !== press.previous) {
-          commit({ ...state, [press.key.id]: press.previous });
-        }
+      // A cancelled gesture (scroll, palm) undoes the lock this press set —
+      // and only that; a modifier consumed by typing meanwhile stays spent.
+      if (press.longPressFired && press.key.kind === "modifier" && press.previous !== null) {
+        commit({ ...modsRef.current, [press.key.id]: press.previous });
       }
     },
     [clearPress, commit],
