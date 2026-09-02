@@ -7,7 +7,7 @@ import functools
 import mimetypes
 import ntpath
 import urllib.parse
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Annotated, Any, cast
 
@@ -22,6 +22,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.types import Receive, Scope, Send
 
 from omnigent.entities import (
     Conversation,
@@ -94,6 +95,29 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
+
+
+class _RunnerStreamResponse(StreamingResponse):
+    """Stream a runner response body and close it however the send ends.
+
+    A generator ``finally`` only runs once the body is first pulled, so a
+    send that fails before that, or a client that disconnects (where
+    Starlette skips background tasks), would leak the tunnel request.
+    Closing in ``__call__`` covers every exit.
+
+    :param upstream: The runner's streamed response.
+    :param headers: Response headers to forward.
+    """
+
+    def __init__(self, upstream: httpx.Response, *, headers: Mapping[str, str]) -> None:
+        super().__init__(upstream.aiter_raw(), headers=headers)
+        self._upstream = upstream
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._upstream.aclose()
 
 
 def register_resources_routes(
@@ -309,18 +333,7 @@ def register_resources_routes(
                 )
                 if name in resp.headers
             }
-
-            async def _relay() -> AsyncIterator[bytes]:
-                # Close the runner response on every exit, a client
-                # disconnect included: Starlette skips the background task
-                # on disconnect, which would leak the tunnel request.
-                try:
-                    async for chunk in resp.aiter_raw():
-                        yield chunk
-                finally:
-                    await resp.aclose()
-
-            return StreamingResponse(_relay(), headers=forwarded)
+            return _RunnerStreamResponse(resp, headers=forwarded)
         await resp.aread()
         await resp.aclose()
         if resp.status_code == 200:

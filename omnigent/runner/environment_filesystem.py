@@ -922,12 +922,14 @@ class CallerProcessFilesystem:
         backend masks differently: bwrap binds ``/dev/null`` over a masked
         file, so it stats as a character device on another inode, while
         Seatbelt leaves ``stat`` working and fails the read. ``probe_read``
-        opens the file and reads a byte inside the helper so ``"r"`` means
-        "a regular file the helper can actually read" under either.
+        opens the file inside the helper, takes the identity from that
+        descriptor, and reads a byte from it, so ``"r"`` means "a regular
+        file the helper can actually read" under either, and the reported
+        inode is the one that was read rather than one stat'ed separately.
 
         :param target: Path as the helper should see it: workspace-relative,
             or absolute for a path under a declared grant.
-        :param probe_read: Also attempt a one-byte read of a regular file.
+        :param probe_read: Also open and read one byte of a regular file.
         :returns: ``{"s": size, "m": mtime, "d": is_dir, "l": is_symlink,
             "r": readable_regular_file, "dev": st_dev, "ino": st_ino}``, or
             ``None`` when the helper cannot stat the path.
@@ -948,6 +950,8 @@ class CallerProcessFilesystem:
                 f"if r and {probe_read!r}:",
                 "    try:",
                 "        with open(p, 'rb') as f:",
+                "            s = os.fstat(f.fileno())",
+                "            r = S.S_ISREG(s.st_mode)",
                 "            f.read(1)",
                 "    except OSError:",
                 "        r = False",
