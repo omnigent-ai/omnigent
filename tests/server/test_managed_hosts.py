@@ -50,10 +50,12 @@ from omnigent.server.managed_hosts import (
     RepoWorkspace,
     host_resume_supported,
     launch_managed_host,
+    managed_launch_rendezvous_timeout_s,
     parse_repo_workspace,
     parse_sandbox_config,
     relaunch_managed_host,
     resolve_managed_agent_label,
+    resolve_managed_host_online_timeout_s,
     resume_managed_host,
     terminate_managed_host,
 )
@@ -2190,6 +2192,57 @@ async def test_launch_online_timeout_terminates_and_deletes_host(
         host_store.resolve_launch_token(fake.host_starts[0].host_id, fake.host_starts[0].token)
         is None
     )
+
+
+def test_online_timeout_defaults_when_env_var_is_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An operator who sets nothing keeps the 120 s default."""
+    monkeypatch.delenv(ONLINE_TIMEOUT_ENV_VAR, raising=False)
+
+    assert resolve_managed_host_online_timeout_s() == 120
+
+
+def test_online_timeout_env_var_overrides_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A deployment whose host image is slow to boot can raise the budget
+    without patching the constant.
+    """
+    monkeypatch.setenv(ONLINE_TIMEOUT_ENV_VAR, "600")
+
+    assert resolve_managed_host_online_timeout_s() == 600
+
+
+@pytest.mark.parametrize("raw", ["soon", "", "0", "-30"])
+def test_online_timeout_rejects_an_unusable_override(
+    raw: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A malformed or non-positive budget is refused when it is read, not
+    silently ignored or turned into a launch that can never succeed.
+    """
+    monkeypatch.setenv(ONLINE_TIMEOUT_ENV_VAR, raw)
+
+    with pytest.raises(click.ClickException) as exc:
+        resolve_managed_host_online_timeout_s()
+    assert ONLINE_TIMEOUT_ENV_VAR in exc.value.message
+
+
+def test_rendezvous_budget_tracks_a_raised_online_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The parked-message rendezvous must stay ABOVE the registration wait
+    it covers. Deriving it at import time froze it at the default, so a
+    raised budget left the message expiring before the launch it waits
+    for — losing the first post-dormancy turn on a slow launch.
+    """
+    monkeypatch.setenv(ONLINE_TIMEOUT_ENV_VAR, "600")
+
+    assert managed_launch_rendezvous_timeout_s() == 720
+    assert managed_launch_rendezvous_timeout_s() > resolve_managed_host_online_timeout_s()
 
 
 async def test_launch_with_repo_clones_into_workspace(db_uri: str) -> None:
