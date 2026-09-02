@@ -208,6 +208,26 @@ describe("TerminalExtraKeys pointer semantics", () => {
     expect(installedTransform(target)).toBeNull();
   });
 
+  it("pointercancel after a lock does not re-arm a one-shot that typing spent while held", () => {
+    // WHY: armed → held past the lock → a character goes out as Ctrl+char →
+    // cancel. The one-shot was consumed, so the restore must land on off.
+    const target = makeTarget();
+    render(<TerminalExtraKeys target={target} />);
+    const ctrl = key("Control");
+
+    tap(ctrl);
+    expect(ctrl).toHaveAttribute("data-modifier-state", "armed");
+    pointerDown(ctrl);
+    act(() => vi.advanceTimersByTime(LONG_PRESS_MS + 50));
+    expect(ctrl).toHaveAttribute("data-modifier-state", "locked");
+    expect(typeThrough(target, "c")).toBe("\x03");
+    expect(ctrl).toHaveAttribute("data-modifier-state", "locked");
+
+    fireEvent.pointerCancel(ctrl, { pointerId: 1 });
+    expect(ctrl).toHaveAttribute("data-modifier-state", "off");
+    expect(installedTransform(target)).toBeNull();
+  });
+
   it("activates from a keyboard/AT click (detail 0) without pointer events", () => {
     const target = makeTarget();
     render(<TerminalExtraKeys target={target} />);
