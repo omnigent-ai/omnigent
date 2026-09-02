@@ -52,11 +52,13 @@ def _clean_subagent_registry() -> Iterator[None]:
         {k: set(v) for k, v in runner_app._subagent_work_by_parent.items()},
         dict(runner_app._session_inboxes_ref),
         set(runner_app._drained_delivered_subagent_children),
+        set(runner_app._subagent_recovery_scanned_parents),
     )
     runner_app._subagent_work_by_child.clear()
     runner_app._subagent_work_by_parent.clear()
     runner_app._session_inboxes_ref.clear()
     runner_app._drained_delivered_subagent_children.clear()
+    runner_app._subagent_recovery_scanned_parents.clear()
     try:
         yield
     finally:
@@ -68,6 +70,8 @@ def _clean_subagent_registry() -> Iterator[None]:
         runner_app._session_inboxes_ref.update(saved[2])
         runner_app._drained_delivered_subagent_children.clear()
         runner_app._drained_delivered_subagent_children.update(saved[3])
+        runner_app._subagent_recovery_scanned_parents.clear()
+        runner_app._subagent_recovery_scanned_parents.update(saved[4])
 
 
 class _SnapshotServerClient(NullServerClient):
@@ -103,6 +107,115 @@ class _SnapshotServerClient(NullServerClient):
         if url.rstrip("/").endswith("/items"):
             return self._Resp({"data": [], "has_more": False})
         return self._Response()
+
+
+class _RecoveryServerClient(NullServerClient):
+    """Serve durable parent/child history used by restart recovery tests."""
+
+    def __init__(
+        self,
+        *,
+        parent_items: list[dict[str, Any]],
+        child_items: list[dict[str, Any]] | None = None,
+        compaction_boundaries: dict[str, str] | None = None,
+        failed_item_sessions: set[str] | None = None,
+    ) -> None:
+        """
+        Configure persisted parent items returned by the fake server.
+
+        :param parent_items: Parent transcript items, newest first.
+        :param child_items: Optional child transcript override, oldest first.
+        :param compaction_boundaries: Optional session-to-last-item cursor map.
+        :param failed_item_sessions: Session ids whose non-compaction item read
+            should return HTTP 503.
+        """
+        self._parent_items = parent_items
+        self._child_items = child_items
+        self._compaction_boundaries = compaction_boundaries or {}
+        self.failed_item_sessions = failed_item_sessions or set()
+        self.requests: list[tuple[str, dict[str, Any]]] = []
+
+    class _Resp:
+        """Minimal successful HTTP response carrying a JSON payload."""
+
+        def __init__(self, payload: dict[str, Any], status_code: int = 200) -> None:
+            """
+            Store one JSON response payload.
+
+            :param payload: JSON object returned by :meth:`json`.
+            :param status_code: HTTP status exposed to production code.
+            """
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self) -> dict[str, Any]:
+            """Return the configured JSON payload."""
+            return self._payload
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        """
+        Return child summaries and persisted transcripts for recovery.
+
+        :param url: Requested sessions API path.
+        :param kwargs: Ignored HTTP request options.
+        :returns: Minimal successful response for the requested resource.
+        """
+        params = kwargs.get("params") or {}
+        self.requests.append((url, dict(params)))
+        if params.get("type") == "compaction":
+            session_id = url.rstrip("/").split("/")[-2]
+            boundary = self._compaction_boundaries.get(session_id)
+            rows = (
+                [
+                    {
+                        "id": f"compact_{session_id}",
+                        "type": "compaction",
+                        "summary": "Prior context summarized.",
+                        "last_item_id": boundary,
+                    }
+                ]
+                if boundary is not None
+                else []
+            )
+            return self._Resp({"data": rows, "has_more": False})
+        if url.endswith("/items"):
+            session_id = url.rstrip("/").split("/")[-2]
+            if session_id in self.failed_item_sessions:
+                return self._Resp({}, status_code=503)
+        if url.endswith(f"/{PARENT_SESSION_ID}/child_sessions"):
+            return self._Resp(
+                {
+                    "data": [
+                        {
+                            "id": CHILD_SESSION_ID,
+                            "tool": "reviewer",
+                            "session_name": "review",
+                            "current_task_status": "completed",
+                            "updated_at": 200,
+                        }
+                    ],
+                    "has_more": False,
+                }
+            )
+        if url.endswith(f"/{PARENT_SESSION_ID}/items"):
+            return self._Resp({"data": self._parent_items, "has_more": False})
+        if url.endswith(f"/{CHILD_SESSION_ID}/items"):
+            if self._child_items is not None:
+                return self._Resp({"data": self._child_items, "has_more": False})
+            return self._Resp(
+                {
+                    "data": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "created_at": 200,
+                            "content": [{"type": "output_text", "text": "review complete: LGTM"}],
+                        }
+                    ],
+                    "has_more": False,
+                }
+            )
+        return self._Resp({"data": [], "has_more": False})
 
 
 def _child_snapshot(
@@ -349,6 +462,252 @@ async def test_top_level_session_idle_is_noop(
 
     assert http == 204
     assert items == []
+
+
+@pytest.mark.asyncio
+async def test_runner_restart_recovers_undrained_terminal_child(
+    _clean_subagent_registry: None,
+) -> None:
+    """A new runner queue is rebuilt from durable child state and transcript.
+
+    This is the OMNI-4482 regression: no work entry, inbox item, or drained
+    tombstone survives the process restart. The test supplies only server-side
+    session/history records and requires recovery to recreate the exact result.
+    """
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Return the parent spec needed by the public initialization route.
+
+        :param agent_id: Bound agent id supplied by initialization.
+        :param session_id: Parent session id being initialized.
+        :returns: Minimal parent agent specification.
+        """
+        del agent_id, session_id
+        return AgentSpec(spec_version=1, name="orchestrator")
+
+    server_client = _RecoveryServerClient(
+        parent_items=[],
+        compaction_boundaries={
+            PARENT_SESSION_ID: "parent_boundary",
+            CHILD_SESSION_ID: "child_boundary",
+        },
+    )
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions",
+            json={"session_id": PARENT_SESSION_ID, "agent_id": "ag_orchestrator"},
+        )
+
+    assert response.status_code == 201
+    inbox = runner_app._session_inboxes_ref[PARENT_SESSION_ID]
+    assert inbox.qsize() == 1
+    payload = inbox.get_nowait()
+    assert payload["conversation_id"] == CHILD_SESSION_ID
+    assert payload["status"] == "completed"
+    assert payload["output"] == "review complete: LGTM"
+    item_requests = [params for url, params in server_client.requests if url.endswith("/items")]
+    assert {params.get("after") for params in item_requests} >= {
+        "parent_boundary",
+        "child_boundary",
+    }
+    assert sum(params.get("type") == "compaction" for params in item_requests) == 2
+    request_count = len(server_client.requests)
+    await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+    assert len(server_client.requests) == request_count
+
+
+@pytest.mark.asyncio
+async def test_runner_restart_does_not_replay_persisted_drain(
+    _clean_subagent_registry: None,
+) -> None:
+    """A persisted inbox output newer than completion prevents duplicate replay.
+
+    The test's parent function output is the durable acknowledgement already
+    produced by the real ``sys_read_inbox`` path. Removing the acknowledgement
+    check makes this test enqueue a duplicate and fail.
+    """
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    app = create_runner_app(
+        server_client=_RecoveryServerClient(
+            parent_items=[
+                {
+                    "type": "function_call",
+                    "created_at": 201,
+                    "call_id": "call_inbox",
+                    "name": "sys_read_inbox",
+                },
+                {
+                    "type": "function_call_output",
+                    "created_at": 201,
+                    "call_id": "call_inbox",
+                    "output": (
+                        f"[System: sub-agent task {CHILD_SESSION_ID} completed — "
+                        "reviewer:review returned: review complete: LGTM]"
+                    ),
+                },
+            ]
+        ),  # type: ignore[arg-type]
+    )
+
+    await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+
+    assert runner_app._session_inboxes_ref[PARENT_SESSION_ID].empty()
+    assert runner_app.get_subagent_work(CHILD_SESSION_ID) is None
+
+
+@pytest.mark.asyncio
+async def test_runner_restart_recovers_output_from_compaction_summary(
+    _clean_subagent_registry: None,
+) -> None:
+    """A child result covered by compaction is delivered from its summary."""
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    server_client = _RecoveryServerClient(
+        parent_items=[],
+        child_items=[{"type": "message", "role": "user", "created_at": 201, "content": []}],
+        compaction_boundaries={CHILD_SESSION_ID: "child_boundary"},
+    )
+    app = create_runner_app(server_client=server_client)  # type: ignore[arg-type]
+
+    await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+
+    payload = runner_app._session_inboxes_ref[PARENT_SESSION_ID].get_nowait()
+    assert payload["conversation_id"] == CHILD_SESSION_ID
+    assert payload["output"] == "Prior context summarized."
+
+
+@pytest.mark.asyncio
+async def test_runner_restart_retries_after_child_history_read_failure(
+    _clean_subagent_registry: None,
+) -> None:
+    """A partial child read failure does not memoize recovery as complete."""
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    server_client = _RecoveryServerClient(parent_items=[], failed_item_sessions={CHILD_SESSION_ID})
+    app = create_runner_app(server_client=server_client)  # type: ignore[arg-type]
+
+    await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+    assert runner_app._session_inboxes_ref[PARENT_SESSION_ID].empty()
+    assert PARENT_SESSION_ID not in runner_app._subagent_recovery_scanned_parents
+
+    server_client.failed_item_sessions.clear()
+    await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+
+    payload = runner_app._session_inboxes_ref[PARENT_SESSION_ID].get_nowait()
+    assert payload["conversation_id"] == CHILD_SESSION_ID
+    assert payload["output"] == "review complete: LGTM"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "parent_items",
+    [
+        [
+            {
+                "type": "function_call",
+                "created_at": 199,
+                "call_id": "call_old_inbox",
+                "name": "sys_read_inbox",
+            },
+            {
+                "type": "function_call_output",
+                "created_at": 199,
+                "call_id": "call_old_inbox",
+                "output": f"[System: sub-agent task {CHILD_SESSION_ID} completed]",
+            },
+        ],
+        [
+            {
+                "type": "function_call_output",
+                "created_at": 201,
+                "call_id": "call_session_list",
+                "output": f"child session: {CHILD_SESSION_ID}",
+            }
+        ],
+    ],
+)
+async def test_runner_restart_replays_after_old_or_unrelated_child_reference(
+    _clean_subagent_registry: None,
+    parent_items: list[dict[str, Any]],
+) -> None:
+    """Only a newer, correlated ``sys_read_inbox`` output proves consumption.
+
+    :param _clean_subagent_registry: Isolates module-level runner state.
+    :param parent_items: Either an older inbox drain from a previous child turn
+        or an unrelated tool output that happens to mention the child id.
+    """
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    app = create_runner_app(
+        server_client=_RecoveryServerClient(parent_items=parent_items),  # type: ignore[arg-type]
+    )
+
+    await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+
+    payload = runner_app._session_inboxes_ref[PARENT_SESSION_ID].get_nowait()
+    assert payload["conversation_id"] == CHILD_SESSION_ID
+    assert payload["output"] == "review complete: LGTM"
+
+
+@pytest.mark.asyncio
+async def test_runner_restart_never_suppresses_continued_child_generation(
+    _clean_subagent_registry: None,
+) -> None:
+    """A child-id acknowledgement cannot suppress a later continued turn.
+
+    Both turns and the old drain intentionally share one-second timestamps.
+    Without the at-least-once continued-child guard, recovery mistakes the old
+    result for acknowledgement of the new one and leaves the inbox empty.
+    """
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    parent_items = [
+        {
+            "type": "function_call",
+            "created_at": 200,
+            "call_id": "call_old_inbox",
+            "name": "sys_read_inbox",
+        },
+        {
+            "type": "function_call_output",
+            "created_at": 200,
+            "call_id": "call_old_inbox",
+            "output": f"[System: sub-agent task {CHILD_SESSION_ID} completed]",
+        },
+    ]
+    child_items = [
+        {"type": "message", "role": "user", "created_at": 199, "content": []},
+        {"type": "message", "role": "user", "created_at": 200, "content": []},
+        {
+            "type": "message",
+            "role": "assistant",
+            "created_at": 200,
+            "content": [{"type": "output_text", "text": "new turn result"}],
+        },
+    ]
+    app = create_runner_app(
+        server_client=_RecoveryServerClient(
+            parent_items=parent_items,
+            child_items=child_items,
+        ),  # type: ignore[arg-type]
+    )
+
+    await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+
+    payload = runner_app._session_inboxes_ref[PARENT_SESSION_ID].get_nowait()
+    assert payload["conversation_id"] == CHILD_SESSION_ID
+    assert payload["output"] == "new turn result"
+
+    # The restart may replay an ambiguous continued result once, but after the
+    # parent drains that replay the process-local tombstone must keep every
+    # later sys_read_inbox call from resurrecting it forever.
+    runner_app.unregister_subagent_work(CHILD_SESSION_ID, remember_drained_delivery=True)
+    await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+    assert runner_app._session_inboxes_ref[PARENT_SESSION_ID].empty()
 
 
 @pytest.mark.asyncio

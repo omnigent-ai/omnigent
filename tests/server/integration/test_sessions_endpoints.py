@@ -3271,6 +3271,41 @@ async def test_list_session_items_pagination(
     assert len(page["data"]) <= 1
 
 
+async def test_list_session_items_filters_by_type(
+    client: httpx.AsyncClient,
+) -> None:
+    """Items endpoint passes the type filter through to the store query."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], initial_message="before compaction")
+    await _wait_for_idle(client, session["id"])
+    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    boundary_id = items[-1]["id"]
+    compact = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "compaction",
+            "data": {
+                "summary": "Prior context summarized.",
+                "last_item_id": boundary_id,
+                "model": "test-model",
+                "token_count": 10,
+            },
+        },
+    )
+    assert compact.status_code == 202
+
+    response = await client.get(
+        f"/v1/sessions/{session['id']}/items",
+        params={"type": "compaction", "order": "desc", "limit": 1},
+    )
+
+    assert response.status_code == 200
+    filtered = response.json()["data"]
+    assert len(filtered) == 1  # Exactly the one compaction appended above.
+    assert filtered[0]["type"] == "compaction"
+    assert filtered[0]["last_item_id"] == boundary_id
+
+
 async def test_list_session_items_404_for_nonexistent(
     client: httpx.AsyncClient,
 ) -> None:
