@@ -80,6 +80,44 @@ gateway / `auth.type: databricks` does not apply. Authenticate it with
 `auth: {type: api_key, api_key: ${CURSOR_API_KEY}}`, and choose a Cursor model
 id (e.g. `auto`, `gpt-5`) rather than a `databricks-*` id.
 
+### Claude on Vertex AI
+
+`harness: claude-sdk` can also route to Claude models hosted on Google's
+Vertex AI, as an alternative to the Databricks gateway or direct Anthropic
+API. Opt in via `executor.config` — the same `vertex`/`project`/`location`
+keys the [Antigravity](#antigravity-gemini) harness uses:
+
+```yaml
+executor:
+  harness: claude-sdk
+  model: claude-sonnet-4-5-20250929   # Anthropic's native dash-dated id
+  config:
+    vertex: true
+    project: my-gcp-project
+    location: global                  # or a region, e.g. us-east5
+```
+
+Vertex's Anthropic integration uses a different wire shape than the plain
+Anthropic API the Claude CLI's `ANTHROPIC_BASE_URL` normally targets
+(`:rawPredict`/`:streamRawPredict` instead of `/v1/messages`, the model id
+in the URL path using Vertex's `@`-dated form instead of Anthropic's
+dash-dated form, `anthropic_version` injected into the body, and GCP OAuth2
+bearer auth instead of an Anthropic API key). A local
+[`VertexAnthropicGatewayShim`](../omnigent/inner/vertex_anthropic_shim.py)
+translates transparently, so the CLI is never aware it's talking to Vertex.
+
+GCP credentials are resolved via Application Default Credentials
+(`gcloud auth application-default login`, or `GOOGLE_APPLICATION_CREDENTIALS`
+for a service account key) in Omnigent's own process — not inside the Claude
+CLI subprocess the harness spawns, which may be sandboxed. This is the reason
+to prefer this path over Claude's own native `CLAUDE_CODE_USE_VERTEX=1`
+support: that reads GCP credentials directly inside the CLI process, which
+would expose them to a sandboxed subprocess.
+
+Mutually exclusive with the Databricks/generic gateway path (`auth.type:
+databricks`, or an `auth.type: api_key` with a `base_url`) — a spec setting
+both raises at executor construction time.
+
 The `kiro-native` harness is the native Kiro CLI terminal path used by
 `omnigent kiro`. It requires `kiro-cli` on `PATH` and Kiro's own login/auth; it
 does not use Databricks, OpenAI, or Anthropic provider credentials. Plain
