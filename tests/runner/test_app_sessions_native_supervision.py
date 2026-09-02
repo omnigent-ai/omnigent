@@ -1969,7 +1969,10 @@ async def test_parent_idle_with_stuck_wake_flag_and_drained_inbox_clears_flag() 
 
 
 @pytest.mark.asyncio
-async def test_repeat_identical_recovery_wake_is_suppressed() -> None:
+@pytest.mark.parametrize("server_version", [None, "0.2.0", "0.3.0"])
+async def test_repeat_identical_recovery_wake_is_suppressed(
+    monkeypatch: pytest.MonkeyPatch, server_version: str | None
+) -> None:
     """
     A recovery wake identical to the previous one is skipped, not re-posted.
 
@@ -2001,6 +2004,7 @@ async def test_repeat_identical_recovery_wake_is_suppressed() -> None:
     """
     from omnigent.runner import app as runner_app
 
+    monkeypatch.setattr(runner_app, "_server_version", server_version)
     parent_id = "b3d5c9f1a26e4708b1f0c4d29e7a6f13"
     child_a = "5f2a1c8b90d34e6fa7c1b2d3e4f50617"
     child_b = "6a3b2d9c81e45f70b8d2c3e4f5061728"
@@ -2099,6 +2103,14 @@ async def test_repeat_identical_recovery_wake_is_suppressed() -> None:
             assert "sub-agent gp/fanout finished (completed)" in recovery_text
             assert "2 results waiting in inbox" in recovery_text
             await _wait_turn_idle()
+            # A legacy wire fallback must not pin activity after T1 finishes.
+            assert app.state.native_pane_status[parent_id] == "waiting"
+            statuses = [
+                event["status"]
+                for event in _drain_session_event_queue(app.state.session_event_queues[parent_id])
+                if event.get("type") == "session.status"
+            ]
+            assert statuses[-1] == ("waiting" if server_version == "0.3.0" else "running")
 
             # 4. Start T2 (clears the flag). Drain one inbox item, then child C
             #    completes mid-T2 — the count returns to 2, so C's completion
