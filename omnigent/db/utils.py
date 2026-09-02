@@ -523,6 +523,64 @@ def run_migrations_with_retry(
             engine.dispose()
 
 
+# Substrings identifying a *transient* store-availability fault in a
+# driver-level error message, matched case-insensitively. Deliberately
+# narrow: an OperationalError matching none of these (e.g. SQLite
+# "no such table") stays classified as a genuine defect.
+_TRANSIENT_DB_ERROR_PATTERNS: tuple[str, ...] = (
+    # SQLite: another connection held the write lock past busy_timeout.
+    "database is locked",
+    "database table is locked",
+    # Postgres: endpoint suspended/resuming (managed stores such as
+    # Lakebase suspend after an idle window), restarting, or failing over.
+    "the database system is starting up",
+    "the database system is shutting down",
+    "the database system is in recovery mode",
+    "connection refused",
+    "server closed the connection unexpectedly",
+    "ssl connection has been closed unexpectedly",
+    "connection reset by peer",
+    "connection timed out",
+    # Connection/rate limiting on hosted endpoints.
+    "too many connections",
+    "too many clients",
+    "remaining connection slots are reserved",
+    "rate limit",
+)
+
+
+def is_transient_db_error(exc: BaseException) -> bool:
+    """Return whether ``exc`` is a transient store-availability fault.
+
+    Transient means the store itself is momentarily unable to serve the
+    request — rate-limited, suspended/resuming, locked, or out of pool
+    connections — and the *same* request succeeds once it recovers.
+    Callers use this to answer with a retryable error (HTTP 503,
+    ``store_unavailable``) instead of the ``internal_error`` catch-all,
+    and to log a concise availability event rather than a stack trace.
+
+    :param exc: The exception to classify, typically raised by a store
+        or session operation.
+    :returns: ``True`` for a retryable store-availability fault,
+        ``False`` for anything that looks like a genuine defect.
+    """
+    from sqlalchemy.exc import DBAPIError, OperationalError
+    from sqlalchemy.exc import TimeoutError as SqlAlchemyTimeoutError
+
+    if isinstance(exc, SqlAlchemyTimeoutError):
+        # Pool checkout timed out: every pooled connection is busy. The
+        # pool drains as in-flight work completes, so a retry can succeed.
+        return True
+    if isinstance(exc, DBAPIError) and exc.connection_invalidated:
+        # The dialect itself flagged the connection as gone (disconnect
+        # detection) — the pool replaces it, so a retry can succeed.
+        return True
+    if isinstance(exc, OperationalError):
+        message = str(exc.orig if exc.orig is not None else exc).lower()
+        return any(pattern in message for pattern in _TRANSIENT_DB_ERROR_PATTERNS)
+    return False
+
+
 def _get_current_db_revision(engine: Engine) -> str | None:
     """
     Return the database's current Alembic revision, or ``None``.
