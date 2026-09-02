@@ -78,3 +78,16 @@ what to look for, and why it's wrong.
   never force-delete the pre-existing thing (e.g. `git branch -D` on a branch the
   user owned before the call, losing unpushed commits). Check every failure path
   that shares a cleanup helper with the create-from-scratch flow.
+
+## Logging / secrets
+
+- **Never log an index/registry/endpoint URL verbatim.** URLs that reach logs or
+  error messages (e.g. a configurable package-index URL) commonly carry userinfo
+  credentials (`https://user:token@host/...`); redact the userinfo before
+  logging or raising.
+
+## Tests / hermeticity (continued)
+
+- **Dynamically imported modules must be removed from `sys.modules`.** A fixture
+  that `importlib`-loads a script into `sys.modules` must pop it on teardown, or
+  the module leaks shared mutable state across the test session.

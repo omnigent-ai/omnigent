@@ -162,8 +162,11 @@ See [`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md) for the current
 inventory and rollback procedure.
 
 > [!TIP]
-> To lock against a private PyPI mirror or proxy instead of public
-> PyPI, set `UV_INDEX_URL` before running `deploy.py`.
+> To lock against a private PyPI mirror or proxy instead of public PyPI, set
+> `DEPLOY_UV_INDEX_URL` before running `deploy.py`. The generic `UV_INDEX_URL`
+> and machine-level uv index config are deliberately ignored: the generated
+> lock installs in the Databricks Apps runtime, which must be able to reach
+> every host the lock references.
 
 ## Smoke check
 
