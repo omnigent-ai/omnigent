@@ -2785,3 +2785,92 @@ def test_probe_codex_home_bridges_provider_tables_and_credential(
     )
     home = codex_native_app_server._probe_codex_home(['model_provider="Databricks"'])
     assert "https://two.example" in (home / "config.toml").read_text()
+
+
+def test_resolve_databricks_codex_model_prefers_a_route_served_default() -> None:
+    """An implicit default skips listing entries the codex route does not serve.
+
+    Some workspaces (Azure) advertise GPT ids in the Unity Catalog listing
+    that the Codex Responses route 404s, so the ranked default must be
+    validated against the route: the first served candidate wins, and when
+    the probe cannot discriminate the ranked default stands. An explicit
+    request is never probed — the gateway's error beats a substitution.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from omnigent.codex_native_app_server import _resolve_databricks_codex_model
+
+    servable = ("system.ai.gpt-5-6-sol", "system.ai.gpt-5-5", "system.ai.glm-5-2")
+    with (
+        patch(
+            "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+            return_value=SimpleNamespace(token="tok"),
+        ),
+        patch(
+            "omnigent.databricks_model_discovery.discover_databricks_codex_models",
+            return_value=servable,
+        ),
+        patch(
+            "omnigent.databricks_model_discovery.first_served_codex_model",
+            return_value="system.ai.glm-5-2",
+        ) as probe,
+    ):
+        assert (
+            _resolve_databricks_codex_model("https://h.example.com", "prof", None)
+            == "system.ai.glm-5-2"
+        )
+        probe.assert_called_once_with("https://h.example.com", "tok", servable)
+
+        # An explicit request bypasses the probe entirely.
+        probe.reset_mock()
+        assert (
+            _resolve_databricks_codex_model("https://h.example.com", "prof", "databricks-gpt-5-5")
+            == "system.ai.gpt-5-5"
+        )
+        probe.assert_not_called()
+
+    # A probe that cannot discriminate keeps the ranked default.
+    for indeterminate in (None, RuntimeError("probe blew up")):
+        with (
+            patch(
+                "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+                return_value=SimpleNamespace(token="tok"),
+            ),
+            patch(
+                "omnigent.databricks_model_discovery.discover_databricks_codex_models",
+                return_value=servable,
+            ),
+            patch(
+                "omnigent.databricks_model_discovery.first_served_codex_model",
+                **(
+                    {"side_effect": indeterminate}
+                    if isinstance(indeterminate, Exception)
+                    else {"return_value": indeterminate}
+                ),
+            ),
+        ):
+            assert (
+                _resolve_databricks_codex_model("https://h.example.com", "prof", None)
+                == "system.ai.gpt-5-6-sol"
+            )
+
+    # A single-candidate listing needs no probe — there is nothing to skip to.
+    with (
+        patch(
+            "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+            return_value=SimpleNamespace(token="tok"),
+        ),
+        patch(
+            "omnigent.databricks_model_discovery.discover_databricks_codex_models",
+            return_value=("system.ai.gpt-5-6-sol",),
+        ),
+        patch(
+            "omnigent.databricks_model_discovery.first_served_codex_model",
+        ) as probe,
+    ):
+        assert (
+            _resolve_databricks_codex_model("https://h.example.com", "prof", None)
+            == "system.ai.gpt-5-6-sol"
+        )
+        probe.assert_not_called()
