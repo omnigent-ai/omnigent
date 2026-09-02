@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { SHIFT_ENTER_CSI_U } from "./TerminalSession";
 import {
   EXTRA_KEY_ROWS,
   MODIFIERS_OFF,
   NO_MODIFIERS,
+  SHIFT_ENTER_CSI_U,
   activeModifiers,
   encodeExtraKey,
   encodeModifiedInput,
@@ -122,6 +122,13 @@ describe("encodeModifiedInput", () => {
   it("prefixes Alt + char with Esc in a single string", () => {
     expect(encodeModifiedInput("p", mods({ alt: true }))).toBe("\x1bp");
     expect(encodeModifiedInput("c", mods({ alt: true, ctrl: true }))).toBe("\x1b\x03");
+  });
+
+  it("encodes Shift + a typed Tab as CSI Z like the row's own Tab under Shift", () => {
+    expect(encodeModifiedInput("\t", mods({ shift: true }))).toBe("\x1b[Z");
+    expect(encodeModifiedInput("\t", mods({ shift: true, ctrl: true }))).toBe("\x1b[Z");
+    expect(encodeModifiedInput("\t", mods({ shift: true, alt: true }))).toBe("\x1b\x1b[Z");
+    expect(encodeModifiedInput("\t", NO_MODIFIERS)).toBe("\t");
   });
 
   it("encodes Shift + Enter as the shared CSI-u sequence and leaves other Shift chars alone", () => {

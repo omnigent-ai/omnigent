@@ -1667,11 +1667,8 @@ html[data-electron-mac] .breadcrumb-folder {
   }
 }
 
-/* Terminal extra-keys row (Esc / Tab / Ctrl / arrows for soft keyboards).
- * Fixed 2×7 grid in normal flow under the xterm mount: same panel chrome as
- * the terminal card, a hairline on top, key labels in the terminal font. Keys
- * never wrap or scroll; wider surfaces (tablets, landscape) widen the columns.
- * `touch-action: manipulation` drops the 300ms tap delay and double-tap zoom. */
+/* Terminal extra-keys row for soft keyboards: fixed 2×7 grid in normal flow
+ * under the xterm mount, terminal-card chrome; columns widen, never wrap. */
 .terminal-extra-keys {
   display: grid;
   grid-template-columns: repeat(7, minmax(0, 1fr));
@@ -1681,10 +1678,8 @@ html[data-electron-mac] .breadcrumb-folder {
   border-top: 1px solid var(--border);
   background: var(--card);
   font-family: var(--font-mono);
-  /* Terminal font size on a phone-wide surface; shrinks with the container so
-     "Home"/"PgUp" still fit seven columns inside a narrow rail shell. */
-  container-type: inline-size;
-  font-size: clamp(0.625rem, 3.4cqi, 0.8125rem);
+  /* Default terminal font size; keys clip rather than wrap in a narrow rail. */
+  font-size: 0.8125rem;
   touch-action: manipulation;
   user-select: none;
   -webkit-user-select: none;

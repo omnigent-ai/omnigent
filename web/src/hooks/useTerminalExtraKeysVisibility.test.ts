@@ -49,8 +49,10 @@ beforeEach(() => {
 
 afterEach(() => {
   delete win.omnigentNative;
-  localStorage.clear();
   vi.restoreAllMocks();
+  // Also clears any write kept in memory after a refused storage write.
+  writeTerminalExtraKeysMode("auto");
+  localStorage.clear();
 });
 
 describe("useTerminalExtraKeysVisibility", () => {
@@ -111,6 +113,22 @@ describe("useTerminalExtraKeysVisibility", () => {
     act(() => writeTerminalExtraKeysMode("auto"));
     rerender();
     expect(result.current).toBe(true);
+  });
+
+  it("reflects a preference write even when storage refuses it", () => {
+    // WHY: the snapshot re-reads the store; if the write only lived in
+    // localStorage a quota error would leave the row's visibility stale.
+    stubMatchMedia(false);
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("quota");
+    });
+    const { result, rerender } = renderHook(() => useTerminalExtraKeysVisibility(false));
+    expect(result.current).toBe(false);
+
+    act(() => writeTerminalExtraKeysMode("on"));
+    rerender();
+    expect(result.current).toBe(true);
+    expect(localStorage.getItem("omnigent:terminal-extra-keys")).toBeNull();
   });
 
   it("never consults viewport width", () => {

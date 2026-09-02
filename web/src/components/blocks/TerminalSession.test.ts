@@ -1360,7 +1360,7 @@ describe("TerminalSession", () => {
     });
 
     it("sends nothing while the socket is not open", () => {
-      // WHY: a read-only or reconnecting attach must not queue or throw.
+      // WHY: a reconnecting attach must not queue or throw.
       const onInput = vi.fn();
       const { socket, session } = makeSession(undefined, onInput);
 

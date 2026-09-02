@@ -11,8 +11,10 @@ import {
 const KEY = "omnigent:terminal-extra-keys";
 
 afterEach(() => {
-  localStorage.clear();
   vi.restoreAllMocks();
+  // Also clears any write kept in memory after a refused storage write.
+  writeTerminalExtraKeysMode("auto");
+  localStorage.clear();
 });
 
 describe("terminalExtraKeysPreferences", () => {
@@ -58,7 +60,7 @@ describe("terminalExtraKeysPreferences", () => {
     expect(listener).toHaveBeenCalledTimes(1);
   });
 
-  it("still notifies when the storage write throws", () => {
+  it("still notifies and reads back the value when the storage write throws", () => {
     vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
       throw new Error("quota");
     });
@@ -66,5 +68,11 @@ describe("terminalExtraKeysPreferences", () => {
     subscribeTerminalExtraKeys(listener);
     expect(() => writeTerminalExtraKeysMode("on")).not.toThrow();
     expect(listener).toHaveBeenCalledWith("on");
+    // The refused write is still what readers see, until a write succeeds.
+    expect(readTerminalExtraKeysMode()).toBe("on");
+    vi.restoreAllMocks();
+    writeTerminalExtraKeysMode("off");
+    expect(readTerminalExtraKeysMode()).toBe("off");
+    expect(localStorage.getItem(KEY)).toBe("off");
   });
 });

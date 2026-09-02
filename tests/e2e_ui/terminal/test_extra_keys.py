@@ -279,3 +279,52 @@ def test_extra_keys_keep_focus_and_scrollback(
         expect(row).to_be_visible()
     finally:
         context.close()
+
+
+_NATIVE_SHELL_PROBE = """
+() => {
+  const shell = document.querySelector('.app-shell');
+  shell.setAttribute('data-ios-native', 'true');
+  const probe = document.createElement('div');
+  probe.className = 'main-terminal-view';
+  shell.appendChild(probe);
+  const root = parseFloat(getComputedStyle(document.documentElement).fontSize);
+  const shellStyle = getComputedStyle(shell);
+  const result = {
+    overflow: shellStyle.overflow,
+    height: parseFloat(shellStyle.height),
+    innerHeight: window.innerHeight,
+    paddingTop: parseFloat(getComputedStyle(probe).paddingTop),
+    expectedPaddingTop: 3.25 * root,
+  };
+  probe.remove();
+  return result;
+}
+"""
+
+
+def test_native_shell_terminal_insets_apply_at_phone_and_tablet_widths(
+    browser: Browser, seeded_session: tuple[str, str]
+) -> None:
+    """The iOS-shell viewport lock and terminal inset hold at every width.
+
+    The native-shell rules used to live under ``@media (width < 48rem)``; an
+    iPad-width shell got neither the viewport lock nor the terminal top inset.
+    Marking the shell ``data-ios-native`` and probing a ``.main-terminal-view``
+    element must yield the same computed values at 390px (unchanged from before)
+    and at 1024px (newly covered): ``overflow: hidden``, a height locked to the
+    viewport, and ``padding-top`` of ``3.25rem`` plus the (zero) OS inset.
+    """
+    base_url, session_id = seeded_session
+    for viewport in (_PHONE, _TABLET):
+        context = _touch_context(browser, viewport)
+        page = context.new_page()
+        try:
+            page.goto(f"{base_url}/c/{session_id}")
+            expect(page.locator(".app-shell")).to_be_visible(timeout=30_000)
+            probe = page.evaluate(_NATIVE_SHELL_PROBE)
+            assert probe["overflow"] == "hidden", (viewport, probe)
+            assert abs(probe["height"] - probe["innerHeight"]) <= 1, (viewport, probe)
+            assert abs(probe["paddingTop"] - probe["expectedPaddingTop"]) <= 0.5, (viewport, probe)
+        finally:
+            context.close()
