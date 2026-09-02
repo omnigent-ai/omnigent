@@ -5588,32 +5588,7 @@ async def test_effort_sync_swallows_patch_failure() -> None:
     assert captured[0].method == "PATCH"
 
 
-def _compact_slash_command_item(*, output: str | None) -> ClaudeTranscriptItem:
-    """
-    Build a ``/compact`` ``slash_command`` item carrying stdout.
-
-    :param output: The ``<local-command-stdout>`` text, or ``None`` for a
-        compaction that actually ran (no refusal stdout).
-    :returns: A ``slash_command`` item shaped like the bridge emits.
-    """
-    data: dict[str, Any] = {
-        "agent": "claude",
-        "kind": "command",
-        "name": "compact",
-        "arguments": "",
-    }
-    if output is not None:
-        data["output"] = output
-    return ClaudeTranscriptItem(
-        source_id="rec01:0:slash_command",
-        item_type="slash_command",
-        data=data,
-        response_id="resp_1",
-    )
-
-
 async def _run_dismiss_stranded_spinner(
-    item: ClaudeTranscriptItem,
     *,
     bridge_dir: Path,
     status: int = 200,
@@ -5621,7 +5596,6 @@ async def _run_dismiss_stranded_spinner(
     """
     Drive ``_maybe_dismiss_stranded_compaction_spinner`` against a mock AP.
 
-    :param item: Transcript item to feed the helper.
     :param bridge_dir: Bridge dir holding the compaction state.
     :param status: HTTP status the mock endpoint returns.
     :returns: Every request the helper issued, in order.
@@ -5637,20 +5611,12 @@ async def _run_dismiss_stranded_spinner(
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
         await forwarder._maybe_dismiss_stranded_compaction_spinner(
-            client, session_id="conv_x", bridge_dir=bridge_dir, item=item
+            client, session_id="conv_x", bridge_dir=bridge_dir
         )
     return captured
 
 
-@pytest.mark.parametrize(
-    "output",
-    [
-        "Not enough messages to compact.",
-        "not enough messages to compact",
-        "Nothing to compact.",
-    ],
-)
-async def test_compact_refusal_dismisses_stranded_spinner(output: str, tmp_path: Path) -> None:
+async def test_compact_refusal_dismisses_stranded_spinner(tmp_path: Path) -> None:
     """
     A ``/compact`` refusal posts ``failed`` and drops the pending token.
 
@@ -5665,9 +5631,7 @@ async def test_compact_refusal_dismisses_stranded_spinner(output: str, tmp_path:
         bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
     )
 
-    captured = await _run_dismiss_stranded_spinner(
-        _compact_slash_command_item(output=output), bridge_dir=bridge_dir
-    )
+    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir)
 
     assert captured == [
         _CapturedRequest(
@@ -5690,34 +5654,9 @@ async def test_compact_refusal_without_pending_token_no_ops(tmp_path: Path) -> N
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
 
-    captured = await _run_dismiss_stranded_spinner(
-        _compact_slash_command_item(output="Not enough messages to compact."),
-        bridge_dir=bridge_dir,
-    )
+    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir)
 
     assert captured == [], f"expected no POST without a pending token, got {captured!r}"
-
-
-async def test_successful_compact_does_not_dismiss_spinner(tmp_path: Path) -> None:
-    """
-    A ``/compact`` that actually ran must NOT post ``failed``.
-
-    A real compaction carries no refusal stdout; the pending token is
-    consumed by the ``isCompactSummary`` completion path, not dropped here.
-    """
-    bridge_dir = tmp_path / "bridge"
-    bridge_dir.mkdir()
-    await forwarder._note_precompact(
-        bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
-    )
-
-    captured = await _run_dismiss_stranded_spinner(
-        _compact_slash_command_item(output=None), bridge_dir=bridge_dir
-    )
-
-    assert captured == [], f"expected no failed POST for a real compaction, got {captured!r}"
-    # Token left intact for the completion path to consume.
-    assert forwarder._read_compaction_state(bridge_dir).pending is not None
 
 
 async def test_compact_refusal_swallows_post_failure(tmp_path: Path) -> None:
@@ -5728,11 +5667,7 @@ async def test_compact_refusal_swallows_post_failure(tmp_path: Path) -> None:
         bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
     )
 
-    captured = await _run_dismiss_stranded_spinner(
-        _compact_slash_command_item(output="Not enough messages to compact."),
-        bridge_dir=bridge_dir,
-        status=503,
-    )
+    captured = await _run_dismiss_stranded_spinner(bridge_dir=bridge_dir, status=503)
 
     # Attempted once, the 503 swallowed. The token is still cleared (the
     # spinner-owning PreCompact will never complete regardless).
