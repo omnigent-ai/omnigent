@@ -1360,6 +1360,37 @@ def _accumulate_session_usage(
     return _priced_cost_for_display(new_current)
 
 
+async def _persist_relay_reported_model(
+    resp_obj: dict[str, Any],
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> None:
+    """Persist the concrete model reported by an SDK harness response."""
+    usage_obj = resp_obj.get("usage")
+    if not isinstance(usage_obj, dict):
+        return
+    raw_model = usage_obj.get("model")
+    if not isinstance(raw_model, str) or not raw_model.strip():
+        return
+    model = raw_model.strip()
+    conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    if conv is None or conv.reported_model == model:
+        return
+    await asyncio.to_thread(
+        conversation_store.update_conversation,
+        session_id,
+        reported_model=model,
+    )
+    session_stream.publish(
+        session_id,
+        SessionModelEvent(
+            type="session.model",
+            conversation_id=session_id,
+            model=model,
+        ).model_dump(exclude_none=True),
+    )
+
+
 def _persist_native_cumulative_usage(
     session_id: str,
     data: dict[str, Any],
@@ -6358,6 +6389,14 @@ async def _relay_runner_stream_once(
                     # Accumulate LLM token usage from the harness
                     # response so policy callables can read
                     # event["context"]["usage"]["total_cost_usd"].
+                    if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES:
+                        _terminal_response = event.get("response")
+                        if isinstance(_terminal_response, dict):
+                            await _persist_relay_reported_model(
+                                _terminal_response,
+                                session_id,
+                                conversation_store,
+                            )
                     if evt_type == "response.completed":
                         # Persist the turn's usage (cost + token buckets) so
                         # policy callables can read
@@ -6374,10 +6413,9 @@ async def _relay_runner_stream_once(
                         if _turn_start_s is not None:
                             _latency_ms = (time.monotonic() - _turn_start_s) * 1000
                         _turn_start_s = None
+                        _response = event.get("response")
                         _resp_usage = (
-                            event.get("response", {}).get("usage") or {}
-                            if evt_type == "response.completed"
-                            else {}
+                            _response.get("usage") or {} if isinstance(_response, dict) else {}
                         )
                         _turn_in = _resp_usage.get("input_tokens")
                         _turn_out = _resp_usage.get("output_tokens")
