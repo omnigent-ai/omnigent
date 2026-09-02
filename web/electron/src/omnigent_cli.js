@@ -665,7 +665,14 @@ async function tailLocalServerLog(onLine, opts = {}) {
   const sleep = (ms) =>
     new Promise((resolve) => {
       const t = setTimeout(resolve, ms);
-      signal?.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
+      signal?.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(t);
+          resolve();
+        },
+        { once: true },
+      );
     });
 
   // 1. Wait for the child's logfile to appear. It's created at spawn, so this

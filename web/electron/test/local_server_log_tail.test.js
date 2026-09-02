@@ -10,8 +10,12 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const { makeLineSplitter, stripAnsi, findLiveServerLog, tailLocalServerLog } =
-  require("../src/omnigent_cli");
+const {
+  makeLineSplitter,
+  stripAnsi,
+  findLiveServerLog,
+  tailLocalServerLog,
+} = require("../src/omnigent_cli");
 
 describe("makeLineSplitter", () => {
   it("emits whole lines and buffers a trailing partial across chunks", () => {
