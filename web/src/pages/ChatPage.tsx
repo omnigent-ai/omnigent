@@ -2099,10 +2099,10 @@ function MainAgentSurface({
         <>
           {/* Task tracker pinned above the thread. Sibling of the viewport (not
           an overlay) so it shrinks the scroll area rather than covering
-          messages. mt clears the floating header (h-14 mobile / h-12 desktop).
-          Self-hides with no tasks. ponytail: header offset is the web height;
-          native shells (data-ios/android) size their header via CSS vars — not
-          tuned here. */}
+          messages. mt clears the floating header (h-14 mobile / h-12 desktop);
+          native shells shift the header by the safe area, so index.css
+          re-derives this offset for them (.chat-plan-accordion). Self-hides
+          with no tasks. */}
           <ChatPlanAccordion className="mt-14 md:mt-12" />
           {/* Wrapper div gives us a ref to scope the SelectionPopup to the
           conversation area without requiring Conversation to forward refs. */}

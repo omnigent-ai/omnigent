@@ -732,6 +732,15 @@ aside[aria-label="Workspace"][data-maximized] {
     top: max(0px, calc(var(--omnigent-safe-top) - 0.5rem));
   }
 
+  /* The pinned Plan tracker clears the floating header with a fixed mt-14
+     tuned for the web header at top: 0. Native shells shift the header down
+     by the rule above, so fold the same offset into the tracker's margin or
+     the header's floating controls land on top of the Plan bar. */
+  [data-ios-native] .chat-plan-accordion,
+  [data-android-native] .chat-plan-accordion {
+    margin-top: calc(var(--omnigent-header-height) + max(0px, var(--omnigent-safe-top) - 0.5rem));
+  }
+
   [data-ios-native] .chat-conversation-content,
   [data-android-native] .chat-conversation-content {
     /* header band + 1.5rem breathing room + OS safe area, sourced from the
