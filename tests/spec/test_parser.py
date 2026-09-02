@@ -1912,6 +1912,25 @@ def test_parse_os_env_sandbox_with_cwd_allow_hidden(tmp_path: Path) -> None:
     assert spec.os_env.sandbox.cwd_allow_hidden == [".venv", ".cache"]
 
 
+def test_parse_os_env_sandbox_cwd_allow_hidden_wildcard(tmp_path: Path) -> None:
+    """The explicit wildcard survives parsing for trusted workspaces."""
+    config = {
+        "spec_version": 1,
+        "name": "allow-all-hidden",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {"type": "linux_bwrap", "cwd_allow_hidden": ["*"]},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(tmp_path)
+
+    assert spec.os_env is not None
+    assert spec.os_env.sandbox is not None
+    assert spec.os_env.sandbox.cwd_allow_hidden == ["*"]
+
+
 def test_parse_os_env_sandbox_cwd_allow_hidden_empty_list_preserved(
     tmp_path: Path,
 ) -> None:
