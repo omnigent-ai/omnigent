@@ -15,15 +15,17 @@ import { CHAT_COLUMN_WIDTH } from "./chatLayout";
  * starting → connecting. `starting` is the in-sandbox host booting
  * and dialing back to the server (so it reads "Connecting host");
  * `connecting` is the agent runner being launched on that host
- * (so it reads "Starting agent"). Terminal stages are absent on
- * purpose — `ready` clears the band and `failed` renders its own
- * error band.
+ * (so it reads "Starting agent"). Each stage pairs its label with a
+ * duration expectation so the band never reads as stuck — the two
+ * host/agent stages finish in seconds, not minutes. Terminal stages
+ * are absent on purpose — `ready` clears the band and `failed`
+ * renders its own error band.
  */
-const SANDBOX_STAGE_LABELS: Record<string, string | undefined> = {
-  provisioning: "Provisioning sandbox",
-  cloning: "Cloning repository",
-  starting: "Connecting host",
-  connecting: "Starting agent",
+const SANDBOX_STAGE_COPY: Record<string, { label: string; expectation: string } | undefined> = {
+  provisioning: { label: "Provisioning sandbox", expectation: "this can take a minute" },
+  cloning: { label: "Cloning repository", expectation: "this can take a minute" },
+  starting: { label: "Connecting host", expectation: "usually just a few seconds" },
+  connecting: { label: "Starting agent", expectation: "usually just a few seconds" },
 };
 
 /**
@@ -166,9 +168,9 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
   // `ready` never reaches the store (cleared) and `failed` renders the
   // destructive band in ConnectionIndicator — only in-flight stages
   // with known copy show here.
-  const sandboxLabel =
+  const sandboxCopy =
     sandboxStatus !== null && sandboxStatus.stage !== "failed"
-      ? SANDBOX_STAGE_LABELS[sandboxStatus.stage]
+      ? SANDBOX_STAGE_COPY[sandboxStatus.stage]
       : undefined;
   // `terminalStartingUp` is computed for ALL sessions in AppShell (it does not
   // check isTerminalFirst), so gate on isTerminalFirst too: regular agents
@@ -177,10 +179,9 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
   const terminalSpinUp = Boolean(
     terminalFirst?.isTerminalFirst && terminalFirst.terminalStartingUp,
   );
-  if (sandboxLabel === undefined && !terminalSpinUp) {
+  if (sandboxCopy === undefined && !terminalSpinUp) {
     return null;
   }
-  const line = sandboxLabel !== undefined ? `${sandboxLabel}…` : "Starting up…";
   // role=status + aria-live so assistive tech announces the transient wait;
   // the spinner glyph itself is decorative (aria-hidden).
   if (variant === "hero") {
@@ -190,15 +191,19 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
         role="status"
         aria-live="polite"
         icon={<Loader2Icon className="size-7 animate-spin" aria-hidden />}
-        title={sandboxLabel !== undefined ? `${sandboxLabel}…` : "Starting up…"}
+        title={sandboxCopy !== undefined ? `${sandboxCopy.label}…` : "Starting up…"}
         description={
-          sandboxLabel !== undefined
-            ? "Setting up your sandbox — this can take a minute."
+          sandboxCopy !== undefined
+            ? `Setting up your sandbox — ${sandboxCopy.expectation}.`
             : "This can take a few seconds."
         }
       />
     );
   }
+  const line =
+    sandboxCopy !== undefined
+      ? `${sandboxCopy.label}… (${sandboxCopy.expectation})`
+      : "Starting up…";
   return (
     <Message
       from="assistant"
