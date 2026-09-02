@@ -403,19 +403,29 @@ async function startLocalServer(cliPath, onLine) {
     if (onLine) onLine("Server already running — connecting…");
     return { ok: true, url: existing.url, alreadyRunning: true };
   }
-  // Tail the daemon's logfile alongside the start so lines stream as it boots.
-  // The tail stops itself on /health-ready or timeout; a tail failure must not
-  // fail the start, so it's fire-and-forget and awaited only for cleanup.
-  const tail = onLine
-    ? cli.tailLocalServerLog(onLine).catch(() => {})
+  // Tail the daemon's boot logfile alongside the start so lines stream live as
+  // it boots. `omnigent server --background` blocks until the server is healthy
+  // or fails, so it IS the authoritative "boot finished" signal: abort the tail
+  // the moment it resolves rather than letting the tail poll on its own. This
+  // keeps a failed start from waiting on the tail (no ~60s stall), and the
+  // startedAt floor makes the tail ignore any stale log from a prior crash. A
+  // tail failure must never fail the start, so it's isolated with catch.
+  const startedAtMs = Date.now();
+  const controller = onLine ? new AbortController() : null;
+  const tail = controller
+    ? cli.tailLocalServerLog(onLine, { signal: controller.signal, startedAtMs }).catch(() => {})
     : Promise.resolve();
-  const res = await cli.startLocalServer(cliPath);
-  await tail;
-  if (res.ok) {
-    ownedLocalServer = { url: res.url, port: res.port, pid: res.pid };
-    return { ok: true, url: res.url };
+  try {
+    const res = await cli.startLocalServer(cliPath);
+    if (res.ok) {
+      ownedLocalServer = { url: res.url, port: res.port, pid: res.pid };
+      return { ok: true, url: res.url };
+    }
+    return { ok: false, error: res.error };
+  } finally {
+    controller?.abort();
+    await tail; // let it drain the final lines and close its watcher
   }
-  return { ok: false, error: res.error };
 }
 
 /**

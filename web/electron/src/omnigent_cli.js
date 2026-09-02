@@ -551,25 +551,55 @@ async function startLocalServer(cliPath) {
   };
 }
 
-/** Path of the log-path sidecar the background server writes on startup. */
-function localServerLogRefPath() {
-  return path.join(localDataDir(), "local_server.logpath");
+/** Directory the background server writes its per-run logfile into. Mirrors
+ * `open_process_log_file("server", root=<data_dir>/logs)` in local_server.py:
+ * files are named `server-<timestamp>.log` and created at spawn time. */
+function localServerLogDir() {
+  return path.join(localDataDir(), "logs", "server");
 }
 
 /**
- * Read the absolute logfile path the background server recorded, or null. The
- * detached child writes this *after* it starts, so callers must retry until it
- * appears. Mirrors `_read_local_server_log_path()` in local_server.py.
+ * Find the background server's CURRENT-run logfile by scanning the server log
+ * dir for the newest `server-*.log` created at/after `startedAtMs`.
  *
- * @returns {string | null}
+ * Why not the `local_server.logpath` sidecar: that sidecar is written only
+ * AFTER the server is healthy (local_server.py records it post-`/health`), so
+ * during boot it doesn't exist yet — tailing it can't stream the startup, and a
+ * stale sidecar from a prior crashed run would stream old content. The child's
+ * real logfile, by contrast, is created the moment it spawns. The `startedAtMs`
+ * floor rejects a previous run's log so a failed start never tails stale lines.
+ *
+ * @param {number} startedAtMs Only consider files modified at/after this (ms).
+ * @returns {string | null} Absolute path of the freshest matching log, or null.
  */
-function readLocalServerLogPath() {
+function findLiveServerLog(startedAtMs) {
+  const dir = localServerLogDir();
+  let entries;
   try {
-    const p = fs.readFileSync(localServerLogRefPath(), "utf8").trim();
-    return p || null;
+    entries = fs.readdirSync(dir);
   } catch {
-    return null;
+    return null; // dir not created yet (child hasn't spawned)
   }
+  let best = null;
+  let bestMtime = -1;
+  // A small floor tolerance: the child may open its log a beat before our
+  // recorded start, and mtime resolution is coarse on some filesystems.
+  const floor = startedAtMs - 2000;
+  for (const name of entries) {
+    if (!/^server-.*\.log$/.test(name)) continue;
+    const full = path.join(dir, name);
+    try {
+      const st = fs.statSync(full);
+      const mtime = st.mtimeMs;
+      if (mtime >= floor && mtime > bestMtime) {
+        best = full;
+        bestMtime = mtime;
+      }
+    } catch {
+      // Racing file removal — skip it.
+    }
+  }
+  return best;
 }
 
 /**
@@ -610,39 +640,48 @@ function makeLineSplitter(onLine) {
 }
 
 /**
- * Tail the background server's logfile, forwarding each new line to `onLine`,
- * until `/health` is ready (or a timeout). Does NOT own the server process — it
- * only reads the logfile the detached daemon writes, keeping the daemon model
- * intact. The logfile appears late (the child writes the sidecar after it
- * starts), so we poll for the sidecar+file before tailing. Naive read-from-
- * offset on `fs.watch` change events — no tail library, no external deps.
+ * Tail the background server's boot logfile, forwarding each new line to
+ * `onLine`, until the caller signals stop (its `omnigent server --background`
+ * resolved — success or failure) or a discovery timeout elapses. Does NOT own
+ * the server process nor decide readiness — it only reads the logfile the
+ * detached child writes, keeping the daemon model intact.
+ *
+ * Discovery uses {@link findLiveServerLog} (the child's real logfile, created
+ * at spawn) rather than the post-health `local_server.logpath` sidecar — so
+ * lines stream DURING boot, and a prior run's stale log is never adopted. Naive
+ * read-from-offset driven by `fs.watch` + a poll fallback; no tail library.
  *
  * @param {(line: string) => void} onLine
- * @param {{ readyTimeoutMs?: number, sidecarTimeoutMs?: number, pollMs?: number }} [opts]
- * @returns {Promise<void>} resolves when tailing stops (ready or timed out).
+ * @param {{ signal?: AbortSignal, startedAtMs?: number, discoverTimeoutMs?: number, pollMs?: number }} [opts]
+ *   `signal` stops the tail (the caller aborts it once the start resolves);
+ *   `startedAtMs` floors log discovery so stale logs are ignored (default: now).
+ * @returns {Promise<void>} resolves when tailing stops (aborted, timed out, or
+ *   the log couldn't be found).
  */
 async function tailLocalServerLog(onLine, opts = {}) {
-  const { readyTimeoutMs = 60000, sidecarTimeoutMs = 15000, pollMs = 200 } = opts;
+  const { signal, startedAtMs = Date.now(), discoverTimeoutMs = 15000, pollMs = 200 } = opts;
   const emit = makeLineSplitter((line) => onLine(stripAnsi(line)));
-  const deadline = Date.now() + readyTimeoutMs;
-  const sidecarDeadline = Date.now() + sidecarTimeoutMs;
-  const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+  const aborted = () => signal?.aborted === true;
+  const sleep = (ms) =>
+    new Promise((resolve) => {
+      const t = setTimeout(resolve, ms);
+      signal?.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
+    });
 
-  // 1. Wait for the sidecar + logfile to exist (detached child writes them).
+  // 1. Wait for the child's logfile to appear. It's created at spawn, so this
+  //    is a short wait — bounded so a start that never writes a log can't hang.
+  const discoverDeadline = Date.now() + discoverTimeoutMs;
   let logPath = null;
-  while (Date.now() < sidecarDeadline) {
-    const p = readLocalServerLogPath();
-    if (p && fs.existsSync(p)) {
-      logPath = p;
-      break;
-    }
-    // eslint-disable-next-line no-await-in-loop -- sequential poll for a file that appears over time
+  while (!aborted() && Date.now() < discoverDeadline) {
+    logPath = findLiveServerLog(startedAtMs);
+    if (logPath) break;
+    // eslint-disable-next-line no-await-in-loop -- sequential poll for a file that appears at spawn
     await sleep(pollMs);
   }
-  if (!logPath) return; // No logfile to tail — the caller still reports ready/fail via status.
+  if (!logPath) return; // No logfile found — the caller still reports ready/fail.
 
-  // 2. Read the file from the start, then follow appended bytes. fs.watch can
-  //    miss rapid writes, so we also re-check on each poll tick until ready.
+  // 2. Read from the start, then follow appended bytes. fs.watch can miss rapid
+  //    writes, so a poll tick also drains until the caller aborts.
   let offset = 0;
   const readNew = () => {
     try {
@@ -658,7 +697,7 @@ async function tailLocalServerLog(onLine, opts = {}) {
         fs.closeSync(fd);
       }
     } catch {
-      // File rotated/removed mid-tail — stop reading; readiness poll still runs.
+      // File rotated/removed mid-tail — stop reading; the caller drives the end.
     }
   };
 
@@ -670,16 +709,12 @@ async function tailLocalServerLog(onLine, opts = {}) {
   }
   try {
     readNew();
-    while (Date.now() < deadline) {
-      // eslint-disable-next-line no-await-in-loop -- sequential poll: tick, drain new bytes, re-check readiness
+    while (!aborted()) {
+      // eslint-disable-next-line no-await-in-loop -- sequential poll: tick, drain, until aborted
       await sleep(pollMs);
       readNew();
-      // eslint-disable-next-line no-await-in-loop -- must await this tick's health before the next
-      if (await localServerHealthy(1000)) {
-        readNew(); // final drain of the readiness lines
-        return;
-      }
     }
+    readNew(); // final drain of any lines written just before the abort
   } finally {
     if (watcher) watcher.close();
   }
@@ -1080,7 +1115,7 @@ module.exports = {
   getCliStatus,
   getServerStatus,
   startLocalServer,
-  readLocalServerLogPath,
+  findLiveServerLog,
   makeLineSplitter,
   stripAnsi,
   tailLocalServerLog,
