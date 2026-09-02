@@ -1138,10 +1138,14 @@ async def test_ensure_session_uses_server_assigned_id_and_caches() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(30)
+@pytest.mark.timeout(15)
 async def test_ensure_initialized_times_out_at_init_deadline(monkeypatch) -> None:
     """The ``initialize`` handshake is bounded by the module's init-timeout
-    constant, not left to hang forever against a stuck goose subprocess."""
+    constant. Checks elapsed time too, so a regression back to _rpc's
+    def-time-bound default (~30s) fails fast instead of passing silently.
+    """
+    import time
+
     from omnigent.inner import goose_executor
 
     monkeypatch.setattr(goose_executor, "_INIT_TIMEOUT_SECONDS", 0.05)
@@ -1154,9 +1158,16 @@ async def test_ensure_initialized_times_out_at_init_deadline(monkeypatch) -> Non
 
     executor._send = fake_send  # type: ignore[method-assign]
 
+    start = time.monotonic()
     with pytest.raises(asyncio.TimeoutError):
         await executor._ensure_initialized()
+    elapsed = time.monotonic() - start
+
     assert executor._initialized is False
+    # Comfortably above the 0.05s patched deadline plus scheduling slack, and
+    # comfortably below the real 30.0s default a dropped-kwarg regression
+    # would fall back to.
+    assert elapsed < 10.0
 
 
 @pytest.mark.asyncio
