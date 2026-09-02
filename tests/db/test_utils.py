@@ -487,6 +487,51 @@ def test_copied_sqlite_template_migrates_once_and_remains_isolated(
             engine.dispose()
 
 
+@pytest.mark.parametrize("marker", ["first", "second"])
+def test_db_uri_uses_template_without_replaying_migrations(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    marker: str,
+) -> None:
+    """The real SQLite ``db_uri`` path copies an at-head template."""
+    # Resolve the session template before installing the spy. Its one migration
+    # is expected; acquiring a per-test copy must not run another migration.
+    request.getfixturevalue("_sqlite_schema_template")
+    migration_uris: list[str] = []
+
+    def _counting_run_migrations(engine: Any, db_uri: str) -> None:
+        migration_uris.append(db_uri)
+        _run_migrations(engine, db_uri)
+
+    monkeypatch.setattr(
+        "omnigent.db.utils._run_migrations",
+        _counting_run_migrations,
+    )
+
+    db_uri = request.getfixturevalue("db_uri")
+    engine = get_or_create_engine(db_uri)
+    assert migration_uris == []
+    assert _get_current_db_revision(engine) == _get_head_db_revision(db_uri)
+
+    # Two parametrized fixture acquisitions must each start from the pristine
+    # template. Reusing a prior test database would expose this marker table.
+    with engine.begin() as conn:
+        existing = conn.execute(
+            text(
+                "SELECT count(*) FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'fixture_isolation_probe'"
+            )
+        ).scalar()
+        assert existing == 0
+        conn.execute(text("CREATE TABLE fixture_isolation_probe (value TEXT)"))
+        conn.execute(
+            text("INSERT INTO fixture_isolation_probe (value) VALUES (:marker)"),
+            {"marker": marker},
+        )
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT value FROM fixture_isolation_probe")).scalar() == marker
+
+
 def test_initialize_or_verify_schema_auto_migrates_when_stale(
     tmp_path: Path,
 ) -> None:
