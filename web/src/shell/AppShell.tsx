@@ -10,10 +10,6 @@ import {
 import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
-import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
-import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
-import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
-import { useIsEmbedded } from "@/lib/embedded";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
@@ -1315,17 +1311,10 @@ export function AppShell() {
     setRightPanelMaximized((prev) => !prev);
   };
 
-  // ⌘⌥[ / ⌘⌥] (Ctrl+Alt on Win/Linux) toggle the left and right sidebars. Bound
-  // here where both panels' open-state lives.
-  useSidebarToggleHotkeys({
-    onToggleLeft: toggleLeftSidebar,
-    onToggleRight: toggleRightPanel,
-  });
-
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
-  const isEmbedded = useIsEmbedded();
 
   useRegisterAction("session.action.new", {
+    acceptsKeybindings: true,
     run: () => {
       navigate("/");
       return HANDLED;
@@ -1350,30 +1339,26 @@ export function AppShell() {
     },
   });
   useRegisterAction("workbench.action.toggleConversationsSidebar", {
+    acceptsKeybindings: true,
     run: () => {
       toggleLeftSidebar();
       return HANDLED;
     },
   });
   useRegisterAction("workbench.action.toggleWorkspaceSidebar", {
+    acceptsKeybindings: true,
     run: () => {
       toggleRightPanel();
       return HANDLED;
     },
   });
   useRegisterAction("workbench.action.showCommands", {
+    acceptsKeybindings: true,
     run: () => {
       setCommandPaletteOpen((prev) => !prev);
       return HANDLED;
     },
   });
-
-  // Legacy bindings stay active until the next migration opts these actions
-  // into central dispatch. Command-palette capture must still beat embedded
-  // host-page listeners. New session remains unconditionally palette-visible,
-  // while its keyboard binding stays disabled in embedded mode.
-  useCommandPaletteHotkey(() => setCommandPaletteOpen((prev) => !prev));
-  useNewSessionHotkey(!isEmbedded);
 
   // Mobile back button: close the open file and return to the files/changes
   // list. On mobile the tab strip is hidden, so a "back" should fully drop the
@@ -2183,13 +2168,11 @@ export function AppShell() {
               </DialogContent>
             </Dialog>
           )}
-          {/* Keyboard-shortcuts reference. Self-contained (owns its open state +
-              ⌘/Ctrl+/ opener); ungated so it works on every route. */}
+          {/* Keyboard-shortcuts reference. Owns the action handler and open
+              state; the centralized keymap owns its shortcut. */}
           <KeyboardShortcutsDialog />
-          {/* Global command palette (⌘K). Ungated so it works on every route
-              and in embedded mode — the sidebar's "Search" button opens it
-              there even though the ⌘K hotkey is disabled (it belongs to the
-              host page). */}
+          {/* Global command palette. The centralized capture binding remains
+              active in embedded mode so it can beat host-page listeners. */}
           <CommandPalette open={commandPaletteOpen} onOpenChange={setCommandPaletteOpen} />
           {/* Transient toasts (e.g. "session archived"). Mounted once here so
               any surface can fire one via showToast(). */}

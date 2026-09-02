@@ -2,6 +2,7 @@ import { StrictMode, useState } from "react";
 import { createPortal } from "react-dom";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { EmbeddedProvider } from "@/lib/embedded";
 import { ActionScope, ActionsProvider } from "./ActionProvider";
 import { KeybindingDispatcher } from "./KeybindingDispatcher";
 import { when } from "./context";
@@ -18,7 +19,10 @@ function Handler({
     | "workbench.action.showCommands"
     | "chat.action.acceptApproval"
     | "composer.action.send"
-    | "panel.action.closeFiles";
+    | "panel.action.closeFiles"
+    | "session.action.new"
+    | "workbench.action.toggleConversationsSidebar"
+    | "workbench.action.toggleWorkspaceSidebar";
   run: () => "handled" | "notHandled";
 }) {
   useRegisterAction(action, { run, acceptsKeybindings: true });
@@ -46,6 +50,55 @@ describe("KeybindingDispatcher", () => {
       cancelable: true,
     });
     window.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  it("keeps new-session disabled but command palette active in embedded mode", () => {
+    const palette = vi.fn(() => HANDLED);
+    const newSession = vi.fn(() => HANDLED);
+    render(
+      <EmbeddedProvider>
+        <ActionsProvider>
+          <KeybindingDispatcher />
+          <Handler action="session.action.new" run={newSession} />
+          <Handler action="workbench.action.showCommands" run={palette} />
+        </ActionsProvider>
+      </EmbeddedProvider>,
+    );
+    const newEvent = new KeyboardEvent("keydown", {
+      key: "n",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(newEvent);
+    expect(newSession).not.toHaveBeenCalled();
+    expect(newEvent.defaultPrevented).toBe(false);
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "k",
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    expect(palette).toHaveBeenCalledOnce();
+  });
+
+  it("ignores AltGraph for centralized sidebar bindings", () => {
+    const run = vi.fn(() => HANDLED);
+    renderActions(<Handler action="workbench.action.toggleConversationsSidebar" run={run} />);
+    const event = new KeyboardEvent("keydown", {
+      key: "[",
+      code: "BracketLeft",
+      ctrlKey: true,
+      altKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    event.getModifierState = (key) => key === "AltGraph";
+    window.dispatchEvent(event);
+    expect(run).not.toHaveBeenCalled();
     expect(event.defaultPrevented).toBe(false);
   });
 
@@ -78,6 +131,72 @@ describe("KeybindingDispatcher", () => {
     expect(run).not.toHaveBeenCalled();
     fireEvent.keyDown(terminal, { key: "k", metaKey: true });
     expect(run).toHaveBeenCalledOnce();
+  });
+
+  it("leaves both command-palette modifier variants to Monaco", () => {
+    const run = vi.fn(() => HANDLED);
+    renderActions(
+      <>
+        <Handler action="workbench.action.showCommands" run={run} />
+        <div className="monaco-editor">
+          <textarea aria-label="code editor" />
+        </div>
+      </>,
+    );
+    const editor = screen.getByRole("textbox", { name: "code editor" });
+    expect(fireEvent.keyDown(editor, { key: "k", ctrlKey: true })).toBe(true);
+    expect(fireEvent.keyDown(editor, { key: "k", metaKey: true })).toBe(true);
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("matches both physical sidebar brackets and rejects missing Alt", () => {
+    const left = vi.fn(() => HANDLED);
+    const right = vi.fn(() => HANDLED);
+    renderActions(
+      <>
+        <Handler action="workbench.action.toggleConversationsSidebar" run={left} />
+        <Handler action="workbench.action.toggleWorkspaceSidebar" run={right} />
+      </>,
+    );
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "‘",
+        code: "BracketRight",
+        ctrlKey: true,
+        altKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    expect(right).toHaveBeenCalledOnce();
+    expect(left).not.toHaveBeenCalled();
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "[",
+        code: "BracketLeft",
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    expect(left).not.toHaveBeenCalled();
+  });
+
+  it("lets opted-in legacy globals run after a target prevents default", () => {
+    const left = vi.fn(() => HANDLED);
+    renderActions(
+      <>
+        <Handler action="workbench.action.toggleConversationsSidebar" run={left} />
+        <textarea aria-label="owned widget" onKeyDown={(event) => event.preventDefault()} />
+      </>,
+    );
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "owned widget" }), {
+      key: "[",
+      code: "BracketLeft",
+      ctrlKey: true,
+      altKey: true,
+    });
+    expect(left).toHaveBeenCalledOnce();
   });
 
   it("falls through a notHandled capture action to a composer bubble action", () => {

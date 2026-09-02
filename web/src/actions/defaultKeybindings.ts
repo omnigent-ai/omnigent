@@ -9,6 +9,7 @@ interface BaseRuleOptions {
   phase?: KeybindingRule["phase"];
   priority?: number;
   allowRepeat?: boolean;
+  allowDefaultPrevented?: boolean;
   preventDefault?: boolean;
   stopPropagation?: boolean;
 }
@@ -35,6 +36,7 @@ function rule<A extends ActionId>(
     phase: options.phase ?? "bubble",
     priority: options.priority,
     allowRepeat: options.allowRepeat,
+    allowDefaultPrevented: options.allowDefaultPrevented,
     preventDefault: options.preventDefault ?? true,
     stopPropagation: options.stopPropagation ?? false,
   } as KeybindingRule<A>;
@@ -76,24 +78,30 @@ for (let slot = 0; slot < 10; slot += 1) {
 export const DEFAULT_KEYBINDINGS: readonly KeybindingRule[] = [
   // New session is the one legacy action that requires the platform modifier
   // exactly; other migrated hooks historically accepted either Ctrl or Meta.
-  rule("session.new", "session.action.new", "mod+n", { when: notEmbedded }),
+  rule("session.new", "session.action.new", "mod+n", {
+    when: notEmbedded,
+    allowDefaultPrevented: true,
+    stopPropagation: true,
+  }),
   rule("workbench.showCommands", "workbench.action.showCommands", "primary+k", {
     phase: "capture",
     stopPropagation: true,
     when: paletteFocusAllowed,
   }),
-  rule("workbench.openKeyboardShortcuts", "workbench.action.openKeyboardShortcuts", "primary+/"),
+  rule("workbench.openKeyboardShortcuts", "workbench.action.openKeyboardShortcuts", "primary+/", {
+    allowDefaultPrevented: true,
+  }),
   rule(
     "workbench.toggleConversationsSidebar",
     "workbench.action.toggleConversationsSidebar",
     "primary+alt+[BracketLeft]",
-    { stopPropagation: true },
+    { allowDefaultPrevented: true, stopPropagation: true },
   ),
   rule(
     "workbench.toggleWorkspaceSidebar",
     "workbench.action.toggleWorkspaceSidebar",
     "primary+alt+[BracketRight]",
-    { stopPropagation: true },
+    { allowDefaultPrevented: true, stopPropagation: true },
   ),
   // Approval and send intentionally keep repeat disabled: a held Enter must
   // not accept multiple prompts or enqueue repeated messages.

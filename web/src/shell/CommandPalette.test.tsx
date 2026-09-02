@@ -366,6 +366,7 @@ describe("CommandPalette — actions", () => {
     expect(screen.getByText("Toggle conversations sidebar")).toBeTruthy();
     expect(screen.getByText("Toggle workspace sidebar")).toBeTruthy();
     expect(screen.queryByText("Open command palette")).toBeNull();
+    expect(screen.queryByText("Open keyboard shortcuts")).toBeNull();
   });
 
   it("preserves the historical action order with New chat first", () => {

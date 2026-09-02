@@ -1,13 +1,12 @@
 // A read-only "Keyboard shortcuts" overlay listing the shortcuts that already
 // exist in the chat surface. It is intentionally a mirror of the live
-// behavior — every row here corresponds to a handler that ships today
-// (composer `handleKeyDown`, the global session-switch / message-nav hotkeys,
-// and the approve hotkey). Nothing here binds new behavior except the dialog's
-// own opener (⌘/Ctrl + /), which this component registers.
+// behavior — every row here corresponds to behavior that ships today, whether
+// routed through centralized actions or a not-yet-migrated local handler. The
+// dialog owns the centralized action handler for
+// its opener; the default key itself lives in actions/defaultKeybindings.ts.
 //
-// Self-contained: it owns its open state and listens for its opener directly
-// (a window keydown for ⌘/Ctrl+/, plus a custom event so a menu entry can open
-// it without prop-drilling). Mount it once near the app shell.
+// Self-contained: it owns its open state and also keeps a temporary custom
+// event bridge for menu callers that have not migrated to actions yet.
 
 import { useEffect, useState } from "react";
 
@@ -30,6 +29,7 @@ import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { isNativeShell } from "@/lib/nativeBridge";
+import { HANDLED, useRegisterAction } from "@/actions";
 
 // Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
 // account menu) can open it without threading state through the tree.
@@ -192,22 +192,18 @@ export function KeyboardShortcutsList() {
 export function KeyboardShortcutsDialog() {
   const [open, setOpen] = useState(false);
 
+  useRegisterAction("workbench.action.openKeyboardShortcuts", {
+    acceptsKeybindings: true,
+    run: ({ source }) => {
+      setOpen((prev) => (source === "keyboard" ? !prev : true));
+      return HANDLED;
+    },
+  });
+
   useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      // ⌘/Ctrl + / toggles the panel. Plain `/` is the composer's slash-menu
-      // trigger, so require the modifier and no Shift/Alt to avoid clashing.
-      if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key === "/") {
-        e.preventDefault();
-        setOpen((prev) => !prev);
-      }
-    };
     const onOpenEvent = () => setOpen(true);
-    window.addEventListener("keydown", onKeyDown);
     window.addEventListener(KEYBOARD_SHORTCUTS_EVENT, onOpenEvent);
-    return () => {
-      window.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener(KEYBOARD_SHORTCUTS_EVENT, onOpenEvent);
-    };
+    return () => window.removeEventListener(KEYBOARD_SHORTCUTS_EVENT, onOpenEvent);
   }, []);
 
   return (

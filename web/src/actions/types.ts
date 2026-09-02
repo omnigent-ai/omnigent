@@ -187,6 +187,8 @@ export type KeybindingRule<A extends ActionId = ActionId> = A extends ActionId
       /** Higher values win among otherwise equally specific matching rules. */
       priority?: number;
       allowRepeat?: boolean;
+      /** Preserve legacy globals that ran after a widget called preventDefault. */
+      allowDefaultPrevented?: boolean;
       preventDefault?: boolean;
       stopPropagation?: boolean;
     } & ActionArgsField<A>

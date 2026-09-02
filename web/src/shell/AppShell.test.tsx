@@ -20,7 +20,7 @@ import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
-import { ActionsProvider, useActions } from "@/actions";
+import { ActionsProvider, KeybindingDispatcher, useActions } from "@/actions";
 
 const runnerHealthState = vi.hoisted(() => ({
   runnerOnline: undefined as boolean | undefined,
@@ -440,6 +440,7 @@ function renderShell(path: string, info?: ServerInfo) {
       <TooltipProvider>
         <MemoryRouter initialEntries={[path]}>
           <ActionsProvider>
+            <KeybindingDispatcher />
             <Routes>
               <Route element={<AppShell />}>
                 <Route
@@ -605,6 +606,46 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("AppShell header", () => {
+  it("opens the command palette through the centralized capture binding", () => {
+    mockConversations([]);
+    renderShell("/");
+    const hostListener = vi.fn();
+    document.addEventListener("keydown", hostListener, { capture: true });
+    try {
+      fireEvent.keyDown(screen.getByRole("button", { name: "Open sidebar" }), {
+        key: "K",
+        ctrlKey: true,
+      });
+      expect(screen.getByTestId("command-palette-input")).toBeInTheDocument();
+      expect(hostListener).not.toHaveBeenCalled();
+    } finally {
+      document.removeEventListener("keydown", hostListener, { capture: true });
+    }
+  });
+
+  it("toggles sidebars through physical bracket bindings and ignores repeat", () => {
+    mockConversations([]);
+    renderShell("/");
+    const sidebar = screen.getByTestId("sidebar");
+    const before = sidebar.getAttribute("data-open");
+    fireEvent.keyDown(window, {
+      key: "“",
+      code: "BracketLeft",
+      ctrlKey: true,
+      altKey: true,
+    });
+    expect(sidebar.getAttribute("data-open")).not.toBe(before);
+    const after = sidebar.getAttribute("data-open");
+    fireEvent.keyDown(window, {
+      key: "“",
+      code: "BracketLeft",
+      ctrlKey: true,
+      altKey: true,
+      repeat: true,
+    });
+    expect(sidebar.getAttribute("data-open")).toBe(after);
+  });
+
   it.each([
     ["action-inbox", "inbox route"],
     ["action-automations", "automations route"],
@@ -616,10 +657,17 @@ describe("AppShell header", () => {
     expect(screen.getByText(destination)).toBeInTheDocument();
   });
 
-  it("registers the new-session action", () => {
+  it("registers the new-session API action", () => {
     mockConversations([]);
     renderShell("/c/current");
     fireEvent.click(screen.getByTestId("action-new"));
+    expect(screen.getByText("home")).toBeInTheDocument();
+  });
+
+  it("routes the new-session binding through the same action", () => {
+    mockConversations([]);
+    renderShell("/c/current");
+    fireEvent.keyDown(window, { key: "N", ctrlKey: true });
     expect(screen.getByText("home")).toBeInTheDocument();
   });
 

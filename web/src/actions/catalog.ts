@@ -15,7 +15,7 @@ const definitions = [
     category: "General",
     keywords: ["keybindings", "hotkeys"],
     icon: "Keyboard",
-    palette: true,
+    palette: false,
     paletteOrder: 70,
   },
   {
