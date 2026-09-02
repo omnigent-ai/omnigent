@@ -1,6 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import type { ReactNode } from "react";
-import { userEvent, within } from "storybook/test";
+import { within } from "storybook/test";
 import { TerminalExtraKeys, type ExtraKeysTarget } from "./TerminalExtraKeys";
 import { LONG_PRESS_MS } from "./terminalExtraKeysModel";
 
@@ -11,6 +11,9 @@ const noopTarget: ExtraKeysTarget = {
   applicationCursor: () => false,
 };
 
+/** Widest surface the preview wrapper shows unclipped; wider ones are zoomed down. */
+const PREVIEW_MAX_WIDTH = 700;
+
 /**
  * Keyboard-closed framing: the row is the bottom-most element of the
  * terminal surface, docked under a (mock) xterm pane, with no soft keyboard
@@ -20,7 +23,7 @@ const noopTarget: ExtraKeysTarget = {
 function Surface({ width, children }: { width: number; children: ReactNode }) {
   return (
     <div
-      style={{ width }}
+      style={{ width, zoom: Math.min(1, PREVIEW_MAX_WIDTH / width) }}
       className="flex flex-col overflow-hidden rounded-lg border border-border bg-card shadow-sm"
     >
       <div
@@ -49,13 +52,18 @@ const meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 
+/**
+ * Press a modifier for ``holdMs`` with raw pointer events — the row acts on
+ * pointerdown/pointerup, and pointerId 1 is the browser's always-present mouse.
+ */
 async function pressModifier(canvasElement: HTMLElement, name: string, holdMs: number) {
   const key = within(canvasElement).getByRole("button", { name });
-  await userEvent.pointer({ keys: "[MouseLeft>]", target: key });
+  const init = { pointerId: 1, isPrimary: true, button: 0, bubbles: true };
+  key.dispatchEvent(new PointerEvent("pointerdown", init));
   await new Promise((resolve) => {
     setTimeout(resolve, holdMs);
   });
-  await userEvent.pointer({ keys: "[/MouseLeft]", target: key });
+  key.dispatchEvent(new PointerEvent("pointerup", init));
 }
 
 export const PhoneIdle: Story = {
