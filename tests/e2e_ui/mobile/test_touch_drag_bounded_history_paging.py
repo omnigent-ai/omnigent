@@ -228,6 +228,8 @@ def test_one_touch_drag_loads_bounded_history(
                 last_count = current
 
         pages_loaded = last_count - 1
+        # The drag must actually work: at least one page, never a runaway.
+        assert pages_loaded >= 1, "the touch drag loaded no history at all; paging never armed"
         assert pages_loaded <= _MAX_PAGES_PER_GESTURE, (
             f"one 60px touch drag chained {pages_loaded} history-page requests "
             f"(expected at most {_MAX_PAGES_PER_GESTURE}); the reader asked to "

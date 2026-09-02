@@ -656,6 +656,40 @@ describe("HistoryAutoLoader", () => {
     expect(loadMoreHistory.mock.calls.length).toBeLessThanOrEqual(3);
   });
 
+  it("holds the bound when pages settle mid-drag between touchmoves", () => {
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({ hasMoreHistory: true, oldestItemId: "item_50", loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 800 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader />);
+    fireEvent.touchStart(scrollRoot, { touches: [{ clientY: 300 }] });
+
+    // A sustained drag on a fast connection: pages settle while the finger is
+    // still moving, so every settle is followed by another touchmove from the
+    // SAME gesture. Those mid-drag touchmoves must not refill the budget.
+    let settled = 49;
+    let fingerY = 320;
+    let stalled = 0;
+    while (stalled < 2 && settled > 0) {
+      const before = loadMoreHistory.mock.calls.length;
+      fireEvent.touchMove(scrollRoot, { touches: [{ clientY: fingerY }] });
+      fingerY += 10;
+      act(() => {
+        useChatStore.setState({ loadingMoreHistory: false, oldestItemId: `item_${settled}` });
+      });
+      settled -= 1;
+      if (loadMoreHistory.mock.calls.length === before) stalled += 1;
+      else stalled = 0;
+    }
+
+    expect(loadMoreHistory.mock.calls.length).toBeGreaterThanOrEqual(1);
+    expect(loadMoreHistory.mock.calls.length).toBeLessThanOrEqual(3);
+  });
+
   it("re-grants the chain budget on the reader's next gesture", () => {
     const loadMoreHistory = vi.fn(async () => {
       useChatStore.setState({ loadingMoreHistory: true });
