@@ -1863,7 +1863,7 @@ describe("useProjects", () => {
   });
 });
 
-describe("useUpdateProjectConfig cache seeding", () => {
+describe("useUpdateProjectConfig", () => {
   it("seeds the fresh config + upserts the projects list on success (no stale read)", async () => {
     // The composer prefill settles once from the cache, so a save must write
     // the fresh value in — not merely invalidate — or the next visit within the
@@ -1876,22 +1876,124 @@ describe("useUpdateProjectConfig cache seeding", () => {
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
 
-    // The PATCH (label-only folder → promoted, so a create precedes it) returns
-    // the fresh first-class project with its stored config.
-    fetchMock
-      .mockResolvedValueOnce(mockResponse({ id: "p_new", name: "Work" })) // apiCreateProject
-      .mockResolvedValueOnce(
-        mockResponse({ id: "p_new", name: "Work", config: { agent_id: "ag_x" } }),
-      );
+    // A label-only folder is created with its config in the same request.
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ id: "p_new", name: "Work", config: { agent_id: "ag_x" } }),
+    );
 
     const { result } = renderHook(() => useUpdateProjectConfig(), { wrapper });
-    result.current.mutate({ id: null, name: "Work", config: { agent_id: "ag_x" } });
+    result.current.mutate({
+      id: null,
+      oldName: "Work",
+      newName: "Work",
+      config: { agent_id: "ag_x" },
+    });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/projects");
+    expect(JSON.parse(init.body as string)).toEqual({
+      name: "Work",
+      config: { agent_id: "ag_x" },
+    });
     // The config cache holds the fresh value keyed by the NEW id.
     expect(queryClient.getQueryData(["project-config", "p_new"])).toEqual({ agent_id: "ag_x" });
     // The projects list now resolves "Work" → the promoted first-class id.
     expect(queryClient.getQueryData(["projects"])).toEqual([{ id: "p_new", name: "Work" }]);
+  });
+
+  it("promotes and renames a legacy label project while preserving its members", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(["projects"], [{ id: null, name: "Old" }]);
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({ id: "p_new", name: "New", config: { agent_id: "ag_x" } }),
+      )
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [{ id: "session_1" }],
+          first_id: "session_1",
+          last_id: "session_1",
+          has_more: false,
+        }),
+      )
+      .mockResolvedValueOnce(mockResponse({ id: "session_1" }));
+
+    const { result } = renderHook(() => useUpdateProjectConfig(), { wrapper });
+    result.current.mutate({
+      id: null,
+      oldName: "Old",
+      newName: "New",
+      config: { agent_id: "ag_x" },
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    const [createUrl, createInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(createUrl).toBe("/v1/projects");
+    expect(JSON.parse(createInit.body as string)).toEqual({
+      name: "New",
+      config: { agent_id: "ag_x" },
+    });
+    expect(fetchMock.mock.calls[1][0]).toContain("project=Old");
+    const [sessionUrl, sessionInit] = fetchMock.mock.calls[2] as [string, RequestInit];
+    expect(sessionUrl).toBe("/v1/sessions/session_1");
+    expect(JSON.parse(sessionInit.body as string)).toEqual({
+      project_id: "p_new",
+      labels: { omni_project: "" },
+    });
+    expect(queryClient.getQueryData(["projects"])).toEqual([{ id: "p_new", name: "New" }]);
+    expect(queryClient.getQueryData(["project-config", "p_new"])).toEqual({
+      agent_id: "ag_x",
+    });
+  });
+
+  it("updates name and config together, migrates legacy labels, and replaces the cached name", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(["projects"], [{ id: "p_1", name: "Old" }]);
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({ id: "p_1", name: "New", config: { use_worktree: true } }),
+      )
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [{ id: "session_1" }],
+          first_id: "session_1",
+          last_id: "session_1",
+          has_more: false,
+        }),
+      )
+      .mockResolvedValueOnce(mockResponse({ id: "session_1" }));
+
+    const { result } = renderHook(() => useUpdateProjectConfig(), { wrapper });
+    result.current.mutate({
+      id: "p_1",
+      oldName: "Old",
+      newName: "New",
+      config: { use_worktree: true },
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    const [projectUrl, projectInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(projectUrl).toBe("/v1/projects/p_1");
+    expect(JSON.parse(projectInit.body as string)).toEqual({
+      name: "New",
+      config: { use_worktree: true },
+    });
+    expect(fetchMock.mock.calls[1][0]).toContain("project=Old");
+    const [sessionUrl, sessionInit] = fetchMock.mock.calls[2] as [string, RequestInit];
+    expect(sessionUrl).toBe("/v1/sessions/session_1");
+    expect(JSON.parse(sessionInit.body as string)).toEqual({
+      project_id: "p_1",
+      labels: { omni_project: "" },
+    });
+    expect(queryClient.getQueryData(["projects"])).toEqual([{ id: "p_1", name: "New" }]);
+    expect(queryClient.getQueryData(["project-config", "p_1"])).toEqual({
+      use_worktree: true,
+    });
   });
 });
 

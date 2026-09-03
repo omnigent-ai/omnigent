@@ -49,6 +49,7 @@ import {
 } from "@/lib/nativeCodingAgents";
 import type { ProjectConfig } from "@/lib/projectsApi";
 import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
+import { ProjectLandingIcon } from "@/components/ProjectIconPicker";
 import { AgentHarnessPicker } from "./NewChatDialog";
 import { isNavigablePath, WorkspacePicker } from "./WorkspacePicker";
 
@@ -124,6 +125,7 @@ export function ProjectSettingsDialog({
 
   // Draft fields. Seeded from the stored config each time the dialog opens (or
   // the fetched config arrives); local until saved.
+  const [name, setName] = useState(projectName);
   const [hostId, setHostId] = useState<string>(NONE);
   const [workspace, setWorkspace] = useState("");
   // Worktree default for the project. The toggle seeds from the project's
@@ -176,6 +178,11 @@ export function ProjectSettingsDialog({
 
   useEffect(() => {
     if (!open) return;
+    setName(projectName);
+  }, [open, projectName]);
+
+  useEffect(() => {
+    if (!open) return;
     // Don't seed a blank draft from a failed load — Save is blocked anyway, and
     // clobbering the fields would risk sending `{}` if the guard ever regressed.
     if (loadFailed) return;
@@ -193,7 +200,9 @@ export function ProjectSettingsDialog({
     e.preventDefault();
     // Guard against submitting a blank draft seeded from a failed load, which
     // the server would read as "clear the stored defaults".
-    if (loadFailed) return;
+    // A blank name would rename the project to nothing, so hold the submit.
+    const newName = name.trim();
+    if (loadFailed || newName === "") return;
     // Preserve config keys owned by other dialogs, then replace only the fields
     // this form edits.
     const config: ProjectConfig = { ...(stored ?? {}) };
@@ -230,7 +239,7 @@ export function ProjectSettingsDialog({
     else if (!agentUnresolved) delete config.model;
 
     updateConfig.mutate(
-      { id: projectId, name: projectName, config },
+      { id: projectId, oldName: projectName, newName, config },
       { onSuccess: () => onOpenChange(false) },
     );
   };
@@ -317,11 +326,33 @@ export function ProjectSettingsDialog({
         <DialogHeader>
           <DialogTitle>Project settings</DialogTitle>
           <DialogDescription>
-            Defaults for new sessions in <span className="font-medium">{projectName}</span>. Each is
-            a starting point you can change per session; leave a field blank for no default.
+            Update this project and its defaults for new sessions. Each default is a starting point
+            you can change per session; leave a field blank for no default.
           </DialogDescription>
         </DialogHeader>
         <form onSubmit={onSubmit} className="flex flex-col gap-4">
+          <Field label="Name" htmlFor="project-settings-name">
+            <input
+              id="project-settings-name"
+              data-testid="project-settings-name"
+              className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              disabled={updateConfig.isPending}
+              maxLength={100}
+              required
+            />
+          </Field>
+
+          <Field label="Icon" hint="Shown beside the project in the sidebar">
+            <ProjectLandingIcon
+              projectId={projectId}
+              projectName={projectName}
+              config={stored}
+              configReady={projectId === null || stored !== undefined}
+            />
+          </Field>
+
           <Field label="Host" hint="Where new sessions run by default">
             <Select
               value={hostId}
@@ -587,7 +618,7 @@ export function ProjectSettingsDialog({
               type="submit"
               data-testid="project-settings-save"
               loading={updateConfig.isPending}
-              disabled={isLoading || loadFailed}
+              disabled={isLoading || loadFailed || name.trim() === ""}
             >
               Save
             </Button>

@@ -3,11 +3,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
-import { getProject, updateProjectConfig, createProject } from "@/lib/projectsApi";
+import { getProject, updateProjectSettings, createProject } from "@/lib/projectsApi";
 
 vi.mock("@/lib/projectsApi", () => ({
   getProject: vi.fn(),
-  updateProjectConfig: vi.fn(),
+  updateProjectSettings: vi.fn(),
   createProject: vi.fn(),
 }));
 // Hoisted so the vi.mock factory can reference it; per-test overrides let
@@ -56,7 +56,7 @@ vi.mock("./WorkspacePicker", () => ({
 }));
 
 const getProjectMock = vi.mocked(getProject);
-const updateMock = vi.mocked(updateProjectConfig);
+const updateMock = vi.mocked(updateProjectSettings);
 const createMock = vi.mocked(createProject);
 
 function renderDialog(projectId: string | null = "p_1") {
@@ -103,6 +103,45 @@ describe("ProjectSettingsDialog", () => {
     expect(screen.getByTestId("project-settings-workspace")).toHaveTextContent(
       /pick a host first/i,
     );
+    expect(screen.getByRole("textbox", { name: "Name" })).toHaveValue("Work");
+  });
+
+  it("trims and saves the project name with its config in one update", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    renderDialog();
+    await waitFor(() =>
+      expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Name" }), {
+      target: { value: "  Renamed  " },
+    });
+    fireEvent.click(screen.getByTestId("project-settings-worktree"));
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", "Renamed", { use_worktree: true }),
+    );
+  });
+
+  it("requires a non-blank project name", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    renderDialog();
+    await waitFor(() =>
+      expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Name" }), {
+      target: { value: "   " },
+    });
+
+    expect(screen.getByTestId("project-settings-save")).toBeDisabled();
+    fireEvent.submit(screen.getByTestId("project-settings-save").closest("form")!);
+    expect(updateMock).not.toHaveBeenCalled();
   });
 
   it("saves only the fields that are set (unset slots omitted)", async () => {
@@ -121,7 +160,7 @@ describe("ProjectSettingsDialog", () => {
     fireEvent.click(screen.getByTestId("project-settings-save"));
 
     await waitFor(() => expect(updateMock).toHaveBeenCalled());
-    expect(updateMock).toHaveBeenCalledWith("p_1", { use_worktree: true });
+    expect(updateMock).toHaveBeenCalledWith("p_1", "Work", { use_worktree: true });
   });
 
   it("preserves the project icon when saving settings", async () => {
@@ -141,7 +180,7 @@ describe("ProjectSettingsDialog", () => {
     fireEvent.click(screen.getByTestId("project-settings-save"));
 
     await waitFor(() =>
-      expect(updateMock).toHaveBeenCalledWith("p_1", { icon: "🔥", use_worktree: true }),
+      expect(updateMock).toHaveBeenCalledWith("p_1", "Work", { icon: "🔥", use_worktree: true }),
     );
   });
 
@@ -155,7 +194,7 @@ describe("ProjectSettingsDialog", () => {
     );
     // Leave the toggle OFF (default) → config clears to {} (use_worktree absent).
     fireEvent.click(screen.getByTestId("project-settings-save"));
-    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", {}));
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", "Work", {}));
   });
 
   it("shows the base-branch field only when the worktree default is on, and saves it", async () => {
@@ -177,7 +216,10 @@ describe("ProjectSettingsDialog", () => {
 
     // Trimmed and stored alongside the worktree default.
     await waitFor(() =>
-      expect(updateMock).toHaveBeenCalledWith("p_1", { use_worktree: true, base_branch: "main" }),
+      expect(updateMock).toHaveBeenCalledWith("p_1", "Work", {
+        use_worktree: true,
+        base_branch: "main",
+      }),
     );
   });
 
@@ -197,7 +239,7 @@ describe("ProjectSettingsDialog", () => {
     // Turn the worktree default OFF → base branch drops, config clears to {}.
     fireEvent.click(screen.getByTestId("project-settings-worktree"));
     fireEvent.click(screen.getByTestId("project-settings-save"));
-    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", {}));
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", "Work", {}));
   });
 
   it("hides the sandbox option when managed sandboxes are disabled", async () => {
@@ -222,8 +264,8 @@ describe("ProjectSettingsDialog", () => {
     fireEvent.click(screen.getByTestId("project-settings-worktree"));
     fireEvent.click(screen.getByTestId("project-settings-save"));
 
-    await waitFor(() => expect(createMock).toHaveBeenCalledWith("Work"));
-    expect(updateMock).toHaveBeenCalledWith("p_new", { use_worktree: true });
+    await waitFor(() => expect(createMock).toHaveBeenCalledWith("Work", { use_worktree: true }));
+    expect(updateMock).not.toHaveBeenCalled();
   });
 
   it("persists host, workspace, and agent from a seeded config on save", async () => {
@@ -241,7 +283,7 @@ describe("ProjectSettingsDialog", () => {
     // Save without touching anything — the seeded fields round-trip back out.
     fireEvent.click(screen.getByTestId("project-settings-save"));
     await waitFor(() =>
-      expect(updateMock).toHaveBeenCalledWith("p_1", {
+      expect(updateMock).toHaveBeenCalledWith("p_1", "Work", {
         host_id: "h1",
         workspace: "/repo",
         agent_id: "ag_1",
@@ -269,7 +311,10 @@ describe("ProjectSettingsDialog", () => {
 
     fireEvent.click(screen.getByTestId("project-settings-save"));
     await waitFor(() =>
-      expect(updateMock).toHaveBeenCalledWith("p_1", { host_id: "h1", workspace: "/picked/dir" }),
+      expect(updateMock).toHaveBeenCalledWith("p_1", "Work", {
+        host_id: "h1",
+        workspace: "/picked/dir",
+      }),
     );
   });
 

@@ -45,7 +45,6 @@ import {
   SearchIcon,
   Settings2Icon,
   ShareIcon,
-  SmilePlusIcon,
   SquareIcon,
   SquareCheckIcon,
   SquarePenIcon,
@@ -104,7 +103,6 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   type Conversation,
   type PinnedConversationsResult,
@@ -118,9 +116,6 @@ import {
   useLeaveSession,
   useMoveToProject,
   useDeleteProject,
-  useRenameProject,
-  useProjectConfig,
-  useUpdateProjectConfig,
   PROJECT_LABEL_KEY,
   PINNED_CONVERSATIONS_KEY,
   usePinnedConversations,
@@ -141,7 +136,6 @@ import { showToast } from "@/components/ui/toast";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { ProjectRowIcon } from "./ProjectPicker";
-import { EmojiPicker } from "@/components/ProjectIconPicker";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
@@ -1252,11 +1246,7 @@ function ProjectFolder({
     data: { type: "project", name },
   });
 
-  const { actions: menuActions, dialogs: menuDialogs } = useProjectFolderMenu(
-    name,
-    projectId,
-    icon,
-  );
+  const { actions: menuActions, dialogs: menuDialogs } = useProjectFolderMenu(name, projectId);
 
   return (
     <div
@@ -4247,12 +4237,6 @@ function ProjectFolderMenuItems({
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
 }) {
-  useEffect(() => {
-    // Config loading follows the Radix content lifecycle; do not force-mount it.
-    actions.onMenuOpen();
-    return actions.onMenuClose;
-  }, [actions]);
-
   return (
     <>
       <C.Item asChild data-testid="project-new-session-menu">
@@ -4267,10 +4251,6 @@ function ProjectFolderMenuItems({
           New session
         </Link>
       </C.Item>
-      <C.Item data-testid="rename-project" onSelect={actions.openRename}>
-        <PencilIcon className="size-3.5" />
-        Rename project
-      </C.Item>
       <C.Item data-testid="project-settings" onSelect={actions.openSettings}>
         <Settings2Icon className="size-3.5" />
         Project settings
@@ -4284,254 +4264,32 @@ function ProjectFolderMenuItems({
 }
 
 interface ProjectFolderMenuActions {
-  openRename: () => void;
   openSettings: () => void;
   openDelete: () => void;
-  onMenuOpen: () => void;
-  onMenuClose: () => void;
 }
 
 /** Owns the dialogs and mutations shared by both project-folder menus. */
 function useProjectFolderMenu(
   projectName: string,
   projectId: string | null,
-  icon?: string | null,
 ): { actions: ProjectFolderMenuActions; dialogs: ReactNode } {
-  const [menuOpen, setMenuOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
-  const [renameOpen, setRenameOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [emojiOpen, setEmojiOpen] = useState(false);
-  const [renameValue, setRenameValue] = useState(projectName);
-  // The icon staged in the rename modal, committed only on Confirm:
-  //   undefined = untouched (show the saved icon), string = a picked emoji,
-  //   null = staged removal. Reset to `undefined` each time the modal opens.
-  const [pendingIcon, setPendingIcon] = useState<string | null | undefined>(undefined);
   const deleteProject = useDeleteProject();
-  const renameProject = useRenameProject();
-  const updateConfig = useUpdateProjectConfig();
-  // Fetch the full config only while the menu or rename modal is open, so we can
-  // merge the icon onto the other stored defaults (host / workspace / agent)
-  // without a per-folder request on every sidebar render — and without wiping
-  // those defaults on save.
-  const { data: iconConfig, isError: iconConfigError } = useProjectConfig(
-    menuOpen || renameOpen ? projectId : null,
-  );
-  // The config PATCH replaces the whole blob, so an ICON save must merge onto a
-  // fully-loaded config or it silently wipes the other defaults. "Ready" means
-  // the config actually resolved (`!== undefined` — `isLoading` alone is false
-  // on a query *error* too, leaving no data to merge onto) — except a
-  // label-only folder (`projectId === null`), whose base is legitimately `{}`.
-  // This gates only the icon path; renaming the name never needs the config.
-  const configReady = projectId === null || iconConfig !== undefined;
-  const savedIcon = iconConfig !== undefined ? iconConfig?.icon : icon;
-  // What the modal's tile shows: the staged pick when touched, else the saved
-  // icon. `null` (staged removal) renders as the empty folder.
-  const displayIcon = pendingIcon !== undefined ? pendingIcon : savedIcon;
 
   const actions = useMemo<ProjectFolderMenuActions>(
     () => ({
-      openRename: () => {
-        setRenameValue(projectName);
-        setPendingIcon(undefined);
-        setRenameOpen(true);
-      },
       openSettings: () => setSettingsOpen(true),
       openDelete: () => setDeleteOpen(true),
-      onMenuOpen: () => setMenuOpen(true),
-      onMenuClose: () => setMenuOpen(false),
     }),
-    [projectName],
+    [],
   );
 
   const dialogs = (
     <>
-      <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
-        <DialogContent
-          onClick={(e) => e.stopPropagation()}
-          // emoji-mart preventDefaults the pointer event, so Radix's own
-          // outside-dismissal never fires for clicks elsewhere in the modal.
-          // Catch them in the capture phase and close the picker ourselves,
-          // unless the pointer is inside the picker or on its trigger tile.
-          onPointerDownCapture={(e) => {
-            if (!emojiOpen) return;
-            const target = e.target as Element;
-            if (
-              target.closest('[data-slot="popover-content"]') ||
-              target.closest('[data-testid="rename-project-icon"]')
-            )
-              return;
-            setEmojiOpen(false);
-          }}
-        >
-          <DialogHeader>
-            <DialogTitle>Rename project</DialogTitle>
-          </DialogHeader>
-          {/* A <form> so Enter in the input submits natively (Radix Dialog
-              doesn't wrap children in one) instead of relying on a manual
-              key handler + button lookup. */}
-          <form
-            onSubmit={async (e) => {
-              e.preventDefault();
-              const newName = renameValue.trim();
-              const nameChanged = newName !== "" && newName !== projectName;
-              const iconChanged = pendingIcon !== undefined && pendingIcon !== (savedIcon ?? null);
-              // Only the icon write needs a loaded config to merge onto; a
-              // name-only rename must proceed even if the config fetch failed.
-              if (iconChanged && !configReady) return;
-              try {
-                // Name first: it promotes a label-only folder (creating the
-                // first-class row) and reconciles members. Capture the resolved
-                // id so the icon write below targets that row — passing the
-                // stale render-time `null` would make the config write try to
-                // create the project a second time and 409 on the duplicate.
-                let targetId = projectId;
-                if (nameChanged) {
-                  targetId = await renameProject.mutateAsync({
-                    id: projectId,
-                    oldName: projectName,
-                    newName,
-                  });
-                }
-                if (iconChanged) {
-                  const next = { ...(iconConfig ?? {}) };
-                  if (pendingIcon === null) delete next.icon;
-                  else next.icon = pendingIcon;
-                  await updateConfig.mutateAsync({
-                    id: targetId,
-                    name: nameChanged ? newName : projectName,
-                    config: next,
-                  });
-                }
-              } catch {
-                // Errors surface via the mutation state below. A rename that
-                // lands before a failed icon write is already persisted; only
-                // the icon needs retrying.
-                return;
-              }
-              setRenameOpen(false);
-              setMenuOpen(false);
-            }}
-          >
-            {/* One combined control: emoji tile (left) + name (right) share a
-                single border, so it reads as a single input. The tile opens a
-                picker popover; the pick is staged and committed on Confirm. */}
-            <div className="flex items-stretch overflow-hidden rounded-lg border border-input">
-              <Popover open={emojiOpen} onOpenChange={setEmojiOpen}>
-                <PopoverTrigger asChild>
-                  <button
-                    type="button"
-                    aria-label="Change project icon"
-                    data-testid="rename-project-icon"
-                    disabled={!configReady}
-                    className={cn(
-                      "flex size-[38px] shrink-0 cursor-pointer items-center justify-center outline-none transition-colors disabled:cursor-default disabled:opacity-50",
-                      displayIcon ? "bg-muted" : "bg-tag-pink",
-                    )}
-                  >
-                    {displayIcon ? (
-                      <span className="text-xl leading-none">{displayIcon}</span>
-                    ) : (
-                      <SmilePlusIcon className="size-4 text-brand-accent" />
-                    )}
-                  </button>
-                </PopoverTrigger>
-                <PopoverContent
-                  align="start"
-                  // Publish the collision-aware available viewport height (Radix
-                  // exposes it as a CSS var), less the optional "Remove icon"
-                  // header and capped at the picker's natural size, so the
-                  // .emoji-picker-popover rule in index.css shrinks emoji-mart to
-                  // fit — it then scrolls its grid internally (nav + search
-                  // pinned) instead of clipping on short screens.
-                  collisionPadding={8}
-                  style={
-                    {
-                      "--emoji-picker-height": `min(420px, calc(var(--radix-popover-content-available-height) - ${displayIcon ? "38px" : "0px"}))`,
-                    } as CSSProperties
-                  }
-                  className="emoji-picker-popover flex max-h-[var(--radix-popover-content-available-height)] w-auto flex-col overflow-hidden p-0"
-                  // The rename Dialog's scroll lock (react-remove-scroll)
-                  // preventDefaults wheel events over the picker — it can't see
-                  // emoji-mart's scroll region inside shadow DOM. Stop the wheel
-                  // from reaching the document-level lock so the grid scrolls.
-                  onWheel={(e) => e.stopPropagation()}
-                  // Nested in the rename Dialog, emoji-mart's own focus handling
-                  // swallows Radix's default outside-pointer dismissal, so a
-                  // click elsewhere in the modal wouldn't close the picker.
-                  // Close it explicitly on any outside interaction.
-                >
-                  {displayIcon ? (
-                    <div className="shrink-0 border-b p-1">
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        className="w-full justify-start"
-                        data-testid="rename-project-remove-icon"
-                        onClick={() => {
-                          setPendingIcon(null);
-                          setEmojiOpen(false);
-                        }}
-                      >
-                        <Trash2Icon className="size-3.5" />
-                        Remove icon
-                      </Button>
-                    </div>
-                  ) : null}
-                  <EmojiPicker
-                    onSelect={(native) => {
-                      setPendingIcon(native);
-                      setEmojiOpen(false);
-                    }}
-                  />
-                </PopoverContent>
-              </Popover>
-              <input
-                className="w-full bg-transparent px-3 py-2 text-ui outline-none"
-                value={renameValue}
-                onChange={(e) => setRenameValue(e.target.value)}
-              />
-            </div>
-            {iconConfigError && (
-              <p className="text-ui text-destructive" role="alert">
-                Couldn&apos;t load this project&apos;s icon settings. You can still rename it;
-                changing the icon is unavailable until this loads.
-              </p>
-            )}
-            {(renameProject.isError || updateConfig.isError) && (
-              <p className="text-ui text-destructive" role="alert">
-                {((renameProject.error ?? updateConfig.error) as Error).message}
-              </p>
-            )}
-            <DialogFooter className="border-t-0 bg-transparent">
-              <Button
-                type="button"
-                variant="ghost"
-                onClick={() => setRenameOpen(false)}
-                disabled={renameProject.isPending || updateConfig.isPending}
-              >
-                Cancel
-              </Button>
-              <Button
-                type="submit"
-                data-testid="rename-project-confirm"
-                loading={renameProject.isPending || updateConfig.isPending}
-                disabled={renameValue.trim() === ""}
-                componentId="sidebar.project.rename"
-              >
-                Confirm
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
       <ProjectSettingsDialog
         open={settingsOpen}
-        onOpenChange={(o) => {
-          setSettingsOpen(o);
-          if (!o) setMenuOpen(false);
-        }}
+        onOpenChange={setSettingsOpen}
         projectId={projectId}
         projectName={projectName}
       />
@@ -4572,7 +4330,6 @@ function useProjectFolderMenu(
                   {
                     onSuccess: () => {
                       setDeleteOpen(false);
-                      setMenuOpen(false);
                     },
                   },
                 );
