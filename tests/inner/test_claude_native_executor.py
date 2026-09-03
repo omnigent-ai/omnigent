@@ -594,6 +594,98 @@ async def test_run_turn_unresolved_file_id_emits_visible_marker(
 
 
 @pytest.mark.asyncio
+async def test_run_turn_materializes_zip_into_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A zip attachment lands in the workspace, not the bridge directory.
+
+    The bridge dir is not part of the project Claude's tools operate in, so
+    a file staged there would be unreachable; the workspace is its cwd.
+    """
+    import json
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    (tmp_path / "bridge.json").write_text(json.dumps({"workspace": str(workspace)}))
+
+    sent: list[dict[str, Any]] = []
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", _stub_inject(sent))
+
+    zip_bytes = b"PK\x03\x04 fake zip"
+    executor = ClaudeNativeExecutor(tmp_path)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "file_data": (
+                                "data:application/zip;base64,"
+                                f"{base64.b64encode(zip_bytes).decode()}"
+                            ),
+                            "filename": "bundle.zip",
+                        },
+                        {"type": "input_text", "text": "what is in here?"},
+                    ],
+                }
+            ],
+            tools=[],
+            system_prompt="ignored",
+        )
+    ]
+
+    assert events == [TurnComplete(response=None)]
+    materialized = workspace / "session-attachments" / "bundle.zip"
+    assert materialized.read_bytes() == zip_bytes
+    assert not (tmp_path / "uploads").exists()
+    assert f"[Attached file: {materialized}]" in sent[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_zip_without_workspace_emits_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    With no workspace recorded at launch there is nowhere to place the file,
+    so the turn surfaces a visible marker instead of failing or silently
+    dropping the attachment.
+    """
+    sent: list[dict[str, Any]] = []
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", _stub_inject(sent))
+
+    executor = ClaudeNativeExecutor(tmp_path)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "file_data": "data:application/zip;base64,UEsDBA==",
+                            "filename": "bundle.zip",
+                        },
+                        {"type": "input_text", "text": "unpack this"},
+                    ],
+                }
+            ],
+            tools=[],
+            system_prompt="ignored",
+        )
+    ]
+
+    assert events == [TurnComplete(response=None)]
+    assert sent[0]["content"] == "[Attachment bundle.zip could not be loaded]\n\nunpack this"
+
+
+@pytest.mark.asyncio
 async def test_run_turn_dedup_same_filename(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

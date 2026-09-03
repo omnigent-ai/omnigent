@@ -1240,6 +1240,21 @@ def read_active_session_id(bridge_dir: Path) -> str | None:
     return legacy if isinstance(legacy, str) and legacy else None
 
 
+def read_bridge_workspace(bridge_dir: Path) -> Path | None:
+    """
+    Read the workspace directory Claude was launched in.
+
+    :param bridge_dir: Bridge directory path.
+    :returns: Workspace root, e.g. ``Path("/home/me/repo")``, or ``None``
+        when the bridge config is absent or records no workspace.
+    """
+    config = _read_json_file(bridge_dir / _CONFIG_FILE)
+    if not isinstance(config, dict):
+        return None
+    workspace = config.get("workspace")
+    return Path(workspace) if isinstance(workspace, str) and workspace else None
+
+
 def read_launch_model(bridge_dir: Path) -> str | None:
     """
     Read the gateway model name that Claude was launched with.
