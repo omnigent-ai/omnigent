@@ -1,7 +1,7 @@
 import type { Conversation } from "@/hooks/useConversations";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { getOptimisticTitle } from "@/lib/optimisticTitles";
-import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import { PINNED_LABEL_KEY, PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 
 export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation-ids";
 
@@ -164,6 +164,24 @@ export function conversationDisplayLabel(conversation: Conversation): string {
   const label = nativeWrapperLabel(conversation);
   if (label !== null) return label;
   return UNTITLED_CONVERSATION_LABEL;
+}
+
+/**
+ * The project a session is filed under, or `null` when unfiled. Dual-read:
+ * prefer the first-class `project_id` membership (resolved via the caller's
+ * id → name map), falling back to the legacy `omni_project` label. An
+ * empty-string label reads as unfiled — the app clears membership by
+ * PATCHing that label to `""` rather than removing it.
+ */
+export function conversationProjectName(
+  conversation: Conversation,
+  projectNamesById: ReadonlyMap<string, string>,
+): string | null {
+  const firstClassName =
+    conversation.project_id != null ? projectNamesById.get(conversation.project_id) : undefined;
+  if (firstClassName !== undefined) return firstClassName;
+  const label = conversation.labels?.[PROJECT_LABEL_KEY];
+  return label ? label : null;
 }
 
 export function filterConversations(
