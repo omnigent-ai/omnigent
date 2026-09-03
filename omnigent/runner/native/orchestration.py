@@ -250,6 +250,24 @@ async def teardown_all_codex_native_app_servers() -> None:
             await teardown_codex_native_app_server(session_id)
 
 
+async def teardown_opencode_native_server(session_id: str) -> None:
+    """Tear down one host-spawned OpenCode server and its forwarder."""
+    if session_id not in _AUTO_OPENCODE_SERVERS:
+        return
+    await _cancel_auto_forwarder_task(session_id)
+    leftover = _AUTO_OPENCODE_SERVERS.pop(session_id, None)
+    if leftover is not None:
+        with contextlib.suppress(Exception):
+            await leftover.close()
+
+
+async def teardown_all_opencode_native_servers() -> None:
+    """Tear down every host-spawned OpenCode server on this runner."""
+    for session_id in list(_AUTO_OPENCODE_SERVERS):
+        with contextlib.suppress(Exception):
+            await teardown_opencode_native_server(session_id)
+
+
 def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -> None:
     """
     Register a session's transcript-forwarder task in the keyed registry.
@@ -1414,7 +1432,7 @@ async def _auto_create_opencode_terminal(
                 workspace=workspace,
             ),
         )
-    except Exception:
+    except BaseException:
         await server.close()
         _AUTO_OPENCODE_SERVERS.pop(session_id, None)
         raise
@@ -1483,7 +1501,7 @@ async def _auto_create_opencode_terminal(
                 "resource": session_resource_view_to_dict(terminal_view),
             },
         )
-    except Exception:
+    except BaseException:
         await _cancel_auto_forwarder_task(session_id)
         await server.close()
         _AUTO_OPENCODE_SERVERS.pop(session_id, None)

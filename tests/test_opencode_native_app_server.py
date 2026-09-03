@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -182,6 +183,54 @@ async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert started["argv"][1] == "serve"
     assert server.process is not None
     assert server.process.pid == 4242
+
+
+async def test_start_closes_process_when_readiness_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Cancellation during readiness cannot orphan ``opencode serve``."""
+    server = _server(monkeypatch, tmp_path)
+
+    class _FakeProc:
+        returncode: int | None = None
+        terminated = False
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.returncode = -15
+
+        def wait(self, _timeout: float | None = None) -> int:
+            assert self.returncode is not None
+            return self.returncode
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    process = _FakeProc()
+    readiness_started = asyncio.Event()
+
+    async def cancelled_wait(self: OpenCodeNativeServer) -> None:
+        readiness_started.set()
+        await asyncio.Event().wait()
+
+    async def direct_to_thread(func, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(appsrv.subprocess, "Popen", lambda argv, **kwargs: process)
+    monkeypatch.setattr(OpenCodeNativeServer, "_wait_until_ready", cancelled_wait)
+    monkeypatch.setattr(appsrv.asyncio, "to_thread", direct_to_thread)
+
+    start_task = asyncio.create_task(server.start())
+    await readiness_started.wait()
+    start_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await start_task
+
+    assert process.terminated is True
+    assert server.process is None
 
 
 async def test_start_raises_on_unsupported_version_without_env(
