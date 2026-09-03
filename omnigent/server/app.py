@@ -617,6 +617,14 @@ def _ensure_builtin_agent(
                 artifact_store.put(existing.bundle_location, bundle_bytes)
             # Evict so a lagging replica's stale cache reloads the bundle.
             agent_cache.evict(existing.id)
+            # Content unchanged, but clones minted before repointing existed
+            # may still carry an older key — heal them on every boot.
+            for stale_id in agent_store.repoint_session_agents(
+                existing.id,
+                existing.bundle_location,
+                previous_bundle_location=existing.bundle_location,
+            ):
+                agent_cache.evict(stale_id)
             return
         artifact_store.put(new_loc, bundle_bytes)
         agent_store.update(existing.id, new_loc)
@@ -624,6 +632,14 @@ def _ensure_builtin_agent(
         # Built-ins are operator-authored template agents, so ${VAR} may expand
         # against the server env.
         agent_cache.replace(existing.id, new_loc, bundle_bytes, expand_env=True)
+        # Fork/switch clone the built-in's bundle key verbatim into
+        # session-scoped rows this name-keyed refresh never touches — repoint
+        # uncustomized clones (a per-session edit re-keys under the clone's own
+        # id and stays pinned) so their sessions follow the current bundle.
+        for stale_id in agent_store.repoint_session_agents(
+            existing.id, new_loc, previous_bundle_location=existing.bundle_location
+        ):
+            agent_cache.evict(stale_id)
         _logger.info(
             "Refreshed built-in %s agent %s to bundle %s",
             name,

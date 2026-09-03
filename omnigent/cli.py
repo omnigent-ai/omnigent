@@ -1607,6 +1607,26 @@ def _preregister_agent(  # type: ignore[explicit-any]  # agent_store / artifact_
             # ``--agent`` registers operator-authored template agents,
             # so ${VAR} may expand against the server env here.
             agent_cache.replace(existing.id, new_loc, bundle_bytes, expand_env=True)
+            # Fork/switch clone this template's bundle key verbatim into
+            # session-scoped rows that startup registration (which resolves
+            # by the clean template name) never sees — so sessions bound to
+            # a clone would keep running the pre-update spec forever. Track
+            # the source: repoint uncustomized clones (a per-session edit
+            # re-keys the bundle under the clone's own id and stays pinned)
+            # and evict them so the cache re-fetches the current bundle.
+            for stale_id in agent_store.repoint_session_agents(
+                existing.id, new_loc, previous_bundle_location=existing.bundle_location
+            ):
+                agent_cache.evict(stale_id)
+        else:
+            # Content unchanged, but clones minted before repointing existed
+            # may still carry an older key — heal them on every restart.
+            for stale_id in agent_store.repoint_session_agents(
+                existing.id,
+                existing.bundle_location,
+                previous_bundle_location=existing.bundle_location,
+            ):
+                agent_cache.evict(stale_id)
         click.echo(f"  agent: {spec.name} (from {agent_source})")
         return cast(str, existing.id)
 

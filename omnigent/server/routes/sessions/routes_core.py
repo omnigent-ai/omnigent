@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 import secrets
 import time
 from collections.abc import Callable
@@ -204,6 +205,37 @@ from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.version import VERSION
+
+#: One trailing ``" (fork <id>)"`` / ``" (switch <id>)"`` clone suffix.
+#: Mirrors the web's ``agentRootName`` (web/src/lib/forkHarness.ts), but only
+#: matches the exact shapes the routes ever minted — ``id[:10]`` of a bare
+#: 32-hex id (10 hex) or of a legacy prefixed id (``ag_`` + 7 hex /
+#: ``conv_`` + 5 hex) — so a user-authored name that merely ends in
+#: ``" (switch prod)"`` or ``" (switch dead)"`` is never mistaken for a
+#: clone and renamed.
+_CLONE_SUFFIX = re.compile(
+    r" \((?:fork|switch) (?:ag_[0-9a-f]{7}|conv_[0-9a-f]{5}|[0-9a-f]{10})\)$"
+)
+
+
+def _agent_root_name(name: str) -> str:
+    """
+    The root agent name behind any chain of fork/switch clone suffixes.
+
+    Fork/switch clone a bound agent into a session-scoped row; a clone of a
+    clone would stack suffixes (``"codex (switch ag_a) (fork ag_b)"``). Peel
+    every layer so a re-clone carries the ORIGIN's name instead of minting
+    yet another suffixed duplicate the picker lists as a distinct agent.
+
+    :param name: An agent name, possibly with clone suffixes,
+        e.g. ``"pinfoo (switch ag_abc123)"``.
+    :returns: The root name, e.g. ``"pinfoo"``.
+    """
+    while True:
+        stripped = _CLONE_SUFFIX.sub("", name)
+        if stripped == name:
+            return name
+        name = stripped
 
 
 def register_core_routes(
@@ -2400,9 +2432,11 @@ def register_core_routes(
         # pre-created row would survive a fork failure as an orphaned
         # session_id=NULL built-in polluting the picker. Session-scoped rows
         # are exempt from the unique built-in-name index, so the clone reuses
-        # the source's name verbatim — no "(fork …)" suffix needed.
+        # the source's ROOT name — no "(fork …)" suffix needed, and any
+        # "(switch …)" suffix on a switched source is peeled so forking it
+        # doesn't mint duplicate suffixed rows the picker lists as agents.
         cloned_agent_id = generate_agent_id()
-        cloned_agent_name = base_agent.name
+        cloned_agent_name = _agent_root_name(base_agent.name)
 
         # A model id is provider-bound, so the source's model_override /
         # reasoning_effort only carry over when the switch stays in the same

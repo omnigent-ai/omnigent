@@ -1406,3 +1406,89 @@ async def test_fork_clone_reuses_source_agent_name_verbatim() -> None:
     assert conv_store.fork_calls[0]["cloned_agent_name"] == "claude-native-ui", (
         "Fork clone should reuse the source name verbatim, no '(fork …)' suffix"
     )
+
+
+@pytest.mark.asyncio
+async def test_fork_of_switched_session_roots_the_clone_name() -> None:
+    """Forking a session bound to a "<name> (switch <id>)" clone must name
+    the new clone by the ROOT agent name.
+
+    The switch route disambiguates its clone row with a "(switch <id>)"
+    suffix; copying that suffix verbatim on fork mints ever-more rows
+    carrying the same suffixed name, which the picker's session scan then
+    lists as duplicate agents (and suffixes would stack on re-clones).
+    """
+    switched_clone = Agent(
+        id="1d09e2c5b6a74000a000000000000001",
+        created_at=1,
+        name="pinfoo (switch 1d09e2c5b6)",
+        bundle_location="0b7000000000000000000000000000aa/fakehash",
+        version=1,
+        session_id="e9f8f58523cec9a57d3bdf93be543e8c",
+    )
+    conv = _make_conversation(agent_id=switched_clone.id)
+    conv_store = _ConversationStore(
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={"e9f8f58523cec9a57d3bdf93be543e8c": []},
+    )
+    agent_store = _AgentStore(agents={switched_clone.id: switched_clone})
+    client = TestClient(_build_app(conv_store, agent_store=agent_store))
+
+    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+
+    assert resp.status_code == 201, resp.text
+    assert len(conv_store.fork_calls) == 1
+    assert conv_store.fork_calls[0]["cloned_agent_name"] == "pinfoo", (
+        "The fork clone must carry the root agent name, not the switch "
+        f"suffix, got {conv_store.fork_calls[0]['cloned_agent_name']!r}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "user_authored_name",
+    [
+        # Non-hex word: never matches any id shape.
+        "release (switch prod)",
+        # Hex-only English word, but 4 chars — not the exact 10-hex width
+        # (or ag_+7 / conv_+5) the routes ever minted.
+        "deploy (switch dead)",
+    ],
+)
+async def test_fork_preserves_user_authored_suffix_looking_name(
+    user_authored_name: str,
+) -> None:
+    """A user-authored name that merely LOOKS like a clone suffix must be
+    copied verbatim on fork.
+
+    Only the exact shapes the routes ever minted (``id[:10]``: 10 bare hex,
+    or legacy ``ag_``+7 / ``conv_``+5 hex) are framework clone suffixes; a
+    template someone named "release (switch prod)" — or with a short hex
+    word like "deploy (switch dead)" — is not a clone, and renaming its
+    fork would change its identity (and could collide with a different
+    agent of that name).
+    """
+    user_named = Agent(
+        id="1d09e2c5b6a74000a000000000000002",
+        created_at=1,
+        name=user_authored_name,
+        bundle_location="1d09e2c5b6a74000a000000000000002/fakehash",
+        version=1,
+        session_id="e9f8f58523cec9a57d3bdf93be543e8d",
+    )
+    conv = _make_conversation(agent_id=user_named.id)
+    conv_store = _ConversationStore(
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8d": conv},
+        items_by_conv={"e9f8f58523cec9a57d3bdf93be543e8d": []},
+    )
+    agent_store = _AgentStore(agents={user_named.id: user_named})
+    client = TestClient(_build_app(conv_store, agent_store=agent_store))
+
+    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8d/fork", json={})
+
+    assert resp.status_code == 201, resp.text
+    assert len(conv_store.fork_calls) == 1
+    assert conv_store.fork_calls[0]["cloned_agent_name"] == user_authored_name, (
+        "A user-authored suffix-looking name is not a clone suffix and must "
+        f"survive the fork verbatim, got {conv_store.fork_calls[0]['cloned_agent_name']!r}"
+    )

@@ -135,6 +135,47 @@ class AgentStore(ABC):
         """
         ...
 
+    def repoint_session_agents(
+        self,
+        source_agent_id: str,
+        bundle_location: str,
+        previous_bundle_location: str | None = None,
+    ) -> builtins.list[str]:
+        """
+        Repoint stale, uncustomized session-scoped clones of a template
+        agent to its current bundle.
+
+        Fork/switch clone a template's ``bundle_location`` verbatim into a
+        session-scoped row, and bundle keys are content-addressed under the
+        source template's id (``"{template_id}/{sha256}"``). A session row
+        still keyed under *source_agent_id* (or under the template's
+        previous artifact-key prefix — legacy rows keep an ``ag_``-prefixed
+        physical key) but with different content is therefore a stale,
+        uncustomized copy; without repointing, sessions bound to it keep
+        running the spec captured at clone time after every template
+        update. A clone customized after cloning (per-session MCP edits
+        re-key the bundle under the clone's OWN id) no longer matches and
+        stays pinned to its customized bundle.
+
+        Default implementation is a no-op so backends without clone
+        tracking keep the prior leave-pinned behavior.
+
+        :param source_agent_id: The updated template agent's id,
+            e.g. ``"ag_abc123"``.
+        :param bundle_location: The template's current artifact key,
+            e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
+        :param previous_bundle_location: The template's artifact key before
+            this update, when known. Its prefix catches clones of legacy
+            rows whose key segment differs from the row id.
+        :returns: Ids of session-scoped clone rows whose cached bundle may
+            be stale — rows repointed now plus rows already at the current
+            location (another replica may have repointed them while this
+            process's cache still held the old extraction). Callers evict
+            each from the agent cache so the next load re-fetches.
+        """
+        del source_agent_id, bundle_location, previous_bundle_location
+        return []
+
     @abstractmethod
     def delete(self, agent_id: str) -> bool:
         """

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import builtins
+from typing import cast
 
 from sqlalchemy import and_, asc, desc, or_, select
+from sqlalchemy import update as sql_update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.converters import sql_agent_to_entity
@@ -304,6 +307,96 @@ class SqlAlchemyAgentStore(AgentStore):
         if row.kind == encode_agent_kind("session"):
             session_id = self._session_id_for_agent(agent_id)
         return sql_agent_to_entity(row, session_id=session_id)
+
+    def repoint_session_agents(
+        self,
+        source_agent_id: str,
+        bundle_location: str,
+        previous_bundle_location: str | None = None,
+    ) -> builtins.list[str]:
+        """
+        Repoint stale, uncustomized session-scoped clones to *bundle_location*.
+
+        Bundle keys are content-addressed under the source template's id
+        (``"{template_id}/{sha256}"``) and fork/switch copy them verbatim, so a
+        session-scoped row whose key still lives under *source_agent_id* — in
+        its bare or legacy ``ag_``-prefixed spelling (the uuid migration
+        stripped row-id prefixes but left physical bundle keys untouched) — or
+        under *previous_bundle_location*'s prefix, but differs from the
+        current location, is a stale, uncustomized clone. Per-session customization re-keys the
+        bundle under the clone's own id, so customized clones never match and
+        stay pinned.
+
+        Bumps each repointed row's ``version`` so the runner's version-keyed
+        spec cache re-fetches. Callers evict every returned id from the
+        server's :class:`AgentCache` (it trusts its per-id entry without
+        checking ``bundle_location``) — the return includes clones ALREADY at
+        the current location, because another replica (or a prior boot that
+        crashed before evicting) may have committed the repoint while this
+        process's cache still holds the old extraction. Already-current rows
+        are only returned, never mutated (no version churn).
+
+        :param source_agent_id: The updated template agent's id.
+        :param bundle_location: The template's current artifact key.
+        :param previous_bundle_location: The template's pre-update artifact
+            key, when known, e.g. a legacy ``"ag_foo/sha"``.
+        :returns: Ids of session-scoped clone rows whose cached bundle may be
+            stale: rows repointed now, plus rows already at
+            *bundle_location*.
+        """
+        # ``autoescape`` neutralizes ``%``/``_`` wildcards in ids. The
+        # ``ag_``-prefixed spelling is the pre-uuid-migration id form: the
+        # migration stripped the prefix from row ids but deliberately left
+        # ``bundle_location`` untouched, so a clone minted before the
+        # migration — whose template has since re-keyed to the bare-id form —
+        # is still keyed under ``ag_{bare_id}/`` and is otherwise invisible.
+        prefixes = {f"{source_agent_id}/", f"ag_{source_agent_id}/"}
+        if previous_bundle_location is not None and "/" in previous_bundle_location:
+            prefixes.add(f"{previous_bundle_location.rsplit('/', 1)[0]}/")
+        with self._session("repoint_stale_session_agent_clones") as session:
+            prefix_match = or_(
+                *(SqlAgent.bundle_location.startswith(p, autoescape=True) for p in prefixes)
+            )
+            candidates = session.execute(
+                select(SqlAgent.id, SqlAgent.bundle_location).where(
+                    SqlAgent.workspace_id == current_workspace_id(),
+                    SqlAgent.kind == encode_agent_kind("session"),
+                    prefix_match,
+                )
+            ).all()
+            now = now_epoch()
+            evict: builtins.list[str] = []
+            for agent_id, seen_location in candidates:
+                if seen_location == bundle_location:
+                    # Already current — possibly repointed by another replica
+                    # while this process's cache still holds the old spec.
+                    evict.append(agent_id)
+                    continue
+                # Conditional atomic repoint: the WHERE re-asserts the exact
+                # location observed above, so a customization committed
+                # between the SELECT and this UPDATE (which re-keys the
+                # bundle under the clone's own id) makes rowcount 0 and the
+                # clone stays pinned to the user's customized bundle.
+                result = cast(
+                    CursorResult[tuple[object]],
+                    session.execute(
+                        sql_update(SqlAgent)
+                        .where(
+                            SqlAgent.workspace_id == current_workspace_id(),
+                            SqlAgent.id == agent_id,
+                            SqlAgent.kind == encode_agent_kind("session"),
+                            SqlAgent.bundle_location == seen_location,
+                        )
+                        .values(
+                            bundle_location=bundle_location,
+                            version=SqlAgent.version + 1,
+                            updated_at=now,
+                        )
+                    ),
+                )
+                if result.rowcount == 1:
+                    evict.append(agent_id)
+            return evict
 
     def delete(self, agent_id: str) -> bool:
         """
