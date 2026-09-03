@@ -26,6 +26,7 @@ from omnigent.onboarding.sandboxes.base import (
     render_host_config_write_command,
 )
 from omnigent.onboarding.sandboxes.blaxel import managed_token_ttl_s as blaxel_managed_token_ttl_s
+from omnigent.onboarding.sandboxes.databricks_sandbox import DatabricksSandboxLauncher
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
 from omnigent.onboarding.sandboxes.registry import (
     COMMUNITY_MODULE_PREFIX,
@@ -37,6 +38,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.managed_hosts import (
     BOXLITE_MANAGED_TOKEN_TTL_S,
+    DATABRICKS_MANAGED_TOKEN_TTL_S,
     DAYTONA_MANAGED_TOKEN_TTL_S,
     ISLO_MANAGED_TOKEN_TTL_S,
     KUBERNETES_MANAGED_TOKEN_TTL_S,
@@ -278,6 +280,60 @@ def test_parse_daytona_without_section_defaults(
     assert cfg.launcher_factory() is fake
     assert fake.image is None
     assert fake.env is None
+
+
+def test_parse_valid_databricks_config_builds_parameterized_factory() -> None:
+    """Databricks YAML settings reach the public-CLI launcher unchanged."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "databricks",
+            "server_url": "https://srv.example.com/",
+            "databricks": {
+                "cli_path": "/opt/databricks/bin/databricks",
+                "profile": "sandbox-sp",
+                "idle_timeout": "4h",
+                "no_autostop": False,
+            },
+        }
+    )
+    assert cfg is not None
+    cfg = cfg.default
+    assert cfg.server_url == "https://srv.example.com"
+    assert cfg.token_ttl_s == DATABRICKS_MANAGED_TOKEN_TTL_S
+    assert cfg.managed_launch_supported is True
+    assert cfg.provider == "databricks"
+
+    launcher = cfg.launcher_factory()
+    assert isinstance(launcher, DatabricksSandboxLauncher)
+    assert launcher.provider == "databricks"
+    assert launcher._cli_path == "/opt/databricks/bin/databricks"
+    assert launcher._profile == "sandbox-sp"
+    assert launcher._idle_timeout == "4h"
+    assert launcher._no_autostop is False
+
+
+def test_parse_databricks_without_section_uses_launcher_defaults() -> None:
+    """Provider plus server URL is a complete Databricks configuration."""
+    cfg = parse_sandbox_config({"provider": "databricks", "server_url": "https://srv.example.com"})
+    assert cfg is not None
+    launcher = cfg.default.launcher_factory()
+    assert isinstance(launcher, DatabricksSandboxLauncher)
+    assert launcher._cli_path == "databricks"
+    assert launcher._profile is None
+    assert launcher._idle_timeout is None
+    assert launcher._no_autostop is True
+
+
+def test_parse_databricks_rejects_unknown_settings() -> None:
+    """Typos in the provider block fail instead of being silently ignored."""
+    with pytest.raises(ValueError, match="unknown key"):
+        parse_sandbox_config(
+            {
+                "provider": "databricks",
+                "server_url": "https://srv.example.com",
+                "databricks": {"workspace": "wrong-layer"},
+            }
+        )
 
 
 def test_parse_valid_blaxel_config_builds_parameterized_factory(

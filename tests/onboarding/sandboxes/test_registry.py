@@ -68,6 +68,7 @@ def test_plugin_state_loads_builtins() -> None:
     assert isinstance(state, SandboxProviderPluginState)
     assert "modal" in state
     assert "blaxel" in state
+    assert "databricks" in state
     assert "kubernetes" in state
 
 
@@ -94,6 +95,7 @@ def test_available_providers_returns_builtins() -> None:
     names = available_providers()
     assert "modal" in names
     assert "blaxel" in names
+    assert "databricks" in names
     assert "kubernetes" in names
 
 
@@ -124,6 +126,13 @@ def test_instantiate_loads_blaxel_without_optional_sdk() -> None:
     reset_plugin_state_for_tests()
     launcher = instantiate("blaxel")
     assert launcher.provider == "blaxel"
+
+
+def test_instantiate_loads_databricks_without_optional_sdk() -> None:
+    """The Databricks launcher uses only the public CLI and core dependencies."""
+    reset_plugin_state_for_tests()
+    launcher = instantiate("databricks")
+    assert launcher.provider == "databricks"
 
 
 def test_instantiate_unknown_raises() -> None:
