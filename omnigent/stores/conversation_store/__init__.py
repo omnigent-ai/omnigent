@@ -1502,6 +1502,7 @@ class ConversationStore(ABC):
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
         project_id: str | None = None,
+        host_id: str | None = None,
     ) -> CreatedSession:
         """
         Atomically create a session and its session-scoped agent.
@@ -1540,6 +1541,9 @@ class ConversationStore(ABC):
         :param runner_id: Optional runner binding to persist at
             creation time, e.g. ``"runner_abc123"``. Child sessions
             inherit the parent's binding through this field.
+        :param host_id: Optional external host the session binds to,
+            e.g. ``"host_a1b2c3d4..."``. Requires a non-``None``
+            ``workspace``. ``None`` leaves the session unbound.
         :returns: The committed conversation and agent entities.
         :raises ConversationNotFoundError: If
             ``parent_conversation_id`` is set but no such

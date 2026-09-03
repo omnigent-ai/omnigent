@@ -316,6 +316,7 @@ def _new_session_metadata_row(
     workspace: str | None = None,
     terminal_launch_args: list[str] | None = None,
     project_id: str | None = None,
+    host_id: str | None = None,
 ) -> SqlConversationMetadata:
     """
     Build the Omnigent metadata row paired with a new session conversation.
@@ -329,6 +330,10 @@ def _new_session_metadata_row(
     :param terminal_launch_args: Optional pass-through CLI args for a
         native terminal wrapper. ``None`` leaves it NULL; a list
         (including ``[]``) is JSON-encoded.
+    :param host_id: Optional external host the session binds to. Callers
+        must supply ``workspace`` alongside it (the
+        ``workspace_required_for_host`` check constraint enforces the
+        pairing). ``None`` leaves the column NULL.
     :returns: Unsaved :class:`SqlConversationMetadata` row.
     """
     return SqlConversationMetadata(
@@ -336,6 +341,7 @@ def _new_session_metadata_row(
         kind=encode_conversation_kind("sub_agent" if parent_conversation_id else "default"),
         runner_id=runner_id,
         project_id=project_id,
+        host_id=host_id,
         workspace=workspace,
         terminal_launch_args=(
             json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
@@ -3370,6 +3376,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
         project_id: str | None = None,
+        host_id: str | None = None,
     ) -> CreatedSession:
         """
         Atomically insert a conversation row and session-scoped agent.
@@ -3401,10 +3408,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``"/Users/corey/projects/myapp"``. CLI-launched
             sessions populate this with ``os.getcwd()``;
             multipart bundle uploads from the Web UI may pass
-            ``None``. ``None`` is allowed because this path
-            doesn't set ``host_id`` (so the
+            ``None`` — but only when ``host_id`` is also unset (the
             ``ck_conversations_workspace_required_for_host``
-            constraint isn't active).
+            constraint requires the pair).
         :param terminal_launch_args: Optional pass-through CLI args
             for a native terminal wrapper (claude / codex), e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves
@@ -3418,6 +3424,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             creation time, e.g. ``"runner_abc123"``. Child sessions
             inherit the parent's binding through this field so
             runner dispatch remains explicit in store state.
+        :param host_id: Optional external host the session binds to,
+            e.g. ``"host_a1b2c3d4..."``. Persisted at creation so a
+            bundled create with a caller-supplied host can launch a
+            runner on it, mirroring the JSON create path. Requires a
+            non-``None`` ``workspace``.
         :returns: A :class:`CreatedSession` with both entities.
         :raises ConversationNotFoundError: If
             ``parent_conversation_id`` is set but no such
@@ -3437,6 +3448,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             parent_conversation_id=parent_conversation_id,
             runner_id=runner_id,
             project_id=project_id,
+            host_id=host_id,
         )
 
     def _create_session_with_agent_with_id(
@@ -3455,6 +3467,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
         project_id: str | None = None,
+        host_id: str | None = None,
     ) -> CreatedSession:
         """Body of :meth:`create_session_with_agent` under a caller-supplied
         ``conversation_id``. The public method generates a fresh id; this seam
@@ -3505,6 +3518,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             project_id=project_id,
             workspace=workspace,
             terminal_launch_args=terminal_launch_args,
+            host_id=host_id,
         )
         with self._session("create_session_with_agent") as session:
             session.add(agent_row)

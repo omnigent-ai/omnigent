@@ -69,10 +69,12 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
+    local_single_user_enabled,
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
 )
+from omnigent.server.bundles import validate_agent_bundle
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
@@ -328,6 +330,126 @@ def register_core_routes(
         _managed_launch_tasks.add(launch_task)
         launch_task.add_done_callback(_managed_launch_tasks.discard)
 
+    async def _bind_and_launch_on_caller_host(
+        request: Request,
+        *,
+        user_id: str | None,
+        session_id: str,
+        host_id: str,
+        workspace: str | None,
+        harness: str | None,
+    ) -> tuple[str, bool] | None:
+        """
+        Bind a just-created session to a caller-supplied host and launch.
+
+        Shared by both create forms of ``POST /v1/sessions``: the JSON
+        path and the multipart bundle path, so a bundled create with
+        ``metadata.host_id`` launches a runner exactly like the JSON
+        create does. Authorizes via ``resolve_host_launch`` (caller must
+        own the host AND the session — same path as
+        ``POST /v1/hosts/{host_id}/runners``), atomically sets
+        ``runner_id`` (WHERE runner_id IS NULL closes the TOCTOU), then
+        sends the ``host.launch_runner`` frame and waits for the host's
+        verdict.
+
+        Lenient on every launch failure: the picker's readiness data can
+        be stale (the user may have run ``omnigent setup`` since the host
+        last connected), so the create is never blocked. The session
+        keeps the binding; the first message drives the real runner
+        start, and if the host still refuses there, that path consults
+        the daemon and persists a transcript error (see post_event's
+        relaunch branch). No create-time harness gating.
+
+        :param request: The create request (for ``app.state`` lookups).
+        :param user_id: Authenticated caller, or ``None`` when auth is
+            disabled.
+        :param session_id: The newly-created session id, whose row
+            already carries ``host_id`` and ``workspace``.
+        :param host_id: The caller-supplied host to launch on.
+        :param workspace: The session's persisted workspace. ``None``
+            is impossible for a schema-valid row (the check constraint
+            requires it with ``host_id``) and raises.
+        :param harness: Canonical harness for the host-side
+            configuration check, or ``None`` to skip it.
+        :returns: ``(runner_id, launch_failed)`` after the bind, or
+            ``None`` when the server has no host registry/store wired
+            (minimal test wirings — nothing was attempted).
+        :raises OmnigentError: ``CONFLICT`` when a runner is already
+            bound; ``INTERNAL_ERROR`` on a NULL workspace.
+        :raises HTTPException: 403/404 from ``resolve_host_launch``.
+        """
+        host_registry = getattr(request.app.state, "host_registry", None)
+        host_store_inst = getattr(request.app.state, "host_store", None)
+        if host_registry is None or host_store_inst is None:
+            return None
+        from omnigent.host.frames import (
+            HostLaunchRunnerFrame,
+            encode_host_frame,
+        )
+        from omnigent.runner.identity import token_bound_runner_id
+        from omnigent.server.routes._host_launch import resolve_host_launch
+
+        target = await asyncio.to_thread(
+            resolve_host_launch,
+            user_id=user_id,
+            host_id=host_id,
+            session_id=session_id,
+            host_store=host_store_inst,
+            host_registry=host_registry,
+            conversation_store=conversation_store,
+            permission_store=permission_store,
+        )
+        conn = target.conn
+        binding_token = secrets.token_urlsafe(32)
+        runner_id = token_bound_runner_id(binding_token)
+        # Atomic bind (WHERE runner_id IS NULL) closes the TOCTOU.
+        bound = await asyncio.to_thread(
+            conversation_store.set_runner_id,
+            session_id,
+            runner_id,
+        )
+        if not bound:
+            raise OmnigentError(
+                f"Session {session_id!r} already has a runner bound",
+                code=ErrorCode.CONFLICT,
+            )
+        request_id = secrets.token_hex(8)
+        future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
+        conn.pending_launches[request_id] = future
+        if workspace is None:  # pragma: no cover — schema guards
+            raise OmnigentError(
+                "session has host_id but no workspace; "
+                "schema constraint should have prevented this",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        launch_frame = encode_host_frame(
+            HostLaunchRunnerFrame(
+                request_id=request_id,
+                binding_token=binding_token,
+                workspace=workspace,
+                session_id=session_id,
+                # Lets the host refuse an unconfigured harness before
+                # spawning. None (agent not resolvable) skips the
+                # host-side check.
+                harness=harness,
+            )
+        )
+        host_registry.send_text(conn, launch_frame)
+        try:
+            launch_result = await asyncio.wait_for(future, timeout=30.0)
+        except asyncio.TimeoutError:
+            conn.pending_launches.pop(request_id, None)
+            launch_result = {"status": "failed", "error": "host launch timed out"}
+        launch_failed = launch_result.get("status") == "failed"
+        if launch_failed:
+            _logger.warning(
+                "Host %s failed to launch runner for session %s: %s",
+                host_id,
+                session_id,
+                launch_result.get("error"),
+            )
+        return runner_id, launch_failed
+
     @router.post(
         "/sessions",
         status_code=201,
@@ -527,96 +649,25 @@ def register_core_routes(
         # own the host AND the session), atomically bind, then launch.
         # Same authorization path as POST /v1/hosts/{host_id}/runners.
         if launch_host_id is not None and resp.runner_id is None:
-            host_registry = getattr(request.app.state, "host_registry", None)
-            host_store_inst = getattr(request.app.state, "host_store", None)
-            if host_registry is not None and host_store_inst is not None:
-                from omnigent.host.frames import (
-                    HostLaunchRunnerFrame,
-                    encode_host_frame,
-                )
-                from omnigent.runner.identity import token_bound_runner_id
-                from omnigent.server.routes._host_launch import resolve_host_launch
-
-                target = await asyncio.to_thread(
-                    resolve_host_launch,
-                    user_id=user_id,
-                    host_id=launch_host_id,
-                    session_id=resp.id,
-                    host_store=host_store_inst,
-                    host_registry=host_registry,
-                    conversation_store=conversation_store,
-                    permission_store=permission_store,
-                )
-                conn = target.conn
-                binding_token = secrets.token_urlsafe(32)
-                runner_id = token_bound_runner_id(binding_token)
-                # Atomic bind (WHERE runner_id IS NULL) closes the TOCTOU.
-                bound = await asyncio.to_thread(
-                    conversation_store.set_runner_id,
-                    resp.id,
-                    runner_id,
-                )
-                if not bound:
-                    raise OmnigentError(
-                        f"Session {resp.id!r} already has a runner bound",
-                        code=ErrorCode.CONFLICT,
-                    )
-                # host_id and workspace were already written by
-                # _create_session_from_existing_agent; we only need
-                # to set runner_id atomically (above) and send the
-                # launch frame.
-                request_id = secrets.token_hex(8)
-                future: asyncio.Future[dict[str, str | None]] = (
-                    asyncio.get_running_loop().create_future()
-                )
-                conn.pending_launches[request_id] = future
-                if resp.workspace is None:  # pragma: no cover — schema guards
-                    raise OmnigentError(
-                        "session has host_id but no workspace; "
-                        "schema constraint should have prevented this",
-                        code=ErrorCode.INTERNAL_ERROR,
-                    )
-                launch_frame = encode_host_frame(
-                    HostLaunchRunnerFrame(
-                        request_id=request_id,
-                        binding_token=binding_token,
-                        workspace=resp.workspace,
-                        session_id=resp.id,
-                        # Already canonical (see _resolve_harness); lets
-                        # the host refuse an unconfigured harness before
-                        # spawning. None (agent not resolvable) skips the
-                        # host-side check.
-                        harness=resp.harness,
-                    )
-                )
-                host_registry.send_text(conn, launch_frame)
-                try:
-                    launch_result = await asyncio.wait_for(future, timeout=30.0)
-                except asyncio.TimeoutError:
-                    conn.pending_launches.pop(request_id, None)
-                    launch_result = {"status": "failed", "error": "host launch timed out"}
-                if launch_result.get("status") == "failed":
-                    # Lenient on every create-time launch failure, including
-                    # an unconfigured harness: the picker's readiness data
-                    # can be stale (the user may have run `omnigent setup`
-                    # since the host last connected), so we never block the
-                    # create. The session opens with the binding intact; the
-                    # first message drives the real runner start, and if the
-                    # host still refuses there, that path consults the daemon
-                    # and persists a transcript error (see post_event's
-                    # relaunch branch). No create-time harness gating.
-                    _logger.warning(
-                        "Host %s failed to launch runner for session %s: %s",
-                        launch_host_id,
-                        resp.id,
-                        launch_result.get("error"),
-                    )
+            launched = await _bind_and_launch_on_caller_host(
+                request,
+                user_id=user_id,
+                session_id=resp.id,
+                host_id=launch_host_id,
+                # Already written by _create_session_from_existing_agent;
+                # only runner_id still needs the atomic set inside.
+                workspace=resp.workspace,
+                # Already canonical (see _resolve_harness).
+                harness=resp.harness,
+            )
+            if launched is not None:
+                runner_id, launch_failed = launched
+                if launch_failed and _terminal_first_create:
                     # The runner never booted, so its pending=False clear
                     # will never fire. Clear the spin-up flag here so a
                     # failed launch doesn't strand the Terminal-pill
                     # spinner. No-op when we never set it.
-                    if _terminal_first_create:
-                        _publish_terminal_pending(resp.id, False)
+                    _publish_terminal_pending(resp.id, False)
                 resp.runner_id = runner_id
                 resp.host_id = launch_host_id
 
@@ -692,6 +743,36 @@ def register_core_routes(
             )
 
         bundle_bytes = await bundle.read()
+        # Validate the bundle BEFORE any row exists: the external-host
+        # branch below needs the spec's os_env.cwd for workspace
+        # validation, and _create_session_from_bundle reuses the parsed
+        # spec so the tarball isn't extracted twice.
+        spec = await asyncio.to_thread(
+            validate_agent_bundle,
+            bundle_bytes,
+            enforce_handler_allowlist=not local_single_user_enabled(),
+        )
+
+        # Caller-supplied external host: validate the workspace against
+        # the uploaded spec's os_env boundary BEFORE creating the row
+        # (mirroring the JSON path — a bad workspace never produces a
+        # session) and persist the canonical path the host returned.
+        if parsed_metadata.host_id is not None:
+            from omnigent.server.routes._session_create_validation import (
+                validate_uploaded_bundle_host_workspace,
+            )
+
+            os_env = getattr(spec, "os_env", None)
+            canonical_workspace = await validate_uploaded_bundle_host_workspace(
+                user_id=user_id,
+                host_id=parsed_metadata.host_id,
+                workspace=parsed_metadata.workspace,
+                spec_cwd=getattr(os_env, "cwd", None) if os_env is not None else None,
+                host_store=getattr(request.app.state, "host_store", None),
+                host_registry=getattr(request.app.state, "host_registry", None),
+            )
+            parsed_metadata = parsed_metadata.model_copy(update={"workspace": canonical_workspace})
+
         result = await asyncio.to_thread(
             _create_session_from_bundle,
             conversation_store,
@@ -699,6 +780,7 @@ def register_core_routes(
             parsed_metadata,
             bundle_bytes,
             inherited_runner_id,
+            spec,
         )
         # Top-level creates (no inherited runner) skip the notify —
         # their runner registers itself later.
@@ -733,6 +815,25 @@ def register_core_routes(
                 user_id=user_id,
                 sandbox_provider=parsed_metadata.sandbox_provider,
                 workspace=parsed_metadata.workspace,
+            )
+        # Caller-supplied external host: bind + launch a runner on it,
+        # exactly like the JSON create form (same authorization, atomic
+        # bind, and lenient launch-failure semantics — the ownership
+        # grant above is what resolve_host_launch's session-owner check
+        # sees). A sub-agent child (inherited runner) is never launched
+        # here — it co-locates on the parent's runner.
+        if parsed_metadata.host_id is not None and inherited_runner_id is None:
+            from omnigent.harness_aliases import canonicalize_harness
+            from omnigent.model_catalog import spec_harness
+
+            raw_harness = spec_harness(spec)
+            await _bind_and_launch_on_caller_host(
+                request,
+                user_id=user_id,
+                session_id=result.session_id,
+                host_id=parsed_metadata.host_id,
+                workspace=parsed_metadata.workspace,
+                harness=canonicalize_harness(raw_harness) or raw_harness,
             )
         return result, project_resolution.warnings
 
