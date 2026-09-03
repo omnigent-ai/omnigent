@@ -1466,14 +1466,18 @@ def create_app(
     # policy config, permission_hook.json) leaked by a prior runner that died
     # without running the explicit delete path. Dynamic across all native
     # harnesses — see native_bridge_common.reap_orphaned_native_bridge_dirs.
-    from omnigent.native_bridge_common import reap_orphaned_native_bridge_dirs
+    # Best-effort: a sweep failure must never crash runner startup.
+    try:
+        from omnigent.native_bridge_common import reap_orphaned_native_bridge_dirs
 
-    _reaped_bridge_dirs = reap_orphaned_native_bridge_dirs()
-    if _reaped_bridge_dirs:
-        _logger.info(
-            "Reaped %d orphaned native bridge dir(s) from prior runs",
-            _reaped_bridge_dirs,
-        )
+        _reaped_bridge_dirs = reap_orphaned_native_bridge_dirs()
+        if _reaped_bridge_dirs:
+            _logger.info(
+                "Reaped %d orphaned native bridge dir(s) from prior runs",
+                _reaped_bridge_dirs,
+            )
+    except Exception:  # noqa: BLE001 — housekeeping must never block startup
+        _logger.debug("native bridge-dir orphan sweep failed", exc_info=True)
 
     # Reuse the tunnel binding token for runner-side request auth.
     # The same secret is already shared between the

@@ -1,7 +1,7 @@
 """Shared owner-pid marker + orphan prune for native-harness bridge dirs.
 
-Each native coding-agent harness (claude / codex / antigravity / opencode)
-keeps a per-session bridge directory under its own bridge root holding the
+Each native coding-agent harness (claude / codex / antigravity / opencode /
+pi) keeps a per-session bridge directory under its own bridge root holding the
 ``bridge.json`` token, MCP/policy config, and ``permission_hook.json``. When a
 launcher crashes or a session is abandoned, that directory is left behind and
 accumulates — each one holds bearer-token / auth material.
@@ -11,7 +11,7 @@ process that prepared it. The marker is refreshed on every turn's bridge prep,
 so it always names the *current* runner; a periodic startup sweep removes dirs
 whose owner is provably dead while leaving live and unmarked dirs untouched.
 
-This module factors the marker write and the per-root sweep so all four
+This module factors the marker write and the per-root sweep so all five
 harnesses share one implementation (the per-harness modules only supply their
 own bridge root), plus a dynamic cross-harness reaper for the runner to call at
 startup. It mirrors the terminal orphan sweep
@@ -27,8 +27,6 @@ import logging
 import os
 import shutil
 from pathlib import Path
-
-from omnigent.inner.terminal import _process_alive as _owner_pid_alive
 
 _logger = logging.getLogger(__name__)
 
@@ -83,6 +81,8 @@ def prune_orphaned_dirs(bridge_root: Path) -> int:
             pid = int(marker.read_text(encoding="utf-8").strip())
         except (OSError, ValueError):
             continue
+        from omnigent.inner.terminal import _process_alive as _owner_pid_alive
+
         if _owner_pid_alive(pid):
             continue
         # Accepted residual race: the owner pid could in principle be reused
