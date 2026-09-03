@@ -26,16 +26,14 @@ demand counts GitHub `+1` reactions only, not all reaction types.
 
 ## New-issue grading
 
-When `ISSUE_PRIORITIZATION_V2_ENABLED=true`, the Issue Triage workflow sends each
-new non-bot issue, including maintainer-authored issues, through V2 only. V2
-classifies and prioritizes the issue, completes one-time intake, and uploads a
-30-day decision artifact. Setting the switch to `false` restores the untouched
-legacy intake as a rollback path.
+The Issue Triage workflow sends each new non-bot issue, including
+maintainer-authored issues, through V2. V2 classifies and prioritizes the issue,
+completes one-time intake, and uploads a 30-day decision artifact.
 Legacy `severity:S*` labels are removed instead of replaced with another label.
 The periodic Databricks job remains responsible for
 the complete ranking and dashboard; the issue-open path does not wait for it.
 
-Configure these repository settings before enabling the switch:
+Configure these repository settings:
 
 | Setting | Kind | Purpose |
 | --- | --- | --- |
@@ -43,11 +41,9 @@ Configure these repository settings before enabling the switch:
 | `DATABRICKS_CLIENT_ID` | Secret | OAuth service-principal client ID. |
 | `DATABRICKS_CLIENT_SECRET` | Secret | OAuth service-principal secret. |
 | `ISSUE_PRIORITIZATION_V2_MODEL_ENDPOINT` | Variable | Endpoint name, such as `databricks-gpt-5-6-luna`. |
-| `ISSUE_PRIORITIZATION_V2_ENABLED` | Variable | Set to `true` only after the other settings are ready. |
 
 The service principal needs `CAN QUERY` on the endpoint. GitHub supplies the
-issue-write token automatically; no GitHub PAT is stored in Actions. Enable v2
-last:
+issue-write token automatically; no GitHub PAT is stored in Actions:
 
 ```bash
 gh secret set DATABRICKS_HOST --repo omnigent-ai/omnigent
@@ -55,8 +51,6 @@ gh secret set DATABRICKS_CLIENT_ID --repo omnigent-ai/omnigent
 gh secret set DATABRICKS_CLIENT_SECRET --repo omnigent-ai/omnigent
 gh variable set ISSUE_PRIORITIZATION_V2_MODEL_ENDPOINT \
   --repo omnigent-ai/omnigent --body databricks-gpt-5-6-luna
-gh variable set ISSUE_PRIORITIZATION_V2_ENABLED \
-  --repo omnigent-ai/omnigent --body true
 ```
 
 For a no-write check, export the same Databricks credentials plus
@@ -260,11 +254,10 @@ Keep the write variable false until a dry-run's `ranking.*` and
 `mutations.json` artifacts have been reviewed. Apply mode also creates any
 missing labels declared in `.github/issue-prioritization-labels.json`.
 
-The same repository switch stops legacy intake from writing priority or
-component labels. New-issue v2 becomes their owner, and Databricks runs remain
-available for ranking and backfills. Event ownership is recorded in
-`event.json`, but periodic apply runs preserve those labels until an artifact
-importer shares that ownership with `issue_bot_state`.
+New-issue V2 owns priority and component labels, while Databricks runs remain
+available for ranking and backfills. Event ownership is recorded in `event.json`,
+but periodic apply runs preserve those labels until an artifact importer shares
+that ownership with `issue_bot_state`.
 
 ## Tests
 

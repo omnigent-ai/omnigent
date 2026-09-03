@@ -2,7 +2,7 @@ name: Security Alert Triage
 
 # Scheduled AI triage of open Dependabot + CodeQL alerts via Omnigent.
 #
-# Architecture (prompt-injection resistant — same model as issue-triage.yml):
+# Architecture (prompt-injection resistant — same trust boundary as issue triage):
 #   1. TRUSTED steps fetch the open alerts via `gh api`.
 #   2. The LLM agent classifies each alert with NO shell/tool access — it
 #      outputs structured JSON only and never sees any GitHub token.

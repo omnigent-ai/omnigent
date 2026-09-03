@@ -19,7 +19,7 @@ findings are never auto-fixed — only triaged.
 ## How the triage cron decides
 
 The cron (`.github/workflows/security-triage.yml`) follows the same
-injection-resistant model as `issue-triage.yml`: trusted steps fetch alerts and
+injection-resistant trust boundary as issue triage: trusted steps fetch alerts and
 apply mutations; the LLM (`.github/triage/security/`) runs with **no tools, no
 shell, no token** and only emits validated JSON.
 

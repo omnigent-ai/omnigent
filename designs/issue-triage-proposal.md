@@ -52,7 +52,7 @@ Triggered on every new issue. The bot classifies, deduplicates, resolves what it
 - Close issues unless they are validated high-confidence duplicates
 - Re-triage after initial classification (maintainers can override freely)
 
-**Tool:** `omnigent run .github/triage/` via GitHub Actions workflow, triggered `on: issues: [opened]`. The triage agent is a tool-less Claude SDK harness that outputs structured JSON; all GitHub mutations (labeling, assignment, comments) happen in trusted workflow steps that validate against allowlists. LLM credentials route through the Databricks gateway (`LLM_API_KEY` + `GATEWAY_BASE_URL`). Permissions: `issues: write` only.
+**Tool:** `issue-priority-event` via GitHub Actions, triggered on issue opens and edits. The classifier calls a Databricks model serving endpoint and outputs structured JSON; trusted Python validates all labels, assignments, comments, and closures. Permissions: `issues: write` only.
 
 **Most issues never need a maintainer.** The bot + lifecycle automation resolves them:
 
@@ -104,11 +104,11 @@ The bot posts exactly one duplicate-check comment on every new issue. The commen
 
 **Why:** Authors need to understand automated closure decisions and benefit from discovering related work even when the match is uncertain. Keeping the response short, templated, and limited to duplicate detection avoids the verbose, speculative behavior that caused backlash against bots such as Dosu ([discussion #25153](https://github.com/langchain-ai/langchain/discussions/25153)).
 
-### Decision: Omnigent triage agent over `claude-code-action`
+### Decision: Trusted V2 classifier over `claude-code-action`
 
-Use `omnigent run .github/triage/` as the triage engine — a tool-less Claude SDK harness that outputs structured JSON, with all GitHub mutations in trusted workflow steps.
+Use the V2 classifier as the triage engine. It outputs structured JSON, with all GitHub mutations in trusted code.
 
-**Why:** `claude-code-action` requires a direct Anthropic API key (`ANTHROPIC_API_KEY`), which we don't have — our LLM access routes through the Databricks gateway. More critically, `claude-code-action` gives the LLM shell access and a GitHub token, creating a prompt injection → secret exfiltration attack surface (a crafted issue body could trick the agent into running `printenv` → `gh issue comment`). The Omnigent approach eliminates this structurally: the LLM has no tools, no shell, and no `GH_TOKEN` — it only outputs JSON that is validated against allowlists before any GitHub mutation occurs.
+**Why:** `claude-code-action` gives the LLM shell access and a GitHub token, creating a prompt injection → secret exfiltration attack surface. V2 sends only the classification prompt to model serving; GitHub credentials remain inside trusted code, and model output is validated before any mutation occurs.
 
 **Alternatives considered:**
 

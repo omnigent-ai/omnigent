@@ -39,7 +39,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           CLOSE_ENABLED: ${{ vars.ISSUE_TRIAGE_CLOSE_NEEDS_INFO || 'false' }}
-          V2_ENABLED: ${{ vars.ISSUE_PRIORITIZATION_V2_ENABLED || 'false' }}
           MANUAL_APPLY: ${{ inputs.apply || false }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
@@ -47,10 +46,6 @@ jobs:
           args=()
           if { [ "$EVENT_NAME" = "schedule" ] && [ "$CLOSE_ENABLED" = "true" ]; } || \
              [ "$MANUAL_APPLY" = "true" ]; then
-            if [ "$V2_ENABLED" != "true" ]; then
-              echo "::error::Expiry apply requires ISSUE_PRIORITIZATION_V2_ENABLED=true"
-              exit 1
-            fi
             args+=(--apply)
           fi
           uv run --frozen --project .github/triage_v2 issue-needs-info-expiry \

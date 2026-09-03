@@ -383,7 +383,7 @@ dropdowns (cheap for the reporter, better signal than free text):
 Nothing here is built yet except the `areas.json` weights (+ test). Action items,
 each its own PR:
 
-- [ ] **Tune the classifier prompt** (`.github/triage/config.yaml`) — S0–S3 rubric,
+- [ ] **Tune the classifier prompt** (`.github/triage_v2/src/issue_prioritization/classification_prompt.txt`) — S0–S3 rubric,
   FRs graded, tier-1 nudge, P0 list; emit + **persist** `severity`, `component`,
   `sub_area` (persisted severity is what keeps re-scoring deterministic).
 - [ ] **Create the cron job** — scheduled Databricks notebook: read
