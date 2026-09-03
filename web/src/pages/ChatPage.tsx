@@ -92,7 +92,7 @@ import type { NativeModelOption, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
-import type { MessageContentBlock } from "@/lib/blocks";
+import type { AnyBlock, MessageContentBlock } from "@/lib/blocks";
 import { ELICITATION_RESPONSE_PREFIX } from "@/lib/blocks";
 import {
   derivePermissionLevel,
@@ -1008,6 +1008,14 @@ export function ChatPage() {
     [blocks],
   );
 
+  // A rendered runner-disconnect card also suppresses the shimmer: the two
+  // are contradictory ("the turn was interrupted" vs "still working"). See
+  // computeShowsWorking for why the status alone can't resolve this.
+  const hasRunnerDisconnectError = useMemo(
+    () => hasCurrentRunnerDisconnectError(blocks, activeResponse?.responseId ?? null),
+    [blocks, activeResponse],
+  );
+
   // Single-session snapshot (shared cache with chatStore.bindStream).
   // Must be declared BEFORE the early-return guards below — otherwise
   // the hook is skipped on renders that hit the loading/error branches,
@@ -1065,6 +1073,7 @@ export function ChatPage() {
     // flag (``isStartingUp`` in Sidebar.tsx), so the two agreed only once the
     // server confirmed; now they agree immediately.
     localSendInFlight: status === "streaming" && !spinUpInFlight,
+    hasRunnerDisconnectError,
   });
 
   // A fork of a coding session carries the source id in this label (set by
@@ -5717,6 +5726,41 @@ export function computeIsWorking(sessionStatus: SessionStatus): boolean {
 }
 
 /**
+ * Whether a *current* runner-disconnect error card is rendered — one that
+ * contradicts the working indicator and must suppress it.
+ *
+ * "Current" means the card belongs to the active streaming response (the
+ * relay persists the interrupted turn's ``response_id`` on the error item,
+ * and the grace-window snapshot re-opens that same response — so they match
+ * in the race this guards). With no response open, a trailing card is current
+ * — the newest thing in the transcript. A historical disconnect card from an
+ * earlier turn must NOT suppress a later, genuinely live turn: the
+ * `session_status` handler drops stale cards on the next live edge, but a
+ * cold open mid-turn may hydrate old cards with no further edge in sight, so
+ * response scoping is the safe gate.
+ *
+ * @param blocks - Rendered chat blocks, newest last.
+ * @param activeResponseId - The streaming response id, or ``null`` when no
+ *   response is open.
+ * @returns ``true`` when a current runner-disconnect card is rendered.
+ */
+export function hasCurrentRunnerDisconnectError(
+  blocks: AnyBlock[],
+  activeResponseId: string | null,
+): boolean {
+  if (activeResponseId !== null) {
+    return blocks.some(
+      (b) =>
+        b.type === "error" &&
+        b.code === "runner_disconnected" &&
+        b.ctx.responseId === activeResponseId,
+    );
+  }
+  const last = blocks[blocks.length - 1];
+  return last?.type === "error" && last.code === "runner_disconnected";
+}
+
+/**
  * Whether the main chat's display-only "Working…" indicator should light up.
  *
  * @param sessionStatus - The main session status, e.g. ``"running"``.
@@ -5742,6 +5786,16 @@ export function computeIsWorking(sessionStatus: SessionStatus): boolean {
  *   so without it the two disagree for the dispatch round-trip. Distinct from
  *   ``sessionStatus``, which mirrors the server: this one means "we asked", not
  *   "the agent is working".
+ * @param options.hasRunnerDisconnectError - A ``runner_disconnected`` error
+ *   card is rendered. The card and the shimmer are mutually exclusive: the
+ *   error says the turn was interrupted, so "Working…" alongside it reads as a
+ *   contradiction. Within the server's disconnect grace the reconnect snapshot
+ *   still reports ``running`` (the turn resumes if the runner returns in time),
+ *   so neither the status nor the local streaming flag (which the mid-turn
+ *   snapshot re-open also sets) can tell a live turn from an interrupted one —
+ *   the rendered card can. It wins unconditionally: the ``session_status``
+ *   handler drops the card on the next live (non-failed) edge, restoring the
+ *   shimmer the moment the runner proves it is actually working again.
  * @returns ``true`` when the main session's own status should render Working.
  */
 export function computeShowsWorking(
@@ -5751,9 +5805,11 @@ export function computeShowsWorking(
     runnerOnline: boolean | undefined;
     backgroundTaskCount?: number;
     localSendInFlight?: boolean;
+    hasRunnerDisconnectError?: boolean;
   },
 ): boolean {
   if (options.hasPendingElicitation) return false;
+  if (options.hasRunnerDisconnectError) return false;
   const isWorking = computeIsWorking(sessionStatus);
   // A running/waiting session is proof the runner is up, so a stale
   // poll-derived ``runnerOnline === false`` must not suppress it. Only gate on

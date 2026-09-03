@@ -89,7 +89,7 @@ def test_runner_disconnect_card_clears_when_the_runner_reports_a_live_status(
     """A ``runner_disconnected`` card disappears once the runner is live again.
 
     A server that closed a runner tunnel on its way down (a deploy) lit a
-    "connection to the host dropped" card; the runner never died, and its
+    runner-disconnected card; the runner never died, and its
     next status edge on reconnect proves it is reachable. That card is an
     observation, not a turn result, so a live (non-``failed``) status edge
     must remove it — the fix in the ``session_status`` handler. Other
@@ -118,7 +118,7 @@ def test_runner_disconnect_card_clears_when_the_runner_reports_a_live_status(
     pills = page.get_by_test_id("error-pill")
     expect(pills).to_have_count(2, timeout=15_000)
     disconnect_pill = page.get_by_test_id("error-pill").filter(
-        has_text="The connection to the host dropped unexpectedly"
+        has_text="The agent's process disconnected unexpectedly"
     )
     expect(disconnect_pill).to_have_count(1)
 

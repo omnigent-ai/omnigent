@@ -18,6 +18,7 @@ import {
   collectPendingElicitations,
   computeIsWorking,
   computeShowsWorking,
+  hasCurrentRunnerDisconnectError,
   containsMarkdownTable,
   dispatchInitialPrompt,
   isCostRoutingEligible,
@@ -953,6 +954,99 @@ describe("computeShowsWorking", () => {
     // The flag is opt-in: a cross-client or TUI-typed turn sets no local
     // status here, so an idle session with no send stays dark.
     expect(computeShowsWorking("idle", opts({ localSendInFlight: false }))).toBe(false);
+  });
+
+  it("a rendered runner-disconnect error suppresses the shimmer even while running", () => {
+    // In the server's disconnect-grace window the reconnect snapshot still
+    // reports `running` (the turn resumes if the runner comes back), so the
+    // status alone re-lights the shimmer next to the persisted
+    // runner_disconnected error card — a contradiction ("interrupted" vs
+    // "still working"). The rendered card must win.
+    expect(computeShowsWorking("running", opts({ hasRunnerDisconnectError: true }))).toBe(false);
+    expect(computeShowsWorking("waiting", opts({ hasRunnerDisconnectError: true }))).toBe(false);
+  });
+
+  it("a runner-disconnect error also suppresses a background-shell tally", () => {
+    // A stale card means the runner (and its shells) is unreachable; the
+    // tally must not keep the indicator lit over the error.
+    expect(
+      computeShowsWorking("idle", opts({ hasRunnerDisconnectError: true, backgroundTaskCount: 2 })),
+    ).toBe(false);
+  });
+
+  it("a runner-disconnect card wins over the local streaming flag", () => {
+    // `localSendInFlight` reads chatStore.status === "streaming", which the
+    // mid-turn snapshot re-open (cold bind / reconnect within the disconnect
+    // grace) also sets — so it can't distinguish a user's fresh send from the
+    // grace-window race. The card wins; the next live status edge drops it
+    // and relights the shimmer if work truly resumed.
+    expect(
+      computeShowsWorking(
+        "idle",
+        opts({ hasRunnerDisconnectError: true, localSendInFlight: true }),
+      ),
+    ).toBe(false);
+  });
+
+  it("no runner-disconnect error leaves the running shimmer lit", () => {
+    expect(computeShowsWorking("running", opts({ hasRunnerDisconnectError: false }))).toBe(true);
+  });
+});
+
+// ── hasCurrentRunnerDisconnectError ───────────────────────────────────────────
+
+describe("hasCurrentRunnerDisconnectError", () => {
+  const errorBlock = (code: string, responseId: string) =>
+    ({
+      type: "error",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId, itemId: null },
+      message: "boom",
+      source: "",
+      code,
+    }) as const;
+  const textBlock = (responseId: string) =>
+    ({
+      type: "assistant_message",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId, itemId: "i1" },
+      content: "hi",
+    }) as never;
+
+  it("a trailing runner-disconnect card is current when no response is open", () => {
+    // The card is the newest thing in the transcript — the grace-window
+    // race renders exactly this shape right after reconnect.
+    const blocks = [textBlock("r1"), errorBlock("runner_disconnected", "r2")];
+    expect(hasCurrentRunnerDisconnectError(blocks as never, null)).toBe(true);
+  });
+
+  it("a card on the active streaming response is current even mid-transcript", () => {
+    // The reconnect backfill can splice gap-committed items after the card.
+    const blocks = [errorBlock("runner_disconnected", "r2"), textBlock("r2")];
+    expect(hasCurrentRunnerDisconnectError(blocks as never, "r2")).toBe(true);
+  });
+
+  it("a historical card from an earlier turn does not suppress a later live turn", () => {
+    // Cold-open mid-turn: an old disconnect card hydrates from items, but the
+    // active response is a NEWER turn — the old card must not hide its shimmer.
+    const blocks = [errorBlock("runner_disconnected", "r1"), textBlock("r2")];
+    expect(hasCurrentRunnerDisconnectError(blocks as never, "r2")).toBe(false);
+    expect(hasCurrentRunnerDisconnectError(blocks as never, null)).toBe(false);
+  });
+
+  it("a historical TRAILING card does not suppress a newer active response", () => {
+    // Cold-open into a fresh running turn before any of its blocks commit:
+    // the old card is still last, but the active response is a different
+    // turn — the response scope wins over the trailing-position fallback.
+    const blocks = [textBlock("r1"), errorBlock("runner_disconnected", "r1")];
+    expect(hasCurrentRunnerDisconnectError(blocks as never, "r2")).toBe(false);
+  });
+
+  it("other error codes never suppress", () => {
+    const blocks = [errorBlock("required_terminal_exited", "r2")];
+    expect(hasCurrentRunnerDisconnectError(blocks as never, "r2")).toBe(false);
+  });
+
+  it("an empty transcript has no current card", () => {
+    expect(hasCurrentRunnerDisconnectError([], "r1")).toBe(false);
   });
 });
 

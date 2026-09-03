@@ -189,7 +189,9 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
     ),
     "terminal_launch_failed": "The agent's terminal couldn't be started on the host.",
     "runner_error": "Something went wrong setting up the turn on the host.",
-    "runner_disconnected": "The connection to the host dropped unexpectedly.",
+    # Deliberately does not blame the host: the runner can drop while the
+    # host stays online (and the UI's host badge then shows it connected).
+    "runner_disconnected": "The agent's process disconnected unexpectedly.",
     "connection_error": "The connection to the agent dropped mid-turn.",
     "context_length_exceeded": "The conversation grew past the model's context window.",
     "executor_error": "The agent runtime hit an error while running the turn.",

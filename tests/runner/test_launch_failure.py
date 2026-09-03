@@ -116,7 +116,7 @@ def test_command_path_is_matched_by_basename() -> None:
         ("required_terminal_exited", "terminal exited"),
         ("terminal_launch_failed", "couldn't be started"),
         ("runner_error", "setting up the turn"),
-        ("runner_disconnected", "host dropped"),
+        ("runner_disconnected", "process disconnected"),
         ("connection_error", "connection"),
         ("context_length_exceeded", "context window"),
     ],
