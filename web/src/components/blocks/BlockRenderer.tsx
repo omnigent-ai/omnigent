@@ -839,6 +839,8 @@ function renderItem(
           cause={item.cause}
           remediation={item.remediation}
           onRetry={onRetryError ? () => onRetryError(item) : undefined}
+          // The message stream renders inside the `@container/chat` pane.
+          fullBleed
         />
       );
     case "policy_denied":

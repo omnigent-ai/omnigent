@@ -3613,9 +3613,11 @@ function AssistantBubble({
   const hasElicitation = bubble.items.some((it) => it.kind === "elicitation");
   const isWide =
     hasElicitation || containsMarkdownTable(bubble.items) || containsDisplayMath(bubble.items);
-  // An error banner's dashed rule spans the full chat column: MessageContent
-  // is w-fit, so without w-full an error-only bubble shrink-wraps the 560px
-  // pill and the rule clips to it instead of reaching the column edges.
+  // The error banner full-bleeds to the conversation pane's edges via a
+  // container-relative breakout, which centers on its column. Keeping
+  // MessageContent w-full (it is otherwise w-fit) makes an error-only bubble
+  // fill the centered column instead of shrink-wrapping the 560px pill, so the
+  // breakout stays symmetric and the dashed rule reaches both pane edges.
   const hasError = bubble.items.some((it) => it.kind === "error");
   // A bubble carrying an error but no prose stands alone as a thread-level
   // element — the hover footer's timestamp/actions belong to assistant text,
@@ -3715,7 +3717,7 @@ function AssistantBubble({
           dropped host connection already carries its own error pill inside the
           bubble and leaves `bubble.error` null, so this stays hidden there. */}
       {bubble.lifecycle === "failed" && bubble.error && (
-        <ErrorBanner message={bubble.error} source="" code="" />
+        <ErrorBanner message={bubble.error} source="" code="" fullBleed />
       )}
     </>
   );
