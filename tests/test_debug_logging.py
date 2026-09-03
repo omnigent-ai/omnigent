@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 
 import pytest
 
@@ -33,6 +34,9 @@ def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
         dl.ENDPOINT_ENV_VAR,
         dl.USER_ID_ENV_VAR,
         dl.PRIMARY_SESSION_ID_ENV_VAR,
+        dl.ORIGIN_WORKSPACE_ID_ENV_VAR,
+        dl.APP_NAME_ENV_VAR,
+        dl.SERVER_URL_ENV_VAR,
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -106,12 +110,46 @@ def test_record_to_row_shape_and_coercions() -> None:
         "attributes",
         "log_id",
         "user_id",
+        "workspace_id",
+        "app_name",
     }
 
 
-def test_record_to_row_reads_session_id_from_extra() -> None:
+def test_record_to_row_redacts_token_like_text_fields() -> None:
+    secret = "aB3" + "xY7" * 12
+    try:
+        raise ValueError(f"credential={secret}")
+    except ValueError:
+        import sys
+
+        record = logging.LogRecord(
+            "omnigent.runner",
+            logging.ERROR,
+            __file__,
+            10,
+            "request failed: %s",
+            (secret,),
+            sys.exc_info(),
+            func="do_it",
+        )
+    record.attributes = {"upstream_response": secret, "attempt": 3}
+
+    row = dl.record_to_row(record, source="runner")
+
+    attributes = row["attributes"]
+    assert isinstance(attributes, dict)
+    assert secret not in str(row["message"])
+    assert secret not in str(row["stack_trace"])
+    assert secret not in attributes["upstream_response"]
+    assert attributes["attempt"] == "3"
+    assert "[REDACTED]" in str(row)
+
+
+def test_record_to_row_reads_session_id_from_extra(monkeypatch: pytest.MonkeyPatch) -> None:
     # session_id is passed explicitly at the callsite via extra= and read off
-    # the record; there is no ambient contextvar fallback.
+    # the record. There is deliberately no ambient request-scoped fallback; an
+    # explicit id also wins over the runner-primary env fallback.
+    monkeypatch.setenv(dl.PRIMARY_SESSION_ID_ENV_VAR, "conv_primary")
     record = logging.LogRecord(
         "omnigent.runner", logging.INFO, __file__, 1, "hi", (), None, func="f"
     )
@@ -120,7 +158,22 @@ def test_record_to_row_reads_session_id_from_extra() -> None:
     assert row["session_id"] == "conv_row"
 
 
+def test_record_to_row_session_id_falls_back_to_primary_on_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # On a runner the primary-session env is set, so an unthreaded log is
+    # attributed to the primary (parent) conversation. A co-located subagent's
+    # unthreaded log can be mis-attributed to the parent — an accepted trade-off.
+    monkeypatch.setenv(dl.PRIMARY_SESSION_ID_ENV_VAR, "conv_primary")
+    record = logging.LogRecord("omnigent.runner", logging.INFO, __file__, 1, "hi", (), None)
+    assert dl.record_to_row(record, source="runner")["session_id"] == "conv_primary"
+
+
 def test_record_to_row_null_correlation_without_extra() -> None:
+    # The server never sets the primary-session env (the _clear_env fixture
+    # mirrors that), so an unthreaded server log stays null rather than
+    # borrowing another concurrent request's id — the deliberate no-ambient-
+    # fallback property.
     record = logging.LogRecord("omnigent", logging.INFO, __file__, 1, "hi", (), None)
     row = dl.record_to_row(record, source="server")
     assert row["session_id"] is None
@@ -192,6 +245,72 @@ def test_record_to_row_falls_back_to_context_var() -> None:
     assert dl.record_to_row(record, source="server")["user_id"] is None
 
 
+def test_record_to_row_session_id_falls_back_to_ambient_scope() -> None:
+    # The server middleware binds an ambient session id for a session-scoped
+    # request; unthreaded records inherit it, and only inside the scope.
+    record = logging.LogRecord("omnigent", logging.INFO, __file__, 1, "hi", (), None)
+    with dl.current_session_id_scope("conv_ambient"):
+        assert dl.record_to_row(record, source="server")["session_id"] == "conv_ambient"
+    assert dl.record_to_row(record, source="server")["session_id"] is None
+
+
+def test_record_to_row_prefers_explicit_session_id_over_ambient() -> None:
+    # An explicit record.session_id wins over the ambient request-scoped value.
+    record = logging.LogRecord("omnigent", logging.INFO, __file__, 1, "hi", (), None)
+    record.session_id = "conv_explicit"
+    with dl.current_session_id_scope("conv_ambient"):
+        assert dl.record_to_row(record, source="server")["session_id"] == "conv_explicit"
+
+
+def test_record_to_row_session_ambient_beats_primary_but_explicit_wins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Priority on a runner: explicit extra > ambient scope > primary-session env.
+    monkeypatch.setenv(dl.PRIMARY_SESSION_ID_ENV_VAR, "conv_primary")
+    record = logging.LogRecord("omnigent", logging.INFO, __file__, 1, "hi", (), None)
+    with dl.current_session_id_scope("conv_ambient"):
+        assert dl.record_to_row(record, source="runner")["session_id"] == "conv_ambient"
+    assert dl.record_to_row(record, source="runner")["session_id"] == "conv_primary"
+
+
+def test_request_audit_attrs_accumulate_and_reset() -> None:
+    # Outside a request (no bag) add_audit_attrs is a no-op and the current
+    # attrs are empty.
+    assert dl.current_request_audit_attrs() == {}
+    dl.add_audit_attrs(event_type="message")
+    assert dl.current_request_audit_attrs() == {}
+    # After a per-request reset, handlers accumulate attrs (coerced to str,
+    # None dropped) that the middleware later reads.
+    dl.reset_request_audit_attrs()
+    dl.add_audit_attrs(event_type="message", item_id="it_1", ignored=None)
+    dl.add_audit_attrs(count=3)
+    assert dl.current_request_audit_attrs() == {
+        "event_type": "message",
+        "item_id": "it_1",
+        "count": "3",
+    }
+
+
+def test_mark_request_audit_suppressed_sets_reserved_flag() -> None:
+    # Inside a request it sets the reserved _suppress key the middleware reads
+    # to skip the envelope end-event.
+    dl.reset_request_audit_attrs()
+    assert "_suppress" not in dl.current_request_audit_attrs()
+    dl.mark_request_audit_suppressed()
+    assert dl.current_request_audit_attrs()["_suppress"] == "1"
+
+
+def test_current_session_id_scope_resets() -> None:
+    assert dl.current_session_id() is None
+    dl.set_current_session_id("outer")
+    try:
+        with dl.current_session_id_scope("inner"):
+            assert dl.current_session_id() == "inner"
+        assert dl.current_session_id() == "outer"
+    finally:
+        dl.set_current_session_id(None)
+
+
 def test_record_to_row_falls_back_to_env(monkeypatch: pytest.MonkeyPatch) -> None:
     # No explicit user_id and no ContextVar -> the process-constant env (runner/host).
     monkeypatch.setenv(dl.USER_ID_ENV_VAR, "env@x")
@@ -247,6 +366,39 @@ def test_emit_revives_closed_uploader(_configured_env: None) -> None:
         sink.close()
 
 
+def test_custom_send_receives_prepared_rows_without_zerobus_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    batches: list[list[dl.DebugLogRow]] = []
+    delivered = threading.Event()
+
+    def send(batch: list[dl.DebugLogRow]) -> None:
+        batches.append(batch)
+        delivered.set()
+
+    sink = dl.DebugLogHandler("integration", send)
+    try:
+        record = logging.LogRecord(
+            "integration.logger",
+            logging.INFO,
+            __file__,
+            1,
+            "hello %s",
+            ("world",),
+            None,
+        )
+        sink.emit(record)
+
+        assert delivered.wait(timeout=1.0)
+        assert len(batches) == 1
+        assert len(batches[0]) == 1
+        assert batches[0][0]["source"] == "integration"
+        assert batches[0][0]["message"] == "hello world"
+    finally:
+        sink.close()
+
+
 def test_ignored_loggers_are_dropped() -> None:
     # httpx/httpcore records are chatty HTTP-client noise and must be dropped;
     # everything else is kept.
@@ -262,6 +414,46 @@ def test_attach_is_noop_when_disabled() -> None:
     target.handlers.clear()
     dl.attach_debug_log_sink([target], source="runner", level=logging.INFO)
     assert not any(isinstance(h, dl.ZerobusLogHandler) for h in target.handlers)
+
+
+def test_attach_uses_custom_send_without_zerobus_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    monkeypatch.setattr(dl, "_active_sink", None)
+    target = logging.getLogger("test.debug_logging.custom")
+    target.handlers.clear()
+    target.setLevel(logging.INFO)
+    batches: list[list[dl.DebugLogRow]] = []
+    delivered = threading.Event()
+
+    def send(batch: list[dl.DebugLogRow]) -> None:
+        batches.append(batch)
+        delivered.set()
+
+    dl.attach_debug_log_sink(
+        [target],
+        source="custom",
+        level=logging.INFO,
+        send=send,
+    )
+    sink = dl._active_sink
+    assert sink is not None
+    assert type(sink) is dl.DebugLogHandler
+    try:
+        target.info("custom delivery")
+        assert delivered.wait(timeout=1.0)
+        assert batches[0][0]["message"] == "custom delivery"
+        # The audit-event logger is wired sink-only and non-propagating, so
+        # request audit rows reach the table but never the on-disk/stderr logs.
+        audit_logger = dl.audit_event_logger()
+        assert audit_logger.propagate is False
+        assert sink in audit_logger.handlers
+    finally:
+        target.removeHandler(sink)
+        dl.sse_event_logger().removeHandler(sink)
+        dl.audit_event_logger().removeHandler(sink)
+        sink.close()
 
 
 def test_runner_primary_session_id(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -324,3 +516,131 @@ def test_attach_suppresses_handler_init_failure(
     dl.attach_debug_log_sink([target], source="server", level=logging.INFO)
     assert target.handlers == []
     assert dl._active_sink is None
+
+
+# ── origin workspace_id / app_name resolution ───────────────────────────────
+
+
+def test_parse_app_host_basic() -> None:
+    assert dl._parse_databricks_app_host(
+        "https://omnigents-3272836215725701.aws.databricksapps.com/c/abc123"
+    ) == ("omnigents", "3272836215725701")
+
+
+def test_parse_app_host_hyphenated_app_name() -> None:
+    # The app name may contain hyphens; only the final numeric segment is the
+    # workspace id, so the split must be on the LAST hyphen.
+    assert dl._parse_databricks_app_host(
+        "https://my-cool-app-3272836215725701.aws.databricksapps.com"
+    ) == ("my-cool-app", "3272836215725701")
+
+
+def test_parse_app_host_non_apps_urls_yield_nothing() -> None:
+    # Managed service (dbc-<hash> host), localhost, a custom domain, and empty
+    # input carry no parseable Databricks Apps identity.
+    assert dl._parse_databricks_app_host(
+        "https://dbc-a5d4177a-49dc.cloud.databricks.com/omnigent"
+    ) == (None, None)
+    assert dl._parse_databricks_app_host("http://localhost:8000") == (None, None)
+    assert dl._parse_databricks_app_host("https://omnigent.example.com") == (None, None)
+    assert dl._parse_databricks_app_host(None) == (None, None)
+    assert dl._parse_databricks_app_host("") == (None, None)
+
+
+def test_parse_app_host_rejects_malformed_labels() -> None:
+    # A databricksapps host with no hyphen, or a non-numeric final segment, is
+    # not a valid <app_name>-<workspace_id> label.
+    assert dl._parse_databricks_app_host("https://noworkspaceid.aws.databricksapps.com") == (
+        None,
+        None,
+    )
+    assert dl._parse_databricks_app_host("https://app-notanumber.aws.databricksapps.com") == (
+        None,
+        None,
+    )
+
+
+def test_process_identity_from_databricks_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Databricks App: the platform-injected env is authoritative.
+    monkeypatch.setenv(dl.ORIGIN_WORKSPACE_ID_ENV_VAR, "111222333")
+    monkeypatch.setenv(dl.APP_NAME_ENV_VAR, "omnigents")
+    assert dl._process_identity() == ("111222333", "omnigents")
+
+
+def test_process_identity_from_server_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Runner/host connected to a Databricks App: both parsed from the server URL.
+    monkeypatch.setenv(
+        dl.SERVER_URL_ENV_VAR, "https://omnigents-3272836215725701.aws.databricksapps.com"
+    )
+    assert dl._process_identity() == ("3272836215725701", "omnigents")
+
+
+def test_process_identity_env_beats_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Explicit DATABRICKS_* env wins over a (possibly divergent) URL parse.
+    monkeypatch.setenv(dl.ORIGIN_WORKSPACE_ID_ENV_VAR, "999")
+    monkeypatch.setenv(dl.APP_NAME_ENV_VAR, "envapp")
+    monkeypatch.setenv(dl.SERVER_URL_ENV_VAR, "https://urlapp-111.aws.databricksapps.com")
+    assert dl._process_identity() == ("999", "envapp")
+
+
+def test_process_identity_managed_service_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Managed service: no DATABRICKS_* env and the server URL is a dbc-<hash> host,
+    # not an Apps URL. Identity arrives per-record, so the process constant is empty.
+    monkeypatch.setenv(
+        dl.SERVER_URL_ENV_VAR, "https://dbc-a5d4177a-49dc.cloud.databricks.com/omnigent"
+    )
+    assert dl._process_identity() == (None, None)
+
+
+def test_process_identity_unset_is_none() -> None:
+    # OSS / local: nothing set anywhere.
+    assert dl._process_identity() == (None, None)
+
+
+def test_record_to_row_prefers_record_workspace_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The managed service stamps record.workspace_id per request; it wins over
+    # the process-constant fallback.
+    monkeypatch.setenv(dl.ORIGIN_WORKSPACE_ID_ENV_VAR, "process999")
+    record = logging.LogRecord("omnigent.server", logging.INFO, __file__, 1, "hi", (), None)
+    record.workspace_id = "perrequest111"
+    assert dl.record_to_row(record, source="server")["workspace_id"] == "perrequest111"
+
+
+def test_record_to_row_blank_record_workspace_id_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Outside a request the managed filter sets record.workspace_id = "" — an
+    # empty value must fall through to the process constant, not win.
+    monkeypatch.setenv(dl.ORIGIN_WORKSPACE_ID_ENV_VAR, "process999")
+    record = logging.LogRecord("omnigent.server", logging.INFO, __file__, 1, "hi", (), None)
+    record.workspace_id = ""
+    assert dl.record_to_row(record, source="server")["workspace_id"] == "process999"
+
+
+def test_record_to_row_origin_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Databricks App: both columns come from the process constant when the record
+    # carries none.
+    monkeypatch.setenv(dl.ORIGIN_WORKSPACE_ID_ENV_VAR, "3272836215725701")
+    monkeypatch.setenv(dl.APP_NAME_ENV_VAR, "omnigents")
+    record = logging.LogRecord("omnigent.server", logging.INFO, __file__, 1, "hi", (), None)
+    row = dl.record_to_row(record, source="server")
+    assert row["workspace_id"] == "3272836215725701"
+    assert row["app_name"] == "omnigents"
+
+
+def test_record_to_row_app_name_null_on_managed() -> None:
+    # Managed service: workspace_id arrives per-record, but there is no per-request
+    # app_name and no process constant, so app_name is null.
+    record = logging.LogRecord("omnigent.server", logging.INFO, __file__, 1, "hi", (), None)
+    record.workspace_id = "3272836215725701"
+    row = dl.record_to_row(record, source="server")
+    assert row["workspace_id"] == "3272836215725701"
+    assert row["app_name"] is None
+
+
+def test_record_to_row_origin_columns_null_on_oss() -> None:
+    # OSS / local: nothing set anywhere → both columns null.
+    record = logging.LogRecord("omnigent", logging.INFO, __file__, 1, "hi", (), None)
+    row = dl.record_to_row(record, source="host")
+    assert row["workspace_id"] is None
+    assert row["app_name"] is None

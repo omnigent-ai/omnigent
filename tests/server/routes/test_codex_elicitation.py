@@ -10,11 +10,14 @@ import pytest
 from omnigent.errors import OmnigentError
 from omnigent.server.routes._codex_elicitation import (
     _codex_command_preview,
+    _codex_mcp_elicitation_response,
+    _codex_mcp_persist_modes,
     _execpolicy_amendment,
     _json_preview,
     _string_list_answer,
     parse_codex_elicitation_request,
 )
+from omnigent.server.schemas import ElicitationResult
 
 # ── parse_codex_elicitation_request ──────────────────────────────────
 
@@ -70,6 +73,61 @@ class TestParseCodexElicitationRequest:
             }
         )
         assert req.method == "item/commandExecution/requestApproval"
+
+
+# ── Codex MCP approval persistence ───────────────────────────────────
+
+
+class TestCodexMcpApprovalPersistence:
+    """Tests for Codex's session and durable MCP approval choices."""
+
+    @pytest.mark.parametrize("mode", ["session", "always"])
+    def test_returns_advertised_persistence_mode(self, mode: str) -> None:
+        result = ElicitationResult.model_validate({"action": "accept", "_meta": {"persist": mode}})
+
+        response = _codex_mcp_elicitation_response(
+            result,
+            "mcpServer/elicitation/request",
+            {
+                "_meta": {
+                    "codex_approval_kind": "mcp_tool_call",
+                    "persist": ["session", "always"],
+                }
+            },
+        )
+
+        assert response == {
+            "action": "accept",
+            "content": None,
+            "_meta": {"persist": mode},
+        }
+
+    def test_rejects_unadvertised_persistence_mode(self) -> None:
+        result = ElicitationResult.model_validate(
+            {"action": "accept", "_meta": {"persist": "always"}}
+        )
+
+        with pytest.raises(OmnigentError, match="was not advertised"):
+            _codex_mcp_elicitation_response(
+                result,
+                "mcpServer/elicitation/request",
+                {
+                    "_meta": {
+                        "codex_approval_kind": "mcp_tool_call",
+                        "persist": ["session"],
+                    }
+                },
+            )
+
+    def test_ignores_malformed_advertised_modes(self) -> None:
+        params = {
+            "_meta": {
+                "codex_approval_kind": "mcp_tool_call",
+                "persist": ["session", {"unexpected": "object"}, None],
+            }
+        }
+
+        assert _codex_mcp_persist_modes(params) == {"session"}
 
 
 # ── _string_list_answer ──────────────────────────────────────────────

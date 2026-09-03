@@ -1425,6 +1425,180 @@ def test_local_run_persists_launch_state_on_fresh_session(
     assert opened == [("http://127.0.0.1:12345", "conv_local_fresh", True)]
 
 
+def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fresh(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    The real outer call site (``_run_with_local_server``) threads the
+    wrapper spec's raw instructions all the way into ``_prepare_claude_terminal``
+    on a FRESH session — with ``_prepare_claude_terminal`` itself REAL, not
+    faked, so the outer-to-inner threading is what is exercised rather than a
+    hand-supplied ``append_system_prompt``. Only ``_launch_claude_terminal``
+    — one level further in — is faked here, to observe what the real
+    ``_prepare_claude_terminal`` call actually forwards.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec_path = claude_native._materialize_claude_agent_spec(tmp_path)
+
+    class _Proc:
+        def poll(self) -> None:
+            return None
+
+    def fake_start_server(*args: object, **kwargs: object) -> Any:
+        del args, kwargs
+        return SimpleNamespace(proc=_Proc(), runner_id="runner_local", log_path=None)
+
+    launch_kwargs: dict[str, Any] = {}
+
+    async def _fake_create_session(
+        _client: object, _bundle: bytes, *, bridge_id: str, terminal_launch_args: object = None
+    ) -> str:
+        del _client, _bundle, bridge_id, terminal_launch_args
+        return "conv_local_fresh_raw"
+
+    async def _fake_bind_session_runner(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    async def _fake_launch_claude_terminal(
+        _client: object,
+        _session_id: str,
+        _claude_args: tuple[str, ...],
+        *,
+        command: str,
+        bridge_dir: Path,
+        claude_config: object = None,
+        append_system_prompt: str | None = None,
+        allowed_tools: tuple[str, ...] = (),
+    ) -> str:
+        del _client, _session_id, _claude_args, command, bridge_dir, claude_config, allowed_tools
+        launch_kwargs["append_system_prompt"] = append_system_prompt
+        return "terminal_claude_main"
+
+    async def fake_attach(
+        attach_url: str, *, headers: dict[str, str], terminal_gone_probe: object | None = None
+    ) -> bool:
+        del attach_url, headers, terminal_gone_probe
+        return True
+
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 12346)
+    monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
+    monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
+    monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.chat._bundle_agent", lambda path: b"bundle")
+    monkeypatch.setattr(claude_native, "_create_claude_session", _fake_create_session)
+    monkeypatch.setattr(claude_native, "_bind_session_runner", _fake_bind_session_runner)
+    monkeypatch.setattr(claude_native, "_launch_claude_terminal", _fake_launch_claude_terminal)
+    monkeypatch.setattr(claude_native, "attach_local_terminal", fake_attach)
+    monkeypatch.setattr(claude_native, "prepare_bridge_dir", lambda *a, **k: tmp_path / "bridge")
+    monkeypatch.setattr(claude_native, "reset_transcript_forward_state", lambda bridge_dir: None)
+    monkeypatch.setattr(claude_native, "open_conversation_link_if_enabled", lambda **kwargs: None)
+    monkeypatch.setattr(claude_native, "_record_launch_for_fresh_session", lambda session_id: None)
+
+    claude_native._run_with_local_server(
+        spec_path,
+        session_id=None,
+        resume_picker=False,
+        claude_args=(),
+        command="claude",
+        auto_open_conversation=False,
+    )
+
+    assert launch_kwargs.get("append_system_prompt") is not None
+    assert (
+        "Claude Code is running in the session terminal" in launch_kwargs["append_system_prompt"]
+    )
+
+
+def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold_resume(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Same as the fresh-session sibling, but for the COLD-RESUME branch: an
+    existing session with no live terminal launches a NEW one (unlike hot
+    reattach, which returns before ``_launch_claude_terminal`` is ever
+    called) and must still receive the wrapper's raw instructions.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec_path = claude_native._materialize_claude_agent_spec(tmp_path)
+
+    class _Proc:
+        def poll(self) -> None:
+            return None
+
+    def fake_start_server(*args: object, **kwargs: object) -> Any:
+        del args, kwargs
+        return SimpleNamespace(proc=_Proc(), runner_id="runner_local", log_path=None)
+
+    launch_kwargs: dict[str, Any] = {}
+
+    async def _fake_find_running(_client: object, _session_id: str) -> str | None:
+        return None
+
+    async def _fake_fetch_labels(_client: object, _session_id: str) -> dict[str, str]:
+        return {}
+
+    async def _fake_resolve_cold_resume_args(_client: object, _session_id: str) -> tuple[str, ...]:
+        return ("--resume", "claude-sid-cold")
+
+    async def _fake_bind_session_runner(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    async def _fake_launch_claude_terminal(
+        _client: object,
+        _session_id: str,
+        _claude_args: tuple[str, ...],
+        *,
+        command: str,
+        bridge_dir: Path,
+        claude_config: object = None,
+        append_system_prompt: str | None = None,
+        allowed_tools: tuple[str, ...] = (),
+    ) -> str:
+        del _client, _session_id, _claude_args, command, bridge_dir, claude_config, allowed_tools
+        launch_kwargs["append_system_prompt"] = append_system_prompt
+        return "terminal_claude_main"
+
+    async def fake_attach(
+        attach_url: str, *, headers: dict[str, str], terminal_gone_probe: object | None = None
+    ) -> bool:
+        del attach_url, headers, terminal_gone_probe
+        return True
+
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 12347)
+    monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
+    monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
+    monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
+    monkeypatch.setattr(claude_native, "_find_running_claude_terminal", _fake_find_running)
+    monkeypatch.setattr(claude_native, "_fetch_claude_session_labels", _fake_fetch_labels)
+    monkeypatch.setattr(claude_native, "_resolve_cold_resume_args", _fake_resolve_cold_resume_args)
+    monkeypatch.setattr(claude_native, "_bind_session_runner", _fake_bind_session_runner)
+    monkeypatch.setattr(claude_native, "_launch_claude_terminal", _fake_launch_claude_terminal)
+    monkeypatch.setattr(claude_native, "attach_local_terminal", fake_attach)
+    monkeypatch.setattr(claude_native, "prepare_bridge_dir", lambda *a, **k: tmp_path / "bridge")
+    monkeypatch.setattr(claude_native, "reset_transcript_forward_state", lambda bridge_dir: None)
+    monkeypatch.setattr(claude_native, "open_conversation_link_if_enabled", lambda **kwargs: None)
+
+    claude_native._run_with_local_server(
+        spec_path,
+        session_id="conv_cold_resume_raw",
+        resume_picker=False,
+        claude_args=(),
+        command="claude",
+        auto_open_conversation=False,
+    )
+
+    assert launch_kwargs.get("append_system_prompt") is not None
+    assert (
+        "Claude Code is running in the session terminal" in launch_kwargs["append_system_prompt"]
+    )
+
+
 def test_local_resume_does_not_print_redundant_resume_hint(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2605,6 +2779,294 @@ async def test_ensure_local_claude_resume_transcript_returns_none_when_no_record
         projects / claude_native._sanitize_claude_project_name(str(workspace)) / "sid123.jsonl"
     )
     assert not expected.exists()
+
+
+@pytest.mark.asyncio
+async def test_fetch_resume_items_retries_smaller_pages_on_5xx() -> None:
+    """
+    A 5xx on a large item page retries at smaller page sizes.
+
+    A deployed backend can fail reading one oversized page of a big
+    conversation while serving the same rows fine at smaller page sizes.
+    The history is recoverable, so the fetch must shrink the page and keep
+    going instead of raising (which would silently cold-start a blank
+    Claude session).
+    """
+    requested_limits: list[int] = []
+    total = 600
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        limit = int(request.url.params["limit"])
+        requested_limits.append(limit)
+        if limit > 400:
+            return httpx.Response(500, json={"error": {"code": "internal_error"}})
+        after = request.url.params.get("after")
+        start = int(after) + 1 if after is not None else 0
+        page = [
+            {"type": "message", "id": str(i), "role": "user", "content": []}
+            for i in range(start, min(start + limit, total))
+        ]
+        last = page[-1]["id"] if page else None
+        return httpx.Response(
+            200,
+            json={"data": page, "has_more": start + limit < total, "last_id": last},
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        items = await claude_native._fetch_all_session_items_for_claude_resume(client, "conv_abc")
+
+    # Every item arrives exactly once, in order — the degrade must not
+    # drop or duplicate rows across the retried page boundary.
+    assert [item["id"] for item in items] == [str(i) for i in range(total)]
+    # The first request went out at the full page size, 500'd, and the
+    # fetch degraded (halving through the still-failing 500) until pages
+    # served, instead of raising.
+    assert requested_limits[0] == 1000
+    assert requested_limits == sorted(requested_limits, reverse=True)
+    assert requested_limits[-1] <= 400
+
+
+@pytest.mark.asyncio
+async def test_fetch_resume_items_retries_smaller_pages_on_dropped_connection() -> None:
+    """
+    A connection dropped mid-response on a large page degrades like a 5xx.
+
+    A backend choking on an oversized page may sever the connection instead
+    of returning a clean 500; the fetch must retry the page smaller rather
+    than abandoning the resume.
+    """
+    requested_limits: list[int] = []
+    total = 300
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        limit = int(request.url.params["limit"])
+        requested_limits.append(limit)
+        if limit > 400:
+            raise httpx.ReadError("connection dropped", request=request)
+        after = request.url.params.get("after")
+        start = int(after) + 1 if after is not None else 0
+        page = [
+            {"type": "message", "id": str(i), "role": "user", "content": []}
+            for i in range(start, min(start + limit, total))
+        ]
+        last = page[-1]["id"] if page else None
+        return httpx.Response(
+            200,
+            json={"data": page, "has_more": start + limit < total, "last_id": last},
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        items = await claude_native._fetch_all_session_items_for_claude_resume(client, "conv_abc")
+
+    assert [item["id"] for item in items] == [str(i) for i in range(total)]
+    assert requested_limits[0] == 1000
+    assert requested_limits[-1] <= 400
+
+
+@pytest.mark.asyncio
+async def test_fetch_resume_items_raises_on_4xx_without_retry() -> None:
+    """A 4xx is a contract error: raise immediately, no page-size retry."""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        del request
+        calls += 1
+        return httpx.Response(404, json={"error": {"code": "not_found"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException):
+            await claude_native._fetch_all_session_items_for_claude_resume(client, "conv_abc")
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_resume_items_raises_when_5xx_persists_at_floor() -> None:
+    """A backend that 500s even at the smallest page size still raises."""
+    requested_limits: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_limits.append(int(request.url.params["limit"]))
+        return httpx.Response(500, json={"error": {"code": "internal_error"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException):
+            await claude_native._fetch_all_session_items_for_claude_resume(client, "conv_abc")
+
+    # Degraded down to the floor, then gave up — bounded, no infinite loop.
+    assert requested_limits[-1] == claude_native._CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR
+    assert requested_limits == sorted(requested_limits, reverse=True)
+
+
+@pytest.mark.asyncio
+async def test_resume_transcript_falls_back_to_local_file_when_history_unfetchable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Server history unreachable + intact local transcript → resume from it.
+
+    When every page size fails, a previous run's local
+    ``~/.claude/projects/<ws>/<sid>.jsonl`` still holds the conversation;
+    resuming from it beats silently launching a blank session.
+    """
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    workspace = Path("/work/some-repo")
+    target_dir = projects / claude_native._sanitize_claude_project_name(str(workspace))
+    target_dir.mkdir(parents=True)
+    local = target_dir / "sid123.jsonl"
+    local.write_text('{"type":"user"}\n', encoding="utf-8")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(500, json={"error": {"code": "internal_error"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        written = await claude_native._ensure_local_claude_resume_transcript(
+            client,
+            session_id="conv_abc",
+            external_session_id="sid123",
+            workspace=workspace,
+        )
+
+    assert written == local
+    # The untouched local transcript is used as-is, never overwritten with
+    # partial server state.
+    assert local.read_text(encoding="utf-8") == '{"type":"user"}\n'
+
+
+@pytest.mark.asyncio
+async def test_resume_transcript_ignores_corrupt_local_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A non-JSONL local file is not a resumable fallback.
+
+    ``claude --resume`` against a corrupt transcript exits fatally instead
+    of starting, so the fallback must reject it and surface the fetch
+    failure.
+    """
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    workspace = Path("/work/some-repo")
+    target_dir = projects / claude_native._sanitize_claude_project_name(str(workspace))
+    target_dir.mkdir(parents=True)
+    (target_dir / "sid123.jsonl").write_text("not json at all\n", encoding="utf-8")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(500, json={"error": {"code": "internal_error"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException):
+            await claude_native._ensure_local_claude_resume_transcript(
+                client,
+                session_id="conv_abc",
+                external_session_id="sid123",
+                workspace=workspace,
+            )
+
+
+@pytest.mark.asyncio
+async def test_resume_transcript_ignores_binary_local_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A binary (non-UTF-8) local file is not a resumable fallback.
+
+    Decoding fails mid-iteration rather than at ``json.loads``, so the
+    validator must degrade to "not resumable" instead of propagating a
+    ``UnicodeDecodeError`` out of the fallback path.
+    """
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    workspace = Path("/work/some-repo")
+    target_dir = projects / claude_native._sanitize_claude_project_name(str(workspace))
+    target_dir.mkdir(parents=True)
+    (target_dir / "sid123.jsonl").write_bytes(b"\xff\xfe\x00\x01 not utf-8 \x80\n")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(500, json={"error": {"code": "internal_error"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException):
+            await claude_native._ensure_local_claude_resume_transcript(
+                client,
+                session_id="conv_abc",
+                external_session_id="sid123",
+                workspace=workspace,
+            )
+
+
+@pytest.mark.asyncio
+async def test_resume_transcript_ignores_local_file_on_4xx(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A 4xx contract error never falls back to a local transcript.
+
+    A 404/401/403 means the server explicitly rejected the conversation;
+    reviving local history could resume the wrong (e.g. deleted or
+    reassigned) session, so the failure must surface even when an intact
+    local transcript exists.
+    """
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    workspace = Path("/work/some-repo")
+    target_dir = projects / claude_native._sanitize_claude_project_name(str(workspace))
+    target_dir.mkdir(parents=True)
+    (target_dir / "sid123.jsonl").write_text('{"type":"user"}\n', encoding="utf-8")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(404, json={"error": {"code": "not_found"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException):
+            await claude_native._ensure_local_claude_resume_transcript(
+                client,
+                session_id="conv_abc",
+                external_session_id="sid123",
+                workspace=workspace,
+            )
+
+
+@pytest.mark.asyncio
+async def test_resume_transcript_raises_when_history_unfetchable_and_no_local_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No server history and no local transcript → the failure surfaces."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(500, json={"error": {"code": "internal_error"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException):
+            await claude_native._ensure_local_claude_resume_transcript(
+                client,
+                session_id="conv_abc",
+                external_session_id="sid123",
+                workspace=Path("/work/some-repo"),
+            )
 
 
 def _resume_rebuild_handler(
@@ -5178,6 +5640,7 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
             session_bundle=None,
             claude_args=("--print", "hello"),
             command="claude",
+            append_system_prompt="Wrapper bridge instructions.",
         )
         del http_client  # context-managed by the with block
 
@@ -5195,7 +5658,9 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
         "--print",
         "hello",
     )
-    assert captured_terminal_args["append_system_prompt"] is None
+    # Cold resume launches a new terminal (no early reattach return), so raw
+    # author instructions must reach --append-system-prompt exactly as given.
+    assert captured_terminal_args["append_system_prompt"] == "Wrapper bridge instructions."
     assert captured_terminal_args["allowed_tools"] == ()
 
     # Load-bearing for the duplicate-message bug: cold resume
@@ -5261,7 +5726,7 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
         allowed_tools: tuple[str, ...] = (),
     ) -> str:
         """Return a fixed terminal id without spawning anything."""
-        assert append_system_prompt is None
+        assert append_system_prompt == "Fresh session bridge instructions."
         assert allowed_tools == ()
         del _client, _session_id, _claude_args, command, bridge_dir, claude_config
         return "terminal_claude_main"
@@ -5291,6 +5756,7 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
             session_bundle=b"fake-bundle",
             claude_args=(),
             command="claude",
+            append_system_prompt="Fresh session bridge instructions.",
         )
         del http_client
 
@@ -5302,6 +5768,27 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
     # claude writes on cold start), the first turn would be dropped.
     assert prepared.cold_resumed is False
     assert prepared.reattached is False
+
+
+def test_wrapper_spec_raw_instructions_resolves_prompt(tmp_path: Path) -> None:
+    """The ``omnigent claude`` wrapper's own materialized spec is resolvable.
+
+    Its ``prompt`` field is real ``AgentSpec.instructions`` content (the
+    bridge-behavior description), not framework-composed text, so it must
+    reach ``--append-system-prompt`` like any other claude-native author
+    instructions.
+    """
+    spec_path = claude_native._materialize_claude_agent_spec(tmp_path)
+    result = claude_native._wrapper_spec_raw_instructions(spec_path)
+    assert result is not None
+    assert "Claude Code is running in the session terminal" in result
+
+
+def test_wrapper_spec_raw_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
+    """A malformed wrapper spec must not block the terminal launch."""
+    bad_spec = tmp_path / "bad.yaml"
+    bad_spec.write_text("not: [valid, agent, spec")
+    assert claude_native._wrapper_spec_raw_instructions(bad_spec) is None
 
 
 @pytest.mark.asyncio
@@ -9232,17 +9719,82 @@ def test_parse_claude_model_aliases_reads_the_usage_line() -> None:
             {"label": "Opus in plan mode, else Sonnet"},
             id="prose-label-kept-verbatim",
         ),
+        pytest.param(
+            json.dumps({"type": "result", "result": "Current model: `Sonnet 5` (effort: high)"}),
+            {"label": "Sonnet 5"},
+            id="markdown-backticks-around-the-name-are-stripped",
+        ),
+        pytest.param(
+            json.dumps({"type": "result", "result": "Current model: `Opus 5 (1M context)`"}),
+            {"label": "Opus 5 (1M context)"},
+            id="markdown-backticks-around-the-whole-label-are-stripped",
+        ),
+        pytest.param(
+            json.dumps({"type": "result", "result": "Current model: `Opus 5 (effort: high)`"}),
+            {"label": "Opus 5"},
+            id="effort-suffix-inside-the-backticks-still-strips",
+        ),
+        pytest.param(
+            json.dumps(
+                {"type": "result", "result": "Current model: `Opus 5 (1M context) (default)`"}
+            ),
+            {"label": "Opus 5 (1M context)"},
+            id="default-marker-on-the-enumeration-run-is-stripped",
+        ),
+        pytest.param(
+            json.dumps({"type": "result", "result": "Current model: Sonnet 5 (default)"}),
+            {"label": "Sonnet 5"},
+            id="default-marker-without-backticks-is-stripped",
+        ),
         pytest.param("Current model: Opus 5\nnot json", {}, id="non-stream-json-yields-nothing"),
     ],
 )
 def test_parse_claude_current_model(stdout: str, expected: dict[str, str]) -> None:
     """The stream-json run's exact id and printed label parse verbatim.
 
-    Only the trailing ``(effort: …)`` suffix is stripped from the label —
-    context markers and prose like opusplan's description survive, because
-    the parser knows no model names.
+    Only markdown backticks and the trailing ``(effort: …)`` / ``(default)``
+    suffixes are stripped from the label — context markers and prose like
+    opusplan's description survive, because the parser knows no model names.
     """
     assert claude_native._parse_claude_current_model(stdout) == expected
+
+
+@pytest.mark.parametrize(
+    ("alias", "label", "model", "expected"),
+    [
+        pytest.param(
+            "sonnet[1m]",
+            "`Sonnet 5`",
+            "claude-sonnet-5[1m]",
+            "Sonnet 5 (1M context)",
+            id="marker-appended-outside-stripped-backticks",
+        ),
+        pytest.param(
+            "opus[1m]",
+            "`Opus 5 (1M context)`",
+            "claude-opus-5[1m]",
+            "Opus 5 (1M context)",
+            id="marker-already-present-inside-backticks",
+        ),
+    ],
+)
+def test_claude_alias_row_marks_1m_context_consistently(
+    alias: str, label: str, model: str, expected: str
+) -> None:
+    """A markdown-quoted harness label cannot split the 1M-context marker.
+
+    Backticks leave at parse time, so the marker lands on plain text and
+    the guard against a duplicate marker sees the name it is guarding.
+    """
+    resolution = claude_native._parse_claude_current_model(
+        json.dumps({"type": "system", "subtype": "init", "model": model})
+        + "\n"
+        + json.dumps({"type": "result", "result": f"Current model: {label} (effort: high)"})
+    )
+
+    row = claude_native._claude_alias_row(alias, resolution)
+
+    assert row == {"id": alias, "model": model, "displayName": expected}
 
 
 async def test_probe_claude_model_options_runs_bare(
@@ -9649,3 +10201,251 @@ def test_claude_catalog_serves_model(
     assert (
         claude_native.claude_catalog_serves_model(_subscription_catalog(), model, config) is served
     )
+
+
+@pytest.mark.parametrize(
+    ("config", "label"),
+    [
+        (None, "Claude Code's own login"),
+        (
+            claude_native.ClaudeNativeUcodeConfig(
+                env={
+                    "ANTHROPIC_BASE_URL": "https://user:secret@gateway.example:8443/anthropic?sig=1"
+                },
+                api_key_helper="printf sk-key",
+            ),
+            "the gateway at https://gateway.example:8443",
+        ),
+        (
+            claude_native.ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock.example/v1"},
+                api_key_helper=None,
+            ),
+            "the Bedrock endpoint at https://bedrock.example",
+        ),
+    ],
+)
+def test_claude_launch_endpoint_label_names_where_inference_goes(
+    config: claude_native.ClaudeNativeUcodeConfig | None, label: str
+) -> None:
+    """
+    The label names only the endpoint's origin: no path, userinfo, or query.
+    """
+    assert claude_native.claude_launch_endpoint_label(config) == label
+
+
+# ── Bare --resume picker: host scoping and concise errors ────────────
+
+
+def test_resolve_session_id_for_resume_threads_local_host_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bare ``--resume`` scopes the picker to this machine's host id.
+
+    Native transcript/workspace state is host-local; without the
+    invoking host id the picker offers dead-end rows from other hosts.
+    """
+    from omnigent.host import identity as host_identity
+
+    captured: dict[str, Any] = {}
+
+    async def fake_picker(client: Any, **kwargs: Any) -> str | None:
+        """Capture the picker kwargs; skip any real listing."""
+        del client
+        captured.update(kwargs)
+        return "conv_picked"
+
+    monkeypatch.setattr(
+        "omnigent.repl._resume_picker.pick_conversation_by_wrapper_label_from_sdk",
+        fake_picker,
+    )
+    monkeypatch.setattr(
+        host_identity,
+        "load_host_identity_if_present",
+        lambda *a, **k: host_identity.HostIdentity(
+            host_id="aaaa1111aaaa1111aaaa1111aaaa1111", name="test-host"
+        ),
+    )
+
+    resolved = claude_native._resolve_session_id_for_resume(
+        base_url="http://127.0.0.1:1",
+        headers={},
+        session_id=None,
+        resume_picker=True,
+    )
+    assert resolved == "conv_picked"
+    assert captured["host_id"] == "aaaa1111aaaa1111aaaa1111aaaa1111"
+
+
+def test_resolve_session_id_for_resume_unregistered_machine_lists_unfiltered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No persisted host identity → the picker lists without a host filter.
+
+    The lookup must be read-only: resolving a resume must never mint a
+    host identity on a machine that is not a host.
+    """
+    from omnigent.host import identity as host_identity
+
+    captured: dict[str, Any] = {}
+
+    async def fake_picker(client: Any, **kwargs: Any) -> str | None:
+        """Capture the picker kwargs; skip any real listing."""
+        del client
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(
+        "omnigent.repl._resume_picker.pick_conversation_by_wrapper_label_from_sdk",
+        fake_picker,
+    )
+    monkeypatch.setattr(host_identity, "load_host_identity_if_present", lambda *a, **k: None)
+
+    resolved = claude_native._resolve_session_id_for_resume(
+        base_url="http://127.0.0.1:1",
+        headers={},
+        session_id=None,
+        resume_picker=True,
+    )
+    assert resolved is None
+    assert captured["host_id"] is None
+
+
+def test_resolve_session_id_for_resume_wraps_sdk_error_as_click_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A persistent SDK failure surfaces as a concise ``ClickException``.
+
+    The bare-``--resume`` journey must never end in a raw SDK
+    traceback: a list failure that outlives the picker's bounded
+    retries (e.g. a persistent 429) becomes a one-line CLI error.
+    """
+    from omnigent_client import RateLimitedError
+
+    from omnigent.host import identity as host_identity
+
+    async def fake_picker(client: Any, **kwargs: Any) -> str | None:
+        """Simulate the list call failing past the retry budget."""
+        del client, kwargs
+        raise RateLimitedError("rate limited", 429, "rate_limited")
+
+    monkeypatch.setattr(
+        "omnigent.repl._resume_picker.pick_conversation_by_wrapper_label_from_sdk",
+        fake_picker,
+    )
+    monkeypatch.setattr(host_identity, "load_host_identity_if_present", lambda *a, **k: None)
+
+    with pytest.raises(click.ClickException) as exc_info:
+        claude_native._resolve_session_id_for_resume(
+            base_url="http://127.0.0.1:1",
+            headers={},
+            session_id=None,
+            resume_picker=True,
+        )
+    assert "Could not list sessions to resume" in exc_info.value.message
+
+
+def test_resolve_session_id_for_resume_explicit_id_bypasses_host_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit ``--resume <id>`` returns as-is — no picker, no filtering."""
+
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("picker must not run for explicit --resume <id>")
+
+    monkeypatch.setattr(
+        "omnigent.repl._resume_picker.pick_conversation_by_wrapper_label_from_sdk",
+        boom,
+    )
+    resolved = claude_native._resolve_session_id_for_resume(
+        base_url="http://127.0.0.1:1",
+        headers={},
+        session_id="conv_explicit",
+        resume_picker=False,
+    )
+    assert resolved == "conv_explicit"
+
+
+def test_resolve_session_id_for_resume_partial_env_identity_is_concise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A half-set host-identity env pair fails as a concise CLI error.
+
+    ``load_host_identity_if_present`` raises ``ValueError`` when only
+    one of the managed-host launch env vars is set; bare ``--resume``
+    must surface that as a ``ClickException``, not a raw traceback.
+    """
+    from omnigent.host import identity as host_identity
+
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise ValueError("OMNIGENT_HOST_ID and OMNIGENT_HOST_NAME must be set together")
+
+    monkeypatch.setattr(host_identity, "load_host_identity_if_present", boom)
+
+    with pytest.raises(click.ClickException) as exc_info:
+        claude_native._resolve_session_id_for_resume(
+            base_url="http://127.0.0.1:1",
+            headers={},
+            session_id=None,
+            resume_picker=True,
+        )
+    assert "host identity" in exc_info.value.message
+
+
+# ── catalog fingerprint keys on the CLI binary ───────────
+
+
+def _point_claude_at(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
+    """Make the fingerprint resolve the Claude binary to *path*."""
+    monkeypatch.setattr(
+        "omnigent.claude_launcher.resolve_claude_launch",
+        lambda command, args: (str(path), list(args)),
+    )
+
+
+def test_catalog_fingerprint_changes_when_the_cli_is_upgraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An upgraded Claude Code misses the catalog its predecessor wrote.
+
+    The catalog stores the model names one binary printed. Without the
+    binary in the key, an upgrade keeps serving the old names until the
+    entry ages out, which hides models a release adds or renames.
+    """
+    old_release = tmp_path / "2.1.247"
+    new_release = tmp_path / "2.1.250"
+    old_release.write_text("old")
+    new_release.write_text("newer build")
+    link = tmp_path / "claude"
+    link.symlink_to(old_release)
+    _point_claude_at(monkeypatch, link)
+
+    before = claude_native.claude_catalog_fingerprint(None)
+
+    link.unlink()
+    link.symlink_to(new_release)
+    after = claude_native.claude_catalog_fingerprint(None)
+
+    assert before != after
+
+
+def test_catalog_fingerprint_is_stable_for_one_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unchanged binary keeps its catalog, so no probe is repaid."""
+    binary = tmp_path / "claude"
+    binary.write_text("build")
+    _point_claude_at(monkeypatch, binary)
+
+    assert claude_native.claude_catalog_fingerprint(None) == (
+        claude_native.claude_catalog_fingerprint(None)
+    )
+
+
+def test_catalog_fingerprint_survives_a_missing_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A binary the resolver cannot find still yields a usable key."""
+    _point_claude_at(monkeypatch, tmp_path / "absent")
+
+    assert isinstance(claude_native.claude_catalog_fingerprint(None), str)

@@ -2134,7 +2134,14 @@ def _build_fwd_blocking_app(
     :param fwd_gate: Releases a blocked interrupt forward.
     :returns: ``(app, process_manager, harness_client)`` tuple.
     """
-    spec = AgentSpec(spec_version=1, name="t")
+    # Use the test-only harness so _build_spawn_env_from_spec returns None
+    # without reading provider config. The test seeds _session_spec_cache via
+    # POST /v1/sessions before sending the turn.
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "runner-test-default"}),
+    )
     sse_frames = [
         _sse({"type": "response.created", "response": {"id": "resp_fwd"}}),
         _sse({"type": "response.completed", "response": {"id": "resp_fwd"}}),
@@ -2177,6 +2184,11 @@ async def test_interrupt_forwards_to_harness_before_cancelling() -> None:
 
     async with _runner_client(app) as client:
         conv_id = "d741917a64f51f2d41226b88d53daf58"
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_fwd_test"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
             json={

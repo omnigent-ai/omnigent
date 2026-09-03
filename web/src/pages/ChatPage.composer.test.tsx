@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import { clearSessionDrafts, hasSessionDraft } from "@/lib/sessionDrafts";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
@@ -22,6 +23,12 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
     useWorkspaceDirectory: () => ({ data: undefined }),
   };
 });
+
+// ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
+// (default: no PR) so bare Composer renders don't need a QueryClientProvider.
+vi.mock("@/hooks/useGithub", () => ({
+  useGithubInfo: () => ({ data: undefined }),
+}));
 // HostBadge now renders in the composer's status-line tray and reads the
 // session's host binding via TanStack Query. Stub the hooks so it self-hides
 // (no host bound) without needing a QueryClient provider around these renders.
@@ -105,6 +112,23 @@ function textarea() {
   return screen.getByLabelText("Message the agent") as HTMLTextAreaElement;
 }
 
+function forceDesktopCoarsePointer(): () => void {
+  const original = window.matchMedia;
+  window.matchMedia = ((query: string) => ({
+    matches: query.includes("pointer: coarse"),
+    media: query,
+    onchange: null,
+    addListener: () => {},
+    removeListener: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    dispatchEvent: () => false,
+  })) as typeof window.matchMedia;
+  return () => {
+    window.matchMedia = original;
+  };
+}
+
 /** The currently highlighted menu row, or null when none is highlighted. */
 function activeRow(): HTMLElement | null {
   return document.querySelector('[data-active="true"]');
@@ -112,6 +136,12 @@ function activeRow(): HTMLElement | null {
 
 function renderWithTooltips(ui: ReactElement) {
   return render(<TooltipProvider>{ui}</TooltipProvider>);
+}
+
+function tooltipKeys(tooltip: HTMLElement): string[] {
+  return Array.from(tooltip.querySelectorAll('[data-slot="kbd"]')).map(
+    (key) => key.textContent ?? "",
+  );
 }
 
 describe("Composer session drafts", () => {
@@ -181,6 +211,94 @@ describe("Composer growth layout", () => {
       "[&::-webkit-scrollbar]:hidden",
     );
     expect(ta.parentElement).toHaveClass("overflow-hidden");
+  });
+});
+
+describe("Composer send shortcut", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    clearSessionDrafts();
+    useChatStore.setState({
+      conversationId: "conv_shortcut",
+      skills: [{ name: "deslop", description: "Remove AI slop" }],
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    clearSessionDrafts();
+  });
+
+  it("keeps Enter and the legacy Mod+Enter alias in default mode", () => {
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    fireEvent.change(textarea(), { target: { value: "legacy alias" } });
+    fireEvent.keyDown(textarea(), { key: "Enter", metaKey: true });
+    expect(onSend).toHaveBeenCalledWith("legacy alias", undefined);
+
+    fireEvent.change(textarea(), { target: { value: "default shortcut" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(onSend).toHaveBeenLastCalledWith("default shortcut", undefined);
+  });
+
+  it("uses Mod+Enter after the alternate preference is restored", () => {
+    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    fireEvent.change(textarea(), { target: { value: "alternate shortcut" } });
+
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(textarea(), { key: "Enter", metaKey: true });
+    expect(onSend.mock.calls[0]?.[0]).toBe("alternate shortcut");
+  });
+
+  it("shows the alternate Send shortcut in the button tooltip", async () => {
+    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "ready to send" } });
+
+    fireEvent.pointerMove(screen.getByRole("button", { name: "Send" }), {
+      pointerType: "mouse",
+    });
+    const tooltip = await screen.findByRole("tooltip");
+
+    expect(within(tooltip).getByText("Send")).toBeInTheDocument();
+    expect(tooltipKeys(tooltip)).toEqual(["Ctrl", "↵"]);
+  });
+
+  it("keeps Enter native and hides its hint on a desktop-width coarse pointer", () => {
+    const restorePointer = forceDesktopCoarsePointer();
+    const onSend = vi.fn();
+    try {
+      render(<Composer {...composerProps({ onSend })} />);
+      fireEvent.change(textarea(), { target: { value: "/des" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(textarea().value).toBe("/des");
+      expect(onSend).not.toHaveBeenCalled();
+
+      fireEvent.focus(screen.getByRole("button", { name: "Send" }));
+      expect(screen.queryByRole("tooltip")).toBeNull();
+    } finally {
+      restorePointer();
+    }
+  });
+
+  it("keeps plain Enter completion while Mod+Enter bypasses an open slash menu", () => {
+    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    fireEvent.change(textarea(), { target: { value: "/des" } });
+
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(textarea().value).toBe("/deslop ");
+    expect(onSend).not.toHaveBeenCalled();
+
+    fireEvent.change(textarea(), { target: { value: "/des" } });
+    fireEvent.keyDown(textarea(), { key: "Enter", ctrlKey: true });
+    expect(onSend.mock.calls[0]?.[0]).toBe("/des");
   });
 });
 
@@ -592,6 +710,68 @@ describe("Composer slash-command submit routing", () => {
     expect(screen.getByTestId("composer-config-model")).toBeTruthy();
   });
 
+  it("shows the model connection from both the model label and session gear", async () => {
+    useChatStore.setState({ llmModel: "sonnet" });
+    const options = CLAUDE_MODEL_OPTIONS.map((option) => ({
+      ...option,
+      source: {
+        kind: "databricks",
+        label: "Workspace",
+        name: "production-west",
+        host: "acme.cloud.databricks.com",
+      },
+    }));
+    render(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: options,
+        })}
+      />,
+    );
+
+    const source = screen.getByTestId("composer-model-source");
+    expect(source).toHaveTextContent("Sonnet 4.6");
+    expect(source).not.toHaveTextContent("Workspace");
+    fireEvent.focus(source);
+    const tooltip = await screen.findByTestId("composer-model-source-tooltip");
+    expect(tooltip).toHaveTextContent("Connection: Databricks · production-west");
+    expect(tooltip).not.toHaveTextContent("acme.cloud.databricks.com");
+    expect(tooltip).not.toHaveTextContent("Profile:");
+    expect(tooltip).not.toHaveTextContent("Host:");
+
+    fireEvent.blur(source);
+    fireEvent.focus(screen.getByTestId("composer-config-gear"));
+    const gearTooltip = await screen.findByTestId("composer-config-gear-tooltip");
+    expect(gearTooltip).toHaveTextContent("Connection: Databricks · production-west");
+    expect(gearTooltip.textContent?.indexOf("Connection:")).toBeGreaterThan(
+      gearTooltip.textContent?.indexOf("Effort:") ?? -1,
+    );
+  });
+
+  it("labels subscription provenance instead of showing an unexplained CLI name", async () => {
+    useChatStore.setState({ llmModel: "sonnet" });
+    const options = CLAUDE_MODEL_OPTIONS.map((option) => ({
+      ...option,
+      source: { kind: "subscription", label: "Subscription", name: "claude" },
+    }));
+    render(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: options,
+        })}
+      />,
+    );
+
+    fireEvent.focus(screen.getByTestId("composer-model-source"));
+    const tooltip = await screen.findByTestId("composer-model-source-tooltip");
+    expect(tooltip).toHaveTextContent("Connection: Claude subscription");
+    expect(tooltip).not.toHaveTextContent("Authentication");
+  });
+
   it("does not open an empty Claude config modal while the live catalog loads", () => {
     const onSend = vi.fn();
     render(
@@ -792,6 +972,10 @@ describe("Composer model/effort label", () => {
       selectedEffort: "high",
       costControlModeOverride: "on",
     });
+    const options = CLAUDE_MODEL_OPTIONS.map((option) => ({
+      ...option,
+      source: { kind: "subscription", label: "Subscription", name: "claude" },
+    }));
     renderWithTooltips(
       <Composer
         {...composerProps({
@@ -800,12 +984,14 @@ describe("Composer model/effort label", () => {
           modelPickerKind: "claude",
           showModels: true,
           costRoutingEligible: true,
+          codexModelOptions: options,
         })}
       />,
     );
     expect(label()).toHaveTextContent("Smart Routing");
     expect(label()).not.toHaveTextContent("Opus");
     expect(label()).not.toHaveTextContent("High");
+    expect(screen.queryByTestId("composer-model-source")).toBeNull();
   });
 
   it("renders the reported model, never the request or the sticky", () => {
@@ -1442,7 +1628,7 @@ describe("Composer placeholder", () => {
 
   it("shows the normal placeholder when the runner is live", () => {
     render(<Composer {...composerProps({})} />);
-    expect(textarea().placeholder).toMatch(/ask the agent anything/i);
+    expect(textarea().placeholder).toMatch(/send a message/i);
   });
 
   it("a structural read-only reason wins over the normal placeholder", () => {
@@ -1452,17 +1638,8 @@ describe("Composer placeholder", () => {
     expect(textarea().placeholder).toBe("Mirrored transcript");
   });
 
-  it("runner_asleep (reconnectHint): enabled composer nudges the user to send", () => {
-    // Host online but runner offline — sending relaunches the runner, so the
-    // composer stays writable and the placeholder is the affordance.
-    render(<Composer {...composerProps({ reconnectHint: true })} />);
-    expect(textarea().placeholder).toBe("Send a message to reconnect this session");
-    expect(textarea().disabled).toBe(false);
-  });
-
-  it("streaming wins over the reconnect hint", () => {
-    // A queued follow-up message takes precedence over the asleep nudge.
-    render(<Composer {...composerProps({ reconnectHint: true, status: "streaming" })} />);
+  it("streaming shows the queued follow-up placeholder", () => {
+    render(<Composer {...composerProps({ status: "streaming" })} />);
     expect(textarea().placeholder).toMatch(/send a follow-up/i);
   });
 
@@ -1470,12 +1647,6 @@ describe("Composer placeholder", () => {
     // A message can't wake it, so the textarea is disabled and the banner
     // below is the only affordance.
     render(<Composer {...composerProps({ unreachable: true })} />);
-    expect(textarea().disabled).toBe(true);
-    expect(textarea().placeholder).toMatch(/reconnect below/i);
-  });
-
-  it("unreachable wins over the reconnect hint (both set defensively)", () => {
-    render(<Composer {...composerProps({ unreachable: true, reconnectHint: true })} />);
     expect(textarea().disabled).toBe(true);
     expect(textarea().placeholder).toMatch(/reconnect below/i);
   });
@@ -1646,6 +1817,9 @@ describe("Composer reply-quote focus", () => {
 describe("Composer file-attachment focus", () => {
   beforeEach(() => {
     useChatStore.setState({ conversationId: "conv_test", skills: [] });
+    // Drafts persist per conversation: without this, a file attached by one
+    // test is restored into the next one's composer.
+    clearSessionDrafts();
   });
 
   afterEach(() => {
@@ -1686,6 +1860,50 @@ describe("Composer file-attachment focus", () => {
     fireEvent.change(fileInput(), { target: { files: [bad] } });
 
     expect(document.activeElement).not.toBe(ta);
+  });
+
+  // The drop target is the chat column (``[data-chat-surface]``, SessionLayout),
+  // which the composer resolves from its own card. Unhandled, a drop on the
+  // transcript makes the browser navigate away to render the file.
+  it("attaches a file dropped elsewhere in the chat column", () => {
+    render(
+      <div data-chat-surface>
+        <div data-testid="transcript">transcript</div>
+        <Composer {...composerProps()} />
+      </div>,
+    );
+    const transcript = screen.getByTestId("transcript");
+    // ``types`` is the only file signal available mid-drag.
+    fireEvent.dragEnter(transcript, { dataTransfer: { types: ["Files"], files: [] } });
+    expect(screen.getByTestId("file-drop-overlay")).toBeTruthy();
+
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    fireEvent.drop(transcript, { dataTransfer: { types: ["Files"], files: [file] } });
+
+    // getAllBy: the chip pairs the visible name with a hover title.
+    expect(screen.getAllByText("shot.png").length).toBeGreaterThan(0);
+    expect(screen.queryByTestId("file-drop-overlay")).toBeNull();
+  });
+
+  // Outside the column — sidebar, workspace rail — a file drag is not an
+  // attachment.
+  it("ignores a file dropped outside the chat column", () => {
+    render(
+      <div>
+        <div data-chat-surface>
+          <Composer {...composerProps()} />
+        </div>
+        <div data-testid="sidebar">sidebar</div>
+      </div>,
+    );
+    const sidebar = screen.getByTestId("sidebar");
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+
+    fireEvent.dragEnter(sidebar, { dataTransfer: { types: ["Files"], files: [] } });
+    expect(screen.queryByTestId("file-drop-overlay")).toBeNull();
+    fireEvent.drop(sidebar, { dataTransfer: { types: ["Files"], files: [file] } });
+
+    expect(screen.queryByText("shot.png")).toBeNull();
   });
 
   it("clears the rejection notice once the user types", () => {
@@ -2799,5 +3017,18 @@ describe("shouldQueueSend", () => {
 
   it("ignores queued messages belonging to a different conversation", () => {
     expect(shouldQueueSend("conv_a", "idle", "idle", [q("conv_b")])).toBe(false);
+  });
+
+  it("sends directly while busy when alwaysSteer is on", () => {
+    // The whole point of the preference: a mid-turn follow-up is POSTed now
+    // (steered) instead of parking in the queue strip.
+    expect(shouldQueueSend("conv_a", "streaming", "idle", [], true)).toBe(false);
+    expect(shouldQueueSend("conv_a", "idle", "running", [], true)).toBe(false);
+  });
+
+  it("still queues under alwaysSteer when this conversation has a queued message", () => {
+    // The ordering guard outranks always-steer: draining must stay in order, so
+    // a direct send can't overtake a still-queued earlier one.
+    expect(shouldQueueSend("conv_a", "streaming", "running", [q("conv_a")], true)).toBe(true);
   });
 });

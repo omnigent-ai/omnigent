@@ -39,7 +39,7 @@ from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import open_right_rail
 
-_COMPOSER = "Ask the agent anything…"
+_COMPOSER = "Send a message…"
 # The palette's search box — its user-visible handle, stable across the
 # dialog's internals.
 _PALETTE_INPUT = "Search sessions or run a command"

@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
@@ -43,6 +44,35 @@ def fingerprint_of(*parts: object) -> str:
         digest.update(repr(part).encode("utf-8"))
         digest.update(b"\x00")
     return digest.hexdigest()[:16]
+
+
+def binary_identity(command: str | None) -> tuple[str, int, int] | None:
+    """
+    Identity of the executable a harness probe runs, for its fingerprint.
+
+    A catalog records what one specific binary offers, so an upgraded
+    binary must miss rather than serve the old answer. The real path
+    catches installs that keep each release in its own directory, and
+    size plus mtime catches a binary replaced in place.
+
+    :param command: Executable name or path, e.g. ``"claude"``, or
+        ``None`` when the caller resolved none.
+    :returns: ``(real path, size, mtime_ns)``, or ``None`` when the
+        executable is missing or unreadable. ``None`` is a stable facet
+        value, so a probe that cannot resolve its binary keys
+        consistently rather than churning the stored catalog.
+    """
+    if not command:
+        return None
+    resolved = command if os.path.isabs(command) else shutil.which(command)
+    if not resolved:
+        return None
+    try:
+        real_path = os.path.realpath(resolved)
+        stat_result = os.stat(real_path)
+    except OSError:
+        return None
+    return real_path, stat_result.st_size, stat_result.st_mtime_ns
 
 
 #: Catalog entries older than this get a background refresh on read, and
@@ -225,6 +255,36 @@ def _refresh_in_background(
     _inflight[key] = asyncio.create_task(_run(), name=f"model-catalog-refresh-{harness}")
 
 
+async def reprobe_catalog(
+    harness: str,
+    fingerprint: str,
+    resolve: Callable[[], Awaitable[list[dict[str, Any]] | None]],
+) -> list[dict[str, Any]] | None:
+    """
+    Re-probe now and return the fresh rows, joining a probe already in flight.
+
+    For a decision that must not rest on a stale entry (resetting a model pick
+    the stored rows do not serve), the refresh :func:`ensure_catalog` only
+    kicks in the background is awaited here. A failed probe returns ``None``
+    and leaves the stored rows in place.
+
+    :param harness: Canonical harness name.
+    :param fingerprint: The launch-config fingerprint.
+    :param resolve: Probe coroutine factory producing verbatim rows.
+    :returns: The fresh rows, or ``None`` when the probe failed.
+    """
+    key = (harness, fingerprint)
+    task = _inflight.get(key)
+    if task is None or task.done():
+        _refresh_in_background(harness, fingerprint, resolve)
+        task = _inflight[key]
+    try:
+        return await asyncio.shield(task)
+    except Exception:  # noqa: BLE001 — a joined miss probe may raise; stored rows keep serving
+        _logger.warning("%s catalog refresh failed", harness, exc_info=True)
+        return None
+
+
 def default_row(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     """Return the catalog's single ``isDefault`` row, if any.
 
@@ -246,6 +306,7 @@ def catalog_contains(rows: list[dict[str, Any]], token: str) -> bool:
 
 __all__ = [
     "CATALOG_STALE_AFTER_S",
+    "binary_identity",
     "catalog_age_s",
     "catalog_contains",
     "catalog_is_stale",
@@ -254,5 +315,6 @@ __all__ = [
     "ensure_catalog",
     "fingerprint_of",
     "read_catalog",
+    "reprobe_catalog",
     "write_catalog",
 ]

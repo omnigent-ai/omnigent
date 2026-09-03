@@ -241,6 +241,13 @@ async def _run_tmux_capture(socket_path: str, tmux_target: str) -> bytes | None:
     stream (which already carries CRLF). Home + clear (``\\x1b[H\\x1b[2J``) is
     prepended so the seed lands on a clean screen at the top-left.
 
+    ``-J`` joins soft-wrapped rows back into their original logical lines, so
+    a long line the pane wrapped across rows is written to xterm as one line
+    and xterm re-wraps it with its own wrapped-line flags. Without it the
+    seed turns every soft wrap into a hard line break, and copying the line
+    back out of the browser terminal inserts a newline at each wrap point
+    (xterm's selection joiner only rejoins rows flagged as wrapped).
+
     ``capture-pane`` records only the cell contents, not the cursor. Writing
     the seed leaves the browser cursor wherever the last row ended, not where
     the application actually parked it (e.g. inside a prompt input box). We
@@ -277,7 +284,8 @@ async def _run_tmux_capture(socket_path: str, tmux_target: str) -> bytes | None:
     meta = await _capture_pane_metadata(tmux, socket_path, tmux_target)
     # Only extend the capture into history when on the primary screen; on the
     # alternate screen ``-S -`` leaks stale primary history (see docstring).
-    capture_args = ["capture-pane", "-e", "-p", "-t", tmux_target]
+    # ``-J`` joins soft-wrapped rows into logical lines (see docstring).
+    capture_args = ["capture-pane", "-e", "-p", "-J", "-t", tmux_target]
     if meta is not None and not meta.alternate_on:
         capture_args += ["-S", "-"]
     try:
@@ -330,6 +338,8 @@ class _PaneMetadata:
         ``#{mouse_utf8_flag}``.
     :param app_cursor_keys: DECCKM (application cursor keys) from
         ``#{keypad_cursor_flag}``.
+    :param bracket_paste: DECSET 2004 (bracketed paste) from
+        ``#{bracket_paste_flag}``.
     """
 
     cursor_x: int
@@ -342,6 +352,7 @@ class _PaneMetadata:
     mouse_sgr: bool = False
     mouse_utf8: bool = False
     app_cursor_keys: bool = False
+    bracket_paste: bool = False
 
 
 def _mode_restore_escapes(meta: _PaneMetadata | None) -> tuple[bytes, bytes]:
@@ -362,8 +373,15 @@ def _mode_restore_escapes(meta: _PaneMetadata | None) -> tuple[bytes, bytes]:
       pollutes primary-screen scrollback.
     - Postlude (after the cursor restore): the mouse tracking mode
       (``?1000h``/``?1002h``/``?1003h``), its report encoding
-      (``?1005h``/``?1006h``), and DECCKM (``?1h``) so wheel-to-arrow
-      fallback picks the encoding the program expects.
+      (``?1005h``/``?1006h``), DECCKM (``?1h``) so wheel-to-arrow
+      fallback picks the encoding the program expects, and bracketed
+      paste (``?2004h``). Without the 2004 replay, a pane program that
+      enabled bracketed paste before this client attached (readline,
+      claude) leaves the browser xterm unaware, so a multi-line paste is
+      sent as raw newlines and readline executes each line on arrival
+      instead of inserting the block. ``#{bracket_paste_flag}`` needs
+      tmux >= 3.7; older tmux expands it empty, degrading to no replay
+      (the pre-replay behavior).
 
     Only enables are emitted: every attach starts a fresh xterm whose modes
     default off, so disables would be no-ops.
@@ -387,6 +405,8 @@ def _mode_restore_escapes(meta: _PaneMetadata | None) -> tuple[bytes, bytes]:
         postlude += b"\x1b[?1006h"
     if meta.app_cursor_keys:
         postlude += b"\x1b[?1h"
+    if meta.bracket_paste:
+        postlude += b"\x1b[?2004h"
     return prelude, postlude
 
 
@@ -415,7 +435,8 @@ async def _capture_pane_metadata(
             tmux_target,
             "#{cursor_x},#{cursor_y},#{cursor_flag},#{alternate_on},"
             "#{mouse_standard_flag},#{mouse_button_flag},#{mouse_all_flag},"
-            "#{mouse_sgr_flag},#{mouse_utf8_flag},#{keypad_cursor_flag}",
+            "#{mouse_sgr_flag},#{mouse_utf8_flag},#{keypad_cursor_flag},"
+            "#{bracket_paste_flag}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -432,8 +453,8 @@ async def _capture_pane_metadata(
         # field count holds), but pad regardless: a flags anomaly must cost
         # only the optional mode replay, never the mandatory cursor and
         # alt-screen state the rest of the seed depends on.
-        fields += ["0"] * (10 - len(fields))
-        x_str, y_str, flag_str, alt_str, std, btn, allm, sgr, utf8, ckm = fields[:10]
+        fields += ["0"] * (11 - len(fields))
+        x_str, y_str, flag_str, alt_str, std, btn, allm, sgr, utf8, ckm, bpaste = fields[:11]
         return _PaneMetadata(
             cursor_x=int(x_str),
             cursor_y=int(y_str),
@@ -445,6 +466,7 @@ async def _capture_pane_metadata(
             mouse_sgr=sgr == "1",
             mouse_utf8=utf8 == "1",
             app_cursor_keys=ckm == "1",
+            bracket_paste=bpaste == "1",
         )
     except (ValueError, UnicodeDecodeError):
         return None

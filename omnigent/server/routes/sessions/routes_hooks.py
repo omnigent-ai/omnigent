@@ -15,6 +15,7 @@ from fastapi import (
 from fastapi.responses import Response
 
 from omnigent.codex_native_elicitation import codex_elicitation_id
+from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import Conversation
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
 from omnigent.runner.routing import RunnerRouter
@@ -366,6 +367,18 @@ def register_hooks_routes(
             and result.content
         ):
             decision["updatedInput"] = {**tool_input, "answers": result.content}
+        # ExitPlanMode is a requiresUserInteraction tool: Claude Code coerces a
+        # bare PermissionRequest allow back to an interactive prompt unless the
+        # decision also carries ``updatedInput``. The plan needs no change, so
+        # echo the model's own input verbatim — its presence, not its content,
+        # is what lets a web-UI approval proceed without a TUI keystroke.
+        if (
+            behavior == "allow"
+            and tool_name == "ExitPlanMode"
+            and isinstance(tool_input, dict)
+            and tool_input
+        ):
+            decision["updatedInput"] = tool_input
         # "Accept & allow all edits" — the user approved this edit AND
         # asked to auto-accept future edits. Echo a ``setMode`` permission
         # update so Claude Code switches this session into ``acceptEdits``
@@ -758,6 +771,10 @@ def register_hooks_routes(
             policy_store=get_policy_store(),
             phase=phase,
             tool_name=data.get("name") if isinstance(data, dict) else None,
+            # A sub-agent conversation's own guardrails live on the CHILD
+            # spec inside this bundle; without the row the check would
+            # fast-path skip a bundle whose only policies are child-declared.
+            conversation=conv,
         ):
             return Response(
                 content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
@@ -886,6 +903,12 @@ def register_hooks_routes(
                                 "result": "POLICY_ACTION_DENY",
                                 "reason": exc.args[0] or "Approval was declined.",
                             }
+                            add_audit_attrs(
+                                policy_verdict="POLICY_ACTION_DENY",
+                                policy_phase=phase.value,
+                                policy_reason=decline_body["reason"],
+                                policy_gate="declined",
+                            )
                             return Response(
                                 content=json.dumps(decline_body),
                                 media_type="application/json",
@@ -898,6 +921,13 @@ def register_hooks_routes(
                                 "reason": result.reason or "Approval was not granted.",
                             }
                         )
+                        add_audit_attrs(
+                            policy_verdict=approval_body["result"],
+                            policy_phase=phase.value,
+                            policy_gate="ask",
+                        )
+                        if approval_body.get("reason"):
+                            add_audit_attrs(policy_reason=approval_body["reason"])
                         return Response(
                             content=json.dumps(approval_body),
                             media_type="application/json",
@@ -916,6 +946,18 @@ def register_hooks_routes(
             resp_body["reason"] = result.reason
         if result.data is not None:
             resp_body["data"] = result.data
+        # Tag the audit envelope with the decision so a DENY/ASK is debuggable
+        # (a deny returns HTTP 200, so status alone can't tell you the verdict).
+        add_audit_attrs(policy_verdict=resp_body["result"], policy_phase=phase.value)
+        if result.reason:
+            add_audit_attrs(policy_reason=result.reason)
+        _policy_tool = data.get("name") if isinstance(data, dict) else None
+        if _policy_tool:
+            add_audit_attrs(policy_tool=_policy_tool)
+        if result.deciding_policy is not None:
+            add_audit_attrs(
+                policy=getattr(result.deciding_policy, "name", None) or str(result.deciding_policy)
+            )
         # A request-phase HARD DENY (no approve option) — surface the reason as a
         # dismissable tmux popup on the native pane. opencode hard-blocks the
         # prompt by its plugin throwing (rendered as a generic error), so this is
@@ -1317,6 +1359,12 @@ def register_hooks_routes(
         policy_name = payload.get("policy_name")
         if not isinstance(policy_name, str) or not policy_name:
             policy_name = "native_permission"
+        extras: dict[str, Any] = {}
+        ask_user_question = payload.get("ask_user_question")
+        if isinstance(ask_user_question, dict) and isinstance(
+            ask_user_question.get("questions"), list
+        ):
+            extras["ask_user_question"] = ask_user_question
         params = ElicitationRequestParams(
             mode="form",
             message=message,
@@ -1325,6 +1373,7 @@ def register_hooks_routes(
             phase="pre_tool_use",
             policy_name=policy_name,
             content_preview=content_preview,
+            **extras,
         )
         from omnigent.server.routes import sessions as _sf
 

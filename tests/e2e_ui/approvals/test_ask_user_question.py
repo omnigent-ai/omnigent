@@ -43,7 +43,7 @@ _FORM = '[data-testid="ask-user-question-form"]'
 _SUBMIT = '[data-testid="ask-user-question-submit"]'
 _CUSTOM_INPUT = '[data-testid="ask-user-question-custom-input"]'
 _WORKED_FOLD = '[data-testid="turn-worked-fold"]'
-_COMPOSER = "Ask the agent anything…"
+_COMPOSER = "Send a message…"
 
 _MOCK_ELICITATION_TIMEOUT_MS = 15_000
 # A mock-LLM turn is fast, but this one is paused mid-flight on the gate

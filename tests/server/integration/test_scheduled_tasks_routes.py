@@ -423,6 +423,203 @@ async def test_update_changes_fields_and_validates_rrule(
     assert deleted_state.status_code == 422, deleted_state.text
 
 
+async def test_update_switches_the_bound_agent(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """PATCH ``agent_id`` rebinds a task to a different harness.
+
+    An existing automation must be switchable in place — the alternative is
+    recreating it, which loses the task id and its run history.
+    """
+    from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+    assert created["agent_id"] == builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME)
+
+    target = builtin_agent_id(CODEX_NATIVE_AGENT_NAME)
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}",
+        json={"agent_id": target},
+        headers=_headers(),
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["agent_id"] == target
+    # Same task row, not a recreate.
+    assert patched.json()["id"] == task_id
+
+    got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+    assert got.json()["agent_id"] == target
+
+
+async def test_update_agent_switch_clears_the_old_harnesss_settings(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A switch drops per-agent settings the new harness can't use.
+
+    ``permission_mode`` is a Claude-only flag and a model id is provider-bound,
+    so carrying them onto a codex task would break the fire with an unknown
+    ``--permission-mode`` / a model its CLI has never heard of.
+    """
+    from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(
+                permission_mode="bypassPermissions",
+                model_override="databricks-claude-sonnet-4-6",
+                reasoning_effort="high",
+            ),
+            headers=_headers(),
+        )
+    ).json()
+    task_id = created["id"]
+    assert created["permission_mode"] == "bypassPermissions"
+
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}",
+        json={"agent_id": builtin_agent_id(CODEX_NATIVE_AGENT_NAME)},
+        headers=_headers(),
+    )
+    assert patched.status_code == 200, patched.text
+    got = (await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())).json()
+    assert got["permission_mode"] is None
+    assert got["model_override"] is None
+    assert got["reasoning_effort"] is None
+
+
+async def test_update_agent_switch_revalidates_workspace_against_the_new_agent(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A switch re-checks the pinned workspace against the TARGET agent.
+
+    The ``os_env`` boundary is per-agent, so a workspace validated for the old
+    harness proves nothing about the new one. The autouse fixture stubs the
+    validator, so capture the agent it receives to pin down WHICH agent the
+    boundary check runs against — asserting a 200 alone would pass even if the
+    route kept checking the old agent.
+    """
+    from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+
+    seen: list[str] = []
+
+    async def _recording_validate(**kwargs: object) -> str:
+        agent = kwargs["agent"]
+        seen.append(getattr(agent, "id", ""))
+        workspace = kwargs["workspace"]
+        assert isinstance(workspace, str)
+        return workspace
+
+    monkeypatch.setattr(
+        scheduled_tasks_routes, "validate_existing_host_workspace", _recording_validate
+    )
+
+    target = builtin_agent_id(CODEX_NATIVE_AGENT_NAME)
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"agent_id": target},
+        headers=_headers(),
+    )
+    assert patched.status_code == 200, patched.text
+    # Ran once, against the agent being switched TO — not the one being left.
+    assert seen == [target], seen
+
+
+async def test_update_agent_switch_keeps_settings_resent_in_the_same_patch(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Settings sent alongside a switch are kept and gated on the NEW agent."""
+    from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(agent_id=builtin_agent_id(CODEX_NATIVE_AGENT_NAME)),
+            headers=_headers(),
+        )
+    ).json()
+
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={
+            "agent_id": builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
+            "permission_mode": "acceptEdits",
+        },
+        headers=_headers(),
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["permission_mode"] == "acceptEdits"
+
+
+async def test_update_agent_switch_gates_permission_mode_on_the_new_agent(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A Claude-only mode sent with a switch to codex is rejected, not persisted."""
+    from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+
+    resp = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={
+            "agent_id": builtin_agent_id(CODEX_NATIVE_AGENT_NAME),
+            "permission_mode": "acceptEdits",
+        },
+        headers=_headers(),
+    )
+    assert resp.status_code == 400, resp.text
+    assert "permission_mode" in resp.text
+    # Rejected before any write: the task keeps its original agent.
+    got = await auth_client.get(f"/v1/scheduled-tasks/{created['id']}", headers=_headers())
+    assert got.json()["agent_id"] == builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME)
+
+
+async def test_update_rejects_unknown_agent(auth_client: httpx.AsyncClient, db_uri: str) -> None:
+    """Switching to a nonexistent agent 404s instead of persisting a dead binding."""
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+
+    resp = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"agent_id": "ag_does_not_exist"},
+        headers=_headers(),
+    )
+    assert resp.status_code == 404, resp.text
+
+
+async def test_update_rejects_null_agent(auth_client: httpx.AsyncClient, db_uri: str) -> None:
+    """A task must always have an agent — an explicit null is a 422, not a no-op."""
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+
+    resp = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"agent_id": None},
+        headers=_headers(),
+    )
+    assert resp.status_code == 422, resp.text
+
+
 async def test_create_rejects_permission_mode_for_non_claude_agent(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:

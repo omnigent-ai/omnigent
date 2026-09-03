@@ -34,7 +34,7 @@ from playwright.sync_api import Browser, Locator, Page, expect
 
 from tests.e2e_ui.conftest import _server_state, seed_committed_items
 
-_COMPOSER_PLACEHOLDER = "Ask the agent anything…"
+_COMPOSER_PLACEHOLDER = "Send a message…"
 _USER_BUBBLE = '[data-testid="message-bubble"][data-role="user"]'
 _ASSISTANT_BUBBLE = '[data-testid="message-bubble"][data-role="assistant"]'
 _WORKING = '[data-testid="working-indicator"]'

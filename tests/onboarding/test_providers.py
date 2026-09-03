@@ -246,6 +246,9 @@ def test_get_models_preserves_context_and_cache_pricing_metadata() -> None:
         ("databricks-claude-opus-4-8", "anthropic", "claude-opus-4-8"),
         ("databricks/databricks-claude-opus-4-8", "anthropic", "claude-opus-4-8"),
         ("DATABRICKS-CLAUDE-OPUS-4-8", "anthropic", "claude-opus-4-8"),
+        ("anthropic.claude-opus-4-8-v1:0", "anthropic", "claude-opus-4-8"),
+        ("us.anthropic.claude-opus-4-8-v1:0", "anthropic", "claude-opus-4-8"),
+        ("anthropic.claude-opus-4-8", "anthropic", "claude-opus-4-8"),
     ],
 )
 def test_find_catalog_models_resolves_provider_and_vendor_namespaces(

@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     # import annotations`` is in effect).
     from omnigent.inner.datamodel import OSEnvSpec
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.entities import (
     NON_CONTENT_ITEM_TYPES,
     CompactionData,
@@ -46,6 +47,7 @@ from omnigent.onboarding.detected import (
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
     BEDROCK_KIND,
+    CHAT_WIRE_API,
     CLI_CONFIG_KIND,
     DATABRICKS_KIND,
     OPENAI_FAMILY,
@@ -437,7 +439,7 @@ _HARNESS_DATABRICKS_PROFILE: dict[AgentHarnessType, str] = {
     # NB: no ``antigravity`` — it has no Databricks/gateway path (Gemini-native).
     # NB: no ``kimi`` — upstream kimi has no per-spawn provider override flag,
     # so Omnigent cannot thread a Databricks gateway through. Users configure
-    # providers via ``kimi provider add`` in ``~/.kimi/config.toml``
+    # providers via ``kimi provider add`` in ``~/.kimi-code/config.toml``
     # (Omnigent-side provider injection is a deferred follow-up).
 }
 
@@ -740,8 +742,18 @@ def _apply_provider_family(
     :param harness_type: ``"claude-sdk"`` or ``"codex"``.
     :param family: The resolved provider family for this harness.
     :raises OmnigentError: If no model is resolvable (neither the spec nor
-        the family declares one).
+        the family declares one), or if a Codex provider is configured for
+        the unsupported Chat Completions wire API.
     """
+    if harness_type == "codex" and family.wire_api == CHAT_WIRE_API:
+        raise OmnigentError(
+            "The 'codex' harness requires an OpenAI Responses API endpoint, but "
+            f"provider endpoint {family.base_url!r} is configured with "
+            "'wire_api: chat'. Choose a Responses-capable endpoint and set "
+            "'wire_api: responses', or use a harness that supports Chat Completions.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
     cfg = _UCODE_HARNESS_CONFIGS[harness_type]
     env[_HARNESS_GATEWAY_FLAG[harness_type]] = "true"
     env[cfg.base_url_key] = family.base_url
@@ -1045,7 +1057,7 @@ def _resolve_provider_for_build(
             raise OmnigentError(
                 f"executor.auth references provider {auth.name!r}, but no such provider is "
                 "configured under 'providers:' in ~/.omnigent/config.yaml. "
-                "Run `omnigent setup --no-internal-beta` to configure one.",
+                f"Run `{cli_invocation()} setup --no-internal-beta` to configure one.",
                 code=ErrorCode.INVALID_INPUT,
             )
         return entry
@@ -1173,7 +1185,10 @@ def _build_claude_sdk_spawn_env(
     env: dict[str, str] = {}
     model = _resolve_spec_model(spec)
     if model is not None:
-        env["HARNESS_CLAUDE_SDK_MODEL"] = model
+        # Specs may pin the provider-routed spelling ("anthropic/<name>") so
+        # generic clients route correctly, but the claude CLI rejects
+        # vendor-prefixed model ids — hand it the bare name.
+        env["HARNESS_CLAUDE_SDK_MODEL"] = model.removeprefix("anthropic/")
     # Session workspace (the selected working folder), not the bundle workdir.
     # Without this the SDK subprocess inherits the runner's launch cwd — see
     # ``HARNESS_CLAUDE_SDK_CWD`` in ``omnigent/inner/claude_sdk_harness.py``.
@@ -1983,7 +1998,7 @@ def _build_kimi_spawn_env(
     The upstream Kimi Code CLI has no per-spawn provider override flag
     (no ``--config-file`` / ``--mcp-config-file``), so this builder
     only threads the model, working directory, and ``os_env`` sandbox
-    spec. Provider routing for kimi lives in ``~/.kimi/config.toml``
+    spec. Provider routing for kimi lives in ``~/.kimi-code/config.toml``
     and is managed out-of-band via ``kimi provider add``. Unlike the
     sibling builders, ``_build_kimi_spawn_env`` never calls
     :func:`configure_agent_harness_with_provider` (there is no env-var
@@ -2013,7 +2028,8 @@ def _build_kimi_spawn_env(
             "auth injection: upstream kimi has no per-spawn config override "
             "(no ``--config-file`` / ``--mcp-config-file``). Remove "
             "``executor.auth`` from the spec and configure the provider once "
-            "via `kimi provider add` in ~/.kimi/config.toml, then pin the "
+            "via `kimi provider add` in $KIMI_CODE_HOME/config.toml (default "
+            "~/.kimi-code/config.toml), then pin the "
             "resulting model id in the agent spec. Omnigent-side provider "
             "injection is a deferred follow-up.",
             code=ErrorCode.INVALID_INPUT,
@@ -2912,34 +2928,9 @@ def _find_spec_by_name(
     child ``__web_researcher`` session boots by re-parsing the bundle
     fresh (``runner/_entry.py`` spec resolver), so the researcher is
     absent from the re-parsed tree and a plain search returns ``None``.
-    Every caller swaps to the resolved sub-spec only ``if ... is not
-    None`` and otherwise keeps the parent spec, which boots the child as
-    a full clone of the parent (runaway recursion via ``sys_session_send``
-    when the parent is a coordinator). To keep that fallback safe, the
-    researcher is reconstructed deterministically from the parent (the
-    same pure builder ``WebFetchTool`` uses) instead of returning ``None``,
-    but only when some node in the tree actually declares the ``web_fetch``
-    builtin. That builtin is the sole reason the researcher ever exists, so a
-    tree without it anywhere has no such child and the name falls through to
-    normal resolution (``None``). Reconstructing unconditionally would let a
-    caller-controlled ``sub_agent_name`` coerce any parent into a
-    shell-capable researcher (``build_researcher_spec`` synthesizes an
-    ``OSEnvSpec``), widening the parent's tool boundary.
+    The root is never matched against itself, even when ``spec.name == name``.
 
-    The owning node need not be the root: a nested sub-agent may own
-    ``web_fetch`` while the handed-in root does not. The gate locates the
-    ``web_fetch`` owner via a root-first pre-order walk
-    (:func:`omnigent.tools.builtins.web_fetch.find_web_fetch_owner`) and
-    reconstructs from THAT owner, not the
-    root, so the researcher inherits the owner's LLM and sandbox/egress
-    boundary (``build_researcher_spec`` derives both from its argument). When
-    several nodes own ``web_fetch`` the first pre-order owner wins; this is a
-    deliberate limitation tied to the ``__web_researcher`` name not being
-    unique per owner (plumbing an "effective parent" through every call site
-    is out of scope). The root-owner case is unchanged: the owner is the
-    root, so the output is identical to before.
-
-    :param spec: The root agent spec to search.
+    :param spec: The root agent spec to search under.
     :param name: The sub-agent name to find,
         e.g. ``"researcher"``.
     :returns: The matching sub-agent spec, the reconstructed

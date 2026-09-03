@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { ConnectionIndicator } from "./ChatPage";
+import { ConnectionIndicator } from "./ChatIndicators";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import {
   TerminalFirstContextProvider,

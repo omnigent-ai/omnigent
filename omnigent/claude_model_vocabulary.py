@@ -236,3 +236,37 @@ def claude_model_command_arg(
         # Opus 5).
         return candidate
     return claude_model_alias(model, env)
+
+
+def _model_version_key(model: str) -> tuple[tuple[int, str | int], ...]:
+    """Order model ids naturally by their numeric segments (``4-8`` < ``5``)."""
+    return tuple(
+        (1, int(part)) if part.isdigit() else (0, part)
+        for part in re.split(r"(\d+)", normalized_model_id(model))
+        if part
+    )
+
+
+def served_alias_pins(model_ids: Iterable[str]) -> dict[str, str]:
+    """Map each family alias to the newest served id of that family.
+
+    A gateway that serves Claude under its own ids (``databricks-claude-opus-4-8``,
+    ``anthropic/claude-opus-4-8``) leaves Claude Code's alias vocabulary
+    unpinned, and an unpinned alias resolves to a canonical vendor id the
+    gateway rejects. Every alias surface — the refusal-fallback, ``/model``,
+    ``Agent``-tool spawns — then fails ``model_not_found``. This picks, per
+    family, the id the gateway actually serves so the launch env can pin it.
+
+    :param model_ids: The ids a gateway's model listing reports.
+    :returns: Alias → served id, e.g. ``{"opus": "databricks-claude-opus-4-8"}``,
+        for the families the listing serves. Ids of no Claude family are
+        ignored.
+    """
+    pins: dict[str, str] = {}
+    for model_id in model_ids:
+        alias = claude_model_alias(model_id, env={})
+        if alias not in ALIAS_MODEL_ENV_VARS:
+            continue
+        if alias not in pins or _model_version_key(model_id) > _model_version_key(pins[alias]):
+            pins[alias] = model_id
+    return pins

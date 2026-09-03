@@ -34,6 +34,7 @@ from typing import Any
 import click
 import httpx
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.db.utils import builtin_agent_id
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.native_coding_agents import native_coding_agent_for_harness
@@ -165,7 +166,7 @@ def check_smart_routing_available(
             f"Smart Routing is unavailable for {harness} on this host: its inference "
             f"is not AI-Gateway-backed ({reason}), so a routed model would not be "
             "reachable from the pane. Re-run without --smart-routing, or point the "
-            "harness at the workspace AI Gateway (`omnigent configure harnesses`)."
+            f"harness at the workspace AI Gateway (`{cli_invocation()} configure harnesses`)."
         )
 
 

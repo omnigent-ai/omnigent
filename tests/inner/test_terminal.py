@@ -558,10 +558,53 @@ async def _capture_launch_argv(
     return captured[0]
 
 
+@pytest.mark.parametrize("version", [(3, 3), (3, 10)])
+def test_require_supported_tmux_accepts_minimum_or_newer(
+    monkeypatch: pytest.MonkeyPatch,
+    version: tuple[int, int],
+) -> None:
+    """Managed-terminal preflight accepts tmux 3.3 and newer."""
+    monkeypatch.setattr(terminal_mod.shutil, "which", lambda _: "/usr/bin/tmux")
+    monkeypatch.setattr(terminal_mod, "tmux_version", lambda _: version)
+
+    terminal_mod._require_supported_tmux()
+
+
+def test_require_supported_tmux_rejects_missing_binary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Managed terminals retain the existing clear missing-tmux error."""
+    monkeypatch.setattr(terminal_mod.shutil, "which", lambda _: None)
+
+    with pytest.raises(RuntimeError, match="tmux is not installed or not on PATH"):
+        terminal_mod._require_supported_tmux()
+
+
+@pytest.mark.parametrize(
+    ("version", "message"),
+    [
+        ((3, 2), "tmux 3.2 is too old"),
+        (None, "Could not determine the installed tmux version"),
+    ],
+)
+def test_require_supported_tmux_rejects_old_or_unknown_version(
+    monkeypatch: pytest.MonkeyPatch,
+    version: tuple[int, int] | None,
+    message: str,
+) -> None:
+    """Managed terminals fail early unless tmux 3.3 support is confirmed."""
+    monkeypatch.setattr(terminal_mod.shutil, "which", lambda _: "/usr/bin/tmux")
+    monkeypatch.setattr(terminal_mod, "tmux_version", lambda _: version)
+
+    with pytest.raises(RuntimeError, match=message):
+        terminal_mod._require_supported_tmux()
+
+
 @pytest.mark.parametrize("keep_alive", [True, False])
 def test_create_terminal_instance_propagates_keep_alive_after_exit(
     tmp_path: Path,
     keep_alive: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     ``create_terminal_instance`` carries ``keep_alive_after_exit`` from the spec
@@ -574,6 +617,7 @@ def test_create_terminal_instance_propagates_keep_alive_after_exit(
     :param tmp_path: Temporary directory used as the terminal cwd.
     :param keep_alive: Spec value to propagate.
     """
+    monkeypatch.setattr(terminal_mod, "_require_supported_tmux", lambda: None)
     spec = TerminalEnvSpec(
         command="bash",
         os_env=OSEnvSpec(type="caller_process", cwd=str(tmp_path)),
@@ -631,6 +675,40 @@ async def test_launch_disables_tmux_mouse_mode(
     cmd = await _capture_launch_argv(tmp_path, monkeypatch, keep_alive_after_exit=False)
     assert contains_subsequence(cmd, ["set-option", "-g", "mouse", "off"])
     assert not contains_subsequence(cmd, ["set-option", "-g", "mouse", "on"])
+
+
+@pytest.mark.asyncio
+async def test_launch_binds_page_up_scrollback_entry_point(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Managed terminals keep one route into tmux scrollback for attached users.
+
+    The lockdown removes every default copy-mode entry point (``mouse off``,
+    ``prefix None``, emptied prefix table) and native clients attach with
+    ``-f /dev/null``, so without a root-table Page Up binding the formatted
+    output above the viewport is unreachable. The binding must pass Page Up
+    through on the alternate screen so full-screen programs keep the key.
+
+    :param tmp_path: Temporary directory for the fake tmux socket.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    cmd = await _capture_launch_argv(tmp_path, monkeypatch, keep_alive_after_exit=False)
+    assert contains_subsequence(
+        cmd,
+        [
+            "bind-key",
+            "-T",
+            "root",
+            "PPage",
+            "if-shell",
+            "-F",
+            "#{alternate_on}",
+            "send-keys PPage",
+            "copy-mode -eu",
+        ],
+    )
 
 
 @pytest.mark.asyncio
@@ -1437,11 +1515,8 @@ def test_create_terminal_instance_denies_control_socket_but_keeps_private_dir_wr
     """
     import shutil
 
-    # create_terminal_instance only guards on tmux availability (it does
-    # not launch tmux during construction), so faking the predicate lets
-    # this run in CI without tmux installed — same trick the reaper tests
-    # use — instead of an invisible-coverage-loss skip.
-    monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
+    # Construction enforces tmux compatibility but does not launch tmux.
+    monkeypatch.setattr(terminal_mod, "_require_supported_tmux", lambda: None)
 
     backend_type = "linux_bwrap" if sys.platform == "linux" else "darwin_seatbelt"
     spec = TerminalEnvSpec(

@@ -24,6 +24,8 @@ import {
 import { AgentInfoButton } from "@/components/AgentInfo";
 import { ConversationBreadcrumb } from "./ConversationBreadcrumb";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
+import { HeaderProjectTag } from "./HeaderProjectTag";
+import { HeaderTitle } from "./HeaderTitle";
 import { UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { PresenceAvatars } from "@/components/PresenceAvatars";
 import type { Agent } from "@/hooks/useAgents";
@@ -99,6 +101,12 @@ interface ChatHeaderProps {
   onOpenSidebar: (peek?: boolean) => void;
   /** Whether the active session is a sub-agent (appends its identity). */
   isChildSession: boolean;
+  /**
+   * The session's own ``sub_agent_name`` — identifies a dispatched sub-agent
+   * in the breadcrumb. ``null`` when the session has none (top-level, or an
+   * Add-Agent child bound to its own agent).
+   */
+  subAgentName?: string | null;
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
   /** Owner-managed top-level row backing the title-adjacent action menu. */
@@ -171,7 +179,8 @@ interface ChatHeaderProps {
  * mask, index.css; chat reserves clearance via ``pt-20``,
  * terminal-first via ``pt-14``). Left slot: open-sidebar + a conversation
  * breadcrumb (``[folder] / <title> [/ <sub-agent>]``, with the session-actions
- * kebab on desktop). Right slot: desktop action buttons (Agent info ·
+ * kebab on desktop and a "Move to…" project picker on the folder tag). Right
+ * slot: desktop action buttons (Agent info ·
  * Share · right-panel toggle) and, on mobile, a **single** kebab holding both
  * the session actions (pin/share/rename/project/archive/delete) and the
  * workspace-rail entries that open Files · Agents · Shells as full-screen
@@ -186,6 +195,7 @@ export function ChatHeader({
   sidebarOpen,
   onOpenSidebar,
   isChildSession,
+  subAgentName,
   conversationId,
   actionConversation = null,
   conversationTitle,
@@ -342,6 +352,27 @@ export function ChatHeader({
       workspaceItems={isMobile ? workspaceItems : null}
     />
   ) : null;
+  // Slack-style "Move to…" shortcut on the breadcrumb's folder tag: click it to
+  // file/move/unfile the session without opening the kebab. Desktop-only (the
+  // tag is hidden on mobile; the mobile menu keeps its own move item) and only
+  // for the owner-managed top-level row — a sub-agent's folder stays static so
+  // the title keeps its back-to-parent role. `null` falls back to the static
+  // folder icon in the breadcrumb.
+  const projectTag =
+    !isMobile && actionConversation && !isChildSession ? (
+      <HeaderProjectTag conversationId={actionConversation.id} projectName={projectName} />
+    ) : null;
+  // Click-to-rename on the breadcrumb title, same gating as the folder tag:
+  // desktop, owner-managed top-level row. A sub-agent's title stays a
+  // back-to-parent link (titleLinkTo wins over titleSlot in the breadcrumb),
+  // and mobile keeps the Rename item in the kebab.
+  const titleSlot =
+    !isMobile && actionConversation && !isChildSession ? (
+      <HeaderTitle
+        conversationId={actionConversation.id}
+        title={conversationTitle ?? UNTITLED_CONVERSATION_LABEL}
+      />
+    ) : null;
   return (
     <header
       className={cn(
@@ -392,14 +423,14 @@ export function ChatHeader({
                 // copy of it. Kept everywhere else, where it is the ONLY way to
                 // reopen a collapsed sidebar.
                 className={cn(
-                  "chat-header-sidebar-toggle text-muted-foreground hover:text-foreground md:size-6",
+                  "chat-header-sidebar-toggle text-muted-foreground hover:text-foreground max-md:size-11 md:size-6",
                   MOBILE_GLASS_PILL,
                 )}
                 onPointerEnter={onPeekSidebar}
                 onPointerDown={cancelPeek}
                 onPointerLeave={cancelPeek}
               >
-                <PanelLeftIcon className="size-4" />
+                <PanelLeftIcon className="size-4 max-md:size-5" />
               </Button>
             </TooltipTrigger>
             {/* Bottom placement keeps the tooltip clear of the macOS
@@ -418,8 +449,11 @@ export function ChatHeader({
           <ConversationBreadcrumb
             conversationTitle={conversationTitle ?? UNTITLED_CONVERSATION_LABEL}
             projectName={projectName}
+            projectTag={projectTag ?? undefined}
+            titleSlot={titleSlot ?? undefined}
             titleLinkTo={titleLinkTo}
             isChildSession={isChildSession}
+            subAgentName={subAgentName}
             boundAgent={boundAgent}
             wrapperLabel={wrapperLabel}
             actions={isMobile ? undefined : (conversationMenu ?? undefined)}
@@ -447,13 +481,17 @@ export function ChatHeader({
             popover; self-hides when the agent has neither configured. */}
         {conversationId && <AgentInfoButton agent={boundAgent} sessionId={conversationId} />}
         {/* Chat/Terminal switcher for terminal-first sessions — self-gates to
-            null otherwise (and in the iOS shell, where it's the native bar). */}
+            null otherwise. Renders on every shell, iOS included. */}
         {conversationId && <ViewModeToggle />}
         {/* Fallback mobile kebab for sessions with no owner-managed menu:
             the action buttons above (Share · Agent info) plus the same
             workspace-rail entries, so a phone still needs only one trigger. */}
         {(hasHeaderMenu || workspaceItems) && (!actionConversation || !isMobile) && (
-          <DropdownMenu>
+          // Non-modal on mobile: modal mode's body-wide pointer-events:none
+          // makes the menu the sole touch target, so touch-target adjustment
+          // snaps outside taps onto it and the menu can't be dismissed (see
+          // HeaderConversationMenu).
+          <DropdownMenu modal={!isMobile}>
             <DropdownMenuTrigger asChild>
               <Button
                 type="button"
@@ -461,9 +499,9 @@ export function ChatHeader({
                 size="icon"
                 aria-label="Session actions"
                 data-testid="session-actions-menu"
-                className="text-muted-foreground hover:text-foreground md:hidden max-md:rounded-full"
+                className="text-muted-foreground hover:text-foreground md:hidden max-md:size-11 max-md:rounded-full"
               >
-                <EllipsisVerticalIcon className="size-4" />
+                <EllipsisVerticalIcon className="size-4 max-md:size-5" />
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className={cn("min-w-44", MOBILE_GLASS_SURFACE)}>

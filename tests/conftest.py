@@ -128,7 +128,21 @@ def _run_test_environment_guardrails(config: pytest.Config) -> None:
 
 
 def pytest_unconfigure(config: pytest.Config) -> None:
-    """Clean up per-session resources."""
+    """Clean up per-session resources.
+
+    Reap before removing the data dir: tests spawn real detached Omnigent
+    processes (host daemons, local servers, runner zygotes) that would
+    otherwise outlive the session — squatting port 6767 and serving a
+    deleted database. Reaping first also lets attribution use the live
+    directory path while orphans still reference it.
+    """
+    from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
+
+    reaped, survivors = reap_leaked_omnigent_processes(_TEST_OMNIGENT_DATA_DIR)
+    for cmdline in reaped:
+        print(f"\nreaped leaked omnigent process: {cmdline}", file=sys.stderr)
+    for cmdline in survivors:
+        print(f"\nUNREAPED omnigent process survived SIGKILL: {cmdline}", file=sys.stderr)
     shutil.rmtree(_TEST_OMNIGENT_DATA_DIR, ignore_errors=True)
 
 

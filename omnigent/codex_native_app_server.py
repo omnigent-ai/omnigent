@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from omnigent.onboarding.provider_config import ProviderEntry
     from omnigent.spec.types import AgentSpec
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.codex_model_vocabulary import codex_spawn_model
 from omnigent.codex_native_bridge import write_policy_hook_config
 from omnigent.codex_native_process_registry import (
@@ -63,6 +64,7 @@ from omnigent.inner.codex_executor import (
     write_codex_hooks_file,
 )
 from omnigent.inner.databricks_executor import _databricks_gateway_host
+from omnigent.process_logging import log_info_once, log_once
 
 _logger = logging.getLogger(__name__)
 
@@ -331,17 +333,19 @@ def _sync_codex_developer_instructions(
     codex_home: Path,
     instructions: str | None,
 ) -> None:
-    """Synchronize framework instructions in the private Codex config.
+    """Synchronize the agent's authored instructions in the private Codex config.
 
     Codex's top-level ``developer_instructions`` setting is additive to its
     built-in operating instructions. The collaboration-mode field is not: a
     non-null value replaces the mode's defaults. The private session config
     therefore stores the user's original value in a sidecar, then derives the
-    active value from that base on every launch. Fresh sessions append the
-    framework directive; resumed sessions restore the unmodified base.
+    active value from that base on every launch. A launch that carries agent
+    instructions appends them to that base; a launch without them restores the
+    base alone.
 
     :param codex_home: Private per-session ``CODEX_HOME`` directory.
-    :param instructions: Framework instructions for this launch, or ``None``.
+    :param instructions: The agent's raw authored instructions
+        (``AgentSpec.instructions``) for this launch, or ``None``.
     :returns: None.
     """
     addition = instructions.strip() if instructions else ""
@@ -359,14 +363,14 @@ def _sync_codex_developer_instructions(
         document = tomlkit.parse(existing) if existing else tomlkit.document()
     except Exception:  # noqa: BLE001 - title metadata must never block Codex startup.
         _logger.warning(
-            "Could not synchronize native Codex framework instructions: invalid private config",
+            "Could not synchronize native Codex agent instructions: invalid private config",
             exc_info=True,
         )
         return
     current = document.get("developer_instructions")
     if current is not None and not isinstance(current, str):
         _logger.warning(
-            "Could not synchronize native Codex framework instructions: "
+            "Could not synchronize native Codex agent instructions: "
             "developer_instructions is not a string"
         )
         return
@@ -374,8 +378,8 @@ def _sync_codex_developer_instructions(
         base = base_path.read_text(encoding="utf-8")
     else:
         base = current.strip() if isinstance(current, str) else ""
-        # A previous Omnigent build may have appended the same framework
-        # directive without writing the sidecar. Recover the user-authored
+        # A previous Omnigent build may have appended the same instructions
+        # without writing the sidecar. Recover the user-authored
         # prefix instead of permanently capturing the combined value as base.
         if addition and base == addition:
             base = ""
@@ -488,6 +492,40 @@ class CodexAppServerResponseError(RuntimeError):
             self.code = code if isinstance(code, int) else None
             self.message = message if isinstance(message, str) else None
         super().__init__(str(error))
+
+
+#: JSON-RPC internal-error code codex returns when its thread-store fails.
+_CODEX_INTERNAL_ERROR_CODE = -32603
+
+#: Substring in codex's ``-32603`` message when its thread-store cannot
+#: load/resume a thread's rollout — stable across the wrapper phrasings
+#: different codex versions use (``failed to read thread: …`` vs
+#: ``error resuming thread: …``).
+_CODEX_THREAD_STORE_ERROR = "thread-store internal error"
+
+
+def is_unreadable_thread_error(exc: BaseException) -> bool:
+    """
+    Whether a ``thread/resume`` failure means codex cannot load the thread.
+
+    Codex answers ``-32603`` with a ``thread-store internal error`` when it
+    cannot load or resume a thread's rollout JSONL — e.g. a large transcript
+    whose multibyte character straddles a read-buffer boundary is rejected as
+    invalid UTF-8 (``failed to read thread: …``), or a rollout record it
+    cannot resume (``error resuming thread: …``). Retrying never resumes such
+    a thread, unlike a refused resume (``-32600``, another writer holds the
+    thread) that clears once the holder exits.
+
+    :param exc: The exception raised by the resume request, e.g. a
+        :class:`CodexAppServerResponseError`.
+    :returns: ``True`` when only a fresh thread can carry the session on.
+    """
+    return (
+        isinstance(exc, CodexAppServerResponseError)
+        and exc.code == _CODEX_INTERNAL_ERROR_CODE
+        and exc.message is not None
+        and _CODEX_THREAD_STORE_ERROR in exc.message
+    )
 
 
 class CodexAppServerClient:
@@ -858,10 +896,15 @@ def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
     Persistent (unlike the hermetic discovery's temp dir) so Codex's own
     ``models_cache.json`` ETag handling makes repeat probes cheap; keyed by
     the override set so a provider change never replays another provider's
-    cache. The account's real ``auth.json`` is symlinked in, the same way
-    a session launch links it: the credential decides which models the
-    account's catalog lists (login-gated entries, the account default), so
-    a credential-less probe answers for a catalog no session will see.
+    cache.
+
+    Materialized by the same bridge a session launch uses, in its minimal
+    shape. Both halves matter: the credential decides which models the
+    account's catalog lists (login-gated entries, the account default), and
+    the provider tables decide whether Codex loads its config at all, since
+    an override naming a ``model_provider`` the home does not define fails
+    config load outright. Minimal keeps the probe from starting the user's
+    MCPs, hooks and plugins.
 
     :param config_overrides: The probe's ``-c`` overrides.
     :returns: The created ``CODEX_HOME`` directory.
@@ -869,13 +912,11 @@ def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
     key = hashlib.sha256("\n".join(config_overrides).encode("utf-8")).hexdigest()[:12]
     home = Path.home() / ".omnigent" / "cache" / "codex-model-probe" / key
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
-    real_auth = _codex_home_config_source_from_env() / "auth.json"
-    probe_auth = home / "auth.json"
-    if real_auth.exists():
-        with contextlib.suppress(OSError):
-            if probe_auth.is_symlink() or probe_auth.exists():
-                probe_auth.unlink()
-            probe_auth.symlink_to(real_auth)
+    # The bridge skips files that already exist, and config.toml is copied
+    # (not symlinked), so drop the copy to re-read an edited source config.
+    with contextlib.suppress(OSError):
+        (home / "config.toml").unlink(missing_ok=True)
+    _populate_codex_home_config(home, _codex_home_config_source_from_env(), minimal_config=True)
     return home
 
 
@@ -986,21 +1027,32 @@ async def probe_codex_model_options(*, codex_path: str | None = None) -> list[_J
     return mark_launch_default(rows, pinned_model)
 
 
-def codex_catalog_fingerprint(launch: NativeCodexLaunch) -> str:
-    """The launch-config fingerprint keying codex's shared model catalog.
+def codex_catalog_fingerprint(launch: NativeCodexLaunch, *, codex_path: str | None = None) -> str:
+    """The launch fingerprint keying codex's shared model catalog.
 
     One formula for every consumer (host boot probe, runner launch, live
     write-back), so they read and write the same catalog file. Callers
     fingerprint the SHAPE — a ``model=None`` resolution — so per-session
     picks never fragment the catalog.
 
+    The Codex executable is part of the key. The catalog holds that
+    binary's own answer, so an upgraded CLI must re-probe instead of
+    serving model names the previous release printed. The binary is
+    resolved the same way the probe launches it.
+
     :param launch: The resolved launch (``resolve_native_codex_launch``).
+    :param codex_path: Optional Codex executable override, matching the
+        one the caller's probe would launch.
     :returns: A stable fingerprint string.
     """
-    from omnigent.model_catalog_store import fingerprint_of
+    from omnigent.model_catalog_store import binary_identity, fingerprint_of
 
     return fingerprint_of(
-        "codex-native", launch.profile, launch.model, tuple(launch.config_overrides)
+        "codex-native",
+        launch.profile,
+        launch.model,
+        tuple(launch.config_overrides),
+        binary_identity(codex_path or _find_codex_cli()),
     )
 
 
@@ -1022,22 +1074,26 @@ async def codex_launch_catalog(*, codex_path: str | None = None) -> list[_JsonOb
     except Exception:  # noqa: BLE001 — a broken provider config means no catalog
         _logger.warning("codex catalog: launch shape resolution failed", exc_info=True)
         return None
-    fingerprint = codex_catalog_fingerprint(launch)
+    fingerprint = codex_catalog_fingerprint(launch, codex_path=codex_path)
 
     async def _probe() -> list[_JsonObject] | None:
         try:
             return await probe_codex_model_options(codex_path=codex_path)
         except Exception:  # noqa: BLE001 — probe failure means "no catalog", never a crash
-            _logger.warning("codex catalog probe failed", exc_info=True)
+            # Best-effort probe re-run on every catalog fetch; log once so a
+            # persistently failing probe doesn't flood the logs.
+            log_once(_logger, logging.WARNING, "codex catalog probe failed", exc_info=True)
             return None
 
     return await model_catalog_store.ensure_catalog("codex-native", fingerprint, _probe)
 
 
-async def codex_launch_catalog_is_stale() -> bool:
+async def codex_launch_catalog_is_stale(*, codex_path: str | None = None) -> bool:
     """
     Whether the default launch shape's stored catalog is past the TTL.
 
+    :param codex_path: Optional Codex executable override, matching the
+        one :func:`codex_launch_catalog` would probe with.
     :returns: ``True`` when the store holds only a stale entry; ``False``
         when it is fresh, absent, or the launch shape cannot resolve.
     """
@@ -1047,7 +1103,9 @@ async def codex_launch_catalog_is_stale() -> bool:
         launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
     except Exception:  # noqa: BLE001 — a broken provider config means no catalog
         return False
-    return model_catalog_store.catalog_is_stale("codex-native", codex_catalog_fingerprint(launch))
+    return model_catalog_store.catalog_is_stale(
+        "codex-native", codex_catalog_fingerprint(launch, codex_path=codex_path)
+    )
 
 
 def _build_native_codex_app_server_argv(
@@ -1074,8 +1132,9 @@ class CodexNativeAppServer:
     :param codex_home: Private per-session ``CODEX_HOME`` path.
     :param env: Environment for the app-server subprocess.
     :param config_overrides: Codex ``-c`` config override values.
-    :param developer_instructions: Optional framework-owned instructions
-        appended to the private session config before app-server startup.
+    :param developer_instructions: Optional raw ``AgentSpec.instructions``
+        (author-supplied, not framework-composed) appended to the private
+        session config before app-server startup.
     :param cwd: Working directory for the app-server process.
     :param bridge_dir: Native Codex bridge directory, e.g.
         ``Path("~/.omnigent/codex-native/<hash>")``. The policy hook
@@ -1106,6 +1165,14 @@ class CodexNativeAppServer:
         session config before startup. Runner-owned headless sessions set
         this because nobody can answer Codex's project-trust TUI prompt.
         Interactive CLI sessions leave it disabled.
+    :param trust_all_hooks: Whether to persist trust for every merged hook
+        (user hooks included) during :meth:`start`. Runner-owned headless
+        sessions set this because codex ignores their
+        ``--dangerously-bypass-hook-trust`` flag for the startup
+        hook-review screen on a persistent ``resume`` attach; persisted
+        trust keeps that interactive screen from stranding a resumed web
+        session (see :func:`trust_all_codex_hooks`). Interactive CLI
+        sessions leave it disabled so a human reviews their own hooks.
     :param policy_notice_pending: One-shot flag: ``True`` once a degrade
         reason is recorded, until the runner's terminal-ensure handler
         surfaces it to Omnigent (which posts a single durable banner). Prevents
@@ -1135,6 +1202,7 @@ class CodexNativeAppServer:
     process_owner_lock: CodexNativeProcessOwnerLock | None = None
     codex_cli_version: tuple[int, int, int] | None = None
     trust_project: bool = False
+    trust_all_hooks: bool = False
     router_hooks_registered: bool = False
 
     async def start(self) -> None:
@@ -1368,6 +1436,31 @@ class CodexNativeAppServer:
                 except Exception:  # noqa: BLE001 - routing trust never blocks startup
                     _logger.warning(
                         "codex subagent-routing hook trust failed; routing will not be enforced",
+                        exc_info=True,
+                    )
+            # Runner-owned sessions launch the TUI with
+            # ``--dangerously-bypass-hook-trust``, but codex ignores that flag
+            # for the startup hook-review screen on a persistent ``resume``
+            # attach, stranding a resumed web session behind the interactive
+            # "Hooks need review" prompt. Persist trust for every merged hook so
+            # the review finds nothing to review. Best effort: a failure only
+            # risks the review screen reappearing, never blocks startup.
+            if self.trust_all_hooks:
+                try:
+                    still_untrusted = await trust_all_codex_hooks(
+                        client.request, cwd=str(self.cwd)
+                    )
+                    if still_untrusted:
+                        _logger.warning(
+                            "codex hook trust-all left %d hook(s) untrusted; the startup "
+                            "hook-review screen may still appear on resume: %s",
+                            len(still_untrusted),
+                            ", ".join(still_untrusted),
+                        )
+                except Exception:  # noqa: BLE001 - trust-all never blocks startup
+                    _logger.warning(
+                        "codex hook trust-all failed; the startup hook-review screen "
+                        "may appear on resume",
                         exc_info=True,
                     )
         except RuntimeError as exc:
@@ -1702,19 +1795,22 @@ def _write_codex_policy_hooks_file(
     _ = write_codex_hooks_file(codex_home, payloads, user_hooks_source=user_hooks_source)
 
 
-def _our_hooks_from_list(listed: _JsonObject, cwd: str, module: str) -> list[_JsonObject]:
+def _our_hooks_from_list(listed: _JsonObject, cwd: str, module: str | None) -> list[_JsonObject]:
     """
-    Extract the hooks for *cwd* whose command runs *module*.
+    Extract the hooks for *cwd*, optionally only those running *module*.
 
-    Filtering by module keeps the trust step from ever touching hooks the
-    user's own ``hooks.json`` contributed to the merged file.
+    Filtering by module keeps a trust step from ever touching hooks the
+    user's own ``hooks.json`` contributed to the merged file. Pass
+    ``module=None`` to return every hook for *cwd* (used by the
+    runner-owned trust-all pass, which deliberately covers user hooks —
+    see :func:`trust_all_codex_hooks`).
 
     :param listed: Parsed ``hooks/list`` response envelope, with
         ``result.data`` a list of ``{cwd, hooks: [...]}`` entries.
     :param cwd: The cwd whose hook set to read, e.g.
         ``"/home/user/repo"``.
-    :param module: Hook-script module marker, e.g.
-        ``"omnigent.codex_native_hook"``.
+    :param module: Hook-script module marker to filter on, e.g.
+        ``"omnigent.codex_native_hook"``; ``None`` returns all hooks.
     :returns: The matching hook metadata dicts (possibly empty), each
         with ``key``, ``currentHash``, ``trustStatus``.
     """
@@ -1730,7 +1826,7 @@ def _our_hooks_from_list(listed: _JsonObject, cwd: str, module: str) -> list[_Js
                 hook
                 for raw_hook in hooks
                 if (hook := _string_object_dict(raw_hook)) is not None
-                and module in str(hook.get("command", ""))
+                and (module is None or module in str(hook.get("command", "")))
             ]
     return []
 
@@ -1911,6 +2007,57 @@ async def trust_codex_router_hooks(request: CodexRequestFn, *, cwd: str) -> list
         len(ours),
         ", ".join(sorted(str(h.get("eventName")) for h in ours)),
     )
+    return []
+
+
+async def trust_all_codex_hooks(request: CodexRequestFn, *, cwd: str) -> list[str]:
+    """
+    Persist trust for every hook discovered for *cwd*, user hooks included.
+
+    Runner-owned native sessions launch the TUI with
+    ``--dangerously-bypass-hook-trust``, which already runs every enabled
+    hook regardless of trust state. But codex only honors that flag for the
+    interactive startup hook-review *screen* when the session is not a
+    persistent resume: it computes ``bypass_hook_trust && !is_persistent_resume``,
+    and an Omnigent ``resume <thread_id> --remote`` attach is a persistent
+    resume. So a resumed web/headless session drops back to the interactive
+    "Hooks need review" screen that nobody can answer, stranding the queued
+    chat message. Persisting trust for the merged hooks (the same
+    ``hooks/list`` -> ``config/batchWrite`` flow the TUI's own "Trust all"
+    button uses) makes codex's startup review find nothing to review, so the
+    screen never appears — on a fresh launch or a resume alike.
+
+    This is not a new trust surface: these sessions already execute the very
+    same hooks unconditionally via the bypass flag. It only makes the
+    persisted trust state match that already-chosen behavior. Interactive
+    ``omnigent codex`` sessions never call this — a human at the terminal
+    reviews their own new or changed hooks.
+
+    Best-effort: a trust failure here only means the review screen may still
+    appear, so it returns the still-untrusted keys instead of raising.
+
+    :param request: Bound app-server JSON-RPC request coroutine, e.g.
+        ``client.request``.
+    :param cwd: The session cwd the hooks are scoped to, e.g.
+        ``"/home/user/repo"``.
+    :returns: Keys of hooks still untrusted afterwards; empty when every
+        discovered hook is trusted (or none are).
+    """
+    listed = await request("hooks/list", {"cwds": [cwd]})
+    all_hooks = _our_hooks_from_list(listed, cwd, None)
+    untrusted = [h for h in all_hooks if h.get("trustStatus") not in _TRUSTED_HOOK_STATUSES]
+    if not untrusted:
+        return []
+    await _persist_hook_trust(request, untrusted)
+    relisted = await request("hooks/list", {"cwds": [cwd]})
+    still_untrusted = [
+        h
+        for h in _our_hooks_from_list(relisted, cwd, None)
+        if h.get("trustStatus") not in _TRUSTED_HOOK_STATUSES
+    ]
+    if still_untrusted:
+        return [str(h.get("key")) for h in still_untrusted]
+    _logger.info("codex hook trust-all: trusted %d hook(s) for cwd %s", len(untrusted), cwd)
     return []
 
 
@@ -2138,6 +2285,7 @@ def build_codex_native_server(
     developer_instructions: str | None = None,
     bypass_sandbox: bool = False,
     trust_project: bool = False,
+    trust_all_hooks: bool = False,
 ) -> CodexNativeAppServer:
     """
     Build a configured native Codex app-server process wrapper.
@@ -2162,8 +2310,9 @@ def build_codex_native_server(
     :param extra_config_overrides: Additional ``-c`` config overrides
         appended after Databricks routing overrides, e.g. MCP server
         registration for the Omnigent tool relay.
-    :param developer_instructions: Optional framework-owned instructions
-        appended to Codex's private per-session config.
+    :param developer_instructions: Optional raw ``AgentSpec.instructions``
+        (author-supplied, not framework-composed) appended to Codex's
+        private per-session config.
     :param bypass_sandbox: When ``True``, append config overrides that put
         the app-server's threads into the full-bypass stance
         (``approval_policy="never"`` + ``sandbox_mode="danger-full-access"``)
@@ -2175,6 +2324,12 @@ def build_codex_native_server(
     :param trust_project: Whether to trust ``cwd`` in the private session
         config before app-server startup. Intended for runner-owned headless
         sessions whose hidden TUI cannot answer Codex's project-trust prompt.
+    :param trust_all_hooks: Whether to persist trust for every merged hook
+        during startup. Intended for runner-owned headless sessions whose
+        ``--dangerously-bypass-hook-trust`` flag codex ignores for the
+        startup hook-review screen on a persistent ``resume`` attach (see
+        :func:`trust_all_codex_hooks`). Interactive CLI sessions leave it
+        disabled so a human reviews their own new or changed hooks.
     :returns: Configured app-server process wrapper.
     :raises ImportError: If no Codex CLI is available.
     :raises OSError: If Databricks routing was requested but no
@@ -2237,6 +2392,7 @@ def build_codex_native_server(
         python_executable=python_executable,
         pinned_model=pinned_model,
         trust_project=trust_project,
+        trust_all_hooks=trust_all_hooks,
     )
 
 
@@ -2258,12 +2414,18 @@ class NativeCodexLaunch:
         outcome (provider / profile / model, or the login-fallback state),
         set at resolution time and surfaced in the startup-timeout error so
         hosted users can diagnose without runner-log access (see #2745).
+    :param login_required: ``True`` when the launch defers to Codex's own
+        login while no usable stored credential exists — the TUI will park
+        on the sign-in screen and never start a thread on its own. Lets a
+        headless caller fail the turn fast with an actionable error instead
+        of burning the thread-start timeout.
     """
 
     config_overrides: list[str]
     model: str | None
     profile: str | None
     summary: str = ""
+    login_required: bool = False
 
 
 _MODEL_PROVIDER_OVERRIDE_PREFIX = "model_provider="
@@ -2582,6 +2744,21 @@ def _first_routable_codex_provider(
     return None
 
 
+def _codex_login_usable() -> bool:
+    """Whether Codex's own stored login can carry a launch that defers to it.
+
+    Reads the same ``auth.json`` the launched Codex process will use (the
+    bridged ``CODEX_HOME`` source), so a login-fallback launch can be marked
+    doomed (``login_required``) only when the sign-in screen is genuinely
+    what the TUI will render.
+
+    :returns: ``True`` when a usable stored credential exists.
+    """
+    from omnigent.onboarding.ambient import codex_auth_has_credential
+
+    return codex_auth_has_credential(_codex_home_config_source_from_env() / "auth.json")
+
+
 def _resolve_subscription_launch(
     entry: ProviderEntry, model: str | None, explicit: dict[str, object]
 ) -> NativeCodexLaunch:
@@ -2603,19 +2780,14 @@ def _resolve_subscription_launch(
         providers.
     :returns: The resolved :class:`NativeCodexLaunch`.
     """
-    from omnigent.onboarding.ambient import codex_auth_has_credential
-
     # Pin codex's built-in ``openai`` provider: the bridged config.toml may
     # set a custom default ``model_provider`` (e.g. isaac's Databricks AI
     # Gateway), which would silently hijack a Subscription selection. A
     # no-op when the user's config sets no custom default.
     subscription_overrides = ['model_provider="openai"']
-    # Resolve against the same CODEX_HOME the native server bridges from
-    # (``_populate_codex_home_config``) so this "is Codex logged in?" check reads
-    # the exact auth.json the launched Codex process will use.
-    real_codex_home = _codex_home_config_source_from_env()
-    if codex_auth_has_credential(real_codex_home / "auth.json"):
-        _logger.info(
+    if _codex_login_usable():
+        log_info_once(
+            _logger,
             "native-codex routing: Codex CLI login (subscription provider %r; Codex is logged in)",
             entry.name,
         )
@@ -2628,7 +2800,8 @@ def _resolve_subscription_launch(
     fallback = _first_routable_codex_provider(explicit, exclude=entry.name, model=model)
     if fallback is not None:
         return fallback
-    _logger.info(
+    log_info_once(
+        _logger,
         "native-codex routing: Codex CLI login (subscription provider %r has no usable "
         "Codex login and no alternative provider is configured)",
         entry.name,
@@ -2642,6 +2815,7 @@ def _resolve_subscription_launch(
             "login and no alternative provider is configured) — the TUI likely renders "
             "the sign-in screen and never starts a thread"
         ),
+        login_required=True,
     )
 
 
@@ -2741,9 +2915,8 @@ def resolve_native_codex_launch(
                 # (:func:`_resolve_subscription_launch`) — never do that for
                 # an explicit spec declaration: silently running a credential
                 # the spec did not name is worse than the login screen.
-                from omnigent.onboarding.ambient import codex_auth_has_credential
-
-                if codex_auth_has_credential(_codex_home_config_source_from_env() / "auth.json"):
+                spec_codex_logged_in = _codex_login_usable()
+                if spec_codex_logged_in:
                     state = "Codex is logged in"
                 else:
                     state = (
@@ -2755,16 +2928,19 @@ def resolve_native_codex_launch(
                     model=model,
                     profile=None,
                     summary=f"Codex CLI login (spec provider {spec_entry.name!r}; {state})",
+                    login_required=not spec_codex_logged_in,
                 )
             launch = _codex_provider_launch(spec_entry, model)
             if launch is not None:
                 if launch.profile is not None:
-                    _logger.info(
+                    log_info_once(
+                        _logger,
                         "native-codex routing: Databricks ucode profile %r (spec auth)",
                         launch.profile,
                     )
                 else:
-                    _logger.info(
+                    log_info_once(
+                        _logger,
                         "native-codex routing: provider %r (spec auth, model=%s)",
                         spec_entry.name,
                         launch.model,
@@ -2793,6 +2969,7 @@ def resolve_native_codex_launch(
                 model=model,
                 profile=None,
                 summary="Codex CLI login (global auth block, non-Databricks; no provider routing)",
+                login_required=not _codex_login_usable(),
             )
         entry = default_provider_for_harness(effective_config_with_detected(explicit), "codex")
 
@@ -2809,7 +2986,8 @@ def resolve_native_codex_launch(
         # This keeps rollout metadata, app-server, and remote TUI routing on
         # one immutable provider selection during cold resume.
         provider_id = config_detection.model_provider
-        _logger.info(
+        log_info_once(
+            _logger,
             "native-codex routing: config.toml provider %r (ambient fallback, model=%s)",
             provider_id,
             model,
@@ -2822,10 +3000,11 @@ def resolve_native_codex_launch(
         )
 
     if entry is None:
-        _logger.info(
+        log_info_once(
+            _logger,
             "native-codex routing: Codex CLI login (no provider configured for the Codex "
             "harness, no Databricks profile). Run `omnigent setup --no-internal-beta` to route "
-            "through a provider."
+            "through a provider.",
         )
         return NativeCodexLaunch(
             config_overrides=no_provider_overrides,
@@ -2834,9 +3013,10 @@ def resolve_native_codex_launch(
             summary=(
                 "Codex CLI login (no provider configured for the codex harness, no "
                 "Databricks profile) — the TUI likely renders the ChatGPT sign-in "
-                "screen and never starts a thread; run `omnigent setup` to route through "
-                "a provider"
+                f"screen and never starts a thread; run `{cli_invocation()} setup` "
+                "to route through a provider"
             ),
+            login_required=not _codex_login_usable(),
         )
     if entry.kind == SUBSCRIPTION_KIND:
         return _resolve_subscription_launch(entry, model, explicit)
@@ -2844,9 +3024,13 @@ def resolve_native_codex_launch(
     launch = _codex_provider_launch(entry, model)
     if launch is not None:
         if launch.profile is not None:
-            _logger.info("native-codex routing: Databricks ucode profile %r", launch.profile)
+            log_info_once(
+                _logger, "native-codex routing: Databricks ucode profile %r", launch.profile
+            )
         else:
-            _logger.info("native-codex routing: provider %r (model=%s)", entry.name, launch.model)
+            log_info_once(
+                _logger, "native-codex routing: provider %r (model=%s)", entry.name, launch.model
+            )
         return launch
     # Default provider can't route on its own (no openai surface / no usable
     # credential / unresolvable secret) → Codex's own login.
@@ -2864,6 +3048,7 @@ def resolve_native_codex_launch(
             "usable openai credential) — the TUI likely renders the sign-in screen "
             "and never starts a thread"
         ),
+        login_required=not _codex_login_usable(),
     )
 
 

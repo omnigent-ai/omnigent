@@ -783,6 +783,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         message: event.error.message,
         source: event.source,
         code: event.error.code,
+        ...(event.error.level ? { level: event.error.level } : {}),
         ...structuredErrorFields(event.error),
       } satisfies ErrorBlock;
       return;
@@ -871,6 +872,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         codexCommand: event.codexCommand,
         allowAllEdits: event.allowAllEdits,
         rememberScope: event.rememberScope,
+        codexPersistModes: event.codexPersistModes,
       } satisfies ElicitationBlock;
       return;
     }

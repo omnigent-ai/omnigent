@@ -1,7 +1,6 @@
 import { Loader2Icon, MessagesSquareIcon, TerminalIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { isIOSShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import { useTerminalFirst } from "./TerminalFirstContext";
 
@@ -14,13 +13,15 @@ import { useTerminalFirst } from "./TerminalFirstContext";
  *
  * Self-gates to null when there's nothing to toggle:
  *   - non-terminal-first sessions,
- *   - the iOS shell (the switcher is the native Liquid Glass bar there),
  *   - a rail-opened shell owning the main view (isShellView) — its own
  *     close affordance is the way back to chat.
+ *
+ * Renders on every shell, including iOS — the native bottom pill is retired
+ * (AppShell pushes it hidden at boot), so the header is the one placement.
  */
 export function ViewModeToggle() {
   const ctx = useTerminalFirst();
-  if (!ctx || !ctx.isTerminalFirst || ctx.isShellView || isIOSShell()) return null;
+  if (!ctx || !ctx.isTerminalFirst || ctx.isShellView) return null;
 
   const { view, setView, terminalStartingUp } = ctx;
   const terminalLabel = terminalStartingUp ? "Terminal is starting up…" : "Terminal view";
@@ -30,6 +31,9 @@ export function ViewModeToggle() {
       role="group"
       aria-label="Switch between chat and terminal"
       data-testid="view-mode-toggle"
+      // Lets the mobile header pill inset itself only when this segmented
+      // track is present — see MOBILE_GLASS_PILL.
+      data-slot="view-mode-toggle"
       // Inset track: p-0.5 around two size-6 segments lands the control at
       // 32px tall, matching the header's other controls.
       className="flex items-center gap-0.5 rounded-[var(--radius-lg)] bg-muted/60 p-0.5"

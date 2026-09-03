@@ -1212,22 +1212,21 @@ async def _drive_remembers_last_picked_host(base_url: str, session_id: str) -> N
             await browser.close()
 
 
-def test_start_session_waits_for_refreshed_remembered_host(
+def test_start_session_preserves_unavailable_remembered_host(
     seeded_session: tuple[str, str],
 ) -> None:
-    """Cached Mac-only hosts do not displace a remembered VM during refresh."""
+    """Mac-only host snapshots do not displace a remembered VM."""
     base_url, session_id = seeded_session
-    _run_in_fresh_loop(_drive_waits_for_refreshed_remembered_host(base_url, session_id))
+    _run_in_fresh_loop(_drive_preserves_unavailable_remembered_host(base_url, session_id))
 
 
-async def _drive_waits_for_refreshed_remembered_host(base_url: str, session_id: str) -> None:
+async def _drive_preserves_unavailable_remembered_host(base_url: str, session_id: str) -> None:
     alpha_id, _alpha_name = _HOST_ALPHA
     beta_id, beta_name = _HOST_BETA
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
         page = await browser.new_page()
-        release_refresh = asyncio.Event()
-        route_state = {"delay_refresh": False, "initial_requests": 0}
+        route_state = {"include_remembered": False, "requests": 0}
         try:
             create_bodies: list[dict[str, Any]] = []
             await _register_common_routes(
@@ -1235,12 +1234,11 @@ async def _drive_waits_for_refreshed_remembered_host(base_url: str, session_id: 
             )
 
             async def handle_hosts(route: Route) -> None:
-                if route_state["delay_refresh"]:
-                    await release_refresh.wait()
-                    body = _two_hosts_body()
-                else:
-                    route_state["initial_requests"] += 1
-                    body = json.dumps(
+                route_state["requests"] += 1
+                body = (
+                    _two_hosts_body()
+                    if route_state["include_remembered"]
+                    else json.dumps(
                         {
                             "hosts": [
                                 {
@@ -1252,6 +1250,7 @@ async def _drive_waits_for_refreshed_remembered_host(base_url: str, session_id: 
                             ]
                         }
                     )
+                )
                 await route.fulfill(status=200, content_type="application/json", body=body)
 
             # Registered after the common route so this stateful handler wins.
@@ -1267,19 +1266,25 @@ async def _drive_waits_for_refreshed_remembered_host(base_url: str, session_id: 
             # stub exposes only the Mac. No landing draft exists on this path.
             await page.goto(f"{base_url}/c/{session_id}")
             await page.get_by_test_id("new-chat-button").wait_for(state="visible", timeout=30_000)
-            await _wait_until(lambda: route_state["initial_requests"] >= 2)
+            await _wait_until(lambda: route_state["requests"] >= 2)
 
-            # NewChat mounts with cached Mac-only data and immediately starts a
-            # fresh request. Hold it so the intermediate choice is observable.
-            route_state["delay_refresh"] = True
+            # NewChat mounts with cached Mac-only data and completes another
+            # Mac-only request. Neither snapshot may silently replace the saved
+            # VM with the local default.
+            requests_before_open = route_state["requests"]
             await page.get_by_test_id("new-chat-button").click()
             chip = page.get_by_test_id("new-chat-landing-host-chip")
+            await _wait_until(lambda: route_state["requests"] > requests_before_open)
             await expect(chip).to_contain_text("Choose host")
 
-            release_refresh.set()
+            # A later host refresh reports the continuously preferred VM again.
+            # The empty slot lets that saved choice heal automatically.
+            route_state["include_remembered"] = True
+            requests_before_focus = route_state["requests"]
+            await page.evaluate("window.dispatchEvent(new Event('visibilitychange'))")
+            await _wait_until(lambda: route_state["requests"] > requests_before_focus)
             await expect(chip).to_contain_text(beta_name)
         finally:
-            release_refresh.set()
             await browser.close()
 
 

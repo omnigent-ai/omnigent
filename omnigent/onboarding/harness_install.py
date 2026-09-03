@@ -50,6 +50,7 @@ from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import resolve_cli_binary
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+from omnigent.cli_invocation import cli_invocation
 from omnigent.harness_install_spec import HarnessInstallSpec, SetupStep
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 from omnigent.opencode_native_client import (
@@ -126,6 +127,7 @@ _KIRO_MIN_VERSION = "2.10.0"
 _CLAUDE_MIN_VERSION = "2.1.161"
 _CURSOR_MIN_VERSION = "2026.06.02"
 _KIMI_MIN_VERSION = "0.7.0"
+_ANTIGRAVITY_MIN_VERSION = "1.1.13"
 
 # OpenCode native harness CLI (``opencode serve`` / ``opencode attach``),
 # installed via the ``opencode-ai`` npm package. No login/logout/status argv
@@ -292,6 +294,8 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         status_args=("models",),
         install_hint="curl -fsSL https://antigravity.google/cli/install.sh | bash",
         auth_hint="run `agy` and complete the browser sign-in",
+        # Direct GEMINI_API_KEY authentication first shipped in agy 1.1.13.
+        min_version=_ANTIGRAVITY_MIN_VERSION,
     ),
     GOOSE_KEY: HarnessInstallSpec(
         "Goose",
@@ -697,7 +701,10 @@ def harness_setup_hint(harness: str | None) -> str:
         elif spec.auth_hint:
             login = f", then {spec.auth_hint}"
         return f"install the {spec.binary} CLI on that machine with `{spec.install_hint}`{login}"
-    return "run `omni setup` on that machine to install the CLI and set a default credential"
+    return (
+        f"run `{cli_invocation(name='omni')} setup` on that machine to install "
+        "the CLI and set a default credential"
+    )
 
 
 _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z]+)*)")

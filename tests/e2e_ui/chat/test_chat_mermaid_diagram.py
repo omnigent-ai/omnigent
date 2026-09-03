@@ -73,7 +73,7 @@ def test_unrenderable_diagram_degrades_instead_of_blanking_the_app(
     page.goto(f"{base_url}/c/{session_id}")
 
     # The app is still mounted: the shell renders and the composer is usable.
-    expect(page.get_by_placeholder("Ask the agent anything…")).to_be_visible(timeout=30_000)
+    expect(page.get_by_placeholder("Send a message…")).to_be_visible(timeout=30_000)
     assert page.evaluate("() => document.getElementById('root')?.children.length ?? 0") > 0
 
     # The message's content survives as markdown source rather than vanishing.
