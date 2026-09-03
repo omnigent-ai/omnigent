@@ -6814,8 +6814,11 @@ _DEFAULT_HARNESS_PROMPT = "You are a helpful coding agent running through Omnige
 # operations route through the Omnigent dispatch path (runner
 # visibility, timeouts, error recovery) instead of the harness's
 # internal built-in tools.
+# Membership is tested on the canonical id, so "acp" covers every
+# acp:<slug> launcher: without os_env the runner 404s the session's
+# environment resource and the web UI unmounts the Files panel.
 _OS_ENV_HARNESSES: frozenset[str] = frozenset(
-    {"claude-sdk", "codex", "pi", "qwen", "goose", "kimi"}
+    {"claude-sdk", "codex", "pi", "qwen", "goose", "kimi", "acp"}
 )
 
 
