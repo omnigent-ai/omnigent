@@ -71,6 +71,8 @@ describe("ExtensionViewHost", () => {
     const iframe = await screen.findByTitle("Dashboard");
     expect(iframe).toHaveAttribute("sandbox", "allow-scripts");
     expect(iframe).toHaveAttribute("allow", "");
+    expect(iframe).toHaveClass("min-h-0", "flex-1");
+    expect(iframe.parentElement).toHaveClass("pt-14", "md:pt-12");
     expect(screen.getByRole("status")).toHaveTextContent("Starting extension");
     await waitFor(() => expect(FakeMessageChannel.latest).not.toBeNull());
     act(() => {
