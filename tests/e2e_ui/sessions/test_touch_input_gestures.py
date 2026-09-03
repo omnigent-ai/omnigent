@@ -37,59 +37,14 @@ fixture has no touch support). Touch gestures are dispatched through CDP
 
 from __future__ import annotations
 
-import os
 import time
 
-from playwright.sync_api import Browser, CDPSession, Page, expect
+from playwright.sync_api import Browser, Page, expect
+
+from tests.e2e_ui._touch import new_touch_context, touch, touch_drag
 
 _DESKTOP_VIEWPORT = {"width": 1280, "height": 800}
 _PHONE_VIEWPORT = {"width": 390, "height": 844}
-
-
-def _context_kwargs(**kwargs: object) -> dict:
-    """Context options honoring ``OMNIGENT_E2E_RECORD_DIR``.
-
-    These tests open their own sync contexts (the conftest recording hook
-    only instruments the *async* Browser), so wire ``record_video_dir``
-    through here to keep the journeys filmable.
-    """
-    record_dir = os.environ.get("OMNIGENT_E2E_RECORD_DIR")
-    if record_dir:
-        kwargs.setdefault("record_video_dir", record_dir)
-    return kwargs
-
-
-def _touch_point(x: float, y: float) -> dict:
-    return {"x": round(x), "y": round(y), "radiusX": 2, "radiusY": 2, "force": 1, "id": 1}
-
-
-def _touch_drag(
-    cdp: CDPSession,
-    start: tuple[float, float],
-    offsets: list[tuple[float, float]],
-    *,
-    hold_before_move_s: float = 0.0,
-    step_pause_s: float = 0.03,
-) -> None:
-    """Dispatch a touchStart → touchMove* → touchEnd sequence via CDP.
-
-    Runs through Chromium's gesture recognizer, so the browser applies the
-    same pan/scroll/long-press arbitration a real finger gets.
-    """
-    sx, sy = start
-    cdp.send(
-        "Input.dispatchTouchEvent",
-        {"type": "touchStart", "touchPoints": [_touch_point(sx, sy)]},
-    )
-    if hold_before_move_s:
-        time.sleep(hold_before_move_s)
-    for dx, dy in offsets:
-        cdp.send(
-            "Input.dispatchTouchEvent",
-            {"type": "touchMove", "touchPoints": [_touch_point(sx + dx, sy + dy)]},
-        )
-        time.sleep(step_pause_s)
-    cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
 
 
 def _sidebar_width(page: Page) -> float:
@@ -98,7 +53,7 @@ def _sidebar_width(page: Page) -> float:
     return box["width"]
 
 
-def test_sidebar_resize_handle_supports_touch_drag(
+def test_sidebar_resize_handle_supportstouch_drag(
     browser: Browser,
     seeded_session: tuple[str, str],
 ) -> None:
@@ -113,7 +68,7 @@ def test_sidebar_resize_handle_supports_touch_drag(
     the sidebar widened.
     """
     base_url, session_id = seeded_session
-    context = browser.new_context(**_context_kwargs(viewport=_DESKTOP_VIEWPORT, has_touch=True))
+    context = new_touch_context(browser, viewport=_DESKTOP_VIEWPORT)
     try:
         page = context.new_page()
         page.goto(f"{base_url}/c/{session_id}")
@@ -131,7 +86,7 @@ def test_sidebar_resize_handle_supports_touch_drag(
 
         cdp = context.new_cdp_session(page)
         # Slow, deliberate horizontal pull — well past any slop threshold.
-        _touch_drag(
+        touch_drag(
             cdp,
             (start_x, start_y),
             [(20, 0), (45, 0), (70, 0), (95, 0), (120, 0), (140, 0)],
@@ -164,9 +119,7 @@ def test_session_row_swipe_shows_affordance(
     watches for a session PATCH carrying ``archived``.
     """
     base_url, session_id = seeded_session
-    context = browser.new_context(
-        **_context_kwargs(viewport=_PHONE_VIEWPORT, has_touch=True, is_mobile=True)
-    )
+    context = new_touch_context(browser, viewport=_PHONE_VIEWPORT, is_mobile=True)
     try:
         page = context.new_page()
 
@@ -218,7 +171,7 @@ def test_session_row_swipe_shows_affordance(
         start_y = box["y"] + box["height"] / 2
 
         cdp = context.new_cdp_session(page)
-        _touch_drag(
+        touch_drag(
             cdp,
             (start_x, start_y),
             [(-25, 0), (-55, 0), (-90, 0), (-125, 0), (-160, 0)],
@@ -258,9 +211,7 @@ def test_session_row_long_press_opens_actions_menu(
     to be on screen.
     """
     base_url, session_id = seeded_session
-    context = browser.new_context(
-        **_context_kwargs(viewport=_PHONE_VIEWPORT, has_touch=True, is_mobile=True)
-    )
+    context = new_touch_context(browser, viewport=_PHONE_VIEWPORT, is_mobile=True)
     try:
         page = context.new_page()
         page.goto(f"{base_url}/c/{session_id}?sidebar=open")
@@ -277,19 +228,12 @@ def test_session_row_long_press_opens_actions_menu(
         # long-press threshold, wobbling ±3px like a real fingertip. 3px is
         # well inside the 8px tolerance dnd-kit itself declares for the hold,
         # so a correct gesture owner must still treat this as a long-press.
-        cdp.send(
-            "Input.dispatchTouchEvent",
-            {"type": "touchStart", "touchPoints": [_touch_point(x, y)]},
-        )
+        touch(cdp, "touchStart", x, y)
         for i in range(6):
             time.sleep(0.12)
-            dx = 3 if i % 2 == 0 else -3
-            cdp.send(
-                "Input.dispatchTouchEvent",
-                {"type": "touchMove", "touchPoints": [_touch_point(x + dx, y)]},
-            )
+            touch(cdp, "touchMove", x + (3 if i % 2 == 0 else -3), y)
         time.sleep(0.3)
-        cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+        touch(cdp, "touchEnd")
 
         # The session actions menu (context menu body) must be on screen.
         expect(
@@ -318,9 +262,7 @@ def test_row_actions_reachable_on_touch_tablet(
     visible: the same device gets different touch treatment per component.
     """
     base_url, session_id = seeded_session
-    context = browser.new_context(
-        **_context_kwargs(viewport={"width": 1024, "height": 768}, has_touch=True)
-    )
+    context = new_touch_context(browser, viewport={"width": 1024, "height": 768})
     try:
         page = context.new_page()
         page.goto(f"{base_url}/c/{session_id}")

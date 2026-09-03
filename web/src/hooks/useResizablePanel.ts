@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
-import { createResizableWidthStore, useResizableWidthSnapshot } from "@/hooks/resizableWidthStore";
+import {
+  arrowResizeDelta,
+  createPersistedWidthStore,
+  useResizableWidthSnapshot,
+} from "@/hooks/resizableWidthStore";
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizeDrag } from "@/hooks/useResizeDrag";
-import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 
 const MIN_WIDTH_PX = 320;
 const MAX_WIDTH_RATIO = 0.8; // 80% of viewport
@@ -45,13 +48,11 @@ function clampWidth(w: number, minPx = MIN_WIDTH_PX): number {
 // independent default, which feels like the chat is jumping width
 // for no reason. ``null`` means "not yet set — fall back to the
 // caller's default (vw-based)". The first drag persists a px value.
-const widthStore = createResizableWidthStore(readPanelSizePreference("pushPanelWidthPx"), (width) =>
-  writePanelSizePreference("pushPanelWidthPx", width),
-);
+const widthStore = createPersistedWidthStore("pushPanelWidthPx");
 
 /** Reset module-level width state from localStorage. Only for tests. */
 export function resetSharedWidthStoreForTesting(): void {
-  widthStore.reset(readPanelSizePreference("pushPanelWidthPx"));
+  widthStore.resetForTesting();
 }
 
 /**
@@ -111,18 +112,11 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
     minWidthPx,
   );
 
-  // Cancellation restores the pre-drag width: onMove writes the live store on
-  // every pointermove, so an abort (Escape, blur, …) must undo those writes.
-  const dragStartWidth = useRef<number | null>(null);
   const resizeDrag = useResizeDrag({
     enabled: open && isDesktop,
     overlay: true,
-    onStart: useCallback(() => {
-      dragStartWidth.current = widthStore.getSnapshot();
-    }, []),
-    onCancel: useCallback(() => {
-      widthStore.set(dragStartWidth.current);
-    }, []),
+    onStart: widthStore.beginDrag,
+    onCancel: widthStore.rollbackDrag,
     onCommit: widthStore.persist,
     onMove: useCallback((e: React.PointerEvent<HTMLElement>) => {
       widthStore.set(clampWidth(window.innerWidth - e.clientX, minWidthRef.current));
@@ -133,20 +127,12 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
       if (!open || !isDesktop) return;
-      const step = 20;
-      if (e.key === "ArrowLeft") {
-        e.preventDefault();
-        widthStore.set(
-          (prev) => clampWidth((prev ?? resolvedWidth) + step, minWidthRef.current),
-          true,
-        );
-      } else if (e.key === "ArrowRight") {
-        e.preventDefault();
-        widthStore.set(
-          (prev) => clampWidth((prev ?? resolvedWidth) - step, minWidthRef.current),
-          true,
-        );
-      }
+      const delta = arrowResizeDelta(e, "ArrowLeft");
+      if (delta === null) return;
+      widthStore.set(
+        (prev) => clampWidth((prev ?? resolvedWidth) + delta, minWidthRef.current),
+        true,
+      );
     },
     [open, isDesktop, resolvedWidth],
   );

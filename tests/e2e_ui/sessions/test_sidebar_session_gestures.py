@@ -12,7 +12,9 @@ import time
 import uuid
 
 import httpx
-from playwright.sync_api import Browser, BrowserContext, CDPSession, Locator, Page, expect
+from playwright.sync_api import Browser, BrowserContext, Locator, Page, expect
+
+from tests.e2e_ui._touch import center, new_touch_context, touch
 
 _MOBILE_VIEWPORT = {"width": 390, "height": 844}
 _UNEXPECTED_EVENT_SCRIPT = """
@@ -40,26 +42,9 @@ for (const type of ['dragstart', 'pointercancel']) {
 
 
 def _new_touch_context(browser: Browser) -> BrowserContext:
-    context = browser.new_context(
-        has_touch=True,
-        is_mobile=True,
-        viewport=_MOBILE_VIEWPORT,
-    )
+    context = new_touch_context(browser, is_mobile=True, viewport=_MOBILE_VIEWPORT)
     context.add_init_script(_UNEXPECTED_EVENT_SCRIPT)
     return context
-
-
-def _touch(
-    cdp: CDPSession, event_type: str, x: float | None = None, y: float | None = None
-) -> None:
-    points = [] if x is None or y is None else [{"x": x, "y": y}]
-    cdp.send("Input.dispatchTouchEvent", {"type": event_type, "touchPoints": points})
-
-
-def _center(locator: Locator) -> tuple[float, float]:
-    box = locator.bounding_box()
-    assert box is not None, "element has no touchable bounding box"
-    return box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
 
 
 def _unexpected_events(page: Page) -> list[str]:
@@ -106,26 +91,26 @@ def test_released_swipe_archives_without_navigating_and_stationary_tap_navigates
         page.goto(f"{base_url}/?sidebar=open")
         link = _row_link(page, session_id)
         expect(link).to_be_visible()
-        x, y = _center(link)
+        x, y = center(link)
 
         cdp = page.context.new_cdp_session(page)
         try:
-            _touch(cdp, "touchStart", x, y)
-            _touch(cdp, "touchEnd")
+            touch(cdp, "touchStart", x, y)
+            touch(cdp, "touchEnd")
             page.wait_for_url(f"**/c/{session_id}")
 
             page.goto(f"{base_url}/?sidebar=open")
             link = _row_link(page, session_id)
             expect(link).to_be_visible()
             row = link.locator("xpath=ancestor::li[1]")
-            x, y = _center(link)
-            _touch(cdp, "touchStart", x, y)
+            x, y = center(link)
+            touch(cdp, "touchStart", x, y)
             for offset in (16, 32, 50, 74, 90):
-                _touch(cdp, "touchMove", x - offset, y)
+                touch(cdp, "touchMove", x - offset, y)
                 page.wait_for_timeout(25)
             expect(row).to_have_class(re.compile(r"\bmx-1\b"))
             assert _unexpected_events(page) == []
-            _touch(cdp, "touchEnd")
+            touch(cdp, "touchEnd")
         finally:
             cdp.detach()
 
@@ -176,23 +161,20 @@ def test_still_touch_opens_session_context_menu_without_dragging(
 
         cdp = page.context.new_cdp_session(page)
         try:
-            cdp.send(
-                "Input.dispatchTouchEvent",
-                {"type": "touchStart", "touchPoints": [{"x": x, "y": y}]},
-            )
+            touch(cdp, "touchStart", x, y)
 
             # The hold arms, lifts the row, and opens exactly one menu without
             # starting either native link drag or dnd-kit drag.
             expect(row).to_have_class(re.compile(r"\bscale-\[1\.01\]"), timeout=2000)
             expect(row).not_to_have_class(re.compile(r"\bopacity-40\b"))
             expect(page.get_by_test_id("rename-conversation")).to_have_count(1)
-            _touch(cdp, "touchMove", x + 1, y)
+            touch(cdp, "touchMove", x + 1, y)
             page.wait_for_timeout(100)
             expect(page.get_by_test_id("rename-conversation")).to_have_count(1)
             assert _unexpected_events(page) == []
             assert link.evaluate("element => element.draggable") is False
 
-            cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+            touch(cdp, "touchEnd")
             expect(page.get_by_test_id("rename-conversation")).to_have_count(1, timeout=2000)
             expect(row).not_to_have_class(re.compile(r"\bopacity-40\b"))
             assert page.evaluate("window.__rowGestureUnexpected") == []
@@ -234,17 +216,11 @@ def test_vertical_touch_scroll_still_works_on_session_row(
 
         cdp = page.context.new_cdp_session(page)
         try:
-            cdp.send(
-                "Input.dispatchTouchEvent",
-                {"type": "touchStart", "touchPoints": [{"x": x, "y": y}]},
-            )
+            touch(cdp, "touchStart", x, y)
             for offset in (20, 45, 70, 95, 120):
-                cdp.send(
-                    "Input.dispatchTouchEvent",
-                    {"type": "touchMove", "touchPoints": [{"x": x, "y": y - offset}]},
-                )
+                touch(cdp, "touchMove", x, y - offset)
                 page.wait_for_timeout(20)
-            cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+            touch(cdp, "touchEnd")
         finally:
             cdp.detach()
 
@@ -277,28 +253,28 @@ def test_horizontal_swipe_wins_before_hold_while_vertical_motion_yields_to_scrol
         link = _row_link(page, session_id)
         expect(link).to_be_visible()
         row = link.locator("xpath=ancestor::li[1]")
-        x, y = _center(link)
+        x, y = center(link)
         # Freeze app timers without pausing the renderer that receives CDP input.
         pause_at = page.evaluate("new Date(Date.now() + 5000).toISOString()")
         page.clock.pause_at(pause_at)
 
         cdp = page.context.new_cdp_session(page)
         try:
-            _touch(cdp, "touchStart", x, y)
+            touch(cdp, "touchStart", x, y)
             page.clock.run_for(350)
             expect(page.get_by_test_id("rename-conversation")).to_have_count(0)
             expect(row).not_to_have_class(re.compile(r"\bscale-\[1\.01\]\b"))
             expect(row).not_to_have_class(re.compile(r"\bopacity-40\b"))
-            _touch(cdp, "touchMove", x - 11, y)
+            touch(cdp, "touchMove", x - 11, y)
             page.clock.run_for(1)
             expect(row).not_to_have_class(re.compile(r"\bmx-1\b"))
-            _touch(cdp, "touchMove", x - 13, y)
+            touch(cdp, "touchMove", x - 13, y)
             page.clock.run_for(1)
             expect(row).to_have_class(re.compile(r"\bmx-1\b"))
             page.clock.run_for(500)
             expect(page.get_by_test_id("rename-conversation")).to_have_count(0)
             expect(row).not_to_have_class(re.compile(r"\bscale-\[1\.01\]\b"))
-            _touch(cdp, "touchEnd")
+            touch(cdp, "touchEnd")
         finally:
             cdp.detach()
 
@@ -323,27 +299,27 @@ def test_pointercancel_resets_menu_and_drag_then_allows_another_hold(
         link = _row_link(page, session_id)
         expect(link).to_be_visible()
         row = link.locator("xpath=ancestor::li[1]")
-        x, y = _center(link)
+        x, y = center(link)
 
         cdp = page.context.new_cdp_session(page)
         try:
-            _touch(cdp, "touchStart", x, y)
+            touch(cdp, "touchStart", x, y)
             expect(page.get_by_test_id("rename-conversation")).to_have_count(1, timeout=2000)
-            _touch(cdp, "touchCancel")
+            touch(cdp, "touchCancel")
             expect(page.get_by_test_id("rename-conversation")).to_have_count(0)
             expect(row).not_to_have_class(re.compile(r"\bscale-\[1\.01\]\b"))
 
-            _touch(cdp, "touchStart", x, y)
+            touch(cdp, "touchStart", x, y)
             expect(page.get_by_test_id("rename-conversation")).to_have_count(1, timeout=2000)
-            _touch(cdp, "touchMove", x, y + 12)
+            touch(cdp, "touchMove", x, y + 12)
             expect(page.get_by_test_id("rename-conversation")).to_have_count(0)
             expect(row).to_have_class(re.compile(r"\bopacity-40\b"))
-            _touch(cdp, "touchCancel")
+            touch(cdp, "touchCancel")
             expect(row).not_to_have_class(re.compile(r"\bopacity-40\b"))
 
-            _touch(cdp, "touchStart", x, y)
+            touch(cdp, "touchStart", x, y)
             expect(page.get_by_test_id("rename-conversation")).to_have_count(1, timeout=2000)
-            _touch(cdp, "touchEnd")
+            touch(cdp, "touchEnd")
         finally:
             cdp.detach()
 
@@ -367,14 +343,14 @@ def test_lost_pointer_capture_resets_swipe_and_allows_another_swipe(
         link = _row_link(page, session_id)
         expect(link).to_be_visible()
         row = link.locator("xpath=ancestor::li[1]")
-        x, y = _center(link)
+        x, y = center(link)
 
         cdp = page.context.new_cdp_session(page)
         try:
-            _touch(cdp, "touchStart", x, y)
-            _touch(cdp, "touchMove", x - 40, y)
+            touch(cdp, "touchStart", x, y)
+            touch(cdp, "touchMove", x - 40, y)
             expect(row).to_have_class(re.compile(r"\bmx-1\b"))
-            _touch(cdp, "touchMove", x - 41, y)
+            touch(cdp, "touchMove", x - 41, y)
             page.wait_for_function("window.__rowGestureCaptureEvents.length > 0")
             assert page.evaluate("window.__rowGestureCaptureEvents")[0]["target"] == "SPAN"
             capture = row.evaluate(
@@ -392,7 +368,7 @@ def test_lost_pointer_capture_resets_swipe_and_allows_another_swipe(
                 }"""
             )
             assert capture["row"] is True, capture
-            _touch(cdp, "touchMove", x - 42, y)
+            touch(cdp, "touchMove", x - 42, y)
             page.wait_for_function("window.__rowGestureCaptureEvents.length > 1")
             capture_events = page.evaluate("window.__rowGestureCaptureEvents")
             assert capture_events[1] == {
@@ -401,12 +377,12 @@ def test_lost_pointer_capture_resets_swipe_and_allows_another_swipe(
                 "trusted": True,
             }
             expect(row).not_to_have_class(re.compile(r"\bmx-1\b"))
-            _touch(cdp, "touchEnd")
+            touch(cdp, "touchEnd")
 
-            _touch(cdp, "touchStart", x, y)
-            _touch(cdp, "touchMove", x - 40, y)
+            touch(cdp, "touchStart", x, y)
+            touch(cdp, "touchMove", x - 40, y)
             expect(row).to_have_class(re.compile(r"\bmx-1\b"))
-            _touch(cdp, "touchEnd")
+            touch(cdp, "touchEnd")
             expect(row).not_to_have_class(re.compile(r"\bmx-1\b"))
         finally:
             cdp.detach()
@@ -448,51 +424,36 @@ def test_touch_drag_moves_session_into_project(
 
         cdp = page.context.new_cdp_session(page)
         try:
-            cdp.send(
-                "Input.dispatchTouchEvent",
-                {
-                    "type": "touchStart",
-                    "touchPoints": [{"x": start_x, "y": start_y}],
-                },
-            )
+            touch(cdp, "touchStart", start_x, start_y)
             page.wait_for_timeout(200)
-            _touch(cdp, "touchMove", start_x, start_y + 8)
+            touch(cdp, "touchMove", start_x, start_y + 8)
             expect(page.get_by_test_id("rename-conversation")).to_have_count(0)
             # Hold until the row lifts, then the first move picks it up as a drag.
             expect(row).to_have_class(re.compile(r"\bscale-\[1\.01\]"), timeout=2000)
             expect(page.get_by_test_id("rename-conversation")).to_have_count(1)
 
             direction = 1 if end_y >= start_y else -1
-            _touch(cdp, "touchMove", start_x, start_y + 8 + direction * 9)
+            touch(cdp, "touchMove", start_x, start_y + 8 + direction * 9)
             expect(page.get_by_test_id("rename-conversation")).to_have_count(1)
             expect(row).not_to_have_class(re.compile(r"\bopacity-40\b"))
 
             # The first move across the threshold must both dismiss the menu
             # and reach dnd-kit on this same pointer.
             pull_y = start_y + 8 + direction * 11
-            cdp.send(
-                "Input.dispatchTouchEvent",
-                {"type": "touchMove", "touchPoints": [{"x": start_x, "y": pull_y}]},
-            )
+            touch(cdp, "touchMove", start_x, pull_y)
             expect(page.get_by_test_id("rename-conversation")).to_have_count(0)
             expect(row).to_have_class(re.compile(r"\bopacity-40\b"), timeout=1000)
 
             for step in range(1, 6):
                 progress = step / 5
-                cdp.send(
-                    "Input.dispatchTouchEvent",
-                    {
-                        "type": "touchMove",
-                        "touchPoints": [
-                            {
-                                "x": start_x + (end_x - start_x) * progress,
-                                "y": start_y + (end_y - start_y) * progress,
-                            }
-                        ],
-                    },
+                touch(
+                    cdp,
+                    "touchMove",
+                    start_x + (end_x - start_x) * progress,
+                    start_y + (end_y - start_y) * progress,
                 )
                 page.wait_for_timeout(20)
-            cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+            touch(cdp, "touchEnd")
         finally:
             cdp.detach()
 
