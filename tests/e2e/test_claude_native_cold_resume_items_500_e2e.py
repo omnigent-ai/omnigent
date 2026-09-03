@@ -379,6 +379,8 @@ def test_cold_resume_resumes_history_when_large_item_page_500s(
                     online = True
                     break
             except httpx.HTTPError:
+                # The server/runner is still booting; transient connection
+                # errors are expected while polling and simply retried.
                 pass
             time.sleep(_POLL_S)
         assert online, (

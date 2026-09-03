@@ -2977,6 +2977,40 @@ async def test_resume_transcript_ignores_corrupt_local_file(
 
 
 @pytest.mark.asyncio
+async def test_resume_transcript_ignores_binary_local_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A binary (non-UTF-8) local file is not a resumable fallback.
+
+    Decoding fails mid-iteration rather than at ``json.loads``, so the
+    validator must degrade to "not resumable" instead of propagating a
+    ``UnicodeDecodeError`` out of the fallback path.
+    """
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    workspace = Path("/work/some-repo")
+    target_dir = projects / claude_native._sanitize_claude_project_name(str(workspace))
+    target_dir.mkdir(parents=True)
+    (target_dir / "sid123.jsonl").write_bytes(b"\xff\xfe\x00\x01 not utf-8 \x80\n")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(500, json={"error": {"code": "internal_error"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException):
+            await claude_native._ensure_local_claude_resume_transcript(
+                client,
+                session_id="conv_abc",
+                external_session_id="sid123",
+                workspace=workspace,
+            )
+
+
+@pytest.mark.asyncio
 async def test_resume_transcript_ignores_local_file_on_4xx(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

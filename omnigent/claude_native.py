@@ -4837,7 +4837,9 @@ def _is_resumable_claude_transcript(path: Path) -> bool:
                 except ValueError:
                     return False
                 return isinstance(record, dict)
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # A binary/non-UTF-8 file raises mid-iteration, outside the per-line
+        # JSON guard — it is just as unresumable as non-JSONL content.
         return False
     return False
 
@@ -4883,7 +4885,9 @@ async def _fetch_all_session_items_for_claude_resume(
         except httpx.TransportError as exc:
             # A backend choking on one oversized page can also drop the
             # connection mid-response instead of returning a clean 5xx;
-            # treat it the same way and retry the page smaller.
+            # treat it the same way and retry the page smaller. Broad on
+            # purpose: total connectivity loss also degrades to the floor,
+            # then the local-transcript fallback rescues the resume.
             if limit > _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR:
                 limit = max(limit // 2, _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR)
                 _logger.warning(
