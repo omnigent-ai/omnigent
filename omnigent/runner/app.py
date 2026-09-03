@@ -4672,14 +4672,18 @@ def create_runner_app(
         The parent inbox is a process-local queue, so a result queued before
         a restart but not yet drained would otherwise vanish. Runs once per
         parent per process; a scan that fails on a server read is retried
-        before the next ``sys_read_inbox`` drain.
+        before the next ``sys_read_inbox`` drain. The inbox is created here
+        when missing: after a reconnect the server can dispatch a pending
+        message before it re-initializes the session, and that turn's drain
+        must still see the recovered results.
 
         :param parent_id: Parent session whose inbox was recreated, e.g.
             ``"conv_parent123"``.
         :returns: None.
         """
-        if parent_id in _subagent_recovery_done or parent_id not in _session_inboxes:
+        if parent_id in _subagent_recovery_done:
             return
+        _session_inboxes.setdefault(parent_id, asyncio.Queue())
         lock = _subagent_recovery_locks.setdefault(parent_id, asyncio.Lock())
         async with lock:
             if parent_id in _subagent_recovery_done:

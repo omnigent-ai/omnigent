@@ -552,6 +552,29 @@ async def test_runner_restart_replays_continued_turn_with_stale_receipt(
 
 
 @pytest.mark.asyncio
+async def test_drain_before_session_init_still_recovers(
+    _clean_subagent_registry: None,
+) -> None:
+    """A drain that runs before the session is initialized still recovers.
+
+    After a reconnect the server can dispatch a pending message before it
+    re-initializes the session on the replacement runner, so the parent has no
+    inbox yet when ``sys_read_inbox`` runs. Recovery must create the inbox and
+    queue the result rather than treat the missing inbox as nothing to do.
+    """
+    app = create_runner_app(
+        server_client=_RecoveryServerClient([_child_summary()]),  # type: ignore[arg-type]
+    )
+    assert PARENT_SESSION_ID not in runner_app._session_inboxes_ref
+
+    await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+
+    payload = runner_app._session_inboxes_ref[PARENT_SESSION_ID].get_nowait()
+    assert payload["conversation_id"] == CHILD_SESSION_ID
+    assert payload["output"] == "review complete: LGTM"
+
+
+@pytest.mark.asyncio
 async def test_runner_restart_recovers_text_less_final_turn_as_no_output(
     _clean_subagent_registry: None,
 ) -> None:
