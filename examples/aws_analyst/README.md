@@ -34,11 +34,12 @@ AWS_PROFILE=my-profile AWS_REGION=us-east-1 omnigent run examples/aws_analyst
 - Pairs naturally with a Databricks Genie connector for a Databricks-on-AWS
   "better together" analyst that reasons across both platforms.
 
-## Run the brain on Amazon Bedrock (governed by Databricks AI Gateway)
+## Optional: centralize model governance via Databricks AI Gateway
 
-The connectors above govern the *data*. You can also run the agent's *reasoning* on
-**Amazon Bedrock**, governed by **Databricks AI Gateway** — a fully AWS-native setup
-that's governed end to end.
+If you already run LLM spend through a gateway, you can run the agent's *reasoning* on
+**Amazon Bedrock** governed by **Databricks AI Gateway**, for a setup that's governed
+end to end. Otherwise, point the `claude-sdk` harness at Bedrock directly — the
+connectors above are unaffected either way.
 
 Amazon Bedrock is a supported provider for Databricks
 [external model endpoints](https://docs.databricks.com/aws/en/generative-ai/external-models/)
