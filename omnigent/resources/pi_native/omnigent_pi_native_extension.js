@@ -1038,6 +1038,7 @@ function startInboxPoller(
   handleCompact,
   handleModelChange,
   handleThinkingLevelChange,
+  isTurnActive,
 ) {
   if (!config || !config.inboxDir || pi.__omnigentInboxPoller) return;
   // Bound the dedup set (FIFO eviction) — delivered files are unlinked, so a
@@ -1083,8 +1084,21 @@ function startInboxPoller(
         payload.type === "user_message" &&
         typeof payload.content === "string"
       ) {
+        // Mid-turn messages must STEER into the active turn: the Pi SDK
+        // holds deliverAs "followUp" until the whole agent loop finishes, so
+        // a web "Send now" delivered as a follow-up stays visibly queued in
+        // the Pi CLI even though the web UI already reported success. When
+        // the agent is idle, keep "followUp" — it starts the next turn
+        // immediately, preserving initiating-message behavior. A turn ending
+        // between this check and the send is benign: the message still
+        // reaches Pi's queue, and a throw leaves the file for the next tick,
+        // which recomputes the mode.
+        const deliverAs =
+          typeof isTurnActive === "function" && isTurnActive()
+            ? "steer"
+            : "followUp";
         try {
-          pi.sendUserMessage(payload.content, { deliverAs: "followUp" });
+          pi.sendUserMessage(payload.content, { deliverAs });
         } catch (_err) {
           // Leave the file to retry next tick, capped by attempt count.
           const key = id ?? fullPath;
@@ -1768,6 +1782,13 @@ module.exports = function (pi) {
         triggerCompaction(config, latestContext, customInstructions),
       (model) => applyModelChange(pi, config, latestContext, model),
       (level) => pi.setThinkingLevel(level),
+      () => {
+        // Prefer the SDK's live idle signal; fall back to the agent loop
+        // state on SDK versions that don't expose isIdle() (same fallback
+        // as requestInterrupt).
+        const idle = safeIsIdle(latestContext);
+        return idle === null ? agentRunning : !idle;
+      },
     );
     const nativeSessionId =
       ctx && ctx.sessionManager && ctx.sessionManager.getSessionId

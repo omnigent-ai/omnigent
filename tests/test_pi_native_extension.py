@@ -2976,3 +2976,156 @@ def test_session_start_empty_registry_posts_no_model_options(tmp_path: Path) -> 
 """
     )
     _run_extension_script(node, _extension_path(), script)
+
+
+_SEND_DELIVERY_HARNESS = r"""
+const assert = require("assert").strict;
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+
+const extensionPath = process.argv[1];
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-send-delivery-"));
+const inboxDir = path.join(tmpDir, "inbox");
+const configPath = path.join(tmpDir, "config.json");
+fs.mkdirSync(inboxDir, { recursive: true });
+fs.writeFileSync(configPath, JSON.stringify({ inboxDir }));
+process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
+
+let pollInbox = null;
+global.setInterval = (fn, _ms) => {
+  pollInbox = fn;
+  return { fakeInterval: true };
+};
+
+const handlers = {};
+const sends = [];
+const pi = {
+  registerCommand() {},
+  on(eventName, handler) {
+    handlers[eventName] = handler;
+  },
+  sendUserMessage(content, options) {
+    sends.push({ content, options });
+  },
+};
+
+require(extensionPath)(pi);
+
+let seq = 0;
+function enqueue(content) {
+  seq += 1;
+  fs.writeFileSync(
+    path.join(inboxDir, `00${seq}-msg.json`),
+    JSON.stringify({ id: `msg-${seq}`, type: "user_message", content }),
+  );
+}
+
+async function drain() {
+  pollInbox();
+  await new Promise((resolve) => setImmediate(resolve));
+}
+"""
+
+
+def test_mid_turn_send_now_is_steered_into_active_turn() -> None:
+    """
+    A user message polled while a turn is ACTIVE must be steered.
+
+    The Pi SDK holds ``deliverAs: "followUp"`` until the whole agent loop
+    finishes, so a mid-turn web "Send now" delivered as a follow-up stays
+    visibly queued in the Pi CLI while the web UI reports success. The inbox
+    poller must deliver it with ``deliverAs: "steer"`` instead.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _SEND_DELIVERY_HARNESS
+        + r"""
+(async () => {
+  // A live turn: the context reports not-idle throughout.
+  await handlers.session_start({}, { isIdle: () => false, abort() {} });
+  enqueue("steer me");
+  await drain();
+  assert.deepEqual(sends, [
+    { content: "steer me", options: { deliverAs: "steer" } },
+  ]);
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_idle_send_stays_a_follow_up() -> None:
+    """
+    A user message polled while the agent is IDLE keeps follow-up delivery.
+
+    With no active turn there is nothing to steer into; ``followUp`` starts
+    the next turn immediately, preserving initiating-message behavior.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _SEND_DELIVERY_HARNESS
+        + r"""
+(async () => {
+  await handlers.session_start({}, { isIdle: () => true, abort() {} });
+  enqueue("start a new turn");
+  await drain();
+  assert.deepEqual(sends, [
+    { content: "start a new turn", options: { deliverAs: "followUp" } },
+  ]);
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_send_delivery_falls_back_to_agent_loop_state() -> None:
+    """
+    Without ``isIdle()`` the delivery mode follows the agent loop state.
+
+    Older Pi SDKs expose no ``isIdle()``; the poller must then steer between
+    ``agent_start`` and ``agent_end`` and fall back to follow-up delivery once
+    the loop has ended -- the same fallback ``requestInterrupt`` uses.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _SEND_DELIVERY_HARNESS
+        + r"""
+(async () => {
+  // Context without isIdle(): the loop-state flag is the only signal.
+  const ctx = { abort() {} };
+  await handlers.session_start({}, ctx);
+  await handlers.agent_start({}, ctx);
+  enqueue("mid-loop");
+  await drain();
+
+  await handlers.agent_end({}, ctx);
+  enqueue("after-loop");
+  await drain();
+
+  assert.deepEqual(sends, [
+    { content: "mid-loop", options: { deliverAs: "steer" } },
+    { content: "after-loop", options: { deliverAs: "followUp" } },
+  ]);
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
