@@ -43,20 +43,25 @@ that's governed end to end.
 Amazon Bedrock is a supported provider for Databricks
 [external model endpoints](https://docs.databricks.com/aws/en/generative-ai/external-models/)
 (`amazon-bedrock`). Serve a Bedrock-hosted Anthropic Claude model as a Databricks
-serving endpoint, enable [AI Gateway](https://docs.databricks.com/aws/en/ai-gateway/) on it, then point this agent at that endpoint via
-the `claude-sdk` harness:
+serving endpoint, enable [AI Gateway](https://docs.databricks.com/aws/en/ai-gateway/)
+on it, then point this agent at that endpoint:
 
 ```yaml
 executor:
   type: omnigent
   config:
     harness: claude-sdk
-  # Name of YOUR Databricks external-model serving endpoint (backed by Bedrock).
-  model: databricks-claude-bedrock
-  auth:
-    type: databricks
-    profile: my-databricks-profile
+    # Name of YOUR Databricks external-model serving endpoint (backed by Bedrock).
+    model: databricks-claude-bedrock
+    auth:
+      type: databricks
+      profile: my-databricks-profile
 ```
+
+`model` and `auth` must sit **inside** `executor.config`. This example is a bundle
+spec (`spec_version: 1` in a directory), and the omnigent executor reads both from
+there. Declaring them as siblings of `config:` still parses, but the run fails at
+launch with `There's an issue with the selected model`.
 
 The `claude-sdk` harness runs any Claude model; here the endpoint is served by
 Amazon Bedrock and fronted by Databricks AI Gateway, so every LLM call picks up rate
@@ -64,7 +69,4 @@ limiting, usage/cost tracking, payload logging, and guardrails — while the Red
 and S3 Tables connectors keep the *data* access read-only. Reasoning on Bedrock, data
 governed in AWS, all model calls governed through Databricks.
 
-> Not validated end-to-end in this repo — this documents a supported configuration
-> path (Bedrock external model + AI Gateway on Databricks Model Serving), verified
-> against the Databricks docs linked above. Substitute your own endpoint name and
-> profile.
+Substitute your own endpoint name and profile.
