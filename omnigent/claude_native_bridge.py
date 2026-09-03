@@ -159,6 +159,12 @@ _COMPOSER_MODE_GLYPHS = (_CLAUDE_PROMPT_GLYPH, _SHELL_MODE_GLYPH)
 # :func:`_permission_mode_from_pane`). Corner glyphs are included because
 # Claude Code has framed the input box both ways across versions.
 _BOX_RULE_CHARS = frozenset("─━╭╮╰╯│┃╌╍")
+# Glyphs a labelled rule may begin or end with. Excludes the verticals, so a
+# framed body row (``│ some text``) can never read as a rule.
+_RULE_EDGE_CHARS = frozenset("─━╭╮╰╯╌╍")
+# Leading rule glyphs required before a rule's label, enough to rule out prose
+# that merely starts with a dash glyph.
+_TITLED_RULE_MIN_LEAD = 3
 # Footer rows the permission-mode reader falls back to scanning while the
 # input box has not mounted yet and no rule is on screen to anchor on.
 _PROMPT_SCAN_TAIL_LINES = 5
@@ -249,6 +255,10 @@ _FOREIGN_DIALOG_HINTS = (
     "Do you want to ",
     "Yes, and don't ask again",
 )
+# Footer under every Claude Code selection dialog's options. Matched instead of
+# the dialog titles, which are open-ended — each release adds prompts. Lowercase
+# and the confirm half only: the cancel half has several spellings.
+_PENDING_DIALOG_FOOTER = "enter to confirm"
 # Seconds to wait for a confirmation dialog before concluding none appears.
 # Bounds the common no-dialog case (a fresh session never pops one) while
 # still covering the slow warm-session render.
@@ -275,6 +285,15 @@ ToolExecutor = Callable[[str, _JsonObject], Awaitable[object]]
 
 class ClaudePromptTimeout(RuntimeError):
     """Claude Code's input box did not render before delivery timed out."""
+
+
+class ClaudePromptBlocked(ClaudePromptTimeout):
+    """Claude Code is waiting on a dialog only a person can answer.
+
+    A subclass because the delivery still failed, so existing
+    ``except ClaudePromptTimeout`` handlers stay correct. Only the remedy
+    differs: the terminal is healthy, so leave it alone instead of reaping it.
+    """
 
 
 class TmuxSessionNotAdvertised(RuntimeError):
@@ -4146,11 +4165,23 @@ def _is_box_rule(line: str) -> bool:
     the rule directly above the composer, so it is the position that
     identifies the box, not the corners.
 
-    :param line: A single pane line, e.g. ``"──────────"``.
+    A rule may also carry a label, which Claude Code draws inline on the
+    composer's opening rule (``─── my session ─``); the composer beneath such
+    a rule is unreachable unless it counts. A labelled rule is identified by
+    its edges — :data:`_TITLED_RULE_MIN_LEAD` leading glyphs and a trailing
+    one, from :data:`_RULE_EDGE_CHARS`.
+
+    :param line: A single pane line, e.g. ``"──────────"`` or
+        ``"─── my session ─"``.
     :returns: ``True`` when the line is a box-drawing rule.
     """
     stripped = line.strip()
-    return len(stripped) >= 3 and all(ch in _BOX_RULE_CHARS for ch in stripped)
+    if len(stripped) < 3:
+        return False
+    if all(ch in _BOX_RULE_CHARS for ch in stripped):
+        return True
+    lead = stripped[:_TITLED_RULE_MIN_LEAD]
+    return all(ch in _RULE_EDGE_CHARS for ch in lead) and stripped[-1] in _RULE_EDGE_CHARS
 
 
 def _submit_needle(content: str) -> str:
@@ -4296,7 +4327,17 @@ def _wait_for_claude_prompt_ready(
         if time.monotonic() >= deadline:
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-    # Timed out. The poll/empty-capture counts separate the failure modes:
+    # Timed out. A dialog awaiting a keypress is not a boot failure — the TUI
+    # is healthy and simply cannot mount the composer until someone answers —
+    # so it gets its own error, and the caller leaves the terminal alone.
+    if _PENDING_DIALOG_FOOTER in last_nonempty.lower():
+        raise ClaudePromptBlocked(
+            "Claude Code is waiting for an answer in its terminal, so the "
+            f"message was not delivered (waited {timeout_s}s). Open the "
+            "terminal and answer the prompt, then send again."
+            + _format_terminal_failure_tail(last_nonempty)
+        )
+    # The poll/empty-capture counts separate the remaining failure modes:
     # mostly-empty captures point at a torn read under a busy repaint (the
     # session is alive but capture-pane came back blank); non-empty captures
     # with no box point at Claude never rendering the prompt (a boot crash,

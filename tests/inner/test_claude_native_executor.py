@@ -12,6 +12,7 @@ import pytest
 
 from omnigent.claude_native_bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
+    ClaudePromptBlocked,
     ClaudePromptTimeout,
     TmuxSessionNotAdvertised,
 )
@@ -1263,6 +1264,49 @@ async def test_run_turn_reaps_tmux_before_reporting_prompt_timeout(
     assert killed == [bridge_dir]
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
+
+
+@pytest.mark.asyncio
+async def test_run_turn_leaves_the_pane_alive_when_a_dialog_is_pending(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A harness parked on a dialog is not reaped.
+
+    ``ClaudePromptBlocked`` means the terminal is alive and waiting on a
+    prompt, so the turn must fail without killing the session holding it.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Pytest temporary directory fixture.
+    :returns: None.
+    """
+    killed: list[Path] = []
+
+    def blocked_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir_arg, content, timeout_s
+        raise ClaudePromptBlocked("Claude Code is waiting for an answer in its terminal")
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", blocked_inject)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "kill_session",
+        lambda bridge_dir_arg, *, timeout_s: killed.append(bridge_dir_arg),
+    )
+
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+        )
+    ]
+
+    assert killed == []
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert "waiting for an answer" in events[0].message
 
 
 @pytest.mark.asyncio

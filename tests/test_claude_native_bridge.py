@@ -28,6 +28,7 @@ from omnigent.claude_native_bridge import (
     _claude_prompt_rendered,
     _escape_unsupported_slash_command,
     _hook_record_from_jsonl_record,
+    _is_box_rule,
     _JsonlRecord,
     _occupying_surface,
     augment_claude_args,
@@ -6896,6 +6897,39 @@ def test_claude_prompt_rendered_ignores_custom_api_key_menu() -> None:
     assert _claude_prompt_rendered(pane) is False
 
 
+def test_claude_prompt_rendered_sees_prompt_under_titled_rule() -> None:
+    """A label drawn on the composer's opening rule still reads as ready.
+
+    Claude Code draws the session's name inline on the box's top rule, and a
+    frame that goes unrecognized hides the composer directly beneath it — a
+    healthy input box then reports "not ready" for the gate's whole timeout.
+    """
+    pane = "\n".join(
+        [
+            "  Ran 1 shell command",
+            "──────────────────────────── my session ─",
+            "❯",  # the live composer, under a LABELLED opening rule
+            "─────────────────────────────────────────",
+            "  ⏸ manual mode on",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_is_box_rule_rejects_a_framed_body_row() -> None:
+    """A framed body row is not a rule, however it starts.
+
+    The labelled-rule spelling widens :func:`_is_box_rule`, so the vertical
+    glyph must stay out of a rule's edges: ``│ some text`` would otherwise read
+    as a rule and offer the row beneath it as the composer.
+    """
+    assert _is_box_rule("│ some text") is False
+    assert _is_box_rule("  │ [note] a framed hint row") is False
+    # Still recognized: the plain and labelled spellings.
+    assert _is_box_rule("─────────") is True
+    assert _is_box_rule("──────── my session ─") is True
+
+
 def test_claude_prompt_rendered_sees_chat_input_below_menu_glyph() -> None:
     """A real chat prompt still reads ready even past a menu-shaped echo.
 
@@ -7394,6 +7428,45 @@ def test_wait_for_claude_prompt_ready_reports_empty_capture_count(
     assert "1 polls, 1 empty captures" in message
     # No pane text to surface when every capture was empty.
     assert "Last terminal output:" not in message
+
+
+def test_wait_for_claude_prompt_ready_reports_a_pending_dialog_separately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dialog awaiting a keypress raises ``ClaudePromptBlocked``, not a boot timeout.
+
+    A selection dialog blocks the composer until a person answers. Calling that
+    a failed boot misdiagnoses a healthy terminal and, via the executor's reap,
+    kills the session holding the unanswered prompt.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    dialog_pane = "\n".join(
+        [
+            "  New MCP server found in this project: example",
+            "  MCP servers may execute code or access system resources.",
+            "    Use this MCP server",
+            "  ❯ Continue without using this MCP server",
+            "  Enter to confirm · Esc to cancel",
+        ]
+    )
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._capture_pane",
+        lambda socket_path, tmux_target: dialog_pane,
+    )
+    with pytest.raises(claude_native_bridge.ClaudePromptBlocked) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=0.0,
+        )
+    message = str(excinfo.value)
+    assert "waiting for an answer in its terminal" in message
+    # The boot-failure wording must not be used for a healthy terminal.
+    assert "did not become ready" not in message
+    # The dialog itself is attached so the person knows what to answer.
+    assert "New MCP server found in this project" in message
 
 
 def test_wait_for_claude_prompt_ready_tail_is_observed_not_recaptured(
