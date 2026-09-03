@@ -24,6 +24,15 @@ _RRULE_DESC = (
     "mornings). Must fire at least twice and no more often than once per hour."
 )
 
+_ACTIVE_RANGE_DESC = (
+    "24-hour 'HH:MM' local time in the task's timezone. active_range_start and "
+    "active_range_end must be set together; omit both for a task that is "
+    "always active. A start later than the end means an overnight window "
+    "(e.g. '22:00' to '06:00'). Only rule occurrences that land inside the "
+    "window actually fire — the underlying cadence is not shifted, "
+    "occurrences outside the window are simply skipped."
+)
+
 
 class SysScheduledTaskCreateTool(Tool):
     """Create a scheduled task. Runner-dispatched to ``POST /v1/scheduled-tasks``."""
@@ -128,6 +137,14 @@ class SysScheduledTaskCreateTool(Tool):
                                 "online host at fire time; a failed run is recorded if none "
                                 "is online."
                             ),
+                        },
+                        "active_range_start": {
+                            "type": "string",
+                            "description": f"Start of the active window. {_ACTIVE_RANGE_DESC}",
+                        },
+                        "active_range_end": {
+                            "type": "string",
+                            "description": f"End of the active window. {_ACTIVE_RANGE_DESC}",
                         },
                     },
                     "required": ["name", "prompt", "rrule", "agent_id"],
@@ -239,6 +256,24 @@ class SysScheduledTaskUpdateTool(Tool):
                         "host_id": {
                             "type": "string",
                             "description": "New connected host to run on.",
+                        },
+                        "active_range_start": {
+                            "type": "string",
+                            "description": (
+                                f"New start of the active window. {_ACTIVE_RANGE_DESC} "
+                                "Pass null for both active_range_start and "
+                                "active_range_end to clear the window back to "
+                                "always-active."
+                            ),
+                        },
+                        "active_range_end": {
+                            "type": "string",
+                            "description": (
+                                f"New end of the active window. {_ACTIVE_RANGE_DESC} "
+                                "Pass null for both active_range_start and "
+                                "active_range_end to clear the window back to "
+                                "always-active."
+                            ),
                         },
                         "state": {
                             "type": "string",
