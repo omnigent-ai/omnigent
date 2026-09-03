@@ -465,15 +465,32 @@ async def test_unset_permission_mode_sends_no_launch_args() -> None:
 
 
 @pytest.mark.asyncio
-async def test_permission_mode_omitted_for_non_claude_agent() -> None:
-    """A mis-stamped non-Claude row degrades to no --permission-mode flag.
-
-    The injection is harness-gated fail-safe: even if a permission_mode somehow
-    persisted on a codex/cursor task, the fire must NOT inject the unknown flag
-    (which would break the launch) — it launches with the agent's own default.
-    """
+async def test_codex_bypass_permission_mode_becomes_terminal_launch_args() -> None:
+    """A Codex task's explicit bypass mode fires with Codex's native flag."""
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="bypassPermissions")})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _claude_agent_deps(store, conv_store, harness="codex-native"),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert conv_store.created[0]["terminal_launch_args"] == [
+        "--dangerously-bypass-approvals-and-sandbox"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unsupported_permission_mode_omitted_for_codex_agent() -> None:
+    """A malformed Codex row retains prompts instead of receiving Claude args."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="acceptEdits")})
 
     async def _launch(conv: Any, task: Any) -> None:
         return None

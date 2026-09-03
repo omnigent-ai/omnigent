@@ -620,17 +620,54 @@ async def test_update_rejects_null_agent(auth_client: httpx.AsyncClient, db_uri:
     assert resp.status_code == 422, resp.text
 
 
-async def test_create_rejects_permission_mode_for_non_claude_agent(
+async def test_create_allows_bypass_permission_mode_for_codex_agent(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
-    """A valid mode on a non-Claude agent is rejected (server capability gate).
+    """Codex may opt into its native noninteractive bypass flag."""
+    from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 
-    The web dialog only shows the permission control for Claude Code; the server
-    enforces the same gate so a codex/cursor/etc. task can't persist a mode the
-    fire path would inject as an unknown ``--permission-mode`` flag. The value
-    itself is a valid Claude mode — the rejection is purely about the agent's
-    harness.
-    """
+    _make_user(db_uri)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(
+            agent_id=builtin_agent_id(CODEX_NATIVE_AGENT_NAME),
+            permission_mode="bypassPermissions",
+        ),
+        headers=_headers(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["permission_mode"] == "bypassPermissions"
+
+
+async def test_update_allows_bypass_permission_mode_for_codex_agent(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """An existing Codex schedule can become unattended without recreation."""
+    from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(agent_id=builtin_agent_id(CODEX_NATIVE_AGENT_NAME)),
+            headers=_headers(),
+        )
+    ).json()
+
+    resp = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"permission_mode": "bypassPermissions"},
+        headers=_headers(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["id"] == created["id"]
+    assert resp.json()["permission_mode"] == "bypassPermissions"
+
+
+async def test_create_rejects_claude_only_permission_mode_for_codex_agent(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Codex rejects modes that have no native CLI equivalent."""
     from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 
     _make_user(db_uri)

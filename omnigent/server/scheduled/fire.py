@@ -57,6 +57,7 @@ from omnigent.entities import Conversation, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.routes._session_create_validation import (
+    permission_mode_launch_args,
     validate_existing_host_workspace,
     validate_session_agent,
     validate_session_model_metadata,
@@ -591,23 +592,16 @@ async def _resolve_default_workspace(deps: FireDeps, host_id: str) -> str:
     return canonical
 
 
-_PERMISSION_MODE_HARNESS = "claude-native"
-
-
 async def _permission_mode_launch_args(deps: FireDeps, task: ScheduledTask) -> list[str] | None:
-    """Derive the native-terminal ``--permission-mode`` args for a task.
+    """Derive native-terminal permission args for a task.
 
-    Mirrors how the interactive New Chat dialog builds ``terminal_launch_args``:
-    a set permission mode becomes ``["--permission-mode", <value>]``, which the
-    runner appends to Claude Code's argv. ``None`` (agent default) sets nothing.
+    Claude modes map to ``--permission-mode``. Codex's explicit
+    ``bypassPermissions`` mode maps to its full bypass flag. ``None`` keeps the
+    agent default and therefore preserves attended approval prompts.
 
-    Fail-safe on harness: only Claude Code accepts ``--permission-mode``, so the
-    flag is injected ONLY when the task's agent is confirmed ``claude-native``.
-    If the harness can't be resolved (no cache / bundle / a load error), the flag
-    is omitted rather than injected — a session that just uses the agent's own
-    default is strictly safer than one launched with an unknown flag. This makes
-    the Claude-only guarantee hold regardless of whether the create/update/fire
-    capability gates ran, so a mis-stamped non-Claude row can never break a fire.
+    Fail-safe on harness: if the harness cannot be resolved or the stored mode is
+    unsupported for it, no flag is injected. A malformed row therefore retains
+    prompts instead of launching a native CLI with the wrong arguments.
     """
     if task.permission_mode is None:
         return None
@@ -625,13 +619,11 @@ async def _permission_mode_launch_args(deps: FireDeps, task: ScheduledTask) -> l
         harness = canonicalize_harness(raw_harness) or raw_harness
     except Exception:
         _logger.exception(
-            "scheduled fire: could not resolve harness for task %s; omitting --permission-mode",
+            "scheduled fire: could not resolve harness for task %s; omitting permission args",
             task.id,
         )
         return None
-    if harness != _PERMISSION_MODE_HARNESS:
-        return None
-    return ["--permission-mode", task.permission_mode]
+    return permission_mode_launch_args(harness, task.permission_mode)
 
 
 async def _spec_reasoning_effort(deps: FireDeps, task: ScheduledTask) -> str | None:
@@ -870,10 +862,8 @@ async def _validate_fire_session_inputs(
             reasoning_effort=task.reasoning_effort,
         )
         validate_session_permission_mode(task.permission_mode)
-        # NB: the harness gate for permission_mode is enforced fail-safe in
-        # _permission_mode_launch_args (the flag is injected only for a confirmed
-        # claude-native agent), so a mis-stamped non-Claude row degrades to "no
-        # flag" rather than failing the whole fire here.
+        # The launch mapper is harness-gated, so a mis-stamped row degrades to
+        # prompting mode rather than receiving another CLI's flags.
         if validate_workspace:
             if task.host_id is None or task.workspace is None:
                 return (

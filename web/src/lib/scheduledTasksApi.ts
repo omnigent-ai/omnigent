@@ -39,9 +39,9 @@ export interface ScheduledTask {
   modelOverride: string | null;
   reasoningEffort: string | null;
   /**
-   * Native-harness permission mode (Claude Code), e.g. `acceptEdits`, or `null`
-   * to use the agent's configured default. The server derives the runner's
-   * `--permission-mode` launch arg from it at fire time.
+   * Native-harness permission mode, or `null` to use the agent's configured
+   * default. Claude supports its graded modes; Codex supports an explicit
+   * `bypassPermissions` opt-in.
    */
   permissionMode: string | null;
   /** Pinned absolute workspace, or `null` (server defaults to the host home). */
@@ -90,7 +90,7 @@ export interface CreateScheduledTaskInput {
   timezone?: string;
   modelOverride?: string | null;
   reasoningEffort?: string | null;
-  /** Native-harness permission mode (Claude Code); omit for the agent default. */
+  /** Native-harness permission mode; omit for the agent default. */
   permissionMode?: string | null;
   /** Optional pinned workspace; only valid together with `hostId`. */
   workspace?: string | null;
@@ -110,8 +110,8 @@ export interface UpdateScheduledTaskInput {
   /**
    * Rebind the task to a different agent, switching the harness its future
    * firings run. The server clears `modelOverride` / `reasoningEffort` /
-   * `permissionMode` on a switch (a model id is provider-bound, permission mode
-   * is Claude-only) unless the same PATCH resends them.
+   * `permissionMode` on a switch because both are harness-specific, unless the
+   * same PATCH resends them.
    */
   agentId?: string;
   timezone?: string;
