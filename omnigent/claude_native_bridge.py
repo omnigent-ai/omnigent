@@ -2824,7 +2824,7 @@ def _wait_for_user_prompt_submit_ack(
         timeout_s = _DELIVERY_ACK_TIMEOUT_S
     deadline = time.monotonic() + timeout_s
     current_session_id = expected_claude_session_id
-    if current_session_id is None and byte_offset:
+    if byte_offset:
         prior = read_hook_events_from_offset(bridge_dir, 0, start_event_count=0)
         for record in prior.records:
             if record.byte_offset > byte_offset:
@@ -3315,10 +3315,12 @@ def inject_user_message(
     # ``paste-buffer -p`` wraps it in the same bracketed-paste markers so
     # interior newlines (mapped to CR below) stay data instead of becoming
     # per-line submits. See anthropics/claude-code#52126.
+    paste_payload = _paste_payload_bytes(injected_text + "\n")
+    expected_delivery_prompt = _normalized_delivery_prompt(paste_payload.decode("utf-8"))
     with tempfile.NamedTemporaryFile(
         dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
     ) as paste_file:
-        paste_file.write(_paste_payload_bytes(injected_text + "\n"))
+        paste_file.write(paste_payload)
         paste_path = paste_file.name
     try:
         _run_tmux(info["socket_path"], "load-buffer", "-b", "omnigent-paste", paste_path)
@@ -3361,13 +3363,6 @@ def inject_user_message(
             # best-effort blind submit rather than hard-failing.
             time.sleep(_PASTE_SETTLE_S)
             _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
-            if require_delivery_ack:
-                _wait_for_user_prompt_submit_ack(
-                    bridge_dir,
-                    byte_offset=hook_offset,
-                    expected_prompt=injected_text,
-                    expected_claude_session_id=expected_claude_session_id,
-                )
             return
         raise RuntimeError(
             f"The pasted draft was never visible in Claude Code's input box after "
@@ -3401,7 +3396,7 @@ def inject_user_message(
         _wait_for_user_prompt_submit_ack(
             bridge_dir,
             byte_offset=hook_offset,
-            expected_prompt=injected_text,
+            expected_prompt=expected_delivery_prompt,
             expected_claude_session_id=expected_claude_session_id,
         )
 

@@ -2071,6 +2071,44 @@ def test_wait_for_prompt_submit_ack_detects_restart_after_unpinned_startup(
         )
 
 
+def test_wait_for_prompt_submit_ack_prefers_pre_offset_session_over_stale_state(
+    tmp_path: Path,
+) -> None:
+    """The hook log closes the append-before-state-update identity race."""
+    bridge_dir = tmp_path / "bridge"
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "initial-session",
+        },
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "replacement-session",
+        },
+    )
+    hook_offset = claude_native_bridge._hook_file_size(bridge_dir)
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "replacement-session",
+            "prompt": "expected prompt",
+        },
+    )
+
+    claude_native_bridge._wait_for_user_prompt_submit_ack(
+        bridge_dir,
+        byte_offset=hook_offset,
+        expected_prompt="expected prompt",
+        expected_claude_session_id="initial-session",
+        timeout_s=0.1,
+    )
+
+
 def test_read_transcript_items_since_surfaces_skill_as_slash_command(
     tmp_path: Path,
 ) -> None:
@@ -3654,7 +3692,9 @@ def test_inject_user_message_escapes_unsupported_slash_command_payload(
 ) -> None:
     """
     Unsupported slash commands land in the tmux buffer with a leading
-    zero-width escape so Claude Code treats them as user text.
+    zero-width escape so Claude Code treats them as user text. Delivery
+    acknowledgement uses the transported text after unsafe control bytes
+    have been removed.
     """
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
@@ -3697,9 +3737,17 @@ def test_inject_user_message_escapes_unsupported_slash_command_payload(
     assert loaded_payloads[0].startswith("\ufeff/help".encode("utf-8"))
     assert acknowledged_prompts == ["\ufeff/help"]
 
+    inject_user_message(bridge_dir, content="  /help")
+    assert loaded_payloads[1].startswith("  \ufeff/help".encode("utf-8"))
+    assert acknowledged_prompts == ["\ufeff/help", "  \ufeff/help"]
+
+    inject_user_message(bridge_dir, content="hello\x0cworld\x07")
+    assert loaded_payloads[2] == b"helloworld\r"
+    assert acknowledged_prompts == ["\ufeff/help", "  \ufeff/help", "helloworld"]
+
     inject_user_message(bridge_dir, content="/clear")
-    assert not loaded_payloads[1].startswith("\ufeff".encode("utf-8"))
-    assert acknowledged_prompts == ["\ufeff/help"]
+    assert not loaded_payloads[3].startswith("\ufeff".encode("utf-8"))
+    assert acknowledged_prompts == ["\ufeff/help", "  \ufeff/help", "helloworld"]
 
 
 def test_inject_user_message_raises_when_tmux_target_never_published(
