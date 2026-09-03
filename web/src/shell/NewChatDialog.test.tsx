@@ -2376,6 +2376,58 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-worktree-option")).toBeNull();
   });
 
+  it("replaces a typed space with a dash immediately", async () => {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+    const branchInput = screen.getByTestId("new-chat-landing-branch-input") as HTMLInputElement;
+    for (const character of "feature new~name") {
+      fireEvent.input(branchInput, {
+        target: { value: `${branchInput.value}${character}` },
+      });
+      if (character === " ") {
+        expect(branchInput.value).toBe("feature-");
+      }
+    }
+
+    // Other invalid characters remain available to the existing branch-name validation.
+    expect(branchInput.value).toBe("feature-new~name");
+  });
+
+  it("replaces pasted spaces with dashes immediately and submits the transformed value", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+    const branchInput = screen.getByTestId("new-chat-landing-branch-input") as HTMLInputElement;
+    fireEvent.paste(branchInput, {
+      clipboardData: { getData: () => "fix pasted branch" },
+    });
+    fireEvent.input(branchInput, { target: { value: "fix pasted branch" } });
+    expect(branchInput.value).toBe("fix-pasted-branch");
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "use the normalized branch" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as {
+      git?: { branch_name: string };
+    };
+    expect(body.git?.branch_name).toBe("fix-pasted-branch");
+  });
+
   it("generates a unique worktree branch name and sends it on create", async () => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
