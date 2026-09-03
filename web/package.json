@@ -119,6 +119,7 @@
     "@vitest/coverage-v8": "^4.1.8",
     "ai": "^6.0.169",
     "ai-elements": "^1.9.0",
+    "fake-indexeddb": "^6.2.5",
     "jsdom": "^29.1.1",
     "lightningcss": "^1.29.1",
     "oxlint": "^1.62.0",

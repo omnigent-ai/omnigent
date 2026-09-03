@@ -4,17 +4,20 @@ import { buildExtensionDocument, createExtensionNonce, loadExtensionBundle } fro
 import {
   EXTENSION_RPC_SOURCE,
   type ExtensionDisposeMessage,
+  type ExtensionEventMessage,
   type ExtensionIdentity,
   type ExtensionInitMessage,
   type ExtensionResponseMessage,
 } from "./rpc/protocol";
 import { isExtensionInboundMessage, isExtensionPayloadWithinBudget } from "./rpc/validation";
+import { ExtensionHostServiceError } from "./services/errors";
 
 const ACTIVATION_TIMEOUT_MS = 10_000;
 const REQUEST_TIMEOUT_MS = 10_000;
 
 type HostMethod = (params: unknown, signal: AbortSignal) => unknown | Promise<unknown>;
 const NO_HOST_METHODS: Readonly<Record<string, HostMethod>> = {};
+const NO_HOST_EVENTS: Readonly<Record<string, unknown>> = {};
 interface PendingRequest {
   controller: AbortController;
   timeout: ReturnType<typeof setTimeout>;
@@ -30,11 +33,13 @@ export function ExtensionViewHost({
   page,
   refresh,
   methods = NO_HOST_METHODS,
+  events = NO_HOST_EVENTS,
 }: {
   extension: ExtensionCatalogItem;
   page: ExtensionPage;
   refresh: () => Promise<ExtensionCatalogItem[]>;
   methods?: Readonly<Record<string, HostMethod>>;
+  events?: Readonly<Record<string, unknown>>;
 }) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const portRef = useRef<MessagePort | null>(null);
@@ -43,6 +48,7 @@ export function ExtensionViewHost({
   const handshakeDoneRef = useRef(false);
   const staleRetryDoneRef = useRef(false);
   const pendingRef = useRef(new Map<string, PendingRequest>());
+  const methodsRef = useRef(methods);
   const [frameDocument, setFrameDocument] = useState<DocumentState | null>(null);
   const [status, setStatus] = useState<"loading" | "activating" | "ready" | "error">("loading");
   const [error, setError] = useState<string | null>(null);
@@ -71,6 +77,10 @@ export function ExtensionViewHost({
     portRef.current = null;
     identityRef.current = null;
   }, []);
+
+  useEffect(() => {
+    methodsRef.current = methods;
+  }, [methods]);
 
   useEffect(() => {
     staleRetryDoneRef.current = false;
@@ -110,6 +120,22 @@ export function ExtensionViewHost({
       closeRuntime();
     };
   }, [closeRuntime, extension, page, refresh, retryKey]);
+
+  useEffect(() => {
+    const port = portRef.current;
+    const identity = identityRef.current;
+    if (status !== "ready" || !port || !identity) return;
+    for (const [event, value] of Object.entries(events)) {
+      const message: ExtensionEventMessage = {
+        ...identity,
+        source: EXTENSION_RPC_SOURCE,
+        type: "event",
+        event,
+        value,
+      };
+      if (isExtensionPayloadWithinBudget(message)) port.postMessage(message);
+    }
+  }, [events, status]);
 
   const handleLoad = useCallback(() => {
     if (!frameDocument || !iframeRef.current?.contentWindow) return;
@@ -161,7 +187,10 @@ export function ExtensionViewHost({
         type: "response",
         requestId: message.requestId,
       };
-      const method = methods[message.method];
+      const currentMethods = methodsRef.current;
+      const method = Object.hasOwn(currentMethods, message.method)
+        ? currentMethods[message.method]
+        : undefined;
       if (!method) {
         response.error = { code: "MethodNotFound", message: "Host method is not available" };
         channel.port1.postMessage(response);
@@ -182,44 +211,53 @@ export function ExtensionViewHost({
         });
       }, REQUEST_TIMEOUT_MS);
       pendingRef.current.set(message.requestId, { controller, timeout: requestTimeout });
-      void Promise.resolve(method(message.params, controller.signal)).then(
-        (result) => {
-          const pending = pendingRef.current.get(message.requestId);
-          if (!pending || !pendingRef.current.delete(message.requestId)) return;
-          clearTimeout(pending.timeout);
-          if (!isExtensionPayloadWithinBudget(result)) {
+      void Promise.resolve()
+        .then(() => method(message.params, controller.signal))
+        .then(
+          (result) => {
+            const pending = pendingRef.current.get(message.requestId);
+            if (!pending || !pendingRef.current.delete(message.requestId)) return;
+            clearTimeout(pending.timeout);
+            if (!isExtensionPayloadWithinBudget(result)) {
+              channel.port1.postMessage({
+                ...response,
+                error: { code: "ResponseTooLarge", message: "Host response exceeds the limit" },
+              });
+              return;
+            }
+            channel.port1.postMessage({ ...response, result });
+          },
+          (reason: unknown) => {
+            const pending = pendingRef.current.get(message.requestId);
+            if (!pending || !pendingRef.current.delete(message.requestId)) return;
+            clearTimeout(pending.timeout);
             channel.port1.postMessage({
               ...response,
-              error: { code: "ResponseTooLarge", message: "Host response exceeds the limit" },
+              error: {
+                code:
+                  reason instanceof ExtensionHostServiceError
+                    ? reason.code
+                    : controller.signal.aborted
+                      ? "Cancelled"
+                      : "HostError",
+                message:
+                  reason instanceof Error ? reason.message.slice(0, 512) : "Host call failed",
+              },
             });
-            return;
-          }
-          channel.port1.postMessage({ ...response, result });
-        },
-        (reason: unknown) => {
-          const pending = pendingRef.current.get(message.requestId);
-          if (!pending || !pendingRef.current.delete(message.requestId)) return;
-          clearTimeout(pending.timeout);
-          channel.port1.postMessage({
-            ...response,
-            error: {
-              code: controller.signal.aborted ? "Cancelled" : "HostError",
-              message: reason instanceof Error ? reason.message.slice(0, 512) : "Host call failed",
-            },
-          });
-        },
-      );
+          },
+        );
     };
     channel.port1.start();
     const init: ExtensionInitMessage = {
       ...frameDocument.identity,
       source: EXTENSION_RPC_SOURCE,
       type: "init",
+      capabilities: Object.keys(methodsRef.current).sort(),
     };
     // A srcdoc frame has opaque origin "null"; the per-mount nonce and the
     // transferred port are the spoofing boundary, so targetOrigin must be "*".
     iframeRef.current.contentWindow.postMessage(init, "*", [channel.port2]);
-  }, [closeRuntime, frameDocument, methods]);
+  }, [closeRuntime, frameDocument]);
 
   if (status === "error") {
     return (
