@@ -1128,6 +1128,14 @@ def _build_session_response(
             if pending_elicitation_events is not None
             else pending_elicitations.snapshot_for(conv.id)
         ),
+        # Replay the parked turn's streamed-so-far assistant text. A turn
+        # parked on an elicitation (AskUserQuestion, permission prompt) has
+        # not settled, so its transcript records are withheld and the durable
+        # items do not exist yet; the live preview that carried the text is
+        # transient and dropped on the refetch the elicitation card triggers.
+        # Without this replay the card renders with none of its antecedent
+        # prose until the user answers (#4984).
+        inflight_text_events=inflight_text.snapshot_for(conv.id),
         # Replay un-consumed web messages on native-terminal sessions
         # so a client that posted then navigated away / rebound re-
         # hydrates the optimistic bubble. Empty for non-native sessions
