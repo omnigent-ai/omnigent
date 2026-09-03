@@ -24,6 +24,7 @@ from typing import Any, TypeAlias
 from omnigent._platform import IS_WINDOWS
 from omnigent.cli_invocation import cli_invocation
 from omnigent.runner.identity import strip_runner_auth_secrets
+from omnigent.tmux_compat import MIN_TMUX_VERSION, MIN_TMUX_VERSION_HINT, tmux_version
 
 from . import _proc
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
@@ -625,6 +626,25 @@ def _apply_utf8_locale_default(env: dict[str, str]) -> None:
 def _tmux_available() -> bool:
     """Check if tmux is installed."""
     return shutil.which("tmux") is not None
+
+
+def _require_supported_tmux() -> None:
+    """Fail before terminal setup when tmux is missing, unknown, or too old."""
+    tmux = shutil.which("tmux")
+    if tmux is None:
+        raise RuntimeError("tmux is not installed or not on PATH")
+    version = tmux_version(tmux)
+    if version is None:
+        raise RuntimeError(
+            "Could not determine the installed tmux version; managed terminals require "
+            f"tmux {MIN_TMUX_VERSION_HINT} or newer"
+        )
+    if version < MIN_TMUX_VERSION:
+        detected = f"{version[0]}.{version[1]}"
+        raise RuntimeError(
+            f"tmux {detected} is too old; managed terminals require "
+            f"tmux {MIN_TMUX_VERSION_HINT} or newer"
+        )
 
 
 def _process_alive(pid: int) -> bool:
@@ -2001,8 +2021,7 @@ def create_terminal_instance(
             f"Run an SDK-based harness via `{cli_invocation()} run <agent.yaml>` (e.g. the "
             "claude-sdk, cursor, copilot, or codex harness) or use the web UI."
         )
-    if not _tmux_available():
-        raise RuntimeError("tmux is not installed or not on PATH")
+    _require_supported_tmux()
 
     # Create the instance's private directory.
     private_dir = Path(tempfile.mkdtemp(prefix=_TERMINAL_DIR_PREFIX))

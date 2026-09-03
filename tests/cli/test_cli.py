@@ -67,6 +67,7 @@ from omnigent.cli_config import (
     _node_dependency_problem,
     _node_version,
     _qwen_auth_configured,
+    _tmux_dependency_problem,
     _warn_missing_harness_dependencies,
 )
 from omnigent.errors import OmnigentError
@@ -6065,10 +6066,9 @@ def _fake_node_run(
     """
     Build a fake ``subprocess.run`` for the Node preflight helpers.
 
-    Dispatches on the command so a single fake serves both calls the
-    helpers make: ``node --version`` yields *version* on stdout, while the
-    ``node -e`` capability probe yields *probe_returncode* (0 = the
-    ``markAsUncloneable`` symbol is present, 1 = too old).
+    Dispatches on the command so a single fake serves the dependency checks:
+    ``node --version`` yields *version*, ``node -e`` yields
+    *probe_returncode*, and ``tmux -V`` reports a supported release.
 
     :param version: Version string to report for ``node --version``,
         without the trailing newline that the real CLI emits.
@@ -6078,6 +6078,8 @@ def _fake_node_run(
     """
 
     def _run(cmd: list[str], *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if cmd[-1] == "-V":
+            return subprocess.CompletedProcess(cmd, 0, stdout="tmux 3.3\n", stderr="")
         if "--version" in cmd:
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{version}\n", stderr="")
         return subprocess.CompletedProcess(cmd, probe_returncode, stdout="", stderr="")
@@ -6161,6 +6163,83 @@ def test_node_version_trims_and_handles_failure(monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.setattr("omnigent.cli.subprocess.run", _boom)
     assert _node_version("/usr/bin/node") is None
+
+
+def _fake_tmux_run(version_line: str) -> Callable[..., subprocess.CompletedProcess[str]]:
+    """
+    Build a fake ``subprocess.run`` answering ``tmux -V`` with *version_line*.
+
+    :param version_line: The ``tmux -V`` stdout, e.g. ``"tmux 3.3a"``.
+    :returns: A callable suitable for ``monkeypatch.setattr`` on
+        ``omnigent.cli.subprocess.run``.
+    """
+
+    def _run(cmd: list[str], *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 0, stdout=f"{version_line}\n", stderr="")
+
+    return _run
+
+
+def test_tmux_dependency_problem_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A machine without ``tmux`` on PATH reports the missing-binary problem."""
+    monkeypatch.setattr("omnigent.cli.shutil.which", lambda _: None)
+
+    problem = _tmux_dependency_problem()
+
+    assert problem is not None
+    assert "tmux not found" in problem
+
+
+@pytest.mark.parametrize("version_line", ["tmux 3.3", "tmux 3.3a", "tmux 3.5a", "tmux 3.10"])
+def test_tmux_dependency_problem_ok(monkeypatch: pytest.MonkeyPatch, version_line: str) -> None:
+    """A tmux at or above the supported floor reports no problem."""
+    monkeypatch.setattr("omnigent.cli.shutil.which", lambda _: "/usr/bin/tmux")
+    monkeypatch.setattr("omnigent.cli.subprocess.run", _fake_tmux_run(version_line))
+
+    assert _tmux_dependency_problem() is None
+
+
+@pytest.mark.parametrize(
+    "version_line", ["tmux 1.8", "tmux 2.9a", "tmux 3.1c", "tmux 3.2", "tmux 3.2a"]
+)
+def test_tmux_dependency_problem_too_old(
+    monkeypatch: pytest.MonkeyPatch, version_line: str
+) -> None:
+    """
+    An outdated tmux surfaces the detected version and the required floor
+    so the warning is actionable.
+    """
+    monkeypatch.setattr("omnigent.cli.shutil.which", lambda _: "/usr/bin/tmux")
+    monkeypatch.setattr("omnigent.cli.subprocess.run", _fake_tmux_run(version_line))
+
+    problem = _tmux_dependency_problem()
+
+    assert problem is not None
+    assert "too old" in problem
+    # The concrete detected version and the required floor must both appear —
+    # that's what makes the compact warning recognizable and actionable.
+    detected = version_line.split()[1].rstrip("abc")
+    assert detected in problem
+    assert "3.3" in problem
+
+
+def test_tmux_dependency_problem_probe_inconclusive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A flaky/timed-out probe or unparsable version yields no problem —
+    setup must not block on a transient ``subprocess`` failure.
+    """
+    monkeypatch.setattr("omnigent.cli.shutil.which", lambda _: "/usr/bin/tmux")
+
+    def _boom(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd="tmux", timeout=10)
+
+    monkeypatch.setattr("omnigent.cli.subprocess.run", _boom)
+    assert _tmux_dependency_problem() is None
+
+    monkeypatch.setattr("omnigent.cli.subprocess.run", _fake_tmux_run("tmux weird"))
+    assert _tmux_dependency_problem() is None
 
 
 def test_warn_missing_harness_dependencies_silent_when_present(
