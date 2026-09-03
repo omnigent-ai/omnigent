@@ -513,6 +513,44 @@ async def test_get_client_respawns_on_model_change(
         await manager.shutdown()
 
 
+async def test_get_client_any_harness_sentinel_ignores_model_change(
+    manager: HarnessProcessManager,
+) -> None:
+    """``get_client(conv, "any", env={...})`` never respawns on a model change.
+
+    Combines the two branches ``test_get_client_respawns_on_model_change`` and
+    ``test_get_client_any_harness_sentinel_reuses_subprocess`` each cover
+    alone: a steering/cancel/interrupt call passes ``"any"`` *and* its own
+    env, which may carry a ``HARNESS_<H>_MODEL`` key that differs from the
+    model the live subprocess was spawned with. ``"any"`` has no real
+    harness of its own to respawn into, so this must stay a no-op — a
+    respawn here would tear down an in-flight turn, and (per the
+    ``entry is None`` fallback) a mismatch with no entry to reuse would raise
+    ``NoLiveHarnessError`` instead, turning a harmless call into a crash.
+    """
+    await manager.start()
+    try:
+        client_first = await manager.get_client(
+            "conv_a",
+            _TEST_HARNESS_NAME,
+            env={"HARNESS_TEST_MODEL": "model-a"},
+        )
+        pid_first = (await client_first.get("/pid")).json()["pid"]
+
+        # "any" sentinel with a DIFFERENT model in env → must still reuse.
+        client_any = await manager.get_client(
+            "conv_a",
+            "any",
+            env={"HARNESS_TEST_MODEL": "model-b"},
+        )
+        pid_any = (await client_any.get("/pid")).json()["pid"]
+        # Same PID proves the model-change branch didn't trip for "any".
+        assert pid_any == pid_first
+        assert _pid_alive(pid_first)
+    finally:
+        await manager.shutdown()
+
+
 async def test_get_client_any_harness_sentinel_reuses_subprocess(
     manager: HarnessProcessManager,
 ) -> None:
