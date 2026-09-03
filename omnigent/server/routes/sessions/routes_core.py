@@ -958,6 +958,7 @@ def register_core_routes(
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
         project: str | None = Query(default=None),
         pinned: bool = Query(default=False),
+        visibility: str = Query(default="all", pattern="^(all|mine|shared)$"),
     ) -> PaginatedList:
         """
         List sessions with cursor-based pagination.
@@ -1005,6 +1006,12 @@ def register_core_routes(
             has pinned (the ``omnigent.pinned`` label). Lets the
             sidebar enumerate pinned sessions that fall outside the
             loaded pagination window. ``False`` (default) disables it.
+        :param visibility: Ownership filter for the sidebar's
+            My/Shared split. ``"mine"`` returns only sessions the
+            caller owns (owner-level grant). ``"shared"`` returns only
+            sessions accessible to the caller but owned by someone else.
+            ``"all"`` (default) returns all accessible sessions,
+            matching the legacy behaviour.
         :returns: A :class:`PaginatedList` of
             :class:`SessionListItem`.
         """
@@ -1021,14 +1028,33 @@ def register_core_routes(
         # disabled entirely — no auth_provider).
         user_id = _require_user(request, auth_provider)
         normalized_query = search_query if search_query else None
-        # A specific project folder ("My sessions"-only) must show only the
-        # viewer's own sessions — a session shared with them but filed under a
-        # like-named project belongs on "Shared with me", not in this folder.
-        # Passing owned_by here also scopes the dual-read's first-class half:
-        # the store resolves the project NAME to the caller's own project id.
-        # The flat list (project=None) and Unfiled (project="") stay unscoped so
-        # shared sessions still surface for the "Shared with me" tab.
-        owned_by = user_id if project else None
+        # Map the visibility filter to store-level ACL params.
+        # "mine": only sessions the caller owns — no accessible_by needed
+        #   because owner-level implies access.
+        # "shared": sessions accessible but not owned — shared_only=True
+        #   computes the set difference (accessible − owned).
+        # "all": all accessible sessions (legacy default). A project folder
+        #   additionally gates on owned_by so a shared session with a
+        #   like-named project stays out of the viewer's own folder.
+        if visibility == "mine":
+            accessible_by_param: str | None = None
+            owned_by_param: str | None = user_id
+            shared_only_param = False
+        elif visibility == "shared":
+            accessible_by_param = user_id
+            owned_by_param = None
+            shared_only_param = True
+        else:  # "all"
+            accessible_by_param = user_id
+            # A specific project folder ("My sessions"-only) must show only the
+            # viewer's own sessions — a session shared with them but filed under a
+            # like-named project belongs on "Shared with me", not in this folder.
+            # Passing owned_by here also scopes the dual-read's first-class half:
+            # the store resolves the project NAME to the caller's own project id.
+            # The flat list (project=None) and Unfiled (project="") stay unscoped so
+            # shared sessions still surface for the "Shared with me" tab.
+            owned_by_param = user_id if project else None
+            shared_only_param = False
         page = await asyncio.to_thread(
             conversation_store.list_conversations,
             limit=limit,
@@ -1036,8 +1062,9 @@ def register_core_routes(
             before=before,
             agent_id=agent_id,
             agent_name=agent_name,
-            accessible_by=user_id,
-            owned_by=owned_by,
+            accessible_by=accessible_by_param,
+            owned_by=owned_by_param,
+            shared_only=shared_only_param,
             has_agent_id=True,
             # The store treats ``None`` as "no kind filter"; the API
             # spells that ``kind=any`` to keep the param required-ish

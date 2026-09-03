@@ -655,6 +655,7 @@ class ConversationStore(ABC):
         search_query: str | None = None,
         accessible_by: str | None = None,
         owned_by: str | None = None,
+        shared_only: bool = False,
         include_archived: bool = False,
         project: str | None = None,
         pinned: bool = False,

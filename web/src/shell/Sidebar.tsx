@@ -582,15 +582,29 @@ export function Sidebar({
     [selectionMode, exitSelectionMode],
   );
 
-  // One paginated session list — sessions are no longer split by
-  // connection state, so the sidebar fetches a single undifferentiated
-  // list. Archived sessions are included (`includeArchived: true`) and
-  // peeled into their own "Archived" section at the bottom of the list.
-  // Session search now lives in the command palette (the "Search" button
-  // below), so the sidebar list itself is unfiltered.
+  // All-sessions query — fetches every accessible session (owned + shared)
+  // including archived ones. Used for inbox badge counts and WS reconciliation
+  // so approvals and comment notifications from shared sessions are never missed.
   const conversationsQuery = useConversations("", true, {
     reconcileWhileConnected: true,
   });
+
+  // Tab-scoped query — server-filtered for "mine" or "shared", disabled on
+  // other tabs. Paginates only the sessions relevant to the active tab so the
+  // sidebar never churns through hundreds of irrelevant pages while the user
+  // looks at a small filtered set (OMNI-6002).
+  const tabVisibility =
+    activeTab === "mine" ? "mine" : activeTab === "shared" ? "shared" : undefined;
+  const filteredConversationsQuery = useConversations(
+    "",
+    false,
+    { enabled: tabVisibility !== undefined },
+    undefined,
+    tabVisibility,
+  );
+  // "all" and "archived" tabs reuse the existing all-sessions query for display;
+  // "mine" and "shared" use the fast tab-scoped query.
+  const displayQuery = tabVisibility ? filteredConversationsQuery : conversationsQuery;
 
   // The scrollable list container — used as the IntersectionObserver root for
   // infinite scroll (auto-loading the next page as the sentinel nears view).
@@ -1049,7 +1063,7 @@ export function Sidebar({
                 className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] max-md:pb-16 [&::-webkit-scrollbar]:hidden"
               >
                 <ConversationList
-                  conversationsQuery={conversationsQuery}
+                  conversationsQuery={displayQuery}
                   scrollContainerRef={scrollContainerRef}
                   onRowClick={onNavClick}
                   searchQuery=""
