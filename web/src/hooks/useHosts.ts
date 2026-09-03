@@ -107,7 +107,11 @@ export function useHostModelOptions(hostId: string | null, harness: string, enab
     queryKey: ["host-model-options", hostId, harness],
     queryFn: () => fetchHostModelOptions(hostId as string, harness),
     enabled: enabled && hostId !== null,
-    staleTime: 30_000,
+    // The host's provider can change underneath an open picker (`omni setup`
+    // re-pointing the Claude default): poll while mounted so the list follows
+    // the host's current catalog, which it re-resolves on every request.
+    staleTime: 15_000,
+    refetchInterval: enabled && hostId !== null ? 15_000 : false,
     // A request racing the host's boot probe gets an honest empty answer
     // with an error string; the probe itself completes shortly after
     // (single-flight in the host's catalog store). Retry with backoff so a

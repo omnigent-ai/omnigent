@@ -487,6 +487,25 @@ def claude_catalog_serves_model(
     )
 
 
+def claude_launch_endpoint_label(claude_config: ClaudeNativeUcodeConfig | None) -> str:
+    """
+    Name where a launch config sends Claude Code's inference, for log lines.
+
+    :param claude_config: The resolved launch config, or ``None`` (Claude
+        Code's own login).
+    :returns: A short phrase, e.g. ``"the gateway at
+        https://example.databricks.com/ai-gateway/anthropic"``.
+    """
+    if claude_config is not None:
+        bedrock_url = claude_config.env.get(_ANTHROPIC_BEDROCK_BASE_URL_ENV)
+        if bedrock_url:
+            return f"the Bedrock endpoint at {bedrock_url}"
+        base_url = claude_config.env.get(_UCODE_CLAUDE_BASE_URL_ENV)
+        if base_url:
+            return f"the gateway at {base_url}"
+    return "Claude Code's own login"
+
+
 def resolve_claude_native_model_selection(
     model: str | None,
     claude_config: ClaudeNativeUcodeConfig | None,
@@ -1221,6 +1240,27 @@ async def claude_launch_catalog(
 
     fingerprint = claude_catalog_fingerprint(claude_config)
     return await model_catalog_store.ensure_catalog(
+        "claude-native", fingerprint, lambda: claude_model_catalog(claude_config)
+    )
+
+
+async def claude_refreshed_launch_catalog(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> list[dict[str, object]] | None:
+    """
+    Re-probe this config's catalog now and return the fresh rows.
+
+    For the launch gate's destructive path: a stale entry may predate a
+    provider change, so a pick it does not serve is re-checked against a
+    probe that is awaited rather than left to the background.
+
+    :param claude_config: The resolved launch config, or ``None``.
+    :returns: The fresh rows, or ``None`` when the probe failed.
+    """
+    from omnigent import model_catalog_store
+
+    fingerprint = claude_catalog_fingerprint(claude_config)
+    return await model_catalog_store.refresh_catalog(
         "claude-native", fingerprint, lambda: claude_model_catalog(claude_config)
     )
 

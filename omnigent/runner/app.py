@@ -186,6 +186,11 @@ _logger = logging.getLogger(__name__)
 # tests can patch the pacing.
 _CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S = 2.5
 
+# How long a claude-native session's model rows are served from the runner's
+# own cache before the shared catalog store is re-read, so a store refresh
+# (its background re-probe) reaches the picker without a runner restart.
+_CLAUDE_MODEL_OPTIONS_CACHE_TTL_S = 15.0
+
 # Claude-native model switch confirmation: how long to watch the pane's
 # statusLine snapshot for the switched model after typing ``/model``, and how
 # often to re-read it. Module-level so tests can patch the pacing.
@@ -2706,6 +2711,19 @@ def create_runner_app(
     _session_claude_launch_config_tasks: dict[
         str, asyncio.Task[ClaudeNativeUcodeConfig | None]
     ] = {}
+    # Claude's session listing IS the shared launch catalog: the same
+    # fingerprint-keyed store file the launch resolved against and the
+    # host's pre-launch picker serves — identical by construction, no
+    # separate composition. Rows are re-read from the store once
+    # ``_CLAUDE_MODEL_OPTIONS_CACHE_TTL_S`` passes (so its background
+    # re-probe reaches the picker) and dropped whenever the launch config is
+    # recorded or dropped, so a relaunch under another provider never serves
+    # the previous one's rows. Entries pair a ``time.monotonic()`` deadline
+    # with the rows. A cold store pays one probe: a short inline wait answers
+    # a warm one, past that the endpoint answers 503 (the server's fetch
+    # retries those) while the store's single-flight probe completes in the
+    # background.
+    _claude_model_options_rows: dict[str, tuple[float, list[dict[str, object]]]] = {}
 
     async def _resolve_session_claude_launch_config(
         session_id: str,
@@ -2737,9 +2755,19 @@ def create_runner_app(
 
     def _drop_session_claude_launch_config(session_id: str) -> None:
         _session_claude_launch_configs.pop(session_id, None)
+        _claude_model_options_rows.pop(session_id, None)
         task = _session_claude_launch_config_tasks.pop(session_id, None)
         if task is not None:
             task.cancel()
+
+    def _record_session_claude_launch_config(
+        session_id: str, config: ClaudeNativeUcodeConfig | None
+    ) -> None:
+        """
+        Memoize the config a launch resolved; rows listed under the old one retire.
+        """
+        _session_claude_launch_configs[session_id] = config
+        _claude_model_options_rows.pop(session_id, None)
 
     _session_agent_ids = _session_agent_ids_ref  # shared with module-level get_session_agent_id
     _session_sub_agent_names: dict[str, str] = {}
@@ -3868,7 +3896,7 @@ def create_runner_app(
                         resolve_launch_config=lambda: _resolve_session_claude_launch_config(
                             session_id
                         ),
-                        record_launch_config=_session_claude_launch_configs.__setitem__,
+                        record_launch_config=_record_session_claude_launch_config,
                     )
 
                 _launch_pre = _claude_pre_launch
@@ -5575,7 +5603,8 @@ def create_runner_app(
         # actually switched; the swallowed-dialog case answers non-2xx so the
         # server surfaces it instead of the row silently claiming the pick.
         expected = {value for value in (resolved_model, model_arg) if value}
-        for row in _claude_model_options_rows.get(conv_id) or []:
+        cached_rows = _claude_model_options_rows.get(conv_id)
+        for row in cached_rows[1] if cached_rows is not None else []:
             if row.get("id") in (selected_model, resolved_model) or row.get("model") in (
                 selected_model,
                 resolved_model,
@@ -9002,7 +9031,7 @@ def create_runner_app(
                         resolve_launch_config=lambda: _resolve_session_claude_launch_config(
                             session_id
                         ),
-                        record_launch_config=_session_claude_launch_configs.__setitem__,
+                        record_launch_config=_record_session_claude_launch_config,
                     )
 
                 _ensure_build = _claude_ensure_build
@@ -10287,16 +10316,6 @@ def create_runner_app(
             content={"models": _with_model_configuration_source(session_id, models)},
         )
 
-    # Claude's session listing IS the shared launch catalog: the same
-    # fingerprint-keyed store file the launch resolved against and the
-    # host's pre-launch picker serves — identical by construction, no
-    # separate composition. Cached per session for its lifetime (the launch
-    # config cannot change under it). A cold store pays one probe: a short
-    # inline wait answers a warm one, past that the endpoint answers 503
-    # (the server's fetch retries those) while the store's single-flight
-    # probe completes in the background.
-    _claude_model_options_rows: dict[str, list[dict[str, object]]] = {}
-
     def _model_configuration_source(session_id: str) -> dict[str, str] | None:
         """Return the session's non-secret model-provider coordinates."""
         from omnigent.model_catalog import model_configuration_source, resolve_model_provider
@@ -10323,7 +10342,9 @@ def create_runner_app(
             return JSONResponse(status_code=200, content={"models": []})
         cached = _claude_model_options_rows.get(session_id)
         if cached is not None:
-            return JSONResponse(status_code=200, content={"models": cached})
+            expires_at, cached_rows = cached
+            if time.monotonic() < expires_at:
+                return JSONResponse(status_code=200, content={"models": cached_rows})
         try:
             claude_config = await _resolve_session_claude_launch_config(session_id)
         except click.ClickException as exc:
@@ -10383,7 +10404,10 @@ def create_runner_app(
                 },
             )
         rows = _with_model_configuration_source(session_id, rows)
-        _claude_model_options_rows[session_id] = rows
+        _claude_model_options_rows[session_id] = (
+            time.monotonic() + _CLAUDE_MODEL_OPTIONS_CACHE_TTL_S,
+            rows,
+        )
         return JSONResponse(status_code=200, content={"models": rows})
 
     @app.get("/v1/sessions/{session_id}/model-options")

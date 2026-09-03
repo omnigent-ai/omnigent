@@ -1734,6 +1734,45 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByText("Bypass permissions")).toBeTruthy();
   });
 
+  it("falls back to Default when the host catalog stops listing the picked model", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    openAgentConfig("a1");
+    pickSelectOption("new-chat-landing-config-model", "Haiku 4.5");
+    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain("Haiku 4.5");
+
+    // The host's provider changes under the open modal: its next poll of the
+    // catalog no longer lists the pick.
+    const shrunk = {
+      data: CLAUDE_MODEL_OPTIONS_RESULT.data.filter((model) => model.id !== "haiku"),
+      isLoading: false,
+      isError: false,
+    };
+    useHostModelOptionsMock.mockImplementation(
+      (_hostId, harness) =>
+        (harness === "codex-native" ? CODEX_MODEL_OPTIONS_RESULT : shrunk) as unknown as ReturnType<
+          typeof useHostModelOptions
+        >,
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "run the build" },
+    });
+    const trigger = screen.getByTestId("new-chat-landing-config-model");
+    expect(trigger.textContent).toContain("Default");
+    expect(trigger.textContent).not.toContain("Haiku 4.5");
+
+    // Saving the fallback sends no override, so the launch uses the provider's default.
+    saveConfig();
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.model_override).toBeUndefined();
+  });
+
   it("shows the Codex approval-mode knob in the gear modal", () => {
     renderLanding();
     // Open Codex's (a2) config modal — it carries the approval-mode select.

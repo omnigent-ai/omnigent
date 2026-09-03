@@ -1540,6 +1540,18 @@ function HarnessConfigModal({
     () => codexModelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) })),
     [codexModelOptions],
   );
+  // The host catalog re-polls while the modal is open (a provider switch under
+  // it). A draft the new catalog no longer lists would render a blank trigger,
+  // so it falls back to Default.
+  const draftModelOptions = hasPermission
+    ? claudeModelSelectOptions
+    : hasApproval
+      ? codexModelSelectOptions
+      : piModelOptions;
+  useEffect(() => {
+    if (!open || !draftModel || draftModelOptions.length === 0) return;
+    if (!draftModelOptions.some((m) => m.id === draftModel)) setDraftModel("");
+  }, [open, draftModel, draftModelOptions]);
   const onModelChange = (value: string) => {
     if (value === MODEL_SELECT_SMART) {
       setDraftRouting("on");
