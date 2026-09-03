@@ -1482,11 +1482,14 @@ export function AppShell() {
   // focus path the menu uses (mark-start snapshot, then focus the tab). Gated
   // on the session declaring shell access and being reachable: an offline
   // session can't be reconnected from the browser, so the chord is inert there,
-  // matching the menu item's disabled state.
+  // matching the menu item's disabled state. Also inert while a create is in
+  // flight, so two quick presses can't spawn two shells (the menu disables its
+  // item on create.isPending for the same reason).
   const createTerminal = useCreateTerminal(conversationId ?? "");
   const shellLaunchable =
     agentSupportsShells &&
     !!conversationId &&
+    !createTerminal.isPending &&
     liveness?.kind !== "host_offline" &&
     liveness?.kind !== "local_stranded";
   const launchDefaultShell = useCallback(() => {
