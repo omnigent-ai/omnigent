@@ -110,6 +110,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
 }));
 
 import { Composer, detectMentionAt, mentionMarkerFor } from "./ChatPage";
+import { stubMatchMedia } from "@/test-helpers/matchMedia";
 
 function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) {
   return {
@@ -227,32 +228,10 @@ describe("mentionMarkerFor", () => {
   });
 });
 
-// Evaluate min-/max-width media queries against a simulated viewport width,
-// so each test runs at an explicit real-browser width instead of inheriting
-// the global test-setup mock (which answers false to every query).
-function stubViewportWidth(width: number) {
-  Object.defineProperty(window, "matchMedia", {
-    writable: true,
-    configurable: true,
-    value: (query: string) => ({
-      matches: (() => {
-        const min = query.match(/^\(min-width: ([\d.]+)px\)$/);
-        if (min) return width >= parseFloat(min[1]);
-        const max = query.match(/^\(max-width: ([\d.]+)px\)$/);
-        if (max) return width <= parseFloat(max[1]);
-        return false;
-      })(),
-      media: query,
-      addEventListener: () => {},
-      removeEventListener: () => {},
-    }),
-  });
-}
-
 // Pin a desktop width for every test: the mention browser's keyboard
 // behavior (Enter acts on the highlighted row) is gated off on mobile.
 beforeEach(() => {
-  stubViewportWidth(1280);
+  stubMatchMedia({ width: 1280 });
 });
 
 describe("Composer @-file-mention browser (native sessions)", () => {

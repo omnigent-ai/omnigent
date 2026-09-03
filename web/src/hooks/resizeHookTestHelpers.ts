@@ -12,7 +12,11 @@ export function setInnerWidth(px: number): void {
 export function mockMatchMedia(matches: Record<string, boolean> = {}) {
   const listeners = new Map<string, Set<MediaListener>>();
   window.matchMedia = ((query: string) => ({
-    matches: matches[query] ?? false,
+    // A getter, like a real MediaQueryList: `fire()` must be visible through a
+    // list created earlier (the breakpoint module keeps one shared list).
+    get matches() {
+      return matches[query] ?? false;
+    },
     media: query,
     onchange: null,
     addEventListener: (_: string, cb: MediaListener) => {

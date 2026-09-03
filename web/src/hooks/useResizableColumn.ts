@@ -1,9 +1,9 @@
 import { useCallback, useRef, useState } from "react";
 
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
+import { arrowResizeDelta } from "@/hooks/resizableWidthStore";
 import { useResizeDrag } from "@/hooks/useResizeDrag";
 
-const KEYBOARD_STEP_PX = 20;
 // Width of the painted separator strip (the consumer's `w-1` element).
 const PAINTED_WIDTH_PX = 4;
 
@@ -62,13 +62,8 @@ export function useResizableColumn(
       if (!enabled) return;
       // Vertical separator between columns: ArrowRight widens the left
       // column, ArrowLeft narrows it, with the same clamps as dragging.
-      if (e.key === "ArrowRight") {
-        e.preventDefault();
-        setWidth((w) => clamp(w + KEYBOARD_STEP_PX));
-      } else if (e.key === "ArrowLeft") {
-        e.preventDefault();
-        setWidth((w) => clamp(w - KEYBOARD_STEP_PX));
-      }
+      const delta = arrowResizeDelta(e, "ArrowRight");
+      if (delta !== null) setWidth((w) => clamp(w + delta));
     },
     [clamp, enabled],
   );
