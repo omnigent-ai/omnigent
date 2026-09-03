@@ -192,9 +192,13 @@ def test_panel_resize_must_not_summon_ghost_scrollbar(
     # For the camera: show that dragging the ghost thumb scrolls nothing.
     _demonstrate_thumb_drag(page)
 
-    # The bug: a scrollbar thumb painted over a fully-visible conversation
-    # with no real scroll range — during the drag or persisting after it.
-    ghost_after = after["thumbVisible"] and after["max"] is not None and after["max"] <= 24
+    # The bug: a scrollbar thumb painted over a fully-visible conversation —
+    # during the drag or persisting after it. Settled state: the conversation
+    # fully fits (asserted above), so *any* thumb is a ghost no matter how
+    # large the phantom range grew. Mid-drag samples keep the small-range cap:
+    # a stale frame between the re-wrap and the spacer's ResizeObserver write
+    # can show a transient real-looking range that settles within a step.
+    ghost_after = after["thumbVisible"]
     assert not ghost_after and not violations, (
         "ghost scrollbar on panel resize: thumb painted while the whole "
         f"conversation is visible (after={json.dumps(after)}, "
@@ -228,7 +232,9 @@ def test_fully_visible_transcript_paints_no_scrollbar(
     # scrolls the phantom ~8px — the transcript visibly does not move.
     _demonstrate_thumb_drag(page)
 
-    ghost = state["thumbVisible"] and state["max"] is not None and state["max"] <= 24
+    # The conversation fully fits (asserted above), so any thumb — whatever
+    # the phantom range — advertises hidden content that does not exist.
+    ghost = state["thumbVisible"]
     assert not ghost, (
         "scrollbar painted for a transcript that fully fits the viewport "
         f"(scroll range {state['max']}px, thumb={json.dumps(state['thumbRect'])})"

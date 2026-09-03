@@ -35,6 +35,16 @@ describe("TranscriptScrollbar thumb", () => {
     expect(screen.getByTestId("transcript-scrollbar-thumb")).toBeTruthy();
   });
 
+  it("paints a thumb at exactly the minimum scroll range", () => {
+    // 804 − 800 sits right on the threshold: the gate is `<`, so a real range
+    // of exactly 4px still gets an indicator. Locks the boundary against an
+    // accidental flip to `<=`.
+    render(
+      <TranscriptScrollbar scroller={makeScroller({ clientHeight: 800, scrollHeight: 804 })} />,
+    );
+    expect(screen.getByTestId("transcript-scrollbar-thumb")).toBeTruthy();
+  });
+
   it("opts out of native touch panning so a touch drag reaches the pointer handlers", () => {
     // The drag is driven by pointer events with pointer capture. Without
     // `touch-action: none` on the thumb, a touch pointerdown is followed by
