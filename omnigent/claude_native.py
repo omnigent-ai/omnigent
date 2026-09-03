@@ -106,7 +106,11 @@ from omnigent.claude_native_state import (
     write_launch_state,
 )
 from omnigent.cli_invocation import cli_invocation
-from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.conversation_browser import (
+    conversation_url,
+    new_session_url,
+    open_conversation_link_if_enabled,
+)
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.host.daemon_launch import (
     daemon_poll_intervals,
@@ -4360,6 +4364,9 @@ def _run_with_remote_server(
                 )
 
             host_id = load_or_create_host_identity().host_id
+            # Sampled once: the runner's cwd and the "new session here" link
+            # below must name the same directory, and a resume can move cwd.
+            launch_workspace = str(Path.cwd().resolve())
             _mark_startup_step(
                 startup_profiler,
                 "host identity loaded",
@@ -4392,7 +4399,7 @@ def _run_with_remote_server(
                         session_bundle=bundle,
                         claude_args=claude_args,
                         host_id=host_id,
-                        workspace=str(Path.cwd().resolve()),
+                        workspace=launch_workspace,
                         startup_profiler=startup_profiler,
                         startup_progress=progress,
                     )
@@ -4416,6 +4423,14 @@ def _run_with_remote_server(
             _record_launch_for_fresh_session(prepared.session_id)
             startup_profiler.mark("fresh remote launch state recorded")
         click.echo(f"Web UI: {conversation_url(base_url, prepared.session_id)}", err=True)
+        # The line above mirrors THIS session. Starting a fresh session from
+        # the web had no way to inherit the launch directory, so offer a link
+        # whose composer opens on it already.
+        click.echo(
+            "New session here: "
+            f"{new_session_url(base_url, workspace=launch_workspace, host_id=host_id)}",
+            err=True,
+        )
         startup_profiler.mark("remote web ui url printed")
         open_conversation_link_if_enabled(
             base_url=base_url,

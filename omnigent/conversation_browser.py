@@ -78,6 +78,42 @@ def conversation_url(base_url: str, conversation_id: str) -> str:
     return f"{base_url.rstrip('/')}/c/{encoded_id}"
 
 
+def new_session_url(base_url: str, *, workspace: str, host_id: str) -> str:
+    """
+    Build the browser URL for a NEW session prefilled with a directory.
+
+    :func:`conversation_url` links the session that already exists, so a
+    terminal launch has no way to carry its cwd into a *fresh* web session.
+    This lands on the new-session composer with the working directory and
+    host preselected (``?host=`` + ``?workspace=``), so starting one from a
+    CLI launch keeps the directory the CLI was run in.
+
+    The host rides along because a path only means something on one machine —
+    the composer will not bind ``workspace`` to a different host.
+
+    :param base_url: Omnigent server base URL, e.g. ``"http://127.0.0.1:6767"``.
+    :param workspace: Absolute directory on *host_id*, e.g. ``"/Users/me/proj"``.
+    :param host_id: Host the directory lives on, e.g. ``"host_abc123"``.
+    :returns: Browser URL, e.g.
+        ``"http://127.0.0.1:6767/?host=host_abc123&workspace=%2FUsers%2Fme%2Fproj"``.
+    """
+    server = ServerUrl.from_api_base(base_url)
+    params = {"host": host_id, "workspace": workspace}
+    parsed = urllib.parse.urlsplit(server.api_base)
+    if server.is_workspace_hosted:
+        if server.org_id:
+            params["o"] = server.org_id
+        path = WORKSPACE_UI_PATH
+    else:
+        # The composer is the SPA's index route, and urlsplit leaves an
+        # origin-only base with an empty path — without the explicit "/" the
+        # query would fuse onto the host (``http://h:6767?host=``).
+        path = parsed.path or "/"
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, path, urllib.parse.urlencode(params), "")
+    )
+
+
 def open_conversation_url(url: str) -> bool:
     """
     Open a conversation URL in the user's default browser.

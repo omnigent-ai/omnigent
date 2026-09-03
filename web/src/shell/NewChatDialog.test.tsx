@@ -1677,6 +1677,111 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
+  it("seeds the working directory from the host's most recent session", async () => {
+    // A session started from a terminal (`omnigent claude` in a directory)
+    // records that cwd as its workspace but never touches this browser's
+    // recents, so the server-side session must win over the stale recent.
+    useDirectorySessionsMock.mockReturnValue({
+      data: [conv({ id: "s1", host_id: "host_1", workspace: "/Users/corey/universe" })],
+    } as unknown as ReturnType<typeof useDirectorySessions>);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+        "universe",
+      ),
+    );
+  });
+
+  it("ignores another host's session when seeding the working directory", async () => {
+    // Paths are host-specific: host_2's workspace must not seed host_1, which
+    // falls back to its own recent ("/Users/corey/repo").
+    useDirectorySessionsMock.mockReturnValue({
+      data: [conv({ id: "s1", host_id: "host_2", workspace: "/Users/corey/universe" })],
+    } as unknown as ReturnType<typeof useDirectorySessions>);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+  });
+
+  it("holds the working-directory seed until the session list resolves", async () => {
+    // Seeding the recent while the scan is in flight would lock the
+    // once-per-host guard and lose to a newer terminal-launched workspace.
+    useDirectorySessionsMock.mockReturnValue({
+      data: undefined,
+      isError: false,
+    } as unknown as ReturnType<typeof useDirectorySessions>);
+    renderLanding();
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-host-chip")).toBeTruthy());
+    expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).not.toContain("repo");
+  });
+
+  it("seeds the working directory and host from a CLI deep link", async () => {
+    // `?host=` + `?workspace=` is what `omnigent <harness>` prints so a fresh
+    // web session starts where the CLI ran. It must beat the localStorage
+    // recent ("/Users/corey/repo") that would otherwise seed the field.
+    renderLanding({}, "/?host=host_1&workspace=/Users/corey/from-cli");
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+        "from-cli",
+      ),
+    );
+    const { body } = await submitAndReadBody();
+    expect(body.host_id).toBe("host_1");
+    expect(body.workspace).toBe("/Users/corey/from-cli");
+  });
+
+  it("beats the host's most recent session workspace with a CLI deep link", async () => {
+    // The deep link is an explicit request for THIS directory; the
+    // last-session seed is only a guess, so the link outranks it.
+    useDirectorySessionsMock.mockReturnValue({
+      data: [conv({ id: "s1", host_id: "host_1", workspace: "/Users/corey/universe" })],
+    } as unknown as ReturnType<typeof useDirectorySessions>);
+    renderLanding({}, "/?host=host_1&workspace=/Users/corey/from-cli");
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+        "from-cli",
+      ),
+    );
+  });
+
+  it("ignores a non-absolute workspace in the URL", async () => {
+    // The create body requires an absolute path, so a relative one is dropped
+    // rather than seeded — the normal seed order takes over.
+    renderLanding({}, "/?host=host_1&workspace=relative/dir");
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+  });
+
+  it("leaves the host unselected when a deep link names an offline host", async () => {
+    // Binding another machine's path is worse than an empty slot, so an
+    // unresolvable `?host=` must not fall through to the first online host.
+    useHostsMock.mockReturnValue({
+      data: [host("online"), { ...host("online"), host_id: "host_2" } as Host],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useHosts>);
+    renderLanding({}, "/?host=host_gone&workspace=/Users/corey/from-cli");
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+        "from-cli",
+      ),
+    );
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+  });
+
+  it("falls back to the recent when the session scan fails", async () => {
+    // A failed scan must not stall the seed forever — the field still fills.
+    useDirectorySessionsMock.mockReturnValue({
+      data: undefined,
+      isError: true,
+    } as unknown as ReturnType<typeof useDirectorySessions>);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+  });
+
   it("quotes server URLs in host and Lakebox connect commands", () => {
     setOmnigentHostConfig({ cliServerUrlSuffix: "/api?profile=dev&glob=*" });
     renderLanding({ databricks_features: true });
