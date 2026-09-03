@@ -1010,6 +1010,21 @@ def _response_body_preview(resp: object, *, limit: int = 500) -> str:
     return ""
 
 
+@dataclasses.dataclass(frozen=True)
+class _LoadedHistory:
+    """One history read, with enough detail to tell empty from unreadable.
+
+    :param items: The converted history items, possibly partial when a
+        later page failed.
+    :param complete: ``True`` when every page read returned 200. ``False``
+        means the server was unreachable or refused a page, so an empty
+        ``items`` says nothing about the conversation.
+    """
+
+    items: list[_JsonObject]
+    complete: bool
+
+
 @dataclasses.dataclass
 @dataclasses.dataclass(frozen=True)
 class _SessionSnapshot:
@@ -2725,6 +2740,32 @@ def create_runner_app(
     # background.
     _claude_model_options_rows: dict[str, tuple[float, list[dict[str, object]]]] = {}
 
+    def _session_spec_entry_for(
+        session_id: str,
+        agent_id: str | None,
+        sub_agent_name: str | None,
+    ) -> _SpecEntry | None:
+        """The session's cached bundle, when it is the one the caller wants.
+
+        Session init resolves the bundle once and caches the entry, already
+        swapped to the sub-agent's own spec; later readers in the same session
+        reuse it instead of re-fetching ``agent/contents``. Both identity
+        checks matter: a request naming a different agent, or a different
+        sub-agent than the cached entry was resolved for, still goes to the
+        resolver. An agent switch drops the cache outright.
+
+        :param session_id: Session/conversation identifier.
+        :param agent_id: Agent id the caller wants the spec for.
+        :param sub_agent_name: Sub-agent the caller wants the spec for, or
+            ``None`` for a top-level session.
+        :returns: The cached entry, or ``None`` when there is nothing to reuse.
+        """
+        if agent_id is None or _session_agent_ids.get(session_id) != agent_id:
+            return None
+        if _session_sub_agent_names.get(session_id) != sub_agent_name:
+            return None
+        return _session_spec_cache.get(session_id)
+
     async def _resolve_session_claude_launch_config(
         session_id: str,
     ) -> ClaudeNativeUcodeConfig | None:
@@ -3513,10 +3554,17 @@ def create_runner_app(
         sub_agent_name = body.sub_agent_name or await _recover_sub_agent_name(conversation_id)
         resolver_agent_id = body.agent_id or _session_agent_ids.get(conversation_id)
         resolver_cwd = await _session_runtime_cwd(conversation_id)
+        # The title request arrives right after session init, which already
+        # resolved (and cached) this session's bundle. Reuse that entry so the
+        # title does not re-fetch agent/contents for a spec that cannot have
+        # changed while the session stays on the same agent — an agent switch
+        # drops the cache, and the resolver still runs then.
+        cached_entry = _session_spec_entry_for(conversation_id, resolver_agent_id, sub_agent_name)
         try:
             effective_harness, spawn_env = await _resolve_harness_config(
                 agent_id=resolver_agent_id,
                 spec_resolver=spec_resolver,
+                resolved_entry=cached_entry,
                 session_id=conversation_id,
                 model_override=body.model_override,
                 harness_override=body.harness_override,
@@ -3531,6 +3579,7 @@ def create_runner_app(
                 resolved_harness, spawn_env = await _resolve_harness_config(
                     agent_id=resolver_agent_id,
                     spec_resolver=spec_resolver,
+                    resolved_entry=cached_entry,
                     session_id=conversation_id,
                     model_override=body.model_override,
                     harness_override=resolver_harness,
@@ -4091,9 +4140,16 @@ def create_runner_app(
             await _seed_last_server_item_id(session_id)
             history = []
         else:
-            history = await _load_history_as_input(session_id)
+            _loaded = await _load_history_pages(session_id)
+            history = _loaded.items
+            # Memoize a confirmed-empty history too. The first forwarded
+            # message reloads the items page whenever this map has no entry
+            # for the session, so leaving a fresh session out costs a second
+            # read of the page init just fetched. A read that failed
+            # empty-handed stays out so that path still retries it.
+            if _loaded.complete or history:
+                _session_histories[session_id] = history
         if history:
-            _session_histories[session_id] = history
             last = history[-1]
             last_type = last.get("type")
             last_role = last.get("role")
@@ -4437,6 +4493,28 @@ def create_runner_app(
         session_id: str,
         drop_item_id: str | None = None,
     ) -> list[_JsonObject]:
+        """Converted history for *session_id*, dropping *drop_item_id*.
+
+        :param session_id: Session/conversation identifier.
+        :param drop_item_id: Persisted item id to leave out, e.g. the
+            message the caller is about to append itself.
+        :returns: The converted history items.
+        """
+        return (await _load_history_pages(session_id, drop_item_id)).items
+
+    async def _load_history_pages(
+        session_id: str,
+        drop_item_id: str | None = None,
+    ) -> _LoadedHistory:
+        """Page the session's items and report whether the read completed.
+
+        :param session_id: Session/conversation identifier.
+        :param drop_item_id: Persisted item id to leave out.
+        :returns: The converted history plus a ``complete`` flag that is
+            ``False`` when a page read failed, so callers can tell an
+            empty conversation apart from an unreadable one.
+        """
+        complete = True
         all_items: list[_JsonObject] = []
         after_cursor: str | None = None
         while True:
@@ -4459,6 +4537,7 @@ def create_runner_app(
                         session_id,
                         extra={"session_id": session_id},
                     )
+                    complete = False
                     break
             except httpx.HTTPError:
                 _logger.warning(
@@ -4467,6 +4546,7 @@ def create_runner_app(
                     exc_info=True,
                     extra={"session_id": session_id},
                 )
+                complete = False
                 break
             page = resp.json()
             page_items = page.get("data", [])
@@ -4495,7 +4575,7 @@ def create_runner_app(
                     session_id=session_id,
                     server_client=server_client,
                 )
-        return converted
+        return _LoadedHistory(items=converted, complete=complete)
 
     def _convert_raw_items_to_input(
         items: list[_JsonObject],
@@ -11443,6 +11523,7 @@ async def _resolve_harness_config(
     *,
     agent_id: str | None,
     spec_resolver: SpecResolver | None,
+    resolved_entry: _SpecEntry | None = None,
     session_id: str | None = None,
     model_override: str | None = None,
     harness_override: str | None = None,
@@ -11453,6 +11534,12 @@ async def _resolve_harness_config(
 
     :param agent_id: Agent id to resolve the spec for.
     :param spec_resolver: Resolver that returns the spec for *agent_id*.
+    :param resolved_entry: The session's already-resolved bundle, when the
+        caller holds one. Used in place of *spec_resolver*, which would
+        otherwise re-fetch ``agent/contents`` for a spec the session
+        already resolved. Session-cached entries are swapped to the
+        sub-agent's own spec at resolution time, so *sub_agent_name* does
+        not apply to one and the swap below is skipped.
     :param session_id: Session/conversation id, threaded to the resolver.
     :param model_override: Per-session ``/model`` override, applied to the
         spawn-env model so it takes effect on the SDK harnesses.
@@ -11475,8 +11562,10 @@ async def _resolve_harness_config(
         cannot be resolved. Callers catch this to surface a clean error
         rather than spawning an invalid harness subprocess.
     """
-    if agent_id and spec_resolver:
+    spec_entry: _SpecEntry | None = resolved_entry
+    if spec_entry is None and agent_id and spec_resolver:
         spec_entry = await spec_resolver(agent_id, session_id)
+    if spec_entry is not None:
         spec = _unwrap_resolved_spec(spec_entry)
         workdir = _resolved_spec_workdir(spec_entry)
         if spec is not None:
@@ -11488,7 +11577,7 @@ async def _resolve_harness_config(
             # The child's bundle dir comes from the same resolution, so the
             # spawn-env below advertises the child's bundle — not the
             # parent's, whose skills and tools the child has no claim to.
-            if sub_agent_name:
+            if sub_agent_name and resolved_entry is None:
                 sub_entry = _native_runtime._resolve_sub_agent_spec_entry(
                     spec_entry, sub_agent_name
                 )

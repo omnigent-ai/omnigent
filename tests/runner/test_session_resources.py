@@ -2772,3 +2772,148 @@ async def test_terminal_exit_cleanup_evicts_only_the_exited_instance(tmp_path: P
         "a successor registered under the same key must survive exit cleanup"
     )
     assert terminal_registry.get("conv_exit", "claude", "main") is successor
+
+
+@pytest.mark.asyncio
+async def test_session_start_reads_bundle_and_history_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session start reads ``agent/contents`` and ``items`` exactly once.
+
+    Sister to the concurrent-burst test above: that one pins the stampede
+    case, this one pins the sequential cold start a host-launched runner
+    actually walks — session init, the first forwarded message, and the
+    background-title request the server sends alongside it.
+
+    Two round trips used to be spent re-reading values init had already
+    fetched. Init loaded the (empty) history but only memoized a non-empty
+    one, so the first message re-paged ``items``; and the background-title
+    handler ran the HTTP spec resolver instead of the entry init cached,
+    re-fetching ``agent/contents``. Counting requests rather than timing
+    them keeps the guard immune to machine load.
+
+    :param tmp_path: Temporary runner workspace root.
+    :param monkeypatch: Stubs out the title harness turn, which is not under
+        test here — only the spec resolution that precedes it.
+    :returns: None.
+    """
+
+    async def _title(_context: object) -> str:
+        """
+        Stand in for the title harness turn.
+
+        :param _context: Background-title context (unused).
+        :returns: A fixed title.
+        """
+        return "A title"
+
+    monkeypatch.setattr("omnigent.runner.app.run_background_title", _title)
+
+    conv = "conv_once"
+    agent_id = "ag_once"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    counts: dict[str, int] = {"contents": 0, "items": 0}
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        """
+        Stub Omnigent server counting the two reads under test.
+
+        :param request: Outbound request from the runner.
+        :returns: An empty items page, the session snapshot, or ``{}``.
+        """
+        path = request.url.path
+        if request.method == "GET" and path == f"/v1/sessions/{conv}/items":
+            counts["items"] += 1
+            return httpx.Response(200, json={"data": [], "has_more": False})
+        if request.method == "GET" and path == f"/v1/sessions/{conv}":
+            return httpx.Response(
+                200,
+                json={"id": conv, "agent_id": agent_id, "workspace": str(workspace)},
+            )
+        return httpx.Response(200, json={})
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="once-agent",
+        executor=ExecutorSpec(config={"harness": "claude-sdk"}, model="m"),
+    )
+
+    async def _spec_resolver(resolved_agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Stand in for the HTTP bundle fetch, counting each ``agent/contents``.
+
+        :param resolved_agent_id: Agent id the caller wants the bundle for.
+        :param session_id: Session id (unused).
+        :returns: The minimal claude-sdk spec.
+        """
+        del resolved_agent_id, session_id
+        counts["contents"] += 1
+        return spec
+
+    harness_client = _ScriptedHarnessClient(
+        [
+            'data: {"type": "response.created", "response": {"id": "resp_1"}}\n\n',
+            'data: {"type": "response.completed", "response": {"id": "resp_1"}}\n\n',
+        ]
+    )
+    pm = _FakeProcessManager(harness_client)
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    )
+    app = create_runner_app(
+        runner_workspace=workspace,
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_spec_resolver,
+        server_client=server_client,
+    )
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+            created = await client.post(
+                "/v1/sessions",
+                json={"session_id": conv, "agent_id": agent_id},
+            )
+            assert created.status_code == 201, f"{created.status_code} {created.text}"
+            after_init = dict(counts)
+
+            turn = await client.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": agent_id,
+                    "content": [{"type": "input_text", "text": "hi"}],
+                },
+            )
+            assert turn.status_code == 202, f"{turn.status_code} {turn.text}"
+            for _ in range(300):
+                if pm.get_client_calls:
+                    break
+                await asyncio.sleep(0.01)
+
+            titled = await client.post(
+                f"/v1/sessions/{conv}/background-title",
+                json={"prompt": "hi", "agent_id": agent_id},
+            )
+            # A 503 here would mean the spec never resolved, which would
+            # make the count below vacuous.
+            assert titled.status_code == 200, f"{titled.status_code} {titled.text}"
+    finally:
+        await server_client.aclose()
+
+    assert after_init == {"contents": 1, "items": 1}, (
+        f"session init must read the bundle and the history once each, got {after_init}"
+    )
+    assert counts["items"] == 1, (
+        f"expected one items read across the whole start, got {counts['items']}; "
+        f"2 means the first forwarded message re-paged the history init loaded"
+    )
+    assert counts["contents"] == 1, (
+        f"expected one agent/contents read across the whole start, got "
+        f"{counts['contents']}; 2 means the background title re-fetched the "
+        f"bundle instead of reusing the entry init cached"
+    )
