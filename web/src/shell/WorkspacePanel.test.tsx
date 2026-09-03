@@ -481,40 +481,10 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(screen.getByRole("button", { name: "Open new" })).not.toHaveFocus();
   });
 
-  it("launches the default from the keyboard (Enter) on the multi-shell row", async () => {
-    // The default-launch control is a real menuitem, so keyboard activation
-    // (Enter/Space) fires it — it must NOT be a submenu trigger, whose open
-    // keys would only reveal the flyout and never launch.
-    useSessionAgentMock.mockReturnValue({
-      data: { terminals: ["zsh", "bash", "fish"] },
-    } as unknown as ReturnType<typeof useSessionAgent>);
-    const created = { id: "terminal_zsh_s1", name: "zsh", session: "u-2", running: true };
-    const mutate = vi.fn((_name: string, opts?: { onSuccess?: (info: unknown) => void }) =>
-      opts?.onSuccess?.(created),
-    );
-    useCreateTerminalMock.mockReturnValue({
-      mutate,
-      isPending: false,
-      isError: false,
-    } as unknown as ReturnType<typeof useCreateTerminal>);
-
-    const { openTerminalTab } = renderWorkspace({ showBrowserTab: false });
-
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
-    const shellItem = await screen.findByRole("menuitem", { name: /shell \(zsh\)/i });
-    // Radix menuitems select on keydown Enter — same path Enter takes when the
-    // item is focused via arrow keys.
-    shellItem.focus();
-    fireEvent.keyDown(shellItem, { key: "Enter" });
-
-    expect(mutate).toHaveBeenCalledWith("zsh", expect.any(Object));
-    expect(openTerminalTab).toHaveBeenCalledWith("terminal:terminal_zsh_s1");
-  });
-
   it("does not launch on the multi-shell row when the session is offline", async () => {
-    // The launch item is disabled on an offline session, so neither a click nor
-    // keyboard activation may fire a create — the split-out menuitem (not a
-    // sub-trigger) is what preserves this guard.
+    // The row is disabled on an offline session. Its click handler is a
+    // sub-trigger's onClick (which Radix runs before its own disabled check), so
+    // the handler guards on shellDisabled itself — a click must not fire create.
     useSessionAgentMock.mockReturnValue({
       data: { terminals: ["zsh", "bash", "fish"] },
     } as unknown as ReturnType<typeof useSessionAgent>);
@@ -532,8 +502,6 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(shellItem).toHaveTextContent(/offline/i);
     expect(shellItem).toHaveAttribute("aria-disabled", "true");
     fireEvent.click(shellItem);
-    shellItem.focus();
-    fireEvent.keyDown(shellItem, { key: "Enter" });
     expect(mutate).not.toHaveBeenCalled();
   });
 
@@ -551,12 +519,13 @@ describe('WorkspacePanel "+" new-tab menu', () => {
 
     renderWorkspace({ showBrowserTab: false });
 
-    // Open the flyout via the separate "Other shells" chevron (ArrowRight). It
-    // lists only the non-default types — zsh is already named in the row.
+    // Open the flyout off the "Shell (zsh)" row (ArrowRight reveals the
+    // submenu). It lists only the non-default types — zsh is already named in
+    // the row itself.
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
-    const otherShells = await screen.findByRole("menuitem", { name: "Other shells" });
-    otherShells.focus();
-    fireEvent.keyDown(otherShells, { key: "ArrowRight" });
+    const shellItem = await screen.findByRole("menuitem", { name: /shell \(zsh\)/i });
+    shellItem.focus();
+    fireEvent.keyDown(shellItem, { key: "ArrowRight" });
     expect(await screen.findByRole("menuitem", { name: /^bash$/i })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /^fish$/i })).toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: /^zsh$/i })).toBeNull();

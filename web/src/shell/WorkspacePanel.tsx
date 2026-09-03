@@ -40,6 +40,7 @@ import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { terminalTabKey, useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import GithubMono from "@lobehub/icons/es/Github/components/Mono";
+import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
 import { FilesPanel } from "./FilesPanel";
 import { FileViewer } from "./FileViewer";
 import { GithubPanel } from "./GithubPanel";
@@ -66,20 +67,6 @@ function WorkspaceTabTooltip({
       <TooltipContent side="bottom">{label}</TooltipContent>
     </Tooltip>
   );
-}
-
-// localStorage key for the last shell type launched from the "+" menu, so the
-// choice is remembered across the menu's remounts (it renders in two spots) and
-// reloads. App-global (not per-session): the user's preferred shell rarely
-// varies by conversation.
-const PREFERRED_SHELL_KEY = "omnigent:preferred-shell";
-
-function readPreferredShell(): string | null {
-  try {
-    return window.localStorage.getItem(PREFERRED_SHELL_KEY);
-  } catch {
-    return null;
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -164,9 +151,9 @@ function NewTabMenu({
   if (!canOpenShell) return null;
 
   // The default launched by the primary segment: the remembered pick when it
-  // is still a declared type, else the first declared name.
-  const defaultShell =
-    preferred !== null && declaredTerminals.includes(preferred) ? preferred : declaredTerminals[0];
+  // is still a declared type, else the first declared name. Non-null here since
+  // the empty case returned above.
+  const defaultShell = resolveDefaultShell(declaredTerminals, preferred) as string;
 
   const launchShell = (name: string) => {
     setMenuOpen(false);
@@ -184,11 +171,7 @@ function NewTabMenu({
   // Launch a type and remember it as the new default for next time.
   const pickShell = (name: string) => {
     setPreferred(name);
-    try {
-      window.localStorage.setItem(PREFERRED_SHELL_KEY, name);
-    } catch {
-      /* storage unavailable — the in-memory pick still holds for this mount */
-    }
+    writePreferredShell(name);
     launchShell(name);
   };
 
@@ -253,43 +236,38 @@ function NewTabMenu({
         <SuppressBrowserView />
         <DropdownMenuLabel>Open new</DropdownMenuLabel>
         {multipleShells ? (
-          // Several types → one visual row with TWO hit targets: a real
-          // launch item (keeps native keyboard/touch/disabled semantics) that
-          // launches the default, and a trailing chevron that opens a flyout of
-          // the OTHER types. Overloading a single sub-trigger with both actions
-          // would make the default launch mouse-only and skip the disabled
-          // guard (Radix fires the sub-trigger's onClick before its disabled
-          // check), so the two actions stay separate controls.
-          <div className="flex items-stretch">
-            <DropdownMenuItem
-              onSelect={() => launchShell(defaultShell)}
+          // Several types → a single "Shell (default)" row that launches the
+          // default on click and reveals a flyout of the OTHER types on hover.
+          // The sub-trigger's built-in chevron is hidden ([&>svg:last-child]) to
+          // keep the row clean. The click handler guards on ``shellDisabled``
+          // itself because Radix runs a sub-trigger's onClick before its own
+          // disabled check — without the guard an offline session would still
+          // fire a create.
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger
               disabled={shellDisabled}
-              className="flex-1 cursor-pointer"
+              onClick={() => {
+                if (!shellDisabled) launchShell(defaultShell);
+              }}
+              className="cursor-pointer [&>svg:last-child]:hidden"
             >
               {shellItemContent}
-            </DropdownMenuItem>
-            <DropdownMenuSub>
-              <DropdownMenuSubTrigger
-                aria-label="Other shells"
-                disabled={shellDisabled}
-                className="cursor-pointer px-1.5"
-              />
-              {/* min-w-0 drops the default 96px floor so the box hugs the shell
-                  name (e.g. "bash") instead of padding it out. */}
-              <DropdownMenuSubContent className="min-w-0">
-                {otherShells.map((name) => (
-                  <DropdownMenuItem
-                    key={name}
-                    onSelect={() => pickShell(name)}
-                    disabled={shellDisabled}
-                    className="cursor-pointer"
-                  >
-                    {name}
-                  </DropdownMenuItem>
-                ))}
-              </DropdownMenuSubContent>
-            </DropdownMenuSub>
-          </div>
+            </DropdownMenuSubTrigger>
+            {/* min-w-0 drops the default 96px floor so the box hugs the shell
+                name (e.g. "bash") instead of padding it out. */}
+            <DropdownMenuSubContent className="min-w-0">
+              {otherShells.map((name) => (
+                <DropdownMenuItem
+                  key={name}
+                  onSelect={() => pickShell(name)}
+                  disabled={shellDisabled}
+                  className="cursor-pointer"
+                >
+                  {name}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
         ) : (
           // Single type → a plain launch item.
           <DropdownMenuItem
