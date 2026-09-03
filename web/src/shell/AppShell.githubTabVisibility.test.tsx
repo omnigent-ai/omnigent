@@ -167,6 +167,20 @@ describe("GitHub rail tab visibility", () => {
     expect(screen.getByRole("tab", { name: "GitHub" })).toBeInTheDocument();
   });
 
+  it("keeps the GitHub tab when the host is outdated", () => {
+    // An outdated host 404s the info endpoint (reason: host_outdated). The
+    // panel renders an actionable "update your host" prompt, so the tab must
+    // stay reachable rather than being hidden like the non-git dead end.
+    useGithubInfoMock.mockReturnValue({
+      data: { object: "session.github.info", available: false, reason: "host_outdated" },
+      isLoading: false,
+    } as ReturnType<typeof useGithubInfo>);
+
+    renderShell();
+
+    expect(screen.getByRole("tab", { name: "GitHub" })).toBeInTheDocument();
+  });
+
   it("keeps the GitHub tab while the info is still loading (no flash)", () => {
     // Default beforeEach mock: data undefined, isLoading true — matches the
     // Files gate's optimistic default so tabs don't pop in after load.

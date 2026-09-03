@@ -734,11 +734,14 @@ export function AppShell() {
   const environmentQuery = useWorkspaceEnvironment(conversationId);
   const showFilesPanel = environmentQuery.data?.available !== false;
   // The GitHub tab needs a git checkout on disk: hide it once the session's
-  // GitHub info resolves unavailable (not a git repo / no os_env). While the
-  // info is still loading the tab stays, matching the Files gate's no-flash
-  // default. Shares ChatPage's status-line query cache, so no extra fetch.
+  // GitHub info resolves to "not a git repo" — that panel is a dead end. Other
+  // unavailable reasons keep the tab: `host_outdated` renders an actionable
+  // "update your host" prompt, and `no_os_env` is already covered by the Files
+  // gate. While the info is still loading the tab stays, matching the Files
+  // gate's no-flash default. Shares ChatPage's status-line query cache, so no
+  // extra fetch.
   const githubInfoQuery = useGithubInfo(conversationId);
-  const showGithubTab = showFilesPanel && githubInfoQuery.data?.available !== false;
+  const showGithubTab = showFilesPanel && githubInfoQuery.data?.reason !== "not_a_git_repo";
   // Per-tab availability for the right workspace rail — the single source
   // of truth shared by the tab-fallback effect below, the rail's mount
   // gate, and the header's collapse toggle, so they can never disagree.
@@ -752,7 +755,7 @@ export function AppShell() {
         // GitHub tab: workspace gate plus the resolved GitHub info — a
         // non-git workspace hides the tab instead of opening a dead-end
         // panel. The panel still renders the "gh not installed" /
-        // "not signed in" states for a real checkout.
+        // "not signed in" / "update your host" states for a real checkout.
         github: showGithubTab,
         // Browser tab: shown only when the desktop shell hosts the embedded
         // WebContentsView. A plain web build has no embedded browser, and an
