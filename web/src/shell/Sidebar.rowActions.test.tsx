@@ -472,11 +472,11 @@ describe("quick pin/unpin hover button", () => {
     renderSidebar();
 
     const rowLink = screen.getByRole("link", { name: "My Session" });
-    expect(rowLink).not.toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:md:pr-20");
+    expect(rowLink).not.toHaveClass("fine-hover:md:pr-20");
 
     fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
 
-    expect(rowLink).toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:md:pr-20");
+    expect(rowLink).toHaveClass("fine-hover:md:pr-20");
   });
 
   it("sizes the project-folder header controls to match the session-row kebab", () => {
@@ -542,9 +542,9 @@ describe("quick pin/unpin hover button", () => {
     // Hover-capable desktop: fades out until the header is hovered / focused /
     // a menu opens.
     expect(wrapper).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100",
+      "fine-hover:md:opacity-0",
+      "fine-hover:md:group-hover/header:opacity-100",
+      "fine-hover:md:has-[:focus-visible]:opacity-100",
     );
   });
 
@@ -557,10 +557,10 @@ describe("quick pin/unpin hover button", () => {
 
     const cluster = screen.getByTestId("conversation-row-controls");
     expect(cluster).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:md:pointer-events-none",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover:pointer-events-auto",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[:focus-visible]:pointer-events-auto",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[aria-expanded=true]]:pointer-events-auto",
+      "fine-hover:md:pointer-events-none",
+      "fine-hover:md:group-hover:pointer-events-auto",
+      "fine-hover:md:group-has-[:focus-visible]:pointer-events-auto",
+      "fine-hover:md:group-has-[[aria-expanded=true]]:pointer-events-auto",
     );
     expect(cluster).not.toHaveClass("pointer-events-none", "md:pointer-events-none");
   });
@@ -571,21 +571,18 @@ describe("quick pin/unpin hover button", () => {
     // hover-incapable md+ device (touch tablet) a bare `md:opacity-0` leaves
     // the controls permanently invisible — there is no hover to reveal them —
     // so the fade and its hover/focus reveals must all be gated on
-    // `[@media((hover:hover)_and_(pointer:fine))]`, never on viewport width alone.
+    // `fine-hover`, never on viewport width alone.
     renderSidebar();
 
     const pin = screen.getByTestId("quick-pin-conversation");
-    expect(pin).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-100",
-    );
+    expect(pin).toHaveClass("fine-hover:md:opacity-0", "fine-hover:md:group-hover:opacity-100");
     expect(pin).not.toHaveClass("md:opacity-0");
 
     const kebab = screen.getByTestId("conversation-actions");
     expect(kebab).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-100",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:aria-expanded:opacity-100",
+      "fine-hover:md:opacity-0",
+      "fine-hover:md:group-hover:opacity-100",
+      "fine-hover:md:group-has-[[aria-expanded=true]]:opacity-100",
     );
     expect(kebab).not.toHaveClass("md:opacity-0");
   });
@@ -606,9 +603,9 @@ describe("quick pin/unpin hover button", () => {
       const header = screen.getByRole("button", { name });
       const chevron = header.querySelector(".lucide-chevron-right");
       expect(chevron).toHaveClass(
-        "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
-        "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-100",
-        "[@media((hover:hover)_and_(pointer:fine))]:md:group-focus-visible:opacity-100",
+        "fine-hover:md:opacity-0",
+        "fine-hover:md:group-hover:opacity-100",
+        "fine-hover:md:group-focus-visible:opacity-100",
       );
       expect(chevron).not.toHaveClass("md:opacity-0");
     }

@@ -4,24 +4,9 @@ from __future__ import annotations
 
 from playwright.sync_api import Page, expect
 
+from tests.e2e_ui._touch import touch_drag_between
+
 _FINE_GUTTER_PX = 10
-
-
-def _touch_drag(page: Page, *, start: tuple[float, float], end: tuple[float, float]) -> None:
-    """Drive trusted touch input so Chromium exercises pointer capture."""
-    client = page.context.new_cdp_session(page)
-    try:
-        client.send(
-            "Input.dispatchTouchEvent",
-            {"type": "touchStart", "touchPoints": [{"x": start[0], "y": start[1]}]},
-        )
-        client.send(
-            "Input.dispatchTouchEvent",
-            {"type": "touchMove", "touchPoints": [{"x": end[0], "y": end[1]}]},
-        )
-        client.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
-    finally:
-        client.detach()
 
 
 def _open_execution_logs_panel(page: Page) -> None:
@@ -45,7 +30,7 @@ def test_workspace_panel_pointer_resize_persists_without_annexing_chat(
     initial_width = panel.bounding_box()["width"]
     handle_box = handle.bounding_box()
 
-    _touch_drag(
+    touch_drag_between(
         page,
         start=(handle_box["x"] + handle_box["width"] / 2, handle_box["y"] + 100),
         end=(handle_box["x"] - 80, handle_box["y"] + 100),

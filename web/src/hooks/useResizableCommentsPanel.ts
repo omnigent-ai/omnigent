@@ -15,11 +15,14 @@
 // resizes are also persisted so a full page reload restores the width.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createResizableWidthStore, useResizableWidthSnapshot } from "@/hooks/resizableWidthStore";
+import {
+  arrowResizeDelta,
+  createPersistedWidthStore,
+  useResizableWidthSnapshot,
+} from "@/hooks/resizableWidthStore";
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizeDrag } from "@/hooks/useResizeDrag";
-import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 
 const DEFAULT_WIDTH_PX = 240;
 const MIN_WIDTH_PX = 200;
@@ -60,14 +63,11 @@ function gutterStyle(isCoarse: boolean): React.CSSProperties {
 // Module-level width store (shared across panel remounts within a session)
 // ---------------------------------------------------------------------------
 
-const widthStore = createResizableWidthStore(
-  readPanelSizePreference("commentsPanelWidthPx"),
-  (width) => writePanelSizePreference("commentsPanelWidthPx", width),
-);
+const widthStore = createPersistedWidthStore("commentsPanelWidthPx");
 
 /** Reset module-level width state from localStorage. Only for tests. */
 export function resetCommentsWidthStoreForTesting(): void {
-  widthStore.reset(readPanelSizePreference("commentsPanelWidthPx"));
+  widthStore.resetForTesting();
 }
 
 /**
@@ -128,18 +128,11 @@ export function useResizableCommentsPanel() {
     return () => observer.disconnect();
   }, [clampWidth]);
 
-  // Cancellation restores the pre-drag width: onMove writes the live store on
-  // every pointermove, so an abort (Escape, blur, …) must undo those writes.
-  const dragStartWidth = useRef<number | null>(null);
   const resizeDrag = useResizeDrag({
     enabled: isDesktop,
     overlay: true,
-    onStart: useCallback(() => {
-      dragStartWidth.current = widthStore.getSnapshot();
-    }, []),
-    onCancel: useCallback(() => {
-      widthStore.set(dragStartWidth.current !== null ? clampWidth(dragStartWidth.current) : null);
-    }, [clampWidth]),
+    onStart: widthStore.beginDrag,
+    onCancel: useCallback(() => widthStore.rollbackDrag(clampWidth), [clampWidth]),
     onCommit: widthStore.persist,
     onMove: useCallback(
       (e: React.PointerEvent) => {
@@ -154,13 +147,9 @@ export function useResizableCommentsPanel() {
   // Keyboard resize: left/right arrows widen/narrow by 20px.
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
-      const step = 20;
-      if (e.key === "ArrowLeft") {
-        e.preventDefault();
-        widthStore.set((prev) => clampWidth((prev ?? DEFAULT_WIDTH_PX) + step), true);
-      } else if (e.key === "ArrowRight") {
-        e.preventDefault();
-        widthStore.set((prev) => clampWidth((prev ?? DEFAULT_WIDTH_PX) - step), true);
+      const delta = arrowResizeDelta(e, "ArrowLeft");
+      if (delta !== null) {
+        widthStore.set((prev) => clampWidth((prev ?? DEFAULT_WIDTH_PX) + delta), true);
       }
     },
     [clampWidth],

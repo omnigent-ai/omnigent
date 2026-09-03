@@ -1,8 +1,7 @@
-import { renderSidebar as renderSidebarAt } from "@/test/sidebarTestHelpers";
-import { conversationPage } from "@/test/sidebarMockHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Layout regression tests for the project-folder header's icon/chevron.
 // Desired behaviour: a project folder shows its folder icon by default and,
 // on hover-capable desktop, swaps that folder icon for a chevron *in place*
@@ -17,29 +16,99 @@ vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 //   3. A header without a leading icon (the "Projects" group header) keeps a
 //      capability-gated trailing chevron and does NOT swap an icon.
 
-import { cleanup, fireEvent, screen, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
-vi.mock("@/hooks/useConversations", async () => {
-  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
-  return {
-    ...conversationHooksMock(),
-    useProjects: () => ({ data: [{ id: "p_my", name: "My Project" }] }),
-  };
-});
+vi.mock("@/hooks/useConversations", () => ({
+  useConversations: vi.fn(),
+  useConnectedConversations: () => [],
+  useStopAndDeleteConversation: () => ({
+    mutate: vi.fn(),
+    reset: vi.fn(),
+    isPending: false,
+    isError: false,
+  }),
+  usePinnedConversations: () => ({
+    data: { conversations: [], filterHonored: true },
+    isSuccess: true,
+  }),
+  useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
+  setConversationPinned: vi.fn(() => Promise.resolve({})),
+  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
+  useRenameConversation: () => ({ mutate: vi.fn() }),
+  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
+  useArchiveConversation: () => ({ mutate: vi.fn() }),
+  useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useStopSession: () => ({ mutate: vi.fn() }),
+  // One project so a folder header renders. Empty projects are not filtered
+  // out, so no conversations are needed to exercise the header layout.
+  useProjects: () => ({ data: [{ id: "p_my", name: "My Project" }] }),
+  useProjectSessions: () => ({
+    data: undefined,
+    isLoading: false,
+    hasNextPage: false,
+    isFetchingNextPage: false,
+    fetchNextPage: vi.fn(),
+  }),
+  useMoveToProject: () => ({ mutate: vi.fn() }),
+  useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useProjectConfig: () => ({ data: undefined, isLoading: false }),
+  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  fetchProjectSessionIds: () => Promise.resolve([]),
+  PROJECT_LABEL_KEY: "omni_project",
+}));
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
+import { Sidebar } from "./Sidebar";
+import { stubMatchMedia } from "@/test-helpers/matchMedia";
 
 const useConvMock = vi.mocked(useConversations);
 
 function mockConversations(conversations: Conversation[]) {
-  const withData = conversationPage(conversations);
+  const withData = {
+    data: {
+      pages: [
+        {
+          data: conversations,
+          first_id: conversations[0]?.id ?? null,
+          last_id: conversations.at(-1)?.id ?? null,
+          has_more: false,
+        },
+      ],
+      pageParams: [undefined],
+    },
+    isLoading: false,
+    isError: false,
+    error: null,
+    fetchNextPage: vi.fn(),
+    hasNextPage: false,
+    isFetchingNextPage: false,
+  } as unknown as ReturnType<typeof useConversations>;
   useConvMock.mockImplementation(() => withData);
 }
 
 function renderSidebar(initialEntry = "/") {
-  return renderSidebarAt({ route: initialEntry });
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={qc}>
+      <SidebarDataProvider>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={[initialEntry]}>
+            <Sidebar open={true} onClose={vi.fn()} />
+          </MemoryRouter>
+        </TooltipProvider>
+      </SidebarDataProvider>
+    </QueryClientProvider>,
+  );
 }
 
 /** The <button> header for a section/folder, found by its accessible name. */
@@ -60,27 +129,7 @@ function stubInputScenario(
   coarsePrimary = anyCoarse,
   anyHover = canHover,
 ) {
-  Object.defineProperty(window, "matchMedia", {
-    writable: true,
-    configurable: true,
-    value: (query: string) => ({
-      matches: query.split(/\s+and\s+/).every((condition) => {
-        const normalized = condition.trim();
-        if (normalized === "(pointer: coarse)") return coarsePrimary;
-        if (normalized === "(any-pointer: coarse)") return anyCoarse;
-        if (normalized === "(hover: hover)") return canHover;
-        if (normalized === "(any-hover: hover)") return anyHover;
-        const min = normalized.match(/^\(min-width: ([\d.]+)px\)$/);
-        if (min) return width >= parseFloat(min[1]);
-        const max = normalized.match(/^\(max-width: ([\d.]+)px\)$/);
-        if (max) return width <= parseFloat(max[1]);
-        return false;
-      }),
-      media: query,
-      addEventListener: () => {},
-      removeEventListener: () => {},
-    }),
-  });
+  stubMatchMedia({ width, anyCoarse, coarsePrimary, canHover, anyHover });
 }
 
 beforeEach(() => {
@@ -127,8 +176,8 @@ describe("project folder header icon/chevron", () => {
     // Only a hover-capable desktop fades the folder out of its icon slot.
     const folderWrapper = folder.parentElement as HTMLElement;
     expect(folderWrapper).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-focus-visible:opacity-0",
+      "fine-hover:md:group-hover:opacity-0",
+      "fine-hover:md:group-focus-visible:opacity-0",
     );
     expect(folderWrapper).not.toHaveClass("md:group-hover:opacity-0");
 
@@ -141,8 +190,8 @@ describe("project folder header icon/chevron", () => {
       "hidden",
       "md:flex",
       "opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-100",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-focus-visible:opacity-100",
+      "fine-hover:md:group-hover:opacity-100",
+      "fine-hover:md:group-focus-visible:opacity-100",
     );
     expect(swap).not.toHaveClass("md:group-hover:opacity-100");
 
@@ -167,7 +216,7 @@ describe("project folder header icon/chevron", () => {
     const chevrons = Array.from(header.querySelectorAll(".lucide-chevron-right"));
     const trailing = chevrons.find((c) => !classOf(c).includes("absolute")) as HTMLElement;
     expect(trailing).toBeTruthy();
-    expect(trailing).toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:md:hidden");
+    expect(trailing).toHaveClass("fine-hover:md:hidden");
     expect(trailing).not.toHaveClass("md:hidden");
   });
 
@@ -256,9 +305,9 @@ describe("project folder header icon/chevron", () => {
     const [chevron] = chevrons;
     expect(classOf(chevron)).not.toMatch(/\babsolute\b/);
     expect(chevron).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-100",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-focus-visible:opacity-100",
+      "fine-hover:md:opacity-0",
+      "fine-hover:md:group-hover:opacity-100",
+      "fine-hover:md:group-focus-visible:opacity-100",
     );
     expect(chevron).not.toHaveClass("md:opacity-0");
   });

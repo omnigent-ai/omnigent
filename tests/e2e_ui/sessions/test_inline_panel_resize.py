@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from playwright.sync_api import Page, expect
 
+from tests.e2e_ui._touch import touch_drag_between
 from tests.e2e_ui.conftest import open_right_rail, seed_committed_turn
 
 _VIEWPORT = {"width": 1280, "height": 700}
@@ -12,23 +13,6 @@ _VIEWPORT = {"width": 1280, "height": 700}
 _TABLET_VIEWPORT = {"width": 1024, "height": 720}
 _GUTTER = "[data-workspace-panel-resize-gutter]"
 _STORAGE_KEY = "omnigent:session-workspace-state"
-
-
-def _touch_drag(page: Page, *, start: tuple[float, float], end: tuple[float, float]) -> None:
-    """Drive trusted touch input so Chromium exercises pointer capture."""
-    client = page.context.new_cdp_session(page)
-    try:
-        client.send(
-            "Input.dispatchTouchEvent",
-            {"type": "touchStart", "touchPoints": [{"x": start[0], "y": start[1]}]},
-        )
-        client.send(
-            "Input.dispatchTouchEvent",
-            {"type": "touchMove", "touchPoints": [{"x": end[0], "y": end[1]}]},
-        )
-        client.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
-    finally:
-        client.detach()
 
 
 def _panel_width(page: Page) -> float:
@@ -129,7 +113,7 @@ def test_touch_resize_persists_without_stealing_transcript_scroll(
     assert gutter_box is not None
     initial_width = _panel_width(page)
 
-    _touch_drag(
+    touch_drag_between(
         page,
         start=(gutter_box["x"] + gutter_box["width"] / 2, gutter_box["y"] + 200),
         end=(gutter_box["x"] + 120, gutter_box["y"] + 200),
@@ -188,7 +172,7 @@ def test_touch_resize_persists_without_stealing_transcript_scroll(
     )
     assert scroll_top == 0
     width_before_scroll = _panel_width(page)
-    _touch_drag(
+    touch_drag_between(
         page,
         start=(transcript_box["x"] + transcript_box["width"] - 16, transcript_box["y"] + 400),
         end=(transcript_box["x"] + transcript_box["width"] - 16, transcript_box["y"] + 280),
@@ -222,7 +206,7 @@ def test_touch_resize_keeps_drag_range_on_tablet_width(
     initial_width = _panel_width(page)
 
     # Shrink toward the rail's floor…
-    _touch_drag(
+    touch_drag_between(
         page,
         start=(gutter_box["x"] + gutter_box["width"] / 2, gutter_box["y"] + 200),
         end=(gutter_box["x"] + 150, gutter_box["y"] + 200),
@@ -233,7 +217,7 @@ def test_touch_resize_keeps_drag_range_on_tablet_width(
     # …then widen back out: the move that used to be a pinned no-op.
     gutter_box = gutter.bounding_box()
     assert gutter_box is not None
-    _touch_drag(
+    touch_drag_between(
         page,
         start=(gutter_box["x"] + gutter_box["width"] / 2, gutter_box["y"] + 200),
         end=(gutter_box["x"] - 200, gutter_box["y"] + 200),

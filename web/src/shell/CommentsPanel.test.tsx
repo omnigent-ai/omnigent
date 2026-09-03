@@ -12,6 +12,7 @@ import type { Comment } from "@/hooks/useComments";
 import { getCurrentAuthorId } from "@/lib/identity";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { CommentsPanel } from "./CommentsPanel";
+import { stubMatchMedia } from "@/test-helpers/matchMedia";
 
 // CommentsPanel reads the current user's identity (getCurrentAuthorId) to
 // decide whose comments expose Edit/Delete. Mock it so author-ownership tests
@@ -25,12 +26,7 @@ const mockGetCurrentAuthorId = vi.mocked(getCurrentAuthorId);
 const originalMatchMedia = window.matchMedia;
 
 function setDesktopViewport(matches: boolean): void {
-  window.matchMedia = vi.fn((query: string) => ({
-    matches: query === "(min-width: 768px)" ? matches : false,
-    media: query,
-    addEventListener: () => {},
-    removeEventListener: () => {},
-  })) as unknown as typeof window.matchMedia;
+  stubMatchMedia({ width: matches ? 1280 : 390 });
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

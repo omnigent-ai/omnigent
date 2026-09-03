@@ -8,11 +8,7 @@
 
 import { useSyncExternalStore } from "react";
 
-import { MD_MIN_WIDTH_QUERY, isMobileViewport, subscribeMatchMedia } from "@/lib/breakpoints";
-
-function subscribe(callback: () => void): () => void {
-  return subscribeMatchMedia([MD_MIN_WIDTH_QUERY], callback);
-}
+import { isMobileViewport, subscribeMdBreakpoint } from "@/lib/breakpoints";
 
 // One canonical predicate: the snapshot IS the imperative helper, so the
 // reactive and point-in-time answers can never diverge.
@@ -27,5 +23,5 @@ function getSnapshot(): boolean {
  * (returns `false` on the server, matching `initialSidebarOpen`).
  */
 export function useIsMobileViewport(): boolean {
-  return useSyncExternalStore(subscribe, getSnapshot, () => false);
+  return useSyncExternalStore(subscribeMdBreakpoint, getSnapshot, () => false);
 }
