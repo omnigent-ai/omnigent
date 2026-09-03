@@ -217,6 +217,71 @@ def test_conversation_url_workspace_hosted_without_org_record(tmp_path, monkeypa
     assert url == "https://example.databricks.com/omnigent/c/conv_abc123"
 
 
+def test_new_session_url_workspace_hosted_carries_host_and_dir(tmp_path, monkeypatch) -> None:
+    """The SPA-mount deep link carries host, workspace and the ?o selector.
+
+    A terminal launch's own link only mirrors that session, so this is the
+    link that lets a NEW web session start in the directory the CLI ran in.
+    """
+    from omnigent.cli_auth import store_databricks_auth
+    from omnigent.conversation_browser import new_session_url
+
+    monkeypatch.setattr(
+        "omnigent.cli_auth._token_file_path",
+        lambda: tmp_path / "auth_tokens.json",
+    )
+    server = "https://example.databricks.com/api/2.0/omnigent"
+    store_databricks_auth(
+        server,
+        "https://example.databricks.com",
+        org_id="2850744067564480",
+    )
+
+    url = new_session_url(server, workspace="/home/me/proj", host_id="host_abc123")
+
+    assert url == (
+        "https://example.databricks.com/omnigent"
+        "?host=host_abc123&workspace=%2Fhome%2Fme%2Fproj&o=2850744067564480"
+    )
+
+
+def test_new_session_url_plain_server_uses_index_route(tmp_path, monkeypatch) -> None:
+    """A bare server base gets the explicit "/" so the query can't fuse to the host.
+
+    ``urlsplit("http://127.0.0.1:6767").path`` is empty, and urlunsplit would
+    otherwise emit ``http://127.0.0.1:6767?host=...`` — a URL the SPA router
+    does not resolve to the composer.
+    """
+    from omnigent.conversation_browser import new_session_url
+
+    monkeypatch.setattr(
+        "omnigent.cli_auth._token_file_path",
+        lambda: tmp_path / "auth_tokens.json",
+    )
+
+    url = new_session_url("http://127.0.0.1:6767", workspace="/srv/repo", host_id="host_1")
+
+    assert url == "http://127.0.0.1:6767/?host=host_1&workspace=%2Fsrv%2Frepo"
+
+
+def test_new_session_url_quotes_directories_with_spaces(tmp_path, monkeypatch) -> None:
+    """Paths with spaces or ``&`` survive the round trip percent-encoded.
+
+    An unencoded ``&`` in a directory name would split into a bogus extra
+    query param and truncate the seeded path.
+    """
+    from omnigent.conversation_browser import new_session_url
+
+    monkeypatch.setattr(
+        "omnigent.cli_auth._token_file_path",
+        lambda: tmp_path / "auth_tokens.json",
+    )
+
+    url = new_session_url("http://127.0.0.1:6767", workspace="/srv/a b&c", host_id="host_1")
+
+    assert url == "http://127.0.0.1:6767/?host=host_1&workspace=%2Fsrv%2Fa+b%26c"
+
+
 def test_conversation_url_plain_server_unchanged(tmp_path, monkeypatch) -> None:
     """Non-workspace servers keep the plain /c/<id> link shape."""
     from omnigent.conversation_browser import conversation_url

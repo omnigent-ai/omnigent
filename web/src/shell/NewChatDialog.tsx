@@ -2038,6 +2038,15 @@ export function NewChatLandingScreen() {
   // Project driving this visit, when the sidebar's per-project "new session"
   // pencil landed here with a `?project=` query param. Empty otherwise.
   const projectParam = searchParams.get("project") ?? "";
+  // Directory + host a CLI launch deep-linked in (`new_session_url` in
+  // omnigent/conversation_browser.py): a terminal session's own link only ever
+  // mirrors that session, so this is how a `omnigent <harness>` launch carries
+  // its cwd into a NEW web session. A path means nothing without the machine it
+  // is on, so the two are honored together. A non-absolute `workspace` is
+  // dropped rather than sent — the create body requires an absolute path.
+  const workspaceParam = searchParams.get("workspace") ?? "";
+  const workspaceFromUrl = isValidWorkspace(workspaceParam) ? workspaceParam.trim() : "";
+  const hostParam = searchParams.get("host");
   // Project prefill source: a project-driven visit seeds the composer from the
   // project's stored defaults (host / working directory / agent / worktree).
   // `?project=` carries the project NAME, so resolve it to the first-class id
@@ -2394,7 +2403,12 @@ export function NewChatLandingScreen() {
   const [sandboxRepoBranch, setSandboxRepoBranch] = useState<string>(
     () => restoredDraft?.sandboxRepoBranch ?? "",
   );
-  const [workspace, setWorkspace] = useState<string>(() => restoredDraft?.workspace ?? "");
+  // The URL seed is the mount-time value, so no effect can race it and the
+  // once-per-host auto-seed (which only fills an EMPTY field) leaves it alone.
+  // A restored draft still wins: that is the user's own edit from this visit.
+  const [workspace, setWorkspace] = useState<string>(
+    () => restoredDraft?.workspace || workspaceFromUrl,
+  );
   // Source tracking for the create's field-omission contract: true while the
   // slot's value is the untouched seed the project-prefill effect wrote from
   // the config. ANY other write — a picker selection, browsing, a host
@@ -2702,6 +2716,18 @@ export function NewChatLandingScreen() {
     if (sandboxSelected) return;
     if (selectedHostId !== null) return;
 
+    // A CLI deep link (`?host=` + `?workspace=`) outranks the persisted pick:
+    // it names the machine the linked directory is on. Honored under the same
+    // rules as a persisted pick — wait for the list, and bind only an online
+    // host — and it deliberately does NOT fall through to the defaults, since
+    // seeding one machine's path onto another is worse than an empty slot.
+    if (hostParam !== null) {
+      if (hostsLoading) return;
+      const requested = (hosts ?? []).find((h) => h.host_id === hostParam && h.status === "online");
+      if (requested) setSelectedHostId(requested.host_id);
+      return;
+    }
+
     // Read the persisted pick once, as a mount-time seed — deliberately NOT a
     // dependency: it only matters until the slot is filled, and re-running on
     // its value would fight an explicit in-session selection.
@@ -2744,6 +2770,7 @@ export function NewChatLandingScreen() {
   }, [
     hosts,
     hostsLoading,
+    hostParam,
     selectedHostId,
     sandboxSelected,
     managedSandboxesEnabled,
