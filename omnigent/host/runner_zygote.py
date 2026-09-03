@@ -236,6 +236,13 @@ class ZygoteManager:
                 stdin=subprocess.DEVNULL,
                 stdout=log_fh,
                 stderr=log_fh,
+                # Root the zygote at a stable directory instead of inheriting
+                # the daemon's cwd: the daemon may have been started from a
+                # transient worktree, and a long-lived zygote pinning a deleted
+                # directory keeps it undeletable state and hands that dead cwd
+                # to every fork that doesn't chdir. The zygote never resolves
+                # relative paths, so "/" is safe.
+                cwd="/",
             )
 
     def fork_runner(self, env: dict[str, str], log_path: str, workspace: str) -> ZygoteRunnerProc:
