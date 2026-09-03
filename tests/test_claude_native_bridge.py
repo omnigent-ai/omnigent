@@ -96,6 +96,15 @@ def _composer_pane(draft: str = "") -> str:
 """
 
 
+def _bypass_delivery_ack(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep composer-focused injection tests independent of hook acknowledgement."""
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_wait_for_user_prompt_submit_ack",
+        lambda *_args, **_kwargs: None,
+    )
+
+
 def _load_invocation_settings(args: list[str]) -> dict[str, Any]:
     settings_path = Path(args[args.index("--settings") + 1])
     return json.loads(settings_path.read_text(encoding="utf-8"))
@@ -1885,6 +1894,131 @@ def test_read_hook_events_from_offset_preserves_partial_trailing_line(tmp_path: 
     assert [record.event_name for record in second.records] == ["Stop"]
 
 
+def test_hook_file_size_excludes_partial_record_present_before_injection(tmp_path: Path) -> None:
+    """A pre-existing partial hook cannot acknowledge the new injection."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    hooks_path = bridge_dir / "hooks.jsonl"
+    hooks_path.write_text(
+        '{"payload":{"hook_event_name":"UserPromptSubmit","prompt":"old',
+        encoding="utf-8",
+    )
+
+    hook_offset = claude_native_bridge._hook_file_size(bridge_dir)
+    with hooks_path.open("a", encoding="utf-8") as handle:
+        handle.write(' prompt"}}\n')
+
+    with pytest.raises(RuntimeError, match="did not acknowledge"):
+        claude_native_bridge._wait_for_user_prompt_submit_ack(
+            bridge_dir,
+            byte_offset=hook_offset,
+            expected_prompt="old prompt",
+            expected_claude_session_id=None,
+            timeout_s=0.01,
+        )
+
+
+def test_wait_for_prompt_submit_ack_accepts_matching_prompt(tmp_path: Path) -> None:
+    """A matching parent-session hook is an authoritative delivery acknowledgement."""
+    bridge_dir = tmp_path / "bridge"
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "active-session",
+            "prompt": "line one\r\nline two\n",
+        },
+    )
+
+    claude_native_bridge._wait_for_user_prompt_submit_ack(
+        bridge_dir,
+        byte_offset=0,
+        expected_prompt="line one\nline two",
+        expected_claude_session_id="active-session",
+        timeout_s=0.1,
+    )
+
+
+def test_wait_for_prompt_submit_ack_ignores_mismatched_prompt(tmp_path: Path) -> None:
+    """An unrelated prompt hook cannot acknowledge the injected message."""
+    bridge_dir = tmp_path / "bridge"
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "active-session",
+            "prompt": "some other prompt",
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="did not acknowledge"):
+        claude_native_bridge._wait_for_user_prompt_submit_ack(
+            bridge_dir,
+            byte_offset=0,
+            expected_prompt="expected prompt",
+            expected_claude_session_id="active-session",
+            timeout_s=0.01,
+        )
+
+
+def test_wait_for_prompt_submit_ack_rejects_old_session_after_restart(tmp_path: Path) -> None:
+    """A matching acknowledgement from the replaced session is not delivery."""
+    bridge_dir = tmp_path / "bridge"
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "new-session",
+        },
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "old-session",
+            "prompt": "expected prompt",
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="restarted"):
+        claude_native_bridge._wait_for_user_prompt_submit_ack(
+            bridge_dir,
+            byte_offset=0,
+            expected_prompt="expected prompt",
+            expected_claude_session_id="old-session",
+            timeout_s=0.01,
+        )
+
+
+def test_wait_for_prompt_submit_ack_ignores_subagent_session_start(tmp_path: Path) -> None:
+    """Subagent lifecycle hooks do not replace the expected parent session."""
+    bridge_dir = tmp_path / "bridge"
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "subagent-session",
+            "transcript_path": str(tmp_path / "session" / "subagents" / "agent.jsonl"),
+        },
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "parent-session",
+            "prompt": "expected prompt",
+        },
+    )
+
+    claude_native_bridge._wait_for_user_prompt_submit_ack(
+        bridge_dir,
+        byte_offset=0,
+        expected_prompt="expected prompt",
+        expected_claude_session_id="parent-session",
+        timeout_s=0.1,
+    )
+
+
 def test_read_transcript_items_since_surfaces_skill_as_slash_command(
     tmp_path: Path,
 ) -> None:
@@ -3341,6 +3475,7 @@ def test_inject_user_message_pastes_content_then_submits(
     regresses to send-keys argv delivery, drops the trailing Enter, or
     stops clearing the stale buffer.
     """
+    _bypass_delivery_ack(monkeypatch)
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
@@ -3477,6 +3612,7 @@ def test_inject_user_message_escapes_unsupported_slash_command_payload(
     )
 
     loaded_payloads: list[bytes] = []
+    acknowledged_prompts: list[str] = []
     tui = {"pane": _composer_pane()}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
@@ -3499,12 +3635,19 @@ def test_inject_user_message_escapes_unsupported_slash_command_payload(
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_wait_for_user_prompt_submit_ack",
+        lambda *_args, **kwargs: acknowledged_prompts.append(str(kwargs["expected_prompt"])),
+    )
 
     inject_user_message(bridge_dir, content="/help")
     assert loaded_payloads[0].startswith("\ufeff/help".encode("utf-8"))
+    assert acknowledged_prompts == ["\ufeff/help"]
 
     inject_user_message(bridge_dir, content="/clear")
     assert not loaded_payloads[1].startswith("\ufeff".encode("utf-8"))
+    assert acknowledged_prompts == ["\ufeff/help"]
 
 
 def test_inject_user_message_raises_when_tmux_target_never_published(
@@ -3581,6 +3724,7 @@ def test_inject_user_message_waits_for_claude_prompt_before_typing(
     no send-keys is issued until ``capture-pane`` shows the prompt
     glyph, and that injection proceeds once it does.
     """
+    _bypass_delivery_ack(monkeypatch)
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
@@ -3758,6 +3902,7 @@ def test_inject_user_message_resends_enter_when_first_submit_swallowed(
     fire-and-forget Enter would send exactly one and return "success"
     with the message undelivered.
     """
+    _bypass_delivery_ack(monkeypatch)
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     # Shrink the polling cadence so the retry happens in milliseconds —
     # the production defaults (1s retry spacing) would make this test slow.
@@ -6221,6 +6366,23 @@ def test_hook_record_parses_todo_write_todos() -> None:
     assert record.task_status is None
 
 
+def test_hook_record_parses_user_prompt_submit_prompt() -> None:
+    """``UserPromptSubmit`` exposes the prompt used for delivery matching."""
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "claude-session",
+                "prompt": "deliver me",
+            }
+        )
+    )
+
+    assert record.event_name == "UserPromptSubmit"
+    assert record.claude_session_id == "claude-session"
+    assert record.prompt == "deliver me"
+
+
 def test_hook_record_parses_task_update() -> None:
     """
     ``PostToolUse/TaskUpdate`` → ``record.task_id`` and ``record.task_status``.
@@ -8418,6 +8580,7 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
     (its own documented dismissal), restoring the empty input box, then
     deliver the message normally.
     """
+    _bypass_delivery_ack(monkeypatch)
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
     bridge_dir = tmp_path / "bridge"
@@ -8601,6 +8764,7 @@ def test_inject_user_message_retries_a_swallowed_occupied_input_escape(
     Retries fire only while the surface is verifiably on screen, so none
     can reach the restored composer (where Escape interrupts a turn).
     """
+    _bypass_delivery_ack(monkeypatch)
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
     monkeypatch.setattr(
@@ -9190,6 +9354,7 @@ def test_inject_user_message_whitespace_only_content_submits_blind(
     behavior.  This must not raise: the best-effort path is retained for content
     whose draft position cannot be determined.
     """
+    _bypass_delivery_ack(monkeypatch)
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
     monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_COMMIT_TIMEOUT_S", 0.1)
