@@ -1013,6 +1013,22 @@ def test_classify_codex_error_auth_vs_generic() -> None:
     assert fwd._classify_codex_error({"codexErrorInfo": "Other"}, "disk full") == generic
 
 
+def test_classify_codex_error_matches_underscored_token_field_spellings() -> None:
+    """Gateway rejections that echo the JSON field name must classify as auth.
+
+    Gateways reject an expired bearer with the *field's* spelling rather than
+    prose — the Databricks AI Gateway says ``"access_token is expired"``. The
+    fragment fallback must match the underscored form (and the "token is
+    expired" phrasing) or the failed turn surfaces as generic and the session
+    never gets its re-auth recovery path.
+    """
+    auth = fwd._CODEX_ERROR_KIND_AUTH
+    assert fwd._classify_codex_error({}, "access_token is expired") == auth
+    assert fwd._classify_codex_error({}, "Access_Token is expired") == auth
+    assert fwd._classify_codex_error({}, "the refresh token is expired") == auth
+    assert fwd._classify_codex_error({}, "invalid access_token") == auth
+
+
 def test_terminal_error_from_turn_reads_and_classifies_turn_error() -> None:
     """``_terminal_error_from_turn`` returns the classified ``turn.error``.
 
