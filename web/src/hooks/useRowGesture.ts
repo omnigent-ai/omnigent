@@ -449,12 +449,11 @@ export function useRowGesture({
         // A finger still creeping hasn't held still, it's scrolling slowly — and
         // arming would capture the pointer and take the scroll away.
         const drift = Math.hypot(gesture.lastX - gesture.startX, gesture.lastY - gesture.startY);
+        holdTimer.current = null;
         if (drift > ROW_HOLD_TOLERANCE_PX) {
-          holdTimer.current = null;
           setGesturePhase(gesture, "scroll");
           return;
         }
-        holdTimer.current = null;
         gesture.armX = gesture.lastX;
         gesture.armY = gesture.lastY;
         setGesturePhase(gesture, "armed");
