@@ -17,6 +17,8 @@ from pathlib import Path
 
 import tomllib
 
+from omnigent import native_bridge_common
+
 CODEX_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.codex_native.bridge_id"
 CODEX_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_CODEX_NATIVE_BRIDGE_DIR"
 CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID"
@@ -139,7 +141,24 @@ def prepare_bridge_dir(bridge_id: str) -> Path:
     bridge_dir = bridge_dir_for_bridge_id(bridge_id)
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(bridge_dir, 0o700)
+    # Owner-pid marker for the periodic dead-owner prune; refreshed every
+    # turn so it always names the current runner. See native_bridge_common.
+    native_bridge_common.write_owner_pid_marker(bridge_dir)
     return bridge_dir
+
+
+def prune_orphaned_bridge_dirs() -> int:
+    """
+    Remove codex-native bridge dirs whose owner process is provably dead.
+
+    Delegates to the shared sweep against this harness's bridge root; the
+    runner calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
+    at startup to reclaim dirs leaked by a prior runner that died without
+    running the explicit delete path.
+
+    :returns: The number of orphaned bridge dirs removed.
+    """
+    return native_bridge_common.prune_orphaned_dirs(bridge_root())
 
 
 def write_mcp_bridge_config(bridge_dir: Path) -> None:

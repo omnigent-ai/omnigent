@@ -1,12 +1,4 @@
-import {
-  type DragEvent,
-  type ReactNode,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "@/lib/routing";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -201,6 +193,7 @@ import {
   type AvailableAgent,
 } from "@/hooks/useAvailableAgents";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
+import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useRecentHarnesses } from "@/hooks/useRecentHarnesses";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
@@ -226,6 +219,7 @@ import {
 } from "@/lib/sessionListCache";
 import { nextPushedSession } from "@/lib/sessionUpdatesSocket";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
+import { FileDropOverlay } from "@/components/FileDropOverlay";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
   buildMentionPreamble,
@@ -2190,38 +2184,9 @@ export function NewChatLandingScreen() {
     setAttachmentError(null);
   };
 
-  // Drag-and-drop onto the composer — same behavior as the in-session
-  // composer (drop files anywhere on the box; an inset ring + overlay
-  // signal the drop target).
-  const [isDragActive, setIsDragActive] = useState(false);
-
-  const handleDrop = (e: DragEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragActive(false);
-    const dropped = Array.from(e.dataTransfer.files);
-    if (dropped.length > 0) addFiles(dropped);
-  };
-
-  const handleDragOver = (e: DragEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragActive(true);
-  };
-
-  const handleDragEnter = (e: DragEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragActive(true);
-  };
-
-  const handleDragLeave = (e: DragEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    // Only clear the active state when the pointer leaves the container
-    // itself, not when it moves between child elements inside it.
-    if (e.currentTarget.contains(e.relatedTarget as Node)) return;
-    setIsDragActive(false);
-  };
+  // Drag-and-drop — as in the in-session composer, a file dropped anywhere on
+  // the landing surface attaches here. Declared after ``landingSurface``.
+  const isDragActive = useFileDropTarget(landingSurface, addFiles);
 
   // Gates the sandbox host option: only servers whose sandbox
   // config can actually serve a managed launch advertise it. "loading"
@@ -4538,16 +4503,14 @@ export function NewChatLandingScreen() {
             </h1>
           ) : null}
         </div>
+        {/* Drop cue, spanning the landing surface. */}
+        {isDragActive && landingSurface ? <FileDropOverlay container={landingSurface} /> : null}
         <div className="relative flex w-full flex-col gap-1">
           <form
             onSubmit={(e) => {
               e.preventDefault();
               void handleCreate();
             }}
-            onDrop={handleDrop}
-            onDragOver={handleDragOver}
-            onDragEnter={handleDragEnter}
-            onDragLeave={handleDragLeave}
             // A home-specific focus shadow adds depth without a resting shadow
             // or focus border.
             // dark:bg-card-solid stays opaque so dark glass --card doesn't show
@@ -4558,11 +4521,6 @@ export function NewChatLandingScreen() {
             )}
             data-testid="new-chat-landing-composer"
           >
-            {isDragActive && (
-              <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-card/80">
-                <span className="text-ui font-medium text-ring">Drop files here</span>
-              </div>
-            )}
             {/* Skill suggestions — floats above the composer box. */}
             {slashMenuOpen && (
               <SlashCommandMenu

@@ -1184,6 +1184,7 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       error: {
         code: String(rec.code ?? ""),
         message: String(rec.message ?? ""),
+        ...(rec.level === "info" ? { level: "info" as const } : {}),
       },
       itemId,
       responseId,
@@ -1324,6 +1325,7 @@ function parseErrorInfo(raw: unknown): ErrorInfo {
     if (typeof r.title === "string" && r.title) info.title = r.title;
     if (typeof r.cause === "string" && r.cause) info.cause = r.cause;
     if (typeof r.remediation === "string" && r.remediation) info.remediation = r.remediation;
+    if (r.level === "info") info.level = "info";
     return info;
   }
   return { code: "", message: String(raw ?? "") };

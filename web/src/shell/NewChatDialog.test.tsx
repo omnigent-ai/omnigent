@@ -3168,6 +3168,12 @@ describe("NewChatLandingScreen skill pills", () => {
   });
 });
 
+// A dataTransfer for an OS file drag. ``types`` is what the handler reads
+// mid-drag — files are only exposed on drop.
+function fileDrag(files: File[] = []) {
+  return { types: ["Files"], files };
+}
+
 // Attachments on the landing composer — same paperclip affordance as the
 // in-session composer; files ride the pending-prompt handoff (covered in
 // the flow tests), this suite covers the local chip UI.
@@ -3195,24 +3201,54 @@ describe("NewChatLandingScreen attachments", () => {
     renderLanding();
     const composer = screen.getByTestId("new-chat-landing-composer");
     // Dragging over the composer lifts the drop-target overlay.
-    fireEvent.dragOver(composer, { dataTransfer: { files: [] } });
+    fireEvent.dragOver(composer, { dataTransfer: fileDrag() });
     expect(screen.getByText("Drop files here")).toBeTruthy();
     // Dropping a file attaches it (chip proves it reached state) and clears
     // the overlay.
     const file = new File(["hello"], "dropped.txt", { type: "text/plain" });
-    fireEvent.drop(composer, { dataTransfer: { files: [file] } });
+    fireEvent.drop(composer, { dataTransfer: fileDrag([file]) });
     expect(screen.getByText("dropped.txt")).toBeTruthy();
     expect(screen.queryByText("Drop files here")).toBeNull();
   });
 
-  it("clears the drop overlay when the drag leaves the composer", () => {
+  // The whole landing surface is the drop target, not just the composer box.
+  it("attaches files dropped anywhere on the landing surface, not just on the composer", () => {
+    renderLanding();
+    const surface = screen.getByTestId("new-chat-landing");
+    fireEvent.dragEnter(surface, { dataTransfer: fileDrag() });
+    expect(screen.getByText("Drop files here")).toBeTruthy();
+    const file = new File(["hello"], "shot.png", { type: "image/png" });
+    fireEvent.drop(surface, { dataTransfer: fileDrag([file]) });
+    expect(screen.getByText("shot.png")).toBeTruthy();
+    expect(screen.queryByText("Drop files here")).toBeNull();
+  });
+
+  // Outside it — the sidebar and the rest of the shell — nothing is claimed.
+  it("ignores files dropped outside the landing surface", () => {
+    renderLanding();
+    fireEvent.dragEnter(document.body, { dataTransfer: fileDrag() });
+    expect(screen.queryByText("Drop files here")).toBeNull();
+    const file = new File(["hello"], "elsewhere.txt", { type: "text/plain" });
+    fireEvent.drop(document.body, { dataTransfer: fileDrag([file]) });
+    expect(screen.queryByText("elsewhere.txt")).toBeNull();
+  });
+
+  it("clears the drop overlay when the drag leaves the landing surface", () => {
     renderLanding();
     const composer = screen.getByTestId("new-chat-landing-composer");
-    fireEvent.dragEnter(composer, { dataTransfer: { files: [] } });
+    fireEvent.dragEnter(composer, { dataTransfer: fileDrag() });
     expect(screen.getByText("Drop files here")).toBeTruthy();
-    // relatedTarget defaults to null (outside the composer), so the active
-    // state clears rather than sticking when moving between child elements.
-    fireEvent.dragLeave(composer, { dataTransfer: { files: [] } });
+    fireEvent.dragLeave(composer, { dataTransfer: fileDrag() });
+    expect(screen.queryByText("Drop files here")).toBeNull();
+  });
+
+  // Dragging selected text (no "Files" type) must stay native so it can be
+  // dropped into the textarea — the page-wide handler ignores it.
+  it("ignores a drag that carries no files", () => {
+    renderLanding();
+    fireEvent.dragOver(screen.getByTestId("new-chat-landing-composer"), {
+      dataTransfer: { types: ["text/plain"], files: [] },
+    });
     expect(screen.queryByText("Drop files here")).toBeNull();
   });
 
@@ -3237,7 +3273,7 @@ describe("NewChatLandingScreen attachments", () => {
     const composer = screen.getByTestId("new-chat-landing-composer");
     const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
     const zip = new File([new Uint8Array(10)], "photos.zip", { type: "application/zip" });
-    fireEvent.drop(composer, { dataTransfer: { files: [ok, zip] } });
+    fireEvent.drop(composer, { dataTransfer: fileDrag([ok, zip]) });
     expect(screen.getByText("notes.txt")).toBeTruthy();
     expect(screen.queryByText("photos.zip")).toBeNull();
     expect(screen.getByTestId("new-chat-landing-attachment-error").textContent).toContain(

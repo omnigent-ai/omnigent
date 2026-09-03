@@ -2585,13 +2585,13 @@ async def test_github_info_proxies_to_runner(client: httpx.AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_github_changes_forwards_base_param(client: httpx.AsyncClient) -> None:
-    """GET /resources/github/changes forwards ``?base=`` to the runner."""
+async def test_github_changes_proxies_to_runner(client: httpx.AsyncClient) -> None:
+    """GET /resources/github/changes proxies the PR file list to the runner."""
     fake_runner = _FakeRunnerClient(payload={"object": "list", "data": [], "has_more": False})
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     resp = await client.get(
-        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/changes?base=main"
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/changes"
     )
 
     assert resp.status_code == 200
@@ -2599,19 +2599,16 @@ async def test_github_changes_forwards_base_param(client: httpx.AsyncClient) -> 
         "GET",
         "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/changes",
     ) in fake_runner.calls
-    assert {"base": "main"} in fake_runner.get_params
 
 
 @pytest.mark.asyncio
 async def test_github_pr_diff_proxies_whole_patch(client: httpx.AsyncClient) -> None:
-    """GET /resources/github/diff (no path) proxies the whole-PR patch + base."""
+    """GET /resources/github/diff (no path) proxies the whole-PR patch."""
     payload = {"object": "session.github.pr_diff", "patch": "diff --git a/x b/x\n"}
     fake_runner = _FakeRunnerClient(payload=payload)
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
-    resp = await client.get(
-        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff?base=main"
-    )
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff")
 
     assert resp.status_code == 200
     assert resp.json() == payload
@@ -2619,7 +2616,6 @@ async def test_github_pr_diff_proxies_whole_patch(client: httpx.AsyncClient) -> 
         "GET",
         "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff",
     ) in fake_runner.calls
-    assert {"base": "main"} in fake_runner.get_params
 
 
 @pytest.mark.asyncio

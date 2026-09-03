@@ -384,11 +384,16 @@ class ErrorData(BaseModel):
         ``"native_terminal_start_failed"``.
     :param message: Human-readable error message, e.g.
         ``"Native Codex requires the 'codex' CLI on PATH."``.
+    :param level: Rendering level. ``"info"`` renders the banner as a neutral
+        notice (e.g. codex started a fresh thread) rather than a failure;
+        ``None`` / ``"error"`` is the destructive default and is omitted from
+        the wire so existing error items are unchanged.
     """
 
     source: Literal["llm", "execution", "tool", "harness"]
     code: str
     message: str
+    level: Literal["error", "info"] | None = None
 
     @field_validator("code", "message")
     @classmethod

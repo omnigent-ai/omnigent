@@ -87,6 +87,7 @@ describe("KeyboardShortcutsDialog", () => {
     expect(screen.getByText("Recall previous prompt")).toBeTruthy();
     expect(screen.getByText("Previous session")).toBeTruthy();
     expect(screen.getByText("Toggle conversations sidebar")).toBeTruthy();
+    expect(screen.getByText("Open a new shell")).toBeTruthy();
     expect(screen.getByText("Navigate suggestions")).toBeTruthy();
   });
 
