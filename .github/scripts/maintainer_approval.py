@@ -47,7 +47,7 @@ def approval_decision(
     commits: list[dict[str, Any]],
     timeline: list[dict[str, Any]] | None = None,
 ) -> ApprovalDecision:
-    """Accept current approval or trusted same-repository successor commits."""
+    """Accept current approval or trusted successor commits."""
     maintainers = {login.casefold() for login in maintainers}
     trusted_successors = {login.casefold() for login in trusted_successors}
     if author.casefold() in maintainers:
@@ -56,7 +56,9 @@ def approval_decision(
     commit_positions = {
         str(commit.get("sha") or ""): index for index, commit in enumerate(commits)
     }
-    same_repository = head_repository.casefold() == repository.casefold()
+    head_scope = (
+        "same-repository" if head_repository.casefold() == repository.casefold() else "fork"
+    )
     failures: list[str] = []
     for login, review in latest_decisive_reviews(reviews).items():
         if login.casefold() not in maintainers:
@@ -67,9 +69,6 @@ def approval_decision(
         approved_sha = str(review.get("commit_id") or "")
         if review_state == "APPROVED" and approved_sha == head_sha:
             return ApprovalDecision(True, f"Current head approved by maintainer @{login}.")
-        if not same_repository:
-            failures.append(f"@{login}'s approval predates a fork-head update")
-            continue
         position = commit_positions.get(approved_sha)
         if position is None:
             failures.append(f"@{login}'s approved commit is no longer in PR history")
@@ -87,7 +86,7 @@ def approval_decision(
         if not untrusted:
             if review_state == "DISMISSED" and not trusted_automatic_dismissal(
                 review=review,
-                successor_shas={str(commit.get("sha") or "") for commit in successors},
+                successor_commits={str(commit.get("sha") or ""): commit for commit in successors},
                 trusted_successors=trusted_successors,
                 timeline=timeline or [],
             ):
@@ -98,7 +97,8 @@ def approval_decision(
             return ApprovalDecision(
                 True,
                 f"Maintainer @{login} approved {approved_sha[:9]}; only trusted "
-                f"automation committed through {head_sha[:9]}.",
+                f"automation committed on the {head_scope} head through "
+                f"{head_sha[:9]}.",
             )
         failures.append(
             f"@{login}'s approval predates untrusted commit(s): {', '.join(untrusted)}"
@@ -111,25 +111,30 @@ def approval_decision(
 def trusted_automatic_dismissal(
     *,
     review: dict[str, Any],
-    successor_shas: set[str],
+    successor_commits: dict[str, dict[str, Any]],
     trusted_successors: set[str],
     timeline: list[dict[str, Any]],
 ) -> bool:
     review_id = str(review.get("id") or "")
     for event in timeline:
         dismissed = event.get("dismissed_review") or {}
-        actor = event.get("actor") or {}
         if str(event.get("event") or "") != "review_dismissed":
             continue
         if str(dismissed.get("review_id") or "") != review_id:
             continue
         if str(dismissed.get("state") or "").upper() != "APPROVED":
             continue
-        if str(actor.get("login") or "").casefold() not in trusted_successors:
+        if dismissed.get("dismissal_message") not in {None, ""}:
             continue
-        if str(dismissed.get("dismissal_commit_id") or "") not in successor_shas:
+        dismissal_commit = successor_commits.get(str(dismissed.get("dismissal_commit_id") or ""))
+        if dismissal_commit is None:
             continue
-        return True
+        author_login = str((dismissal_commit.get("author") or {}).get("login") or "").casefold()
+        committer_login = str(
+            (dismissal_commit.get("committer") or {}).get("login") or ""
+        ).casefold()
+        if author_login in trusted_successors and committer_login in trusted_successors:
+            return True
     return False
 
 
