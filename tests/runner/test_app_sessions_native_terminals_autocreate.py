@@ -3585,9 +3585,74 @@ async def test_auto_create_claude_terminal_unserved_pick_resets_to_the_catalog_d
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("served_after_refresh", [True, False])
+async def test_auto_create_claude_terminal_keeps_the_pick_when_the_terminal_fails_to_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A pick is reset only once the fallback terminal is up.
+
+    The reset would otherwise outlive a launch that failed after the gate, so
+    a tmux or bridge failure must leave the persisted pick untouched.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    catalog = [
+        {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5", "isDefault": True}
+    ]
+
+    async def _catalog(config: object) -> list[dict[str, object]]:
+        del config
+        return catalog
+
+    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", _catalog)
+    monkeypatch.setattr(
+        "omnigent.claude_native.claude_launch_catalog_is_stale", lambda config: False
+    )
+
+    class _FailingResourceRegistry:
+        """Fails the tmux launch after the gate has run."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(self, **kwargs: Any) -> SessionResourceView:
+            """Raise the way a tmux launch failure does."""
+            del kwargs
+            raise RuntimeError("tmux exited")
+
+    patches: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH":
+            patches.append(json.loads(request.content))
+        return httpx.Response(200, json={"model_override": "gpt-5.4", "labels": {}})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(_handle_request),
+    )
+
+    async def _resolve() -> None:
+        return None
+
+    with pytest.raises(RuntimeError, match="tmux exited"):
+        await _auto_create_claude_terminal(
+            "3c4d5e6f7a8b49c0d1e2f3a4b5c6d7e8",
+            _FailingResourceRegistry(),
+            lambda _sid, _evt: None,
+            server_client=fake_client,
+            resolve_launch_config=_resolve,
+        )
+    assert [body for body in patches if "model_override" in body] == []
+
+    await fake_client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refresh", ["serves_pick", "lacks_pick", "fails"])
 async def test_auto_create_claude_terminal_refreshes_a_stale_catalog_before_resetting_the_pick(
-    served_after_refresh: bool,
+    refresh: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3596,8 +3661,9 @@ async def test_auto_create_claude_terminal_refreshes_a_stale_catalog_before_rese
 
     The stored rows may predate a provider change, so resetting the pick on
     them alone could discard a model the provider serves today. The launch
-    awaits the re-probe: a fresh row serving the pick keeps it, and only a
-    fresh catalog that still lacks it falls back and resets the pick.
+    awaits the re-probe: a fresh row serving the pick keeps it, only a fresh
+    catalog that still lacks it resets the pick, and a failed probe launches
+    on the default while keeping the pick for the next relaunch.
     """
     import os
     import time
@@ -3635,13 +3701,15 @@ async def test_auto_create_claude_terminal_refreshes_a_stale_catalog_before_rese
         },
     ]
     refreshed_rows = list(stale_rows)
-    if served_after_refresh:
+    if refresh == "serves_pick":
         refreshed_rows.append({"id": "haiku", "model": "claude-haiku-4-5-20251001"})
     probes: list[int] = []
 
     async def _probe(config: object) -> list[dict[str, object]]:
         del config
         probes.append(1)
+        if refresh == "fails":
+            raise OSError("provider unreachable")
         return refreshed_rows
 
     monkeypatch.setattr("omnigent.claude_native.claude_model_catalog", _probe)
@@ -3703,14 +3771,21 @@ async def test_auto_create_claude_terminal_refreshes_a_stale_catalog_before_rese
     )
     args = captured["spec"].args
     assert probes == [1], "the launch must await exactly one re-probe"
-    assert model_catalog_store.read_catalog("claude-native", fingerprint) == refreshed_rows
     pick_resets = [body for body in patches if "model_override" in body]
-    if served_after_refresh:
+    if refresh == "serves_pick":
+        assert model_catalog_store.read_catalog("claude-native", fingerprint) == refreshed_rows
         assert args[args.index("--model") + 1] == "claude-haiku-4-5"
         assert pick_resets == []
-    else:
+    elif refresh == "lacks_pick":
+        assert model_catalog_store.read_catalog("claude-native", fingerprint) == refreshed_rows
         assert args[args.index("--model") + 1] == "claude-opus-4-8[1m]"
         assert pick_resets == [{"model_override": "default"}]
+    else:
+        # No fresh rows: the stale entry stays, the Default launch of a stale
+        # catalog goes bare, and the pick survives for the next relaunch.
+        assert model_catalog_store.read_catalog("claude-native", fingerprint) == stale_rows
+        assert "--model" not in args
+        assert pick_resets == []
 
     await fake_client.aclose()
 

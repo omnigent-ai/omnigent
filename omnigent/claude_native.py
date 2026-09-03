@@ -487,22 +487,40 @@ def claude_catalog_serves_model(
     )
 
 
+def _endpoint_origin(url: str) -> str:
+    """
+    Reduce an endpoint URL to its scheme and host, for log lines.
+
+    :param url: An endpoint URL, e.g. ``"https://user:pw@gw.example/anthropic?sig=1"``.
+    :returns: The origin only, e.g. ``"https://gw.example"``; the URL itself
+        when it has no scheme.
+    """
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.hostname:
+        return url
+    host = f"{parsed.hostname}:{parsed.port}" if parsed.port else parsed.hostname
+    return f"{parsed.scheme}://{host}"
+
+
 def claude_launch_endpoint_label(claude_config: ClaudeNativeUcodeConfig | None) -> str:
     """
     Name where a launch config sends Claude Code's inference, for log lines.
 
+    Only the endpoint's origin is named: a custom base URL can carry userinfo
+    or a signed query string that must not reach the logs.
+
     :param claude_config: The resolved launch config, or ``None`` (Claude
         Code's own login).
     :returns: A short phrase, e.g. ``"the gateway at
-        https://example.databricks.com/ai-gateway/anthropic"``.
+        https://example.databricks.com"``.
     """
     if claude_config is not None:
         bedrock_url = claude_config.env.get(_ANTHROPIC_BEDROCK_BASE_URL_ENV)
         if bedrock_url:
-            return f"the Bedrock endpoint at {bedrock_url}"
+            return f"the Bedrock endpoint at {_endpoint_origin(bedrock_url)}"
         base_url = claude_config.env.get(_UCODE_CLAUDE_BASE_URL_ENV)
         if base_url:
-            return f"the gateway at {base_url}"
+            return f"the gateway at {_endpoint_origin(base_url)}"
     return "Claude Code's own login"
 
 

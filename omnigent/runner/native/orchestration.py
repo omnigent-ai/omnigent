@@ -6836,6 +6836,9 @@ async def _auto_create_claude_terminal(
         if session_model_override
         else unpinned_launch_model
     )
+    # A pick the provider cannot serve is dropped only once the fallback
+    # terminal is actually up, so a failed launch never loses it.
+    reset_pick_after_launch = False
     # Explicit launches (model-flows design §4): consult the shared catalog
     # only when it can change the outcome — to validate an explicit request,
     # or to resolve a Default launch that would otherwise pass no ``--model``
@@ -6879,33 +6882,42 @@ async def _auto_create_claude_terminal(
                     rows, pick, claude_config
                 ) or claude_catalog_serves_model(rows, resolved_request, claude_config)
 
+            # Only rows that are fresh may retire the pick: a stale entry may
+            # predate a provider change, so it is re-probed first, and a
+            # failed probe leaves no trusted rows at all.
+            trusted_rows: list[dict[str, object]] | None = launch_catalog
             if launch_catalog_was_stale and not _serves_pick(launch_catalog):
-                # A stale entry may predate a provider change, so only a fresh
-                # probe can justify resetting the pick: await it here.
-                refreshed = await claude_refreshed_launch_catalog(claude_config)
-                if refreshed:
-                    launch_catalog = refreshed
+                trusted_rows = await claude_refreshed_launch_catalog(claude_config)
+                if trusted_rows:
+                    launch_catalog = trusted_rows
                     launch_catalog_was_stale = False
             if not _serves_pick(launch_catalog):
                 # The pick outlives the provider it was made under (a later
                 # ``omnigent setup`` can re-point the default). Launch on what
-                # this provider serves and reset the pick to Default, so the
-                # session comes back and the picker shows what it now runs.
+                # this provider serves; reset the pick to Default only on fresh
+                # evidence, so the picker shows what the session now runs.
                 offered = ", ".join(
                     str(row.get("id") or row.get("model") or "") for row in launch_catalog
                 )
+                if trusted_rows:
+                    reset_pick_after_launch = True
+                    outcome = "launching on the provider default and resetting the pick to Default"
+                else:
+                    outcome = (
+                        "the re-probe failed, so launching on the provider default and "
+                        "keeping the pick for the next relaunch"
+                    )
                 _logger.warning(
                     "claude-native: model pick %r for session %s is not served by %s "
-                    "(it offers: %s); launching on the provider default and resetting "
-                    "the pick to Default",
+                    "(it offers: %s); %s",
                     pick,
                     session_id,
                     claude_launch_endpoint_label(claude_config),
                     offered,
+                    outcome,
                     extra={"session_id": session_id},
                 )
                 launch_model = unpinned_launch_model
-                await _clear_session_model_override(session_id, server_client)
         if launch_model is None and launch_catalog:
             # A stale entry's default is yesterday's answer: pinning it as
             # ``--model`` turns a provider-side retirement or entitlement
@@ -7124,6 +7136,8 @@ async def _auto_create_claude_terminal(
             extra={"session_id": session_id},
         )
         raise
+    if reset_pick_after_launch:
+        await _clear_session_model_override(session_id, server_client)
     # Surface the terminal on the live SSE stream so an already-connected
     # web UI enables the Terminal toggle immediately. The required-terminal
     # launch helper registers the resource and starts the activity watcher but
