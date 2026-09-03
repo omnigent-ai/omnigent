@@ -7,7 +7,6 @@ import {
   Loader2Icon,
   MaximizeIcon,
   MinimizeIcon,
-  MoreHorizontalIcon,
   PlusIcon,
   TerminalIcon,
   XIcon,
@@ -85,12 +84,13 @@ function readPreferredShell(): string | null {
 
 // ---------------------------------------------------------------------------
 // NewTabMenu — the "+" affordance in the tab strip. Opens a small dropdown
-// ("Open new") to spin up a Shell as a rail tab. A top "Shell" item launches
-// the remembered default (the last-picked type, else the first declared name);
-// when several types are declared, a "More shells" flyout lists them all so the
-// user can pick a specific one (remembered as the new default). The flyout
-// trigger only reveals the submenu — it never launches. Gated on the agent's
-// spec declaring terminal access — renders nothing else.
+// ("Open new") to spin up a Shell as a rail tab. A single "Shell" item both
+// launches and picks the type: clicking its label launches the remembered
+// default (the last-picked type, else the first declared name), and the item
+// names that default inline — "Shell (zsh)". When several types are declared,
+// the same row carries a flyout (chevron) listing the OTHER types; picking one
+// launches it and remembers it as the new default. Gated on the agent's spec
+// declaring terminal access — renders nothing otherwise.
 //
 // The "Shell" item also reflects the session's liveness so opening a shell on
 // a disconnected session isn't a silent 502:
@@ -163,7 +163,7 @@ function NewTabMenu({
   // per conversation, reached via its own pinned tab, so it's not offered here.)
   if (!canOpenShell) return null;
 
-  // The default launched on a plain "Shell" click: the remembered pick when it
+  // The default launched by the primary segment: the remembered pick when it
   // is still a declared type, else the first declared name.
   const defaultShell =
     preferred !== null && declaredTerminals.includes(preferred) ? preferred : declaredTerminals[0];
@@ -192,17 +192,21 @@ function NewTabMenu({
     launchShell(name);
   };
 
-  // One declared shell → just the "Shell" item. Several → a "More shells"
-  // flyout to pick a specific type.
+  // One declared shell → a plain "Shell" item. Several → the same row carries a
+  // flyout to the other types.
   const multipleShells = declaredTerminals.length > 1;
+  // The other declared types, shown in the row's flyout (the current default is
+  // already named in the row itself).
+  const otherShells = declaredTerminals.filter((name) => name !== defaultShell);
 
   // Liveness-derived affordance for the "Shell" item. A create in flight on a
   // wakeable session reads "Reconnecting…" (the server is waking the runner);
   // an offline session disables the item since the browser can't reconnect it.
   const isReconnecting = create.isPending && connectState === "wakeable";
   const shellDisabled = create.isPending || connectState === "offline";
-  // Icon + label + trailing hint for the "Shell" item, reflecting the connect
-  // state.
+  // Icon + label + trailing hint for the "Shell" item. The label names the
+  // current default inline — "Shell (zsh)" — so the type is visible without
+  // opening the flyout.
   const shellItemContent = (
     <>
       {isReconnecting ? (
@@ -210,7 +214,9 @@ function NewTabMenu({
       ) : (
         <TerminalIcon className="size-4" />
       )}
-      <span className="whitespace-nowrap">{isReconnecting ? "Reconnecting…" : "Shell"}</span>
+      <span className="whitespace-nowrap">
+        {isReconnecting ? "Reconnecting…" : `Shell (${defaultShell})`}
+      </span>
       {connectState === "offline" && (
         <span className="ml-auto pl-4 text-sm text-muted-foreground">Offline</span>
       )}
@@ -246,25 +252,22 @@ function NewTabMenu({
             paint over the dropdown (#3980). Only this rail menu needs it. */}
         <SuppressBrowserView />
         <DropdownMenuLabel>Open new</DropdownMenuLabel>
-        {/* Remembered default shell — the direct-launch item. */}
-        <DropdownMenuItem
-          onSelect={() => launchShell(defaultShell)}
-          disabled={shellDisabled}
-          className="cursor-pointer"
-        >
-          {shellItemContent}
-        </DropdownMenuItem>
-        {/* Other declared types live behind a flyout whose trigger only reveals
-            the submenu — it never launches, so the type list stays discoverable.
-            Picking one launches it and remembers it as the new default. */}
-        {multipleShells && (
+        {multipleShells ? (
+          // Several types → the "Shell (default)" row both launches the default
+          // (on click) and opens a flyout of the OTHER types (on hover / chevron).
+          // Picking one launches it and remembers it as the new default.
           <DropdownMenuSub>
-            <DropdownMenuSubTrigger disabled={shellDisabled}>
-              <MoreHorizontalIcon className="size-4" />
-              <span className="whitespace-nowrap">More shells</span>
+            <DropdownMenuSubTrigger
+              disabled={shellDisabled}
+              onClick={() => launchShell(defaultShell)}
+              className="cursor-pointer"
+            >
+              {shellItemContent}
             </DropdownMenuSubTrigger>
-            <DropdownMenuSubContent>
-              {declaredTerminals.map((name) => (
+            {/* min-w-0 drops the default 96px floor so the box hugs the shell
+                name (e.g. "bash") instead of padding it out. */}
+            <DropdownMenuSubContent className="min-w-0">
+              {otherShells.map((name) => (
                 <DropdownMenuItem
                   key={name}
                   onSelect={() => pickShell(name)}
@@ -276,6 +279,15 @@ function NewTabMenu({
               ))}
             </DropdownMenuSubContent>
           </DropdownMenuSub>
+        ) : (
+          // Single type → a plain launch item.
+          <DropdownMenuItem
+            onSelect={() => launchShell(defaultShell)}
+            disabled={shellDisabled}
+            className="cursor-pointer"
+          >
+            {shellItemContent}
+          </DropdownMenuItem>
         )}
       </DropdownMenuContent>
     </DropdownMenu>
