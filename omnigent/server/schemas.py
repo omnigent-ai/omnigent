@@ -805,6 +805,17 @@ class ChildSessionSummary(BaseModel):
         a fanned-out sub-agent that needs attention is visible
         without opening its chat. Mirrors
         :attr:`SessionListItem.pending_elicitations_count`.
+    :param status: The child's live session status — ``"idle"``,
+        ``"running"``, ``"waiting"``, or ``"failed"`` — from the relay-fed
+        status cache, falling back to the durable
+        ``omnigent_conversation_metadata.live_status`` row so a replica
+        that does not hold the runner tunnel (or a restarted server) still
+        reports the child's real state. Forced to ``"failed"`` when the
+        child carries a durable ``last_task_error``. ``None`` when no live
+        state is known anywhere (e.g. a child that has not run a turn).
+        This is what lets a supervisor agent reconcile a sub-agent whose
+        turn died with an interrupted runner instead of assuming it is
+        still working.
     :param routed_model: Model this sub-agent runs on when one was pinned
         for it, e.g. ``"databricks-claude-opus-4-8"``. Read from the
         child's ``model_override`` — the field intelligent routing writes
@@ -832,6 +843,7 @@ class ChildSessionSummary(BaseModel):
     current_task_id: str | None = None
     current_task_status: str | None = None
     busy: bool = False
+    status: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     last_task_error: dict[str, str] | None = None
     last_message_preview: str | None = None

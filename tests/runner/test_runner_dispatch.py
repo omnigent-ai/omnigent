@@ -6114,6 +6114,7 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
                         "title": "researcher:auth",
                         "tool": "researcher",
                         "session_name": "auth",
+                        "status": "running",
                     },
                     {
                         "id": "c2",
@@ -6156,10 +6157,10 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
     # c3 (explicitly closed despite its mixed-type label map), c5
     # (legacy title tombstone), and c4
     # (no colon) dropped; the ui:-added child surfaces under its bound
-    # agent + label.
+    # agent + label. ``status`` mirrors the row's live status (absent → None).
     assert out["sub_agents"] == [
-        {"agent": "researcher", "title": "auth", "conversation_id": "c1"},
-        {"agent": "claude-native-ui", "title": "1", "conversation_id": "c2"},
+        {"agent": "researcher", "title": "auth", "conversation_id": "c1", "status": "running"},
+        {"agent": "claude-native-ui", "title": "1", "conversation_id": "c2", "status": None},
     ]
 
 
@@ -6199,6 +6200,7 @@ async def test_session_list_adds_main_and_siblings_for_child_caller() -> None:
                             "title": "researcher:auth",
                             "tool": "researcher",
                             "session_name": "auth",
+                            "status": "idle",
                         },
                     ],
                 },
@@ -6212,10 +6214,11 @@ async def test_session_list_adds_main_and_siblings_for_child_caller() -> None:
             )
         )
     # No own children; gains main (its parent) + the sibling, with itself
-    # excluded from the sibling list.
+    # excluded from the sibling list. ``main`` carries no status (the
+    # parent-id probe doesn't fetch one); the sibling's is passed through.
     assert out["sub_agents"] == [
-        {"agent": "main", "title": None, "conversation_id": "conv_main"},
-        {"agent": "researcher", "title": "auth", "conversation_id": "conv_sib"},
+        {"agent": "main", "title": None, "conversation_id": "conv_main", "status": None},
+        {"agent": "researcher", "title": "auth", "conversation_id": "conv_sib", "status": "idle"},
     ]
 
 

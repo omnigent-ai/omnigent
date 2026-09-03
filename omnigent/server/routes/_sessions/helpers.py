@@ -9549,9 +9549,12 @@ def _child_session_summary_from_conversation(
     the raw title and ``session_name`` is ``None`` — the row is still
     surfaced so debug views can investigate.
 
-    ``busy`` is derived from the relay-fed ``_session_status_cache``
-    (the tasks table has been removed). ``agent_id`` and ``agent_name``
-    are read from the conversation row directly.
+    ``busy`` / ``status`` are derived from the relay-fed
+    ``_session_status_cache`` (the tasks table has been removed), falling
+    back to the row's durable ``live_status`` on a cache miss so a replica
+    that does not hold the runner tunnel — or a restarted server — still
+    reports the child's real state instead of a blank one. ``agent_id``
+    and ``agent_name`` are read from the conversation row directly.
 
     :param conv: A child :class:`Conversation` row
         (``kind="sub_agent"``) from
@@ -9600,17 +9603,25 @@ def _child_session_summary_from_conversation(
         tool = display_title or None
         session_name = None
 
-    # Derive busy from the relay-fed cache; tasks table is gone.
+    # Derive busy from the relay-fed cache; tasks table is gone. On a cache
+    # miss (a replica that doesn't hold the runner tunnel, or a restarted
+    # server), fall back to the durable ``live_status`` row so the child's
+    # real state — e.g. a turn that died with an interrupted runner — is
+    # still reported rather than presenting as unknown.
     if cached_status is None:
         cached_status = _session_status_cache.get(conv.id)
+    if cached_status is None:
+        cached_status = conv.live_status
     if cached_status in ("running", "waiting"):
         busy = True
     else:
         busy = False
     last_task_error = _last_task_error_from_labels(labels)
     current_task_status = _child_session_current_task_status_from_cached_status(cached_status)
+    status = cached_status if cached_status in ("idle", "running", "waiting", "failed") else None
     if last_task_error is not None:
         current_task_status = "failed"
+        status = "failed"
 
     # For Codex children, fall back to the prompt label as preview when the
     # real transcript has not arrived yet — avoids synthesizing a user message
@@ -9638,6 +9649,7 @@ def _child_session_summary_from_conversation(
         current_task_id=None,
         current_task_status=current_task_status,
         busy=busy,
+        status=status,
         labels=labels,
         last_task_error=last_task_error,
         last_message_preview=last_message_preview,
