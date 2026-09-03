@@ -17,6 +17,7 @@ from omnigent.entities import (
     ConversationItem,
 )
 from omnigent.runtime import pending_elicitations
+from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
 from omnigent.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
@@ -143,7 +144,11 @@ class SysSessionSendTool(Tool):
             "pass their file ids via the object args form's 'file_ids' "
             "list on the first named (agent, title) send only; file_ids "
             "cannot be used with session_id or when continuing an existing "
-            "named session."
+            "named session. When a dispatched child finishes, the Omnigent "
+            f"runtime posts `{SUBAGENT_WAKE_NOTICE_SHAPE}` into this session "
+            "as a new message, starting a turn for you if you are idle. That "
+            "notice comes from the runtime, not from a person; respond by "
+            "calling sys_read_inbox to collect the result."
         )
 
     def __init__(self, sub_specs: dict[str, AgentSpec]) -> None:

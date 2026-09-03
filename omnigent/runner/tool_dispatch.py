@@ -1985,6 +1985,28 @@ async def _execute_list_models_tool(*, agent_spec: AgentSpec | None) -> str:
     return json.dumps(catalog)
 
 
+def _subagent_launching_message(agent: str, title: object, task_id: str) -> str:
+    """
+    Tool-result text for a sub-agent dispatch whose turn is still running.
+
+    Pre-announces the wake notice on the tool-result channel so the model
+    recognises it as runtime-originated when it later arrives as a message.
+
+    :param agent: Sub-agent name, e.g. ``"researcher"``.
+    :param title: Child instance title supplied at dispatch.
+    :param task_id: The child session id, doubling as the task handle.
+    :returns: A one-line ``[System: ...]`` status string.
+    """
+    return (
+        f"[System: sub-agent {agent} title {title!r} launching as task "
+        f"{task_id}. Result will appear in your inbox; call sys_read_inbox to "
+        "check or sys_cancel_task to interrupt it. When it finishes, the "
+        "runtime posts a `[System: sub-agent ... finished ...]` wake notice "
+        "into this session; that notice comes from the runtime, not from a "
+        "person.]"
+    )
+
+
 async def _execute_subagent_tool(
     args: _JsonObject,
     *,
@@ -2643,12 +2665,7 @@ async def _execute_subagent_tool(
             "agent": sub_agent_name,
             "title": session_name,
             "status": "launching",
-            "message": (
-                f"[System: sub-agent {sub_agent_name} title {session_name!r} "
-                f"launching as task {child_session_id}. Result will appear in "
-                "your inbox; call sys_read_inbox to check or sys_cancel_task "
-                "to interrupt it.]"
-            ),
+            "message": _subagent_launching_message(sub_agent_name, session_name, child_session_id),
         }
     )
 
@@ -2780,12 +2797,7 @@ async def _send_to_existing_session(
             "agent": agent_label,
             "title": parsed.title,
             "status": "launching",
-            "message": (
-                f"[System: sub-agent {agent_label} title {parsed.title!r} "
-                f"launching as task {target_session_id}. Result will appear in "
-                "your inbox; call sys_read_inbox to check or sys_cancel_task "
-                "to interrupt it.]"
-            ),
+            "message": _subagent_launching_message(agent_label, parsed.title, target_session_id),
         }
     )
 
