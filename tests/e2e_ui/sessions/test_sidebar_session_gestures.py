@@ -15,6 +15,7 @@ import httpx
 from playwright.sync_api import Browser, BrowserContext, Locator, Page, expect
 
 from tests.e2e_ui._touch import center, new_touch_context, touch
+from tests.e2e_ui.conftest import set_session_title
 
 _MOBILE_VIEWPORT = {"width": 390, "height": 844}
 _UNEXPECTED_EVENT_SCRIPT = """
@@ -51,16 +52,6 @@ def _unexpected_events(page: Page) -> list[str]:
     return page.evaluate("window.__rowGestureUnexpected")
 
 
-def _set_title(base_url: str, session_id: str, title: str) -> None:
-    """Give the test session a unique, visible sidebar label."""
-    response = httpx.patch(
-        f"{base_url}/v1/sessions/{session_id}",
-        json={"title": title},
-        timeout=10.0,
-    )
-    response.raise_for_status()
-
-
 def _create_project(base_url: str, name: str) -> None:
     """Create an empty project for a drag target."""
     response = httpx.post(f"{base_url}/v1/projects", json={"name": name}, timeout=10.0)
@@ -83,7 +74,7 @@ def test_released_swipe_archives_without_navigating_and_stationary_tap_navigates
 ) -> None:
     """A real released swipe commits archive, while a stationary touch remains a tap."""
     base_url, session_id = seeded_session
-    _set_title(base_url, session_id, f"e2e-touch-archive-{uuid.uuid4().hex[:8]}")
+    set_session_title(base_url, session_id, f"e2e-touch-archive-{uuid.uuid4().hex[:8]}")
 
     context = _new_touch_context(browser)
     try:
@@ -144,7 +135,7 @@ def test_still_touch_opens_session_context_menu_without_dragging(
     """A still touch opens the context menu; only a moving finger drags."""
     base_url, session_id = seeded_session
     title = f"e2e-touch-hold-{uuid.uuid4().hex[:8]}"
-    _set_title(base_url, session_id, title)
+    set_session_title(base_url, session_id, title)
 
     context = _new_touch_context(browser)
     try:
@@ -190,7 +181,7 @@ def test_vertical_touch_scroll_still_works_on_session_row(
 ) -> None:
     """Moving before the hold delay scrolls the sidebar instead of dragging."""
     base_url, session_id = seeded_session
-    _set_title(base_url, session_id, f"e2e-touch-scroll-{uuid.uuid4().hex[:8]}")
+    set_session_title(base_url, session_id, f"e2e-touch-scroll-{uuid.uuid4().hex[:8]}")
 
     context = _new_touch_context(browser)
     try:
@@ -243,7 +234,7 @@ def test_horizontal_swipe_wins_before_hold_while_vertical_motion_yields_to_scrol
 ) -> None:
     """Axis ownership resolves before the competing hold can arm."""
     base_url, session_id = seeded_session
-    _set_title(base_url, session_id, f"e2e-touch-axis-{uuid.uuid4().hex[:8]}")
+    set_session_title(base_url, session_id, f"e2e-touch-axis-{uuid.uuid4().hex[:8]}")
 
     context = _new_touch_context(browser)
     try:
@@ -290,7 +281,7 @@ def test_pointercancel_resets_menu_and_drag_then_allows_another_hold(
 ) -> None:
     """Cancellation returns an armed or dragging row to a reusable idle state."""
     base_url, session_id = seeded_session
-    _set_title(base_url, session_id, f"e2e-touch-cancel-{uuid.uuid4().hex[:8]}")
+    set_session_title(base_url, session_id, f"e2e-touch-cancel-{uuid.uuid4().hex[:8]}")
 
     context = _new_touch_context(browser)
     try:
@@ -334,7 +325,7 @@ def test_lost_pointer_capture_resets_swipe_and_allows_another_swipe(
 ) -> None:
     """Unexpected capture loss clears translation without poisoning the next touch."""
     base_url, session_id = seeded_session
-    _set_title(base_url, session_id, f"e2e-touch-capture-{uuid.uuid4().hex[:8]}")
+    set_session_title(base_url, session_id, f"e2e-touch-capture-{uuid.uuid4().hex[:8]}")
 
     context = _new_touch_context(browser)
     try:
@@ -398,7 +389,7 @@ def test_touch_drag_moves_session_into_project(
 ) -> None:
     """A touch drag still drops the session into a project folder."""
     base_url, session_id = seeded_session
-    _set_title(base_url, session_id, f"e2e-touch-drop-{uuid.uuid4().hex[:8]}")
+    set_session_title(base_url, session_id, f"e2e-touch-drop-{uuid.uuid4().hex[:8]}")
     project = f"Project {uuid.uuid4().hex[:6]}"
     _create_project(base_url, project)
 

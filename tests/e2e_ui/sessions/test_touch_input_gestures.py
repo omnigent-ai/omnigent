@@ -1,38 +1,11 @@
 """E2E: touch input across the web shell.
 
-The user-facing claims, each driven here with real (CDP-synthesized)
-touch input against the live SPA:
-
-1. **Pane dividers are mouse-only.** Every resize hook binds ``onMouseDown``
-   only, so a finger/stylus drag on a divider never resizes the pane. Driven
-   on the left Conversations sidebar's right-edge handle: a touch drag that a
-   mouse drag of the same geometry performs must change the sidebar width.
-
-2. **Session rows expose no swipe affordance.** A deliberate horizontal swipe
-   on a sidebar session row must produce *some* swipe response — the row
-   tracking the finger (a transform appearing on the row while the gesture is
-   in flight) or a committed swipe action (an ``archived`` PATCH). Today the
-   gesture is dead: nothing moves and nothing fires.
-
-3. **Long-press on a session row doesn't reliably open the row menu.** The
-   row is wrapped in a Radix ``ContextMenuTrigger`` (which serves long-press
-   on touch via the browser's contextmenu gesture) while dnd-kit's
-   ``TouchSensor`` (250ms hold, 8px tolerance) arms a drag on the same
-   pointer. A perfectly stationary hold happens to work, but a hold with a
-   realistic few-px finger wobble — inside dnd-kit's own declared tolerance —
-   opens nothing, which is exactly the "randomly does nothing" flakiness the
-   report describes.
-
-4. **Capability checks drift between call sites.** On a hover-incapable touch
-   tablet the sidebar header's actions are visible (they carry the
-   ``[@media((hover:hover)_and_(pointer:fine))]`` guard) while the session row's actions kebab is
-   still purely hover-revealed — the same device gets different touch
-   treatment from adjacent components.
-
-All four drive their own touch-enabled contexts (the default ``page``
-fixture has no touch support). Touch gestures are dispatched through CDP
-``Input.dispatchTouchEvent`` so they run Chromium's real gesture recognizer
-(pan/long-press/compatibility-mouse semantics), exactly as a finger would.
+Four journeys, each driven with real (CDP-synthesized) touch input against the
+live SPA so Chromium's gesture recognizer arbitrates them as a finger would:
+a touch drag on a pane divider resizes it, a horizontal swipe on a session row
+tracks the finger or commits its action, a long-press with realistic finger
+wobble opens the row menu, and a hover-incapable md+ tablet keeps the row's
+controls visible without hover.
 """
 
 from __future__ import annotations
@@ -53,20 +26,11 @@ def _sidebar_width(page: Page) -> float:
     return box["width"]
 
 
-def test_sidebar_resize_handle_supportstouch_drag(
+def test_sidebar_resize_handle_supports_touch_drag(
     browser: Browser,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A touch drag on the sidebar's resize handle must resize the sidebar.
-
-    The mouse-only-dividers facet: the resize hooks (`useResizableSidebar` and its four
-    siblings) listen for ``mousedown``/``mousemove`` only. Chromium emits no
-    compatibility mouse-move stream for a touch drag, so the same drag a mouse
-    performs does nothing from a finger — the divider is effectively
-    mouse-only. This drives the identical geometry a working mouse drag uses
-    (grab the handle, pull 140px right) with a real touch sequence and asserts
-    the sidebar widened.
-    """
+    """A touch drag on the sidebar's resize handle resizes the sidebar."""
     base_url, session_id = seeded_session
     context = new_touch_context(browser, viewport=_DESKTOP_VIEWPORT)
     try:
@@ -108,16 +72,7 @@ def test_session_row_swipe_shows_affordance(
     browser: Browser,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A horizontal swipe on a session row must produce a swipe response.
-
-    The dead-swipe facet: session rows have no swipe affordances — archive /
-    delete require opening a menu. A left swipe on the row should either track
-    the finger (the row/link translating while the gesture is in flight) or
-    commit a swipe action (an ``archived`` PATCH). The probe samples the row's
-    and link's computed transforms every frame during the swipe (baselined
-    first, so pre-existing static transforms don't count) and the test also
-    watches for a session PATCH carrying ``archived``.
-    """
+    """A horizontal swipe on a session row tracks the finger or commits its action."""
     base_url, session_id = seeded_session
     context = new_touch_context(browser, viewport=_PHONE_VIEWPORT, is_mobile=True)
     try:
@@ -196,20 +151,7 @@ def test_session_row_long_press_opens_actions_menu(
     browser: Browser,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A long-press with realistic finger wobble must open the row menu.
-
-    The flaky-long-press facet: on touch the row menu's only long-press path is the
-    Radix ``ContextMenuTrigger`` riding the browser's long-press-contextmenu
-    gesture, while dnd-kit's ``TouchSensor`` (250ms hold, 8px tolerance) arms
-    a drag on the very same pointer. A *perfectly stationary* hold happens to
-    open the menu, but any real finger wobbles a few px during the hold — and
-    a wobble of just 3px (far inside dnd-kit's own declared 8px tolerance and
-    any platform's touch slop) kills the long-press, so on-device the menu
-    opens "randomly" depending on how still the finger was. Holds with a ±3px
-    wobble past both thresholds, releases, and requires the row actions (the
-    shared ``ConversationMenuItems`` body — ``rename-conversation`` et al.)
-    to be on screen.
-    """
+    """A long-press with ±3px finger wobble still opens the row menu."""
     base_url, session_id = seeded_session
     context = new_touch_context(browser, viewport=_PHONE_VIEWPORT, is_mobile=True)
     try:
@@ -249,18 +191,7 @@ def test_row_actions_reachable_on_touch_tablet(
     browser: Browser,
     seeded_session: tuple[str, str],
 ) -> None:
-    """On a touch tablet the session-row kebab must be visible without hover.
-
-    The capability-drift facet: capability checks drift between call sites. The
-    Projects header actions already fall back to always-visible on
-    hover-incapable devices (``[@media((hover:hover)_and_(pointer:fine))]`` gating — the touch
-    tablet fix), but the session row's kebab and pin — an adjacent call site
-    in the same sidebar — are still purely hover-revealed
-    (``md:opacity-0 md:group-hover:opacity-100`` with no hover-capability
-    guard). On a touch tablet (>=768px viewport, coarse pointer, no hover)
-    the row controls are therefore invisible while the header controls are
-    visible: the same device gets different touch treatment per component.
-    """
+    """On a hover-incapable md+ tablet the row's kebab is visible without hover."""
     base_url, session_id = seeded_session
     context = new_touch_context(browser, viewport={"width": 1024, "height": 768})
     try:

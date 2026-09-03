@@ -120,9 +120,9 @@ export function useResizeDrag<T extends Element = Element>({
       const onDocumentKeyDown = (documentEvent: KeyboardEvent) => {
         if (documentEvent.key === "Escape") cancelDrag();
       };
-      const onContextMenu = () => cancelDrag();
-      const onWindowBlur = () => cancelDrag();
-      const onVisibilityChange = () => cancelDrag();
+      const onContextMenu = cancelDrag;
+      const onWindowBlur = cancelDrag;
+      const onVisibilityChange = cancelDrag;
       const observer = observeHandleRemoval
         ? new MutationObserver(() => {
             if (activeHandle.current && !activeHandle.current.isConnected) cancelDrag();
