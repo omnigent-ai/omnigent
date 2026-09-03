@@ -117,6 +117,7 @@ def test_browser_tools_not_advertised_to_request_harness_without_renderer(
             for request in get_mock_requests(mock_llm_server_url, key=model)
         )
     )
+    assert "load_skill" in advertised, "expected captured framework tool schemas"
     assert advertised.isdisjoint(BROWSER_TOOL_NAMES), (
         f"browser tools advertised without a renderer: {sorted(advertised & BROWSER_TOOL_NAMES)}"
     )
