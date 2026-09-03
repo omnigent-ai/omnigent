@@ -4,6 +4,7 @@ import type {
   ActionDefinition,
   ActionId,
   ActionInvocation,
+  ArglessActionId,
   ActionResult,
   ContextPatch,
   ContextSnapshot,
@@ -34,6 +35,8 @@ export interface ActionHandlerRegistration<A extends ActionId = ActionId> {
   ) => ActionResult | void | Promise<ActionResult | void>;
   isEnabled?: (context: ActionHandlerContext) => boolean;
   isVisible?: (context: ActionHandlerContext) => boolean;
+  /** Opt in only when the action's legacy shortcut has migrated. */
+  acceptsKeybindings?: boolean;
 }
 
 interface RegisteredHandler {
@@ -45,6 +48,7 @@ interface RegisteredHandler {
   ) => ActionResult | void | Promise<ActionResult | void>;
   isEnabled?: (context: ActionHandlerContext) => boolean;
   isVisible?: (context: ActionHandlerContext) => boolean;
+  acceptsKeybindings: boolean;
   token: number;
   order: number;
 }
@@ -57,6 +61,10 @@ export interface ActionResolution {
 
 export interface AvailableAction extends ActionDefinition {
   enabled: boolean;
+}
+
+export interface AvailablePaletteAction extends Omit<AvailableAction, "id"> {
+  id: ArglessActionId;
 }
 
 interface RankedHandler {
@@ -141,6 +149,7 @@ export class ActionRegistry {
         registration.run(invocation as Extract<ActionInvocation, { action: A }>, context),
       isEnabled: registration.isEnabled,
       isVisible: registration.isVisible,
+      acceptsKeybindings: registration.acceptsKeybindings ?? false,
       token,
       order: this.nextOrder++,
     };
@@ -251,7 +260,11 @@ export class ActionRegistry {
     return merged;
   }
 
-  private rankedHandlers(action: ActionId, resolution: ActionResolution): RankedHandler[] {
+  private rankedHandlers(
+    action: ActionId,
+    resolution: ActionResolution,
+    keyboardOnly = false,
+  ): RankedHandler[] {
     const entries = this.handlers.get(action);
     if (!entries) return [];
     const focusedRanks = new Map(
@@ -259,6 +272,7 @@ export class ActionRegistry {
     );
     const ranked: RankedHandler[] = [];
     for (const handler of entries.values()) {
+      if (keyboardOnly && !handler.acceptsKeybindings) continue;
       let rank: number;
       if (handler.scopeId === null) {
         rank = 10_000;
@@ -279,16 +293,24 @@ export class ActionRegistry {
     );
   }
 
-  canHandle(action: ActionId, resolution: ActionResolution): boolean {
+  canHandle(
+    action: ActionId,
+    resolution: ActionResolution,
+    options: { keyboardOnly?: boolean } = {},
+  ): boolean {
     if (this.inert) return false;
-    return this.rankedHandlers(action, resolution).some(
+    return this.rankedHandlers(action, resolution, options.keyboardOnly).some(
       ({ handler, context }) => handler.isEnabled?.(context) !== false,
     );
   }
 
   execute(invocation: ActionInvocation, resolution: ActionResolution): ActionResult {
     if (this.inert) return NOT_HANDLED;
-    for (const { handler, context } of this.rankedHandlers(invocation.action, resolution)) {
+    for (const { handler, context } of this.rankedHandlers(
+      invocation.action,
+      resolution,
+      invocation.source === "keyboard",
+    )) {
       if (handler.isEnabled?.(context) === false) continue;
       const result = handler.run(invocation, context);
       if (result === NOT_HANDLED) continue;
@@ -323,7 +345,17 @@ export class ActionRegistry {
           ),
         },
       ];
-    });
+    }).sort((left, right) =>
+      options.paletteOnly
+        ? (left.paletteOrder ?? Number.MAX_SAFE_INTEGER) -
+          (right.paletteOrder ?? Number.MAX_SAFE_INTEGER)
+        : 0,
+    );
+  }
+
+  listPaletteActions(resolution: ActionResolution): readonly AvailablePaletteAction[] {
+    // catalog.ts has a compile-time witness that every palette action is argless.
+    return this.listAvailable(resolution, { paletteOnly: true }) as AvailablePaletteAction[];
   }
 }
 

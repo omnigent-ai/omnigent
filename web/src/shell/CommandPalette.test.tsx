@@ -1,6 +1,7 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ComponentProps } from "react";
+import { useState, type ComponentProps } from "react";
+import { ActionsProvider, HANDLED, useRegisterAction } from "@/actions";
 
 import { CommandPalette } from "./CommandPalette";
 
@@ -33,16 +34,80 @@ function labelRow(text: string) {
   return screen.getByText((_content, el) => el?.tagName === "SPAN" && el.textContent === text);
 }
 
-function renderPalette(overrides: Partial<ComponentProps<typeof CommandPalette>> = {}) {
-  const props = {
-    open: true,
-    onOpenChange: vi.fn(),
-    onToggleLeftSidebar: vi.fn(),
-    onToggleRightSidebar: vi.fn(),
-    ...overrides,
+interface RenderPaletteOptions extends Partial<ComponentProps<typeof CommandPalette>> {
+  onToggleLeftSidebar?: () => void;
+  onToggleRightSidebar?: () => void;
+  settingsEnabled?: boolean;
+  inboxVisible?: boolean;
+  onInvocation?: (source: string) => void;
+}
+
+const NOOP = () => {};
+
+function PaletteActions({
+  onToggleLeftSidebar,
+  onToggleRightSidebar,
+  settingsEnabled = true,
+  inboxVisible = true,
+  onInvocation = NOOP,
+}: {
+  onToggleLeftSidebar: () => void;
+  onToggleRightSidebar: () => void;
+  settingsEnabled?: boolean;
+  inboxVisible?: boolean;
+  onInvocation?: (source: string) => void;
+}) {
+  const navigateAction = (path: string) => (invocation: { source: string }) => {
+    onInvocation(invocation.source);
+    navigate(path);
+    return HANDLED;
   };
-  render(<CommandPalette {...props} />);
-  return props;
+  useRegisterAction("session.action.new", { run: navigateAction("/") });
+  useRegisterAction("workbench.action.showCommands", { run: () => HANDLED });
+  useRegisterAction("workbench.action.navigateInbox", {
+    run: navigateAction("/inbox"),
+    isVisible: () => inboxVisible,
+  });
+  useRegisterAction("workbench.action.navigateAutomations", { run: navigateAction("/tasks") });
+  useRegisterAction("workbench.action.navigateSettings", {
+    run: navigateAction("/settings"),
+    isEnabled: () => settingsEnabled,
+  });
+  useRegisterAction("workbench.action.toggleConversationsSidebar", {
+    run: () => {
+      onToggleLeftSidebar();
+      return HANDLED;
+    },
+  });
+  useRegisterAction("workbench.action.toggleWorkspaceSidebar", {
+    run: () => {
+      onToggleRightSidebar();
+      return HANDLED;
+    },
+  });
+  return null;
+}
+
+function renderPalette(overrides: RenderPaletteOptions = {}) {
+  const props: ComponentProps<typeof CommandPalette> = {
+    open: overrides.open ?? true,
+    onOpenChange: overrides.onOpenChange ?? vi.fn(),
+  };
+  const onToggleLeftSidebar = overrides.onToggleLeftSidebar ?? vi.fn();
+  const onToggleRightSidebar = overrides.onToggleRightSidebar ?? vi.fn();
+  render(
+    <ActionsProvider>
+      <PaletteActions
+        onToggleLeftSidebar={onToggleLeftSidebar}
+        onToggleRightSidebar={onToggleRightSidebar}
+        settingsEnabled={overrides.settingsEnabled}
+        inboxVisible={overrides.inboxVisible}
+        onInvocation={overrides.onInvocation}
+      />
+      <CommandPalette {...props} />
+    </ActionsProvider>,
+  );
+  return { ...props, onToggleLeftSidebar, onToggleRightSidebar };
 }
 
 beforeEach(() => {
@@ -300,16 +365,79 @@ describe("CommandPalette — actions", () => {
     expect(screen.getByText("Go to Settings")).toBeTruthy();
     expect(screen.getByText("Toggle conversations sidebar")).toBeTruthy();
     expect(screen.getByText("Toggle workspace sidebar")).toBeTruthy();
+    expect(screen.queryByText("Open command palette")).toBeNull();
   });
 
-  it("runs a navigation action and closes the palette", () => {
+  it("preserves the historical action order with New chat first", () => {
+    renderPalette();
+    const group = screen.getByText("Actions").closest("[cmdk-group]");
+    const labels = within(group as HTMLElement)
+      .getAllByRole("option")
+      .map((item) => item.textContent);
+    expect(labels).toEqual([
+      "New chat",
+      "Go to Inbox",
+      "Go to Automations",
+      "Go to Settings",
+      "Toggle conversations sidebar",
+      "Toggle workspace sidebar",
+    ]);
+  });
+
+  it.each([
+    ["new session", "New chat"],
+    ["account", "Go to Settings"],
+    ["sessions list", "Toggle conversations sidebar"],
+  ])("retains the legacy %s keyword", (query, label) => {
+    renderPalette();
+    fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value: query } });
+    expect(screen.getByText(label)).toBeTruthy();
+  });
+
+  it("runs a navigation action with palette source and closes", () => {
     const onOpenChange = vi.fn();
-    renderPalette({ onOpenChange });
+    const onInvocation = vi.fn();
+    renderPalette({ onOpenChange, onInvocation });
 
     fireEvent.click(screen.getByText("Go to Settings"));
 
     expect(navigate).toHaveBeenCalledWith("/settings");
+    expect(onInvocation).toHaveBeenCalledWith("palette");
     expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("renders disabled actions without executing them", () => {
+    renderPalette({ settingsEnabled: false });
+    const row = screen.getByText("Go to Settings").closest("[data-slot=command-item]");
+    expect(row).toHaveAttribute("data-disabled", "true");
+    fireEvent.click(row!);
+    expect(navigate).not.toHaveBeenCalledWith("/settings");
+  });
+
+  it("omits invisible actions", () => {
+    renderPalette({ inboxVisible: false });
+    expect(screen.queryByText("Go to Inbox")).toBeNull();
+  });
+
+  it("removes rows when their handler unregisters", () => {
+    function ToggleHarness() {
+      const [registered, setRegistered] = useState(true);
+      return (
+        <ActionsProvider>
+          {registered ? (
+            <PaletteActions onToggleLeftSidebar={() => {}} onToggleRightSidebar={() => {}} />
+          ) : null}
+          <button type="button" onClick={() => setRegistered(false)}>
+            Unregister
+          </button>
+          <CommandPalette open onOpenChange={() => {}} />
+        </ActionsProvider>
+      );
+    }
+    render(<ToggleHarness />);
+    expect(screen.getByText("New chat")).toBeTruthy();
+    fireEvent.click(screen.getByText("Unregister"));
+    expect(screen.queryByText("New chat")).toBeNull();
   });
 
   it("invokes the sidebar-toggle callbacks", () => {
