@@ -670,6 +670,33 @@ def test_deleted_file_raises_clear_error(
         )
 
 
+def test_workspace_materialize_file_rejected_by_generic_resolver() -> None:
+    """A generic (non-native) model can't be handed a workspace-materialize
+    type — it would either fail provider-side or garble as text, so the
+    resolver must raise a clear, actionable error instead of inlining it."""
+    zip_store = FakeFileStore(
+        files={
+            "file_zip": StoredFile(
+                id="file_zip",
+                created_at=1000,
+                filename="archive.zip",
+                bytes=4,
+                content_type="application/zip",
+            ),
+        }
+    )
+    item = _make_conversation_item(
+        [{"type": "input_file", "file_id": "file_zip", "filename": "archive.zip"}]
+    )
+
+    with pytest.raises(ValueError, match="filesystem-capable harness"):
+        resolve_content_references(
+            [item],
+            zip_store,
+            FakeArtifactStore(blobs={}),  # type: ignore[arg-type]
+        )
+
+
 # ── _resolve_content_type tests ───────────────────────────────────────
 
 

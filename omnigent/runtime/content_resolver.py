@@ -507,7 +507,8 @@ def _resolve_file_id_block(
         content. All other fields are preserved.
     :raises ValueError: If ``file_id`` is not found in the file
         store — the file was deleted between request validation
-        and agent loop execution.
+        and agent loop execution — or if the referenced file is a
+        workspace-materialize type this (non-native) adapter can't inline.
     """
     file_id = block["file_id"]
     owner_session_id = session_id or _session_id_from_block(block)
@@ -518,6 +519,16 @@ def _resolve_file_id_block(
         raise ValueError(
             f"Referenced file '{file_id}' no longer exists — "
             f"it may have been deleted after the request was accepted"
+        )
+    # Workspace-materialize types never reach a model as bytes — a native
+    # harness reads them off disk instead — so inlining one here would send
+    # a payload the provider can't interpret. Fail with an actionable error.
+    from omnigent.inner.native_attachments import workspace_materialize_upload_limit
+
+    if workspace_materialize_upload_limit(file_meta.filename) is not None:
+        raise ValueError(
+            f"Attachment '{file_meta.filename}' requires a filesystem-capable "
+            "harness (e.g. Claude Code, Codex) and cannot be used with this model."
         )
 
     # Use cached base64 if available; otherwise fetch, encode, and cache.
