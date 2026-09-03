@@ -13,8 +13,10 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import re
 import sys
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -88,6 +90,30 @@ def _patch_daemon_spawn(
         return proc
 
     monkeypatch.setattr(cli.subprocess, "Popen", _popen)
+
+    def _claim(
+        target: str,
+        spawned: cli._SpawnedDaemonProcess,
+        **_kwargs: object,
+    ) -> cli._HostDaemonRecord | None:
+        env = captured["env"]
+        assert isinstance(env, dict)
+        mode = "local" if target == "local" else "server"
+        cli._write_daemon_record(
+            cli._HostDaemonRecord(
+                pid=spawned.pid,
+                target=target,
+                mode=mode,
+                server_url=None if mode == "local" else target,
+                log_path=spawned.log_path,
+                started_at=int(cli.time.time()),
+                config_sig=str(env[cli.DAEMON_CONFIG_SIG_ENV_VAR]),
+            )
+        )
+        cli._HOST_PID_PATH.write_text(f"{spawned.pid}\n{target}\n")
+        return cli._find_daemon_record(target)
+
+    monkeypatch.setattr(cli, "_wait_for_daemon_claim", _claim)
 
 
 def _write_daemon_registry_record(
@@ -542,6 +568,95 @@ def test_ensure_host_daemon_young_offline_daemon_not_torn_down(
 
     assert torn_down == []
     assert "args" not in captured  # reused despite being offline (still connecting)
+
+
+def test_concurrent_ensure_host_daemon_elects_one_daemon(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Concurrent launchers may spawn, but only one daemon claims the target."""
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_build_host_daemon_env", lambda **_kw: {})
+    monkeypatch.setattr(cli, "server_config_signature", lambda **_kw: "sig")
+    live_pids: set[int] = set()
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: pid in live_pids)
+
+    both_spawned = threading.Barrier(2)
+    spawn_count = 0
+    count_lock = threading.Lock()
+
+    def _spawn(**_kw: object) -> cli._SpawnedDaemonProcess:
+        nonlocal spawn_count
+        with count_lock:
+            spawn_count += 1
+            count = spawn_count
+        pid = 4241 + count
+        both_spawned.wait(timeout=5)
+        if count == 1:
+            live_pids.add(pid)
+            target = "https://server.example.com"
+            cli._write_daemon_record(
+                cli._HostDaemonRecord(
+                    pid=pid,
+                    target=target,
+                    mode="server",
+                    server_url=target,
+                    log_path=str(tmp_path / "host.log"),
+                    started_at=int(cli.time.time()),
+                    config_sig="sig",
+                )
+            )
+        return cli._SpawnedDaemonProcess(pid=pid, log_path=str(tmp_path / "host.log"))
+
+    monkeypatch.setattr(cli, "_spawn_host_daemon_process", _spawn)
+    errors: list[Exception] = []
+
+    def _ensure() -> None:
+        try:
+            _ensure_host_daemon("https://server.example.com")
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    first = threading.Thread(target=_ensure)
+    second = threading.Thread(target=_ensure)
+    first.start()
+    second.start()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert spawn_count == 2
+    record = cli._find_daemon_record("https://server.example.com")
+    assert record is not None
+    assert record.pid == 4242
+
+
+def test_ensure_host_daemon_warns_when_spawned_daemon_never_claims(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A spawned daemon that never writes its record is surfaced, not silent."""
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_build_host_daemon_env", lambda **_kw: {})
+    monkeypatch.setattr(cli, "server_config_signature", lambda **_kw: "sig")
+    log_path = tmp_path / "host.log"
+    monkeypatch.setattr(
+        cli,
+        "_spawn_host_daemon_process",
+        lambda **_kw: cli._SpawnedDaemonProcess(pid=4242, log_path=str(log_path)),
+    )
+    # The daemon crashes before claiming: no record ever appears.
+    monkeypatch.setattr(cli, "_wait_for_daemon_claim", lambda *_a, **_kw: None)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.cli"):
+        _ensure_host_daemon("https://server.example.com")
+
+    assert any(
+        "did not claim its registry record" in message and str(log_path) in message
+        for message in caplog.messages
+    )
 
 
 def _online_record() -> cli._HostDaemonRecord:
@@ -2093,6 +2208,185 @@ def test_databricks_preflight_non_interactive_overrides_tty(
     assert f"omnigent login {_HOST_DATABRICKS_SERVER}" in str(exc.value)
     # The browser login never ran despite the TTY.
     assert login_calls == []
+
+
+def _patch_rejected_credential_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pointer_workspace: str | None,
+    unauthed_status: int,
+    unauthed_realm: bool,
+) -> list[str]:
+    """Wire the pre-flight for a stale-bearer run the edge rejects with 403.
+
+    The credential chain mints a (stale) bearer, the authed ``/v1/me``
+    probe answers a bare 403 (no edge signature — the shape an expired
+    Databricks OAuth token gets), and the SDK can mint no fresh token.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param pointer_workspace: Workspace host the stored ``omnigent login``
+        pointer record names, or ``None`` when no record exists.
+    :param unauthed_status: Status the credential-less re-probe answers.
+    :param unauthed_realm: Whether that re-probe carries the
+        DatabricksRealm challenge.
+    :returns: Capture list of the URLs each probe was sent to with
+        ``"authed"``/``"unauthed"`` markers.
+    """
+    import httpx
+
+    probes: list[str] = []
+
+    def _get(url: str, **kwargs: object) -> httpx.Response:
+        headers = kwargs.get("headers")
+        authed = isinstance(headers, dict) and "Authorization" in headers
+        probes.append("authed" if authed else "unauthed")
+        if authed:
+            return httpx.Response(
+                403,
+                json={"error_code": 403, "message": "Invalid access token. [ReqId: x]"},
+                request=httpx.Request("GET", url),
+            )
+        realm_headers = (
+            {"www-authenticate": 'Bearer realm="DatabricksRealm"'} if unauthed_realm else {}
+        )
+        return httpx.Response(
+            unauthed_status, headers=realm_headers, request=httpx.Request("GET", url)
+        )
+
+    monkeypatch.setattr(
+        "omnigent.chat._remote_headers",
+        lambda server_url=None, *, host_id=None: {"Authorization": "Bearer stale"},
+    )
+    monkeypatch.setattr(httpx, "get", _get)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_workspace_host", lambda server: pointer_workspace
+    )
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: None)
+    monkeypatch.setattr(cli, "_databricks_workspace_auth_info", lambda workspace: None)
+    monkeypatch.setattr(
+        cli, "_databricks_login", lambda *args, **kwargs: pytest.fail("browser login ran")
+    )
+    return probes
+
+
+def test_databricks_preflight_expired_credential_routes_to_reauth_via_pointer_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 403-rejected stale bearer surfaces the re-login hint, not the raw 403.
+
+    The edge rejects an expired bearer with a bare 403 (no OAuth redirect,
+    no DatabricksRealm challenge), so the shape classifier alone can't see
+    Databricks — the stored ``omnigent login`` pointer record names the
+    fronting workspace and must route the run to reauth instead of letting
+    it die at session-create with the raw ``Invalid access token`` error.
+    """
+    probes = _patch_rejected_credential_preflight(
+        monkeypatch,
+        pointer_workspace="https://example.databricks.com",
+        unauthed_status=403,
+        unauthed_realm=False,
+    )
+
+    with pytest.raises(click.ClickException) as exc:
+        cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
+
+    assert "expired or was revoked" in str(exc.value)
+    assert f"omnigent login {_HOST_DATABRICKS_SERVER}" in str(exc.value)
+    # The pointer record answered; no credential-less re-probe was needed.
+    assert probes == ["authed"]
+
+
+def test_databricks_preflight_expired_credential_routes_to_reauth_via_reprobe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a pointer record, a credential-less re-probe classifies the edge.
+
+    Ambient workspace-CLI profile credentials (no ``omnigent login`` record)
+    can also go stale; the bare re-probe surfaces the DatabricksRealm
+    challenge the stale bearer masked, so the run still routes to reauth.
+    """
+    probes = _patch_rejected_credential_preflight(
+        monkeypatch,
+        pointer_workspace=None,
+        unauthed_status=401,
+        unauthed_realm=True,
+    )
+
+    with pytest.raises(click.ClickException) as exc:
+        cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
+
+    assert "expired or was revoked" in str(exc.value)
+    assert f"omnigent login {_HOST_DATABRICKS_SERVER}" in str(exc.value)
+    assert probes == ["authed", "unauthed"]
+
+
+def test_databricks_preflight_leaves_non_databricks_403_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 403 from a non-Databricks server is not misread as an expired login.
+
+    No pointer record and no edge signature on the credential-less
+    re-probe means the rejection is the server's own (e.g. a permission
+    refusal) — suggesting a re-login could not help, so the pre-flight
+    steps aside and lets the connect path report the real error.
+    """
+    probes = _patch_rejected_credential_preflight(
+        monkeypatch,
+        pointer_workspace=None,
+        unauthed_status=403,
+        unauthed_realm=False,
+    )
+
+    cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
+
+    assert probes == ["authed", "unauthed"]
+
+
+def test_databricks_preflight_rejected_credential_recovers_via_sdk_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected stale bearer still recovers silently when the SDK can refresh."""
+    import httpx
+
+    stored: list[tuple[str, str]] = []
+
+    def _get(url: str, **kwargs: object) -> httpx.Response:
+        headers = kwargs.get("headers")
+        auth = headers.get("Authorization") if isinstance(headers, dict) else None
+        if auth == "Bearer fresh-token":
+            return httpx.Response(200, request=httpx.Request("GET", url))
+        return httpx.Response(
+            403,
+            json={"error_code": 403, "message": "Invalid access token. [ReqId: x]"},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(
+        "omnigent.chat._remote_headers",
+        lambda server_url=None, *, host_id=None: {"Authorization": "Bearer stale"},
+    )
+    monkeypatch.setattr(httpx, "get", _get)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_workspace_host",
+        lambda server: "https://example.databricks.com",
+    )
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: None)
+    monkeypatch.setattr(
+        cli,
+        "_databricks_workspace_auth_info",
+        lambda workspace: cli._DatabricksWorkspaceAuthInfo(token="fresh-token", profile_name=None),
+    )
+    monkeypatch.setattr(
+        cli, "_databricks_login", lambda *args, **kwargs: pytest.fail("browser login ran")
+    )
+    monkeypatch.setattr(
+        "omnigent.cli_auth.store_databricks_auth",
+        lambda server, workspace, user_id=None, org_id=None: stored.append((server, workspace)),
+    )
+
+    cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
+
+    assert stored == [(_HOST_DATABRICKS_SERVER, "https://example.databricks.com")]
 
 
 def _patch_foreground_host(

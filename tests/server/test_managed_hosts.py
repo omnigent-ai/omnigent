@@ -683,6 +683,7 @@ def test_parse_valid_kubernetes_config_builds_parameterized_factory(
                 "secret_name": "omnigent-creds",
                 "service_account": "omnigent-runner",
                 "node_selector": {"omnigent.ai/runner-ready": "true"},
+                "runtime_class": "kata",
                 "in_cluster": True,
                 "resources": {"requests": {"cpu": "500m"}, "limits": {"memory": "8Gi"}},
                 "pod_ready_timeout_s": 300,
@@ -704,6 +705,7 @@ def test_parse_valid_kubernetes_config_builds_parameterized_factory(
     assert fake.secret_name == "omnigent-creds"
     assert fake.service_account == "omnigent-runner"
     assert fake.node_selector == {"omnigent.ai/runner-ready": "true"}
+    assert fake.runtime_class == "kata"
     assert fake.in_cluster is True
     assert fake.resources == {"requests": {"cpu": "500m"}, "limits": {"memory": "8Gi"}}
     assert fake.pod_ready_timeout_s == 300
@@ -857,6 +859,7 @@ def test_parse_host_config_lossy_json_key_collision_fails_loud() -> None:
     [
         ({"namespace": "Bad_NS"}, "sandbox.kubernetes.namespace"),
         ({"node_selector": {"omnigent.ai/x": "Bad Value"}}, "node_selector"),
+        ({"runtime_class": "Not_A_DNS_Name"}, "sandbox.kubernetes.runtime_class"),
         ({"resources": {"requests": {"cpu": "not a quantity!"}}}, "valid Kubernetes quantity"),
         ({"resources": {"requests": {"disk": "1Gi"}}}, "unknown key"),
         ({"in_cluster": "yes"}, "must be a boolean"),

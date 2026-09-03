@@ -133,7 +133,7 @@ class LoadSkillTool(Tool):
             return "Error: missing required 'name' argument"
         if not isinstance(skill_name, str):
             return "Error: 'name' must be a string"
-        skill = self._skills_by_name.get(skill_name)
+        skill = find_skill_by_name(self._skills, skill_name)
         if skill is None:
             available = list(self._skills_by_name.keys())
             return f"Error: skill {skill_name!r} not found. Available skills: {available}"
@@ -203,19 +203,72 @@ def format_skill_content(
     return "\n".join(lines)
 
 
+def _has_plugin_provenance(skill: SkillSpec, plugin: str) -> bool:
+    """
+    Whether *skill*'s on-disk location shows it came from *plugin*.
+
+    Plugin-derived skills live in the plugin cache under the structural
+    layout ``.../cache/<marketplace>/<plugin>/<version>/skills/<skill>``
+    (both the Claude and Codex plugin stores use this shape), and the
+    codex runtime links them into ``CODEX_HOME/skills/<skill>`` via a
+    symlink that resolves back into that cache. The full structural
+    sequence is required — not just the plugin name appearing somewhere
+    in the path — so an unrelated skill under a directory that happens
+    to be named like the plugin does not acquire its provenance. An
+    in-memory skill (``skill_dir is None``) never matches.
+
+    :param skill: Candidate skill for an aliased lookup.
+    :param plugin: The plugin namespace from the requested name, e.g.
+        ``"myplugin"`` for a ``"myplugin:code-review"`` request.
+    :returns: ``True`` when the resolved skill directory sits at
+        ``cache/<marketplace>/<plugin>/<version>/skills/<dir>``.
+    """
+    if skill.skill_dir is None or not plugin:
+        return False
+    try:
+        parts = skill.skill_dir.resolve().parts
+    except OSError:
+        return False
+    return (
+        len(parts) >= 6 and parts[-2] == "skills" and parts[-4] == plugin and parts[-6] == "cache"
+    )
+
+
 def find_skill_by_name(skills: list[SkillSpec], name: str) -> SkillSpec | None:
     """
-    Return the skill with the requested name.
+    Return the skill with the requested name, accepting namespace aliases.
+
+    An exact match always wins. When none exists, plugin-namespace aliases
+    are tried: the same installed plugin skill is surfaced as
+    ``<plugin>:<skill>`` by claude-family discovery but as the bare
+    ``<skill>`` by codex-family discovery, so a name carried from one
+    context into the other would otherwise fail to resolve. A namespaced
+    request falls back to the bare skill name only when that skill's
+    on-disk provenance shows it belongs to the named plugin (so
+    ``pluginb:deploy`` cannot hijack an unrelated ``deploy``); a bare
+    request falls back to a namespaced entry only when exactly one plugin
+    exposes that skill (an ambiguous bare name stays unresolved rather
+    than guessing).
 
     :param skills: Discovered skills for an agent (bundled + host),
         e.g. the merged list from :attr:`LoadSkillTool.skills`.
-    :param name: Skill name to match exactly, e.g. ``"code-review"``.
+    :param name: Skill name to match, e.g. ``"code-review"`` or the
+        namespaced ``"myplugin:code-review"``.
     :returns: The matching :class:`SkillSpec`, or ``None`` when the
         command references a skill the agent does not expose.
     """
     for skill in skills:
         if skill.name == name:
             return skill
+    if ":" in name:
+        plugin, bare = name.split(":", 1)
+        for skill in skills:
+            if skill.name == bare and _has_plugin_provenance(skill, plugin):
+                return skill
+        return None
+    namespaced = [s for s in skills if ":" in s.name and s.name.split(":", 1)[1] == name]
+    if len(namespaced) == 1:
+        return namespaced[0]
     return None
 
 

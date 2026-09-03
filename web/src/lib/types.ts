@@ -32,6 +32,9 @@ export interface RememberScope {
   host?: string;
 }
 
+/** Persistence scopes advertised by Codex for MCP tool approvals. */
+export type CodexPersistMode = "session" | "always";
+
 /**
  * An un-consumed web-composer user message replayed from the session
  * snapshot. Native-terminal sessions don't persist a web message at

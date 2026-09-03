@@ -25,11 +25,18 @@ _ALLOW: PolicyResponse = {"result": "ALLOW"}
 
 _SYS_OS_TOOLS = frozenset({"sys_os_read", "sys_os_write", "sys_os_edit", "sys_os_shell"})
 
+# Claude Code / Codex native tools that MUTATE a file, surfaced via the
+# PreToolUse hook contract. Single source of truth: the write policies in
+# ``omnigent.policies.builtins.orchestration`` build their gated sets from
+# this, and it must stay equal to ``_CLAUDE_NATIVE_EDIT_TOOLS`` in
+# ``omnigent.server.routes._sessions.common`` (asserted in the tests).
+NATIVE_WRITE_TOOLS: frozenset[str] = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
+
 # Claude Code and Codex native tool names surfaced via the PreToolUse /
 # PostToolUse hook contract (see ``omnigent.native_policy_hook``).
 # These bypass Omnigent' ``sys_os_*`` MCP tools and execute directly
 # inside the CLI subprocess.
-_NATIVE_OS_TOOLS = frozenset({"Bash", "Read", "Write", "Edit", "Glob", "Grep"})
+_NATIVE_OS_TOOLS = NATIVE_WRITE_TOOLS | {"Bash", "Read", "Glob", "Grep"}
 
 # Cursor SDK native tool names surfaced via the preToolUse hook
 # (see ``omnigent.inner.cursor_policy_hook``). Cursor uses ``Shell``
@@ -230,8 +237,8 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
     - **Omnigent built-in OS tools** (``sys_os_read``,
       ``sys_os_write``, ``sys_os_edit``, ``sys_os_shell``).
     - **Claude Code native tools** (``Bash``, ``Read``, ``Write``,
-      ``Edit``, ``Glob``, ``Grep``) — surfaced via the
-      ``PreToolUse`` hook contract.
+      ``Edit``, ``MultiEdit``, ``NotebookEdit``, ``Glob``, ``Grep``) —
+      surfaced via the ``PreToolUse`` hook contract.
     - **Codex native tools** — uses the same ``PreToolUse`` hook
       contract with the same tool names (e.g. ``Bash``).
     - **Cursor SDK native tools** (``Shell``) — surfaced via the
@@ -240,6 +247,9 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
     - **Pi native tools** (``read``, ``bash``, ``write``, ``edit``)
       — surfaced via the pi ``tool_call`` extension hook. Lowercase
       and distinct from the Claude/Codex casing.
+    - **Goose native tools** (``developer__shell`` and the
+      ``developer__*`` file tools) — surfaced via the goose
+      extension hook.
     - **Hermes Agent tools** (``terminal``, ``execute_code``,
       ``read_file``, ``write_file``, ``search_files``) — surfaced
       via the ``pre_tool_call`` shell hook.
@@ -287,11 +297,15 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
         elif tool in ("Grep", "Glob", "search_files", "grep", "glob"):
             preview = args.get("pattern", "") if isinstance(args, dict) else ""
         elif tool == "execute_code":
-            preview = args.get("code", "")[:80] if isinstance(args, dict) else ""
+            code = args.get("code") if isinstance(args, dict) else None
+            preview = code[:80] if isinstance(code, str) else ""
         else:
-            # Omnigent tools use ``path``; Claude native tools use ``file_path``.
+            # Omnigent tools use ``path``; Claude native tools use ``file_path``,
+            # except NotebookEdit which uses ``notebook_path``.
             preview = (
-                (args.get("path") or args.get("file_path", "")) if isinstance(args, dict) else ""
+                (args.get("path") or args.get("file_path") or args.get("notebook_path") or "")
+                if isinstance(args, dict)
+                else ""
             )
         return {
             "result": "ASK",
@@ -364,13 +378,45 @@ def block_skills(blocked: list[str]) -> PolicyCallable:
        phase as synthetic ``"/<name> <args>"`` text via
        ``_build_skill_slash_command_policy_body``.
 
-    Matching is case-insensitive.
+    Matching is case-insensitive and namespace-insensitive: the same
+    installed plugin skill can be spelled ``<plugin>:<skill>`` (claude-family
+    surfaces) or bare ``<skill>`` (codex-family surfaces), and the skill
+    resolver accepts either alias — so a block on one spelling denies the
+    other too (deny-biased: an alias never bypasses the blocklist).
 
     :param blocked: Skill names to block, e.g.
         ``["code-review", "deploy"]``.
     :returns: A policy callable that DENYs blocked skill loads.
     """
     blocked_lower = frozenset(name.lower() for name in blocked)
+    # Bare forms of namespaced block entries: blocking "plugin:deploy" also
+    # denies a request for the bare "deploy", because on codex-family
+    # surfaces the blocked plugin skill is exposed under exactly that bare
+    # name (deny-biased — the bare spelling can't prove it is a different
+    # skill).
+    blocked_bare_lower = frozenset(name.split(":", 1)[1] for name in blocked_lower if ":" in name)
+
+    def _is_blocked(skill_name: str) -> bool:
+        """Whether *skill_name* (any alias spelling) hits the blocklist.
+
+        Deny when the raw name is blocked; when a bare request matches a
+        namespaced block entry's bare form; or when a namespaced request's
+        bare form is blocked outright (a bare block entry denies every
+        namespace). A namespaced block entry does NOT deny a *different*
+        exact namespace — ``otherplugin:deploy`` stays allowed when only
+        ``myplugin:deploy`` is blocked, since those are distinct skills.
+
+        :param skill_name: The requested skill name, raw.
+        :returns: True when any alias spelling of the request is blocked.
+        """
+        lowered = skill_name.lower()
+        if lowered in blocked_lower:
+            return True
+        if ":" in lowered:
+            # A bare block entry blocks the skill under every namespace.
+            return lowered.split(":", 1)[1] in blocked_lower
+        # A namespaced block entry blocks the bare alias of its skill.
+        return lowered in blocked_bare_lower
 
     def evaluate(event: PolicyEvent) -> PolicyResponse:
         """Evaluate whether the skill load should be blocked.
@@ -394,7 +440,7 @@ def block_skills(blocked: list[str]) -> PolicyCallable:
             if tool in _SKILL_TOOLS:
                 # load_skill uses "name"; read_skill_file uses "skill_name"
                 skill_name = args.get("name") if tool == "load_skill" else args.get("skill_name")
-                if skill_name and skill_name.lower() in blocked_lower:
+                if skill_name and _is_blocked(skill_name):
                     return {
                         "result": "DENY",
                         "reason": f"Skill '{skill_name}' is blocked by policy",
@@ -405,7 +451,7 @@ def block_skills(blocked: list[str]) -> PolicyCallable:
             # Fired via PreToolUse hook → Omnigent /policies/evaluate.
             if tool == _NATIVE_SKILL_TOOL:
                 skill_name = args.get("skill")
-                if skill_name and skill_name.lower() in blocked_lower:
+                if skill_name and _is_blocked(skill_name):
                     return {
                         "result": "DENY",
                         "reason": f"Skill '{skill_name}' is blocked by policy",
@@ -427,7 +473,7 @@ def block_skills(blocked: list[str]) -> PolicyCallable:
                 # an empty list — guard against IndexError.
                 tokens = text[1:].split(None, 1)
                 command = tokens[0] if tokens else ""
-                if command.lower() in blocked_lower:
+                if command and _is_blocked(command):
                     return {
                         "result": "DENY",
                         "reason": f"Skill '{command}' is blocked by policy",
@@ -722,9 +768,11 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         "kind": "callable",
         "name": "Require Approval for File & Shell Operations",
         "description": "Asks for user approval before any file or shell tool call — "
-        "covers Omnigent sys_os_* tools, Claude Code native tools "
-        "(Bash, Read, Write, Edit, Glob, Grep), Codex native tools, "
+        "covers Omnigent sys_os_* tools, Claude Code and Codex native tools "
+        "(Bash, Read, Write, Edit, MultiEdit, NotebookEdit, Glob, Grep), "
+        "Cursor native tools (Shell), Pi native tools (read, bash, write, edit), "
         "opencode native tools (bash, edit, read, grep, glob), "
+        "Goose native tools (developer__shell and the developer__* file tools), "
         "and Hermes Agent tools (terminal, execute_code, read_file, write_file, search_files)",
         "params_schema": None,
     },

@@ -774,9 +774,9 @@ def _parse_claude_current_model(stdout: str) -> dict[str, str]:
     Extract the resolved model from a stream-json ``/model`` probe run.
 
     Two harness-owned facts, taken verbatim: the ``init`` event's exact
-    model id, and the printed ``Current model:`` label with only the
-    trailing ``(effort: …)`` suffix stripped — so labels like
-    ``Opus 4.8 (1M context)`` survive untouched.
+    model id, and the printed ``Current model:`` label with only markdown
+    backticks and the trailing ``(effort: …)`` / ``(default)`` suffixes
+    stripped — so labels like ``Opus 4.8 (1M context)`` survive untouched.
 
     :param stdout: The run's ``--output-format stream-json`` stdout.
     :returns: Whichever of ``{"model": …, "label": …}`` parsed.
@@ -798,7 +798,13 @@ def _parse_claude_current_model(stdout: str) -> dict[str, str]:
                 _, marker, tail = text_line.partition("Current model:")
                 if not marker:
                     continue
-                label = re.sub(r"\s*\(effort:[^)]*\)\s*$", "", tail).strip()
+                # Some harness releases print the name as markdown code
+                # (``Current model: `Opus 5```); no model name holds a backtick.
+                plain = tail.replace("`", "")
+                # The enumeration run's label can carry a trailing
+                # ``(default)`` marker — CLI presentation, not the name.
+                plain = re.sub(r"\s*\(default\)\s*$", "", plain.strip())
+                label = re.sub(r"\s*\(effort:[^)]*\)\s*$", "", plain).strip()
                 if label:
                     resolved["label"] = label
                 break
@@ -1096,21 +1102,29 @@ async def probe_claude_model_options(
 
 
 def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) -> str:
-    """The launch-config fingerprint keying claude's shared model catalog.
+    """The launch fingerprint keying claude's shared model catalog.
 
     One formula for every consumer (host boot probe, runner launch, session
     listing), so they read and write the same catalog file.
 
+    The Claude Code executable is part of the key. The catalog holds that
+    binary's own answer, so an upgraded CLI must re-probe instead of
+    serving model names the previous release printed. The binary is
+    resolved the same way the probe launches it.
+
     :param claude_config: The resolved launch config, or ``None``.
     :returns: A stable fingerprint string.
     """
-    from omnigent.model_catalog_store import fingerprint_of
+    from omnigent.claude_launcher import resolve_claude_launch
+    from omnigent.model_catalog_store import binary_identity, fingerprint_of
 
+    command, _ = resolve_claude_launch("claude", [])
     return fingerprint_of(
         "claude-native",
         sorted(claude_config.env.items()) if claude_config is not None else None,
         claude_config.api_key_helper if claude_config is not None else None,
         claude_config.model if claude_config is not None else None,
+        binary_identity(command),
     )
 
 
@@ -1409,29 +1423,54 @@ def _resolve_session_id_for_resume(
 
     :param base_url: Omnigent server base URL.
     :param headers: HTTP auth headers; ``{}`` for local server.
-    :param session_id: Explicit ``--resume <id>``; wins over the picker.
+    :param session_id: Explicit ``--resume <id>``; wins over the picker
+        and is never host-filtered (diagnostics / migration workflows).
     :param resume_picker: ``True`` for bare ``--resume`` (no value).
     :returns: Conversation id, or ``None`` for "start fresh" / picker cancelled.
-    :raises click.ClickException: Picker requested but no prior sessions exist.
+    :raises click.ClickException: Picker requested but the session list
+        could not be fetched (a persistent rate-limit, an auth/server
+        failure, …) or the local host identity is mis-configured — a
+        concise error, never a raw SDK traceback.
     """
     if session_id is not None:
         return session_id
     if not resume_picker:
         return None
     # Deferred — omnigent_client / repl pull in heavy graphs we don't want at startup.
-    from omnigent_client import OmnigentClient
+    from omnigent_client import OmnigentClient, OmnigentError
 
+    from omnigent.host.identity import load_host_identity_if_present
     from omnigent.repl._resume_picker import pick_conversation_by_wrapper_label_from_sdk
+
+    # Native transcript / workspace state is host-local, so the picker
+    # scopes to sessions bound to THIS machine's host id. Read-only
+    # lookup: a machine that never registered as a host has no id and
+    # the picker lists unfiltered rather than minting an identity here.
+    # A mis-configured identity (only one of the launch env vars set)
+    # raises ValueError — keep that concise too.
+    try:
+        identity = load_host_identity_if_present()
+    except ValueError as exc:
+        raise click.ClickException(
+            f"Could not resolve this machine's host identity: {exc}"
+        ) from exc
+    invoking_host_id = identity.host_id if identity is not None else None
 
     async def _drive() -> str | None:
         async with OmnigentClient(
             base_url=base_url, headers=headers if headers else None
         ) as client:
             return await pick_conversation_by_wrapper_label_from_sdk(
-                client, wrapper_value=_WRAPPER_LABEL_VALUE, agent_name=_AGENT_NAME
+                client,
+                wrapper_value=_WRAPPER_LABEL_VALUE,
+                agent_name=_AGENT_NAME,
+                host_id=invoking_host_id,
             )
 
-    return asyncio.run(_drive())
+    try:
+        return asyncio.run(_drive())
+    except OmnigentError as exc:
+        raise click.ClickException(f"Could not list sessions to resume: {exc}") from exc
 
 
 def _align_working_directory_with_session(
@@ -2046,7 +2085,7 @@ def _fetch_external_session_id_for_redirect(
         if resp.status_code >= 400:
             return None
         payload = resp.json()
-    except Exception:  # noqa: BLE001 - optional redirect preflight
+    except Exception:  # noqa: BLE001
         _logger.warning(
             "failed to fetch external Claude session id for redirect; session=%s",
             session_id,
@@ -2549,7 +2588,7 @@ def _ucode_config_for_profile(
             live_catalog = discover_databricks_claude_catalog(creds.host, creds.token)
             live_models = live_catalog.families
             routable_models = live_catalog.model_ids
-        except Exception:  # noqa: BLE001 — cached ucode state is the launch fallback
+        except Exception:  # noqa: BLE001
             _logger.warning(
                 "native-claude: live Databricks model discovery failed for profile %r; "
                 "using cached ucode models",
@@ -3077,7 +3116,7 @@ def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
 
     try:
         spec = load_agent_spec(spec_path, expand_env=False)
-    except Exception:  # noqa: BLE001 — best-effort; never block the launch
+    except Exception:  # noqa: BLE001
         _logger.warning(
             "Could not resolve raw instructions from wrapper spec %s",
             spec_path,
@@ -3497,7 +3536,7 @@ async def _attach_with_transcript_forwarder(
                 await forwarder
             except asyncio.CancelledError:
                 pass
-            except Exception:  # noqa: BLE001 — cleanup must run regardless
+            except Exception:  # noqa: BLE001
                 # The forwarder is best-effort mirroring. A bug there
                 # (corrupt transcript JSONL, file-system error, anything
                 # uncaught in the parser) must not skip the Omnigent terminal
@@ -3592,7 +3631,7 @@ async def _attach_with_reconnect(
         if not first_attempt and recover is not None:
             try:
                 await recover()
-            except Exception:  # noqa: BLE001 — best-effort recovery
+            except Exception:  # noqa: BLE001
                 _logger.warning(
                     "claude-native reconnect recovery callback raised; retrying attach anyway",
                     exc_info=True,

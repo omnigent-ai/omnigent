@@ -320,9 +320,7 @@ def validate_duplicate_decision(
         """Keep only links the model is reasonably sure of and text agrees with."""
         if confidence < SIMILAR_MIN_CONFIDENCE:
             return []
-        return [
-            number for number in numbers if similarity.get(number, 0.0) >= SIMILAR_COSINE_FLOOR
-        ]
+        return [number for number in numbers if similarity.get(number, 0.0) >= SIMILAR_COSINE_FLOOR]
 
     decision = "none"
     if requested_decision == "duplicate" and duplicate_of is not None:

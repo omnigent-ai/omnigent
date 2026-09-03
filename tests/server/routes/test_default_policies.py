@@ -15,10 +15,12 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
+from starlette.requests import HTTPConnection
 
 from omnigent.runtime import get_caps
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
+from omnigent.server.auth import AuthProvider
 from omnigent.spec.types import FunctionPolicySpec, FunctionRef
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -30,6 +32,14 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
 
 _REGISTERED_HANDLER = "omnigent.policies.builtins.safety.ask_on_os_tools"
+_TEST_USER_ID = "alice@example.com"
+
+
+class _FixedAuthProvider(AuthProvider):
+    """Auth provider that always returns a fixed user ID, for audit log tests."""
+
+    def get_user_id(self, request: HTTPConnection) -> str | None:
+        return _TEST_USER_ID
 
 
 @pytest.fixture()
@@ -50,12 +60,41 @@ def policy_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
     )
 
 
+@pytest.fixture()
+def policy_app_with_auth(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
+    """Policy-enabled app with a fixed auth provider for audit log tests."""
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    return create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / "cache",
+        ),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        policy_store=SqlAlchemyPolicyStore(db_uri),
+        auth_provider=_FixedAuthProvider(),
+    )
+
+
 @pytest_asyncio.fixture()
 async def policy_client(
     policy_app: FastAPI,
 ) -> AsyncIterator[httpx.AsyncClient]:
     """HTTP client wired to the policy-enabled app."""
     transport = httpx.ASGITransport(app=policy_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
+
+
+@pytest_asyncio.fixture()
+async def authed_policy_client(
+    policy_app_with_auth: FastAPI,
+) -> AsyncIterator[httpx.AsyncClient]:
+    """HTTP client wired to the auth-enabled policy app."""
+    transport = httpx.ASGITransport(app=policy_app_with_auth)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
 
@@ -337,3 +376,75 @@ async def test_create_default_policy_no_telemetry_on_error(
         resp = await policy_client.post("/v1/policies", json=_policy_payload(name="dup"))
     assert resp.status_code == 409
     mock_emit.assert_not_called()
+
+
+# ── Audit logging ─────────────────────────────────────────────────────
+
+
+async def test_create_default_policy_logs_audit(
+    policy_client: httpx.AsyncClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``POST /v1/policies`` emits an audit log line with policy_id and handler."""
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="omnigent.server.routes.default_policies"):
+        resp = await policy_client.post("/v1/policies", json=_policy_payload())
+    assert resp.status_code == 200
+    pid = resp.json()["id"]
+    assert "policies/create" in caplog.text
+    assert pid in caplog.text
+    assert _REGISTERED_HANDLER in caplog.text
+    assert "(single-user)" in caplog.text
+
+
+async def test_update_default_policy_logs_audit(
+    policy_client: httpx.AsyncClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``PATCH /v1/policies/{id}`` emits an audit log line with the policy_id."""
+    import logging
+
+    create_resp = await policy_client.post("/v1/policies", json=_policy_payload())
+    pid = create_resp.json()["id"]
+    with caplog.at_level(logging.INFO, logger="omnigent.server.routes.default_policies"):
+        resp = await policy_client.patch(f"/v1/policies/{pid}", json={"name": "renamed"})
+    assert resp.status_code == 200
+    assert "policies/update" in caplog.text
+    assert pid in caplog.text
+    assert "(single-user)" in caplog.text
+
+
+async def test_delete_default_policy_logs_audit(
+    policy_client: httpx.AsyncClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``DELETE /v1/policies/{id}`` emits an audit log line with the policy_id."""
+    import logging
+
+    create_resp = await policy_client.post("/v1/policies", json=_policy_payload())
+    pid = create_resp.json()["id"]
+    with caplog.at_level(logging.INFO, logger="omnigent.server.routes.default_policies"):
+        resp = await policy_client.delete(f"/v1/policies/{pid}")
+    assert resp.status_code == 200
+    assert "policies/delete" in caplog.text
+    assert pid in caplog.text
+    assert "(single-user)" in caplog.text
+
+
+async def test_audit_logs_include_caller_user_id(
+    authed_policy_client: httpx.AsyncClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Audit log lines include the full caller user ID (not redacted)."""
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="omnigent.server.routes.default_policies"):
+        create_resp = await authed_policy_client.post(
+            "/v1/policies", json=_policy_payload(name="uid_test")
+        )
+        pid = create_resp.json()["id"]
+        await authed_policy_client.patch(f"/v1/policies/{pid}", json={"name": "uid_test_renamed"})
+        await authed_policy_client.delete(f"/v1/policies/{pid}")
+
+    assert caplog.text.count(_TEST_USER_ID) == 3  # create, update, delete

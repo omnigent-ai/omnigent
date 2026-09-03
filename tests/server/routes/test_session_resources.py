@@ -6,12 +6,13 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import AsyncIterator, Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
 from omnigent.errors import ErrorCode, OmnigentError
@@ -163,14 +164,16 @@ class _ConversationStore:
 
         :param conversation_id: Conversation id to update.
         :param title: Optional title to set.
-        :param kwargs: Extra store fields ignored by this test stub.
+        :param kwargs: Additional conversation fields used by relay tests.
         :returns: Updated conversation, or ``None`` if absent.
         """
-        del kwargs
         conv = self._conversations.get(conversation_id)
         if conv is None:
             return None
-        conv.title = title
+        if title is not None:
+            conv.title = title
+        if "reported_model" in kwargs:
+            conv.reported_model = kwargs["reported_model"]
         return conv
 
     def set_labels(
@@ -183,6 +186,22 @@ class _ConversationStore:
         del updated_at
         conv = self._conversations[conversation_id]
         conv.labels.update(updates)
+
+    def set_host_id(
+        self,
+        conversation_id: str,
+        host_id: str,
+        workspace: str | None = None,
+        git_branch: str | None = None,
+    ) -> Conversation:
+        """Set a conversation's host placement fields."""
+        conv = self._conversations[conversation_id]
+        conv.host_id = host_id
+        if workspace is not None:
+            conv.workspace = workspace
+        if git_branch is not None:
+            conv.git_branch = git_branch
+        return conv
 
     def append(
         self,
@@ -449,6 +468,8 @@ def runner_globals_reset() -> Iterator[None]:
 def app(runner_globals_reset: None) -> FastAPI:
     del runner_globals_reset
     app = FastAPI()
+    conversation_store = _ConversationStore()
+    app.state.test_conversation_store = conversation_store
 
     @app.exception_handler(OmnigentError)
     async def _handle_omnigent_error(
@@ -473,7 +494,7 @@ def app(runner_globals_reset: None) -> FastAPI:
 
     app.include_router(
         create_sessions_router(
-            _ConversationStore(),  # type: ignore[arg-type]
+            conversation_store,  # type: ignore[arg-type]
             _StubAgentStore(),  # type: ignore[arg-type]
         ),
         prefix="/v1",
@@ -1550,8 +1571,15 @@ async def test_delete_terminal_proxies_to_runner(
 @pytest.mark.asyncio
 async def test_transfer_terminal_authorizes_sessions_and_proxies_to_runner(
     client: httpx.AsyncClient,
+    app: FastAPI,
 ) -> None:
-    """POST terminal transfer validates source and target then proxies."""
+    """POST terminal transfer proxies and carries the source placement."""
+    conversation_store: _ConversationStore = app.state.test_conversation_store
+    source = conversation_store.get_conversation("79b22ebd2309e48fdeb450c65611d51b")
+    assert source is not None
+    source.host_id = "host_arca"
+    source.workspace = "/home/alice/workspace"
+    source.git_branch = "feature/clear"
     terminal_resource = {
         "id": "terminal_bash_s1",
         "object": "session.resource",
@@ -1589,6 +1617,11 @@ async def test_transfer_terminal_authorizes_sessions_and_proxies_to_runner(
         ),
     ]
     assert router.resource_calls == ["79b22ebd2309e48fdeb450c65611d51b"]
+    target = conversation_store.get_conversation("5d29bee4350489d66feafecfebd94a97")
+    assert target is not None
+    assert target.host_id == "host_arca"
+    assert target.workspace == "/home/alice/workspace"
+    assert target.git_branch == "feature/clear"
 
 
 @pytest.mark.asyncio
@@ -2524,6 +2557,97 @@ async def test_files_route_not_captured_as_resource_id(
 
 
 @pytest.mark.asyncio
+async def test_github_info_proxies_to_runner(client: httpx.AsyncClient) -> None:
+    """GET /resources/github proxies to the runner and returns its payload.
+
+    Also guards route ordering: registered before the generic
+    ``/resources/{resource_id}`` lookup so ``github`` is not a resource id.
+    """
+    payload = {
+        "object": "session.github.info",
+        "available": True,
+        "authenticated": True,
+        "branch": "feature",
+        "base_ref": "main",
+        "pr": None,
+    }
+    fake_runner = _FakeRunnerClient(payload=payload)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github")
+
+    assert resp.status_code == 200
+    assert resp.json() == payload
+    assert (
+        "GET",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github",
+    ) in fake_runner.calls
+
+
+@pytest.mark.asyncio
+async def test_github_changes_forwards_base_param(client: httpx.AsyncClient) -> None:
+    """GET /resources/github/changes forwards ``?base=`` to the runner."""
+    fake_runner = _FakeRunnerClient(payload={"object": "list", "data": [], "has_more": False})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/changes?base=main"
+    )
+
+    assert resp.status_code == 200
+    assert (
+        "GET",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/changes",
+    ) in fake_runner.calls
+    assert {"base": "main"} in fake_runner.get_params
+
+
+@pytest.mark.asyncio
+async def test_github_pr_diff_proxies_whole_patch(client: httpx.AsyncClient) -> None:
+    """GET /resources/github/diff (no path) proxies the whole-PR patch + base."""
+    payload = {"object": "session.github.pr_diff", "patch": "diff --git a/x b/x\n"}
+    fake_runner = _FakeRunnerClient(payload=payload)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff?base=main"
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == payload
+    assert (
+        "GET",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff",
+    ) in fake_runner.calls
+    assert {"base": "main"} in fake_runner.get_params
+
+
+@pytest.mark.asyncio
+async def test_github_diff_proxies_path_and_base(client: httpx.AsyncClient) -> None:
+    """GET /resources/github/diff/{path} proxies the path + base to the runner."""
+    payload = {
+        "object": "session.github.file_diff",
+        "path": "src/app.py",
+        "before": "old",
+        "after": "new",
+    }
+    fake_runner = _FakeRunnerClient(payload=payload)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff/src/app.py?base=main"
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == payload
+    assert (
+        "GET",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff/src/app.py",
+    ) in fake_runner.calls
+    assert {"base": "main"} in fake_runner.get_params
+
+
+@pytest.mark.asyncio
 async def test_files_appear_in_unified_inventory(
     file_client: httpx.AsyncClient,
 ) -> None:
@@ -2919,6 +3043,163 @@ async def test_filesystem_read_proxies_to_runner(
     )
     assert resp.status_code == 200
     assert resp.json()["content"] == "hello world"
+
+
+@contextlib.asynccontextmanager
+async def _runner_app_client(runner: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    """Route session resources to a stub runner app over a real httpx client.
+
+    The download proxy streams through ``build_request``/``send`` rather
+    than the canned ``get`` the fake client answers, so it needs a client
+    with real transport semantics.
+
+    :param runner: Stub runner app serving the filesystem route.
+    :returns: The client bound to the stub, installed as the runner router.
+    """
+    transport = httpx.ASGITransport(app=runner)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as runner_http:
+        set_runner_router(_FakeRunnerRouter(runner_http))  # type: ignore[arg-type]
+        yield runner_http
+
+
+_FS_ROUTE = (
+    "/v1/sessions/{session_id}/resources/environments/{environment_id}"
+    "/filesystem/{relative_path:path}"
+)
+_DOWNLOAD_URL = (
+    "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+    "/filesystem/data/big.bin?download=true"
+)
+
+
+@pytest.mark.asyncio
+async def test_filesystem_download_streams_runner_attachment(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """``?download=true`` forwards the runner's attachment and headers verbatim."""
+    payload = bytes(range(256)) * 64
+    (tmp_path / "big.bin").write_bytes(payload)
+    runner = FastAPI()
+    seen: list[tuple[str, bool]] = []
+
+    @runner.get(_FS_ROUTE)
+    async def _serve(
+        session_id: str,
+        environment_id: str,
+        relative_path: str,
+        download: bool = False,
+    ) -> FileResponse:
+        del session_id, environment_id
+        seen.append((relative_path, download))
+        return FileResponse(
+            tmp_path / "big.bin",
+            filename="big.bin",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async with _runner_app_client(runner):
+        resp = await client.get(_DOWNLOAD_URL)
+
+    assert resp.status_code == 200
+    assert resp.content == payload
+    assert resp.headers["content-disposition"] == 'attachment; filename="big.bin"'
+    assert resp.headers["content-length"] == str(len(payload))
+    assert resp.headers["cache-control"] == "no-store"
+    assert seen == [("data/big.bin", True)]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_download_rejects_runner_without_download_support(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner that ignores ``download`` answers the capped JSON envelope.
+
+    Serving that would truncate silently, so the proxy fails loudly instead.
+    """
+    runner = FastAPI()
+
+    @runner.get(_FS_ROUTE)
+    async def _serve(session_id: str, environment_id: str, relative_path: str) -> JSONResponse:
+        del session_id, environment_id, relative_path
+        return JSONResponse(
+            {
+                "object": "session.environment.filesystem.file_content",
+                "content": "partial",
+                "truncated": True,
+            }
+        )
+
+    async with _runner_app_client(runner):
+        resp = await client.get(_DOWNLOAD_URL)
+
+    assert resp.status_code == 503
+    assert resp.json()["error"]["code"] == "runner_unavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("runner_status", "code"),
+    [(404, "path_not_found"), (400, "invalid_path"), (403, "path_unreachable")],
+)
+async def test_filesystem_download_forwards_runner_errors(
+    client: httpx.AsyncClient,
+    runner_status: int,
+    code: str,
+) -> None:
+    """A missing, directory, or out-of-grant path keeps the runner's status and code."""
+    runner = FastAPI()
+
+    @runner.get(_FS_ROUTE)
+    async def _serve(session_id: str, environment_id: str, relative_path: str) -> JSONResponse:
+        del session_id, environment_id, relative_path
+        return JSONResponse(
+            status_code=runner_status,
+            content={"error": {"code": code, "message": "nope"}},
+        )
+
+    async with _runner_app_client(runner):
+        resp = await client.get(_DOWNLOAD_URL)
+
+    assert resp.status_code == runner_status
+    assert resp.json()["error"] == {"code": code, "message": "nope"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["read", "download", "write"])
+async def test_filesystem_forwards_a_literal_percent_still_encoded(
+    client: httpx.AsyncClient,
+    operation: str,
+) -> None:
+    """A name the server decoded to a literal ``%2F`` reaches the runner as that name.
+
+    Forwarded verbatim it would decode once more into an absolute path,
+    past the owner-only gate the server applied at workspace level.
+    """
+    runner = FastAPI()
+    seen: list[str] = []
+
+    @runner.get(_FS_ROUTE)
+    @runner.put(_FS_ROUTE)
+    async def _serve(session_id: str, environment_id: str, relative_path: str) -> JSONResponse:
+        del session_id, environment_id
+        seen.append(relative_path)
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"code": "path_not_found", "message": "nope"}},
+        )
+
+    url = (
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+        "/filesystem/%252Fetc/passwd"
+    )
+    async with _runner_app_client(runner):
+        if operation == "write":
+            await client.put(url, json={"content": "x", "encoding": "utf-8"})
+        else:
+            await client.get(url, params={"download": "true"} if operation == "download" else None)
+
+    assert seen == ["%2Fetc/passwd"]
 
 
 @pytest.mark.asyncio
@@ -4327,6 +4608,56 @@ async def test_relay_skips_malformed_resource_created_from_runner() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_type", ["response.completed", "response.failed"])
+async def test_relay_persists_harness_reported_model(
+    terminal_type: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDK terminal usage records the concrete model on the session snapshot."""
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session_id, event: published.append(event),
+    )
+    store = _ConversationStore()
+    client = _FakeStreamingRunnerClient(
+        [
+            _sse_frame(
+                {
+                    "type": terminal_type,
+                    "response": {
+                        "id": "resp_model",
+                        "model": "repro_agent",
+                        "usage": {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "total_tokens": 0,
+                            "model": "claude-opus-4-8",
+                        },
+                    },
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    await _relay_runner_stream(session_id, client, store)  # type: ignore[arg-type]
+
+    assert store.get_conversation(session_id).reported_model == "claude-opus-4-8"  # type: ignore[union-attr]
+    model_events = [event for event in published if event.get("type") == "session.model"]
+    assert model_events == [
+        {
+            "type": "session.model",
+            "conversation_id": session_id,
+            "model": "claude-opus-4-8",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "frame_payload",
     [
@@ -5383,6 +5714,94 @@ async def test_offline_environment_advertises_the_same_reach_as_the_runner(
         "unconfined": True,
         "roots": [{"path": _OFFLINE_WORKSPACE, "access": "write", "origin": "cwd"}],
     }
+
+
+@pytest.mark.asyncio
+async def test_github_info_falls_back_to_host_when_runner_offline(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub info is served over the host tunnel when the runner is offline."""
+    from omnigent.server.routes import _host_filesystem
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_read(
+        *,
+        host_registry: Any,
+        host_conn: Any,
+        op: str,
+        workspace: str,
+        session_id: str,
+        params: Any,
+    ) -> dict[str, Any]:
+        del host_registry, host_conn, session_id, params
+        captured["op"] = op
+        captured["workspace"] = workspace
+        return {
+            "object": "session.github.info",
+            "available": True,
+            "gh_available": True,
+            "authenticated": True,
+            "branch": "feature",
+            "base_ref": "main",
+            "repo": {"name_with_owner": "acme/app"},
+            "pr": None,
+        }
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", _fake_read)
+
+    resp = await offline_env_client.get(f"/v1/sessions/{_OFFLINE_SESSION}/resources/github")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["branch"] == "feature"
+    assert captured["op"] == "github_info"
+    assert captured["workspace"] == _OFFLINE_WORKSPACE
+
+
+@pytest.mark.asyncio
+async def test_github_diff_falls_back_to_host_when_runner_offline(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The GitHub diff (gzip route) also falls back to the host tunnel offline.
+
+    Proves the file-read router's GitHub diff route is wired to the fallback,
+    and that the ``base`` + ``path`` reach the host op.
+    """
+    from omnigent.server.routes import _host_filesystem
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_read(
+        *,
+        host_registry: Any,
+        host_conn: Any,
+        op: str,
+        workspace: str,
+        session_id: str,
+        params: Any,
+    ) -> dict[str, Any]:
+        del host_registry, host_conn, session_id, workspace
+        captured["op"] = op
+        captured["params"] = params
+        return {
+            "object": "session.github.file_diff",
+            "path": "app.py",
+            "before": "base",
+            "after": "changed",
+        }
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", _fake_read)
+
+    resp = await offline_env_client.get(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github/diff/app.py?base=main"
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["after"] == "changed"
+    assert captured["op"] == "github_diff"
+    assert captured["params"] == {"base": "main", "path": "app.py"}
 
 
 # ── Workspace-file gzip (GZipFileContentRoute) ───────────────────

@@ -91,15 +91,16 @@ _DEFAULT_POLICY_SPECS_CACHE: cachetools.TTLCache[int, list[PolicySpec]] = cachet
     maxsize=256, ttl=30
 )
 
-# Invalidation-based LRU cache of ``(workspace_id, conversation_id) -> list[PolicySpec]``
-# for session-scoped policies. Unlike defaults, session policies can be added
-# mid-session (via sys_add_policy), so a TTL would delay enforcement. Instead,
-# the cache is explicitly invalidated whenever a session policy is mutated via
-# the CRUD routes. Keyed by workspace to prevent cross-tenant leakage.
-# Bounded (LRU, 4096 entries) to match _SESSION_OWNER_CACHE and prevent unbounded
-# growth — LRU eviction handles sessions that end without any policy mutation.
-_SESSION_POLICY_SPECS_CACHE: cachetools.LRUCache[tuple[int, str], list[PolicySpec]] = (
-    cachetools.LRUCache(maxsize=4096)
+# TTL+LRU cache of ``(workspace_id, conversation_id) -> list[PolicySpec]``
+# for session-scoped policies. Mutations call invalidate_session_policy_specs_cache
+# for immediate local eviction (single-instance or lucky same-replica routing).
+# The TTL (30 s) is the safety ceiling for horizontally-scaled deployments where
+# a DELETE/PATCH on one replica cannot evict another replica's in-process cache —
+# without it, a deleted session policy would remain enforced on other replicas
+# indefinitely (no natural expiry). Keyed by workspace to prevent cross-tenant
+# leakage. TTLCache subsumes LRU eviction, bounding memory the same way.
+_SESSION_POLICY_SPECS_CACHE: cachetools.TTLCache[tuple[int, str], list[PolicySpec]] = (
+    cachetools.TTLCache(maxsize=4096, ttl=30)
 )
 
 
@@ -1462,11 +1463,15 @@ def _load_session_policy_specs(
     Load enabled session policies from the store and convert
     them to :class:`FunctionPolicySpec` instances.
 
-    Results are cached per ``(workspace_id, conversation_id)`` and
-    invalidated on any mutation via :func:`invalidate_session_policy_specs_cache`.
-    There is no TTL — the cache entry is permanent until explicitly evicted,
-    so session policy changes (including ``sys_add_policy``) take effect
-    immediately on the next engine build.
+    Results are cached per ``(workspace_id, conversation_id)`` with a
+    30 s TTL (see :data:`_SESSION_POLICY_SPECS_CACHE`). Mutations call
+    :func:`invalidate_session_policy_specs_cache` for immediate local
+    eviction on the replica that handled the change; the TTL is the
+    safety net for replicas in a horizontally-scaled deployment that
+    never received the invalidation signal. Same-replica mutations
+    (including ``sys_add_policy``) still take effect on the next engine
+    build via the explicit invalidation; cross-replica propagation is
+    bounded to ≤ 30 s.
 
     Only ``type="python"`` policies are instantiable today. An
     enabled policy of an unsupported type (e.g. ``type="url"``)

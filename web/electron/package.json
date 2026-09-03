@@ -1,8 +1,8 @@
 {
   "name": "omnigent-desktop-electron",
   "productName": "Omnigent",
-  "version": "0.12.0-dev.0",
-  "description": "Omnigent desktop shell (Electron edition) — a thin native wrapper around the server-served web UI.",
+  "version": "0.12.0",
+  "description": "Omnigent desktop shell (Electron edition) \u2014 a thin native wrapper around the server-served web UI.",
   "private": true,
   "main": "src/main.js",
   "homepage": "https://omnigent.ai",
@@ -23,7 +23,7 @@
     "build:mac:release": "OMNIGENT_NOTARIZE_DMG=true electron-builder --mac -c.mac.notarize=true -c.dmg.sign=true",
     "build:linux": "electron-builder --linux",
     "build:win": "electron-builder --win",
-    "build:overlay": "pnpm --filter web run build:overlay",
+    "build:overlay": "pnpm --filter web run build:overlay && pnpm --filter web run build:server-selector-v2",
     "predev": "pnpm run build:overlay",
     "prestart": "pnpm run build:overlay",
     "prebuild": "pnpm run build:overlay",
@@ -61,7 +61,10 @@
     "afterAllArtifactBuild": "build/afterAllArtifactBuild.js",
     "files": [
       "src/**/*",
+      "about/**/*",
       "setup/**/*",
+      "arca-connect/**/*",
+      "server-selector-v2/**/*",
       "find/**/*",
       "return-banner/**/*",
       "icons/**/*",
@@ -86,7 +89,8 @@
       "entitlementsInherit": "signing/entitlements.mac.inherit.plist",
       "extendInfo": {
         "NSMicrophoneUsageDescription": "Omnigent uses the microphone for voice dictation in the message composer.",
-        "CFBundleIconName": "AppIcon"
+        "CFBundleIconName": "AppIcon",
+        "NSPrefersDisplaySafeAreaCompatibilityMode": false
       },
       "gatekeeperAssess": false,
       "notarize": false,
@@ -163,6 +167,8 @@
     }
   },
   "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
     "electron-updater": "^6.3.9",
     "js-yaml": "^4.3.0"
   }

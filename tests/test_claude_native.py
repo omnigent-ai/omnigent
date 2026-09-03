@@ -9431,17 +9431,82 @@ def test_parse_claude_model_aliases_reads_the_usage_line() -> None:
             {"label": "Opus in plan mode, else Sonnet"},
             id="prose-label-kept-verbatim",
         ),
+        pytest.param(
+            json.dumps({"type": "result", "result": "Current model: `Sonnet 5` (effort: high)"}),
+            {"label": "Sonnet 5"},
+            id="markdown-backticks-around-the-name-are-stripped",
+        ),
+        pytest.param(
+            json.dumps({"type": "result", "result": "Current model: `Opus 5 (1M context)`"}),
+            {"label": "Opus 5 (1M context)"},
+            id="markdown-backticks-around-the-whole-label-are-stripped",
+        ),
+        pytest.param(
+            json.dumps({"type": "result", "result": "Current model: `Opus 5 (effort: high)`"}),
+            {"label": "Opus 5"},
+            id="effort-suffix-inside-the-backticks-still-strips",
+        ),
+        pytest.param(
+            json.dumps(
+                {"type": "result", "result": "Current model: `Opus 5 (1M context) (default)`"}
+            ),
+            {"label": "Opus 5 (1M context)"},
+            id="default-marker-on-the-enumeration-run-is-stripped",
+        ),
+        pytest.param(
+            json.dumps({"type": "result", "result": "Current model: Sonnet 5 (default)"}),
+            {"label": "Sonnet 5"},
+            id="default-marker-without-backticks-is-stripped",
+        ),
         pytest.param("Current model: Opus 5\nnot json", {}, id="non-stream-json-yields-nothing"),
     ],
 )
 def test_parse_claude_current_model(stdout: str, expected: dict[str, str]) -> None:
     """The stream-json run's exact id and printed label parse verbatim.
 
-    Only the trailing ``(effort: …)`` suffix is stripped from the label —
-    context markers and prose like opusplan's description survive, because
-    the parser knows no model names.
+    Only markdown backticks and the trailing ``(effort: …)`` / ``(default)``
+    suffixes are stripped from the label — context markers and prose like
+    opusplan's description survive, because the parser knows no model names.
     """
     assert claude_native._parse_claude_current_model(stdout) == expected
+
+
+@pytest.mark.parametrize(
+    ("alias", "label", "model", "expected"),
+    [
+        pytest.param(
+            "sonnet[1m]",
+            "`Sonnet 5`",
+            "claude-sonnet-5[1m]",
+            "Sonnet 5 (1M context)",
+            id="marker-appended-outside-stripped-backticks",
+        ),
+        pytest.param(
+            "opus[1m]",
+            "`Opus 5 (1M context)`",
+            "claude-opus-5[1m]",
+            "Opus 5 (1M context)",
+            id="marker-already-present-inside-backticks",
+        ),
+    ],
+)
+def test_claude_alias_row_marks_1m_context_consistently(
+    alias: str, label: str, model: str, expected: str
+) -> None:
+    """A markdown-quoted harness label cannot split the 1M-context marker.
+
+    Backticks leave at parse time, so the marker lands on plain text and
+    the guard against a duplicate marker sees the name it is guarding.
+    """
+    resolution = claude_native._parse_claude_current_model(
+        json.dumps({"type": "system", "subtype": "init", "model": model})
+        + "\n"
+        + json.dumps({"type": "result", "result": f"Current model: {label} (effort: high)"})
+    )
+
+    row = claude_native._claude_alias_row(alias, resolution)
+
+    assert row == {"id": alias, "model": model, "displayName": expected}
 
 
 async def test_probe_claude_model_options_runs_bare(
@@ -9848,3 +9913,220 @@ def test_claude_catalog_serves_model(
     assert (
         claude_native.claude_catalog_serves_model(_subscription_catalog(), model, config) is served
     )
+
+
+# ── Bare --resume picker: host scoping and concise errors ────────────
+
+
+def test_resolve_session_id_for_resume_threads_local_host_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bare ``--resume`` scopes the picker to this machine's host id.
+
+    Native transcript/workspace state is host-local; without the
+    invoking host id the picker offers dead-end rows from other hosts.
+    """
+    from omnigent.host import identity as host_identity
+
+    captured: dict[str, Any] = {}
+
+    async def fake_picker(client: Any, **kwargs: Any) -> str | None:
+        """Capture the picker kwargs; skip any real listing."""
+        del client
+        captured.update(kwargs)
+        return "conv_picked"
+
+    monkeypatch.setattr(
+        "omnigent.repl._resume_picker.pick_conversation_by_wrapper_label_from_sdk",
+        fake_picker,
+    )
+    monkeypatch.setattr(
+        host_identity,
+        "load_host_identity_if_present",
+        lambda *a, **k: host_identity.HostIdentity(
+            host_id="aaaa1111aaaa1111aaaa1111aaaa1111", name="test-host"
+        ),
+    )
+
+    resolved = claude_native._resolve_session_id_for_resume(
+        base_url="http://127.0.0.1:1",
+        headers={},
+        session_id=None,
+        resume_picker=True,
+    )
+    assert resolved == "conv_picked"
+    assert captured["host_id"] == "aaaa1111aaaa1111aaaa1111aaaa1111"
+
+
+def test_resolve_session_id_for_resume_unregistered_machine_lists_unfiltered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No persisted host identity → the picker lists without a host filter.
+
+    The lookup must be read-only: resolving a resume must never mint a
+    host identity on a machine that is not a host.
+    """
+    from omnigent.host import identity as host_identity
+
+    captured: dict[str, Any] = {}
+
+    async def fake_picker(client: Any, **kwargs: Any) -> str | None:
+        """Capture the picker kwargs; skip any real listing."""
+        del client
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(
+        "omnigent.repl._resume_picker.pick_conversation_by_wrapper_label_from_sdk",
+        fake_picker,
+    )
+    monkeypatch.setattr(host_identity, "load_host_identity_if_present", lambda *a, **k: None)
+
+    resolved = claude_native._resolve_session_id_for_resume(
+        base_url="http://127.0.0.1:1",
+        headers={},
+        session_id=None,
+        resume_picker=True,
+    )
+    assert resolved is None
+    assert captured["host_id"] is None
+
+
+def test_resolve_session_id_for_resume_wraps_sdk_error_as_click_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A persistent SDK failure surfaces as a concise ``ClickException``.
+
+    The bare-``--resume`` journey must never end in a raw SDK
+    traceback: a list failure that outlives the picker's bounded
+    retries (e.g. a persistent 429) becomes a one-line CLI error.
+    """
+    from omnigent_client import RateLimitedError
+
+    from omnigent.host import identity as host_identity
+
+    async def fake_picker(client: Any, **kwargs: Any) -> str | None:
+        """Simulate the list call failing past the retry budget."""
+        del client, kwargs
+        raise RateLimitedError("rate limited", 429, "rate_limited")
+
+    monkeypatch.setattr(
+        "omnigent.repl._resume_picker.pick_conversation_by_wrapper_label_from_sdk",
+        fake_picker,
+    )
+    monkeypatch.setattr(host_identity, "load_host_identity_if_present", lambda *a, **k: None)
+
+    with pytest.raises(click.ClickException) as exc_info:
+        claude_native._resolve_session_id_for_resume(
+            base_url="http://127.0.0.1:1",
+            headers={},
+            session_id=None,
+            resume_picker=True,
+        )
+    assert "Could not list sessions to resume" in exc_info.value.message
+
+
+def test_resolve_session_id_for_resume_explicit_id_bypasses_host_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit ``--resume <id>`` returns as-is — no picker, no filtering."""
+
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("picker must not run for explicit --resume <id>")
+
+    monkeypatch.setattr(
+        "omnigent.repl._resume_picker.pick_conversation_by_wrapper_label_from_sdk",
+        boom,
+    )
+    resolved = claude_native._resolve_session_id_for_resume(
+        base_url="http://127.0.0.1:1",
+        headers={},
+        session_id="conv_explicit",
+        resume_picker=False,
+    )
+    assert resolved == "conv_explicit"
+
+
+def test_resolve_session_id_for_resume_partial_env_identity_is_concise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A half-set host-identity env pair fails as a concise CLI error.
+
+    ``load_host_identity_if_present`` raises ``ValueError`` when only
+    one of the managed-host launch env vars is set; bare ``--resume``
+    must surface that as a ``ClickException``, not a raw traceback.
+    """
+    from omnigent.host import identity as host_identity
+
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise ValueError("OMNIGENT_HOST_ID and OMNIGENT_HOST_NAME must be set together")
+
+    monkeypatch.setattr(host_identity, "load_host_identity_if_present", boom)
+
+    with pytest.raises(click.ClickException) as exc_info:
+        claude_native._resolve_session_id_for_resume(
+            base_url="http://127.0.0.1:1",
+            headers={},
+            session_id=None,
+            resume_picker=True,
+        )
+    assert "host identity" in exc_info.value.message
+
+
+# ── catalog fingerprint keys on the CLI binary ───────────
+
+
+def _point_claude_at(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
+    """Make the fingerprint resolve the Claude binary to *path*."""
+    monkeypatch.setattr(
+        "omnigent.claude_launcher.resolve_claude_launch",
+        lambda command, args: (str(path), list(args)),
+    )
+
+
+def test_catalog_fingerprint_changes_when_the_cli_is_upgraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An upgraded Claude Code misses the catalog its predecessor wrote.
+
+    The catalog stores the model names one binary printed. Without the
+    binary in the key, an upgrade keeps serving the old names until the
+    entry ages out, which hides models a release adds or renames.
+    """
+    old_release = tmp_path / "2.1.247"
+    new_release = tmp_path / "2.1.250"
+    old_release.write_text("old")
+    new_release.write_text("newer build")
+    link = tmp_path / "claude"
+    link.symlink_to(old_release)
+    _point_claude_at(monkeypatch, link)
+
+    before = claude_native.claude_catalog_fingerprint(None)
+
+    link.unlink()
+    link.symlink_to(new_release)
+    after = claude_native.claude_catalog_fingerprint(None)
+
+    assert before != after
+
+
+def test_catalog_fingerprint_is_stable_for_one_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unchanged binary keeps its catalog, so no probe is repaid."""
+    binary = tmp_path / "claude"
+    binary.write_text("build")
+    _point_claude_at(monkeypatch, binary)
+
+    assert claude_native.claude_catalog_fingerprint(None) == (
+        claude_native.claude_catalog_fingerprint(None)
+    )
+
+
+def test_catalog_fingerprint_survives_a_missing_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A binary the resolver cannot find still yields a usable key."""
+    _point_claude_at(monkeypatch, tmp_path / "absent")
+
+    assert isinstance(claude_native.claude_catalog_fingerprint(None), str)

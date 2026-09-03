@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import httpx
@@ -321,3 +322,185 @@ async def test_stream_local_sessions_raises_on_failed_done() -> None:
             )
         ]
     assert conn.pending_import_local == {}
+
+
+async def test_local_import_binds_session_to_importing_host(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host-mediated batch import binds each read session to that host.
+
+    The transcript (and its recorded workspace) live on the importing host, so
+    that host is the natural place to resume. A session whose transcript had no
+    cwd stays unbound: the workspace-required check constraint forbids a host
+    without one.
+    """
+    from fastapi import FastAPI
+
+    from omnigent.server.routes import imports as imports_module
+
+    _seed_claude_agent(db_uri)
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+
+    async def _fake_stream(**_kwargs: object):
+        yield {
+            "external_session_id": "claude-with-cwd",
+            "workspace": "/repo/on/host",
+            "items": [
+                {
+                    "type": "message",
+                    "response_id": "claude:turn-1",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "inspect TODO.md"}],
+                    },
+                }
+            ],
+            "title": "Bound thread",
+            "source": "claude",
+        }
+        yield {
+            "external_session_id": "claude-no-cwd",
+            "workspace": None,
+            "items": [
+                {
+                    "type": "message",
+                    "response_id": "claude:turn-1",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "no workspace here"}],
+                    },
+                }
+            ],
+            "title": "Unbound thread",
+            "source": "claude",
+        }
+
+    monkeypatch.setattr(imports_module, "_stream_local_sessions_from_host", _fake_stream)
+
+    host_conn = SimpleNamespace(
+        host_id="host_0123456789abcdef0123456789abcdef", pending_import_local={}
+    )
+    host_registry = SimpleNamespace(get=lambda host_id: host_conn)
+    host_store = SimpleNamespace(get_host=lambda host_id: SimpleNamespace(user_id=None))
+
+    app = FastAPI()
+    app.include_router(
+        imports_module.create_imports_router(
+            conversation_store,
+            SqlAlchemyAgentStore(db_uri),
+            host_registry=host_registry,  # type: ignore[arg-type]
+            host_store=host_store,  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post(
+            "/v1/imports/local",
+            json={
+                "host_id": "host_0123456789abcdef0123456789abcdef",
+                "source": "claude",
+                "limit": 5,
+            },
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["imported"] == 2
+    by_title = {ref["title"]: ref["session_id"] for ref in body["sessions"]}
+
+    bound = conversation_store.get_conversation(by_title["Bound thread"])
+    assert bound is not None
+    # The store canonicalizes host_id to bare 32-hex (the "host_" prefix is
+    # stripped on read), matching every other host-bound conversation.
+    assert bound.host_id == "0123456789abcdef0123456789abcdef"
+    assert bound.workspace == "/repo/on/host"
+
+    unbound = conversation_store.get_conversation(by_title["Unbound thread"])
+    assert unbound is not None
+    assert unbound.host_id is None
+    assert unbound.workspace is None
+
+
+async def test_local_import_stream_emits_ndjson_session_then_done(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The streaming endpoint emits one ``session`` line per import, then ``done``.
+
+    Same import as the buffered ``/imports/local`` but wire-framed as NDJSON so
+    the caller can list sessions as they land.
+    """
+    from fastapi import FastAPI
+
+    from omnigent.server.routes import imports as imports_module
+
+    _seed_claude_agent(db_uri)
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+
+    async def _fake_stream(**_kwargs: object):
+        for i in (1, 2):
+            yield {
+                "external_session_id": f"claude-stream-{i}",
+                "workspace": "/repo/on/host",
+                "items": [
+                    {
+                        "type": "message",
+                        "response_id": "claude:turn-1",
+                        "data": {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": f"thread {i}"}],
+                        },
+                    }
+                ],
+                "title": f"Streamed {i}",
+                "source": "claude",
+            }
+
+    monkeypatch.setattr(imports_module, "_stream_local_sessions_from_host", _fake_stream)
+
+    host_conn = SimpleNamespace(
+        host_id="host_0123456789abcdef0123456789abcdef", pending_import_local={}
+    )
+    host_registry = SimpleNamespace(get=lambda host_id: host_conn)
+    host_store = SimpleNamespace(get_host=lambda host_id: SimpleNamespace(user_id=None))
+
+    app = FastAPI()
+    app.include_router(
+        imports_module.create_imports_router(
+            conversation_store,
+            SqlAlchemyAgentStore(db_uri),
+            host_registry=host_registry,  # type: ignore[arg-type]
+            host_store=host_store,  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post(
+            "/v1/imports/local/stream",
+            json={
+                "host_id": "host_0123456789abcdef0123456789abcdef",
+                "source": "claude",
+                "limit": 5,
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("application/x-ndjson")
+    events = [json.loads(line) for line in resp.text.splitlines() if line.strip()]
+    session_events = [e for e in events if e["event"] == "session"]
+    assert [e["title"] for e in session_events] == ["Streamed 1", "Streamed 2"]
+    # The terminal line carries the tally.
+    assert events[-1] == {
+        "event": "done",
+        "imported": 2,
+        "already_imported": 0,
+        "failed": 0,
+    }
+    # Each streamed session was actually persisted.
+    for e in session_events:
+        assert conversation_store.get_conversation(e["session_id"]) is not None
