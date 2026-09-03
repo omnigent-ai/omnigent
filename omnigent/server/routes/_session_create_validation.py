@@ -173,7 +173,8 @@ async def resolve_project_session_create(
 # accepts at start, not just the shift+tab-switchable subset. ``dontAsk`` and
 # ``bypassPermissions`` are launch-only (rejected on a running-session PATCH),
 # but a scheduled task launches a fresh session each fire, so all of them are
-# valid here. Mirrors the frontend's ``CLAUDE_NATIVE_PERMISSION_MODES``.
+# valid here. Does not include ``"inherit"`` (the frontend-only no-flag
+# sentinel) — that value is never sent to the server.
 CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES: frozenset[str] = frozenset(
     {"default", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"}
 )

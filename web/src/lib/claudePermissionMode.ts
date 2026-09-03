@@ -23,12 +23,19 @@ export interface ClaudePermissionModeOption {
   description: string;
 }
 
-export const CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE = "default";
+// "inherit" is a web-UI sentinel: no --permission-mode flag is passed, so
+// Claude Code uses whatever the user has configured in their settings file.
+export const CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE = "inherit";
 
 // Claude Code's `claude --permission-mode` choices (v2.1). Keep in sync
-// with `claude --help`. The prompting mode is spelled `default` on the
-// wire and labelled "Manual" in Claude's own UI, which this mirrors.
+// with `claude --help`. "inherit" is prepended as the no-flag default; the
+// rest map 1:1 to --permission-mode values sent on session create.
 export const CLAUDE_NATIVE_PERMISSION_MODES: ClaudePermissionModeOption[] = [
+  {
+    value: "inherit",
+    label: "Default",
+    description: "Uses your configured Claude Code permission mode",
+  },
   { value: "default", label: "Manual", description: "Prompts before edits and commands" },
   {
     value: "auto",
@@ -50,6 +57,8 @@ export const CLAUDE_NATIVE_PERMISSION_MODES: ClaudePermissionModeOption[] = [
 ];
 
 /** Modes a running session can be switched to (shift+tab-reachable). */
+// "inherit" is launch-only — there is no --permission-mode flag that means
+// "use my settings", so it cannot be sent as a mid-session switch.
 export const CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES: ClaudePermissionModeOption[] =
   CLAUDE_NATIVE_PERMISSION_MODES.filter((mode) =>
     ["default", "acceptEdits", "plan", "auto"].includes(mode.value),
@@ -72,8 +81,8 @@ export function claudePermissionModeLabel(mode: string | null | undefined): stri
  * Prefers the label the server stamps after a confirmed switch, then the
  * launch flag. Returns `null` rather than assuming Claude's default: a
  * `permissions.defaultMode` in a settings file boots the session into a mode
- * that never appears in `terminal_launch_args`, so guessing "Manual" would
- * display a mode the session isn't in. Callers hide the picker on `null`.
+ * that never appears in `terminal_launch_args`, so guessing would display a
+ * mode the session isn't in. Callers hide the picker on `null`.
  */
 export function claudePermissionModeFromSession(
   session:

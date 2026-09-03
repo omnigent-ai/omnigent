@@ -3661,9 +3661,9 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     renderLanding();
     openAgentConfig("a1");
     openSelect("new-chat-landing-config-permission");
-    // The footer starts on the selected (Default) mode's blurb...
+    // The footer starts on the selected (Default/inherit) mode's blurb...
     const detail = screen.getByTestId("new-chat-landing-config-permission-detail");
-    expect(detail.textContent).toContain("Prompts before edits and commands");
+    expect(detail.textContent).toContain("Uses your configured Claude Code permission mode");
     // ...then follows the hovered option.
     fireEvent.pointerEnter(screen.getByRole("option", { name: "Plan" }));
     expect(detail.textContent).toContain("Plans only; makes no edits");
@@ -3679,10 +3679,10 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     fireEvent.click(screen.getByTestId("new-chat-landing-config-cancel"));
     expect(screen.queryByTestId("new-chat-landing-config-modal")).toBeNull();
     fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    // Reopened: Plan was discarded, the permission select is back at Manual
-    // (Claude's label for the prompting `default` mode).
+    // Reopened: Plan was discarded, the permission select is back at Default
+    // (the "inherit" no-flag mode).
     expect(screen.getByTestId("new-chat-landing-config-permission").textContent).toContain(
-      "Manual",
+      "Default",
     );
   });
 
@@ -4734,13 +4734,14 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
     expect(permission.textContent).toContain("Default");
     expect(permission.textContent).not.toContain("Plan");
     // Reads the state behind the locked row, not the row's own constant: the
-    // wrapper's full modal is back and shows the reset value.
+    // wrapper's full modal is back and shows the reset value (Default, since
+    // Smart Routing cleared the remembered "plan").
     fireEvent.click(screen.getByTestId("new-chat-landing-config-cancel"));
     selectAgent("a1");
     fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    expect(screen.getByTestId("new-chat-landing-config-permission").textContent).toContain(
-      "Manual",
-    );
+    const reopened = screen.getByTestId("new-chat-landing-config-permission");
+    expect(reopened.textContent).toContain("Default");
+    expect(reopened.textContent).not.toContain("Plan");
   });
 
   it("leaves Smart Routing by re-picking a harness row", () => {
