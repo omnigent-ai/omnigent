@@ -82,6 +82,11 @@ MODEL_VOCABULARY_ENV_VARS: tuple[str, ...] = (
 #: this module stays stdlib-only for hook subprocesses, which also means it
 #: cannot honour a deployment's ``routing.model_prefix`` override.
 _CATALOG_PREFIXES: tuple[str, ...] = ("databricks-", "system.ai.")
+
+#: The vendor prefix every canonical Claude id starts with. Gateways spell
+#: their own ids around this core, so it is what maps a served id back to the
+#: canonical spelling Claude Code emits (see :func:`canonical_claude_id`).
+_CANONICAL_ID_PREFIX = "claude-"
 _SEGMENT_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -270,3 +275,53 @@ def served_alias_pins(model_ids: Iterable[str]) -> dict[str, str]:
         if alias not in pins or _model_version_key(model_id) > _model_version_key(pins[alias]):
             pins[alias] = model_id
     return pins
+
+
+def canonical_claude_id(model_id: str) -> str | None:
+    """The canonical vendor spelling a gateway's id wraps.
+
+    Every canonical Claude id starts at :data:`_CANONICAL_ID_PREFIX`, and a
+    gateway spells its own ids around that core. Claude Code canonicalizes the
+    same way — by finding that substring — so this is also how a served id maps
+    back to the spelling the CLI emits for it.
+
+    :param model_id: A served id, e.g. ``"databricks-claude-opus-4-8"``.
+    :returns: The canonical id (``"claude-opus-4-8"``), or ``None`` when
+        *model_id* spells no Claude model (``"databricks-gpt-5-6"``).
+    """
+    comparable = model_id.strip().lower()
+    index = comparable.rfind(_CANONICAL_ID_PREFIX)
+    return comparable[index:] if index != -1 else None
+
+
+def served_canonical_overrides(model_ids: Iterable[str]) -> dict[str, str]:
+    """Map each canonical Claude id to the gateway's spelling of it.
+
+    Claude Code names some models itself instead of through a family alias: its
+    refusal-fallback re-issues a safeguard-flagged turn on a canonical id read
+    from a route table internal to the CLI. A gateway that serves Claude under
+    its own ids rejects that spelling with ``model_not_found``, so the flagged
+    turn dies. Claude Code's ``modelOverrides`` setting exists for exactly this
+    — it rewrites a canonical id to the provider's spelling on the way out.
+
+    Deriving the map from the gateway's own listing keeps model ids out of
+    Omnigent entirely: whichever model the CLI's table names, and whichever
+    generation it moves to next, the rewrite covers it as long as the gateway
+    serves that model.
+
+    :param model_ids: The ids a gateway's model listing reports.
+    :returns: Canonical id → served id, e.g.
+        ``{"claude-opus-4-8": "databricks-claude-opus-4-8"}``, for served ids
+        that spell a Claude model differently from its canonical form. Empty
+        when the gateway already serves canonical spellings (nothing to
+        rewrite) or serves no Claude model. When two served ids share a
+        canonical form the first in the listing wins.
+    """
+    overrides: dict[str, str] = {}
+    for model_id in model_ids:
+        served = model_id.strip()
+        canonical = canonical_claude_id(served)
+        if canonical is None or canonical == served:
+            continue
+        overrides.setdefault(canonical, served)
+    return overrides

@@ -13,8 +13,13 @@ the fallback request fails ``model_not_found`` and the whole turn dies with
 on the Databricks gateway, whose ids are ``databricks-claude-*``; any gateway
 with its own spellings has the same failure.)
 
-The fix lists the gateway's models and pins each family alias to a served id,
-so the fallback re-issues on the gateway's Opus and the turn completes.
+Pinning the ``opus`` alias is not enough on its own. The alias should track the
+newest Opus the gateway serves, while the CLI's refusal route table names an
+*older* canonical generation, so the two disagree exactly when a gateway serves
+both. The fix therefore also hands Claude Code a ``modelOverrides`` map derived
+from the same listing — canonical id to served spelling — so whichever id the
+route table names is rewritten to something the gateway answers. This test
+serves a newer Opus alongside the fallback target to hold that apart.
 
 This drives the real journey — register a claude-sdk agent on the mock
 gateway, create a runner-bound session (real ``claude`` CLI subprocess), send
@@ -53,9 +58,16 @@ from tests.e2e.conftest import (
 # real vendor's spelling: the fix must work for any gateway's ids.
 _LAUNCH_MODEL = "gw-claude-fable-5"
 _SERVED_FALLBACK_MODEL = "gw-claude-opus-4-8"
+# A newer Opus, served alongside the fallback target. The ``opus`` alias pins
+# to this one (newest per family), so the refusal-fallback can only reach the
+# older generation its route table names through the canonical rewrites — which
+# is the behavior under test. A gateway serving exactly this pair is where the
+# alias-only fix stopped working.
+_SERVED_NEWER_OPUS = "gw-claude-opus-5"
 _SERVED_MODELS = [
     _LAUNCH_MODEL,
     _SERVED_FALLBACK_MODEL,
+    _SERVED_NEWER_OPUS,
     "gw-claude-sonnet-5",
     "gw-claude-haiku-4-5",
 ]
@@ -114,9 +126,12 @@ def test_claude_sdk_refusal_fallback_routes_to_served_model(
     """A safeguard refusal on claude-sdk falls back to the served Opus id.
 
     The mock refuses the launch-model (Fable) turn with a ``cyber`` refusal.
-    With the alias pins the fix injects, Claude Code re-issues the turn on the
-    gateway's own Opus id and completes — instead of dying on a canonical
-    ``claude-opus-4-8`` the gateway rejects.
+    The gateway serves two Opus generations, so the ``opus`` alias points at the
+    newer one and cannot carry the fallback: Claude Code names the older
+    canonical id from its own route table. The canonical rewrites the fix
+    derives from the listing turn that id into the gateway's spelling, so the
+    turn re-issues on a served model and completes instead of dying on a
+    canonical id the gateway rejects.
     """
     reset_mock_llm(mock_llm_server_url)
     # What the gateway serves: the executor lists this once per session and
@@ -155,14 +170,22 @@ def test_claude_sdk_refusal_fallback_routes_to_served_model(
     assert _LAUNCH_MODEL in wire_models, (
         f"the launch model {_LAUNCH_MODEL!r} never reached the wire; models seen: {wire_models}"
     )
-    # The fix pinned the Opus alias to the served id, so the refusal-fallback
-    # re-issued on it. Without the fix the alias resolves to a bare
-    # ``claude-opus-4-8`` the gateway rejects, and no such request is made.
+    # The refusal-fallback re-issued on the gateway's spelling of the older
+    # Opus its route table names. Without the canonical rewrites the CLI sends
+    # the bare canonical id, the gateway rejects it, and no such request lands.
     assert _SERVED_FALLBACK_MODEL in wire_models, (
         f"the refusal-fallback did not re-issue on the served Opus id "
-        f"{_SERVED_FALLBACK_MODEL!r} — the ANTHROPIC_DEFAULT_OPUS_MODEL pin is "
-        f"missing, so the alias resolved to a canonical id the gateway rejects. "
-        f"Models seen on the wire: {wire_models}"
+        f"{_SERVED_FALLBACK_MODEL!r} — the canonical id Claude Code names was "
+        f"not rewritten to this gateway's spelling, so the fallback request "
+        f"named a model the gateway rejects. Models seen: {wire_models}"
+    )
+    # No canonical spelling ever reached the wire: the rewrite happened before
+    # the request, rather than the gateway happening to tolerate a vendor id.
+    canonical_leaks = [
+        model for model in wire_models if isinstance(model, str) and model.startswith("claude-")
+    ]
+    assert not canonical_leaks, (
+        f"canonical vendor ids reached the gateway unrewritten: {canonical_leaks}"
     )
     # And the turn completed rather than dying with the model_not_found error.
     assert body["status"] == "completed", (

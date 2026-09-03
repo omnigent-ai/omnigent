@@ -8,6 +8,7 @@ from omnigent.claude_model_vocabulary import (
     model_vocabulary_env,
     normalized_model_id,
     served_alias_pins,
+    served_canonical_overrides,
 )
 
 # A ucode-style launch pinning: each family alias mapped to a gateway id,
@@ -211,3 +212,69 @@ def test_served_alias_pins_pick_the_newest_served_id_per_family() -> None:
 
 def test_served_alias_pins_ignore_ids_of_no_claude_family() -> None:
     assert served_alias_pins(["databricks-gpt-5-6", "gemini-3-pro", ""]) == {}
+
+
+def test_served_canonical_overrides_map_canonical_ids_to_gateway_spellings() -> None:
+    """Every served generation becomes reachable by its canonical spelling.
+
+    Claude Code names a model itself when its refusal-fallback re-issues a
+    flagged turn, using a canonical id from a route table internal to the CLI.
+    The map has to cover whichever id that is, so it covers all of them.
+    """
+    assert served_canonical_overrides(
+        [
+            "databricks-claude-opus-4-8",
+            "databricks-claude-opus-5",
+            "anthropic/claude-sonnet-5",
+            "gw-claude-haiku-4-5",
+            "system.ai.claude-fable-5-1",
+        ]
+    ) == {
+        "claude-opus-4-8": "databricks-claude-opus-4-8",
+        "claude-opus-5": "databricks-claude-opus-5",
+        "claude-sonnet-5": "anthropic/claude-sonnet-5",
+        "claude-haiku-4-5": "gw-claude-haiku-4-5",
+        "claude-fable-5-1": "system.ai.claude-fable-5-1",
+    }
+
+
+def test_served_canonical_overrides_need_no_knowledge_of_a_generation() -> None:
+    """A model the vocabulary has never heard of still maps.
+
+    The rewrite is derived from the served spelling alone, so a future
+    generation — or a family with no alias of its own, like Mythos — is
+    covered without touching this module.
+    """
+    assert served_canonical_overrides(
+        ["databricks-claude-opus-6", "databricks-claude-mythos-5"]
+    ) == {
+        "claude-opus-6": "databricks-claude-opus-6",
+        "claude-mythos-5": "databricks-claude-mythos-5",
+    }
+
+
+@pytest.mark.parametrize(
+    "served",
+    [
+        pytest.param(["claude-opus-4-8"], id="already-canonical"),
+        pytest.param(["claude-opus-4-8[1m]"], id="context-marker-is-not-a-spelling"),
+        pytest.param(["databricks-gpt-5-6", "gemini-3-pro", ""], id="no-claude-model"),
+        pytest.param([], id="empty-listing"),
+    ],
+)
+def test_served_canonical_overrides_stay_empty_when_there_is_nothing_to_rewrite(
+    served: list[str],
+) -> None:
+    """No entry unless the gateway's spelling actually differs.
+
+    An empty map leaves Claude Code exactly as it behaves today, which is the
+    right outcome when the listing is unhelpful or unreachable.
+    """
+    assert served_canonical_overrides(served) == {}
+
+
+def test_served_canonical_overrides_keep_the_first_of_two_equal_spellings() -> None:
+    """Two served ids sharing a canonical form resolve deterministically."""
+    assert served_canonical_overrides(["databricks-claude-opus-4-8", "gw-claude-opus-4-8"]) == {
+        "claude-opus-4-8": "databricks-claude-opus-4-8"
+    }
