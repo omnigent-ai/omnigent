@@ -254,3 +254,44 @@ def test_sync_raw_status_context_normalizes_and_retries(tmp_path: Path) -> None:
     assert new_sig != sig
     written = _json.loads((tmp_path / "context.json").read_text("utf-8"))
     assert written["model"] == "claude-sonnet-4-6"
+
+
+def test_sync_raw_status_context_survives_a_failed_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unwritable bridge dir leaves the signature alone instead of raising.
+
+    The forwarder calls this at the top of a poll that also mirrors
+    transcript items, hooks and cost, so letting an ENOSPC out of the
+    context-pill write stopped all of that for the rest of the session.
+    """
+    import errno
+
+    from omnigent.claude_native_status import CONTEXT_RAW_FILE, sync_raw_status_context
+
+    raw_path = tmp_path / CONTEXT_RAW_FILE
+    raw_path.write_text(
+        json.dumps({"context_window": {"context_window_size": 1000}}),
+        encoding="utf-8",
+    )
+    real_write = claude_native_status._write_record_atomic
+    full_disk = True
+
+    def _write(bridge_dir: Path, record: dict[str, object]) -> None:
+        if full_disk:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        real_write(bridge_dir, record)
+
+    monkeypatch.setattr(claude_native_status, "_write_record_atomic", _write)
+
+    prior = (12345, 67)
+    assert sync_raw_status_context(tmp_path, prior) == prior
+    assert not (tmp_path / "context.json").exists()
+
+    # The retained signature means the next poll retries rather than
+    # treating the raw capture as already mirrored.
+    full_disk = False
+    assert sync_raw_status_context(tmp_path, prior) != prior
+    assert json.loads((tmp_path / "context.json").read_text("utf-8")) == {
+        "context_window_size": 1000
+    }

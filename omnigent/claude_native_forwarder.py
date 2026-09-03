@@ -94,6 +94,11 @@ _PERMISSION_MODE_POLL_INTERVAL_S = 2.0
 # the loop resumes. Generous vs the 0.25s poll so a legitimately slow batch
 # (large backlog, slow posts) never trips it.
 _FORWARD_LOOP_STALL_DEADLINE_S = 300.0
+# Ceiling on the poll backoff after a failing iteration. A fault that does not
+# clear on its own (a full bridge dir, a wedged mount) otherwise retries — and
+# logs a traceback — four times a second for as long as the session lives;
+# recovery still lands within this window once the fault clears.
+_FORWARD_LOOP_FAILURE_BACKOFF_MAX_S = 30.0
 _POST_TIMEOUT_S = 10.0
 _MAX_SEEN_SOURCE_IDS = 2000
 _CURSOR_FINGERPRINT_BYTES = 256
@@ -758,6 +763,25 @@ class _PostRetryTracker:
         )
 
 
+def _forward_loop_delay(poll_interval_s: float, failure_streak: int) -> float:
+    """
+    Seconds to wait before the forward loop's next iteration.
+
+    A clean iteration keeps the normal poll cadence. A failing one backs off
+    exponentially so a fault that does not clear on its own stops spinning at
+    the poll rate, capped so recovery is still prompt once it clears.
+
+    :param poll_interval_s: Normal spacing between transcript polls.
+    :param failure_streak: Consecutive failed iterations; ``0`` when the last
+        iteration completed.
+    :returns: Delay in seconds.
+    """
+    if failure_streak <= 0:
+        return poll_interval_s
+    backoff = poll_interval_s * 2 ** (failure_streak - 1)
+    return min(backoff, _FORWARD_LOOP_FAILURE_BACKOFF_MAX_S)
+
+
 async def forward_claude_transcript_to_session(
     *,
     base_url: str,
@@ -847,6 +871,7 @@ async def forward_claude_transcript_to_session(
     from omnigent.cli_auth import open_server_client
 
     async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
+        failure_streak = 0
         while True:
             try:
                 async with asyncio.timeout(_FORWARD_LOOP_STALL_DEADLINE_S):
@@ -1089,13 +1114,23 @@ async def forward_claude_transcript_to_session(
                     extra={"session_id": session_id},
                 )
             except Exception:
-                _logger.exception(
-                    "Claude transcript forwarder loop failed; session=%s bridge_dir=%s",
-                    session_id,
-                    bridge_dir,
-                    extra={"session_id": session_id},
-                )
-            await asyncio.sleep(poll_interval_s)
+                failure_streak += 1
+                # A fault that repeats every poll would post one traceback per
+                # 0.25s tick. Report the first, then only as the streak
+                # doubles (1, 2, 4, 8, …), so a persistent fault stays visible
+                # without burying every other error in the fleet's logs.
+                if failure_streak & (failure_streak - 1) == 0:
+                    _logger.exception(
+                        "Claude transcript forwarder loop failed "
+                        "(%d consecutive); session=%s bridge_dir=%s",
+                        failure_streak,
+                        session_id,
+                        bridge_dir,
+                        extra={"session_id": session_id},
+                    )
+            else:
+                failure_streak = 0
+            await asyncio.sleep(_forward_loop_delay(poll_interval_s, failure_streak))
 
 
 def _subagents_dir_for_transcript(transcript_path: Path) -> Path:

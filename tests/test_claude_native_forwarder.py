@@ -8666,3 +8666,95 @@ async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
     assert stall_warnings, "the deadline trip must be loudly logged, never silent"
     # The warning's traceback names the stalled await for next-time forensics.
     assert stall_warnings[0].exc_info is not None
+
+
+def test_forward_loop_delay_backs_off_then_caps() -> None:
+    """A failing iteration waits longer each time, up to the ceiling.
+
+    :returns: None.
+    """
+    assert forwarder._forward_loop_delay(0.25, 0) == 0.25
+    assert forwarder._forward_loop_delay(0.25, 1) == 0.25
+    assert forwarder._forward_loop_delay(0.25, 2) == 0.5
+    assert forwarder._forward_loop_delay(0.25, 3) == 1.0
+    assert forwarder._forward_loop_delay(0.25, 4) == 2.0
+    assert forwarder._forward_loop_delay(0.25, 99) == forwarder._FORWARD_LOOP_FAILURE_BACKOFF_MAX_S
+
+
+async def test_forwarder_backs_off_and_throttles_a_repeating_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A fault that repeats every poll stops spinning and stops flooding.
+
+    A bridge dir that cannot be written failed the same step on every
+    0.25s tick, so one wedged session posted hundreds of identical
+    tracebacks — enough to crowd every other error out of a fleet-wide
+    error view.
+
+    :param tmp_path: Per-test temp directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param caplog: Captured log records.
+    :returns: None.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir(
+        "conv_abc",
+        bridge_id="bridge_stuck",
+        workspace=tmp_path,
+    )
+
+    def _wedged(_bridge_dir: Path) -> str | None:
+        raise OSError("bridge dir is unreadable")
+
+    monkeypatch.setattr(forwarder, "read_active_session_id", _wedged)
+
+    streaks: list[int] = []
+    stop = asyncio.Event()
+
+    def _record_delay(poll_interval_s: float, failure_streak: int) -> float:
+        streaks.append(failure_streak)
+        if len(streaks) < 6:
+            # Keep the test fast; the delay itself is covered by the unit test
+            # above, so this only asserts which streak the loop hands it.
+            return 0.0
+        # Park the loop so the assertions below see a fixed iteration count.
+        stop.set()
+        return 60.0
+
+    monkeypatch.setattr(forwarder, "_forward_loop_delay", _record_delay)
+
+    caplog.set_level(logging.ERROR, logger="omnigent.claude_native_forwarder")
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url="http://127.0.0.1:1",
+            headers={},
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        await asyncio.wait_for(stop.wait(), timeout=10.0)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    # The streak advances every iteration, so the backoff grows instead of
+    # retrying at the poll cadence forever.
+    assert streaks[:6] == [1, 2, 3, 4, 5, 6]
+
+    # Only the doubling iterations report, so a persistent fault leaves a
+    # handful of tracebacks rather than one per tick.
+    failures = [
+        record
+        for record in caplog.records
+        if "Claude transcript forwarder loop failed" in record.getMessage()
+    ]
+    reported = [record.args[0] for record in failures if record.args]
+    assert reported[:3] == [1, 2, 4]
+    assert all(streak & (streak - 1) == 0 for streak in reported)
