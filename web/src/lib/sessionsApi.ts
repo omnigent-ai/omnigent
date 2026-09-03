@@ -516,15 +516,110 @@ export interface LocalImportResult {
 }
 
 /**
- * Import the caller's most recent local transcripts via `POST /v1/imports/local`.
- * The chosen host reads + normalizes its own transcripts over the tunnel (the
- * transcripts live on that machine, not the server); already-imported sessions
- * are skipped. `source` is a specific harness or "all" for every harness at once.
+ * Import the caller's most recent local transcripts from a chosen host. The
+ * host reads + normalizes its own transcripts over the tunnel (they live on
+ * that machine, not the server); already-imported sessions are skipped.
+ * `source` is a specific harness or "all" for every harness at once.
+ *
+ * Prefers the streaming endpoint `POST /v1/imports/local/stream` (NDJSON):
+ * `onSession` fires for each newly imported session as its frame lands, so
+ * callers list sessions live instead of waiting out the whole batch. A
+ * mid-stream host failure throws after the sessions read so far have been
+ * delivered through `onSession`. Against a server too old to have the streaming
+ * endpoint (404), it falls back to the buffered `POST /v1/imports/local`, which
+ * returns the whole tally at once (`onSession` then fires for every session
+ * together). Either way the resolved {@link LocalImportResult} carries the
+ * final tally.
  */
 export async function importLocalSessions(
   hostId: string,
   source: ImportSourceSelector,
   limit: number,
+  onSession?: (session: ImportedSessionRef) => void,
+): Promise<LocalImportResult> {
+  const res = await authenticatedFetch("/v1/imports/local/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    body: JSON.stringify({ host_id: hostId, source, limit }),
+  });
+  // Older server without the streaming endpoint: fall back to the buffered
+  // import so a newer client still works against it.
+  if (res.status === 404) {
+    return importLocalSessionsBuffered(hostId, source, limit, onSession);
+  }
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  if (res.body === null) throw new Error("Import failed: no response stream.");
+
+  const sessions: ImportedSessionRef[] = [];
+  let imported = 0;
+  let alreadyImported = 0;
+  let failed = 0;
+  let errorMessage: string | null = null;
+
+  const handleLine = (line: string): void => {
+    let evt: Record<string, unknown>;
+    try {
+      evt = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    if (evt.event === "session") {
+      const id = typeof evt.session_id === "string" ? evt.session_id : "";
+      if (!id) return;
+      const ref: ImportedSessionRef = {
+        id,
+        title: typeof evt.title === "string" ? evt.title : null,
+      };
+      sessions.push(ref);
+      onSession?.(ref);
+    } else if (evt.event === "done") {
+      imported = typeof evt.imported === "number" ? evt.imported : sessions.length;
+      alreadyImported = typeof evt.already_imported === "number" ? evt.already_imported : 0;
+      failed = typeof evt.failed === "number" ? evt.failed : 0;
+    } else if (evt.event === "error") {
+      errorMessage = typeof evt.message === "string" ? evt.message : "Import failed. Try again.";
+    }
+  };
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buf = "";
+  try {
+    for (;;) {
+      // Sequential by design: each read waits for the next NDJSON chunk.
+      // eslint-disable-next-line no-await-in-loop
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx = buf.indexOf("\n");
+      while (idx !== -1) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
+        if (line) handleLine(line);
+        idx = buf.indexOf("\n");
+      }
+    }
+    const tail = buf.trim();
+    if (tail) handleLine(tail);
+  } finally {
+    reader.cancel().catch(() => {});
+  }
+
+  if (errorMessage !== null) throw new Error(errorMessage);
+  return { imported, alreadyImported, failed, sessions };
+}
+
+/**
+ * Buffered local import via `POST /v1/imports/local` — the pre-streaming shape,
+ * kept as the fallback for a server without the streaming endpoint. Delivers
+ * every imported session through `onSession` at once (no live list) so callers
+ * behave the same as the streaming path, just without the incremental fill.
+ */
+async function importLocalSessionsBuffered(
+  hostId: string,
+  source: ImportSourceSelector,
+  limit: number,
+  onSession?: (session: ImportedSessionRef) => void,
 ): Promise<LocalImportResult> {
   const res = await authenticatedFetch("/v1/imports/local", {
     method: "POST",
@@ -537,11 +632,13 @@ export async function importLocalSessions(
     failed: number;
     sessions: { session_id: string; title: string | null }[];
   }>(res);
+  const sessions = wire.sessions.map((s) => ({ id: s.session_id, title: s.title }));
+  for (const s of sessions) onSession?.(s);
   return {
     imported: wire.imported,
     alreadyImported: wire.already_imported,
     failed: wire.failed,
-    sessions: wire.sessions.map((s) => ({ id: s.session_id, title: s.title })),
+    sessions,
   };
 }
 

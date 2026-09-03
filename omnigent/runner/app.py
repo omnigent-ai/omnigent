@@ -9368,6 +9368,91 @@ def create_runner_app(
             },
         )
 
+    # ── GitHub integration (read-only): PR metadata + branch-vs-base diff ──
+    # Backed by the ``gh`` CLI and ``git``; see omnigent.runner.github_resource.
+    # Each shells out synchronously, so it is offloaded to a thread like the
+    # changed-files / diff routes above (a blocked loop 503s the session).
+
+    async def _github_workspace_root(session_id: str) -> str:
+        """Resolve the workspace root for GitHub routes, or 404 when headless."""
+        agent_spec = await _require_os_env(session_id)
+        root = resource_registry.compute_default_env_root(session_id, agent_spec)
+        if root is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Session has no filesystem; GitHub API unavailable.",
+            )
+        return root
+
+    @app.get("/v1/sessions/{session_id}/resources/github")
+    async def read_github_info(session_id: str) -> JSONResponse:
+        import asyncio as _asyncio
+
+        from omnigent.runner.github_resource import github_info
+
+        root = await _github_workspace_root(session_id)
+        info = await _asyncio.to_thread(github_info, root)
+        return JSONResponse(status_code=200, content=info)
+
+    @app.get("/v1/sessions/{session_id}/resources/github/changes")
+    async def read_github_changes(
+        session_id: str,
+        base: str | None = Query(default=None),
+    ) -> JSONResponse:
+        import asyncio as _asyncio
+
+        from omnigent.runner.github_resource import github_changed_files, resolve_base_ref
+
+        root = await _github_workspace_root(session_id)
+        resolved_base = await _asyncio.to_thread(resolve_base_ref, root, base)
+        if not resolved_base:
+            return JSONResponse(
+                status_code=200,
+                content={"object": "list", "data": [], "has_more": False},
+            )
+        result = await _asyncio.to_thread(github_changed_files, root, resolved_base)
+        return JSONResponse(status_code=200, content=result)
+
+    @app.get("/v1/sessions/{session_id}/resources/github/diff")
+    async def read_github_pr_diff(
+        session_id: str,
+        base: str | None = Query(default=None),
+    ) -> JSONResponse:
+        import asyncio as _asyncio
+
+        from omnigent.runner.github_resource import github_pr_diff, resolve_base_ref
+
+        root = await _github_workspace_root(session_id)
+        resolved_base = await _asyncio.to_thread(resolve_base_ref, root, base)
+        result = await _asyncio.to_thread(github_pr_diff, root, resolved_base or "")
+        return JSONResponse(status_code=200, content=result)
+
+    @app.get("/v1/sessions/{session_id}/resources/github/diff/{relative_path:path}")
+    async def read_github_file_diff(
+        session_id: str,
+        relative_path: str,
+        base: str | None = Query(default=None),
+    ) -> JSONResponse:
+        import asyncio as _asyncio
+
+        from omnigent.runner.github_resource import github_file_diff, resolve_base_ref
+
+        # Repo-root-relative paths only; reject traversal even though ``git show``
+        # reads from the object store (not disk) and rejects out-of-tree paths.
+        if relative_path.startswith("/") or any(
+            seg in ("", "..") for seg in relative_path.split("/")
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"code": "invalid_path", "message": "Invalid path"}},
+            )
+        root = await _github_workspace_root(session_id)
+        resolved_base = await _asyncio.to_thread(resolve_base_ref, root, base)
+        result = await _asyncio.to_thread(
+            github_file_diff, root, resolved_base or "", relative_path
+        )
+        return JSONResponse(status_code=200, content=result)
+
     @app.get(
         "/v1/sessions/{session_id}/resources/environments"
         "/{environment_id}/filesystem/{relative_path:path}"
@@ -9380,8 +9465,11 @@ def create_runner_app(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
-    ) -> JSONResponse:
+        download: bool = False,
+    ) -> Response:
         await _require_os_env(session_id)
+        if download:
+            return await _fs_download(session_id, environment_id, relative_path)
         return await _fs_list_or_read(
             session_id,
             environment_id,
@@ -9955,6 +10043,68 @@ def create_runner_app(
         return JSONResponse(
             status_code=200,
             content={"meta_text": format_skill_meta_text(skill, arguments)},
+        )
+
+    async def _fs_download(
+        session_id: str,
+        environment_id: str,
+        path: str,
+    ) -> StreamingResponse:
+        """Serve a file's complete bytes as an attachment.
+
+        The read path inlines content in a JSON envelope, so it caps at
+        ``_MAX_READ_BYTES``. A download streams from a descriptor and needs
+        no cap; ``open_download`` binds that descriptor to what the sandbox
+        can read before a byte is served.
+
+        :param session_id: Session identifier.
+        :param environment_id: Environment resource id.
+        :param path: Path within the environment, or an absolute path.
+        :returns: The file streamed with ``Content-Disposition: attachment``.
+        :raises InvalidPath: If the path names a directory.
+        :raises FilesystemPathNotFound: If nothing the caller may see exists
+            at the path.
+        """
+        from omnigent.runner.environment_filesystem import CallerProcessFilesystem
+
+        await _ensure_session_registered(session_id)
+        agent_spec = await _resolve_session_agent_spec(session_id)
+        env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
+        fobj, resolved, size = await CallerProcessFilesystem(env).open_download(path)
+
+        async def _chunks() -> AsyncIterator[bytes]:
+            # Stop at the size announced in Content-Length so a file growing
+            # underneath the download cannot overrun the response.
+            remaining = size
+            try:
+                while remaining > 0:
+                    chunk = await asyncio.to_thread(fobj.read, min(64 * 1024, remaining))
+                    if not chunk:
+                        # Ending short of Content-Length would hand the client
+                        # a silently incomplete file; abort the transfer instead.
+                        raise RuntimeError(f"{resolved.name} shrank during download")
+                    remaining -= len(chunk)
+                    yield chunk
+            finally:
+                fobj.close()
+
+        # Same header Starlette's FileResponse builds: a plain quoted filename
+        # when it is URL-safe, else the RFC 5987 encoded form.
+        quoted = urllib.parse.quote(resolved.name)
+        disposition = (
+            f'attachment; filename="{resolved.name}"'
+            if quoted == resolved.name
+            else f"attachment; filename*=utf-8''{quoted}"
+        )
+        return StreamingResponse(
+            _chunks(),
+            media_type=mimetypes.guess_type(resolved.name)[0] or "application/octet-stream",
+            headers={
+                "Content-Length": str(size),
+                "Content-Disposition": disposition,
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     async def _fs_list_or_read(

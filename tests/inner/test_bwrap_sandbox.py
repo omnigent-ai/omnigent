@@ -520,6 +520,59 @@ def test_wrap_launcher_argv_cwd_read_only_by_default(tmp_path: Path) -> None:
     assert "--bind" not in bind_verbs
 
 
+def test_wrap_launcher_argv_write_grant_wins_exact_read_overlap(
+    tmp_path: Path,
+) -> None:
+    """An exact read/write overlap emits only the authoritative RW mount."""
+    backend = _make_backend()
+    root = tmp_path.resolve(strict=False)
+    policy = _make_policy(tmp_path, read_roots=[root], write_roots=[root])
+
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    mounts = [
+        argv[i]
+        for i in range(len(argv) - 2)
+        if argv[i + 1] == str(root) and argv[i + 2] == str(root)
+    ]
+    assert mounts == ["--bind"]
+
+
+def test_wrap_launcher_argv_deduplicates_read_only_cwd(tmp_path: Path) -> None:
+    """An explicit read grant for read-only cwd does not duplicate its mount."""
+    backend = _make_backend()
+    root = tmp_path.resolve(strict=False)
+    policy = _make_policy(tmp_path, read_roots=[root])
+
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    mounts = [
+        argv[i]
+        for i in range(len(argv) - 2)
+        if argv[i + 1] == str(root) and argv[i + 2] == str(root)
+    ]
+    assert mounts == ["--ro-bind"]
+
+
+def test_wrap_launcher_argv_nested_write_mount_follows_read_parent(
+    tmp_path: Path,
+) -> None:
+    """A writable child overlays its read-only parent rather than vice versa."""
+    backend = _make_backend()
+    parent = (tmp_path / "parent").resolve(strict=False)
+    child = parent / "child"
+    child.mkdir(parents=True)
+    policy = _make_policy(tmp_path, read_roots=[parent], write_roots=[child])
+
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    read_index = _index_of_triple(argv, "--ro-bind-try", str(parent), str(parent))
+    write_index = _index_of_triple(argv, "--bind-try", str(child), str(child))
+    assert read_index is not None
+    assert write_index is not None
+    assert read_index < write_index
+
+
 def test_wrap_launcher_argv_masks_denied_unix_socket_after_write_root(
     tmp_path: Path,
 ) -> None:
@@ -1507,6 +1560,70 @@ def test_s5_read_paths_dedup_skips_paths_under_cwd(tmp_path: Path) -> None:
 pytestmark_bwrap = pytest.mark.skipif(
     not BWRAP_AVAILABLE, reason="bwrap not installed on this host"
 )
+
+
+@pytestmark_bwrap
+def test_overlapping_read_write_root_remains_writable(tmp_path: Path) -> None:
+    """End-to-end: an exact read/write overlap keeps the shared root writable."""
+    root = (tmp_path / "shared").resolve(strict=False)
+    root.mkdir()
+    output = root / "created.txt"
+    policy = _make_policy(tmp_path, read_roots=[root], write_roots=[root])
+    probe = f"from pathlib import Path; Path({str(output)!r}).write_text('ok'); print('WROTE')"
+
+    result = _run_helper_probe(tmp_path, probe, policy=policy)
+
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout == "WROTE"
+    assert output.read_text() == "ok"
+
+
+@pytestmark_bwrap
+def test_read_only_root_rejects_writes(tmp_path: Path) -> None:
+    """End-to-end: a root without a write grant remains read-only."""
+    root = (tmp_path / "readonly").resolve(strict=False)
+    root.mkdir()
+    output = root / "blocked.txt"
+    policy = _make_policy(tmp_path, read_roots=[root])
+    probe = (
+        "import errno; from pathlib import Path; "
+        f"p=Path({str(output)!r}); "
+        "\ntry: p.write_text('bad')\n"
+        "except OSError as exc: print(exc.errno)\n"
+        "else: print('WROTE')"
+    )
+
+    result = _run_helper_probe(tmp_path, probe, policy=policy)
+
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout == str(errno.EROFS)
+    assert not output.exists()
+
+
+@pytestmark_bwrap
+def test_nested_write_root_overlays_read_only_parent(tmp_path: Path) -> None:
+    """End-to-end: a child write grant stays scoped within a read-only parent."""
+    parent = (tmp_path / "parent").resolve(strict=False)
+    child = parent / "child"
+    child.mkdir(parents=True)
+    parent_output = parent / "blocked.txt"
+    child_output = child / "created.txt"
+    policy = _make_policy(tmp_path, read_roots=[parent], write_roots=[child])
+    probe = (
+        "import errno; from pathlib import Path; "
+        f"parent=Path({str(parent_output)!r}); child=Path({str(child_output)!r}); "
+        "child.write_text('ok'); "
+        "\ntry: parent.write_text('bad')\n"
+        "except OSError as exc: print(exc.errno)\n"
+        "else: print('PARENT_WROTE')"
+    )
+
+    result = _run_helper_probe(tmp_path, probe, policy=policy)
+
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout == str(errno.EROFS)
+    assert child_output.read_text() == "ok"
+    assert not parent_output.exists()
 
 
 @pytestmark_bwrap

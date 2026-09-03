@@ -28,6 +28,7 @@ export function ConversationBreadcrumb({
   titleSlot,
   titleLinkTo,
   isChildSession,
+  subAgentName,
   boundAgent,
   wrapperLabel,
   actions,
@@ -54,6 +55,12 @@ export function ConversationBreadcrumb({
   titleLinkTo?: string;
   /** Whether the active session is a sub-agent (appends its identity). */
   isChildSession: boolean;
+  /**
+   * The session's own `sub_agent_name` — the dispatched sub-agent's identity
+   * (e.g. a `sys_session_send` child of a bundle). Preferred over
+   * `boundAgent.name`, which for such children is the *parent* bundle's row.
+   */
+  subAgentName?: string | null;
   /** The bound agent — names the sub-agent segment. */
   boundAgent: Agent | undefined;
   /** The session's `omnigent.wrapper` label — names a native sub-agent's vendor. */
@@ -66,11 +73,16 @@ export function ConversationBreadcrumb({
   // A native sub-agent (a Claude Code Task, a Codex collab thread) is bound to
   // its parent's `<vendor>-native-ui` row, so its agent name is an internal the
   // server itself hides (`public_agent_name`). Name the product instead,
-  // matching the Agents rail and the composer. Every other sub-agent keeps its
-  // own agent name, which is already human-readable. Only the sub-agent segment
-  // reads this, so it stays behind `isChildSession`.
-  const subAgentName = isChildSession
-    ? (nativeCodingAgentForSubagentWrapper(wrapperLabel)?.displayName ?? boundAgent?.name ?? null)
+  // matching the Agents rail and the composer. Otherwise prefer the session's
+  // own `sub_agent_name`: a `sys_session_send` child is bound to its parent
+  // bundle's agent row, so `boundAgent.name` would misidentify it as the
+  // parent. `boundAgent.name` remains the fallback for the Add-Agent flow,
+  // where the child is bound to its own agent and `sub_agent_name` is null.
+  const subAgentSegment = isChildSession
+    ? (nativeCodingAgentForSubagentWrapper(wrapperLabel)?.displayName ??
+      (subAgentName?.trim() || null) ??
+      boundAgent?.name ??
+      null)
     : null;
   // iOS/Android native chrome already identifies the session. Restore the
   // compact "< Back" climb-out there; web / Electron keep the parent name.
@@ -139,7 +151,7 @@ export function ConversationBreadcrumb({
           <span className="flex min-w-0 items-center gap-1.5">
             <BotIcon className="size-4 shrink-0 text-muted-foreground" />
             <span className="truncate font-semibold text-foreground">
-              {subAgentName ?? "Sub-agent"}
+              {subAgentSegment ?? "Sub-agent"}
             </span>
           </span>
         </>

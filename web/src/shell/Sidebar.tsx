@@ -151,6 +151,7 @@ import { isSessionStoppable } from "@/lib/sessionStop";
 import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useHasSessionDraft } from "@/lib/sessionDrafts";
+import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
 import { useChatStore } from "@/store/chatStore";
 import {
@@ -190,6 +191,7 @@ import {
 } from "./sidebarNav";
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { SIDEBAR_ROW } from "./sidebarStyles";
+import { TooltipArrow } from "radix-ui/tooltip";
 
 // Positioning for a row's trailing session-state badge. Anchored at the row's
 // right-1 edge in every viewport: on desktop it fades on hover so the pin +
@@ -1044,7 +1046,7 @@ export function Sidebar({
                 // chip is a non-scrolling sibling pinned bottom-right, so
                 // without a gutter the last row's always-visible kebab parks
                 // underneath it and can't be tapped.
-                className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] max-md:pb-14 [&::-webkit-scrollbar]:hidden"
+                className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] max-md:pb-16 [&::-webkit-scrollbar]:hidden"
               >
                 <ConversationList
                   conversationsQuery={conversationsQuery}
@@ -1077,10 +1079,10 @@ export function Sidebar({
               />
             </div>
 
-            {/* Desktop server picker, pinned below the scrolling session list.
-          Self-hiding: renders nothing outside the Electron shell (see
-          SidebarServerPicker), so browsers keep an unchanged sidebar that ends
-          with the list. */}
+            {/* Native-shell server picker, pinned below the scrolling session
+          list. Self-hiding: renders nothing outside a shell with the picker
+          bridge (see SidebarServerPicker), so browsers keep an unchanged
+          sidebar that ends with the list. */}
             <SidebarServerPicker />
           </>
         )}
@@ -3431,6 +3433,11 @@ function ConversationRow({
   }, [conversation.title, pendingTitle, rename.isSuccess, rename.isError]);
 
   const label = pendingTitle ?? conversationDisplayLabel(conversation);
+  // Subscribed so the just-recorded optimistic label flips the row
+  // immediately instead of at the next conversations poll.
+  const optimisticTitle = useOptimisticTitle(conversation.id);
+  const isProvisionalLabel =
+    pendingTitle === null && conversation.title == null && optimisticTitle !== undefined;
   const hasDraft = useHasSessionDraft(conversation.id);
   // Recompute unseen state the moment the last-seen map changes (e.g. the
   // user picks "Mark as unread" on this row) rather than waiting for the
@@ -3582,6 +3589,11 @@ function ConversationRow({
     if (nextArchived) showArchivedToast();
   }
 
+  function runUnarchive() {
+    const nextArchived = !isArchived;
+    archive.mutate({ id: conversation.id, archived: nextArchived });
+  }
+
   function confirmLeave() {
     // Leave is a self-revoke, so it needs the viewer's own id. The menu item is
     // gated on the row NOT being owned by the viewer, which is only decidable
@@ -3657,8 +3669,8 @@ function ConversationRow({
         // `focus-within` also fires for a plain click, which shrank the reserve
         // on the selected row while the marker stayed put, sliding the title
         // under it.
-        !selectionMode && "md:group-hover:pr-14 md:group-has-[:focus-visible]:pr-14",
-        !selectionMode && menuOpen && "md:pr-14",
+        !selectionMode && "md:group-hover:pr-20 md:group-has-[:focus-visible]:pr-20",
+        !selectionMode && menuOpen && "md:pr-20",
         selectionMode && "pr-2 pl-8",
         !selectionMode && isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
         selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
@@ -3699,7 +3711,14 @@ function ConversationRow({
       {/* Row 1: the session name. Working, needs-approval, unseen, and draft
           markers render in the shared trailing indicator slot below. */}
       <div className="flex w-full items-center gap-1.5">
-        <span className="relative min-w-0 truncate">
+        <span
+          className={cn(
+            "relative min-w-0 truncate",
+            // The optimistic first-prompt label is a placeholder until the
+            // server's title lands — dim it so it doesn't read as final.
+            isProvisionalLabel && "italic text-muted-foreground",
+          )}
+        >
           {label}
           {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
         </span>
@@ -3874,6 +3893,49 @@ function ConversationRow({
               )}
             </Button>
           )}
+          {/* Archive is owner-only, same as the kebab's Archive item; non-owners
+              don't get the quick affordance and instead see that item disabled
+              with an explanation. */}
+          {isOwner && (
+            <Tooltip disableHoverableContent>
+              <TooltipContent>
+                <TooltipArrow />
+                {isArchived ? "Unarchive conversation" : "Archive conversation"}
+              </TooltipContent>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={isArchived ? "Unarchive conversation" : "Archive conversation"}
+                  data-testid="quick-archive-conversation"
+                  className={cn(
+                    "text-muted-foreground transition-opacity",
+                    "hidden md:inline-flex",
+                    "md:opacity-0 md:group-hover:opacity-100",
+                    "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
+                  )}
+                  onClick={(e) => {
+                    // Keep the toggle click off the surrounding Link (no navigation).
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (!isArchived) {
+                      runArchive();
+                    } else {
+                      runUnarchive();
+                    }
+                  }}
+                >
+                  {isArchived ? (
+                    <ArchiveRestoreIcon className="size-3.5" data-icon-size="14" />
+                  ) : (
+                    <ArchiveIcon className="size-3.5" data-icon-size="14" />
+                  )}
+                </Button>
+              </TooltipTrigger>
+            </Tooltip>
+          )}
+
           <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
             <DropdownMenuTrigger asChild>
               <Button

@@ -111,9 +111,10 @@ class Conversation:
     :param reported_model: The model the harness last REPORTED the
         session is actually on, verbatim in the harness's own
         spelling, e.g. ``"claude-opus-4-8[1m]"``. Written only by
-        harness reports (``external_model_change``); never by user
-        picks. The only model value UI surfaces display. ``None``
-        means no report has arrived yet.
+        harness reports (native ``external_model_change`` events or
+        SDK terminal-response usage); never by user picks. The only
+        model value UI surfaces display. ``None`` means no report has
+        arrived yet.
     :param model_override: Per-session LLM model override — the user's
         REQUEST, e.g. ``"claude-opus-4-7"``. ``None`` means use the
         agent default from the spec's ``llm.model``. Mutable via

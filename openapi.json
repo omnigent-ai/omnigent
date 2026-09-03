@@ -2371,7 +2371,7 @@
         "type": "object"
       },
       "ImportedSessionRef": {
-        "description": "One freshly imported session: its new id plus display title.\n\n`title` is `None` when the session has no native title and no first user\nmessage to synthesize from; the UI falls back to a placeholder.",
+        "description": "One freshly imported session: its new id plus display title.\n\n`title` is `None` when the session has no native title and no first user\nmessage to synthesize from; the UI falls back to a placeholder. Also the\nshape of each `{\"event\": \"session\", ...}` line the\n`/imports/local/stream` endpoint emits.",
         "properties": {
           "session_id": {
             "title": "Session Id",
@@ -2555,7 +2555,7 @@
         "type": "object"
       },
       "LocalImportResponse": {
-        "description": "Batch result for `POST /v1/imports/local`.",
+        "description": "Buffered batch result for `POST /v1/imports/local`.\n\nThe streaming `/imports/local/stream` endpoint carries the same tally on\nits terminal `{\"event\": \"done\", ...}` line instead.",
         "properties": {
           "already_imported": {
             "format": "int64",
@@ -4027,6 +4027,13 @@
             "title": "Dictation Available",
             "type": "boolean"
           },
+          "enabled_connections": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Enabled Connections",
+            "type": "array"
+          },
           "features": {
             "additionalProperties": {
               "type": "boolean"
@@ -4121,6 +4128,7 @@
           "managed_sandboxes_enabled",
           "sandbox_provider",
           "sandbox_providers",
+          "enabled_connections",
           "sharing_mode",
           "public_sharing_enabled",
           "server_version",
@@ -5327,7 +5335,7 @@
         "type": "object"
       },
       "SessionModelEvent": {
-        "description": "Active-model report from a terminal-backed integration.\n\nEmitted after an `external_model_change` POST from a native\nforwarder \u2014 the launch's own model report, or a switch made inside\nthe pane (a `/model` command or the in-TUI picker). Every surface\nre-renders its model display from this.",
+        "description": "Active-model report from a harness integration.\n\nEmitted after an `external_model_change` POST from a native\nforwarder or when an SDK relay reports its concrete model in terminal\nresponse usage. Every surface re-renders its model display from this.",
         "properties": {
           "conversation_id": {
             "description": "Session identifier, e.g. `\"conv_abc123\"`.",
@@ -9077,7 +9085,7 @@
     },
     "/v1/imports/local": {
       "post": {
-        "description": "Import the caller's recent local transcripts from a chosen host.\n\nThe transcripts live on the caller's machine, so the read happens on\nthe connected host over its tunnel \u2014 the server can't see them. The\nhost enumerates + normalizes the most recent sessions; the server\nimports those not already imported. Drives the web \"Import sessions\"\nbutton.\n\nNot atomic: each session is persisted as its frame arrives. If the host\ndrops mid-stream this raises after the sessions read so far are already\ncommitted; a retry is idempotent (they come back as already-imported).",
+        "description": "Import the caller's recent local transcripts from a chosen host.\n\nThe transcripts live on the caller's machine, so the read happens on\nthe connected host over its tunnel \u2014 the server can't see them. The\nhost enumerates + normalizes the most recent sessions; the server\nimports those not already imported.\n\nBuffered form: returns the whole batch's tally in one JSON body. For a\nlive per-session list use `POST /v1/imports/local/stream`. Not atomic:\neach session is persisted as its frame arrives, so if the host drops\nmid-stream this raises after the sessions read so far are already\ncommitted; a retry is idempotent (they come back as already-imported).",
         "operationId": "import_local_sessions_v1_imports_local_post",
         "requestBody": {
           "content": {
@@ -9112,6 +9120,47 @@
           }
         },
         "summary": "Import Local Sessions",
+        "tags": [
+          "imports"
+        ]
+      }
+    },
+    "/v1/imports/local/stream": {
+      "post": {
+        "description": "Stream the caller's recent local transcripts from a chosen host.\n\nSame import as the buffered `POST /v1/imports/local`, but responds with\nNDJSON: one `{\"event\": \"session\", ...}` line per newly imported session\nas its frame lands, so the caller lists sessions as they arrive rather\nthan waiting out the whole batch; a terminal `{\"event\": \"done\", ...}`\ncarries the tally. A mid-stream host failure emits `{\"event\": \"error\", ...}` before `done` \u2014 the sessions read so far are already committed\nand a retry is idempotent. Request validation still fails ahead of the\nstream with the usual HTTP error.",
+        "operationId": "import_local_sessions_stream_v1_imports_local_stream_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LocalImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              },
+              "application/x-ndjson": {}
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Local Sessions Stream",
         "tags": [
           "imports"
         ]
@@ -12297,7 +12346,7 @@
         ]
       },
       "get": {
-        "description": "Read a file or list a directory in an environment.\n\n**Returns:** File content or directory listing.",
+        "description": "Read a file or list a directory in an environment.\n\n**Returns:** File content or directory listing, or the raw file.",
         "operationId": "read_or_list_environment_path_v1_sessions__session_id__resources_environments__environment_id__filesystem__relative_path__get",
         "parameters": [
           {
@@ -12388,6 +12437,17 @@
               "title": "Order",
               "type": "string"
             }
+          },
+          {
+            "description": "When `True`, stream the complete file as an attachment with no size cap instead of the capped JSON envelope. A directory rejects it with 400.",
+            "in": "query",
+            "name": "download",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Download",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -12395,9 +12455,15 @@
             "content": {
               "application/json": {
                 "schema": {}
+              },
+              "application/octet-stream": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "File content or directory listing as JSON; the raw file as an attachment when `download=true`."
           },
           "422": {
             "content": {
@@ -13172,6 +13238,107 @@
           }
         },
         "summary": "Copy Session Files",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github": {
+      "get": {
+        "description": "Return GitHub context (repo, branch, base ref, PR) for a session.\n\nProxies to the runner, which shells out to `gh`/`git` in the\nworkspace. Returns an `available: false` payload (200) when `gh` is\nmissing or the workspace is not a git repo.\n\n**Returns:** The `session.github.info` object.",
+        "operationId": "get_session_github_v1_sessions__session_id__resources_github_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Github",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/changes": {
+      "get": {
+        "description": "List files changed on the branch relative to its base (PR diff).\n\n**Returns:** Flat list of changed files with `status` and line counts.",
+        "operationId": "list_session_github_changes_v1_sessions__session_id__resources_github_changes_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Base branch name; the runner derives the default when omitted.",
+            "in": "query",
+            "name": "base",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Base"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Github Changes",
         "tags": [
           "session_resources"
         ]

@@ -2989,12 +2989,11 @@ class SessionUsageEvent(_SSEEventBase):
 
 class SessionModelEvent(_SSEEventBase):
     """
-    Active-model report from a terminal-backed integration.
+    Active-model report from a harness integration.
 
     Emitted after an ``external_model_change`` POST from a native
-    forwarder — the launch's own model report, or a switch made inside
-    the pane (a ``/model`` command or the in-TUI picker). Every surface
-    re-renders its model display from this.
+    forwarder or when an SDK relay reports its concrete model in terminal
+    response usage. Every surface re-renders its model display from this.
 
     :param type: Always ``"session.model"``.
     :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.

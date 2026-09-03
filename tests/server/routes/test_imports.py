@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import httpx
@@ -421,3 +422,85 @@ async def test_local_import_binds_session_to_importing_host(
     assert unbound is not None
     assert unbound.host_id is None
     assert unbound.workspace is None
+
+
+async def test_local_import_stream_emits_ndjson_session_then_done(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The streaming endpoint emits one ``session`` line per import, then ``done``.
+
+    Same import as the buffered ``/imports/local`` but wire-framed as NDJSON so
+    the caller can list sessions as they land.
+    """
+    from fastapi import FastAPI
+
+    from omnigent.server.routes import imports as imports_module
+
+    _seed_claude_agent(db_uri)
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+
+    async def _fake_stream(**_kwargs: object):
+        for i in (1, 2):
+            yield {
+                "external_session_id": f"claude-stream-{i}",
+                "workspace": "/repo/on/host",
+                "items": [
+                    {
+                        "type": "message",
+                        "response_id": "claude:turn-1",
+                        "data": {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": f"thread {i}"}],
+                        },
+                    }
+                ],
+                "title": f"Streamed {i}",
+                "source": "claude",
+            }
+
+    monkeypatch.setattr(imports_module, "_stream_local_sessions_from_host", _fake_stream)
+
+    host_conn = SimpleNamespace(
+        host_id="host_0123456789abcdef0123456789abcdef", pending_import_local={}
+    )
+    host_registry = SimpleNamespace(get=lambda host_id: host_conn)
+    host_store = SimpleNamespace(get_host=lambda host_id: SimpleNamespace(user_id=None))
+
+    app = FastAPI()
+    app.include_router(
+        imports_module.create_imports_router(
+            conversation_store,
+            SqlAlchemyAgentStore(db_uri),
+            host_registry=host_registry,  # type: ignore[arg-type]
+            host_store=host_store,  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post(
+            "/v1/imports/local/stream",
+            json={
+                "host_id": "host_0123456789abcdef0123456789abcdef",
+                "source": "claude",
+                "limit": 5,
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("application/x-ndjson")
+    events = [json.loads(line) for line in resp.text.splitlines() if line.strip()]
+    session_events = [e for e in events if e["event"] == "session"]
+    assert [e["title"] for e in session_events] == ["Streamed 1", "Streamed 2"]
+    # The terminal line carries the tally.
+    assert events[-1] == {
+        "event": "done",
+        "imported": 2,
+        "already_imported": 0,
+        "failed": 0,
+    }
+    # Each streamed session was actually persisted.
+    for e in session_events:
+        assert conversation_store.get_conversation(e["session_id"]) is not None

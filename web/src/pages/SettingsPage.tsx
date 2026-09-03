@@ -29,6 +29,7 @@
  */
 
 import {
+  type ComponentType,
   lazy,
   type CSSProperties,
   type ReactNode,
@@ -97,6 +98,12 @@ import {
 import { MOD_KEY } from "@/components/KeyboardShortcut";
 import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
 import { changePassword, logout } from "@/lib/accountsApi";
+import {
+  beginGithubConnect,
+  disconnectGithub,
+  fetchGithubStatus,
+  type GithubConnectionStatus,
+} from "@/lib/githubIntegration";
 import { getCurrentIsAdmin, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
@@ -304,6 +311,7 @@ export function SettingsPage() {
       {section === "appearance" && <AppearanceSection />}
       {section === "general" && <GeneralSection />}
       {section === "git" && <GitSection />}
+      {section === "integrations" && <IntegrationsSection />}
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "import" && <ImportSection />}
       {section === "account" && hasAuthSession && <AccountSection />}
@@ -1024,6 +1032,172 @@ function GitSection() {
   );
 }
 
+/** GitHub brand mark (lucide dropped brand icons, so inline the glyph). */
+function GithubMark({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden className={className} fill="currentColor">
+      <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z" />
+    </svg>
+  );
+}
+
+/**
+/**
+ * Which panel connects/disconnects each provider. The server's
+ * ``enabled_connections`` list says WHICH panels to show; this map says HOW to
+ * render each. Adding a provider is one entry here plus one string server-side.
+ */
+const CONNECTION_PANELS: Record<string, ComponentType> = {
+  github: GithubIntegrationControl,
+};
+
+/**
+ * Sandbox Integrations settings. Renders one connect/disconnect panel per
+ * provider the server reports in ``enabled_connections``, in that order. The
+ * nav hides the section entirely when the list is empty.
+ */
+function IntegrationsSection() {
+  const info = useServerInfo();
+  const providers = info === "loading" ? [] : (info.enabled_connections ?? []);
+  return (
+    <Section
+      title="Sandbox Integrations"
+      description="External accounts your sandboxes use on your behalf."
+    >
+      {providers.map((provider) => {
+        const Panel = CONNECTION_PANELS[provider];
+        return Panel ? <Panel key={provider} /> : null;
+      })}
+    </Section>
+  );
+}
+
+/**
+ * Connect / disconnect a GitHub account. Once connected, a managed
+ * sandbox launched by this user authenticates ``gh`` / git as them and
+ * receives their public SSH keys (so they can SSH into their own box).
+ * The connect action is a full-page redirect to GitHub; on return the
+ * callback lands back here with ``?github=connected|error``.
+ */
+function GithubIntegrationControl() {
+  const [status, setStatus] = useState<GithubConnectionStatus | null | "loading">("loading");
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState<"connected" | "error" | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setStatus(await fetchGithubStatus());
+    } catch {
+      setStatus(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    // Surface the callback outcome carried back in the URL, then strip it
+    // so a reload doesn't re-show the banner.
+    const params = new URLSearchParams(window.location.search);
+    const outcome = params.get("github");
+    if (outcome === "connected" || outcome === "error") {
+      setNotice(outcome);
+      params.delete("github");
+      const qs = params.toString();
+      window.history.replaceState({}, "", `${window.location.pathname}${qs ? `?${qs}` : ""}`);
+    }
+  }, [refresh]);
+
+  const onDisconnect = useCallback(async () => {
+    setBusy(true);
+    try {
+      await disconnectGithub();
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  }, [refresh]);
+
+  const returnTo = `${window.location.pathname}${window.location.search}`;
+
+  if (status === "loading") {
+    return <p className="text-sm text-muted-foreground">Checking…</p>;
+  }
+  if (status === null) {
+    return <p className="text-sm text-muted-foreground">GitHub status is unavailable.</p>;
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      {notice === "connected" && (
+        <div
+          role="status"
+          className="rounded-md border border-success/40 bg-success/10 px-3 py-2 text-sm"
+        >
+          GitHub account connected.
+        </div>
+      )}
+      {notice === "error" && (
+        <div
+          role="alert"
+          className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+        >
+          Couldn't connect your GitHub account. Please try again.
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+        <div className="flex min-w-0 flex-1 flex-col">
+          <span className="text-sm font-medium">GitHub</span>
+          <span className="text-sm text-muted-foreground">
+            {status.connected && status.login
+              ? `Connected as ${status.login}. New sandboxes authenticate gh and git as you, and your public SSH keys are added so you can SSH in.`
+              : "Connect your GitHub account so new sandboxes authenticate gh and git as you, and your public SSH keys are injected."}
+          </span>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          {status.connected ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-9"
+              disabled={busy}
+              data-testid="github-disconnect"
+              onClick={() => void onDisconnect()}
+            >
+              Disconnect
+            </Button>
+          ) : (
+            <Button
+              size="sm"
+              className="h-9 gap-2"
+              disabled={busy}
+              data-testid="github-connect"
+              onClick={() => beginGithubConnect(returnTo)}
+            >
+              <GithubMark className="size-4" />
+              Connect GitHub
+            </Button>
+          )}
+        </div>
+      </div>
+
+      {status.install_url && (
+        <p className="text-xs text-muted-foreground">
+          The app may need to be installed on your repositories.{" "}
+          <a
+            href={status.install_url}
+            target="_blank"
+            rel="noreferrer"
+            className="underline underline-offset-2"
+          >
+            Manage installation
+          </a>
+          .
+        </p>
+      )}
+    </div>
+  );
+}
+
 /**
  * Global default: start every new session in a git workspace in a fresh
  * randomly-named worktree, regardless of which folder the composer lands in.
@@ -1183,10 +1357,10 @@ function DefaultBaseBranchControl() {
 }
 
 /**
- * Desktop UI font size stepper. Maps one of the supported discrete px values
- * into typography tokens via --desktop-ui-font-size (see
- * lib/uiFontPreferences.ts) without resizing layout or icons. Mobile keeps its
- * independent responsive size.
+ * UI font size stepper. Maps one of the supported discrete px values into
+ * typography tokens via --desktop-ui-font-size (see lib/uiFontPreferences.ts)
+ * without resizing layout or icons. Desktop reads the value directly; mobile
+ * scales its own base from it, so the setting applies on both surfaces.
  */
 function UiFontSizeControl() {
   // `px` is the committed value: clamped, persisted, and applied to the UI.
@@ -1235,7 +1409,7 @@ function UiFontSizeControl() {
       <div className="flex flex-col">
         <span className="text-ui font-medium">Interface font size</span>
         <span className="text-sm text-muted-foreground">
-          Set text across the desktop interface. Icons and spacing stay fixed.
+          Set text across the interface. Icons and spacing stay fixed.
         </span>
       </div>
       {/* One cohesive pill: [ −  | value px |  + ]. Segments share the pill
@@ -1665,18 +1839,26 @@ function LocalCliSection() {
             </div>
           )}
 
-          <p className="text-sm text-muted-foreground">
-            For security, a custom path can only be set from the connect screen — this prevents a
-            connected server from pointing the app at a different binary. Open it from the Server
-            menu (Change Server…) and use the settings gear.
-          </p>
+          {status.customizationDisabled ? (
+            <p className="text-sm text-muted-foreground">
+              Managed by your organization. Host enrollment uses <code>isaac omni</code>.
+            </p>
+          ) : (
+            <>
+              <p className="text-sm text-muted-foreground">
+                For security, a custom path can only be set from the connect screen — this prevents
+                a connected server from pointing the app at a different binary. Open it from the
+                Server menu (Change Server…) and use the settings gear.
+              </p>
 
-          {status.source === "configured" && (
-            <div>
-              <Button variant="ghost" size="sm" disabled={busy} onClick={() => void onReset()}>
-                Reset to auto-detected
-              </Button>
-            </div>
+              {status.source === "configured" && (
+                <div>
+                  <Button variant="ghost" size="sm" disabled={busy} onClick={() => void onReset()}>
+                    Reset to auto-detected
+                  </Button>
+                </div>
+              )}
+            </>
           )}
         </div>
       )}

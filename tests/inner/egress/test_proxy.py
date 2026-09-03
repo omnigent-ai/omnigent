@@ -1756,6 +1756,39 @@ async def test_credential_rewrite_swaps_via_refreshing_provider(
     assert synthetic not in (captured[0].authorization or "")
 
 
+@pytest.mark.parametrize("host", ["api.cursor.com", "api2.cursor.sh", "agent.cursor.sh"])
+def test_credential_rewrite_accepts_shared_synthetic_on_configured_hosts(
+    ca_paths: tuple[Path, Path, Path], host: str
+) -> None:
+    cert_path, key_path, _ = ca_paths
+    synthetic = f"{SYNTHETIC_CREDENTIAL_PREFIX}cursor"
+    rules = [
+        CredentialRewriteRule(
+            host=allowed_host,
+            scheme="bearer",
+            synthetic=synthetic,
+            real_secret="real-cursor-secret",
+        )
+        for allowed_host in ("api.cursor.com", "api2.cursor.sh", "agent.cursor.sh")
+    ]
+    proxy = EgressProxy(
+        parse_rules(["* api.cursor.com/**", "* api2.cursor.sh/**", "* agent.cursor.sh/**"]),
+        cert_path,
+        key_path,
+        credential_rewrites=rules,
+    )
+
+    result = proxy._rewrite_authorization(
+        method="POST",
+        host=host,
+        headers_raw=f"Authorization: Bearer {synthetic}\r\n\r\n".encode(),
+    )
+
+    assert result.error is None
+    assert b"Authorization: Bearer real-cursor-secret" in result.headers
+    assert synthetic.encode() not in result.headers
+
+
 @pytest.mark.asyncio
 async def test_credential_rewrite_swaps_basic_password(
     ca_paths: tuple[Path, Path, Path],

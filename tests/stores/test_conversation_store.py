@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from typing import Any
 
@@ -546,6 +547,53 @@ def test_append_leaves_created_by_none_for_agent_items(
     assert persisted.created_by is None
     [read_back] = conversation_store.list_items(conv.id).data
     assert read_back.created_by is None
+
+
+def test_append_encodes_item_data_in_one_batch_call(db_uri: str) -> None:
+    """append() routes every item's payload through _encode_item_data_batch
+    exactly once, passing all payloads in item order — so a subclass whose
+    encode is a per-call RPC can collapse the page into a single call.
+
+    Guards the managed store's per-import CMK cost: one encrypt call per append,
+    not one per item.
+    """
+
+    class RecordingStore(SqlAlchemyConversationStore):
+        def __init__(self, uri: str) -> None:
+            super().__init__(uri)
+            self.batch_calls: list[list[str]] = []
+
+        def _encode_item_data_batch(self, data_jsons: list[str]) -> list[str]:
+            # Record the page, then defer to the identity default so the data
+            # still round-trips through the plaintext column.
+            self.batch_calls.append(list(data_jsons))
+            return super()._encode_item_data_batch(data_jsons)
+
+    store = RecordingStore(db_uri)
+    conv = store.create_conversation()
+    texts = [f"item-{i}" for i in range(5)]
+    persisted = store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_batch",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+            )
+            for text in texts
+        ],
+    )
+
+    # Exactly one batched encode call carrying all five payloads, in order.
+    assert len(store.batch_calls) == 1
+    encoded_page = store.batch_calls[0]
+    assert len(encoded_page) == 5
+    assert [json.loads(payload)["content"][0]["text"] for payload in encoded_page] == texts
+
+    # Data round-trips: persisted order and read-back both match the input.
+    assert [item.data.content[0]["text"] for item in persisted] == texts
+    read_back = store.list_items(conv.id).data
+    assert [item.data.content[0]["text"] for item in read_back] == texts
 
 
 def test_append_function_call_items(

@@ -246,16 +246,15 @@ class EgressProxy:
         #   injects the real credential. Exactly one rule per host — the
         #   parser rejects duplicate-host bindings, so this map never
         #   silently drops a rule.
-        # - ``_cred_by_synthetic``: the opt-in placeholder path. Only
-        #   entries that injected an ``oa_cred_*`` env var register here;
-        #   the synthetic is globally unique so it alone identifies the
-        #   rule (and thus the bound host) for the swap + leak guard.
+        # - ``_cred_by_synthetic``: the opt-in placeholder path. One
+        #   placeholder may intentionally serve several configured hosts.
         self._cred_by_host: dict[str, CredentialRewriteRule] = {}
-        self._cred_by_synthetic: dict[str, CredentialRewriteRule] = {}
+        self._cred_by_synthetic: dict[str, dict[str, CredentialRewriteRule]] = {}
         for rule in credential_rewrites or []:
-            self._cred_by_host[rule.host.lower()] = rule
+            host = rule.host.lower()
+            self._cred_by_host[host] = rule
             if rule.synthetic is not None:
-                self._cred_by_synthetic[rule.synthetic] = rule
+                self._cred_by_synthetic.setdefault(rule.synthetic, {})[host] = rule
         # Precompute the expected header bytes ONCE so the per-request
         # comparison is a constant-time memcmp instead of repeating
         # the base64 round-trip on every connection. Stored as bytes
@@ -1225,8 +1224,9 @@ class EgressProxy:
                     # leave it alone (and don't also inject over it).
                     rewritten.append(value)
                     continue
-                rule = self._cred_by_synthetic.get(synthetic)
-                if rule is None or rule.host != host_key:
+                rules = self._cred_by_synthetic.get(synthetic)
+                rule = rules.get(host_key) if rules is not None else None
+                if rule is None:
                     # A value carrying our placeholder prefix that we don't
                     # recognise for this host. Refuse rather than forward —
                     # this is the leak guard for a compromised sandbox that

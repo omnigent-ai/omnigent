@@ -7,6 +7,7 @@ import contextlib
 import errno
 import logging
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -3948,6 +3949,26 @@ async def test_run_host_process_invalid_host_id_exits_actionably(
     assert "Could not start host" in err
     assert "OMNIGENT_HOST_ID" in err
     assert "not-a-uuid" in err
+
+
+def test_run_host_process_mirrors_structured_logs_on_foreground_tty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Foreground ``omnigent host`` mirrors logs like ``omnigent server``."""
+    monkeypatch.delenv("OMNIGENT_LOG_TO_STDERR", raising=False)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
+
+    with patch(
+        "omnigent.host.connect.configure_process_logging",
+        return_value=tmp_path / "host.log",
+    ) as configure_logging:
+        run_host_process(
+            server_url="https://app.example.databricks.com",
+            config_path=tmp_path / "config.yaml",
+        )
+
+    configure_logging.assert_called_once_with("host", log_to_stderr=True)
 
 
 def test_run_host_process_announces_session_log_dir_on_start(

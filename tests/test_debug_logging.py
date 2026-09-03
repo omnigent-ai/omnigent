@@ -115,6 +115,36 @@ def test_record_to_row_shape_and_coercions() -> None:
     }
 
 
+def test_record_to_row_redacts_token_like_text_fields() -> None:
+    secret = "aB3" + "xY7" * 12
+    try:
+        raise ValueError(f"credential={secret}")
+    except ValueError:
+        import sys
+
+        record = logging.LogRecord(
+            "omnigent.runner",
+            logging.ERROR,
+            __file__,
+            10,
+            "request failed: %s",
+            (secret,),
+            sys.exc_info(),
+            func="do_it",
+        )
+    record.attributes = {"upstream_response": secret, "attempt": 3}
+
+    row = dl.record_to_row(record, source="runner")
+
+    attributes = row["attributes"]
+    assert isinstance(attributes, dict)
+    assert secret not in str(row["message"])
+    assert secret not in str(row["stack_trace"])
+    assert secret not in attributes["upstream_response"]
+    assert attributes["attempt"] == "3"
+    assert "[REDACTED]" in str(row)
+
+
 def test_record_to_row_reads_session_id_from_extra(monkeypatch: pytest.MonkeyPatch) -> None:
     # session_id is passed explicitly at the callsite via extra= and read off
     # the record. There is deliberately no ambient request-scoped fallback; an

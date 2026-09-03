@@ -6,6 +6,7 @@ import contextlib
 import logging
 import os
 import re
+import time
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ from omnigent.process_logging import (
     LOG_TO_STDERR_ENV_VAR,
     LOG_TTY_FD_ENV_VAR,
     PROCESS_LOG_FILE_ENV_VAR,
+    RedactingLogFormatter,
     TerminalLogFormatter,
     _debug_sink_target_loggers,
     _log_once_seen,
@@ -28,6 +30,7 @@ from omnigent.process_logging import (
     log_once,
     process_log_dir_reference,
     process_log_reference,
+    redact_log_text,
     terminal_stream_handler,
     terminal_supports_color,
 )
@@ -106,6 +109,85 @@ def test_terminal_log_formatter_colors_level_name() -> None:
     assert record.levelname == "INFO"
     assert "source_name" not in record.__dict__
     assert "func_name" not in record.__dict__
+
+
+def test_redact_log_text_filters_labeled_and_unlabeled_token_shapes() -> None:
+    """Secrets are removed even when they have no provider-specific prefix."""
+    opaque = "aB3" + "xY7" * 12
+    labeled = "lowercase123" * 4
+    jwt = ".".join(("eyJ" + "HeaderA1" * 2, "PayloadB2" * 2, "SignatureC3" * 2))
+    provider_key = "sk-" + "TestKey123" * 2
+    workspace_pat = "dapi" + "Test1234567890"
+
+    samples = (
+        (f"Authorization: Bearer {labeled}", labeled),
+        (f'headers={{"token": "{labeled}"}}', labeled),
+        ("bearer abc:def", "abc:def"),
+        ("password=;supersecret", ";supersecret"),
+        ("password=p@ss,word", "p@ss,word"),
+        ('{"password":"p@ss,word"}', "p@ss,word"),
+        (f"response contained {opaque}", opaque),
+        (f"session credential {jwt}", jwt),
+        (f"provider key {provider_key}", provider_key),
+        (f"workspace PAT {workspace_pat}", workspace_pat),
+    )
+
+    for sample, secret in samples:
+        redacted = redact_log_text(sample)
+        assert "[REDACTED]" in redacted
+        assert secret not in redacted
+        assert redact_log_text(redacted) == redacted
+
+
+def test_redact_log_text_handles_large_non_token_input_in_linear_time() -> None:
+    """Punctuation-heavy log lines do not trigger quadratic regex backtracking."""
+    text = "+" * 20_000
+
+    started = time.perf_counter()
+    output = redact_log_text(text)
+    elapsed = time.perf_counter() - started
+
+    assert output == text
+    assert elapsed < 0.5
+
+
+def test_redact_log_text_preserves_normal_identifiers() -> None:
+    """UUIDs, session IDs, hashes, and ordinary prose remain useful in logs."""
+    values = (
+        "conv_0123456789abcdef0123456789abcdef",
+        "123e4567-e89b-12d3-a456-426614174000",
+        "0123456789abcdef0123456789abcdef01234567",
+        "claude-sonnet-4-20250514",
+    )
+
+    for value in values:
+        assert redact_log_text(value) == value
+
+
+def test_redacting_log_formatter_scrubs_interpolated_args_and_tracebacks() -> None:
+    """Redaction runs after message interpolation and exception rendering."""
+    secret = "aB3" + "xY7" * 12
+    formatter = RedactingLogFormatter(use_colors=False)
+    try:
+        raise ValueError(f"token={secret}")
+    except ValueError:
+        import sys
+
+        record = logging.LogRecord(
+            "omnigent.example",
+            logging.ERROR,
+            __file__,
+            1,
+            "request failed for %s",
+            (secret,),
+            sys.exc_info(),
+            "send",
+        )
+
+    output = formatter.format(record)
+
+    assert secret not in output
+    assert output.count("[REDACTED]") >= 2
 
 
 def test_terminal_log_formatter_abbreviates_warning_and_source() -> None:

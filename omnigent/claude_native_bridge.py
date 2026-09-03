@@ -229,6 +229,14 @@ _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 0.75
 SWITCH_MODEL_DIALOG_HINT = "Switch model?"
 EFFORT_DIALOG_HINT = "Change effort level?"
 _CONFIRM_DIALOG_HINTS = (SWITCH_MODEL_DIALOG_HINT, EFFORT_DIALOG_HINT)
+# Footer rows the ctrl+r prompt-history search renders directly under the
+# input box's closing rule since Claude Code 2.1.212, where the search rides
+# the framed composer as its filter field instead of drawing its own overlay.
+# The frame and ``❯`` glyph then read exactly like a free composer; this
+# footer is the only tell. Compared case-insensitively — the search chrome's
+# casing has already drifted across releases ("Search prompts" →
+# "search prompts:").
+_HISTORY_SEARCH_FOOTER_PREFIXES = ("search prompts:", "no matching prompt:")
 # Surfaces a confirm Enter must never land on: they are never a slash command's
 # own confirmation, and their default answer commits something the person did
 # not ask for — the ``/model`` picker writes a new global default into
@@ -436,6 +444,13 @@ class ClaudeTranscriptItem:
         :func:`omnigent.claude_native_forwarder._forward_available_items`)
         instead of rendering the summary as a user bubble. Defaults to
         ``False`` for every ordinary transcript item.
+    :param is_compact_noop: ``True`` when this item was parsed from the
+        ``<local-command-stdout>`` record Claude writes when it declines a
+        ``/compact`` (e.g. "Not enough messages to compact."). No real
+        compaction runs, so no ``isCompactSummary`` / ``SessionStart
+        source=compact`` completion signal follows; the forwarder uses this
+        flag to dismiss the stranded "Compacting…" spinner. Never rendered
+        as a bubble. Defaults to ``False``.
     """
 
     source_id: str
@@ -443,6 +458,7 @@ class ClaudeTranscriptItem:
     data: _JsonObject
     response_id: str
     is_compact_summary: bool = False
+    is_compact_noop: bool = False
 
 
 @dataclass(frozen=True)
@@ -2403,7 +2419,7 @@ def read_transcript_items_since_with_position(
         line_cursor=read_result.line_cursor,
         byte_offset=read_result.byte_offset,
         current_response_id=active_response_id,
-        items=items,
+        items=_dedupe_compact_noop_echo(items),
         latest_usage=latest_usage,
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
@@ -2497,7 +2513,7 @@ def read_transcript_items_from_offset(
         line_cursor=read_result.line_cursor,
         byte_offset=read_result.byte_offset,
         current_response_id=active_response_id,
-        items=items,
+        items=_dedupe_compact_noop_echo(items),
         latest_usage=latest_usage,
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
@@ -3140,8 +3156,10 @@ def inject_user_message(
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in time,
         if Claude's input prompt never renders, if a ``tmux send-keys``
-        invocation fails, or if the draft never leaves the input box
-        after repeated submit Enters (message not delivered).
+        invocation fails, if the paste draft was never confirmed in the
+        input box after ``_PASTE_COMMIT_TIMEOUT_S`` (the TUI was still
+        consuming the paste — message not submitted), or if the draft
+        never leaves the input box after repeated submit Enters.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     # A surface left occupying the composer swallows everything typed
@@ -3203,10 +3221,13 @@ def inject_user_message(
     # into a paste; an Enter that arrives while it is still consuming
     # the paste becomes a newline inside the draft instead of a submit,
     # and the message sits unsent. A fixed sleep raced this (lost under
-    # load / large payloads); polling is deterministic. Best-effort:
-    # when the draft never becomes identifiable (e.g. whitespace-only
-    # first line, custom statusline containing the glyph), fall through
-    # after the timeout and submit blind, matching the old behavior.
+    # load / large payloads); polling is deterministic.
+    # When the draft never becomes visible (timeout expired) AND the
+    # content has an identifiable needle, raise rather than submit blind:
+    # a blind Enter races the still-consuming TUI and would silently drop
+    # the message (the caller gets no error but the turn never runs).
+    # When the needle is empty (whitespace-only content) the draft cannot
+    # be confirmed either way; fall through to best-effort blind submit.
     needle = _submit_needle(content)
     draft_seen = False
     deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
@@ -3215,12 +3236,21 @@ def inject_user_message(
             draft_seen = True
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    if not draft_seen:
+        if not needle:
+            # Content has no identifiable first line (e.g. whitespace-only).
+            # The draft position cannot be confirmed, so fall through to a
+            # best-effort blind submit rather than hard-failing.
+            time.sleep(_PASTE_SETTLE_S)
+            _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
+            return
+        raise RuntimeError(
+            f"The pasted draft was never visible in Claude Code's input box after "
+            f"{_PASTE_COMMIT_TIMEOUT_S}s (needle={needle!r}). The TUI may still be "
+            "consuming the paste — the message was not submitted. Retry the send."
+        )
     time.sleep(_PASTE_SETTLE_S)
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
-    if not draft_seen:
-        # The draft was never observed, so its absence proves nothing —
-        # verification would trivially "pass". Submit blind as before.
-        return
     # Verify the submit took: a successful Enter clears the input box.
     # If the draft is still sitting there the Enter was swallowed into
     # the paste burst as a newline — re-send it (the retry lands well
@@ -3966,6 +3996,13 @@ def _occupying_surface(pane: str) -> str | None:
     is drawn over the box; a row led by another mode's glyph means the
     box itself is not taking chat input.
 
+    One surface defeats that structural read: since Claude Code 2.1.212
+    the ctrl+r prompt-history search rides the framed composer as its
+    filter field, so the frame and ``❯`` glyph look exactly like a free
+    input box while every keystroke filters history and Enter replays an
+    old prompt. Its footer (:func:`_history_search_footer_shown`) is the
+    only tell, so that one surface is read from the footer region.
+
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: A short description for the log, e.g. ``"shell mode"``, or
         ``None`` when the chat composer is free — and also when the
@@ -3974,6 +4011,8 @@ def _occupying_surface(pane: str) -> str | None:
     """
     if not pane.strip():
         return None
+    if _history_search_footer_shown(pane):
+        return "the prompt-history search"
     row = _composer_row(pane)
     if row is None:
         return "an overlay"
@@ -4040,11 +4079,43 @@ def _claude_prompt_rendered(pane: str) -> bool:
     rows below the box are unbounded, while the opening rule directly
     above it is not.
 
+    Since Claude Code 2.1.212 the ctrl+r history search rides the framed
+    composer as its filter field, so the frame and glyph alone would read
+    it as ready while a typed message filters history instead of sending;
+    its footer (:func:`_history_search_footer_shown`) rules it out.
+
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: ``True`` when the chat input box appears mounted.
     """
     row = _composer_row(pane)
-    return row is not None and row.strip().startswith(_CLAUDE_PROMPT_GLYPH)
+    if row is None or not row.strip().startswith(_CLAUDE_PROMPT_GLYPH):
+        return False
+    return not _history_search_footer_shown(pane)
+
+
+def _history_search_footer_shown(pane: str) -> bool:
+    """
+    Return whether the ctrl+r history search's footer is on screen.
+
+    The footer sits in the region below the input box's closing rule
+    (the same anchoring as :func:`_permission_mode_from_pane`), so
+    transcript text discussing the search cannot be misread as live.
+    Prefix-matched case-insensitively: the chrome's casing has drifted
+    across Claude Code releases.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when a footer row names the history search.
+    """
+    lines = [line for line in pane.splitlines() if line.strip()]
+    last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=None)
+    region = lines[last_rule + 1 :] if last_rule is not None else lines[-_PROMPT_SCAN_TAIL_LINES:]
+    # A narrow pane wraps the footer's left cell across rows ("search" /
+    # "prompts:"), interleaving the right cell's text, so no single row
+    # carries the whole marker. Each row's left-cell fragment is the text
+    # before the first multi-space column gap; rejoined in order they
+    # spell the footer out again.
+    fragments = (re.split(r"\s{2,}", line.strip(), maxsplit=1)[0] for line in region)
+    return " ".join(fragments).lower().startswith(_HISTORY_SEARCH_FOOTER_PREFIXES)
 
 
 def _is_box_rule(line: str) -> bool:
@@ -5757,6 +5828,7 @@ def _transcript_items_from_entry(
             entry,
             line_number=line_number,
             record_offset=record_offset,
+            agent_name=agent_name,
             current_response_id=current_response_id,
         )
     message = entry.get("message")
@@ -5853,6 +5925,70 @@ _TASK_NOTIFICATION_REQUIRED_MARKERS: tuple[str, ...] = (
     "<task-id>",
     "</task-notification>",
 )
+
+# Substrings Claude Code writes to a ``/compact`` command's
+# ``<local-command-stdout>`` when it declines to compact (context too small
+# to summarize). Claude fires the ``PreCompact`` hook — which raises the web
+# "Compacting conversation…" spinner — BEFORE deciding there's nothing to do,
+# then aborts without any ``isCompactSummary`` / ``SessionStart
+# source=compact`` completion signal, so the spinner is stranded. Matched
+# case-insensitively so the forwarder can dismiss the spinner.
+_COMPACT_NOOP_STDOUT_MARKERS: tuple[str, ...] = (
+    # Observed refusal text.
+    "not enough messages to compact",
+    # Defensive variant against wording drift.
+    "nothing to compact",
+)
+
+
+def _dedupe_compact_noop_echo(
+    items: list[ClaudeTranscriptItem],
+) -> list[ClaudeTranscriptItem]:
+    """
+    Drop the bare ``/compact`` echo when its refusal item is in the same batch.
+
+    Claude records a declined ``/compact`` as two records: the command echo
+    (a ``slash_command`` item with no output) and a standalone stdout record
+    (surfaced as the ``is_compact_noop`` item carrying the refusal text). They
+    are written together and normally read in one poll, so rendering both
+    yields two "Command compact" bubbles. Keep only the refusal item — it
+    carries the message — so the web shows a single bubble like the terminal.
+
+    :param items: Items parsed from one read batch, in order.
+    :returns: The items with any redundant bare ``/compact`` echo removed;
+        unchanged when the batch holds no ``is_compact_noop`` item.
+    """
+    if not any(item.is_compact_noop for item in items):
+        return items
+    return [
+        item
+        for item in items
+        if not (
+            not item.is_compact_noop
+            and item.item_type == "slash_command"
+            and item.data.get("name") == "compact"
+            and not item.data.get("output")
+        )
+    ]
+
+
+def _compact_noop_stdout(content: str) -> str | None:
+    """
+    Return the ``/compact`` "nothing to compact" refusal text, if this is one.
+
+    :param content: Raw ``local_command`` record ``content``, expected to hold a
+        ``<local-command-stdout>`` block.
+    :returns: The stdout text (e.g. "Not enough messages to compact.") when it
+        matches a known compact-refusal marker, else ``None``.
+    """
+    stdout_match = _COMMAND_STDOUT_RE.search(content)
+    if stdout_match is None:
+        return None
+    stdout = stdout_match.group(1)
+    if any(marker in stdout.lower() for marker in _COMPACT_NOOP_STDOUT_MARKERS):
+        return stdout.strip()
+    return None
+
 
 # Markers that prefix a ``role=user`` record produced by Claude
 # Code's CLI scaffolding (not user-typed content). ``<command-
@@ -6042,6 +6178,7 @@ def _local_command_transcript_items_from_entry(
     *,
     line_number: int,
     record_offset: int | None,
+    agent_name: str,
     current_response_id: str | None,
 ) -> tuple[str | None, list[ClaudeTranscriptItem]]:
     """
@@ -6058,6 +6195,7 @@ def _local_command_transcript_items_from_entry(
     :param line_number: One-based transcript line number.
     :param record_offset: Byte offset where the transcript record
         starts, or ``None`` for legacy line-cursor reads.
+    :param agent_name: Agent/model name stamped on surfaced items.
     :param current_response_id: Response id for an in-progress shell
         command group, if the input record was parsed in an earlier
         line.
@@ -6068,6 +6206,29 @@ def _local_command_transcript_items_from_entry(
     if not isinstance(content, str) or not content:
         return current_response_id, []
     source_key = _transcript_source_key(entry, line_number, record_offset)
+    # A ``/compact`` refusal ("Not enough messages to compact.") lands as a
+    # standalone ``local_command`` stdout record, separate from the
+    # ``/compact`` command echo. Surface it as a ``slash_command`` item
+    # carrying the refusal as ``output`` — so the web shows the same message
+    # Claude did — and flag it so the forwarder also dismisses the stranded
+    # "Compacting…" spinner.
+    compact_noop = _compact_noop_stdout(content)
+    if compact_noop is not None:
+        return current_response_id, [
+            ClaudeTranscriptItem(
+                source_id=_source_id(source_key, 0, "compact_noop"),
+                item_type="slash_command",
+                data={
+                    "agent": agent_name,
+                    "kind": "command",
+                    "name": "compact",
+                    "arguments": "",
+                    "output": compact_noop,
+                },
+                response_id=current_response_id or _response_id_from_source(source_key),
+                is_compact_noop=True,
+            )
+        ]
     fallback_response_id = _response_id_from_source(source_key)
     response_id = (
         fallback_response_id

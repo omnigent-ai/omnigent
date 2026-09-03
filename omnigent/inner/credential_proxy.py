@@ -194,6 +194,7 @@ def prepare_credential_proxy_runtime(
     if spec.databricks is not None:
         _prepare_databricks_runtime(spec.databricks, runtime)
 
+    synthetic_by_env: dict[str, str] = {}
     for entry in spec.entries:
         real_secret = _resolve_secret(entry.source, parent_env=parent_env)
         # Mint a placeholder only when the entry injects an env var. The
@@ -202,10 +203,20 @@ def prepare_credential_proxy_runtime(
         # no placeholder to mint or guard.
         synthetic: str | None = None
         if entry.inject_env:
-            # 24 bytes -> 192 bits of entropy, well past any brute-force or
-            # collision concern for a short-lived per-session placeholder.
-            synthetic = f"{SYNTHETIC_CREDENTIAL_PREFIX}{secrets.token_urlsafe(24)}"
+            existing = {
+                synthetic_by_env[env_name]
+                for env_name in entry.inject_env
+                if env_name in synthetic_by_env
+            }
+            if len(existing) > 1:
+                raise ValueError(
+                    "credential_proxy inject_env names resolve to conflicting placeholders"
+                )
+            synthetic = existing.pop() if existing else None
+            if synthetic is None:
+                synthetic = f"{SYNTHETIC_CREDENTIAL_PREFIX}{secrets.token_urlsafe(24)}"
             for env_name in entry.inject_env:
+                synthetic_by_env[env_name] = synthetic
                 runtime.helper_env_updates[env_name] = synthetic
         runtime.rewrites.append(
             CredentialRewriteRule(

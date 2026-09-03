@@ -103,6 +103,12 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
+      - name: Set up Python
+        if: steps.creds.outputs.available == 'true'
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
       # ── Trusted context-gathering steps ──────────────────────────────
       # These run before the LLM and use the GitHub token directly.
       # The LLM never sees GH_TOKEN.
@@ -163,12 +169,12 @@ jobs:
             --json number,title,body,state,stateReason,url,createdAt,updatedAt,labels \
             > /tmp/corpus.json
 
-          PYTHONPATH=.github/scripts python3 <<'PYEOF'
+          PYTHONPATH=.github/triage_v2/src python3 <<'PYEOF'
           import json
           import os
           import pathlib
 
-          from issue_duplicates import extract_issue_references, rank_candidates
+          from issue_prioritization.duplicates import extract_issue_references, rank_candidates
 
           issue = json.loads(pathlib.Path("/tmp/issue.json").read_text())
           corpus = json.loads(pathlib.Path("/tmp/corpus.json").read_text())
@@ -191,12 +197,6 @@ jobs:
           PYEOF
 
       # ── LLM classification (no tools, no shell, no GH_TOKEN) ────────
-
-      - name: Set up Python
-        if: steps.creds.outputs.available == 'true'
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
-        with:
-          python-version-file: ".python-version"
 
       - name: Set up uv
         if: steps.creds.outputs.available == 'true'
@@ -297,8 +297,8 @@ jobs:
           python3 <<'PYEOF'
           import json, pathlib, sys
 
-          sys.path.insert(0, ".github/scripts")
-          from issue_duplicates import format_candidates_for_prompt
+          sys.path.insert(0, ".github/triage_v2/src")
+          from issue_prioritization.duplicates import format_candidates_for_prompt
 
           issue = json.loads(pathlib.Path("/tmp/issue.json").read_text())
           dupes = json.loads(pathlib.Path("/tmp/duplicates.json").read_text())
@@ -429,10 +429,10 @@ jobs:
           # allowlists, and write gh commands to a script file.
           # All GitHub mutations are built in Python with proper escaping
           # — no eval, no shell interpolation of model output.
-          PYTHONPATH=.github/scripts python3 <<'PYEOF'
+          PYTHONPATH=.github/triage_v2/src python3 <<'PYEOF'
           import json, os, pathlib, sys, shlex
 
-          from issue_duplicates import (
+          from issue_prioritization.duplicates import (
               build_duplicate_comment,
               parse_triage_output,
               validate_duplicate_decision,

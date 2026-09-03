@@ -666,28 +666,30 @@ aside[aria-label="Workspace"][data-maximized] {
   display: none;
 }
 
-/* iOS native shell (SwiftUI/WKWebView) runs the webview full-screen under the
- * system status bar and home indicator. Keep the web app visually full-bleed,
- * but move interactive mobile chrome out of unsafe areas. Scoped to the native
- * bridge marker so normal iOS Safari keeps its existing browser-safe layout. */
-@media (width < 48rem) {
-  [data-ios-native].app-shell {
-    /* Lock the shell to the live visual viewport so the soft keyboard can never
-       pan the whole document (which hides the header). --omnigent-viewport-
-       height is published by useIOSViewportLock from visualViewport.height; it
-       shrinks when the keyboard opens so inputs stay above it and only inner
-       panes scroll. Falls back to the large viewport before JS runs / on older
-       WebKit. The two-line pattern keeps the lvh fallback for browsers without
-       the var. */
-    height: 100lvh;
-    height: var(--omnigent-viewport-height, 100lvh);
-    min-height: 100lvh;
-    min-height: var(--omnigent-viewport-height, 100lvh);
-    max-height: 100lvh;
-    max-height: var(--omnigent-viewport-height, 100lvh);
-    overflow: hidden;
-  }
+/* The iOS WKWebView runs full-screen under the keyboard at every responsive
+ * width. Lock the shell to the visual viewport published by
+ * useIOSViewportLock so flow content, including the composer, stays visible. */
+[data-ios-native].app-shell {
+  height: 100lvh;
+  height: var(--omnigent-viewport-height, 100lvh);
+  min-height: 100lvh;
+  min-height: var(--omnigent-viewport-height, 100lvh);
+  max-height: 100lvh;
+  max-height: var(--omnigent-viewport-height, 100lvh);
+  overflow: hidden;
+}
 
+/* Native shells render beneath the status bar at every width. Keep floating
+ * chat controls and the pinned Plan tracker below its safe area. */
+:is([data-ios-native], [data-android-native]) .chat-header {
+  top: max(0px, calc(var(--omnigent-safe-top) - 0.5rem));
+}
+:is([data-ios-native], [data-android-native]) .chat-plan-accordion {
+  margin-top: calc(var(--omnigent-header-height) + max(0px, var(--omnigent-safe-top) - 0.5rem));
+}
+
+/* Remaining native-shell adjustments are specific to the mobile layout. */
+@media (width < 48rem) {
   /* Slide animation for the mobile drawer. Covers BOTH paths that move the
      panel: the edge-swipe drag settles via an inline `transform`, while the
      button toggle (and the drag's resting open/closed state) is driven by
@@ -723,15 +725,6 @@ aside[aria-label="Workspace"][data-maximized] {
     font-size: 16px;
   }
 
-  /* `--omnigent-safe-top` (not raw env()) so this works on Android too, where
-     env(safe-area-inset-top) is 0 in the WebView and the OS inset arrives via
-     the native-injected `--omnigent-android-safe-area-top`. On iOS the var folds
-     down to env(), so the iOS result is unchanged. */
-  [data-ios-native] .chat-header,
-  [data-android-native] .chat-header {
-    top: max(0px, calc(var(--omnigent-safe-top) - 0.5rem));
-  }
-
   [data-ios-native] .chat-conversation-content,
   [data-android-native] .chat-conversation-content {
     /* header band + 1.5rem breathing room + OS safe area, sourced from the
@@ -742,6 +735,12 @@ aside[aria-label="Workspace"][data-maximized] {
   [data-ios-native] .main-terminal-view,
   [data-android-native] .main-terminal-view {
     padding-top: calc(3.25rem + var(--omnigent-inset-top));
+  }
+
+  /* With the bottom pill retired the terminal card is the lowest content in
+     the terminal view — keep it clear of the home indicator. */
+  [data-ios-native] .main-terminal-view {
+    padding-bottom: calc(0.375rem + var(--omnigent-safe-bottom));
   }
 
   [data-ios-native] .chat-scroll-fade {
@@ -784,23 +783,6 @@ aside[aria-label="Workspace"][data-maximized] {
   [data-ios-native] .chat-composer-form,
   [data-android-native] .chat-composer-form {
     padding-bottom: calc(0.75rem + var(--omnigent-safe-bottom));
-  }
-
-  [data-ios-native] .chat-composer-form.terminal-first-composer-form {
-    padding-bottom: 0.25rem;
-  }
-
-  /* Reserve room for the native Liquid Glass switcher that floats over the web
-     view (the in-page pill is suppressed in the iOS shell). Height is the
-     shared bottom inset — the native bar footprint (sourced from the shell, see
-     nativeInsets.ts) plus the home-indicator safe area — so it can never drift
-     from the bar's real size. Chat reserves the same footprint: its composer
-     status line (host / harness / context ring) is content the bar must clear,
-     not spare cushion, so trimming the reserve here let the bar overlap it. */
-  [data-ios-native] .omnigent-native-bottom-spacer,
-  [data-ios-native] .omnigent-native-bottom-spacer--chat {
-    height: var(--omnigent-inset-bottom);
-    flex: none;
   }
 }
 
@@ -994,9 +976,12 @@ aside[aria-label="Workspace"][data-maximized] {
 /* Mobile-specific sidebar geometry. The root remains at the global 16px so
  * rem-based typography and controls keep the same scale across viewports. */
 @media (width < 48rem) {
-  /* Mobile uses its own base size while preserving the desktop hierarchy. */
+  /* Mobile keeps its own touch-friendly base (14px at the default 13px
+   * preference) but scales it off the Appearance value, so the setting
+   * applies on phones instead of being a dead store. The 14/13 factor maps
+   * the default preference exactly onto the historical 14px mobile base. */
   :root {
-    --mobile-ui-font-size: 14px;
+    --mobile-ui-font-size: calc(var(--desktop-ui-font-size) * (14 / 13));
     --text-sm: calc(var(--mobile-ui-font-size) * 0.9);
     --text-ui: var(--mobile-ui-font-size);
   }

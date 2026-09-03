@@ -345,3 +345,81 @@ def test_changes_non_git_workspace_is_empty(tmp_path: Path) -> None:
     result = reader.changes("conv_x")
 
     assert result["data"] == []
+
+
+# ── GitHub ops (host fallback) ────────────────────────────────────────
+
+
+def _git_branch_repo(path: Path) -> None:
+    """A repo with a ``main`` base and a ``feature`` branch that edits a file."""
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True, env=env)
+    (path / "app.txt").write_text("base\n")
+    subprocess.run(["git", "add", "."], cwd=path, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "base"], cwd=path, check=True, capture_output=True, env=env
+    )
+    subprocess.run(
+        ["git", "branch", "-M", "main"], cwd=path, check=True, capture_output=True, env=env
+    )
+    subprocess.run(
+        ["git", "checkout", "-b", "feature"], cwd=path, check=True, capture_output=True, env=env
+    )
+    (path / "app.txt").write_text("changed\n")
+    subprocess.run(["git", "add", "."], cwd=path, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "feature"], cwd=path, check=True, capture_output=True, env=env
+    )
+
+
+def test_github_info_without_gh_reports_git_state(tmp_path: Path, monkeypatch) -> None:
+    """The host serves branch + base from git even when ``gh`` is absent.
+
+    This is what keeps the branch-vs-base diff viewable when the runner is
+    offline and the host machine has no ``gh``.
+    """
+    from omnigent import workspace_fs
+
+    _git_branch_repo(tmp_path)
+    monkeypatch.setattr(workspace_fs.github_resource.shutil, "which", lambda _name: None)
+    reader = WorkspaceReader(tmp_path)
+
+    info = reader.github_info()
+
+    assert info["available"] is True
+    assert info["gh_available"] is False
+    assert info["branch"] == "feature"
+    assert info["base_ref"] == "main"
+
+
+def test_github_changes_lists_branch_diff(tmp_path: Path) -> None:
+    """``github_changes`` derives the base and lists the branch's changes."""
+    _git_branch_repo(tmp_path)
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.github_changes(None)
+
+    paths = {entry["path"]: entry["status"] for entry in result["data"]}
+    assert paths.get("app.txt") == "modified"
+
+
+def test_github_file_diff_returns_before_after(tmp_path: Path) -> None:
+    """``github_file_diff`` returns base vs HEAD content for a file."""
+    _git_branch_repo(tmp_path)
+    reader = WorkspaceReader(tmp_path)
+
+    diff = reader.github_file_diff("main", "app.txt")
+
+    assert diff["before"] == "base\n"
+    assert diff["after"] == "changed\n"
+
+
+def test_github_pr_diff_returns_whole_patch(tmp_path: Path) -> None:
+    """``github_pr_diff`` returns the whole branch-vs-base patch (base derived)."""
+    _git_branch_repo(tmp_path)
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.github_pr_diff(None)
+
+    assert "diff --git a/app.txt b/app.txt" in result["patch"]
+    assert "+changed" in result["patch"]

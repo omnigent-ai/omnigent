@@ -458,6 +458,27 @@ def set_fallback_mock_llm(
     resp.raise_for_status()
 
 
+def set_mock_served_models(mock_llm_server_url: str | None, models: list[str]) -> None:
+    """
+    Set the model ids the mock gateway reports on ``GET /v1/models``.
+
+    The claude-sdk executor lists its gateway's models once per session to
+    pin Claude Code's family aliases to served ids. Cleared by
+    :func:`reset_mock_llm`, so set it after the reset.
+
+    :param mock_llm_server_url: Mock server URL or ``None``.
+    :param models: Served model ids, e.g. ``["gw-claude-opus-4-8"]``.
+    """
+    if mock_llm_server_url is None:
+        return
+    resp = httpx.post(
+        f"{mock_llm_server_url}/mock/served_models",
+        json={"models": models},
+        timeout=5.0,
+    )
+    resp.raise_for_status()
+
+
 def release_mock_gate(mock_llm_server_url: str | None) -> None:
     """
     Release the oldest pending gate on the mock LLM server.

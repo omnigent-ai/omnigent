@@ -4122,6 +4122,12 @@ async def _auto_create_codex_terminal(
         # creating a thread. This TUI runs detached for the web UI, so persist
         # the runner-owned acknowledgements in the private session config.
         trust_project=True,
+        # Codex ignores --dangerously-bypass-hook-trust for the startup
+        # hook-review screen on a persistent ``resume`` attach, which strands a
+        # resumed web session behind the interactive "Hooks need review" prompt.
+        # Persist trust for every merged hook so the review finds nothing to
+        # review. See trust_all_codex_hooks.
+        trust_all_hooks=True,
     )
     # Generate routing hooks.json (and bypass codex's hook-trust prompt): the
     # app-server reads the endpoint out of its own process env at start, and

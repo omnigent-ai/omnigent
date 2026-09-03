@@ -37,19 +37,24 @@ session and logs are things you *produce*, not inputs:
   - **Linear** → query the GraphQL API with `sys_os_shell`, using the Linear key
     from your environment. It arrives as `LINEAR_API_KEY` locally or as
     `DATABRICKS_LINEAR_API_KEY` under `--server` (the CLI→runner env strip only
-    forwards the `DATABRICKS_`-prefixed name), so read whichever is set. Endpoint
-    `https://api.linear.app/graphql`, header `Authorization: <key>` — **no**
-    `Bearer` prefix. Fetch the ticket by its identifier, e.g.:
+    forwards the `DATABRICKS_`-prefixed name), so read whichever is set. A local
+    Linear API key is sent directly as `Authorization: <key>`. A secretless
+    credential proxy instead injects an `oa_cred_*` placeholder, which must be
+    sent as `Authorization: Bearer <placeholder>` so the proxy can recognize and
+    replace it. Fetch the ticket by its identifier, e.g.:
     ```bash
     KEY="${LINEAR_API_KEY:-$DATABRICKS_LINEAR_API_KEY}"
+    AUTH="$KEY"
+    [[ "$KEY" == oa_cred_* ]] && AUTH="Bearer $KEY"
     curl -s https://api.linear.app/graphql \
-      -H "Authorization: $KEY" -H 'Content-Type: application/json' \
+      -H "Authorization: $AUTH" -H 'Content-Type: application/json' \
       -d '{"query":"{ issue(id: \"OMNI-1234\") { identifier title description url state { name } comments(first: 50) { nodes { body } } attachments(first: 20) { nodes { url } } } }"}'
     ```
     If neither `LINEAR_API_KEY` nor `DATABRICKS_LINEAR_API_KEY` is set (or the
-    fetch fails auth), you cannot read the ticket body — stop with verdict
-    `needs_more_info` naming the missing key rather than guessing the bug from the
-    URL slug.
+    fetch fails auth), you cannot read the ticket body. Stop and report the
+    authentication/configuration failure rather than guessing the bug from the
+    URL slug or emitting `needs_more_info`: missing tracker access is an
+    infrastructure failure, not missing information in the report.
   - **Linear → linked GitHub issue.** A Linear ticket often links a GitHub issue
     (in its `attachments`, description, or comments). If you find one, **always
     fetch that GitHub issue too** (`gh issue view <url> --comments`) and treat it
