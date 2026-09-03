@@ -14,72 +14,60 @@
 // file is opened, matching the other panel-resize hooks. Explicit user
 // resizes are also persisted so a full page reload restores the width.
 
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createResizableWidthStore, useResizableWidthSnapshot } from "@/hooks/resizableWidthStore";
+import { useInputCapabilities } from "@/hooks/useInputCapabilities";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useResizeDrag } from "@/hooks/useResizeDrag";
 import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 
-const DEFAULT_WIDTH_PX = 240; // matches the previous fixed `md:w-60`
+const DEFAULT_WIDTH_PX = 240;
 const MIN_WIDTH_PX = 200;
 const MAX_WIDTH_PX = 640;
 /** Keep at least this much room for the code/diff viewer beside the panel. */
 const MIN_VIEWER_PX = 240;
-/** Tailwind `md` breakpoint — must track the value in tailwind.config. */
-const MD_BREAKPOINT = 768;
+// The handle is a dedicated divider gutter between the viewer and the panel —
+// a real flex child outside both scroll containers, so its hit area overlays
+// almost no content. The painted strip (`w-1`) sits centered in the gutter;
+// invisible padding fills the rest and overhangs each side by a small sliver
+// via negative margins. The slivers are capped so the viewer's scrollbar and
+// the panel's header/tabs/cards keep their taps and scroll starts — which
+// also caps the hit total at 26px coarse / 24px fine (TR-7's 24px floor; the
+// preferred 44px would need a visually wide gutter the layout doesn't permit).
+const PAINTED_STRIP_PX = 4; // must match the handle's `w-1` class
+const GUTTER_COARSE_PX = 8;
+const GUTTER_FINE_PX = 6;
+const VIEWER_SLIVER_PX = 10; // ≤10: a 14px viewer scrollbar keeps 4px + its own gutter
+const INWARD_SLIVER_PX = 8; // ≤8: stays within the panel's 12px content gutter
+
+/** Inline style for the divider-gutter handle: layout footprint = gutter
+ * width, hit box = gutter + both slivers, paint = the centered `w-1` strip. */
+function gutterStyle(isCoarse: boolean): React.CSSProperties {
+  const gutter = isCoarse ? GUTTER_COARSE_PX : GUTTER_FINE_PX;
+  const inset = (gutter - PAINTED_STRIP_PX) / 2;
+  return {
+    touchAction: "none",
+    boxSizing: "content-box",
+    paddingLeft: VIEWER_SLIVER_PX + inset,
+    paddingRight: INWARD_SLIVER_PX + inset,
+    marginLeft: -VIEWER_SLIVER_PX,
+    marginRight: -INWARD_SLIVER_PX,
+    backgroundClip: "content-box",
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Module-level width store (shared across panel remounts within a session)
 // ---------------------------------------------------------------------------
 
-// `preferredWidth` mirrors the persisted user choice; `storedWidth` is the
-// effective width after clamping to the available row space. Keeping the
-// preference in memory lets the resize handler re-derive the effective width
-// from it — restoring the larger choice when the row widens again.
-let preferredWidth: number | null = readPanelSizePreference("commentsPanelWidthPx");
-let storedWidth: number | null = preferredWidth;
-const listeners = new Set<() => void>();
-
-function persistWidth(value: number | null) {
-  preferredWidth = value;
-  writePanelSizePreference("commentsPanelWidthPx", value);
-}
-
-function setStoredWidthRaw(value: number | null, persist = false) {
-  if (value === storedWidth) return;
-  storedWidth = value;
-  if (persist) persistWidth(value);
-  for (const l of listeners) l();
-}
-
-function setStoredWidth(
-  next: number | null | ((prev: number | null) => number | null),
-  persist = false,
-) {
-  setStoredWidthRaw(typeof next === "function" ? next(storedWidth) : next, persist);
-}
-
-/** Snapshot the current width to storage (called once at drag end). */
-function persistStoredWidth() {
-  persistWidth(storedWidth);
-}
-
-function subscribe(cb: () => void): () => void {
-  listeners.add(cb);
-  return () => {
-    listeners.delete(cb);
-  };
-}
-
-function getSnapshot(): number | null {
-  return storedWidth;
-}
-
-function getServerSnapshot(): number | null {
-  return null;
-}
+const widthStore = createResizableWidthStore(
+  readPanelSizePreference("commentsPanelWidthPx"),
+  (width) => writePanelSizePreference("commentsPanelWidthPx", width),
+);
 
 /** Reset module-level width state from localStorage. Only for tests. */
 export function resetCommentsWidthStoreForTesting(): void {
-  preferredWidth = readPanelSizePreference("commentsPanelWidthPx");
-  setStoredWidthRaw(preferredWidth);
+  widthStore.reset(readPanelSizePreference("commentsPanelWidthPx"));
 }
 
 /**
@@ -95,60 +83,73 @@ export function resetCommentsWidthStoreForTesting(): void {
  * sibling viewer.
  */
 export function useResizableCommentsPanel() {
-  const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
+  const { anyCoarse } = useInputCapabilities();
+  const mobileViewport = useIsMobileViewport();
+  const isDesktop = typeof window !== "undefined" && !mobileViewport;
+  const raw = useResizableWidthSnapshot(widthStore);
   const width = Math.max(MIN_WIDTH_PX, Math.min(raw ?? DEFAULT_WIDTH_PX, MAX_WIDTH_PX));
-  const dragging = useRef(false);
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const overlayRef = useRef<HTMLDivElement | null>(null);
-
-  // While dragging, a transparent full-window overlay sits above the panel so
-  // the pointer stream keeps reaching the parent document. Without it, dragging
-  // over a cross-origin/sandboxed iframe (e.g. the HTML preview) routes mousemove
-  // /mouseup into the frame, the parent never sees mouseup, and the drag sticks.
-  const addDragOverlay = useCallback(() => {
-    if (overlayRef.current || typeof document === "undefined") return;
-    const el = document.createElement("div");
-    el.style.cssText =
-      "position:fixed;inset:0;z-index:2147483647;cursor:col-resize;background:transparent;";
-    document.body.appendChild(el);
-    overlayRef.current = el;
-  }, []);
-
-  const removeDragOverlay = useCallback(() => {
-    overlayRef.current?.remove();
-    overlayRef.current = null;
-  }, []);
-
-  const [isDesktop, setIsDesktop] = useState(
-    () => typeof window !== "undefined" && window.innerWidth >= MD_BREAKPOINT,
-  );
-
-  useEffect(() => {
-    const mql = window.matchMedia(`(min-width: ${MD_BREAKPOINT}px)`);
-    const handler = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
-    mql.addEventListener("change", handler);
-    return () => mql.removeEventListener("change", handler);
-  }, []);
 
   // Clamp a candidate width to [MIN, dynamic max], leaving MIN_VIEWER_PX for
   // the sibling code/diff viewer so the panel can't swallow the whole row.
-  const clampWidth = useCallback((candidate: number): number => {
+  // The divider gutter is a third flex child in the row, so its footprint
+  // comes out of the budget too — always the coarse 8px, so a pointer-type
+  // flip mid-session can never shrink the viewer below its minimum.
+  const reachableMax = useCallback((): number => {
     const parent = containerRef.current?.parentElement;
-    const parentWidth = parent?.getBoundingClientRect().width ?? window.innerWidth;
-    const max = Math.max(MIN_WIDTH_PX, Math.min(MAX_WIDTH_PX, parentWidth - MIN_VIEWER_PX));
-    return Math.max(MIN_WIDTH_PX, Math.min(candidate, max));
+    const parentWidth =
+      parent?.getBoundingClientRect().width ??
+      (typeof window === "undefined" ? MAX_WIDTH_PX : window.innerWidth);
+    return Math.max(
+      MIN_WIDTH_PX,
+      Math.min(MAX_WIDTH_PX, parentWidth - MIN_VIEWER_PX - GUTTER_COARSE_PX),
+    );
   }, []);
 
-  const onMouseDown = useCallback(
-    (e: React.MouseEvent) => {
-      e.preventDefault();
-      dragging.current = true;
-      addDragOverlay();
-      document.body.style.cursor = "col-resize";
-      document.body.style.userSelect = "none";
-    },
-    [addDragOverlay],
+  const clampWidth = useCallback(
+    (candidate: number): number => Math.max(MIN_WIDTH_PX, Math.min(candidate, reachableMax())),
+    [reachableMax],
   );
+
+  // A row can resize without the window changing (for example, the sidebar
+  // opens). Re-render so the separator's reachable ARIA maximum stays in sync.
+  const [constraintVersion, setConstraintVersion] = useState(0);
+  useEffect(() => {
+    const parent = containerRef.current?.parentElement;
+    if (!parent || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      widthStore.set((prev) => {
+        const base = widthStore.getPreferred() ?? prev;
+        return base !== null ? clampWidth(base) : prev;
+      });
+      setConstraintVersion((version) => version + 1);
+    });
+    observer.observe(parent);
+    return () => observer.disconnect();
+  }, [clampWidth]);
+
+  // Cancellation restores the pre-drag width: onMove writes the live store on
+  // every pointermove, so an abort (Escape, blur, …) must undo those writes.
+  const dragStartWidth = useRef<number | null>(null);
+  const resizeDrag = useResizeDrag({
+    enabled: isDesktop,
+    overlay: true,
+    onStart: useCallback(() => {
+      dragStartWidth.current = widthStore.getSnapshot();
+    }, []),
+    onCancel: useCallback(() => {
+      widthStore.set(dragStartWidth.current !== null ? clampWidth(dragStartWidth.current) : null);
+    }, [clampWidth]),
+    onCommit: widthStore.persist,
+    onMove: useCallback(
+      (e: React.PointerEvent) => {
+        if (!containerRef.current) return;
+        const right = containerRef.current.getBoundingClientRect().right;
+        widthStore.set(clampWidth(right - e.clientX));
+      },
+      [clampWidth],
+    ),
+  });
 
   // Keyboard resize: left/right arrows widen/narrow by 20px.
   const onKeyDown = useCallback(
@@ -156,44 +157,14 @@ export function useResizableCommentsPanel() {
       const step = 20;
       if (e.key === "ArrowLeft") {
         e.preventDefault();
-        setStoredWidth((prev) => clampWidth((prev ?? DEFAULT_WIDTH_PX) + step), true);
+        widthStore.set((prev) => clampWidth((prev ?? DEFAULT_WIDTH_PX) + step), true);
       } else if (e.key === "ArrowRight") {
         e.preventDefault();
-        setStoredWidth((prev) => clampWidth((prev ?? DEFAULT_WIDTH_PX) - step), true);
+        widthStore.set((prev) => clampWidth((prev ?? DEFAULT_WIDTH_PX) - step), true);
       }
     },
     [clampWidth],
   );
-
-  useEffect(() => {
-    function onMouseMove(e: MouseEvent) {
-      if (!dragging.current || !containerRef.current) return;
-      const right = containerRef.current.getBoundingClientRect().right;
-      // Update the live width only; persist once on release to avoid a
-      // synchronous localStorage write per mousemove.
-      setStoredWidth(clampWidth(right - e.clientX));
-    }
-    function onMouseUp() {
-      if (!dragging.current) return;
-      dragging.current = false;
-      removeDragOverlay();
-      persistStoredWidth();
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    }
-    window.addEventListener("mousemove", onMouseMove);
-    window.addEventListener("mouseup", onMouseUp);
-    return () => {
-      window.removeEventListener("mousemove", onMouseMove);
-      window.removeEventListener("mouseup", onMouseUp);
-      if (dragging.current) {
-        dragging.current = false;
-        document.body.style.cursor = "";
-        document.body.style.userSelect = "";
-      }
-      removeDragOverlay();
-    };
-  }, [clampWidth, removeDragOverlay]);
 
   // Re-clamp the stored width when the viewport resizes so a width chosen on
   // a wider layout doesn't crowd out the viewer after the window shrinks.
@@ -201,14 +172,21 @@ export function useResizableCommentsPanel() {
     function onResize() {
       // Re-derive the effective width from the persisted preference so the
       // panel widens back to the user's choice when the row regains space.
-      setStoredWidth((prev) => {
-        const base = preferredWidth ?? prev;
+      widthStore.set((prev) => {
+        const base = widthStore.getPreferred() ?? prev;
         return base !== null ? clampWidth(base) : prev;
       });
+      setConstraintVersion((version) => version + 1);
     }
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, [clampWidth]);
+
+  const ariaValueMax = useMemo(() => {
+    // Row-size signals invalidate the cached layout measurement.
+    void constraintVersion;
+    return reachableMax();
+  }, [constraintVersion, reachableMax]);
 
   return {
     /** Pixel width to apply as an inline style (undefined on mobile). */
@@ -217,14 +195,29 @@ export function useResizableCommentsPanel() {
     containerRef,
     /** Whether the resize handle should render (desktop only). */
     isDesktop,
-    /** Props to spread onto the resize handle element. */
+    /**
+     * Props to spread onto the divider-gutter handle. Render it as the
+     * panel's PRECEDING SIBLING in the split row (a `w-1 shrink-0` flex
+     * child), never inside either scroll container — the pads would be
+     * clipped and would steal the neighbors' pointer streams.
+     */
     handleProps: {
-      onMouseDown,
+      ...resizeDrag.handleProps,
       onKeyDown,
       role: "separator" as const,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize comments panel",
+      "aria-valuenow": width,
+      "aria-valuemin": MIN_WIDTH_PX,
+      "aria-valuemax": ariaValueMax,
       tabIndex: 0,
+      // The gutter owns its touches outright (no scroll/selection may start
+      // from it). With content-box sizing the `w-1` class is the painted
+      // strip; padding centers it in the gutter and adds the overhang
+      // slivers, whose footprint the negative margins cancel — so the
+      // element occupies exactly the gutter width and the hover/active
+      // background (content-box clipped) never widens visually.
+      style: gutterStyle(anyCoarse),
     },
   };
 }
