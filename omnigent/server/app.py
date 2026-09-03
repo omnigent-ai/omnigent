@@ -1636,6 +1636,10 @@ def create_app(
     # outermost WS middleware — a forbidden origin is closed without even
     # reaching the metrics counter (which only counts on accept anyway).
     app.add_middleware(WebSocketOriginMiddleware)
+    # Compress API JSON responses (~3x on the multi-hundred-KB session
+    # snapshots and item pages). Starlette excludes ``text/event-stream`` by
+    # default, so live SSE turn streams still pass through unbuffered.
+    app.add_middleware(GZipMiddleware, minimum_size=_WEB_UI_GZIP_MINIMUM_SIZE)
     # Give the tool-policy ASK gate (which forwards the native-terminal
     # approval popup from a parked-gate background task, off any
     # request/route closure) the runner router so it can reach the bound
