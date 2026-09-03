@@ -5789,23 +5789,30 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         };
       });
       return;
-    case "slash_command":
-      // Claude-native: a `/skill-name` or surfaced CLI command typed
-      // in the web composer round-trips through tmux → Claude TUI →
-      // transcript → `external_conversation_item` (type=slash_command)
-      // → `response.output_item.done`. The Omnigent server bypasses
-      // persistence for these (no `session.input.consumed` fires),
-      // so the optimistic bubble in `pendingUserMessages` would
-      // otherwise linger next to the rendered SlashCommandBlock
-      // until refresh. Pop the FIFO head here to ack the local
-      // send; non-empty guard so observing clients (with no pending
-      // bubble) just render the block.
+    case "slash_command": {
+      // Claude-native skips `session.input.consumed` for slash invocations, so
+      // this receipt is the only ack for the echo `runSlashCommand` parked in
+      // `pendingUserMessages`. Match that echo by text, never by queue
+      // position: the queue is shared with regular messages whose acks arrive
+      // on an unrelated path, so popping the head steals a message's bubble and
+      // renders the wrong text against the wrong entry.
+      const echoText = messageContentText([
+        { type: "input_text", text: `/${event.name} ${event.arguments}` },
+      ]);
       applyToConversation((s) => {
-        if (s.pendingUserMessages.length === 0) return {};
-        const [, ...rest] = s.pendingUserMessages;
-        return { pendingUserMessages: rest };
+        const at = s.pendingUserMessages.findIndex(
+          (p) => messageContentText(p.content) === echoText,
+        );
+        if (at < 0) return {};
+        return {
+          pendingUserMessages: [
+            ...s.pendingUserMessages.slice(0, at),
+            ...s.pendingUserMessages.slice(at + 1),
+          ],
+        };
       });
       return;
+    }
     case "session_interrupted":
       // Explicit user-cancel signal. Distinguishes "interrupted by
       // user action" from the generic `response.incomplete` that

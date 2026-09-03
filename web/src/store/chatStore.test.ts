@@ -5536,6 +5536,90 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       ]);
     });
 
+    it("acks its own echo, not a regular message queued ahead of it", () => {
+      // `test` awaits `session.input.consumed`; `/compact` is acked by this
+      // receipt. The two acks are unordered, so the command's can land first —
+      // and popping the head would then destroy `test`'s bubble.
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          { tempId: "pend_1", content: [{ type: "input_text", text: "test" }] },
+          { tempId: "pend_2", content: [{ type: "input_text", text: "/compact" }] },
+        ],
+      });
+
+      const event: StreamEvent = {
+        type: "slash_command",
+        kind: "command",
+        name: "compact",
+        arguments: "",
+        output: null,
+        agentName: "claude-native-ui",
+        itemId: "item_slash_3",
+        responseId: "resp_slash_3",
+      };
+      handleSessionEvent(event);
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([
+        { tempId: "pend_1", content: [{ type: "input_text", text: "test" }] },
+      ]);
+    });
+
+    it("matches an echo whose arguments the server retrimmed", () => {
+      // The client echoes the typed spacing verbatim while the server reports
+      // trimmed `arguments`; normalized matching still pairs them.
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          { tempId: "pend_1", content: [{ type: "input_text", text: "keep me" }] },
+          { tempId: "pend_2", content: [{ type: "input_text", text: "/review  the   diff" }] },
+        ],
+      });
+
+      const event: StreamEvent = {
+        type: "slash_command",
+        kind: "skill",
+        name: "review",
+        arguments: "the diff",
+        output: null,
+        agentName: "claude-native-ui",
+        itemId: "item_slash_4",
+        responseId: "resp_slash_4",
+      };
+      handleSessionEvent(event);
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([
+        { tempId: "pend_1", content: [{ type: "input_text", text: "keep me" }] },
+      ]);
+    });
+
+    it("leaves a queued message alone for a command typed in the terminal", () => {
+      // A TUI-run command owns no echo here, so it must leave a queued web
+      // message's bubble alone — that bubble has its own ack coming.
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          { tempId: "pend_1", content: [{ type: "input_text", text: "test" }] },
+        ],
+      });
+
+      const event: StreamEvent = {
+        type: "slash_command",
+        kind: "command",
+        name: "compact",
+        arguments: "",
+        output: null,
+        agentName: "claude-native-ui",
+        itemId: "item_slash_5",
+        responseId: "resp_slash_5",
+      };
+      handleSessionEvent(event);
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([
+        { tempId: "pend_1", content: [{ type: "input_text", text: "test" }] },
+      ]);
+    });
+
     it("is a no-op when pendingUserMessages is empty (observing client)", () => {
       useChatStore.setState({ blocks: [], pendingUserMessages: [] });
 
