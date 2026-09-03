@@ -3139,6 +3139,17 @@ async def _ensure_state_for_transcript(
         cursor_fingerprint=_jsonl_cursor_fingerprint(transcript_path, byte_offset),
     )
     await _write_forward_state_async(bridge_dir, state)
+    # First time this forwarder locks onto a transcript file (fresh session, or a
+    # new transcript after /clear or fork) — surface the path in the runner log,
+    # where the host terminal's ``log:`` line already points, so it is easy to
+    # find and tail. Mirrors the status watcher's "claude status file resolved"
+    # line; the two together name both files a claude-native session watches.
+    _logger.info(
+        "claude transcript file resolved: path=%s session=%s",
+        transcript_path,
+        session_id,
+        extra={"session_id": session_id},
+    )
     return state
 
 

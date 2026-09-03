@@ -8666,3 +8666,67 @@ async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
     assert stall_warnings, "the deadline trip must be loudly logged, never silent"
     # The warning's traceback names the stalled await for next-time forensics.
     assert stall_warnings[0].exc_info is not None
+
+
+async def test_ensure_state_logs_transcript_path_on_fresh_adoption(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The forwarder logs the transcript path the first time it adopts one.
+
+    This is how the transcript file surfaces in the runner log — the file the
+    host terminal's ``log:`` line points at — alongside the status watcher's
+    "claude status file resolved" line, so a user can find both files a
+    claude-native session watches.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"type": "user"}\n', encoding="utf-8")
+
+    with caplog.at_level(logging.INFO, logger="omnigent.claude_native_forwarder"):
+        state = await forwarder._ensure_state_for_transcript(
+            bridge_dir=bridge_dir,
+            state=None,
+            transcript_path=transcript,
+            start_at_end=False,
+            session_id="conv_abc",
+        )
+
+    assert state.transcript_path == transcript
+    resolved = [
+        r.getMessage() for r in caplog.records if "transcript file resolved" in r.getMessage()
+    ]
+    assert len(resolved) == 1
+    assert str(transcript) in resolved[0]
+    assert "conv_abc" in resolved[0]
+
+
+async def test_ensure_state_does_not_relog_unchanged_transcript(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Re-adopting the same transcript on later polls logs the path only once."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"type": "user"}\n', encoding="utf-8")
+
+    with caplog.at_level(logging.INFO, logger="omnigent.claude_native_forwarder"):
+        state = await forwarder._ensure_state_for_transcript(
+            bridge_dir=bridge_dir,
+            state=None,
+            transcript_path=transcript,
+            start_at_end=False,
+            session_id="conv_abc",
+        )
+        # Second call carries the state back in — the steady-state poll, which
+        # must early-return without re-logging the (unchanged) transcript path.
+        await forwarder._ensure_state_for_transcript(
+            bridge_dir=bridge_dir,
+            state=state,
+            transcript_path=transcript,
+            start_at_end=False,
+            session_id="conv_abc",
+        )
+
+    resolved = [r for r in caplog.records if "transcript file resolved" in r.getMessage()]
+    assert len(resolved) == 1
