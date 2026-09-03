@@ -443,6 +443,40 @@ def test_host_disable_subcommand_removes_user_service(
     assert "Disabled the Omnigent host user service" in result.output
 
 
+def test_host_stop_stops_service_without_daemon_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A service in its startup window can be stopped before its record appears."""
+    from omnigent.host.service import HostServiceStatus
+
+    monkeypatch.setattr("omnigent.cli._selected_daemon_records", lambda **kw: [])
+    monkeypatch.setattr(
+        "omnigent.host.service.user_host_service_status",
+        lambda: HostServiceStatus(
+            supported=True,
+            kind="systemd_user",
+            path=tmp_path / "omnigent-host.service",
+            label="omnigent-host.service",
+            installed=True,
+            configured_target="local",
+            manager_state="running",
+            enabled=True,
+        ),
+    )
+    stopped: list[str | None] = []
+    monkeypatch.setattr(
+        "omnigent.cli._stop_enabled_host_service",
+        lambda server: stopped.append(server) or True,
+    )
+
+    result = CliRunner().invoke(cli, ["host", "stop", "--server", ""])
+
+    assert result.exit_code == 0, result.output
+    assert stopped == [None]
+    assert "autostart remains enabled" in result.output
+
+
 def test_host_rejects_unknown_plain_token_as_subcommand(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -945,6 +979,55 @@ def test_host_background_spawns_detached_daemon(
     # its URL is reported too (the Web UI is otherwise unreachable).
     assert spawned_args and "--local" in spawned_args[0]
     assert "server: http://127.0.0.1:6767" in result.output
+
+
+def test_host_background_starts_installed_service_without_spawning_daemon(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An installed service owns startup instead of competing with a detached daemon."""
+    from omnigent.cli import _HostDaemonRecord, _write_daemon_record
+    from omnigent.host.service import HostServiceStatus
+
+    spawned_args, _ = _patch_background_host_spawn(monkeypatch, tmp_path)
+    _write_daemon_record(
+        _HostDaemonRecord(
+            pid=4242,
+            target="local",
+            mode="local",
+            server_url=None,
+            log_path=None,
+            started_at=int(time.time()),
+        )
+    )
+    status = HostServiceStatus(
+        supported=True,
+        kind="launchd",
+        path=tmp_path / "ai.omnigent.host.plist",
+        label="ai.omnigent.host",
+        installed=True,
+        configured_target="local",
+        manager_state="running",
+        manager_pid=4242,
+        enabled=True,
+        log=str(tmp_path / "service.log"),
+    )
+    starts: list[str | None] = []
+    monkeypatch.setattr("omnigent.host.service.user_host_service_status", lambda: status)
+
+    def _start(server_url: str | None) -> HostServiceStatus:
+        starts.append(server_url)
+        return status
+
+    monkeypatch.setattr("omnigent.host.service.start_user_host_service", _start)
+
+    result = CliRunner().invoke(cli, ["host", "--background", "--server", ""])
+
+    assert result.exit_code == 0, result.output
+    assert starts == [""]
+    assert spawned_args == []
+    assert "Host user service already running" in result.output
+    assert "autostart remains enabled" in result.output
 
 
 def test_host_background_fails_when_daemon_never_registers(

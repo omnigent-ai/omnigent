@@ -4429,6 +4429,7 @@ def _stop_local_server_and_daemon(*, force: bool) -> bool:
         called, ``False`` otherwise.
     """
     was_running = local_server_url_if_healthy() is not None
+    _stop_enabled_host_service(None)
     local_record = _find_daemon_record(_LOCAL_DAEMON_MARKER)
     if local_record is not None:
         # A stubborn daemon shouldn't block stopping the server.
@@ -4507,10 +4508,16 @@ def server_stop(force: bool) -> None:
         does not exit on SIGTERM.
     :returns: None.
     """
+    service_managed = _user_service_owns_target(None)
     if _stop_local_server_and_daemon(force=force):
         click.echo("Stopped the background server.")
     else:
         click.echo("No background server is running.")
+    if service_managed:
+        click.echo(
+            "The host user service remains installed and will start again at login; "
+            "remove it with `omnigent host disable`."
+        )
 
 
 @server.command("status")
@@ -4623,13 +4630,28 @@ def stop(force: bool) -> None:
     """
     stopped = 0
     failures: list[str] = []
+    service_stopped = False
+    service_target: str | None = None
+    from omnigent.host.service import user_host_service_status
+
+    service_status = user_host_service_status()
+    if service_status.installed and service_status.configured_target is not None:
+        service_target = service_status.configured_target
     for record in _list_daemon_records():
         # Terminating the daemon reaps its runners (orphan-watchdog), so the
         # off-switch doesn't need the graceful per-session HTTP stop that
         # `host stop` does — that keeps teardown quiet and dependency-free.
         try:
+            server_url = None if record.target == _LOCAL_DAEMON_MARKER else record.target
+            service_stopped = _stop_enabled_host_service(server_url) or service_stopped
             _terminate_daemon(record, force=force)
             stopped += 1
+        except click.ClickException as exc:
+            failures.append(exc.message)
+    if service_target is not None and not service_stopped:
+        server_url = None if service_target == _LOCAL_DAEMON_MARKER else service_target
+        try:
+            service_stopped = _stop_enabled_host_service(server_url)
         except click.ClickException as exc:
             failures.append(exc.message)
     server_was_running = local_server_url_if_healthy() is not None
@@ -4647,6 +4669,8 @@ def stop(force: bool) -> None:
         parts.append("the background server")
     if orphan_pid is not None:
         parts.append(f"an untracked server on :{_DEFAULT_LOCAL_PORT} (pid {orphan_pid})")
+    if service_stopped:
+        parts.append("the host user service (autostart remains enabled)")
     if parts:
         click.echo("Stopped " + " and ".join(parts) + ".")
     else:
@@ -8354,6 +8378,62 @@ def _maybe_open_host_web_ui(
         click.echo(f"Open the Omnigent web UI: {web_url}", err=True)
 
 
+def _start_enabled_host_service(
+    server: str | None,
+    *,
+    stop_command: str,
+    non_interactive: bool,
+) -> bool:
+    """Start the installed service when it owns *server*."""
+    from omnigent.host.service import (
+        HostServiceError,
+        start_user_host_service,
+        user_host_service_owns_target,
+        user_host_service_status,
+    )
+
+    service_status = user_host_service_status()
+    if not user_host_service_owns_target(service_status, server):
+        return False
+    was_running = service_status.manager_state == "running"
+    try:
+        service_status = start_user_host_service(server)
+    except HostServiceError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    target = _normalize_daemon_target(server)
+    deadline = time.monotonic() + _BACKGROUND_HOST_REGISTRATION_GRACE_S
+    record = _find_daemon_record(target)
+    while record is None and time.monotonic() < deadline:
+        time.sleep(0.1)
+        record = _find_daemon_record(target)
+    if record is None:
+        detail = f" Check {service_status.log}." if service_status.log else ""
+        raise click.ClickException(
+            f"The host user service did not create its daemon record.{detail}"
+        )
+    if record.mode == "local":
+        server_url = _discover_local_server_url()
+        _update_daemon_resolved_server_url(target, server_url)
+        record = _find_daemon_record(target) or record
+    else:
+        server_url = target
+    _confirm_background_host_registered(record)
+
+    headline = "Host user service already running" if was_running else "Started host user service"
+    click.echo(f"{_cli_style(headline, fg='green', bold=True)} (pid {record.pid}).")
+    _echo_host_field("server", _cli_style(server_url, fg="cyan"))
+    if service_status.log is not None:
+        _echo_host_field("log", service_status.log)
+    click.echo()
+    click.echo(_cli_style("Stop it with (autostart remains enabled):", dim=True))
+    click.echo(f"  {_cli_style(stop_command, bold=True)}")
+    click.echo(_cli_style("Remove autostart with:", dim=True))
+    click.echo(f"  {_cli_style('omnigent host disable', bold=True)}")
+    _maybe_open_host_web_ui(server_url, non_interactive=non_interactive)
+    return True
+
+
 def _run_background_host(
     server: str | None,
     *,
@@ -8387,6 +8467,12 @@ def _run_background_host(
     if server:
         _ensure_databricks_server_auth(server, non_interactive=non_interactive)
     target = _normalize_daemon_target(server)
+    if _start_enabled_host_service(
+        server,
+        stop_command=stop_command,
+        non_interactive=non_interactive,
+    ):
+        return
     previous = _find_daemon_record(target)
     _ensure_host_daemon(server or None)
     record = _find_daemon_record(target)
@@ -9505,6 +9591,34 @@ def _echo_daemon_payloads(payloads: list[_HostPayload]) -> None:
         _add_host_payload_sessions_table(console, payload)
 
 
+def _user_service_owns_target(server: str | None) -> bool:
+    """Return whether the installed user service owns *server*."""
+    from omnigent.host.service import user_host_service_owns_target, user_host_service_status
+
+    return user_host_service_owns_target(user_host_service_status(), server)
+
+
+def _stop_enabled_host_service(server: str | None) -> bool:
+    """Stop the installed service for *server* while retaining autostart."""
+    from omnigent.host.service import (
+        HostServiceError,
+        stop_user_host_service,
+        user_host_service_owns_target,
+        user_host_service_status,
+    )
+
+    status = user_host_service_status()
+    if not user_host_service_owns_target(status, server):
+        return False
+    if status.manager_state == "stopped":
+        return True
+    try:
+        stop_user_host_service(server)
+    except HostServiceError as exc:
+        raise click.ClickException(str(exc)) from exc
+    return True
+
+
 def _echo_host_service_status(status: HostServiceStatus) -> None:
     """Render the per-user host service as a separate status block."""
     click.echo(_cli_style("User service", bold=True))
@@ -9881,18 +9995,51 @@ def host_stop(
     if server is None:
         server = _host_group_option(ctx, "server")
     records = _selected_daemon_records(server=server, all_targets=all_targets, default_all=False)
+    from omnigent.host.service import user_host_service_status
+
+    service_status = user_host_service_status()
+    selected_target = _normalize_daemon_target(_resolve_host_server(server))
+    service_target = service_status.configured_target
     if not records:
+        should_stop_service = service_target is not None and (
+            all_targets or service_target == selected_target
+        )
+        if should_stop_service:
+            service_url = None if service_target == _LOCAL_DAEMON_MARKER else service_target
+            if _stop_enabled_host_service(service_url):
+                click.echo(
+                    f"Stopped {service_target} host user service; autostart remains enabled. "
+                    "Remove it with `omnigent host disable`."
+                )
+                return
         click.echo("No matching host daemon found.")
         return
+    managed_targets: set[str] = set()
     for record in records:
         stopped = 0
         if not daemon_only:
             stopped = _stop_daemon_sessions(record, force=force)
+        service_url = None if record.target == _LOCAL_DAEMON_MARKER else record.target
+        service_managed = _stop_enabled_host_service(service_url)
+        if service_managed:
+            managed_targets.add(record.target)
         _terminate_daemon(record, force=force)
+        suffix = (
+            " Autostart remains enabled; remove it with `omnigent host disable`."
+            if service_managed
+            else ""
+        )
         click.echo(
             f"Stopped {_host_display_url(record.target)} daemon "
-            f"pid={record.pid}; sessions_stopped={stopped}."
+            f"pid={record.pid}; sessions_stopped={stopped}.{suffix}"
         )
+    if all_targets and service_target is not None and service_target not in managed_targets:
+        service_url = None if service_target == _LOCAL_DAEMON_MARKER else service_target
+        if _stop_enabled_host_service(service_url):
+            click.echo(
+                f"Stopped {_host_display_url(service_target)} host user service; "
+                "autostart remains enabled. Remove it with `omnigent host disable`."
+            )
 
 
 @host.command("stop-session")
