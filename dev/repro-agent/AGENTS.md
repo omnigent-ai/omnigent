@@ -104,13 +104,16 @@ Your first turn is a fixed checklist — do all of it before Step 1:
    for UI journeys, and `sys_session_*` / HTTP for backend journeys. Confirm you
    can read the report: `gh` is available for a GitHub issue, or a Linear key
    (`LINEAR_API_KEY` or `DATABRICKS_LINEAR_API_KEY`) is set for a Linear ticket
-   (if it isn't, stop with `needs_more_info`). Also note — without failing —
+   (if it isn't, stop and report an infrastructure/configuration failure without
+   emitting a verdict handoff; the workflow must retry it). Also note — without failing —
    whether the recorders are available (Playwright browsers for
    `pytest --video`, `vhs` for CLI tapes): Step 4 degrades gracefully when they
    are missing.
 
-If you cannot reach the app at all, stop and say so. Don't narrate a clean
-preflight.
+If you cannot reach the app at all, stop and report an operational failure
+without emitting a verdict handoff so the workflow retries. App, network,
+authentication, tooling, sandbox, workspace, timeout, and agent-crash failures
+are never `needs_more_info`. Don't narrate a clean preflight.
 
 ## Step 1 — Reconstruct the user journey
 
@@ -123,7 +126,11 @@ Write down the concrete journey: the entry point (which screen/agent/command),
 the ordered user inputs, the environment/data it needed, and the observable
 failure (crash, traceback, wrong output, missing UI affordance). If the report is
 too thin to reconstruct a concrete journey, stop with verdict `needs_more_info`
-naming exactly what the report is missing.
+naming exactly what the report is missing. This verdict is allowed only after you
+successfully read the complete ticket and linked reports and make a reasonable
+investigation attempt. It means the **report itself** omits product information
+required to define or execute the reproduction—never that your turn, tools,
+credentials, environment, or infrastructure failed.
 
 **The journey is user-observable only — an ordered list of actions a user
 takes.** Write it as concrete numbered steps, each one an action the user
@@ -242,7 +249,9 @@ independently, because a compound bug can be partly fixed:
   (e.g. a missing picker, a wrong value, an error toast). The browser tools drive
   the desktop app's embedded browser, so a UI-journey reproduction expects a
   desktop / embedded-browser context; if you have no browser pane to drive, say
-  so and fall back to the backend path or `needs_more_info`.
+  so and fall back to the backend path. If no valid lane is available, report an
+  operational failure without a verdict handoff so the workflow retries; missing
+  browser/tool access is not `needs_more_info`.
 - **Backend/behavioral bugs** — create a session and drive turns via
   `sys_session_*`, or exercise the server's HTTP API directly, and capture the
   bad response / traceback / exit.
@@ -276,6 +285,13 @@ and observe the SPA's error/recovery UI (the error pill, retry, reconnect) — t
 observed error state is the reproduction, and the same test films it in Step 4.
 
 Judge **each sub-symptom** honestly and independently:
+
+**Global `needs_more_info` rule:** use it only for information absent from the
+complete ticket and linked reports. Never use it for work you did not finish,
+evidence you did not attempt to collect, a failed tool, missing credentials,
+unavailable compute/browser/app access, sandbox restrictions, timeout, crash, or
+any other execution problem. Those are workflow failures and must remain
+retryable rather than becoming a product verdict.
 
 - Failure reproduces → **`reproduced`**. Capture the evidence (snapshot, response,
   log excerpt).
@@ -409,6 +425,7 @@ choice:
      "caption": "open the model picker → select the catalog → picker shows raw IDs instead of names"}
   ],
   "recording_unavailable_reason": "",
+  "missing_information": [],
   "session_id": "dc59e331-...",
   "journey": "open model picker → select catalog → picker shows raw IDs",
   "evidence": "snapshot ref / response / log excerpt, plus root-cause leads"
@@ -431,6 +448,13 @@ Field meanings:
   relative. When multiple facets still reproduce, cover each live one; if you
   authored more than one file, make this an array of paths. Empty string if you
   authored none (e.g. `needs_more_info`).
+- `missing_information` — `[]` for `reproduced`, `not_reproduced`, and
+  `already_fixed`. For `needs_more_info`, a non-empty list of the concrete
+  product details absent from the full ticket and linked reports that prevent a
+  reproduction, such as the triggering user action, required input, expected
+  behavior, or affected surface. Operational failures, incomplete work, and
+  evidence you simply did not attempt to collect are invalid entries and must
+  not produce this verdict.
 - `session_id` — **this session** (in the app), from `sys_session_get_info`, so
   the fix step can replay how you reproduced it and you can browse it at
   `<server>/c/<session_id>`.
