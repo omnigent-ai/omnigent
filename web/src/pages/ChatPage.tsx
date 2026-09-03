@@ -4224,8 +4224,14 @@ function SubagentComposerTray({ label }: { label: string }) {
  * corner radius (CSS can't animate to an `auto` size), growing upward out of an
  * absolute layer over a hidden spacer so the composer below never shifts. A
  * count-only edge (older runner, no per-shell detail) stays a plain tally.
+ *
+ * The whole pill floats as an overlay pinned just above the composer (its form
+ * is `relative`, this is `bottom-full`) rather than taking a flow row — a
+ * reserved row would butt against the transcript's bottom overflow edge and
+ * clip the last line. Only the pill itself takes pointer events so the
+ * transcript underneath stays interactive.
  */
-function BackgroundTaskPill() {
+export function BackgroundTaskPill() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
   const bgTasks = useChatStore((s) => s.backgroundTasks);
   const [open, setOpen] = useState(false);
@@ -4249,96 +4255,104 @@ function BackgroundTaskPill() {
   const showCard = open && canExpand;
 
   return (
-    <div className={cn("mx-auto flex w-full px-1 pb-1.5", CHAT_COLUMN_WIDTH)}>
-      <div className="relative">
-        {/* Reserves the collapsed footprint so the absolute, upward-growing
+    // Floats above the composer instead of taking a flow row: a reserved row
+    // would butt against the transcript's bottom overflow edge and clip its
+    // last line. Pinned to the composer's top (bottom-full) and re-applying the
+    // form's px-4/md:px-6 inset so the pill lines up with the composer card.
+    // pointer-events-none lets the transcript underneath stay scrollable /
+    // selectable — only the pill itself re-enables them.
+    <div className="pointer-events-none absolute inset-x-0 bottom-full px-4 md:px-6">
+      <div className={cn("mx-auto flex w-full px-1 pb-1.5", CHAT_COLUMN_WIDTH)}>
+        <div className="pointer-events-auto relative">
+          {/* Reserves the collapsed footprint so the absolute, upward-growing
             card never shoves the composer. */}
-        <div aria-hidden className="invisible px-3 py-1.5 text-sm">
-          <div className="flex items-center gap-1.5 whitespace-nowrap">
-            <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
-            <span>
-              {bgCount} background task{bgCount === 1 ? "" : "s"}
-            </span>
+          <div aria-hidden className="invisible px-3 py-1.5 text-sm">
+            <div className="flex items-center gap-1.5 whitespace-nowrap">
+              <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
+              <span>
+                {bgCount} background task{bgCount === 1 ? "" : "s"}
+              </span>
+            </div>
           </div>
-        </div>
-        <div
-          role="status"
-          data-testid="background-task-pill"
-          aria-label={`${bgCount} background task${bgCount === 1 ? "" : "s"} still running`}
-          tabIndex={canExpand ? 0 : undefined}
-          // Hover opens ONLY for a real mouse. On touch, opening on emulated
-          // hover triggers iOS's "first tap reveals hover, second tap clicks"
-          // heuristic — which swallows the first tap inconsistently. Touch opens
-          // via onClick instead, so the first tap always lands.
-          onPointerEnter={(e) => {
-            if (e.pointerType === "mouse" && canExpand) setOpen(true);
-          }}
-          onPointerLeave={(e) => {
-            if (e.pointerType === "mouse") setOpen(false);
-          }}
-          // Tap/click: open and focus the pill so onBlur can close it on
-          // tap-out (a gesture-driven focus() works even on iOS, where tapping a
-          // non-button element otherwise won't focus it).
-          onClick={(e) => {
-            if (!canExpand) return;
-            setOpen(true);
-            e.currentTarget.focus({ preventScroll: true });
-          }}
-          onFocus={() => canExpand && setOpen(true)}
-          onBlur={(e) => {
-            // Close when focus leaves the pill entirely (tap/click outside,
-            // Tab away); staying open if it moves to a child.
-            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setOpen(false);
-          }}
-          style={box ? { width: box.width, height: box.height } : undefined}
-          className={cn(
-            "absolute bottom-0 left-0 overflow-hidden rounded-2xl bg-card text-sm shadow-sm ring-1 ring-border transition-[width,height,box-shadow] duration-200 ease-out",
-            showCard && "z-10 shadow-menu",
-          )}
-        >
           <div
-            ref={contentRef}
-            // Cap at Tailwind's `md` container (28rem/448px), but never wider
-            // than the viewport minus a margin so it can't overflow on a narrow
-            // screen. The margin exceeds the composer's own px-4/px-6 inset (this
-            // pill sits at px-1) so the card's right edge, ring included, stays
-            // inside the composer rather than overhanging it.
-            style={
-              showCard ? { maxWidth: "min(var(--container-md, 28rem), 100vw - 3rem)" } : undefined
-            }
-            className={cn("w-max text-left", showCard ? "px-3 py-2" : "px-3 py-1.5")}
-          >
-            {showCard ? (
-              <ul className="flex animate-in flex-col gap-1.5 fade-in-0 duration-200">
-                {bgTasks.map((task, i) => {
-                  const label = task.description || task.command || "Background shell";
-                  const cmd = task.command && task.command !== label ? task.command : null;
-                  return (
-                    <li key={task.id ?? i} className="flex items-start gap-2">
-                      <SquareTerminalIcon
-                        className="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
-                        aria-hidden="true"
-                      />
-                      <div className="min-w-0">
-                        <div className="truncate text-foreground">{label}</div>
-                        {cmd ? (
-                          <div className="truncate font-mono text-xs text-muted-foreground">
-                            {cmd}
-                          </div>
-                        ) : null}
-                      </div>
-                    </li>
-                  );
-                })}
-              </ul>
-            ) : (
-              <div className="flex items-center gap-1.5 whitespace-nowrap text-muted-foreground">
-                <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
-                <span>
-                  {bgCount} background task{bgCount === 1 ? "" : "s"}
-                </span>
-              </div>
+            role="status"
+            data-testid="background-task-pill"
+            aria-label={`${bgCount} background task${bgCount === 1 ? "" : "s"} still running`}
+            tabIndex={canExpand ? 0 : undefined}
+            // Hover opens ONLY for a real mouse. On touch, opening on emulated
+            // hover triggers iOS's "first tap reveals hover, second tap clicks"
+            // heuristic — which swallows the first tap inconsistently. Touch opens
+            // via onClick instead, so the first tap always lands.
+            onPointerEnter={(e) => {
+              if (e.pointerType === "mouse" && canExpand) setOpen(true);
+            }}
+            onPointerLeave={(e) => {
+              if (e.pointerType === "mouse") setOpen(false);
+            }}
+            // Tap/click: open and focus the pill so onBlur can close it on
+            // tap-out (a gesture-driven focus() works even on iOS, where tapping a
+            // non-button element otherwise won't focus it).
+            onClick={(e) => {
+              if (!canExpand) return;
+              setOpen(true);
+              e.currentTarget.focus({ preventScroll: true });
+            }}
+            onFocus={() => canExpand && setOpen(true)}
+            onBlur={(e) => {
+              // Close when focus leaves the pill entirely (tap/click outside,
+              // Tab away); staying open if it moves to a child.
+              if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setOpen(false);
+            }}
+            style={box ? { width: box.width, height: box.height } : undefined}
+            className={cn(
+              "absolute bottom-0 left-0 overflow-hidden rounded-2xl bg-card text-sm shadow-sm ring-1 ring-border transition-[width,height,box-shadow] duration-200 ease-out",
+              showCard && "z-10 shadow-menu",
             )}
+          >
+            <div
+              ref={contentRef}
+              // Cap at Tailwind's `md` container (28rem/448px), but never wider
+              // than the viewport minus a margin so it can't overflow on a narrow
+              // screen. The margin exceeds the composer's own px-4/px-6 inset (this
+              // pill sits at px-1) so the card's right edge, ring included, stays
+              // inside the composer rather than overhanging it.
+              style={
+                showCard ? { maxWidth: "min(var(--container-md, 28rem), 100vw - 3rem)" } : undefined
+              }
+              className={cn("w-max text-left", showCard ? "px-3 py-2" : "px-3 py-1.5")}
+            >
+              {showCard ? (
+                <ul className="flex animate-in flex-col gap-1.5 fade-in-0 duration-200">
+                  {bgTasks.map((task, i) => {
+                    const label = task.description || task.command || "Background shell";
+                    const cmd = task.command && task.command !== label ? task.command : null;
+                    return (
+                      <li key={task.id ?? i} className="flex items-start gap-2">
+                        <SquareTerminalIcon
+                          className="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
+                          aria-hidden="true"
+                        />
+                        <div className="min-w-0">
+                          <div className="truncate text-foreground">{label}</div>
+                          {cmd ? (
+                            <div className="truncate font-mono text-xs text-muted-foreground">
+                              {cmd}
+                            </div>
+                          ) : null}
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : (
+                <div className="flex items-center gap-1.5 whitespace-nowrap text-muted-foreground">
+                  <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
+                  <span>
+                    {bgCount} background task{bgCount === 1 ? "" : "s"}
+                  </span>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </div>
@@ -5240,7 +5254,10 @@ export function Composer({
   return (
     <form
       onSubmit={handleSubmit}
-      className={cn("chat-composer-form px-4 md:px-6", isTerminalFirst ? "pb-1.5" : "pb-3")}
+      className={cn(
+        "chat-composer-form relative px-4 md:px-6",
+        isTerminalFirst ? "pb-1.5" : "pb-3",
+      )}
     >
       {/* Hidden file input for the attach button */}
       <input
@@ -5258,9 +5275,9 @@ export function Composer({
         }}
       />
       {/* Background tasks that outlive the turn show as a pill, not the
-          "Working…" shimmer. Sits above the queued/sub-agent trays: those dock
-          onto the composer card with a negative margin, so nothing may come
-          between them and the card. Self-gates to null otherwise. */}
+          "Working…" shimmer. Floats as an overlay above the composer (the form
+          is `relative`) rather than a flow row, so it never clips the
+          transcript's last line. Self-gates to null otherwise. */}
       <BackgroundTaskPill />
       {/* Queued messages — peeks above the card like the sub-agent tray.
           Lists follow-ups held while the agent is busy; drains FIFO on idle.
