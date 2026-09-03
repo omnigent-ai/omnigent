@@ -7,7 +7,9 @@
 
 import { useEffect, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { isDatabricksWorkspace } from "@/lib/host";
 import { authenticatedFetch } from "@/lib/identity";
+import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import {
   browseLocationBase,
   browseLocationSegment,
@@ -98,31 +100,47 @@ export function fileContentToBlob(data: FileContentResponse): Blob {
  */
 export function triggerBrowserDownload(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob);
+  clickDownloadLink(url, filename);
+  URL.revokeObjectURL(url);
+}
+
+function clickDownloadLink(href: string, filename: string): void {
   const link = document.createElement("a");
-  link.href = url;
+  link.href = href;
   link.download = filename;
   document.body.append(link);
   link.click();
   link.remove();
-  URL.revokeObjectURL(url);
 }
 
 /**
- * Fetch a workspace file's complete bytes and trigger a browser download.
+ * Download a workspace file's complete bytes.
  *
  * Asks the filesystem endpoint for the raw file (`download=true`), which the
  * server streams with no size cap, rather than the viewer's JSON envelope,
  * which is truncated past the server's read cap.
  *
+ * In a browser this is a plain same-origin link click: the browser streams the
+ * attachment straight to disk and shows it in its download UI at once, and the
+ * session cookie or proxy identity header rides along as on any request. The
+ * managed embed owns the transport (auth headers, replica routing) and the
+ * mobile shells save http(s) downloads outside the WebView's session, so those
+ * fetch the bytes through `authenticatedFetch` and hand them over as a Blob,
+ * which only surfaces once the whole file has arrived.
+ *
  * :param conversationId: The session/conversation ID, e.g. ``"sess_abc123"``.
  * :param path: Workspace-relative file path, e.g. ``"src/main.py"``.
  */
 export async function downloadWorkspaceFile(conversationId: string, path: string): Promise<void> {
-  const res = await authenticatedFetch(
-    workspaceFileUrl(conversationId, path, { download: "true" }),
-  );
+  const url = workspaceFileUrl(conversationId, path, { download: "true" });
+  const filename = path.split("/").pop() ?? path;
+  if (!isDatabricksWorkspace() && !isIOSShell() && !isAndroidShell()) {
+    clickDownloadLink(url, filename);
+    return;
+  }
+  const res = await authenticatedFetch(url);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  triggerBrowserDownload(await res.blob(), path.split("/").pop() ?? path);
+  triggerBrowserDownload(await res.blob(), filename);
 }
 
 /**
