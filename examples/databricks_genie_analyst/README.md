@@ -16,7 +16,7 @@ does not mutate data):
 
 | Connector | Server | Transport | Auth |
 |---|---|---|---|
-| `genie` | Databricks-managed MCP (`/api/2.0/mcp/genie/<space-id>`) | `http` | OAuth via `databricks_profile` |
+| `genie` | Databricks-managed MCP (`/api/2.0/mcp/genie/<space-id>`) | `http` | OAuth via the tool's `auth:` block |
 
 ## Prerequisites
 
@@ -45,10 +45,25 @@ DATABRICKS_PROFILE=my-profile \
 
 ## Notes
 
-- The connector uses omnigent's built-in Databricks auth (`databricks_profile`):
-  it mints a short-lived OAuth bearer token per connection instead of hardcoding
-  one. If you'd rather pass a token explicitly, drop `databricks_profile` and set
-  `headers: { Authorization: "Bearer ${DATABRICKS_TOKEN}" }` instead.
+- The connector uses omnigent's built-in Databricks auth — the `auth:` block on
+  the `genie` tool in `config.yaml`:
+
+  ```yaml
+      auth:
+        type: databricks
+        profile: ${DATABRICKS_PROFILE}
+  ```
+
+  omnigent mints a short-lived OAuth bearer token per connection from that
+  profile instead of hardcoding one. If you'd rather pass a token explicitly,
+  **replace that `auth:` block** with an explicit header:
+
+  ```yaml
+      headers:
+        Authorization: Bearer ${DATABRICKS_TOKEN}
+  ```
+
+  Keep one or the other, not both.
 - The managed MCP URL follows the documented pattern
   `https://<workspace-hostname>/api/2.0/mcp/genie/<space-id>`; on-behalf-of-user
   auth uses the `genie` OAuth scope.

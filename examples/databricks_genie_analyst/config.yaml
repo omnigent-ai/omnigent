@@ -9,9 +9,9 @@
 #
 # The Genie space is reached through the Databricks-managed MCP server (no custom
 # connector code): a plain HTTP MCP endpoint whose URL embeds the Genie space id.
-# Auth is handled by `databricks_profile` — omnigent resolves an OAuth token from
-# ~/.databrickscfg at connection time and injects it as `Authorization: Bearer …`,
-# so no token is ever written into this file.
+# Auth is handled by the `auth:` block on the tool below — omnigent resolves an
+# OAuth token from ~/.databrickscfg at connection time and injects it as
+# `Authorization: Bearer …`, so no token is ever written into this file.
 #
 # Prerequisites:
 #   - A Databricks workspace on AWS with a Genie space you can query.
@@ -40,7 +40,7 @@ tools:
   # Databricks Genie — the managed MCP server for a single Genie space. The URL
   # follows the documented managed-MCP pattern:
   #   https://<workspace-hostname>/api/2.0/mcp/genie/<space-id>
-  # `databricks_profile` makes omnigent mint an OAuth bearer token from
+  # The `auth:` block below makes omnigent mint an OAuth bearer token from
   # ~/.databrickscfg at connect time (the `genie` scope) — nothing secret lives
   # in this config. The Genie MCP surface is inherently read-only: it answers
   # questions and returns SQL results; it does not mutate data.
