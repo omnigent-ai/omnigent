@@ -253,32 +253,43 @@ function NewTabMenu({
         <SuppressBrowserView />
         <DropdownMenuLabel>Open new</DropdownMenuLabel>
         {multipleShells ? (
-          // Several types → the "Shell (default)" row both launches the default
-          // (on click) and opens a flyout of the OTHER types (on hover / chevron).
-          // Picking one launches it and remembers it as the new default.
-          <DropdownMenuSub>
-            <DropdownMenuSubTrigger
+          // Several types → one visual row with TWO hit targets: a real
+          // launch item (keeps native keyboard/touch/disabled semantics) that
+          // launches the default, and a trailing chevron that opens a flyout of
+          // the OTHER types. Overloading a single sub-trigger with both actions
+          // would make the default launch mouse-only and skip the disabled
+          // guard (Radix fires the sub-trigger's onClick before its disabled
+          // check), so the two actions stay separate controls.
+          <div className="flex items-stretch">
+            <DropdownMenuItem
+              onSelect={() => launchShell(defaultShell)}
               disabled={shellDisabled}
-              onClick={() => launchShell(defaultShell)}
-              className="cursor-pointer"
+              className="flex-1 cursor-pointer"
             >
               {shellItemContent}
-            </DropdownMenuSubTrigger>
-            {/* min-w-0 drops the default 96px floor so the box hugs the shell
-                name (e.g. "bash") instead of padding it out. */}
-            <DropdownMenuSubContent className="min-w-0">
-              {otherShells.map((name) => (
-                <DropdownMenuItem
-                  key={name}
-                  onSelect={() => pickShell(name)}
-                  disabled={shellDisabled}
-                  className="cursor-pointer"
-                >
-                  {name}
-                </DropdownMenuItem>
-              ))}
-            </DropdownMenuSubContent>
-          </DropdownMenuSub>
+            </DropdownMenuItem>
+            <DropdownMenuSub>
+              <DropdownMenuSubTrigger
+                aria-label="Other shells"
+                disabled={shellDisabled}
+                className="cursor-pointer px-1.5"
+              />
+              {/* min-w-0 drops the default 96px floor so the box hugs the shell
+                  name (e.g. "bash") instead of padding it out. */}
+              <DropdownMenuSubContent className="min-w-0">
+                {otherShells.map((name) => (
+                  <DropdownMenuItem
+                    key={name}
+                    onSelect={() => pickShell(name)}
+                    disabled={shellDisabled}
+                    className="cursor-pointer"
+                  >
+                    {name}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>
+          </div>
         ) : (
           // Single type → a plain launch item.
           <DropdownMenuItem

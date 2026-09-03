@@ -448,7 +448,7 @@ describe('WorkspacePanel "+" new-tab menu', () => {
   it("names the current default in the Shell item and launches it on click when several are declared", async () => {
     // Multiple declared terminals → the "Shell" item names the default inline
     // ("Shell (zsh)") and clicking it launches that default; the OTHER types
-    // live in its flyout.
+    // live behind a separate "Other shells" chevron.
     useSessionAgentMock.mockReturnValue({
       data: { terminals: ["zsh", "bash", "fish"] },
     } as unknown as ReturnType<typeof useSessionAgent>);
@@ -481,6 +481,62 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(screen.getByRole("button", { name: "Open new" })).not.toHaveFocus();
   });
 
+  it("launches the default from the keyboard (Enter) on the multi-shell row", async () => {
+    // The default-launch control is a real menuitem, so keyboard activation
+    // (Enter/Space) fires it — it must NOT be a submenu trigger, whose open
+    // keys would only reveal the flyout and never launch.
+    useSessionAgentMock.mockReturnValue({
+      data: { terminals: ["zsh", "bash", "fish"] },
+    } as unknown as ReturnType<typeof useSessionAgent>);
+    const created = { id: "terminal_zsh_s1", name: "zsh", session: "u-2", running: true };
+    const mutate = vi.fn((_name: string, opts?: { onSuccess?: (info: unknown) => void }) =>
+      opts?.onSuccess?.(created),
+    );
+    useCreateTerminalMock.mockReturnValue({
+      mutate,
+      isPending: false,
+      isError: false,
+    } as unknown as ReturnType<typeof useCreateTerminal>);
+
+    const { openTerminalTab } = renderWorkspace({ showBrowserTab: false });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    const shellItem = await screen.findByRole("menuitem", { name: /shell \(zsh\)/i });
+    // Radix menuitems select on keydown Enter — same path Enter takes when the
+    // item is focused via arrow keys.
+    shellItem.focus();
+    fireEvent.keyDown(shellItem, { key: "Enter" });
+
+    expect(mutate).toHaveBeenCalledWith("zsh", expect.any(Object));
+    expect(openTerminalTab).toHaveBeenCalledWith("terminal:terminal_zsh_s1");
+  });
+
+  it("does not launch on the multi-shell row when the session is offline", async () => {
+    // The launch item is disabled on an offline session, so neither a click nor
+    // keyboard activation may fire a create — the split-out menuitem (not a
+    // sub-trigger) is what preserves this guard.
+    useSessionAgentMock.mockReturnValue({
+      data: { terminals: ["zsh", "bash", "fish"] },
+    } as unknown as ReturnType<typeof useSessionAgent>);
+    const mutate = vi.fn();
+    useCreateTerminalMock.mockReturnValue({
+      mutate,
+      isPending: false,
+      isError: false,
+    } as unknown as ReturnType<typeof useCreateTerminal>);
+
+    renderWorkspace({ liveness: { kind: "local_stranded" } });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    const shellItem = await screen.findByRole("menuitem", { name: /shell \(zsh\)/i });
+    expect(shellItem).toHaveTextContent(/offline/i);
+    expect(shellItem).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(shellItem);
+    shellItem.focus();
+    fireEvent.keyDown(shellItem, { key: "Enter" });
+    expect(mutate).not.toHaveBeenCalled();
+  });
+
   it("lists only the OTHER types in the flyout and remembers a pick as the new default (persisted)", async () => {
     window.localStorage.removeItem("omnigent:preferred-shell");
     useSessionAgentMock.mockReturnValue({
@@ -495,12 +551,12 @@ describe('WorkspacePanel "+" new-tab menu', () => {
 
     renderWorkspace({ showBrowserTab: false });
 
-    // Open the "Shell (zsh)" flyout (ArrowRight). It lists only the non-default
-    // types — zsh is already named in the row itself.
+    // Open the flyout via the separate "Other shells" chevron (ArrowRight). It
+    // lists only the non-default types — zsh is already named in the row.
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
-    const shellItem = await screen.findByRole("menuitem", { name: /shell \(zsh\)/i });
-    shellItem.focus();
-    fireEvent.keyDown(shellItem, { key: "ArrowRight" });
+    const otherShells = await screen.findByRole("menuitem", { name: "Other shells" });
+    otherShells.focus();
+    fireEvent.keyDown(otherShells, { key: "ArrowRight" });
     expect(await screen.findByRole("menuitem", { name: /^bash$/i })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /^fish$/i })).toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: /^zsh$/i })).toBeNull();
