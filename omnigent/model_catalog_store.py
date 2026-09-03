@@ -255,7 +255,7 @@ def _refresh_in_background(
     _inflight[key] = asyncio.create_task(_run(), name=f"model-catalog-refresh-{harness}")
 
 
-async def refresh_catalog(
+async def reprobe_catalog(
     harness: str,
     fingerprint: str,
     resolve: Callable[[], Awaitable[list[dict[str, Any]] | None]],
@@ -315,6 +315,6 @@ __all__ = [
     "ensure_catalog",
     "fingerprint_of",
     "read_catalog",
-    "refresh_catalog",
+    "reprobe_catalog",
     "write_catalog",
 ]

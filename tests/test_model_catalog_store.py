@@ -134,7 +134,7 @@ async def test_ensure_catalog_stale_refresh_failure_keeps_serving() -> None:
     assert await store.ensure_catalog("claude-native", "abc123", _probe) == _ROWS
 
 
-async def test_refresh_catalog_joins_the_background_probe_and_persists() -> None:
+async def test_reprobe_catalog_joins_the_background_probe_and_persists() -> None:
     """
     An awaited refresh reuses the stale hit's in-flight probe and returns its rows.
     """
@@ -148,13 +148,13 @@ async def test_refresh_catalog_joins_the_background_probe_and_persists() -> None
         return refreshed
 
     assert await store.ensure_catalog("claude-native", "abc123", _probe) == _ROWS
-    assert await store.refresh_catalog("claude-native", "abc123", _probe) == refreshed
+    assert await store.reprobe_catalog("claude-native", "abc123", _probe) == refreshed
     assert probes == [1], "the awaited refresh must join the probe already in flight"
     assert store.read_catalog("claude-native", "abc123") == refreshed
     assert store.catalog_is_stale("claude-native", "abc123") is False
 
 
-async def test_refresh_catalog_failure_returns_none_and_keeps_serving() -> None:
+async def test_reprobe_catalog_failure_returns_none_and_keeps_serving() -> None:
     """
     A failed awaited refresh reports ``None`` and leaves the stored rows alone.
     """
@@ -163,7 +163,7 @@ async def test_refresh_catalog_failure_returns_none_and_keeps_serving() -> None:
     async def _probe() -> list[dict[str, object]]:
         raise OSError("provider unreachable")
 
-    assert await store.refresh_catalog("claude-native", "abc123", _probe) is None
+    assert await store.reprobe_catalog("claude-native", "abc123", _probe) is None
     assert store.read_catalog("claude-native", "abc123") == _ROWS
 
 

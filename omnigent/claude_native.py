@@ -1262,7 +1262,7 @@ async def claude_launch_catalog(
     )
 
 
-async def claude_refreshed_launch_catalog(
+async def claude_reprobed_launch_catalog(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> list[dict[str, object]] | None:
     """
@@ -1278,7 +1278,7 @@ async def claude_refreshed_launch_catalog(
     from omnigent import model_catalog_store
 
     fingerprint = claude_catalog_fingerprint(claude_config)
-    return await model_catalog_store.refresh_catalog(
+    return await model_catalog_store.reprobe_catalog(
         "claude-native", fingerprint, lambda: claude_model_catalog(claude_config)
     )
 

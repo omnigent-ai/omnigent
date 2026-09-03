@@ -6849,7 +6849,7 @@ async def _auto_create_claude_terminal(
             claude_launch_catalog,
             claude_launch_catalog_is_stale,
             claude_launch_endpoint_label,
-            claude_refreshed_launch_catalog,
+            claude_reprobed_launch_catalog,
         )
         from omnigent.model_catalog_store import default_row
 
@@ -6887,7 +6887,7 @@ async def _auto_create_claude_terminal(
             # failed probe leaves no trusted rows at all.
             trusted_rows: list[dict[str, object]] | None = launch_catalog
             if launch_catalog_was_stale and not _serves_pick(launch_catalog):
-                trusted_rows = await claude_refreshed_launch_catalog(claude_config)
+                trusted_rows = await claude_reprobed_launch_catalog(claude_config)
                 if trusted_rows:
                     launch_catalog = trusted_rows
                     launch_catalog_was_stale = False

@@ -3672,7 +3672,7 @@ async def test_auto_create_claude_terminal_refreshes_a_stale_catalog_before_rese
     from omnigent.claude_native import claude_catalog_fingerprint
     from tests.runner.conftest import (
         REAL_CLAUDE_LAUNCH_CATALOG,
-        REAL_CLAUDE_REFRESHED_LAUNCH_CATALOG,
+        REAL_CLAUDE_REPROBED_LAUNCH_CATALOG,
     )
 
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
@@ -3688,8 +3688,8 @@ async def test_auto_create_claude_terminal_refreshes_a_stale_catalog_before_rese
     )
     monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG)
     monkeypatch.setattr(
-        "omnigent.claude_native.claude_refreshed_launch_catalog",
-        REAL_CLAUDE_REFRESHED_LAUNCH_CATALOG,
+        "omnigent.claude_native.claude_reprobed_launch_catalog",
+        REAL_CLAUDE_REPROBED_LAUNCH_CATALOG,
     )
     stale_rows = [
         {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
