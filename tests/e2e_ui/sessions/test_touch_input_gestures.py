@@ -184,19 +184,25 @@ def test_session_row_swipe_shows_affordance(
         row_link = page.locator(f'a[href="/c/{session_id}"]')
         expect(row_link).to_be_visible()
 
-        # Baseline the row's transforms, then sample them every frame so any
-        # gesture-driven translation during the swipe is caught.
+        # Baseline the row's transforms and margins, then sample them every
+        # frame so any gesture-driven movement during the swipe is caught. The
+        # swipe surface tracks the finger via margin (not transform), so a
+        # transform-only probe would never see the row move.
         page.evaluate(
             """(sessionId) => {
                 const link = document.querySelector(`a[href="/c/${sessionId}"]`);
                 const row = link.closest('li') ?? link;
-                const targets = [row, link];
-                const baseline = targets.map((el) => getComputedStyle(el).transform);
+                const surface = row.querySelector('[data-testid="conversation-swipe-surface"]');
+                const targets = [row, link, surface].filter(Boolean);
+                const probe = (el) => {
+                    const s = getComputedStyle(el);
+                    return `${s.transform}|${s.marginLeft}|${s.marginRight}`;
+                };
+                const baseline = targets.map(probe);
                 window.__swipeProbe = { moved: false, raf: 0 };
                 const sample = () => {
                     targets.forEach((el, i) => {
-                        const t = getComputedStyle(el).transform;
-                        if (t !== baseline[i]) window.__swipeProbe.moved = true;
+                        if (probe(el) !== baseline[i]) window.__swipeProbe.moved = true;
                     });
                     window.__swipeProbe.raf = requestAnimationFrame(sample);
                 };
