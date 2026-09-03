@@ -1585,18 +1585,28 @@ def _preregister_agent(  # type: ignore[explicit-any]  # agent_store / artifact_
     # prior task — which makes the next ``--continue``
     # filter by ``agent_id`` return zero conversations and
     # exit ``"No prior conversation for agent ..."``. Update
-    # the bundle in place and only refresh
-    # ``bundle_location`` when the content hash actually
-    # changed so the row stays stable across no-op restarts.
+    # the bundle in place and refresh separately stored metadata
+    # whenever it drifts. A metadata-only refresh matters for rows
+    # written by versions that updated the bundle pointer but left
+    # ``description`` stale.
     bundle_hash = hashlib.sha256(bundle_bytes).hexdigest()
     existing = agent_store.get_by_name(spec.name)
     if existing is not None:
-        new_loc = f"{existing.id}/{bundle_hash}"
-        # Sha-segment compare: legacy rows keep an ``ag_``-prefixed left
-        # segment (physical artifact key); only the sha encodes content.
-        if existing.bundle_location.rsplit("/", 1)[-1] != bundle_hash:
+        location_prefix, current_hash = existing.bundle_location.rsplit("/", 1)
+        new_loc = f"{location_prefix}/{bundle_hash}"
+        # Legacy rows may keep an ``ag_``-prefixed physical artifact key.
+        # Preserve that prefix and compare only the content-addressed suffix.
+        bundle_changed = current_hash != bundle_hash
+        description_changed = existing.description != spec.description
+        if bundle_changed:
             artifact_store.put(new_loc, bundle_bytes)
-            agent_store.update(existing.id, bundle_location=new_loc)
+        if bundle_changed or description_changed:
+            agent_store.update(
+                existing.id,
+                bundle_location=(new_loc if bundle_changed else existing.bundle_location),
+                description=spec.description,
+            )
+        if bundle_changed:
             # Swap the cache's extracted bundle in lockstep. Without
             # this, ``AgentCache.load`` will hit Tier 2 (disk —
             # ``cache_dir/<agent_id>/``) on the next request and

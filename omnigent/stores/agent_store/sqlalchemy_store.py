@@ -21,7 +21,11 @@ from omnigent.db.utils import (
     now_epoch,
 )
 from omnigent.entities import Agent, PagedList
-from omnigent.stores.agent_store import AgentStore
+from omnigent.stores.agent_store import (
+    _UNSET_DESCRIPTION,
+    AgentStore,
+    _UnsetDescription,
+)
 
 
 class SqlAlchemyAgentStore(AgentStore):
@@ -280,15 +284,19 @@ class SqlAlchemyAgentStore(AgentStore):
         self,
         agent_id: str,
         bundle_location: str,
+        *,
+        description: str | None | _UnsetDescription = _UNSET_DESCRIPTION,
     ) -> Agent | None:
         """
-        Update an agent's bundle location, bump version, and set
-        ``updated_at``.
+        Update an agent's bundle location and optional description,
+        bump version, and set ``updated_at``.
 
         :param agent_id: Unique agent identifier,
             e.g. ``"agent_abc123"``.
         :param bundle_location: New artifact store key for the
             bundle, e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
+        :param description: Replacement description. Omit to preserve
+            the existing description; pass ``None`` to clear it.
         :returns: The updated :class:`Agent`, or ``None`` if not
             found.
         """
@@ -297,6 +305,8 @@ class SqlAlchemyAgentStore(AgentStore):
             if not row:
                 return None
             row.bundle_location = bundle_location
+            if not isinstance(description, _UnsetDescription):
+                row.description = description
             row.version = row.version + 1
             row.updated_at = now_epoch()
         # Reverse lookup targets the AP DB — see _session_id_for_agent.
