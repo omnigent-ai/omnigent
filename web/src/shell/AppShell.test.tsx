@@ -56,6 +56,14 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   useWorkspaceChangedFiles: vi.fn(() => ({ data: undefined, isLoading: true })),
 }));
 
+// AppShell reads the GitHub info to gate the rail's GitHub tab; keep it
+// loading here (tab visible, matching the Files gate's no-flash default) so
+// no network-backed query fires. Tab visibility itself is covered in
+// AppShell.githubTabVisibility.test.tsx.
+vi.mock("@/hooks/useGithub", () => ({
+  useGithubInfo: vi.fn(() => ({ data: undefined, isLoading: true })),
+}));
+
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module (childSessionsQueryKey, MAX_TREE_DEPTH,
   // cachedTreeContains) — only the hook is replaced.
