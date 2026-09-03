@@ -87,16 +87,28 @@ export function useRunnerHealth(
     // /health when it's already returning 5xx.
     let nextDelayMs = POLL_INTERVAL_MS;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    // Retires the running chain when returning to the tab starts a fresh one,
+    // so an in-flight poll can't leave a second timer behind.
+    let generation = 0;
 
-    async function poll() {
+    async function poll(gen: number) {
+      if (cancelled || gen !== generation) return;
+      // A hidden tab shows no liveness badges, so the request buys nothing —
+      // skip it and re-check on the next tick. This is not a failure, so the
+      // error backoff is left alone. Returning to the tab polls immediately
+      // (see below), so nothing is stale by the time it's visible again.
+      if (typeof document !== "undefined" && document.hidden) {
+        timer = setTimeout(() => void poll(gen), POLL_INTERVAL_MS);
+        return;
+      }
       let success = false;
       try {
         const param = ids.join(",");
         const resp = await authenticatedFetch(`/health?session_ids=${encodeURIComponent(param)}`);
-        if (cancelled) return;
+        if (cancelled || gen !== generation) return;
         if (resp.ok) {
           const body = (await resp.json()) as BatchHealthResponse;
-          if (cancelled) return;
+          if (cancelled || gen !== generation) return;
           if (body.sessions) {
             const next = new Map<string, SessionLiveness>();
             for (const id of ids) {
@@ -116,18 +128,35 @@ export function useRunnerHealth(
       } catch {
         // Network error — leave current state unchanged.
       }
-      if (cancelled) return;
+      if (cancelled || gen !== generation) return;
       if (success) {
         nextDelayMs = POLL_INTERVAL_MS;
       } else {
         nextDelayMs = Math.min(nextDelayMs * 2, POLL_MAX_INTERVAL_MS);
       }
-      timer = setTimeout(() => void poll(), nextDelayMs);
+      timer = setTimeout(() => void poll(gen), nextDelayMs);
     }
 
-    void poll();
+    // Back on screen: poll now rather than waiting out the tick the hidden
+    // branch scheduled, so liveness is current the moment it's visible. Also
+    // clears any accumulated backoff — a fresh look deserves a fresh attempt.
+    function onVisibilityChange() {
+      if (cancelled || document.hidden) return;
+      if (timer !== null) clearTimeout(timer);
+      generation += 1;
+      nextDelayMs = POLL_INTERVAL_MS;
+      void poll(generation);
+    }
+
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisibilityChange);
+    }
+    void poll(generation);
     return () => {
       cancelled = true;
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+      }
       if (timer !== null) clearTimeout(timer);
     };
   }, [sessions]);

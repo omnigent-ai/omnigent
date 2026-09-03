@@ -118,3 +118,89 @@ describe("useRunnerHealth", () => {
     expect(result.current.size).toBe(0);
   });
 });
+
+// A hidden tab renders no liveness badges, so the poll has nothing to keep
+// fresh. Every other poller in the app is a react-query `refetchInterval`,
+// which already stands down when the window loses focus; this hand-rolled
+// loop is the one that didn't.
+describe("useRunnerHealth — hidden tab", () => {
+  // Hoisted so `renderHook` re-renders keep the same array identity, matching
+  // how RunnerHealthProvider passes its memoized `fallbackSet`. An inline
+  // literal would re-fire the effect on every state update the poll causes.
+  const SESSIONS: RunnerHealthInput[] = [{ id: "conv_a", runner_id: null }];
+
+  function setHidden(hidden: boolean) {
+    Object.defineProperty(document, "hidden", { value: hidden, configurable: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+  }
+
+  afterEach(() => {
+    Object.defineProperty(document, "hidden", { value: false, configurable: true });
+  });
+
+  it("skips the request entirely while the tab is hidden", async () => {
+    Object.defineProperty(document, "hidden", { value: true, configurable: true });
+    renderHook(() => useRunnerHealth(SESSIONS));
+
+    // Give the effect and any microtasks a chance to fire a request.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20);
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("polls immediately on returning to the tab, without waiting out the tick", async () => {
+    Object.defineProperty(document, "hidden", { value: true, configurable: true });
+    fetchMock.mockResolvedValue(mockHealth({ conv_a: { runner_online: true } }));
+    const { result } = renderHook(() => useRunnerHealth(SESSIONS));
+
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20);
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    // Becoming visible must not wait out the 10s tick the hidden branch
+    // scheduled — otherwise liveness reads stale right when the user looks.
+    setHidden(false);
+    await waitFor(() => expect(result.current.get("conv_a")?.runner_online).toBe(true));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a single poll chain across repeated visibility flips", async () => {
+    fetchMock.mockResolvedValue(mockHealth({ conv_a: { runner_online: true } }));
+    const { result } = renderHook(() => useRunnerHealth(SESSIONS));
+    await waitFor(() => expect(result.current.size).toBe(1));
+
+    const before = fetchMock.mock.calls.length;
+
+    // Each return to the tab retires the previous chain rather than adding
+    // one, so N flips must not leave N timers polling in parallel.
+    for (let i = 0; i < 3; i++) {
+      setHidden(true);
+      setHidden(false);
+    }
+
+    // Exactly one poll per wake-up, and it stays there once things settle —
+    // a duplicated chain would keep climbing past this.
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(before + 3));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 50);
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(before + 3);
+  });
+
+  it("stops listening for visibility changes after unmount", async () => {
+    fetchMock.mockResolvedValue(mockHealth({ conv_a: { runner_online: true } }));
+    const { result, unmount } = renderHook(() => useRunnerHealth(SESSIONS));
+    await waitFor(() => expect(result.current.size).toBe(1));
+    const callsAtUnmount = fetchMock.mock.calls.length;
+
+    unmount();
+    setHidden(true);
+    setHidden(false);
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20);
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(callsAtUnmount);
+  });
+});
