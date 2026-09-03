@@ -26,9 +26,6 @@
 import { TerminalIcon, XIcon } from "lucide-react";
 import type { CSSProperties } from "react";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
-const TerminalView = lazy(() =>
-  import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
-);
 import { Button } from "@/components/ui/button";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
@@ -37,6 +34,10 @@ import { cn } from "@/lib/utils";
 import { NewTerminalButton } from "./NewTerminalButton";
 import { TerminalStatusBadge } from "./terminalStatus";
 import { useTerminalSplit } from "./useTerminalSplit";
+
+const TerminalView = lazy(() =>
+  import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
+);
 
 interface TerminalsPanelProps {
   open: boolean;

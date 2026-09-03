@@ -15,9 +15,6 @@
 
 import { Loader2Icon, TerminalIcon, XIcon } from "lucide-react";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
-const TerminalView = lazy(() =>
-  import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
-);
 import { Button } from "@/components/ui/button";
 import {
   AGENT_TERMINAL_IDS,
@@ -28,6 +25,10 @@ import {
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { TerminalStatusBadge } from "./terminalStatus";
 import { useTerminalStatuses } from "./useTerminalStatuses";
+
+const TerminalView = lazy(() =>
+  import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
+);
 
 interface MainTerminalViewProps {
   conversationId: string;

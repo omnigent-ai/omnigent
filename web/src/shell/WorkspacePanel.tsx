@@ -15,6 +15,8 @@ import {
 import {
   type CSSProperties,
   type ReactElement,
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useRef,
@@ -34,10 +36,6 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { lazy, Suspense } from "react";
-const TerminalView = lazy(() =>
-  import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
-);
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
@@ -52,6 +50,10 @@ import { SubagentsPanel } from "./SubagentsPanel";
 import { useTerminalStatuses } from "./useTerminalStatuses";
 import { type RightRailTab, TAB_BADGE_BASE } from "./railTabs";
 import { Button } from "../components/ui/button";
+
+const TerminalView = lazy(() =>
+  import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
+);
 
 function WorkspaceTabTooltip({
   label,
