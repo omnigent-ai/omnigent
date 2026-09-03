@@ -25,7 +25,9 @@
 //
 // Submit is gated on EVERY question having an answer (a predefined
 // option selected, or the custom row selected with non-empty text).
-// ⌘/Ctrl+Enter is the keyboard equivalent of the primary button.
+// The keyboard equivalent of the primary button is whichever send
+// chord the composers use — the General setting picks between plain
+// Enter and ⌘/Ctrl+Enter.
 // Selections are gathered into a flat ``{[question id or text]:
 // answer}`` map matching MCP's ``ElicitResult.content`` shape and
 // passed to ``onSubmit``.
@@ -33,7 +35,10 @@
 import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-react";
 import { type ChangeEvent, type KeyboardEvent, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import type { ClaudeQuestion } from "@/lib/askUserQuestion";
+import { isComposerSendKey, readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 
 /**
@@ -85,6 +90,14 @@ function questionKey(question: ClaudeQuestion): string {
 }
 
 export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQuestionFormProps) {
+  // Same send chord as the composers: the General setting decides whether
+  // plain Enter or Mod+Enter submits, and a touch device keeps Enter as a
+  // newline because the Submit button is the only gesture it has.
+  const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
+  const isMobileViewport = useIsMobileViewport();
+  const isCoarsePointer = useIsCoarsePointer();
+  const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
+
   // Currently-visible question (carousel index).
   const [currentIndex, setCurrentIndex] = useState(0);
 
@@ -199,11 +212,30 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
   const isFirst = currentIndex === 0;
   const isLast = currentIndex === questions.length - 1;
 
-  // ⌘/Ctrl+Enter mirrors the primary button: advance the carousel, or
-  // submit on the last question. Plain Enter stays a newline.
+  // The composer's send chord mirrors the primary button: advance the
+  // carousel, or submit on the last question. Anything else types.
   const handleKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
-    if (e.key !== "Enter" || !(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
     if (isImeCompositionKeyEvent(e)) return;
+    // A focused button keeps its native Enter activation. With plain Enter as
+    // the send key, swallowing it here would submit instead of Cancel/Prev/Next.
+    const hasMod = e.metaKey || e.ctrlKey;
+    if (!hasMod && e.target instanceof HTMLElement && e.target.closest("button")) return;
+    if (
+      !isComposerSendKey(
+        {
+          key: e.key,
+          shiftKey: e.shiftKey,
+          metaKey: e.metaKey,
+          ctrlKey: e.ctrlKey,
+          altKey: e.altKey,
+          isComposing: e.nativeEvent.isComposing,
+        },
+        submitWithModEnter,
+        preventsKeyboardSubmit,
+      )
+    ) {
+      return;
+    }
     e.preventDefault();
     if (!isLast) {
       setCurrentIndex((i) => i + 1);

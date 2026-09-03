@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import { useChatStore } from "@/store/chatStore";
 import { ApprovalCard } from "./ApprovalCard";
 
@@ -558,8 +559,31 @@ describe("ApprovalCard — multi-choice options", () => {
 
 describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", () => {
   beforeEach(() => {
+    localStorage.clear();
     useChatStore.setState({ conversationId: "conv_abc", blocks: [] });
   });
+
+  afterEach(() => {
+    localStorage.clear();
+  });
+
+  /** Report a coarse (touch) pointer until the returned restore runs. */
+  function forceCoarsePointer(): () => void {
+    const original = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: query.includes("pointer: coarse"),
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    })) as typeof window.matchMedia;
+    return () => {
+      window.matchMedia = original;
+    };
+  }
 
   const sampleSinglePreview =
     'AskUserQuestion({"questions": [{"question": "Which framework?", ' +
@@ -1137,9 +1161,10 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     expect(screen.queryByText(/wants to call/)).toBeNull();
   });
 
-  it("submits a typed answer on Cmd/Ctrl+Enter", () => {
+  it("submits a typed answer on the default send key (plain Enter)", () => {
     // You are already typing in the custom row, so the Submit button
-    // is the only mouse move in an otherwise keyboard flow.
+    // is the only mouse move in an otherwise keyboard flow. The chord
+    // follows the composer setting, which defaults to plain Enter.
     const submitSpy = vi.fn().mockResolvedValue(undefined);
     useChatStore.setState({ submitApproval: submitSpy } as Partial<
       ReturnType<typeof useChatStore.getState>
@@ -1160,16 +1185,16 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
 
     const input = screen.getByTestId("ask-user-question-custom-input");
     fireEvent.change(input, { target: { value: "Solid" } });
-    fireEvent.keyDown(input, { key: "Enter", metaKey: true });
+    fireEvent.keyDown(input, { key: "Enter" });
 
     expect(submitSpy).toHaveBeenCalledWith("elic_key_submit", "accept", {
       "Which framework?": "Solid",
     });
   });
 
-  it("leaves plain Enter as a newline in the custom-answer row", () => {
-    // The row is a multi-line textarea, so bare Enter must keep
-    // inserting a newline rather than sending a half-written answer.
+  it("leaves Shift+Enter as a newline in the custom-answer row", () => {
+    // The row is a multi-line textarea, so the newline chord must keep
+    // inserting rather than sending a half-written answer.
     const submitSpy = vi.fn().mockResolvedValue(undefined);
     useChatStore.setState({ submitApproval: submitSpy } as Partial<
       ReturnType<typeof useChatStore.getState>
@@ -1190,12 +1215,12 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
 
     const input = screen.getByTestId("ask-user-question-custom-input");
     fireEvent.change(input, { target: { value: "Solid" } });
-    fireEvent.keyDown(input, { key: "Enter" });
+    fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
 
     expect(submitSpy).not.toHaveBeenCalled();
   });
 
-  it("does not submit on Cmd/Ctrl+Enter while a question is unanswered", () => {
+  it("does not submit on the send key while a question is unanswered", () => {
     // Same gating as the disabled Submit button — a shortcut that
     // bypasses it would send ``null`` for the untouched question.
     const submitSpy = vi.fn().mockResolvedValue(undefined);
@@ -1216,15 +1241,12 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
       />,
     );
 
-    fireEvent.keyDown(screen.getByTestId("ask-user-question-custom-input"), {
-      key: "Enter",
-      metaKey: true,
-    });
+    fireEvent.keyDown(screen.getByTestId("ask-user-question-custom-input"), { key: "Enter" });
 
     expect(submitSpy).not.toHaveBeenCalled();
   });
 
-  it("advances the carousel on Cmd/Ctrl+Enter when more questions remain", () => {
+  it("advances the carousel on the send key when more questions remain", () => {
     // Mirrors the visible button: Next is the primary action until
     // the last slide, where Submit takes over.
     render(
@@ -1256,15 +1278,12 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
       />,
     );
 
-    fireEvent.keyDown(screen.getByTestId("ask-user-question-custom-input"), {
-      key: "Enter",
-      ctrlKey: true,
-    });
+    fireEvent.keyDown(screen.getByTestId("ask-user-question-custom-input"), { key: "Enter" });
 
     expect(screen.getByTestId("ask-user-question-progress").textContent).toBe("Question 2 of 2:");
   });
 
-  it("ignores Cmd/Ctrl+Enter raised mid-IME-composition", () => {
+  it("ignores the send key raised mid-IME-composition", () => {
     // Committing a CJK candidate can surface as an Enter keydown;
     // treating it as submit sends the answer mid-word.
     const submitSpy = vi.fn().mockResolvedValue(undefined);
@@ -1287,9 +1306,107 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
 
     const input = screen.getByTestId("ask-user-question-custom-input");
     fireEvent.change(input, { target: { value: "リアクト" } });
-    fireEvent.keyDown(input, { key: "Enter", metaKey: true, isComposing: true });
+    fireEvent.keyDown(input, { key: "Enter", isComposing: true });
 
     expect(submitSpy).not.toHaveBeenCalled();
+  });
+
+  it("leaves Enter on a card button to that button's native activation", () => {
+    // The handler sits on the card, so plain Enter reaches it even from a
+    // focused button. Swallowing it there would submit the answer instead
+    // of running Cancel.
+    const submitSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ submitApproval: submitSpy } as Partial<
+      ReturnType<typeof useChatStore.getState>
+    >);
+
+    render(
+      <ApprovalCard
+        elicitationId="elic_key_button"
+        message="Claude wants to call AskUserQuestion"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview={sampleSinglePreview}
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+      />,
+    );
+
+    fireEvent.change(screen.getByTestId("ask-user-question-custom-input"), {
+      target: { value: "Solid" },
+    });
+    fireEvent.keyDown(screen.getByRole("button", { name: /cancel/i }), { key: "Enter" });
+
+    expect(submitSpy).not.toHaveBeenCalled();
+  });
+
+  it("submits on Mod+Enter, not plain Enter, once the setting is on", () => {
+    // The card reads the same General setting as the composers, so the
+    // two never disagree about which chord sends.
+    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
+    const submitSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ submitApproval: submitSpy } as Partial<
+      ReturnType<typeof useChatStore.getState>
+    >);
+
+    render(
+      <ApprovalCard
+        elicitationId="elic_key_mod"
+        message="Claude wants to call AskUserQuestion"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview={sampleSinglePreview}
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+      />,
+    );
+
+    const input = screen.getByTestId("ask-user-question-custom-input");
+    fireEvent.change(input, { target: { value: "Solid" } });
+
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(submitSpy).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(input, { key: "Enter", metaKey: true });
+    expect(submitSpy).toHaveBeenCalledWith("elic_key_mod", "accept", {
+      "Which framework?": "Solid",
+    });
+  });
+
+  it("keeps both chords inert on a touch device", () => {
+    // An on-screen keyboard's Enter is the only newline key there is, so
+    // Submit stays the one gesture that sends.
+    const restorePointer = forceCoarsePointer();
+    try {
+      const submitSpy = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ submitApproval: submitSpy } as Partial<
+        ReturnType<typeof useChatStore.getState>
+      >);
+
+      render(
+        <ApprovalCard
+          elicitationId="elic_key_touch"
+          message="Claude wants to call AskUserQuestion"
+          phase="pre_tool_use"
+          policyName="claude_native_permission"
+          contentPreview={sampleSinglePreview}
+          requestedSchema={{}}
+          status="pending"
+          response={null}
+        />,
+      );
+
+      const input = screen.getByTestId("ask-user-question-custom-input");
+      fireEvent.change(input, { target: { value: "Solid" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      fireEvent.keyDown(input, { key: "Enter", metaKey: true });
+
+      expect(submitSpy).not.toHaveBeenCalled();
+    } finally {
+      restorePointer();
+    }
   });
 });
 
