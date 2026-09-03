@@ -10,11 +10,14 @@
 // the sidebar — so the store is just a persisted, viewport-clamped width.
 
 import { useCallback, useEffect, useReducer, useRef } from "react";
-import { createResizableWidthStore, useResizableWidthSnapshot } from "@/hooks/resizableWidthStore";
+import {
+  arrowResizeDelta,
+  createPersistedWidthStore,
+  useResizableWidthSnapshot,
+} from "@/hooks/resizableWidthStore";
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
 import { useResizeDrag } from "@/hooks/useResizeDrag";
-import { MD_MIN_WIDTH_QUERY, isMobileViewport, subscribeMatchMedia } from "@/lib/breakpoints";
-import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
+import { isMobileViewport, subscribeMdBreakpoint } from "@/lib/breakpoints";
 
 // The default gives conversation titles room before truncating. The floor keeps
 // controls usable; the viewport-relative ceiling preserves the main content.
@@ -62,13 +65,11 @@ function clamp(w: number): number {
 // Module-level width store (independent of the inline panel / push-panel stores)
 // ---------------------------------------------------------------------------
 
-const widthStore = createResizableWidthStore(readPanelSizePreference("sidebarWidthPx"), (width) =>
-  writePanelSizePreference("sidebarWidthPx", width),
-);
+const widthStore = createPersistedWidthStore("sidebarWidthPx");
 
 /** Reset module-level state. Only for use in tests. */
 export function resetSidebarWidthStoreForTesting(): void {
-  widthStore.reset(readPanelSizePreference("sidebarWidthPx"));
+  widthStore.resetForTesting();
 }
 
 // ---------------------------------------------------------------------------
@@ -102,21 +103,14 @@ export function useResizableSidebar() {
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
-  // Cancellation (Escape, blur, …) restores the width the drag started from —
-  // onMove writes the live store on every pointermove, so without the
-  // snapshot an aborted drag would keep the dragged width on screen while the
-  // persisted preference still held the old one.
-  const dragStartWidth = useRef<number | null>(null);
   const dragDirection = useRef<"ltr" | "rtl">("ltr");
   const resizeDrag = useResizeDrag({
     onStart: useCallback((event: React.PointerEvent<HTMLElement>) => {
-      dragStartWidth.current = widthStore.getSnapshot();
+      widthStore.beginDrag();
       dragDirection.current =
         getComputedStyle(event.currentTarget).direction === "rtl" ? "rtl" : "ltr";
     }, []),
-    onCancel: useCallback(() => {
-      widthStore.set(dragStartWidth.current);
-    }, []),
+    onCancel: widthStore.rollbackDrag,
     onCommit: widthStore.persist,
     onMove: useCallback((e: React.PointerEvent<HTMLElement>) => {
       const inlineStartDistance =
@@ -134,7 +128,7 @@ export function useResizableSidebar() {
   const cancelResizeDrag = resizeDrag.cancelDrag;
   useEffect(
     () =>
-      subscribeMatchMedia([MD_MIN_WIDTH_QUERY], () => {
+      subscribeMdBreakpoint(() => {
         if (isMobileViewport()) cancelResizeDrag();
       }),
     [cancelResizeDrag],
@@ -142,15 +136,9 @@ export function useResizableSidebar() {
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
-      const step = 20;
       // Right edge of a left panel: ArrowRight widens, ArrowLeft narrows.
-      if (e.key === "ArrowRight") {
-        e.preventDefault();
-        widthStore.set((prev) => clamp((prev ?? width) + step), true);
-      } else if (e.key === "ArrowLeft") {
-        e.preventDefault();
-        widthStore.set((prev) => clamp((prev ?? width) - step), true);
-      }
+      const delta = arrowResizeDelta(e, "ArrowRight");
+      if (delta !== null) widthStore.set((prev) => clamp((prev ?? width) + delta), true);
     },
     [width],
   );

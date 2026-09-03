@@ -486,7 +486,6 @@ export function useRowGesture({
       const deltaX = event.clientX - gesture.startX;
       const deltaY = event.clientY - gesture.startY;
       const moved = event.clientX !== gesture.lastX || event.clientY !== gesture.lastY;
-      recordMovementSample(gesture, event.clientX, event.timeStamp);
       gesture.lastX = event.clientX;
       gesture.lastY = event.clientY;
 
@@ -510,6 +509,9 @@ export function useRowGesture({
         return;
       }
       if (gesture.phase === "drag" || gesture.phase === "scroll") return;
+      // Velocity only matters to the swipe commit, so sample it once the
+      // armed / drag / scroll phases (which never read it) are ruled out.
+      recordMovementSample(gesture, event.clientX, event.timeStamp);
       if (gesture.phase === "swipe") {
         // Reversing past the origin crosses into the other direction, which may
         // be configured inert. Rest the row there and stop claiming the gesture,

@@ -314,6 +314,7 @@ import { useForkDialog } from "./ForkDialogContext";
 import { useChatStore } from "@/store/chatStore";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { ErrorBanner } from "@/components/blocks/StatusBlocks";
+import { stubMatchMedia } from "@/test-helpers/matchMedia";
 
 /**
  * Test-only consumer of the TerminalFirstContext provided by AppShell.
@@ -674,33 +675,11 @@ function withWindowOrigin(origin: string, run: () => void) {
   }
 }
 
-// Evaluate min-/max-width media queries against a simulated viewport width,
-// so each test runs at an explicit real-browser width instead of inheriting
-// the global test-setup mock (which answers false to every query).
-function stubViewportWidth(width: number) {
-  Object.defineProperty(window, "matchMedia", {
-    writable: true,
-    configurable: true,
-    value: (query: string) => ({
-      matches: (() => {
-        const min = query.match(/^\(min-width: ([\d.]+)px\)$/);
-        if (min) return width >= parseFloat(min[1]);
-        const max = query.match(/^\(max-width: ([\d.]+)px\)$/);
-        if (max) return width <= parseFloat(max[1]);
-        return false;
-      })(),
-      media: query,
-      addEventListener: () => {},
-      removeEventListener: () => {},
-    }),
-  });
-}
-
 beforeEach(() => {
   // Default to a mobile width: these suites were written against a sidebar
   // that starts closed. Tests that need desktop semantics (hover peek)
   // re-pin a desktop width themselves.
-  stubViewportWidth(375);
+  stubMatchMedia({ width: 375 });
   runnerHealthState.runnerOnline = undefined;
   useConvMock.mockReset();
   useTerminalsMock.mockReset();
@@ -2051,7 +2030,7 @@ describe("Workspace rail maximize", () => {
     // pointerleave, so the card used to sit open indefinitely.
     // Hover peek is a desktop affordance; at a desktop width the sidebar
     // starts open, so collapse it first to expose the peek trigger.
-    stubViewportWidth(1280);
+    stubMatchMedia({ width: 1280 });
     mockConversations([{ id: "conv_abc", permission_level: null }]);
     renderShell("/c/conv_abc");
     fireEvent.keyDown(document, { code: "BracketLeft", metaKey: true, altKey: true });
@@ -2072,7 +2051,7 @@ describe("Workspace rail maximize", () => {
     // the entire point of peeking — closes it.
     // Same desktop setup as above: collapse the open-by-default sidebar to
     // expose the peek trigger.
-    stubViewportWidth(1280);
+    stubMatchMedia({ width: 1280 });
     mockConversations([{ id: "conv_abc", permission_level: null }]);
     renderShell("/c/conv_abc");
     fireEvent.keyDown(document, { code: "BracketLeft", metaKey: true, altKey: true });
@@ -3240,7 +3219,7 @@ describe("Right workspace card visibility", () => {
   });
 
   it("aborts an active resize when the workspace panel closes", () => {
-    stubViewportWidth(1440);
+    stubMatchMedia({ width: 1440 });
     vi.stubGlobal("innerWidth", 1440);
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null, home: null },
