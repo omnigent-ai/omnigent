@@ -552,6 +552,31 @@ async def test_runner_restart_replays_continued_turn_with_stale_receipt(
 
 
 @pytest.mark.asyncio
+async def test_runner_restart_recovers_text_less_final_turn_as_no_output(
+    _clean_subagent_registry: None,
+) -> None:
+    """The newest assistant message wins even without text, as in live delivery.
+
+    Walking past it to an older message would surface a previous turn's text
+    as this turn's result.
+    """
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    child_items = [
+        {"type": "message", "role": "assistant", "content": []},
+        _CHILD_RESULT_ITEM,
+    ]
+    app = create_runner_app(
+        server_client=_RecoveryServerClient([_child_summary()], child_items=child_items),  # type: ignore[arg-type]
+    )
+
+    await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+
+    payload = runner_app._session_inboxes_ref[PARENT_SESSION_ID].get_nowait()
+    assert payload["status"] == "completed"
+    assert payload["output"] == ""
+
+
+@pytest.mark.asyncio
 async def test_runner_restart_recovers_failed_child_error(
     _clean_subagent_registry: None,
 ) -> None:

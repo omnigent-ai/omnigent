@@ -1360,37 +1360,58 @@ async def _session_turn_actor(
     return actor if isinstance(actor, str) and actor else None
 
 
-async def _stamp_subagent_dispatch(
-    server_client: httpx.AsyncClient, child_session_id: str, work_id: str
+async def _patch_subagent_label(
+    server_client: httpx.AsyncClient, child_session_id: str, key: str, value: str
 ) -> str | None:
     """
-    Record a continued child turn's dispatch id on the child session.
+    Write one runner-owned sub-agent label on a child session.
 
-    A new child carries the id in its create body; a continued child keeps
-    its session, so the new turn's id is written before the message is
-    posted. The parent's ``sys_read_inbox`` drain writes the matching
-    delivered-id receipt, which is how a runner restart tells a drained
-    turn from a lost one. Failing here aborts the send: a missing stamp
-    would let the previous turn's receipt mask this turn's result.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param child_session_id: Child session id, e.g. ``"conv_abc123"``.
+    :param key: Label key, e.g. ``"omnigent.subagent.dispatch_id"``.
+    :param value: Label value, e.g. ``"subagent_a1b2c3d4e5f6"``.
+    :returns: A short failure description, or ``None`` on success.
+    """
+    try:
+        resp = await server_client.patch(
+            f"/v1/sessions/{child_session_id}",
+            json={"labels": {key: value}},
+            timeout=30.0,
+        )
+    except httpx.HTTPError as exc:
+        return f"{type(exc).__name__}: {exc}"
+    if resp.status_code >= 400:
+        return f"{resp.status_code} {resp.text[:200]}"
+    return None
+
+
+async def _record_subagent_receipt(
+    server_client: httpx.AsyncClient, child_session_id: str, work_id: str
+) -> None:
+    """
+    Mark a dispatch id as one that will never be delivered as a new result.
+
+    Written when the parent drains the turn's result, and when a continued
+    turn was stamped but its send failed. Best effort: a lost receipt costs
+    one duplicate delivery after a runner restart, whereas a lost result
+    would never reach the parent.
 
     :param server_client: HTTP client pointed at the Omnigent server.
     :param child_session_id: Child session id, e.g. ``"conv_abc123"``.
     :param work_id: Dispatch id, e.g. ``"subagent_a1b2c3d4e5f6"``.
-    :returns: A parent-visible error string, or ``None`` on success.
+    :returns: None.
     """
     from omnigent.runner import app as _runner_app
 
-    try:
-        resp = await server_client.patch(
-            f"/v1/sessions/{child_session_id}",
-            json={"labels": {_runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: work_id}},
-            timeout=30.0,
+    error = await _patch_subagent_label(
+        server_client, child_session_id, _runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY, work_id
+    )
+    if error is not None:
+        _logger.warning(
+            "Failed to record sub-agent delivery receipt for child=%s: %s",
+            child_session_id,
+            error,
         )
-    except httpx.HTTPError as exc:
-        return f"Error: failed to record sub-agent dispatch: {type(exc).__name__}: {exc}"
-    if resp.status_code >= 400:
-        return f"Error: failed to record sub-agent dispatch: {resp.status_code} {resp.text[:200]}"
-    return None
 
 
 async def _post_child_message_event(
@@ -1627,17 +1648,23 @@ async def _teardown_failed_child(
     also reclaims any files copied into it before the failure — leaving an
     empty child behind would poison a retry with the same ``(agent, title)``
     (the next send would attach to the phantom instead of spawning clean)
-    and orphan the copied file rows. Used on both the copy/content failure
-    and the message-post failure paths so they tear down identically.
+    and orphan the copied file rows. A continued child keeps its session,
+    so its already-stamped dispatch id gets a delivery receipt instead;
+    otherwise a runner restart would replay the previous turn's result as
+    this turn's. Used on both the copy/content failure and the
+    message-post failure paths so they tear down identically.
 
     :returns: ``None`` when no server cleanup was needed or cleanup
         succeeded, otherwise a parent-visible warning string.
     """
     from omnigent.runner import app as _runner_app
 
+    entry = _runner_app.get_subagent_work(child_session_id)
     _runner_app.unregister_child_session(child_session_id)
     _runner_app.unregister_subagent_work(child_session_id)
     if not created_child:
+        if entry is not None:
+            await _record_subagent_receipt(server_client, child_session_id, entry.work_id)
         return None
 
     last_error = ""
@@ -2586,6 +2613,15 @@ async def _execute_subagent_tool(
     # title/tool/session_name are known here (we set the title above), so
     # even a cold status update carries a display name. Cleaned up when
     # the child session ends.
+    if not created_child:
+        # A new child carries this turn's id in its create body; a continued
+        # child keeps its session, so the id is written first. A missing
+        # stamp would let the previous turn's receipt mask this turn's result.
+        stamp_error = await _patch_subagent_label(
+            server_client, child_session_id, _runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
+        )
+        if stamp_error is not None:
+            return f"Error: failed to record sub-agent dispatch: {stamp_error}"
     _runner_app.register_child_session(
         child_session_id,
         parent_session_id=conversation_id,
@@ -2602,11 +2638,6 @@ async def _execute_subagent_tool(
         created_by=dispatch_created_by,
         work_id=work_id,
     )
-    if not created_child:
-        stamp_error = await _stamp_subagent_dispatch(server_client, child_session_id, work_id)
-        if stamp_error is not None:
-            await _teardown_failed_child(server_client, child_session_id, created_child=False)
-            return stamp_error
     _publish_child_launching_update(
         parent_session_id=conversation_id,
         child_session_id=child_session_id,
@@ -2770,6 +2801,12 @@ async def _send_to_existing_session(
             f"Error: session {target_session_id!r} is already running; "
             "wait for completion before sending again"
         )
+    work_id = _runner_app.new_subagent_work_id()
+    stamp_error = await _patch_subagent_label(
+        server_client, target_session_id, _runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
+    )
+    if stamp_error is not None:
+        return f"Error: failed to record sub-agent dispatch: {stamp_error}"
     _runner_app.register_child_session(
         target_session_id,
         parent_session_id=conversation_id,
@@ -2777,19 +2814,15 @@ async def _send_to_existing_session(
         tool=agent_label,
         session_name=parsed.title or "",
     )
-    entry = _runner_app.register_subagent_work(
+    _runner_app.register_subagent_work(
         parent_session_id=conversation_id,
         child_session_id=target_session_id,
         agent=agent_label,
         title=parsed.title or "",
         wrapper_label=_session_wrapper_label(snap_data),
         created_by=created_by,
+        work_id=work_id,
     )
-    stamp_error = await _stamp_subagent_dispatch(server_client, target_session_id, entry.work_id)
-    if stamp_error is not None:
-        _runner_app.unregister_child_session(target_session_id)
-        _runner_app.unregister_subagent_work(target_session_id)
-        return stamp_error
     _publish_child_launching_update(
         parent_session_id=conversation_id,
         child_session_id=target_session_id,
@@ -2807,12 +2840,10 @@ async def _send_to_existing_session(
             created_by=created_by,
         )
     except httpx.HTTPError as exc:
-        _runner_app.unregister_child_session(target_session_id)
-        _runner_app.unregister_subagent_work(target_session_id)
+        await _teardown_failed_child(server_client, target_session_id, created_child=False)
         return f"Error: failed to send message to child: {type(exc).__name__}: {exc}"
     if msg_resp.status_code >= 400:
-        _runner_app.unregister_child_session(target_session_id)
-        _runner_app.unregister_subagent_work(target_session_id)
+        await _teardown_failed_child(server_client, target_session_id, created_child=False)
         return (
             f"Error: failed to send message to child: {msg_resp.status_code} {msg_resp.text[:200]}"
         )
@@ -7468,27 +7499,8 @@ async def _cleanup_drained_subagent_work(
         work_id=work_id,
         remember_drained_delivery=True,
     )
-    if server_client is None:
-        return
-    try:
-        resp = await server_client.patch(
-            f"/v1/sessions/{child_id}",
-            json={"labels": {_runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY: work_id}},
-            timeout=30.0,
-        )
-    except httpx.HTTPError:
-        _logger.warning(
-            "Failed to record sub-agent delivery receipt for child=%s",
-            child_id,
-            exc_info=True,
-        )
-        return
-    if resp.status_code >= 400:
-        _logger.warning(
-            "Sub-agent delivery receipt for child=%s returned %d",
-            child_id,
-            resp.status_code,
-        )
+    if server_client is not None:
+        await _record_subagent_receipt(server_client, child_id, work_id)
 
 
 async def _drain_inbox(

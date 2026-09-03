@@ -1795,8 +1795,9 @@ async def _fetch_latest_assistant_text(
 
     :param server_client: HTTP client connected to the Omnigent server.
     :param session_id: Session to read, e.g. ``"conv_child456"``.
-    :returns: Joined text blocks of the newest assistant message, or
-        ``None`` when the transcript holds no assistant text.
+    :returns: Joined text blocks of the newest assistant message (empty when
+        that message carries no text, matching live delivery), or ``None``
+        when the transcript holds no assistant message.
     :raises _SubagentRecoveryReadError: When a page read fails.
     """
     params: dict[str, str] = {"limit": "100", "order": "desc"}
@@ -1805,13 +1806,11 @@ async def _fetch_latest_assistant_text(
         for item in page.get("data", []):
             if item.get("type") != "message" or item.get("role") != "assistant":
                 continue
-            parts = [
+            return "\n".join(
                 block["text"]
                 for block in item.get("content", [])
                 if block.get("type") in {"output_text", "text"} and block.get("text")
-            ]
-            if parts:
-                return "\n".join(parts)
+            )
         if not page.get("has_more") or not page.get("last_id"):
             return None
         params["after"] = page["last_id"]
