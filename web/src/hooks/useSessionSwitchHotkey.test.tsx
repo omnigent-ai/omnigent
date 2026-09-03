@@ -136,6 +136,16 @@ describe("useSessionSwitchHotkey", () => {
     expect(navigate).not.toHaveBeenCalled();
   });
 
+  it("does not navigate behind an open command palette", () => {
+    render(ids, "a");
+    const input = document.createElement("input");
+    input.setAttribute("cmdk-input", "");
+    document.body.appendChild(input);
+    input.focus();
+    press("BracketRight", { metaKey: true }, input);
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
   it("yields when a focused widget already claimed the chord", () => {
     render(ids, "a");
     const menu = document.createElement("div");

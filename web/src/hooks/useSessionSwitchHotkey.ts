@@ -14,8 +14,8 @@ import { useEffect, useRef } from "react";
 import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
 import { useNavigate } from "@/lib/routing";
 
-/** Selector for surfaces that own ⌘[ / ⌘] and must keep them (terminals, editor). */
-const HOTKEY_OWNING_SURFACES = ".xterm, .monaco-editor";
+/** Surfaces that keep bracket chords or must not navigate behind an overlay. */
+const HOTKEY_OWNING_SURFACES = ".xterm, .monaco-editor, [cmdk-input]";
 
 /**
  * @param orderedIds Conversation ids in sidebar render order, visible sections
