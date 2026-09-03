@@ -177,11 +177,11 @@ describe("Warm terminal-surface LRU", () => {
   it("moves a revisited session to the most-recent end without duplicating it", () => {
     const warmed = updateWarmTerminalSurfaces(
       [
-        { conversationId: "conv_a", readOnly: false },
-        { conversationId: "conv_b", readOnly: false },
+        { conversationId: "conv_a", permissionLevel: null },
+        { conversationId: "conv_b", permissionLevel: null },
       ],
       "conv_a",
-      false,
+      null,
     );
     expect(warmed.map((e) => e.conversationId)).toEqual(["conv_b", "conv_a"]);
   });
@@ -190,7 +190,7 @@ describe("Warm terminal-surface LRU", () => {
     const ids = Array.from({ length: MAX_WARM_TERMINAL_SURFACES + 1 }, (_, i) => `conv_${i}`);
     let warmed: WarmTerminalEntry[] = [];
     for (const id of ids) {
-      warmed = updateWarmTerminalSurfaces(warmed, id, false);
+      warmed = updateWarmTerminalSurfaces(warmed, id, null);
     }
     // The oldest fell out: its hidden surface unmounts and its attach is
     // disposed, keeping the cache from accumulating a tmux attach for
@@ -199,20 +199,20 @@ describe("Warm terminal-surface LRU", () => {
     expect(warmed).toHaveLength(MAX_WARM_TERMINAL_SURFACES);
   });
 
-  it("refreshes the readOnly snapshot for the re-inserted session only", () => {
+  it("refreshes the permission snapshot for the re-inserted session only", () => {
     // Permission hydrates late for the active session; a warm background
     // session must keep the snapshot from when IT was active.
     const warmed = updateWarmTerminalSurfaces(
       [
-        { conversationId: "conv_a", readOnly: true },
-        { conversationId: "conv_b", readOnly: false },
+        { conversationId: "conv_a", permissionLevel: 1 },
+        { conversationId: "conv_b", permissionLevel: null },
       ],
       "conv_b",
-      true,
+      2,
     );
     expect(warmed).toEqual([
-      { conversationId: "conv_a", readOnly: true },
-      { conversationId: "conv_b", readOnly: true },
+      { conversationId: "conv_a", permissionLevel: 1 },
+      { conversationId: "conv_b", permissionLevel: 2 },
     ]);
   });
 });

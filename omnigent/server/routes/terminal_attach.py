@@ -51,18 +51,23 @@ When the URL has ``?read_only=true``, binary input frames are dropped
 silently at the server *and* the runner. The tmux control-mode client is also
 marked read-only so tmux refuses input from this attachment.
 
-Write attach is owner-only
---------------------------
+Write attach is gated per terminal kind
+---------------------------------------
 
 A terminal is a single shared PTY driving one process that runs as the
-session owner. Raw keystroke bytes carry no per-user identity, so input
-typed by anyone other than the owner would be acted on — and, for the
-agent's TUI, persisted into conversation history — as if the owner typed
-it. To keep that attribution honest, an *interactive* (write) attach
-requires ``LEVEL_OWNER``; non-owners can only attach read-only and drive
-the agent through the chat composer, which carries the real sender's
-identity. This holds uniformly for the agent's own terminal and for
-user-launched shells, since both attach through this route.
+session owner, and raw keystroke bytes carry no per-user identity. How
+strictly input is gated follows what typing there can do:
+
+- **The agent's own pane** (the SDK REPL / native vendor terminal):
+  input is acted on — and persisted into conversation history — as if
+  the owner typed it. To keep that attribution honest, an *interactive*
+  (write) attach requires ``LEVEL_OWNER``; non-owners attach read-only
+  and drive the agent through the chat composer, which carries the real
+  sender's identity.
+- **User-launched shells**: typing is workspace mutation, the same power
+  edit-level collaborators already hold (they can open and close these
+  shells, and run agent turns that execute commands). An interactive
+  attach requires ``LEVEL_EDIT``; read-level viewers attach read-only.
 """
 
 from __future__ import annotations
@@ -77,12 +82,13 @@ from starlette import status
 
 from omnigent.debug_logging import debug_event
 from omnigent.errors import OmnigentError
+from omnigent.native_coding_agents import is_agent_terminal_resource_id
 from omnigent.runtime import (
     get_runner_ws_factory,
     get_terminal_registry,
 )
 from omnigent.server._runner_ws_tunnel import WrongReplicaWSError
-from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
@@ -154,6 +160,7 @@ def create_terminal_attach_router(
         await _authorize_terminal_attach(
             websocket,
             session_id=session_id,
+            terminal_id=terminal_id,
             read_only=read_only,
             auth_provider=auth_provider,
             permission_store=permission_store,
@@ -279,6 +286,7 @@ async def _authorize_terminal_attach(
     websocket: WebSocket,
     *,
     session_id: str,
+    terminal_id: str,
     read_only: bool,
     auth_provider: AuthProvider | None,
     permission_store: PermissionStore | None,
@@ -288,23 +296,26 @@ async def _authorize_terminal_attach(
     Authorize a terminal-attach WebSocket before accepting it.
 
     Interactive attaches write bytes to the shared PTY, which runs as the
-    session owner and (for the agent's TUI) persists input into history
-    under the owner's identity. Raw keystrokes carry no per-user
-    attribution, so an interactive attach requires ``LEVEL_OWNER`` — only
-    the owner can drive the terminal. Read-only attaches still expose
-    terminal output, so read access is the minimum; non-owners attach
-    read-only and send input through the chat composer (which carries the
-    real sender's identity). When permissions are disabled
-    (``permission_store is None``), preserve the existing
+    session owner, and raw keystrokes carry no per-user attribution. The
+    required level follows the terminal kind (see the module docstring):
+    the agent's own pane persists input into history under the owner's
+    identity, so its interactive attach requires ``LEVEL_OWNER``; a
+    user-launched shell is workspace mutation that edit collaborators
+    already hold, so ``LEVEL_EDIT`` suffices. Read-only attaches expose
+    terminal output only, so read access is the minimum. When permissions
+    are disabled (``permission_store is None``), preserve the existing
     single-user/dev behavior.
 
     :param websocket: The incoming FastAPI :class:`WebSocket`, used to
         resolve the caller's identity via *auth_provider*.
     :param session_id: Session/conversation identifier the attach
         targets, e.g. ``"conv_abc123"``.
+    :param terminal_id: Opaque terminal resource id the attach targets,
+        used to distinguish the agent's own pane from user shells.
     :param read_only: ``True`` for a view-only attach (requires
         ``LEVEL_READ``); ``False`` for an interactive write attach
-        (requires ``LEVEL_OWNER``).
+        (requires ``LEVEL_OWNER`` on the agent pane, ``LEVEL_EDIT`` on
+        a user shell).
     :param auth_provider: Provider used to resolve the caller's user id
         from the WebSocket handshake. Required when *permission_store*
         is set.
@@ -331,7 +342,12 @@ async def _authorize_terminal_attach(
             reason="authentication required",
         )
 
-    required_level = LEVEL_READ if read_only else LEVEL_OWNER
+    if read_only:
+        required_level = LEVEL_READ
+    elif is_agent_terminal_resource_id(terminal_id):
+        required_level = LEVEL_OWNER
+    else:
+        required_level = LEVEL_EDIT
     try:
         await require_access(
             user_id,

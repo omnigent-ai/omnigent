@@ -425,16 +425,55 @@ async def test_attach_terminal_allows_owner_for_interactive_proxy() -> None:
     assert b"whoami\n" in conn.received
 
 
-async def test_attach_terminal_edit_grant_denied_write_allowed_read_only() -> None:
-    """A non-owner edit collaborator cannot type but may observe.
+async def test_attach_user_shell_edit_grant_allows_interactive() -> None:
+    """An edit collaborator may type into a shared user shell.
 
-    A terminal is a single shared PTY whose keystrokes carry no
-    per-user identity, so input is acted on (and, for the agent's TUI,
-    persisted into history) as the owner. Holding *edit* on someone
-    else's session is therefore not enough to drive their terminal: an
-    interactive attach by Bob (edit on Alice's session) is refused
-    before the runner proxy is dialed, while a read-only attach is
-    allowed so Bob can still watch.
+    Typing into a user-launched shell is workspace mutation — the same
+    power edit collaborators already hold (they can open/close these
+    shells and run agent turns that execute commands). Without this,
+    a shared shell is unresponsive to every non-owner: output streams
+    but keystrokes are silently dropped.
+    """
+    conv_store = _StubConversationStore()
+    conv_store.add("conv_alice")
+    perm_store = _StubPermissionStore()
+    perm_store.add_grant("alice@example.com", "conv_alice", LEVEL_OWNER)
+    perm_store.add_grant("bob@example.com", "conv_alice", LEVEL_EDIT)
+    app = FastAPI()
+    app.include_router(
+        create_terminal_attach_router(
+            auth_provider=UnifiedAuthProvider(source="header"),
+            permission_store=perm_store,  # type: ignore[arg-type]
+            conversation_store=conv_store,  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+    conn = _FakeRunnerWSConn(wait_close_after=1)
+    factory = _FakeRunnerWSFactory(conn)
+    set_runner_ws_factory(factory)
+
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/conv_alice/resources/terminals/terminal_bash_s1/attach",
+        headers={"X-Forwarded-Email": "bob@example.com"},
+    ) as ws:
+        ws.send_bytes(b"echo hi\n")
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_bytes()
+
+    assert factory.calls == [
+        "/v1/sessions/conv_alice/resources/terminals/terminal_bash_s1/attach?read_only=false"
+    ]
+    assert b"echo hi\n" in conn.received
+
+
+async def test_attach_agent_pane_edit_grant_denied_write_allowed_read_only() -> None:
+    """The agent's own pane stays owner-only for interactive attaches.
+
+    Input typed into the agent pane is acted on — and persisted into
+    conversation history — as the owner, so holding *edit* on someone
+    else's session is not enough to drive it: an interactive attach by
+    Bob (edit on Alice's session) is refused before the runner proxy is
+    dialed, while a read-only attach is allowed so Bob can still watch.
     """
     conv_store = _StubConversationStore()
     conv_store.add("conv_alice")
@@ -453,27 +492,29 @@ async def test_attach_terminal_edit_grant_denied_write_allowed_read_only() -> No
 
     interactive_factory = _FakeRunnerWSFactory(_FakeRunnerWSConn())
     set_runner_ws_factory(interactive_factory)
-    with pytest.raises(WebSocketDisconnect) as exc_info:
-        with TestClient(app).websocket_connect(
-            "/v1/sessions/conv_alice/resources/terminals/terminal_bash_s1/attach",
-            headers={"X-Forwarded-Email": "bob@example.com"},
-        ):
-            pass
-    assert exc_info.value.code == 1008
+    # Both session shapes' agent panes: the SDK REPL and a native vendor pane.
+    for agent_pane in ("terminal_tui_main", "terminal_claude_main"):
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with TestClient(app).websocket_connect(
+                f"/v1/sessions/conv_alice/resources/terminals/{agent_pane}/attach",
+                headers={"X-Forwarded-Email": "bob@example.com"},
+            ):
+                pass
+        assert exc_info.value.code == 1008
     assert interactive_factory.calls == []
 
     readonly_conn = _FakeRunnerWSConn(outgoing=[b"output"])
     readonly_factory = _FakeRunnerWSFactory(readonly_conn)
     set_runner_ws_factory(readonly_factory)
     with TestClient(app).websocket_connect(
-        "/v1/sessions/conv_alice/resources/terminals/terminal_bash_s1/attach?read_only=true",
+        "/v1/sessions/conv_alice/resources/terminals/terminal_tui_main/attach?read_only=true",
         headers={"X-Forwarded-Email": "bob@example.com"},
     ) as ws:
         assert ws.receive_bytes() == b"output"
         with pytest.raises(WebSocketDisconnect):
             ws.receive_bytes()
     assert readonly_factory.calls == [
-        "/v1/sessions/conv_alice/resources/terminals/terminal_bash_s1/attach?read_only=true"
+        "/v1/sessions/conv_alice/resources/terminals/terminal_tui_main/attach?read_only=true"
     ]
 
 

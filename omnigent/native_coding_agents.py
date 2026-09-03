@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from omnigent._platform import installed_interactive_shells
+from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_plugins import (
     ANTIGRAVITY_NATIVE_CODING_AGENT,
@@ -89,6 +90,30 @@ def native_coding_agent_for_wrapper_label(wrapper: str | None) -> NativeCodingAg
 def native_coding_agent_for_terminal_name(name: str | None) -> NativeCodingAgent | None:
     """Return the native coding-agent metadata for *name*, if any."""
     return _BY_TERMINAL_NAME.get(name or "")
+
+
+# Terminal resource ids of the AGENT's own pane, one per session shape: the
+# embedded Omnigent REPL (``tui``/``main``) for SDK sessions and each native
+# wrapper's vendor pane (``claude``/``main``, ``codex``/``main``, ...).
+# Input typed here is acted on — and persisted into conversation history — as
+# the session owner, so write access is gated more strictly than user shells.
+# Mirrors the web UI's ``AGENT_TERMINAL_IDS`` (web/src/hooks/useTerminals.ts);
+# the two sets must agree or the UI offers input the server refuses.
+AGENT_TERMINAL_RESOURCE_IDS: frozenset[str] = frozenset(
+    {terminal_resource_id("tui", "main")}
+    | {terminal_resource_id(agent.terminal_name, "main") for agent in NATIVE_CODING_AGENTS}
+)
+
+
+def is_agent_terminal_resource_id(terminal_id: str) -> bool:
+    """Return whether *terminal_id* addresses the agent's own terminal pane.
+
+    :param terminal_id: Opaque terminal resource id,
+        e.g. ``"terminal_claude_main"`` or ``"terminal_zsh_u-1a2b3c"``.
+    :returns: ``True`` for the agent pane of any session shape; ``False``
+        for user-launched shells.
+    """
+    return terminal_id in AGENT_TERMINAL_RESOURCE_IDS
 
 
 def native_shell_terminal_spec() -> dict[str, dict[str, object]]:

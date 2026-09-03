@@ -158,6 +158,27 @@ describe("control-mode terminal", () => {
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
     expect(screen.queryByTestId("terminal-selection-hint")).toBeNull();
   });
+
+  it("shows a view-only badge on a connected read-only attach", async () => {
+    // Without the badge a read-only terminal looks broken: output streams
+    // but keystrokes are silently dropped with no feedback.
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" readOnly />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    expect(screen.queryByTestId("terminal-read-only-badge")).toBeNull();
+    act(() => {
+      terminalSessionMock.instances[0].onState({ kind: "connected" });
+    });
+    expect(screen.getByTestId("terminal-read-only-badge")).toHaveTextContent("View only");
+  });
+
+  it("shows no view-only badge on an interactive attach", async () => {
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    act(() => {
+      terminalSessionMock.instances[0].onState({ kind: "connected" });
+    });
+    expect(screen.queryByTestId("terminal-read-only-badge")).toBeNull();
+  });
 });
 
 describe("tmux clipboard", () => {

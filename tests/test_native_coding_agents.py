@@ -13,6 +13,8 @@ from omnigent._wrapper_labels import (
 )
 from omnigent.harness_plugins import KIRO_NATIVE_CODING_AGENT, PI_NATIVE_CODING_AGENT
 from omnigent.native_coding_agents import (
+    NATIVE_CODING_AGENTS,
+    is_agent_terminal_resource_id,
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
     native_shell_terminal_spec,
@@ -146,3 +148,29 @@ def test_native_shell_terminal_spec_falls_back_to_bash(
     spec = native_shell_terminal_spec()
     assert list(spec) == ["bash"]
     assert spec["bash"]["command"] == "bash"
+
+
+def test_agent_terminal_resource_ids_cover_every_session_shape() -> None:
+    """The agent-pane id set covers the SDK REPL and every native vendor pane.
+
+    The terminal-attach gate keys write access off this set: the agent's own
+    pane stays owner-only while user shells accept editor input. A native
+    harness whose pane id is missing here would let edit collaborators type
+    into the agent's TUI (persisting input into history as the owner).
+    """
+    assert is_agent_terminal_resource_id("terminal_tui_main")
+    for agent in NATIVE_CODING_AGENTS:
+        pane = f"terminal_{agent.terminal_name}_main"
+        assert is_agent_terminal_resource_id(pane), pane
+
+
+def test_user_shell_resource_ids_are_not_agent_panes() -> None:
+    """User shells — including one *named* like a vendor — stay non-agent.
+
+    A user shell's session key is never ``main`` (the web UI generates
+    ``u-<random>``), so even a shell launched with a vendor terminal name
+    must not inherit the stricter owner-only gate.
+    """
+    assert not is_agent_terminal_resource_id("terminal_zsh_u-1a2b3c")
+    assert not is_agent_terminal_resource_id("terminal_bash_s1")
+    assert not is_agent_terminal_resource_id("terminal_claude_u-9f8e7d")
