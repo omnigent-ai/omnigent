@@ -22,6 +22,11 @@ vi.mock("@/pages/SettingsPage", async () => {
     SettingsPage: () => <div data-testid="settings-location">{useLocation().pathname}</div>,
   };
 });
+vi.mock("@/extensions/ExtensionPageHost", () => ({
+  ExtensionPageHost: ({ resolved }: { resolved: { page: { title: string } } }) => (
+    <h1>{resolved.page.title}</h1>
+  ),
+}));
 vi.mock("@/extensions/ExtensionProvider", () => ({
   useExtensions: () => [
     {
