@@ -58,6 +58,11 @@ class ErrorCode:
         exists on the selected host (HTTP 410). Retrying cannot recreate
         deleted workspace state; the user must start a session in a valid
         workspace.
+    :cvar AGENT_BUNDLE_MISSING: The session's bound agent bundle can no
+        longer be loaded on the server — e.g. the artifact store lost it
+        across a server reset while the DB kept the agent and session
+        rows (HTTP 410). Retrying cannot restore the lost bundle; the
+        user must re-upload the agent or start a new session.
     """
 
     UNAUTHORIZED = "unauthorized"
@@ -75,6 +80,7 @@ class ErrorCode:
     # the host's wire error code passes through as the API error code.
     HARNESS_NOT_CONFIGURED = "harness_not_configured"
     WORKSPACE_MISSING = "workspace_missing"
+    AGENT_BUNDLE_MISSING = "agent_bundle_missing"
 
 
 # Single source of truth for error code → HTTP status.
@@ -105,6 +111,10 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # neither a 400 (input is fine) nor a 503 (a retry won't help).
     ErrorCode.HARNESS_NOT_CONFIGURED: 412,
     ErrorCode.WORKSPACE_MISSING: 410,
+    # 410 Gone, like WORKSPACE_MISSING: the session's bound server-side
+    # state (the agent bundle) is lost, so no retry can succeed without
+    # user action (re-upload the agent or start a new session).
+    ErrorCode.AGENT_BUNDLE_MISSING: 410,
 }
 
 

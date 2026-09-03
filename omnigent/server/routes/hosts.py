@@ -57,6 +57,7 @@ from omnigent.server.routes._workspace_validation import (
     restore_host_filesystem_url_path,
 )
 from omnigent.server.schemas import SessionGitOptions
+from omnigent.spec import AgentSpec
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
@@ -472,6 +473,51 @@ class LaunchRunnerRequest(BaseModel):
     git: SessionGitOptions | None = None
 
 
+async def _load_launch_agent_spec(
+    conv: Conversation,
+    agent_store: AgentStore,
+    agent_cache: AgentCache,
+) -> AgentSpec | None:
+    """
+    Load the bound agent's parsed spec for a runner launch.
+
+    :param conv: The session/conversation a runner is launching for.
+    :param agent_store: Store to resolve ``conv.agent_id`` to an agent.
+    :param agent_cache: Cache to load the agent's parsed spec.
+    :returns: The parsed spec, or ``None`` when the session has no agent
+        or no bundle (headless / unconstrained).
+    :raises OmnigentError: ``agent_bundle_missing`` (410) when the bundle
+        can no longer be loaded — e.g. the artifact store lost it while
+        the DB kept the agent and session rows, so resuming this session
+        cannot succeed until the agent is re-uploaded.
+    """
+    if conv.agent_id is None:
+        return None
+    agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
+    if agent is None or agent.bundle_location is None:
+        return None
+    try:
+        loaded = await asyncio.to_thread(agent_cache.load, agent.id, agent.bundle_location)
+    except (KeyError, AttributeError, ValueError, ImportError, OSError) as exc:
+        # Same failure set the session-create path guards against; without
+        # this, the artifact store's KeyError escapes to the app catch-all
+        # and session resume surfaces as an opaque 500.
+        _logger.warning(
+            "launch_runner: agent %s bundle failed to load for session %s: %s",
+            conv.agent_id,
+            conv.id,
+            exc,
+            extra={"session_id": conv.id},
+        )
+        raise OmnigentError(
+            f"The agent for this session ({agent.name!r}) can no longer be "
+            f"loaded: its bundle is missing or unreadable on the server. "
+            f"Re-upload the agent or start a new session.",
+            code=ErrorCode.AGENT_BUNDLE_MISSING,
+        ) from exc
+    return loaded.spec
+
+
 async def _resolve_agent_spec_cwd(
     conv: Conversation,
     agent_store: AgentStore,
@@ -486,14 +532,13 @@ async def _resolve_agent_spec_cwd(
     :returns: The agent's ``os_env.cwd`` (absolute or relative), or
         ``None`` when the session has no agent, no bundle, or no
         ``os_env`` block (headless / unconstrained boundary).
+    :raises OmnigentError: ``agent_bundle_missing`` when the bundle
+        cannot be loaded (see :func:`_load_launch_agent_spec`).
     """
-    if conv.agent_id is None:
+    spec = await _load_launch_agent_spec(conv, agent_store, agent_cache)
+    if spec is None:
         return None
-    agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
-    if agent is None or agent.bundle_location is None:
-        return None
-    loaded = await asyncio.to_thread(agent_cache.load, agent.id, agent.bundle_location)
-    os_env = getattr(loaded.spec, "os_env", None)
+    os_env = getattr(spec, "os_env", None)
     return getattr(os_env, "cwd", None) if os_env is not None else None
 
 
@@ -516,14 +561,13 @@ async def _resolve_agent_harness(
     :returns: The canonical harness id, e.g. ``"claude-sdk"``, or
         ``None`` when the session has no agent or no bundle (the host
         then skips the configuration check — fail open).
+    :raises OmnigentError: ``agent_bundle_missing`` when the bundle
+        cannot be loaded (see :func:`_load_launch_agent_spec`).
     """
-    if conv.agent_id is None:
+    spec = await _load_launch_agent_spec(conv, agent_store, agent_cache)
+    if spec is None:
         return None
-    agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
-    if agent is None or agent.bundle_location is None:
-        return None
-    loaded = await asyncio.to_thread(agent_cache.load, agent.id, agent.bundle_location)
-    return canonicalize_harness(loaded.spec.executor.harness_kind)
+    return canonicalize_harness(spec.executor.harness_kind)
 
 
 def create_hosts_router(
@@ -941,7 +985,14 @@ def create_hosts_router(
         # the host-side check.
         harness: str | None = None
         if agent_store is not None and agent_cache is not None:
-            harness = await _resolve_agent_harness(target.conv, agent_store, agent_cache)
+            try:
+                harness = await _resolve_agent_harness(target.conv, agent_store, agent_cache)
+            except OmnigentError:
+                # Runs after the atomic bind: unbind so the failed launch
+                # leaves no runner and a retry starts from a clean slate.
+                conn.pending_launches.pop(request_id, None)
+                await _rollback_failed_launch()
+                raise
         launch_frame = encode_host_frame(
             HostLaunchRunnerFrame(
                 request_id=request_id,
