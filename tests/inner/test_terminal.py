@@ -834,18 +834,21 @@ async def test_launch_disables_tmux_pane_and_window_creation_controls(
     assert contains_subsequence(cmd, ["set-option", "-g", "prefix", "None"])
     assert contains_subsequence(cmd, ["set-option", "-g", "prefix2", "None"])
     assert contains_subsequence(cmd, ["unbind-key", "-a", "-T", "prefix"])
-    assert contains_subsequence(cmd, ["unbind-key", "-q", "-T", "root", "MouseDown3Pane"])
-    assert contains_subsequence(cmd, ["unbind-key", "-q", "-T", "root", "M-MouseDown3Pane"])
-    assert contains_subsequence(cmd, ["unbind-key", "-q", "-T", "root", "MouseDown3Status"])
-    assert contains_subsequence(cmd, ["unbind-key", "-q", "-T", "root", "M-MouseDown3Status"])
+    # tmux 3.0a has all six default bindings but no ``unbind-key -q`` flag.
+    # Keep the lockdown usable on supported older Linux distributions.
+    assert contains_subsequence(cmd, ["unbind-key", "-T", "root", "MouseDown3Pane"])
+    assert contains_subsequence(cmd, ["unbind-key", "-T", "root", "M-MouseDown3Pane"])
+    assert contains_subsequence(cmd, ["unbind-key", "-T", "root", "MouseDown3Status"])
+    assert contains_subsequence(cmd, ["unbind-key", "-T", "root", "M-MouseDown3Status"])
     assert contains_subsequence(
         cmd,
-        ["unbind-key", "-q", "-T", "root", "MouseDown3StatusLeft"],
+        ["unbind-key", "-T", "root", "MouseDown3StatusLeft"],
     )
     assert contains_subsequence(
         cmd,
-        ["unbind-key", "-q", "-T", "root", "M-MouseDown3StatusLeft"],
+        ["unbind-key", "-T", "root", "M-MouseDown3StatusLeft"],
     )
+    assert not contains_subsequence(cmd, ["unbind-key", "-q"])
 
 
 @pytest.mark.asyncio
