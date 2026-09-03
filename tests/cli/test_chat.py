@@ -3219,6 +3219,7 @@ def test_await_accounts_setup_noop_when_token_present(
 ) -> None:
     """A CLI that already holds a token for the server does not probe/wait."""
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: "existing-token")
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_workspace_host", lambda _url: None)
 
     def _must_not_probe(*_a: object, **_k: object) -> object:
         raise AssertionError("must not call /v1/info when a token already exists")
@@ -3228,11 +3229,38 @@ def test_await_accounts_setup_noop_when_token_present(
     chat_module._await_accounts_first_run_setup("http://127.0.0.1:8000")
 
 
+def test_await_accounts_setup_noop_when_databricks_login_stored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stored Databricks login for the server skips the probe entirely.
+
+    The pointer record is written only after a successful login against
+    this server, which a fresh accounts server awaiting its first admin
+    cannot have granted. Probing anyway cost every remote start a TCP+TLS
+    handshake and a round trip for a request that answers 401 there.
+    """
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_workspace_host",
+        lambda _url: "https://example.cloud.databricks.com",
+    )
+
+    def _must_not_probe(*_a: object, **_k: object) -> object:
+        raise AssertionError("must not call /v1/info when a Databricks login is stored")
+
+    monkeypatch.setattr("omnigent.chat.httpx.get", _must_not_probe)
+
+    chat_module._await_accounts_first_run_setup(
+        "https://example.cloud.databricks.com/api/2.0/omnigent"
+    )
+
+
 def test_await_accounts_setup_noop_for_header_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When the server is not in accounts mode there is no admin to wait for."""
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_workspace_host", lambda _url: None)
     monkeypatch.setattr(
         "omnigent.chat.httpx.get",
         lambda _url, timeout=5.0, trust_env=True: _info_response(
@@ -3266,6 +3294,7 @@ def test_await_accounts_setup_waits_then_continues(
         return None if calls["n"] <= 2 else "minted-token"
 
     monkeypatch.setattr("omnigent.cli_auth.load_token", _load)
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_workspace_host", lambda _url: None)
     monkeypatch.setattr(
         "omnigent.chat.httpx.get",
         lambda _url, timeout=5.0, trust_env=True: _info_response(
@@ -3284,6 +3313,7 @@ def test_await_accounts_setup_times_out(
 ) -> None:
     """If the admin is never created, the wait fails loud (no hang/traceback)."""
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_workspace_host", lambda _url: None)
     monkeypatch.setattr(
         "omnigent.chat.httpx.get",
         lambda _url, timeout=5.0, trust_env=True: _info_response(
