@@ -13,13 +13,6 @@ if TYPE_CHECKING:
     from omnigent.spec.types import LLMConfig, PolicySpec
 
 
-def _default_routing_settings() -> RoutingSettings:
-    """Build the default :class:`RoutingSettings` (imported lazily)."""
-    from omnigent.server.smart_routing import RoutingSettings
-
-    return RoutingSettings()
-
-
 @dataclass
 class RuntimeCaps:
     """
@@ -108,6 +101,9 @@ class RuntimeCaps:
     routing_backends: RoutingBackends | None = None
     # Routing knobs parsed from the ``routing:`` block of the server --config
     # YAML (router name, extraction model, scenario menus, subagent fail mode).
-    # Always present so consumers read one value object instead of re-parsing
-    # config; the defaults describe an unconfigured deployment.
-    routing_settings: RoutingSettings = field(default_factory=_default_routing_settings)
+    # ``None`` describes an unconfigured deployment: read it through
+    # ``smart_routing.routing_settings(caps)``, which substitutes the defaults.
+    # Not defaulted to a ``RoutingSettings()`` because building one drags
+    # omnigent.server.smart_routing into every CLI client that imports the
+    # runtime.
+    routing_settings: RoutingSettings | None = None
