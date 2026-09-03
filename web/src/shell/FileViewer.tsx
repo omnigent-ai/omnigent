@@ -350,6 +350,12 @@ function FileViewerBody({
   // param writes to re-run the initialization logic.
   const initialDiffRef = useRef(searchParams.get("diff") === "1");
   const initialCommentIdRef = useRef(searchParams.get("comment"));
+  // 1-based line a chat citation (`path:line`) pointed at, written to ?line=
+  // by AppShell's openFileViewer. Read reactively (not once) so citing another
+  // line while the same file is already open still re-reveals.
+  const lineParam = searchParams.get("line");
+  const parsedLine = lineParam === null ? Number.NaN : Number.parseInt(lineParam, 10);
+  const revealLine = Number.isInteger(parsedLine) && parsedLine >= 1 ? parsedLine : null;
   // Seeded from the parent's persisted state on remount (e.g. returning to a
   // tab); defaults closed on a fresh open. The linked-comment / fresh-open
   // effects below only force it open, never closed, so a restored-open value
@@ -1534,6 +1540,7 @@ function FileViewerBody({
                   pendingBodyRef={pendingBodyRef}
                   searchOpen={searchOpen}
                   onSearchHandled={handleSearchHandled}
+                  revealLine={revealLine}
                 />
               </Suspense>
             )
@@ -1557,6 +1564,7 @@ function FileViewerBody({
               tocOpen={tocOpen}
               onTocToggle={() => setTocOpen((prev) => !prev)}
               onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
+              revealLine={revealLine}
             />
           )}
         </div>
