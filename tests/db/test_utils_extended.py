@@ -27,6 +27,7 @@ from omnigent.db.utils import (
     _ITEM_TYPES,
     clear_engine_cache,
     delete_fts_by_conversation,
+    delete_fts_by_item_ids,
     ensure_fts_table,
     generate_conversation_id,
     generate_file_id,
@@ -285,6 +286,47 @@ class TestFtsHelpers:
             ).fetchall()
             assert len(rows) == 1
             assert rows[0][0] == "9980c8a9248139f14f4165e5d53088aa"
+
+    def test_delete_fts_by_item_ids(self, db_uri: str) -> None:
+        engine = get_or_create_engine(db_uri)
+        if engine.dialect.name != "sqlite":
+            pytest.skip("FTS5 virtual table is SQLite-only; no-op on other backends")
+        ensure_fts_table(engine)
+        managed = make_managed_session_maker(engine)
+
+        with managed() as session:
+            insert_fts(
+                session,
+                "11cd574b729d39c61cf72d568188531a",
+                "223a265445caf1cdb034abe0b449485d",
+                "searchable text",
+            )
+            insert_fts(
+                session,
+                "3317d69fc9d16f420210e37ed3ef5f31",
+                "223a265445caf1cdb034abe0b449485d",
+                "also searchable",
+            )
+
+        with managed() as session:
+            delete_fts_by_item_ids(session, ["11cd574b729d39c61cf72d568188531a"])
+
+        with managed() as session:
+            deleted = session.execute(
+                text(
+                    "SELECT item_id FROM conversation_items_fts"
+                    " WHERE item_id = '11cd574b729d39c61cf72d568188531a'"
+                )
+            ).fetchall()
+            assert len(deleted) == 0
+
+            kept = session.execute(
+                text(
+                    "SELECT item_id FROM conversation_items_fts "
+                    "WHERE item_id = '3317d69fc9d16f420210e37ed3ef5f31'"
+                )
+            ).fetchall()
+            assert len(kept) == 1
 
     def test_delete_fts_by_conversation(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)

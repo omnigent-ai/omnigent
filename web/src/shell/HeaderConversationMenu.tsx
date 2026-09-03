@@ -17,6 +17,7 @@ import {
   PencilIcon,
   PinIcon,
   PinOffIcon,
+  RefreshCwIcon,
   ShareIcon,
   Trash2Icon,
 } from "lucide-react";
@@ -46,6 +47,7 @@ import {
   useArchiveConversation,
   useMoveToProject,
   useRenameConversation,
+  useRestartConversation,
   useStopAndDeleteConversation,
   useTogglePinnedConversation,
 } from "@/hooks/useConversations";
@@ -107,10 +109,13 @@ export function HeaderConversationMenu({
   const moveToProject = useMoveToProject();
   const archive = useArchiveConversation();
   const deleteConversation = useStopAndDeleteConversation();
+  const restart = useRestartConversation();
   const [menuOpen, setMenuOpen] = useState(false);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameTitle, setRenameTitle] = useState(conversation.title ?? "");
+  const [restartOpen, setRestartOpen] = useState(false);
+  const [restartError, setRestartError] = useState<string | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteBranch, setDeleteBranch] = useState(false);
   const previousConversationId = useRef(conversation.id);
@@ -138,6 +143,8 @@ export function HeaderConversationMenu({
     setProjectPickerOpen(false);
     setRenameOpen(false);
     setRenameTitle(conversation.title ?? "");
+    setRestartOpen(false);
+    setRestartError(null);
     setDeleteOpen(false);
     setDeleteBranch(false);
   }, [conversation.id, conversation.title]);
@@ -168,6 +175,19 @@ export function HeaderConversationMenu({
     deleteConversation.mutate({
       id: conversation.id,
       deleteBranch: gitBranch !== null && deleteBranch,
+    });
+  };
+
+  const confirmRestart = () => {
+    setRestartError(null);
+    restart.mutate(conversation.id, {
+      onSuccess: () => {
+        setRestartOpen(false);
+        showToast("Session restarted — running the latest agent version.");
+      },
+      onError: (error) => {
+        setRestartError(error instanceof Error ? error.message : "Restart failed.");
+      },
     });
   };
 
@@ -245,6 +265,14 @@ export function HeaderConversationMenu({
       >
         <MailIcon className="size-3.5" />
         Mark as unread
+      </DropdownMenuItem>
+      <DropdownMenuItem
+        data-testid="header-restart-conversation"
+        className={itemClass}
+        onSelect={() => setRestartOpen(true)}
+      >
+        <RefreshCwIcon className="size-3.5" />
+        Restart session…
       </DropdownMenuItem>
       {/* Move to project is also reachable on desktop via the breadcrumb's
           folder tag (HeaderProjectTag); on mobile the native shells hide the
@@ -400,6 +428,48 @@ export function HeaderConversationMenu({
               </Button>
             </DialogFooter>
           </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={restartOpen}
+        onOpenChange={(open) => {
+          setRestartOpen(open);
+          if (!open) setRestartError(null);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Restart session?</DialogTitle>
+            <DialogDescription>
+              Stops the current harness and starts a fresh one from the latest installed agent
+              version. The session — transcript, files, comments, and workspace — stays exactly
+              where it is.
+            </DialogDescription>
+          </DialogHeader>
+          {restartError !== null && (
+            <p data-testid="header-restart-error" className="text-sm text-destructive">
+              {restartError}
+            </p>
+          )}
+          <DialogFooter className="border-t-0 bg-transparent">
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => setRestartOpen(false)}
+              disabled={restart.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              data-testid="header-restart-confirm"
+              onClick={confirmRestart}
+              disabled={restart.isPending}
+            >
+              {restart.isPending ? "Restarting…" : "Restart"}
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 

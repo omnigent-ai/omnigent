@@ -6641,6 +6641,26 @@
         "title": "SessionResponse",
         "type": "object"
       },
+      "SessionRestartRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `POST /v1/sessions/{id}/restart`.\n\nReplaces the session's harness execution in place \u2014 the current\nharness is stopped and a fresh one is started from the latest\ninstalled agent version/configuration \u2014 while keeping the same\nsession (transcript, title, pin state, project, comments, files,\nworkspace). Unlike fork, no new session is created.",
+        "properties": {
+          "up_to_response_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Restore the session from a selected conversation point, e.g. `\"resp_abc123\"`. When set, items after that response are removed and the restarted harness rebuilds its context from the remaining items. When `None` (default), the restarted harness resumes from the session's latest state.",
+            "title": "Up To Response Id"
+          }
+        },
+        "title": "SessionRestartRequest",
+        "type": "object"
+      },
       "SessionSandboxStatusEvent": {
         "description": "Managed-sandbox launch progress for a `host_type=\"managed\"` session.\n\nA managed create returns before its sandbox exists; the Omnigent\nserver emits this event as the background launch pipeline advances\nso the Web UI can show live provisioning progress on the session\npage instead of a silent dead chat: sandbox provision \u2192 repository\nclone \u2192 host startup \u2192 runner connect \u2192 ready, or a terminal\nfailure with the reason.",
         "properties": {
@@ -14062,6 +14082,60 @@
         "summary": "Get Session Resource",
         "tags": [
           "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/restart": {
+      "post": {
+        "description": "Restart a session's harness execution in place.\n\nThe current harness is stopped and a fresh one is started from the\nlatest installed agent version/configuration, keeping the SAME\nsession \u2014 transcript, title, pin state, project, comments, files,\nhost, and workspace are untouched. When the session is bound to a\nsession-scoped clone whose origin built-in was refreshed after the\nclone was made (matched by root name), the clone is re-created from\nthe built-in's current bundle so the restart picks up the update;\na session bound directly to a built-in already tracks its latest\nbundle. Unlike fork, no new session is created; unlike retry, the\nharness is replaced even when the runner is still connected.\n\nWith `up_to_response_id` the session is first restored to that\nconversation point \u2014 later items are removed and the restarted\nharness rebuilds its context from the remaining items (the stored\nnative session id is cleared since its transcript no longer\nmatches). Without it, the restarted harness resumes from the\nsession's latest state.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionRestartRequest`.\n\n**Returns:** A `SessionResponse` describing the session after the restart (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the session or its agent does not exist; 403 if the caller lacks edit access; 400 if the session is a sub-agent, has no agent binding, the agent bundle can't be loaded, or `up_to_response_id` names no response in the session; 409 if a turn is currently running; 503 if the old execution was stopped but no replacement harness could be started (the session is intact \u2014 retry the restart once the host is reachable).",
+        "operationId": "restart_session_v1_sessions__session_id__restart_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier to restart, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionRestartRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Restart Session",
+        "tags": [
+          "sessions"
         ]
       }
     },

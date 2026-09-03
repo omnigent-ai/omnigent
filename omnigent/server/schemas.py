@@ -2506,6 +2506,29 @@ class SessionSwitchAgentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class SessionRestartRequest(BaseModel):
+    """
+    Request body for ``POST /v1/sessions/{id}/restart``.
+
+    Replaces the session's harness execution in place — the current
+    harness is stopped and a fresh one is started from the latest
+    installed agent version/configuration — while keeping the same
+    session (transcript, title, pin state, project, comments, files,
+    workspace). Unlike fork, no new session is created.
+
+    :param up_to_response_id: Restore the session from a selected
+        conversation point, e.g. ``"resp_abc123"``. When set, items
+        after that response are removed and the restarted harness
+        rebuilds its context from the remaining items. When ``None``
+        (default), the restarted harness resumes from the session's
+        latest state.
+    """
+
+    up_to_response_id: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class SessionListItem(BaseModel):
     """
     Lightweight session summary for ``GET /v1/sessions`` list responses.

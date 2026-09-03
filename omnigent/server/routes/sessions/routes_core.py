@@ -37,6 +37,7 @@ from omnigent.entities import (
     Conversation,
     synthesize_conversation_title,
 )
+from omnigent.entities.agent import Agent
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.model_override import validate_model_override
@@ -117,6 +118,7 @@ from omnigent.server.routes._sessions.helpers import (
     SessionLiveness,
     _agent_carries_cursor_fork_history,
     _agent_carries_native_fork_history,
+    _agent_clone_root_name,
     _announce_session_added,
     _apply_liveness_to_items,
     _authorize_bundled_parent_and_inherit_runner,
@@ -146,6 +148,8 @@ from omnigent.server.routes._sessions.helpers import (
     _same_provider_family,
     _session_status_from_cache,
     _set_read_state,
+    _stop_session_host_runner,
+    _stop_session_via_runner,
     _surface_model_change_forward_failure,
     _title_content_from_item,
     _validate_terminal_launch_args,
@@ -158,7 +162,9 @@ from omnigent.server.routes._sessions.orchestration import (
     _build_session_response,
     _create_session_from_bundle,
     _create_session_from_existing_agent,
+    _ensure_native_terminal_ready,
     _ensure_runner_relay_ready,
+    _ensure_runner_session_initialized,
     _get_session_snapshot,
     _is_native_terminal_session,
     _labels_for_viewer,
@@ -166,6 +172,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _publish_runner_recovered_status,
     _run_managed_launch,
     _spawn_archive_stop,
+    ensure_runner_connected,
 )
 from omnigent.server.schemas import (
     AutomaticSessionRenameRequest,
@@ -182,6 +189,7 @@ from omnigent.server.schemas import (
     SessionListItem,
     SessionProjectSummary,
     SessionResponse,
+    SessionRestartRequest,
     SessionSwitchAgentRequest,
     UpdateSessionRequest,
 )
@@ -2891,4 +2899,302 @@ def register_core_routes(
             permission_level=level,
             last_task_error=None,
             agent_name=target_agent.name,
+        )
+
+    # ── POST /sessions/{session_id}/restart ──────────────────────
+
+    @router.post(
+        "/sessions/{session_id}/restart",
+        # response_model=None keeps FastAPI from re-validating/serializing
+        # the handler's SessionResponse; responses= still advertises the
+        # body schema to docs/SDK tooling.
+        response_model=None,
+        responses={200: {"model": SessionResponse}},
+    )
+    async def restart_session(
+        request: Request,
+        session_id: str,
+        body: SessionRestartRequest,
+    ) -> SessionResponse:
+        """
+        Restart a session's harness execution in place.
+
+        The current harness is stopped and a fresh one is started from the
+        latest installed agent version/configuration, keeping the SAME
+        session — transcript, title, pin state, project, comments, files,
+        host, and workspace are untouched. When the session is bound to a
+        session-scoped clone whose origin built-in was refreshed after the
+        clone was made (matched by root name), the clone is re-created from
+        the built-in's current bundle so the restart picks up the update;
+        a session bound directly to a built-in already tracks its latest
+        bundle. Unlike fork, no new session is created; unlike retry, the
+        harness is replaced even when the runner is still connected.
+
+        With ``up_to_response_id`` the session is first restored to that
+        conversation point — later items are removed and the restarted
+        harness rebuilds its context from the remaining items (the stored
+        native session id is cleared since its transcript no longer
+        matches). Without it, the restarted harness resumes from the
+        session's latest state.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier to restart,
+            e.g. ``"conv_abc123"``.
+        :param body: The validated :class:`SessionRestartRequest`.
+        :returns: A :class:`SessionResponse` describing the session after
+            the restart (status ``"idle"``).
+        :raises OmnigentError: 404 if the session or its agent does not
+            exist; 403 if the caller lacks edit access; 400 if the
+            session is a sub-agent, has no agent binding, the agent
+            bundle can't be loaded, or ``up_to_response_id`` names no
+            response in the session; 409 if a turn is currently running;
+            503 if the old execution was stopped but no replacement
+            harness could be started (the session is intact — retry the
+            restart once the host is reachable).
+        """
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        session = access.conversation
+        if session is None:
+            session = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if session is None:
+                raise OmnigentError(
+                    f"Session not found: {session_id!r}",
+                    code=ErrorCode.NOT_FOUND,
+                )
+        if session.kind == "sub_agent":
+            raise OmnigentError(
+                "Cannot restart a sub-agent session — only top-level sessions can be restarted.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if session.agent_id is None:
+            raise OmnigentError(
+                "Session has no agent binding — cannot restart.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
+        # Restarting mid-turn would tear the running harness subprocess out
+        # from under an active stream. Reject; the caller retries when idle.
+        if _session_status_from_cache(session_id, session.live_status) == "running":
+            raise OmnigentError(
+                "Session is busy — wait for the current turn to finish before restarting.",
+                code=ErrorCode.CONFLICT,
+            )
+
+        current_agent = await asyncio.to_thread(agent_store.get, session.agent_id)
+        if current_agent is None:
+            raise OmnigentError(
+                f"Current agent not found: {session.agent_id!r}",
+                code=ErrorCode.NOT_FOUND,
+            )
+
+        # Resolve the refresh source for a session-scoped clone: the
+        # built-in whose name matches the clone's root name and whose
+        # bundle drifted since the clone was made. A session bound
+        # directly to a built-in already tracks its latest bundle; a
+        # clone with no matching built-in keeps its pinned bundle.
+        refresh_source: Agent | None = None
+        if current_agent.session_id is not None:
+            root_name = _agent_clone_root_name(current_agent.name)
+            candidate = await asyncio.to_thread(agent_store.get_by_name, root_name)
+            if (
+                candidate is not None
+                and candidate.session_id is None
+                and candidate.bundle_location != current_agent.bundle_location
+            ):
+                refresh_source = candidate
+        spec_source = refresh_source or current_agent
+
+        # Load the spec BEFORE committing — an unloadable bundle fails the
+        # request with zero mutation, and the truncation point is validated
+        # before the old execution is stopped.
+        try:
+            from omnigent.server.routes import sessions as _sessions_facade
+
+            await asyncio.to_thread(
+                _sessions_facade.get_agent_cache().load,
+                spec_source.id,
+                spec_source.bundle_location,
+                expand_env=spec_source.session_id is None,
+            )
+        except Exception as exc:
+            raise OmnigentError(
+                "The agent bundle for this session could not be loaded — cannot restart.",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if body.up_to_response_id is not None:
+            precheck_items = await asyncio.to_thread(
+                conversation_store.list_items, session_id, limit=100000
+            )
+            if not any(
+                item.response_id == body.up_to_response_id
+                for item in precheck_items.data
+                if item.response_id is not None
+            ):
+                raise OmnigentError(
+                    f"Response id {body.up_to_response_id!r} not found in session items.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+
+        presentation_labels = await asyncio.to_thread(_presentation_labels_for_agent, spec_source)
+        # A truncated restart rebuilds context from the remaining items:
+        # claude/codex/pi native rebuild their resumable session file,
+        # cursor/opencode replay prior turns as a preamble, and SDK
+        # harnesses replay the transcript as context.
+        carry_history_into_native = body.up_to_response_id is not None and (
+            await asyncio.to_thread(_agent_carries_native_fork_history, spec_source)
+            or await asyncio.to_thread(_agent_carries_cursor_fork_history, spec_source)
+        )
+
+        # Stop the current execution before mutating so no live harness can
+        # write after a truncation. Best-effort: a wedged runner is the
+        # target use case — the replacement runner supersedes it.
+        with contextlib.suppress(OmnigentError):
+            await _stop_session_via_runner(session_id, runner_router)
+        if session.host_id and session.runner_id and host_registry is not None:
+            await _stop_session_host_runner(
+                session_id, session.host_id, session.runner_id, host_registry
+            )
+
+        restart_agent_id: str | None = None
+        restart_agent_name: str | None = None
+        restart_agent_bundle: str | None = None
+        restart_agent_description: str | None = None
+        if refresh_source is not None:
+            restart_agent_id = generate_agent_id()
+            restart_agent_name = refresh_source.name
+            restart_agent_bundle = refresh_source.bundle_location
+            restart_agent_description = refresh_source.description
+        try:
+            updated = await asyncio.to_thread(
+                conversation_store.restart_conversation,
+                session_id,
+                new_agent_id=restart_agent_id,
+                new_agent_name=restart_agent_name,
+                new_agent_bundle_location=restart_agent_bundle,
+                new_agent_description=restart_agent_description,
+                presentation_labels=presentation_labels,
+                up_to_response_id=body.up_to_response_id,
+                carry_history_into_native=carry_history_into_native,
+            )
+        except LookupError as exc:
+            raise OmnigentError(
+                f"Session not found: {session_id!r}",
+                code=ErrorCode.NOT_FOUND,
+            ) from exc
+        except ValueError as exc:
+            # Store raises ValueError when up_to_response_id names no
+            # response in the conversation (raced the route precheck).
+            raise OmnigentError(
+                str(exc),
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+
+        # Runner-derived caches (skills, routing catalog) belong to the old
+        # execution — drop them so the next snapshot re-fetches from the
+        # replacement runner. The model catalog stays: the agent family is
+        # unchanged, and it must outlive runner death for the offline picker.
+        _invalidate_runner_backed_snapshot_state(
+            session_id, cancel_inflight=True, drop_model_options=False
+        )
+
+        # Start the replacement execution. A runner that survived the stop
+        # (in-process or CLI-owned) keeps serving: reset its cached
+        # spec/terminal state so it re-resolves the refreshed agent, then
+        # respawn the native pane eagerly. A runner that is gone (host-bound
+        # and killed above, or dead) is relaunched via the same ladder the
+        # retry path uses.
+        runner_client = await _get_runner_client(session_id, runner_router, conversation=updated)
+        if runner_client is not None:
+            await _reset_runner_resources_after_switch(session_id)
+            if _is_native_terminal_session(updated):
+                terminal_outcome = await _ensure_native_terminal_ready(
+                    runner_client,
+                    session_id,
+                    updated,
+                    persist_resource_event=False,
+                )
+                if terminal_outcome.error is not None:
+                    raise OmnigentError(
+                        terminal_outcome.error.message,
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
+                await _ensure_runner_relay_ready(
+                    session_id,
+                    updated.runner_id,
+                    runner_client,
+                    conversation_store,
+                )
+        elif updated.host_id:
+            runner_client, updated = await ensure_runner_connected(
+                session_id=session_id,
+                conv=updated,
+                app_state=request.app.state,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+                raise_host_refusal=True,
+            )
+            if runner_client is None:
+                raise OmnigentError(
+                    "The session was restarted but no replacement runner could be started — "
+                    "retry the restart once the host is reachable.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
+            terminal_ready_from_init = await _ensure_runner_session_initialized(
+                session_id,
+                updated,
+                runner_client,
+                conversation_store,
+                initializer=getattr(request.app.state, "runner_session_initializer", None),
+                suppress_recovery_turn=False,
+                require_success=True,
+            )
+            if _is_native_terminal_session(updated):
+                if not terminal_ready_from_init:
+                    terminal_outcome = await _ensure_native_terminal_ready(
+                        runner_client,
+                        session_id,
+                        updated,
+                        persist_resource_event=False,
+                    )
+                    if terminal_outcome.error is not None:
+                        raise OmnigentError(
+                            terminal_outcome.error.message,
+                            code=ErrorCode.RUNNER_UNAVAILABLE,
+                        )
+                await _ensure_runner_relay_ready(
+                    session_id,
+                    updated.runner_id,
+                    runner_client,
+                    conversation_store,
+                )
+        # else: a CLI-owned runner is offline — nothing to relaunch
+        # server-side; the next CLI connect resolves the refreshed agent.
+
+        if refresh_source is not None:
+            # Tell connected clients the binding changed so they re-derive
+            # session state (presentation labels, bound agent) from a fresh
+            # snapshot.
+            assert restart_agent_id is not None
+            restart_event = SessionAgentChangedEvent(
+                type="session.agent_changed",
+                conversation_id=session_id,
+                agent_id=restart_agent_id,
+                agent_name=refresh_source.name,
+            )
+            from omnigent.server.routes import sessions as _sessions_facade
+
+            _sessions_facade.session_stream.publish(session_id, restart_event.model_dump())
+
+        items = await asyncio.to_thread(conversation_store.list_items, session_id, limit=10000)
+        level = await _get_permission_level(user_id, session_id, permission_store)
+        return _build_session_response(
+            updated,
+            items.data,
+            "idle",
+            permission_level=level,
+            last_task_error=None,
+            agent_name=spec_source.name,
         )

@@ -1796,3 +1796,83 @@ class ConversationStore(ABC):
             ``False`` otherwise.
         """
         ...
+
+    @abstractmethod
+    def restart_conversation(
+        self,
+        conversation_id: str,
+        *,
+        new_agent_id: str | None,
+        new_agent_name: str | None,
+        new_agent_bundle_location: str | None,
+        new_agent_description: str | None,
+        presentation_labels: dict[str, str] | None,
+        up_to_response_id: str | None,
+        carry_history_into_native: bool,
+    ) -> Conversation:
+        """
+        Restart a session in place, refreshing its agent binding.
+
+        The backing store must:
+
+        1. Verify the conversation exists.
+        2. When ``new_agent_id`` is not ``None``: create a NEW
+           session-scoped agent row (fresh id ``new_agent_id``) cloned
+           from the refresh source (``new_agent_name`` /
+           ``new_agent_bundle_location`` / ``new_agent_description``),
+           point the conversation at it, and delete the old agent row
+           when it was itself session-scoped. When ``new_agent_id`` is
+           ``None``: keep the conversation's current agent binding
+           untouched (a session bound directly to a built-in already
+           tracks that built-in's latest bundle).
+        3. Keep the model settings (``llm_model``,
+           ``llm_context_window``, ``harness_override``,
+           ``terminal_launch_args``) — a restart never changes the
+           agent family, so the session's choices stay valid.
+        4. When ``up_to_response_id`` is not ``None``: resolve the
+           truncation point (the highest position of any item carrying
+           that response id) and remove every item after it, including
+           their FTS rows; raise :class:`ValueError` when no item
+           carries that response id. Also clear
+           ``external_session_id`` — the native transcript no longer
+           matches the truncated items — plus the fork-source labels
+           (the native transcript they point at is likewise stale), and
+           stamp :data:`FORK_CARRY_HISTORY_LABEL_KEY` when
+           ``carry_history_into_native`` so the restarted harness
+           rebuilds its context from the remaining items; remove the
+           marker otherwise.
+        5. When ``up_to_response_id`` is ``None``: keep
+           ``external_session_id`` so the restarted harness resumes
+           from the session's latest native state.
+        6. Drop the instance-scoped labels in
+           ``_INSTANCE_SCOPED_LABEL_KEYS`` (runtime status, runner
+           workspace, schedule links, etc. describe the replaced
+           execution, not the session).
+        7. Refresh presentation labels: drop the existing wrapper/ui
+           keys, then apply ``presentation_labels`` when given.
+        8. Update ``updated_at``.
+
+        :param conversation_id: Conversation to restart,
+            e.g. ``"conv_abc123"``.
+        :param new_agent_id: Fresh id for the replacement session-scoped
+            agent row, or ``None`` to keep the current binding.
+        :param new_agent_name: Name for the replacement agent row.
+        :param new_agent_bundle_location: Bundle directory for the
+            replacement agent row.
+        :param new_agent_description: Description for the replacement
+            agent row.
+        :param presentation_labels: Fresh wrapper/ui labels derived
+            from the refresh source; ``None``/empty drops the keys
+            (plain chat presentation).
+        :param up_to_response_id: Response id to truncate after, or
+            ``None`` to keep the full history.
+        :param carry_history_into_native: Whether the restarted harness
+            can rebuild its context from the remaining items after a
+            truncation.
+        :returns: The updated conversation.
+        :raises ConversationNotFoundError: If no conversation exists
+            with the given id.
+        :raises ValueError: If ``up_to_response_id`` matches no item in
+            the conversation.
+        """
+        ...
