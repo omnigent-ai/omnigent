@@ -48,15 +48,32 @@ def test_store_and_erase_are_noops(monkeypatch: pytest.MonkeyPatch) -> None:
         assert h.main(["--server", "http://s", "--host-id", "h", "--host-token", "t", op]) == 0
 
 
-def test_configure_host_git_sets_helper_and_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_configure_host_git_resets_then_adds_broker_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
     calls: list[list[str]] = []
     monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
     cred = {"connected": True, "owner": "alice@example.com", "login": "octo"}
     monkeypatch.setattr(h, "_fetch", lambda *a, **k: cred)
     h.configure_host_git("http://srv", "host1")
+
+    # The github.com helper chain is reset (empty value) BEFORE the broker helper
+    # is --add'ed, so a wider-scope $GIT_TOKEN helper cannot shadow the broker.
+    key = "credential.https://github.com.helper"
+    reset_idx = next(
+        i
+        for i, c in enumerate(calls)
+        if c[:4] == ["git", "config", "--global", key] and c[-1] == ""
+    )
+    add_idx = next(
+        i
+        for i, c in enumerate(calls)
+        if c[:5] == ["git", "config", "--global", "--add", key] and "host1" in c[-1]
+    )
+    assert reset_idx < add_idx
+    # Commit identity attributed to the connected owner.
     flat = [" ".join(c) for c in calls]
-    assert any("credential.https://github.com.helper" in c and "host1" in c for c in flat)
     assert any("user.email alice@example.com" in c for c in flat)
     assert any("user.name octo" in c for c in flat)
 

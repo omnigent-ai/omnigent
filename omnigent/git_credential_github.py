@@ -121,7 +121,16 @@ def configure_host_git(server_url: str, host_id: str) -> None:
         f"--server {shlex.quote(server_url)} --host-id {shlex.quote(host_id)} "
         f"--host-token {shlex.quote(token)}"
     )
-    _git("credential.https://github.com.helper", helper)
+    # Reset the github.com helper chain before adding ours. Git accumulates
+    # credential helpers across scopes and runs them in parse order (system →
+    # global), stopping at the first that returns a full credential. A managed
+    # image installs a wider-scope helper that answers github.com from a shared
+    # ``$GIT_TOKEN``; parsed before this --global entry, it would vend first and
+    # silently bypass the per-user broker — while the owner attribution set below
+    # still stamps commits as the owner, mis-attributing them. An empty value
+    # clears the inherited chain for github.com, so only the broker remains.
+    _git("credential.https://github.com.helper", "")
+    _git("--add", "credential.https://github.com.helper", helper)
 
     data = _fetch(server_url, host_id, token) or {}
     owner = str(data.get("owner") or "")
