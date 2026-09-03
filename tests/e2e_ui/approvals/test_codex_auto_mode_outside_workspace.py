@@ -138,9 +138,7 @@ def test_codex_auto_mode_outside_workspace_completes_without_approval(
                             {
                                 "cmd": outside_cmd,
                                 "sandbox_permissions": "require_escalated",
-                                "justification": (
-                                    "Create the notes file outside the workspace."
-                                ),
+                                "justification": ("Create the notes file outside the workspace."),
                             }
                         ),
                     }
