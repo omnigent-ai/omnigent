@@ -186,6 +186,8 @@ def _import_runner_graph() -> None:
     harness child forked via ``fork_harness`` shares that floor as well (the
     heaviest part is the fastapi/pydantic/omnigent-core graph the runner
     already holds, so this adds little resident cost).
+
+    The MCP SDK graph is deliberately excluded — see :func:`_import_mcp_graph`.
     """
     from omnigent.runner import _entry, app, native  # noqa: F401
     from omnigent.runner.background_titles import (  # noqa: F401
@@ -194,6 +196,20 @@ def _import_runner_graph() -> None:
         sdk,
     )
     from omnigent.runtime.harnesses import _runner as _harness_runner  # noqa: F401
+
+
+def _import_mcp_graph() -> None:
+    """Import the MCP SDK graph (~300ms) so forked runners inherit it too.
+
+    Kept out of :func:`_import_runner_graph` because the zygote's own boot sits
+    on the first session-create's critical path, while a runner needs MCP only
+    once its spec connects to an MCP server. The serve loop warms it on its
+    first idle tick instead, so the cold start skips it and every session that
+    follows still gets it for free.
+    """
+    # ``omnigent.tools.mcp`` is what pulls the SDK in; the runner's own
+    # mcp_manager imports it (and ``mcp.types``) lazily from there.
+    from omnigent.tools import mcp  # noqa: F401
 
 
 def _wire_child_stdio(log_path: str | None) -> None:
@@ -398,6 +414,8 @@ class _ZygoteServer:
         # close (the daemon socket + all runner sockets).
         self._control_socks: set[socket.socket] = {control_sock}
         self._buffers: dict[int, bytearray] = {}
+        # Whether the deferred MCP graph warm-up has been attempted yet.
+        self._mcp_warmed = False
         self._sel.register(control_sock, selectors.EVENT_READ, "daemon")
         self._buffers[control_sock.fileno()] = bytearray()
 
@@ -407,13 +425,43 @@ class _ZygoteServer:
             while True:
                 self._reap()
                 # Timeout so idle periods still reap exited children promptly.
-                for key, _mask in self._sel.select(timeout=1.0):
+                ready = self._sel.select(timeout=1.0)
+                if not ready:
+                    self._warm_mcp_graph()
+                    continue
+                for key, _mask in ready:
                     # Only sockets are ever registered, so key.fileobj (typed
                     # HasFileno | int by selectors) is always a socket here.
                     if not self._on_readable(cast("socket.socket", key.fileobj), key.data):
                         return
         finally:
             self._sel.close()
+
+    def _warm_mcp_graph(self) -> None:
+        """Import the MCP graph once, on an idle tick, for later forks to share.
+
+        Runs in the main thread between requests rather than on a background
+        thread: the zygote's whole value is forking from a thread-free process.
+        A request landing mid-import waits no longer than it would have waited
+        for the same import during zygote boot.
+        """
+        if self._mcp_warmed:
+            return
+        self._mcp_warmed = True
+        try:
+            _import_mcp_graph()
+        except Exception as exc:  # noqa: BLE001 — a warm-up miss must not kill the server
+            print(f"warning: runner zygote could not warm the MCP graph: {exc}", file=sys.stderr)
+            return
+        if threading.active_count() != 1:  # pragma: no cover — defense in depth
+            names = [t.name for t in threading.enumerate()]
+            print(
+                f"warning: runner zygote gained threads while warming MCP: {names}",
+                file=sys.stderr,
+            )
+        # Keep the newly imported graph out of GC's tracked set, as after the
+        # initial import, so collections stay cheap and don't dirty shared pages.
+        gc.freeze()
 
     def _reap(self) -> None:
         """Non-blocking reap of any exited children into ``exit_codes``.

@@ -29,7 +29,6 @@ from typing import Any
 import pytest
 from mcp.types import Tool as McpToolDef
 
-from omnigent.runner import mcp_manager as _mcp_manager_module
 from omnigent.runner.mcp_manager import (
     _POOL_SPEC_CAPACITY,
     McpSchemasResult,
@@ -38,6 +37,10 @@ from omnigent.runner.mcp_manager import (
     compute_spec_hash,
 )
 from omnigent.spec.types import AgentSpec, MCPServerConfig
+
+# The manager imports ``McpServerConnection`` lazily at connect time (keeping
+# the MCP SDK out of the runner import graph), so patches target its home.
+from omnigent.tools import mcp as _tools_mcp_module
 
 
 def _make_spec(*configs: MCPServerConfig) -> AgentSpec:
@@ -130,10 +133,7 @@ def patch_connection(
             """Forward to the per-config _FakeConn so tests can assert dispatch."""
             return await self._inner.call_tool(name, arguments)
 
-    monkeypatch.setattr(
-        "omnigent.runner.mcp_manager.McpServerConnection",
-        _PatchedConn,
-    )
+    monkeypatch.setattr(_tools_mcp_module, "McpServerConnection", _PatchedConn)
     # Tests script per-server behavior by mutating these dicts BEFORE
     # calling schemas_for; the closure above honors the script.
     conns["__raise_for__"] = raise_for  # type: ignore[assignment]
@@ -432,7 +432,7 @@ async def test_call_tool_connects_only_target_namespaced_server(
             calls.append((self._config.name, name, arguments))
             return "ok"
 
-    monkeypatch.setattr(_mcp_manager_module, "McpServerConnection", _TargetedConn)
+    monkeypatch.setattr(_tools_mcp_module, "McpServerConnection", _TargetedConn)
 
     spec = _make_spec(_make_config("used"), _make_config("unused"))
     manager = RunnerMcpManager()
@@ -516,7 +516,7 @@ async def test_lru_eviction_at_pool_capacity(
             """Unused in this test but required by the interface."""
             return ""
 
-    monkeypatch.setattr(_mcp_manager_module, "McpServerConnection", _CountingConn)
+    monkeypatch.setattr(_tools_mcp_module, "McpServerConnection", _CountingConn)
 
     manager = RunnerMcpManager()
     # Build capacity + 1 distinct specs (different server.name → different
@@ -574,7 +574,7 @@ async def test_prewarm_registers_without_connecting(
             """Unused in this test."""
             return ""
 
-    monkeypatch.setattr(_mcp_manager_module, "McpServerConnection", _CountingConn)
+    monkeypatch.setattr(_tools_mcp_module, "McpServerConnection", _CountingConn)
 
     spec = _make_spec(_make_config("slow"))
     manager = RunnerMcpManager()
@@ -625,7 +625,7 @@ async def test_shutdown_cancels_in_flight_schema_connect(
             """Unused."""
             return ""
 
-    monkeypatch.setattr(_mcp_manager_module, "McpServerConnection", _HangingConn)
+    monkeypatch.setattr(_tools_mcp_module, "McpServerConnection", _HangingConn)
 
     spec = _make_spec(_make_config("hangs"))
     manager = RunnerMcpManager()
@@ -676,7 +676,7 @@ async def test_evicted_spec_closes_late_completed_shared_connect(
         async def call_tool(self, name: str, arguments: dict[str, Any], **_kw: Any) -> str:
             return "ok"
 
-    monkeypatch.setattr(_mcp_manager_module, "McpServerConnection", _SlowConn)
+    monkeypatch.setattr(_tools_mcp_module, "McpServerConnection", _SlowConn)
 
     spec = _make_spec(_make_config("shared"))
     server_hash = compute_server_hash(spec.mcp_servers[0])
@@ -730,7 +730,7 @@ async def test_shared_connect_survives_one_spec_eviction_while_referenced(
         async def call_tool(self, name: str, arguments: dict[str, Any], **_kw: Any) -> str:
             return "ok"
 
-    monkeypatch.setattr(_mcp_manager_module, "McpServerConnection", _SlowConn)
+    monkeypatch.setattr(_tools_mcp_module, "McpServerConnection", _SlowConn)
 
     cfg_run = _make_config("shared")
     cfg_run.tools = ["run"]
@@ -824,7 +824,7 @@ async def test_stdio_cwd_threaded_to_connection(
             """Unused."""
             return ""
 
-    monkeypatch.setattr(_mcp_manager_module, "McpServerConnection", _CwdRecorder)
+    monkeypatch.setattr(_tools_mcp_module, "McpServerConnection", _CwdRecorder)
 
     spec = _make_spec(_make_config("jira"))
     project = Path("/tmp/some-project-root")
