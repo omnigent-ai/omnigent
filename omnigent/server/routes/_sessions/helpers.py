@@ -1834,6 +1834,32 @@ def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
             f"{sorted(OMNIGENT_HARNESSES)}, got {value!r}",
             code=ErrorCode.INVALID_INPUT,
         )
+    # A namespaced generic-ACP override (``acp:<slug>``) must PERSIST the
+    # slug: the runner reads it back for spawn selection (the spec of a
+    # non-ACP bundle carries no executor.config harness, so a persisted bare
+    # ``acp`` falls back to the FIRST configured agent — the wrong one).
+    # Identity checks at the consumption sites canonicalize on their own
+    # (canonicalize_harness is applied wherever harness identity matters),
+    # so returning the original namespaced value here is safe (#4855).
+    if value.startswith("acp:"):
+        slug = value.split(":", 1)[1]
+        from omnigent.onboarding.acp_auth import acp_agents
+
+        try:
+            configured = list(acp_agents())
+        except Exception:  # noqa: BLE001 — unreadable acp config is a create-time error here
+            raise OmnigentError(
+                f"invalid harness_override: the acp: configuration could not be read "
+                f"while validating {value!r}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if not any(entry.slug == slug for entry in configured):
+            raise OmnigentError(
+                f"invalid harness_override: unknown acp agent slug {slug!r}; "
+                f"configured slugs: {[e.slug for e in configured]}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        return value
     try:
         loaded = get_agent_cache().load(
             agent.id, agent.bundle_location, expand_env=agent.session_id is None
