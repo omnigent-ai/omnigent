@@ -1665,6 +1665,17 @@ def register_core_routes(
                                 "hosts-changed push failed; client will rely on fallback poll",
                                 exc_info=True,
                             )
+                elif evt_type == "projects_changed":
+                    async with emit_lock:
+                        try:
+                            await _send({"type": "projects_changed"})
+                        except WebSocketDisconnect:
+                            raise
+                        except Exception:
+                            _logger.warning(
+                                "projects-changed push failed; client converges on next load",
+                                exc_info=True,
+                            )
 
         reader_task = asyncio.create_task(_reader(), name="session-updates-reader")
         ticker_task = asyncio.create_task(_ticker(), name="session-updates-ticker")

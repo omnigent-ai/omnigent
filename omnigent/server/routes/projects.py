@@ -24,6 +24,7 @@ from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes.sessions import announce_projects_changed
 from omnigent.server.schemas import (
     CreateProjectRequest,
     UpdateProjectRequest,
@@ -81,6 +82,9 @@ def create_projects_router(
             user_id,
             body.config,
         )
+        # Push the change to the owner's other connected clients so their
+        # sidebars pick up the new folder without a reload.
+        announce_projects_changed(user_id)
         return _to_response(project)
 
     @router.get("/projects")
@@ -137,6 +141,10 @@ def create_projects_router(
         )
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        # A rename/config change is only ever seen by other connected clients
+        # (another tab, the mobile app) if it is pushed; nothing else refreshes
+        # their projects cache until a full reload.
+        announce_projects_changed(user_id)
         return _to_response(project)
 
     @router.delete("/projects/{project_id}")
@@ -156,6 +164,8 @@ def create_projects_router(
         deleted = await asyncio.to_thread(project_store.delete, project_id, user_id=user_id)
         if not deleted:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        # Drop the folder from the owner's other connected clients live.
+        announce_projects_changed(user_id)
         return {"id": project_id, "object": "project.deleted", "deleted": True}
 
     return router

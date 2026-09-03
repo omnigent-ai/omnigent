@@ -326,3 +326,21 @@ describe("SessionUpdatesProvider list invalidation", () => {
     }
   });
 });
+
+describe("SessionUpdatesProvider projects_changed frames", () => {
+  it("invalidates the project-row caches when another client changes a project", () => {
+    // A project rename/create/delete in another client arrives only as a
+    // `projects_changed` frame; nothing else refreshes ["projects"] (staleTime
+    // keeps it cached), so the handler must invalidate it — and the per-project
+    // config cache — for the sidebar to converge without a reload.
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    renderProvider(client, ["/"]);
+    const frameListener = subscribe.mock.calls.at(-1)?.[0] as unknown as (frame: unknown) => void;
+    expect(frameListener).toBeTypeOf("function");
+    act(() => frameListener({ type: "projects_changed" }));
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["projects"] });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["project-config"] });
+  });
+});

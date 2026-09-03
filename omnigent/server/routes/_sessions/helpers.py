@@ -601,6 +601,21 @@ def announce_hosts_changed(user_id: str | None) -> None:
     user_session_stream.publish(_discovery_key(user_id), {"type": "hosts_changed"})
 
 
+def announce_projects_changed(user_id: str | None) -> None:
+    """
+    Push a ``projects_changed`` event to a user's session-updates streams.
+
+    Called after one of ``user_id``'s projects is created, updated (renamed,
+    config change), or deleted, so that user's other connected clients refresh
+    their projects cache instead of showing the stale name until a reload. A
+    no-op when the user has no stream connected.
+
+    :param user_id: Owner of the project that changed, or ``None`` in
+        single-user mode.
+    """
+    user_session_stream.publish(_discovery_key(user_id), {"type": "projects_changed"})
+
+
 def _native_ask_gate_lock(conversation_id: str, deciding_policy: str) -> asyncio.Lock:
     """
     Return the lock serializing native ASK gates for one (session, policy).

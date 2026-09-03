@@ -310,6 +310,13 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
         case "hosts_changed":
           void queryClient.invalidateQueries({ queryKey: ["hosts"] });
           return;
+        case "projects_changed":
+          // Another client created/renamed/deleted a project (or changed its
+          // config/icon). Only the mutating client invalidates locally, so
+          // refresh the project-row caches here to converge without a reload.
+          void queryClient.invalidateQueries({ queryKey: ["projects"] });
+          void queryClient.invalidateQueries({ queryKey: ["project-config"] });
+          return;
         case "removed":
           for (const id of frame.ids) commentsFingerprintsRef.current.delete(id);
           if (removeIdsFromCache(queryClient, frame.ids)) scheduleInvalidate();
