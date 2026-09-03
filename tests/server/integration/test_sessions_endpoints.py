@@ -10337,3 +10337,50 @@ async def test_create_session_notifies_runner_with_init_envelope(
         "runner seeds it into the first spawn; got "
         f"{envelope.snapshot.model_override!r}"
     )
+
+
+async def test_external_info_error_item_publishes_and_persists_level(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An external ``error`` item with ``level: "info"`` keeps its level on both
+    the live ``response.output_item.done`` frame and the persisted item.
+
+    This is the runner's fresh-thread notice: the web renders it as a neutral
+    pill live, and again after reload from the items endpoint.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "error",
+                "item_data": {
+                    "source": "harness",
+                    "code": "codex_thread_reset",
+                    "message": "Codex started a fresh thread.",
+                    "level": "info",
+                },
+            },
+        },
+    )
+    assert resp.status_code in (200, 202)
+
+    done = [ev for _sid, ev in published if ev.get("type") == "response.output_item.done"]
+    assert len(done) == 1
+    assert done[0]["item"]["type"] == "error"
+    assert done[0]["item"]["level"] == "info"
+
+    items = await client.get(f"/v1/sessions/{session['id']}/items")
+    errors = [item for item in items.json()["data"] if item["type"] == "error"]
+    assert len(errors) == 1
+    assert errors[0]["level"] == "info"

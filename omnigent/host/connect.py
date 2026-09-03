@@ -144,6 +144,8 @@ from omnigent.runner.transports.ws_tunnel.limits import (
 from omnigent.runtime.websocket_metrics import (
     record_websocket_connected,
     record_websocket_disconnected,
+    websocket_close_code,
+    websocket_close_reason,
 )
 from omnigent.suspend_watch import watch_for_resume
 from omnigent.tls import client_ssl_context
@@ -388,6 +390,10 @@ except ValueError:
 # full default timeout on each reconnect after an established tunnel drops.
 _INITIAL_CONNECT_OPEN_TIMEOUT_S = 10.0
 _RECONNECT_OPEN_TIMEOUT_S = 3.0
+# Consecutive handshake recycle failures before the prompt cadence gives way
+# to normal backoff. An ingress cycle is brief; sustained 502 responses are an
+# outage and shouldn't hammer the endpoint twice a second.
+_RECYCLE_PROMPT_MAX_STREAK = 10
 # Fresh hosts get a short auth-retry window for Databricks OAuth refreshes.
 # Established hosts retry auth failures indefinitely to preserve sessions.
 _MAX_CONSECUTIVE_AUTH_ERRORS = 3
@@ -554,6 +560,13 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # auth, which fails for non-AWS proxies. Same rationale as
         # CLAUDE_CODE_USE_BEDROCK above. Safe to propagate: not a secret.
         "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+        # Claude Code's telemetry opt-in: a non-secret boolean the claude-sdk
+        # harness reads to export claude_code.* metrics/events. Must survive
+        # the CLI→daemon→runner env strips alongside its OTEL_* exporter
+        # config (prefix allowlist) and OMNIGENT_TELEMETRY_ENABLED below —
+        # otherwise a background daemon silently disables Claude Code
+        # telemetry that a foreground run exports fine.
+        "CLAUDE_CODE_ENABLE_TELEMETRY",
         # Non-secret Claude Code flags the native-claude provider path reads from
         # os.environ. If stripped, the runner re-adds CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1,
         # which turns off MCP tool search and loads every tool schema eagerly.
@@ -972,6 +985,7 @@ class HostProcess:
         # Consecutive connections that were accepted but died without a single
         # inbound frame; reset by any received frame or a rejected upgrade.
         # Past a bound the reconnect loop escalates instead of fast-recycling.
+        self._recycle_streak = 0
         self._silent_connect_streak = 0
         # Per-connection markers feeding the silent-connect streak.
         self._conn_upgrade_accepted = False
@@ -3116,6 +3130,23 @@ class HostProcess:
         self._reaper_task = asyncio.create_task(
             self._orphan_reaper_loop(), name="host-orphan-reaper"
         )
+        # Reap per-session native-harness bridge dirs orphaned by a runner
+        # that died uncleanly (crash / SIGKILL / host restart mid-run). The
+        # runner performs the same sweep at its own startup, but after a
+        # crash no new runner may ever launch on this machine, so the host
+        # (re)start is the reliable moment to reclaim them. Best-effort and
+        # off-loop: a sweep failure must never block host registration.
+        from omnigent.native_bridge_common import reap_orphaned_native_bridge_dirs
+
+        try:
+            reaped_bridge_dirs = await asyncio.to_thread(reap_orphaned_native_bridge_dirs)
+            if reaped_bridge_dirs:
+                _logger.info(
+                    "Reaped %d orphaned native bridge dir(s) from prior runs",
+                    reaped_bridge_dirs,
+                )
+        except Exception:  # noqa: BLE001 — housekeeping must never block registration
+            _logger.debug("native bridge-dir orphan sweep failed", exc_info=True)
         # Detect wake from system suspend (laptop sleep) and force-drop the
         # then-dead tunnel so the reconnect loop reattaches within seconds
         # instead of waiting out the ~90s keepalive ping timeout.
@@ -3243,11 +3274,14 @@ class HostProcess:
                     # so the overlap window closes and the tunnel settles (and a
                     # genuinely persistent failure surfaces instead of a silent
                     # tight loop).
-                    reason = str(exc).lower()
-                    explicit_recycle = any(
-                        t in reason for t in ("1012", "service restart", "1001", "going away")
+                    close_code = websocket_close_code(exc)
+                    close_reason = (websocket_close_reason(exc) or "").lower()
+                    explicit_recycle = close_code in {1001, 1012} or any(
+                        token in close_reason for token in ("service restart", "going away")
                     )
-                    ingress_recycle = any(t in reason for t in ("no close frame", "502"))
+                    ingress_recycle = (
+                        isinstance(exc, InvalidStatus) and exc.response.status_code == 502
+                    ) or (isinstance(exc, ConnectionClosed) and close_code is None)
                     # A silent-connect streak overrides the recycle fast path:
                     # prompt reconnects are for endpoints that answer.
                     silent_churn = self._silent_connect_streak >= _SILENT_CONNECT_ESCALATE_ATTEMPTS
@@ -3259,13 +3293,19 @@ class HostProcess:
                     # outside the silent-churn gate so wake never takes the slow path.
                     woke = self._woke_from_suspend
                     self._woke_from_suspend = False
-                    recycle = woke or (
-                        (
-                            explicit_recycle
-                            or (ingress_recycle and not _url_is_loopback(self._server_url))
-                        )
-                        and not silent_churn
-                    )
+                    classified_recycle = (
+                        explicit_recycle
+                        or (ingress_recycle and not _url_is_loopback(self._server_url))
+                    ) and not silent_churn
+                    if classified_recycle:
+                        self._recycle_streak += 1
+                        if self._recycle_streak > _RECYCLE_PROMPT_MAX_STREAK:
+                            # A recycle is a brief, self-healing event; a
+                            # sustained run of them is an outage. Fall back to
+                            # the backoff ladder so a dead endpoint is probed
+                            # gently instead of twice a second forever.
+                            classified_recycle = False
+                    recycle = woke or classified_recycle
                     wait_s = _RECONNECT_BASE_S if recycle else backoff
                     _logger.warning(
                         "Host tunnel disconnected: %s. Reconnecting in %.1fs%s",
@@ -3441,6 +3481,9 @@ class HostProcess:
         self._auth_retry_streak = 0
         self._refused_streak = 0
         self._conn_upgrade_accepted = True
+        # A completed upgrade proves the endpoint healthy — the next drop's
+        # prompt reconnect is wanted again.
+        self._recycle_streak = 0
         record_websocket_connected("host", reconnect=reconnect)
         disconnect_error: BaseException | None = None
         try:

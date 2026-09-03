@@ -2373,6 +2373,29 @@ function isPinnedOriginSender(event) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Deny-all permission handlers for an agent view's storage partition.
+ *
+ * SECURITY: agent views live on per-conversation partitions (storage isolation
+ * — see browserViewRegistry), NOT on `session.defaultSession`, so the shell's
+ * permission handlers (registerPermissions) do not cover them. A session with
+ * NO handler auto-grants every permission request in Electron, so each new
+ * partition gets an explicit deny-all before its first page loads. Agent-
+ * visited pages never legitimately need mic/camera/notifications from the
+ * shell; on defaultSession they were already denied (grants require the
+ * pinned server origin), so deny-all preserves the old posture. Re-installing
+ * on a partition that already has the handlers is an idempotent no-op, so no
+ * per-partition memo is kept (a failed install is retried on the next view).
+ *
+ * @param {string | undefined} partition
+ */
+function hardenAgentPartition(partition) {
+  if (!partition) return;
+  const ses = session.fromPartition(partition);
+  ses.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
+  ses.setPermissionCheckHandler(() => false);
+}
+
+/**
  * Build the per-conversation WebContentsView registry for a shell window
  * (positions child views in `win.contentView`, pings back via `win.webContents`).
  *
@@ -2381,7 +2404,12 @@ function isPinnedOriginSender(event) {
  */
 function createBrowserRegistryForWindow(win) {
   return createBrowserViewRegistry({
-    WebContentsViewCtor: (opts) => new WebContentsView(opts),
+    WebContentsViewCtor: (opts) => {
+      // Harden the view's partition before construction so no page can race a
+      // permission request ahead of the deny-all handlers.
+      hardenAgentPartition(opts && opts.webPreferences && opts.webPreferences.partition);
+      return new WebContentsView(opts);
+    },
     createBoundsController: createBrowserViewBoundsController,
     attachToHost: (view) => win.contentView.addChildView(view),
     detachFromHost: (view) => win.contentView.removeChildView(view),

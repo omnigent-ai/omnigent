@@ -42,13 +42,22 @@ def dismissal_event(
     }
 
 
-def decide(*, reviews, commits, timeline=None, head="new", head_repository=REPOSITORY):
+def decide(
+    *,
+    reviews,
+    commits,
+    timeline=None,
+    head="new",
+    head_repository=REPOSITORY,
+    author="contributor",
+):
     return approval_decision(
         repository=REPOSITORY,
-        author="contributor",
+        author=author,
         head_repository=head_repository,
         head_sha=head,
         maintainers=MAINTAINERS,
+        trusted_authors=TRUSTED,
         trusted_successors=TRUSTED,
         reviews=reviews,
         commits=commits,
@@ -60,6 +69,16 @@ def test_current_head_approval_passes():
     decision = decide(reviews=[review("APPROVED", "new")], commits=[commit("new")])
     assert decision.approved
     assert "Current head approved" in decision.reason
+
+
+def test_trusted_automation_author_passes_without_review():
+    decision = decide(
+        author="omni-resolve-agent[bot]",
+        reviews=[],
+        commits=[commit("new")],
+    )
+    assert decision.approved
+    assert "trusted automation" in decision.reason
 
 
 def test_approval_survives_trusted_same_repo_successor_commits():
@@ -159,6 +178,7 @@ def test_maintainer_authored_pr_still_passes():
         head_repository=REPOSITORY,
         head_sha="new",
         maintainers=MAINTAINERS,
+        trusted_authors=TRUSTED,
         trusted_successors=TRUSTED,
         reviews=[],
         commits=[commit("new", "maintainer")],

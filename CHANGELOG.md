@@ -231,7 +231,7 @@ website under `/releases`.
 - [Feature] Scheduled tasks can now set a per-firing cost budget (`max_cost_usd`) that caps LLM spend on each run (#4791)
 - [Bug fix] Sub-agent inbox wake notices no longer repeat the same "results waiting in inbox" line while a parent's results sit undrained. (#4803)
 - [Chore] Cache session access checks briefly to cut per-event database load on active sessions (#4820)
-- [Chore] `omnigent host` conflict error now shows the exact `omnigent host stop --server (#4821)
+- [Chore] `omnigent host` conflict error now shows the exact `omnigent host stop` command to run (#4821)
 - [Bug fix] Resuming a conversation no longer fails with `string indices must be integers` when the history contains a plain-text assistant message (#4824)
 - [UI / Bug fix / Feature] Cmd/Ctrl+N now starts a new session, including in the macOS desktop app without opening another app window. (#4840)
 - [Bug fix] Agent and session discovery tools now page large catalogs through an opaque cursor, or return a bounded diagnostic when the smallest page cannot fit. (#4892)

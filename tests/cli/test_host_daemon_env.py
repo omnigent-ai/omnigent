@@ -160,3 +160,45 @@ def test_runner_env_preserves_claude_tool_search_flags() -> None:
 
     # Then
     assert {name: env.get(name) for name in _CLAUDE_TOOL_SEARCH_ENV} == _CLAUDE_TOOL_SEARCH_ENV
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_host_daemon_env_preserves_claude_telemetry_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """CLAUDE_CODE_ENABLE_TELEMETRY survives the CLI→daemon strip in both modes."""
+    # Given
+    monkeypatch.setenv("CLAUDE_CODE_ENABLE_TELEMETRY", "1")
+    monkeypatch.setenv("OTEL_METRICS_EXPORTER", "otlp")
+
+    # When
+    env = _build_host_daemon_env(server_url=server_url)
+
+    # Then: the opt-in flag travels with the OTEL exporter config it belongs to.
+    assert env.get("OTEL_METRICS_EXPORTER") == "otlp"
+    assert env.get("CLAUDE_CODE_ENABLE_TELEMETRY") == "1"
+
+
+def test_runner_env_preserves_claude_telemetry_opt_in() -> None:
+    """CLAUDE_CODE_ENABLE_TELEMETRY survives the daemon→runner strip."""
+    # Given
+    base_env = {
+        "PATH": "/usr/bin",
+        "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+        "OTEL_METRICS_EXPORTER": "otlp",
+    }
+
+    # When
+    env = _build_runner_env(
+        base_env,
+        server_url=_REMOTE_SERVER_URL,
+        runner_id="runner_telemetry",
+        binding_token="binding-telemetry",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    # Then
+    assert env.get("OTEL_METRICS_EXPORTER") == "otlp"
+    assert env.get("CLAUDE_CODE_ENABLE_TELEMETRY") == "1"

@@ -1,8 +1,9 @@
 name: Maintainer Approval
 
-# Gates merge on a maintainer's approval. The job *is* the required check: it
-# exits non-zero until a maintainer approves, and GitHub reports that pass/fail
-# as the `Maintainer Approval` status. No commit status is posted (a fork's token
+# Gates merge on a maintainer's approval, except for explicitly trusted automation
+# authors. The job *is* the required check: it exits non-zero until approval (or
+# a trusted author) is present, and GitHub reports that pass/fail as the
+# `Maintainer Approval` status. No commit status is posted (a fork's token
 # is read-only, so a `gh api .../statuses` POST would 403), so the check is the
 # job result instead.
 #
@@ -53,4 +54,5 @@ jobs:
           python3 .github/scripts/maintainer_approval.py \
             --repository "$REPO" \
             --pr-number "$PR" \
+            --trusted-author 'omni-resolve-agent[bot]' \
             --trusted-successor 'omni-resolve-agent[bot]'

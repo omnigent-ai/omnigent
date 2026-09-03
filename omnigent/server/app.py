@@ -37,6 +37,9 @@ from omnigent.debug_logging import (
     set_current_user_id,
 )
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.extensions import ExtensionPluginState
+from omnigent.extensions.assets import ResolvedBundle, build_asset_index
+from omnigent.extensions.registry import plugin_state as load_extension_plugin_state
 from omnigent.harness_plugins import (
     NativeHarnessProvider,
     native_provider_for_key,
@@ -74,6 +77,8 @@ from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
 from omnigent.server.routes.dictation import create_dictation_router
+from omnigent.server.routes.extension_assets import create_extension_assets_router
+from omnigent.server.routes.extensions import create_extensions_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
@@ -150,6 +155,33 @@ class ServerInfoResponse(BaseModel):
     installable_harnesses: list[str]
     dictation_available: bool
     branding: BrandingInfo
+
+
+def _resolve_extension_state(
+    provided: ExtensionPluginState | None,
+) -> ExtensionPluginState:
+    """Resolve extensions without allowing catalog discovery to stop the server."""
+    if provided is not None:
+        return provided
+    try:
+        return load_extension_plugin_state()
+    # Distribution metadata is an external installation boundary. Preserve the
+    # rest of the server if global discovery itself fails before per-plugin
+    # failure isolation can apply.
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("could not discover installed extensions (%s)", exc, exc_info=True)
+        return ExtensionPluginState(manifests=(), load_errors={"registry": str(exc)})
+
+
+def _resolve_extension_assets(
+    state: ExtensionPluginState,
+) -> tuple[dict[str, ResolvedBundle], dict[str, str]]:
+    """Resolve bundle snapshots without allowing asset failures to stop the server."""
+    try:
+        return build_asset_index(state)
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("could not build extension asset index (%s)", exc, exc_info=True)
+        return {}, {"registry": str(exc)}
 
 
 def _server_version() -> str:
@@ -1042,6 +1074,7 @@ def create_app(
     public_sharing: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
+    extension_state: ExtensionPluginState | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1144,6 +1177,9 @@ def create_app(
     :param feature_flags: Optional immutable release-feature snapshot.
         When omitted, resolves the comma-separated ``OMNIGENT_FEATURES``
         enabled set once at application construction.
+    :param extension_state: Optional pre-resolved installed-extension registry.
+        When omitted, entry points are discovered once at application
+        construction and the process-cached state is reused thereafter.
     :param public_sharing: Whether public (anyone-with-the-link) read
         access may be granted — i.e. whether the ``__public__`` grant is
         allowed. Orthogonal to ``sharing_mode``: a server can keep normal
@@ -1176,6 +1212,8 @@ def create_app(
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
+    resolved_extension_state = _resolve_extension_state(extension_state)
+    extension_bundles, extension_asset_errors = _resolve_extension_assets(resolved_extension_state)
 
     # First-boot admin bootstrap for the accounts auth provider.
     # Runs before any route is mounted so the login page is never
@@ -1767,7 +1805,20 @@ def create_app(
         :param exc: The application error.
         :returns: A JSON response with the error code and message.
         """
-        if exc.http_status >= 500:
+        if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
+            # A session state, not a fault: the user's machine is asleep or
+            # the host disconnected, and clients render it as a reconnect
+            # affordance. Through the 5xx arm every poll of an offline
+            # session added an "Internal error" plus a stack, which is what
+            # buried the real 500s.
+            _logger.warning(
+                "Runner unavailable: %s",
+                exc.message,
+                extra=_error_audit_extra(
+                    request, phase="unavailable", code=str(exc.code), http_status="503"
+                ),
+            )
+        elif exc.http_status >= 500:
             _logger.error(
                 "Internal error: %s",
                 exc.message,
@@ -2531,6 +2582,25 @@ def create_app(
         create_harnesses_router(auth_provider=auth_provider),
         prefix="/v1",
         tags=["harnesses"],
+    )
+    app.include_router(
+        create_extensions_router(
+            resolved_extension_state,
+            bundles=extension_bundles,
+            asset_errors=extension_asset_errors,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["extensions"],
+    )
+    app.include_router(
+        create_extension_assets_router(
+            extension_bundles,
+            auth_provider=auth_provider,
+        ),
+        prefix="/v1",
+        tags=["extensions"],
     )
     # Server-side speech-to-text behind the composer mic button
     # (designs/server-dictation.md). Availability is probed lazily, so

@@ -793,6 +793,64 @@ def test_preload_codex_thread_for_resume_resumes_and_closes(
     assert fake_client.closed is True
 
 
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (
+            codex_native_app_server.CodexAppServerResponseError(
+                {
+                    "code": -32603,
+                    "message": (
+                        "failed to read thread: thread-store internal error: failed to "
+                        "load thread history /codex-home/sessions/rollout.jsonl: stream "
+                        "did not contain valid UTF-8"
+                    ),
+                }
+            ),
+            True,
+        ),
+        (
+            codex_native_app_server.CodexAppServerResponseError(
+                {
+                    "code": -32603,
+                    "message": (
+                        "error resuming thread: Fatal error: Failed to initialize "
+                        "session: thread-store internal error: failed to resume local "
+                        "thread recorder: final paginated rollout record at "
+                        "/codex-home/sessions/rollout.jsonl is missing an ordinal"
+                    ),
+                }
+            ),
+            True,
+        ),
+        (
+            codex_native_app_server.CodexAppServerResponseError(
+                {"code": -32603, "message": "internal error: something unrelated"}
+            ),
+            False,
+        ),
+        (
+            codex_native_app_server.CodexAppServerResponseError(
+                {"code": -32600, "message": "thread 019e already has an active writer"}
+            ),
+            False,
+        ),
+        (RuntimeError("thread-store internal error: not an app-server error"), False),
+    ],
+)
+def test_is_unreadable_thread_error(exc: BaseException, expected: bool) -> None:
+    """
+    Only codex's thread-store read failure counts as an unreadable thread.
+
+    A refused resume (another writer holds the thread) and a plain runtime
+    error must keep failing loud rather than silently starting a fresh thread.
+
+    :param exc: Exception raised by the resume request.
+    :param expected: Whether it classifies as an unreadable thread.
+    """
+    assert codex_native_app_server.is_unreadable_thread_error(exc) is expected
+
+
 def test_codex_resume_permission_params_parse_legacy_flags() -> None:
     """Legacy approval and sandbox flags become preload overrides."""
     assert codex_native_app_server._codex_resume_permission_params(
@@ -4964,6 +5022,64 @@ def test_forwarder_sends_codex_command_approval_response_to_app_server(
     asyncio.run(run())
 
     assert fake_client.responses == [(14, {"decision": "accept"})]
+
+
+def test_forwarder_declines_codex_command_when_approval_hook_rejects_request(
+    tmp_path: Path,
+) -> None:
+    """A rejected Omnigent hook must not leave Codex waiting forever."""
+    fake_client = _FakeCodexAppServerClient()
+    codex_event = {
+        "id": 14,
+        "method": "item/commandExecution/requestApproval",
+        "params": {
+            "threadId": "thread_123",
+            "turnId": "turn_123",
+            "itemId": "item_cmd",
+            "command": "date",
+            "availableDecisions": [
+                {
+                    "acceptWithExecpolicyAmendment": {
+                        "execpolicy_amendment": [],
+                    }
+                }
+            ],
+        },
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/conv_123/hooks/codex-elicitation-request"
+        assert json.loads(request.content) == codex_event
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "code": "invalid_input",
+                    "message": ("Codex execpolicy amendment must be a non-empty list of strings."),
+                }
+            },
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            elicitation_tracker = _elicitation_tracker()
+            await codex_native_forwarder._handle_event(
+                client,
+                session_id="conv_123",
+                bridge_dir=tmp_path,
+                usage_coalescer=_usage_coalescer(client),
+                elicitation_tracker=elicitation_tracker,
+                event=codex_event,
+                codex_client=fake_client,  # type: ignore[arg-type]
+            )
+            await elicitation_tracker.drain()
+
+    asyncio.run(run())
+
+    assert fake_client.responses == [(14, {"decision": "decline"})]
 
 
 def test_forwarder_routes_unregistered_child_command_approval_to_parent(

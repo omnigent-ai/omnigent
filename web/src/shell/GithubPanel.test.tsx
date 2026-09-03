@@ -55,7 +55,8 @@ vi.mock("@/components/theme/useResolvedThemeMode", () => ({
   useResolvedThemeMode: () => "light",
 }));
 
-import { GithubPanel } from "./GithubPanel";
+import { GithubPanel, deriveGithubPanelState } from "./GithubPanel";
+import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 
 function file(
   path: string,
@@ -303,6 +304,116 @@ describe("GithubPanel", () => {
       isFetching: false,
     };
     renderPanel();
-    expect(screen.getByText(/isn.t a git repository/)).toBeInTheDocument();
+    expect(screen.getByText("Not a git repository")).toBeInTheDocument();
+    expect(screen.queryByTestId("diff")).toBeNull();
+  });
+
+  it("prompts to update the host when it predates the GitHub route", () => {
+    state.info = {
+      data: { object: "session.github.info", available: false, reason: "host_outdated" },
+      isLoading: false,
+      error: null,
+      isFetching: false,
+    };
+    renderPanel();
+    expect(screen.getByText("Update your host to use GitHub")).toBeInTheDocument();
+    expect(screen.getByText(/0\.13\.0 or later/)).toBeInTheDocument();
+    expect(screen.queryByTestId("diff")).toBeNull();
+  });
+
+  it("prompts to install the GitHub CLI when gh is missing", () => {
+    state.info!.data!.gh_available = false;
+    renderPanel();
+    expect(screen.getByText("GitHub CLI not found")).toBeInTheDocument();
+    expect(screen.queryByTestId("diff")).toBeNull();
+  });
+
+  it("prompts to check gh auth when the upstream repo can't be resolved", () => {
+    // Signed in, but `gh repo view` failed → no repo resolved.
+    state.info!.data!.authenticated = true;
+    state.info!.data!.repo = null;
+    renderPanel();
+    expect(screen.getByText("Can’t reach the upstream repo")).toBeInTheDocument();
+    expect(screen.getByText(/gh auth status/)).toBeInTheDocument();
+    expect(screen.queryByTestId("diff")).toBeNull();
+  });
+
+  it("shows a no-open-PR empty state (naming the branch) and hides the diff", () => {
+    state.info!.data!.pr = null;
+    renderPanel();
+    expect(screen.getByText(/No open PR for/)).toBeInTheDocument();
+    expect(screen.getByText("test/pr-view")).toBeInTheDocument();
+    expect(screen.queryByTestId("diff")).toBeNull();
+  });
+});
+
+describe("deriveGithubPanelState", () => {
+  const ready: GithubInfo = {
+    object: "session.github.info",
+    available: true,
+    gh_available: true,
+    authenticated: true,
+    branch: "feat/x",
+    base_ref: "main",
+    repo: { name_with_owner: "acme/app" },
+    pr: {
+      number: 1,
+      title: "t",
+      state: "OPEN",
+      url: "u",
+      is_draft: false,
+      author: "a",
+      base_ref: "main",
+      head_ref: "feat/x",
+      checks: { passing: 0, failing: 0, pending: 0, total: 0, runs: [] },
+    },
+  };
+  const q = (over: Partial<{ isLoading: boolean; error: unknown; data: GithubInfo }>) => ({
+    isLoading: false,
+    error: null as unknown,
+    data: undefined as GithubInfo | undefined,
+    ...over,
+  });
+
+  it("orders transient states ahead of data", () => {
+    expect(deriveGithubPanelState(q({ isLoading: true })).kind).toBe("loading");
+    expect(deriveGithubPanelState(q({ error: new RunnerOfflineError() })).kind).toBe(
+      "runner-offline",
+    );
+    expect(deriveGithubPanelState(q({ error: new Error("boom") })).kind).toBe("error");
+  });
+
+  it("maps each unavailable reason to its own state", () => {
+    expect(deriveGithubPanelState(q({ data: undefined })).kind).toBe("unavailable");
+    expect(
+      deriveGithubPanelState(
+        q({ data: { object: "session.github.info", available: false, reason: "no_os_env" } }),
+      ).kind,
+    ).toBe("unavailable");
+    expect(
+      deriveGithubPanelState(
+        q({ data: { object: "session.github.info", available: false, reason: "not_a_git_repo" } }),
+      ).kind,
+    ).toBe("not-a-git-repo");
+    expect(
+      deriveGithubPanelState(
+        q({ data: { object: "session.github.info", available: false, reason: "host_outdated" } }),
+      ).kind,
+    ).toBe("host-outdated");
+  });
+
+  it("walks the gh layer: cli → auth → repo → pr → ready", () => {
+    expect(deriveGithubPanelState(q({ data: { ...ready, gh_available: false } })).kind).toBe(
+      "no-gh-cli",
+    );
+    expect(deriveGithubPanelState(q({ data: { ...ready, authenticated: false } })).kind).toBe(
+      "repo-unresolved",
+    );
+    expect(deriveGithubPanelState(q({ data: { ...ready, repo: null } })).kind).toBe(
+      "repo-unresolved",
+    );
+    const noPr = deriveGithubPanelState(q({ data: { ...ready, pr: null } }));
+    expect(noPr).toEqual({ kind: "no-pr", branch: "feat/x" });
+    expect(deriveGithubPanelState(q({ data: ready }))).toEqual({ kind: "ready" });
   });
 });

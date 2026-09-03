@@ -15,6 +15,7 @@ import functools
 import itertools
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -136,7 +137,7 @@ from omnigent.runner.native import (
     _unwrap_resolved_spec,
 )
 from omnigent.runner.native import orchestration as _native_runtime
-from omnigent.runner.native.interrupt import NativeInterruptRunner
+from omnigent.runner.native.interrupt import MarkSubagentTerminalAndWake, NativeInterruptRunner
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -399,6 +400,45 @@ def _unwrap_spec_entry(entry: _SpecEntry | None) -> AgentSpec | None:
 
 _NO_BODY_STATUS_CODES = {204, 304}
 _SUBAGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+# Liveness budget for a sub-agent dispatch stuck in ``launching``: a child
+# that has produced NO edge at all (no running/waiting/terminal status, no
+# in-flight response) within this window never started — fail it loudly
+# instead of letting the dispatched work wedge forever with no error surfaced.
+_SUBAGENT_LAUNCH_TIMEOUT_S_ENV = "OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S"
+_DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S = 180.0
+# Interval for the background sweep in the runner entrypoint.
+SUBAGENT_LAUNCH_REAP_INTERVAL_S = 30.0
+
+
+def resolve_subagent_launch_timeout_s() -> float:
+    """
+    Resolve the sub-agent launch liveness budget in seconds.
+
+    Values ``<= 0`` disable the reaper. A non-numeric override is rejected
+    with a warning and falls back to the default.
+
+    :returns: The budget in seconds, e.g. ``180.0``.
+    """
+    raw = os.environ.get(_SUBAGENT_LAUNCH_TIMEOUT_S_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        value = None
+    # Non-finite values (nan/inf) would silently disable reaping without the
+    # explicit ``<= 0`` "disabled" intent — reject them like non-numeric input.
+    if value is None or not math.isfinite(value):
+        _logger.warning(
+            "Invalid %s=%r; using default %ss",
+            _SUBAGENT_LAUNCH_TIMEOUT_S_ENV,
+            raw,
+            _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S,
+        )
+        return _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S
+    return value
+
+
 _SUBAGENT_DELIVERY_DELIVERED = "delivered"
 _SUBAGENT_DELIVERY_ALREADY_DELIVERED = "already_delivered"
 _SUBAGENT_DELIVERY_UNTRACKED = "untracked"
@@ -1914,6 +1954,19 @@ def mark_subagent_work_terminal(
             reason=_SUBAGENT_DELIVERY_UNTRACKED,
         )
     if entry.status in _SUBAGENT_TERMINAL_STATUSES:
+        # ``failed`` outranks ``completed``: a quiescence-derived ``completed``
+        # (the watcher's ``idle`` edge) can be recorded — and delivered — before
+        # the turn's real ``failed`` edge lands. The failure must replace it and
+        # be re-delivered, or the parent is left believing the turn succeeded
+        # and the error text is silently dropped. A parent may act on the false
+        # success before the re-delivery arrives — that window is inherent to
+        # the edge race; re-delivery is the mitigation, not a prevention.
+        if status == "failed" and entry.status == "completed":
+            entry.status = status
+            entry.output = output
+            entry.completed_at = time.time()
+            entry.delivered = False
+            return _deliver_subagent_completion(entry)
         if entry.delivered:
             return _SubagentDeliveryAck(
                 entry=entry,
@@ -1922,8 +1975,12 @@ def mark_subagent_work_terminal(
                 reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
             )
         # A late stop_session-driven "cancelled" must not downgrade an
-        # already-recorded "completed"/"failed" still awaiting delivery.
-        if status != "cancelled" or entry.status == "cancelled":
+        # already-recorded "completed"/"failed" still awaiting delivery, and a
+        # trailing quiescence "completed" must not launder a recorded "failed".
+        keep_recorded = (status == "cancelled" and entry.status != "cancelled") or (
+            status == "completed" and entry.status == "failed"
+        )
+        if not keep_recorded:
             entry.status = status
             entry.output = output
             entry.completed_at = time.time()
@@ -1986,6 +2043,86 @@ def _deliver_subagent_completion(entry: _SubagentWorkEntry) -> _SubagentDelivery
         delivered_now=True,
         reason=_SUBAGENT_DELIVERY_DELIVERED,
     )
+
+
+def reap_stalled_subagent_launches(
+    *,
+    now: float | None = None,
+    timeout_s: float | None = None,
+    mark_terminal: MarkSubagentTerminalAndWake | None = None,
+) -> list[_SubagentWorkEntry]:
+    """
+    Fail sub-agent dispatches stuck in ``launching`` beyond the liveness budget.
+
+    A child that has produced no edge at all (no running/waiting/terminal
+    status) within the budget never started; without this sweep the dispatched
+    work wedges forever and the parent is never told. Each reaped entry is
+    marked ``failed`` and its failure is delivered to the parent inbox through
+    ``mark_terminal``.
+
+    :param now: Clock override for tests, e.g. ``time.time()``.
+    :param timeout_s: Budget override for tests; defaults to
+        :func:`resolve_subagent_launch_timeout_s`.
+    :param mark_terminal: Terminal-delivery callback. Production passes the
+        app's ``mark_subagent_terminal_and_wake`` seam so the reaped failure
+        also schedules the parent wake POST — the sole signal that rouses an
+        idle parent to drain its inbox. Defaults to the inbox-only
+        :func:`mark_subagent_work_terminal`.
+    :returns: The entries that were failed by this sweep.
+    """
+    budget = resolve_subagent_launch_timeout_s() if timeout_s is None else timeout_s
+    if budget <= 0:
+        return []
+    deliver = mark_subagent_work_terminal if mark_terminal is None else mark_terminal
+    current = time.time() if now is None else now
+    reaped: list[_SubagentWorkEntry] = []
+    for entry in list(_subagent_work_by_child.values()):
+        if entry.status != "launching":
+            continue
+        if current - entry.created_at < budget:
+            continue
+        _logger.warning(
+            "Sub-agent dispatch stuck in launching for %.0fs; failing it: parent=%s child=%s",
+            current - entry.created_at,
+            entry.parent_session_id,
+            entry.child_session_id,
+        )
+        deliver(
+            entry.child_session_id,
+            status="failed",
+            output=(
+                f"Error: sub-agent {entry.agent!r} title {entry.title!r} produced no "
+                f"activity within {budget:.0f}s of dispatch; the child session never "
+                "started. The dispatched message was not processed."
+            ),
+        )
+        reaped.append(entry)
+    return reaped
+
+
+async def run_subagent_launch_reaper(
+    *,
+    interval_s: float = SUBAGENT_LAUNCH_REAP_INTERVAL_S,
+    mark_terminal: MarkSubagentTerminalAndWake | None = None,
+) -> None:
+    """
+    Periodically sweep for sub-agent dispatches wedged in ``launching``.
+
+    Runs until cancelled; started by the runner entrypoint alongside the
+    process manager. Sweep errors are logged and never end the loop.
+
+    :param interval_s: Seconds between sweeps, e.g. ``30.0``.
+    :param mark_terminal: Terminal-delivery callback forwarded to each sweep;
+        the entrypoint passes the app's wake-scheduling seam so a reaped
+        failure wakes the parent, not just its inbox.
+    :returns: None.
+    """
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            reap_stalled_subagent_launches(mark_terminal=mark_terminal)
+        except Exception:  # noqa: BLE001 — the sweep is a backstop; never die.
+            _logger.warning("sub-agent launch reaper sweep failed", exc_info=True)
 
 
 async def _wake_retry_sleep(seconds: float) -> None:
@@ -2794,6 +2931,14 @@ def create_runner_app(
     ) -> _JsonObject | None:
         if status in ("running", "waiting"):
             mark_subagent_work_started(session_id)
+        # ``failed`` is sticky against a trailing ``idle``, mirroring the
+        # server invariant (see ``omnigent/server/routes/_sessions/helpers.py``):
+        # a failed native turn's pane goes quiet, so the PTY-activity watcher
+        # emits a trailing ``idle`` ~1s later — republishing the child as
+        # ``completed`` would show a green child for a turn that died. A later
+        # ``running``/``waiting`` edge (new activity) clears it normally.
+        if status == "idle" and meta.last_task_status == "failed":
+            return None
         busy = status in ("running", "waiting")
         task_status = _session_status_to_task_status(status)
         error_signature = (error["code"], error["message"]) if error is not None else None
@@ -4013,7 +4158,6 @@ def create_runner_app(
 
     @app.get("/v1/sessions/{session_id}/stream")
     async def stream_session(session_id: str) -> StreamingResponse:
-
         async def _event_generator() -> AsyncIterator[bytes]:
             queue = _session_event_queues.get(session_id)
             if queue is None:
@@ -6428,7 +6572,6 @@ def create_runner_app(
     async def _check_and_start_next_turn(
         session_id: str,
     ) -> None:
-
         _seq = _ingest_next_seq.get(session_id, 0)
         _ingest_next_seq[session_id] = _seq + 1
         _cond = _ingest_cond.get(session_id)
@@ -6653,6 +6796,10 @@ def create_runner_app(
         if ack.entry is not None and ack.delivered_now:
             _schedule_subagent_wake(ack.entry)
         return ack
+
+    # Seam for the entrypoint's launch reaper (and tests): terminal delivery
+    # that also schedules the parent wake POST, not just the inbox insert.
+    app.state.mark_subagent_terminal_and_wake = _mark_subagent_terminal_and_wake
 
     _native_interrupt_runner = NativeInterruptRunner(
         server_client=server_client,
@@ -8521,7 +8668,15 @@ def create_runner_app(
         if body_type == "approval":
             _data = body.get("data") or body
             _elicit_action = _data.get("action", "")
-            pending_approvals.resolve(_data.get("elicitation_id", ""), _elicit_action == "accept")
+            # ``content`` is the person's answer when the prompt asked for
+            # more than consent (an MCP ``requestedSchema``). Dropping it here
+            # is what used to make the awaiting caller invent one.
+            _elicit_content = _data.get("content")
+            pending_approvals.resolve(
+                _data.get("elicitation_id", ""),
+                _elicit_action == "accept",
+                _elicit_content if isinstance(_elicit_content, dict) else None,
+            )
             if _elicit_action == "decline":
                 try:
                     _int_client = await process_manager.get_client(conversation_id, "any")

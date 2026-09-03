@@ -494,6 +494,40 @@ class CodexAppServerResponseError(RuntimeError):
         super().__init__(str(error))
 
 
+#: JSON-RPC internal-error code codex returns when its thread-store fails.
+_CODEX_INTERNAL_ERROR_CODE = -32603
+
+#: Substring in codex's ``-32603`` message when its thread-store cannot
+#: load/resume a thread's rollout — stable across the wrapper phrasings
+#: different codex versions use (``failed to read thread: …`` vs
+#: ``error resuming thread: …``).
+_CODEX_THREAD_STORE_ERROR = "thread-store internal error"
+
+
+def is_unreadable_thread_error(exc: BaseException) -> bool:
+    """
+    Whether a ``thread/resume`` failure means codex cannot load the thread.
+
+    Codex answers ``-32603`` with a ``thread-store internal error`` when it
+    cannot load or resume a thread's rollout JSONL — e.g. a large transcript
+    whose multibyte character straddles a read-buffer boundary is rejected as
+    invalid UTF-8 (``failed to read thread: …``), or a rollout record it
+    cannot resume (``error resuming thread: …``). Retrying never resumes such
+    a thread, unlike a refused resume (``-32600``, another writer holds the
+    thread) that clears once the holder exits.
+
+    :param exc: The exception raised by the resume request, e.g. a
+        :class:`CodexAppServerResponseError`.
+    :returns: ``True`` when only a fresh thread can carry the session on.
+    """
+    return (
+        isinstance(exc, CodexAppServerResponseError)
+        and exc.code == _CODEX_INTERNAL_ERROR_CODE
+        and exc.message is not None
+        and _CODEX_THREAD_STORE_ERROR in exc.message
+    )
+
+
 class CodexAppServerClient:
     """JSON-RPC client for a Codex app-server.
 

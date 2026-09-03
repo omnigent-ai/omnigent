@@ -11,9 +11,11 @@
 // reader expands unchanged context.
 //
 // Data comes from the runner's read-only GitHub resource API (see
-// hooks/useGithub.ts), which shells out to `gh` + `git`. When gh is missing /
-// unauthenticated / the workspace isn't a repo, the panel renders a message
-// rather than an error.
+// hooks/useGithub.ts), which shells out to `gh` + `git`. `deriveGithubPanelState`
+// is the single switch that turns the info query into what the panel shows: an
+// outdated host, a non-git workspace, a missing `gh` CLI, an unresolved
+// upstream repo, or no open PR each render their own empty state, and only an
+// open PR falls through to the header + stacked diff.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -21,22 +23,28 @@ import {
   ChevronRightIcon,
   ChevronsDownUpIcon,
   ChevronsUpDownIcon,
+  AlertCircleIcon,
   CircleCheckIcon,
   CircleDotIcon,
   CircleXIcon,
   Columns2Icon,
+  DownloadIcon,
   ExternalLinkIcon,
   FileDiffIcon,
   FileMinusIcon,
   FilePlusIcon,
   FileSymlinkIcon,
   FolderIcon,
+  GitBranchIcon,
+  GitPullRequestIcon,
+  KeyRoundIcon,
   Loader2Icon,
   type LucideIcon,
   PanelLeftCloseIcon,
   PanelLeftOpenIcon,
   RefreshCwIcon,
   Rows2Icon,
+  TerminalIcon,
 } from "lucide-react";
 import { FileDiff } from "@pierre/diffs/react";
 import { parsePatchFiles, type FileDiffMetadata } from "@pierre/diffs";
@@ -56,19 +64,85 @@ import {
   useGithubPrDiff,
   type GithubChangedFile,
   type GithubCheckRun,
+  type GithubInfo,
 } from "@/hooks/useGithub";
 
 // Shiki bundled themes matching the app's editor look; the concrete side is
 // chosen by `themeType` from the app's resolved light/dark mode.
 const DIFF_THEME = { dark: "github-dark", light: "github-light" } as const;
 
-/** Centered muted message filling the panel — the shared empty/error/loading shell. */
+/** Centered muted message filling the panel — the shared loading/transient shell. */
 function PanelMessage({ children }: { children: React.ReactNode }) {
   return (
     <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center text-ui text-muted-foreground">
       {children}
     </div>
   );
+}
+
+/** Full-panel empty state: an icon, a title, and an optional hint line. Used
+ *  for every "no GitHub content to show" reason so they read as one family. */
+function GithubEmptyState({
+  icon: Icon,
+  title,
+  hint,
+}: {
+  icon: LucideIcon;
+  title: React.ReactNode;
+  hint?: React.ReactNode;
+}) {
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
+      <Icon className="size-8 text-muted-foreground/50" />
+      <p className="text-ui font-medium text-foreground">{title}</p>
+      {hint && <p className="max-w-xs text-ui text-muted-foreground">{hint}</p>}
+    </div>
+  );
+}
+
+/** The one thing the panel should show, derived from the info query. Every
+ *  non-`ready` kind is a whole-panel state; `ready` renders the PR + diff. */
+export type GithubPanelState =
+  | { kind: "loading" }
+  | { kind: "runner-offline" }
+  | { kind: "error"; message: string }
+  | { kind: "host-outdated" }
+  | { kind: "unavailable" }
+  | { kind: "not-a-git-repo" }
+  | { kind: "no-gh-cli" }
+  | { kind: "repo-unresolved" }
+  | { kind: "no-pr"; branch: string | undefined }
+  | { kind: "ready" };
+
+/** Central switch turning the GitHub info query into the panel's state.
+ *
+ * Order matters: transient states (loading/offline/error) first, then the
+ * git-first availability reasons, then the `gh` enhancement layer (CLI → auth
+ * → repo → PR). `ready` is reached only with an open PR to render. */
+export function deriveGithubPanelState(info: {
+  isLoading: boolean;
+  error: unknown;
+  data: GithubInfo | undefined;
+}): GithubPanelState {
+  if (info.isLoading) return { kind: "loading" };
+  if (info.error) {
+    if (info.error instanceof RunnerOfflineError) return { kind: "runner-offline" };
+    return { kind: "error", message: (info.error as Error).message };
+  }
+  const data = info.data;
+  if (!data || !data.available) {
+    if (data?.reason === "not_a_git_repo") return { kind: "not-a-git-repo" };
+    if (data?.reason === "host_outdated") return { kind: "host-outdated" };
+    return { kind: "unavailable" };
+  }
+  // Git repo present; `gh` layers PR/repo metadata on top of it.
+  if (data.gh_available === false) return { kind: "no-gh-cli" };
+  // Not signed in, or signed in but the upstream repo can't be resolved —
+  // both point the user at `gh auth status`.
+  if (data.authenticated === false) return { kind: "repo-unresolved" };
+  if (!data.repo?.name_with_owner) return { kind: "repo-unresolved" };
+  if (!data.pr) return { kind: "no-pr", branch: data.branch };
+  return { kind: "ready" };
 }
 
 /** A ghost icon button with a tooltip; the toolbar's shared control element.
@@ -627,38 +701,96 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
   };
 
   // ── Whole-panel states (before the header + stacked diff) ───────────────
-  if (info.isLoading) {
-    return (
-      <PanelMessage>
-        <Loader2Icon className="size-5 animate-spin" />
-        Loading GitHub…
-      </PanelMessage>
-    );
-  }
-  if (info.error) {
-    if (info.error instanceof RunnerOfflineError) {
+  // One central switch: every non-`ready` kind returns its own whole-panel
+  // state, so the diff below renders only when there's an open PR.
+  const panelState = deriveGithubPanelState({
+    isLoading: info.isLoading,
+    error: info.error,
+    data: info.data,
+  });
+  switch (panelState.kind) {
+    case "loading":
+      return (
+        <PanelMessage>
+          <Loader2Icon className="size-5 animate-spin" />
+          Loading GitHub…
+        </PanelMessage>
+      );
+    case "runner-offline":
       return (
         <PanelMessage>The agent is asleep. Send a message to reconnect its runner.</PanelMessage>
       );
-    }
-    return <PanelMessage>Couldn’t load GitHub info: {(info.error as Error).message}</PanelMessage>;
-  }
-  const data = info.data;
-  if (!data || !data.available) {
-    if (data?.reason === "not_a_git_repo") {
-      return <PanelMessage>This workspace isn’t a git repository.</PanelMessage>;
-    }
-    return <PanelMessage>GitHub isn’t available for this session.</PanelMessage>;
+    case "error":
+      return <PanelMessage>Couldn’t load GitHub info: {panelState.message}</PanelMessage>;
+    case "host-outdated":
+      return (
+        <GithubEmptyState
+          icon={DownloadIcon}
+          title="Update your host to use GitHub"
+          hint="The GitHub panel needs the host running Omnigent 0.13.0 or later. Update the host, then reconnect the session."
+        />
+      );
+    case "not-a-git-repo":
+      return (
+        <GithubEmptyState
+          icon={GitBranchIcon}
+          title="Not a git repository"
+          hint="This workspace isn’t a git checkout, so there’s no branch or PR to show."
+        />
+      );
+    case "no-gh-cli":
+      return (
+        <GithubEmptyState
+          icon={TerminalIcon}
+          title="GitHub CLI not found"
+          hint={
+            <>
+              Install the GitHub CLI (<span className="font-mono">gh</span>) on the host to see this
+              branch’s pull request and CI status.
+            </>
+          }
+        />
+      );
+    case "repo-unresolved":
+      return (
+        <GithubEmptyState
+          icon={KeyRoundIcon}
+          title="Can’t reach the upstream repo"
+          hint={
+            <>
+              Run <span className="font-mono">gh auth status</span> on the host to confirm the
+              GitHub CLI is signed in to the right account.
+            </>
+          }
+        />
+      );
+    case "no-pr":
+      // TODO: offer a "Create PR" action here once the panel can open PRs.
+      return (
+        <GithubEmptyState
+          icon={GitPullRequestIcon}
+          title={
+            <>
+              No open PR for <span className="font-mono">{panelState.branch ?? "this branch"}</span>
+            </>
+          }
+          hint="When you open a pull request for this branch, it’ll show up here."
+        />
+      );
+    case "unavailable":
+      return (
+        <GithubEmptyState
+          icon={AlertCircleIcon}
+          title="GitHub isn’t available"
+          hint="There’s no GitHub information to show for this session."
+        />
+      );
   }
 
-  const pr = data.pr ?? null;
-  const checks = pr?.checks;
-  const ghNote =
-    data.gh_available === false
-      ? "GitHub CLI (gh) not installed — showing local branch diff."
-      : data.authenticated === false
-        ? "Not signed in — run `gh auth login` for PR info."
-        : null;
+  // ── Ready: an open PR to render as its header + the stacked diff ─────────
+  const data = info.data!;
+  const pr = data.pr!;
+  const checks = pr.checks;
 
   return (
     <TooltipProvider delayDuration={0}>
@@ -685,66 +817,45 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
               />
             </IconButton>
           </div>
-          {pr ? (
-            <>
-              <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                <a
-                  href={pr.url}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="group inline-flex min-w-0 items-center gap-1 text-ui font-medium hover:underline"
-                >
-                  <span className="truncate">{pr.title}</span>
-                  <span className="shrink-0 text-muted-foreground">#{pr.number}</span>
-                  <ExternalLinkIcon className="size-3 shrink-0 text-muted-foreground" />
-                </a>
-              </div>
-              {/* CI status checks (from the PR's statusCheckRollup), on their own
-                line as pills; hover a pill to see the job names in that bucket. */}
-              {checks && checks.total > 0 && (
-                <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-muted-foreground">
-                  <span className="text-ui font-medium">Checks</span>
-                  <CheckPill
-                    label="passed"
-                    count={checks.passing}
-                    runs={checks.runs.filter((r) => r.bucket === "passing")}
-                    icon={
-                      <CircleCheckIcon className="size-2.5 text-green-600 dark:text-green-400" />
-                    }
-                    className="border-green-500/25 bg-green-500/10 text-green-700 dark:text-green-400"
-                  />
-                  <CheckPill
-                    label="pending"
-                    count={checks.pending}
-                    runs={checks.runs.filter((r) => r.bucket === "pending")}
-                    icon={<CircleDotIcon className="size-2.5 text-amber-600 dark:text-amber-400" />}
-                    className="border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-400"
-                  />
-                  <CheckPill
-                    label="failed"
-                    count={checks.failing}
-                    runs={checks.runs.filter((r) => r.bucket === "failing")}
-                    icon={<CircleXIcon className="size-2.5 text-red-600 dark:text-red-400" />}
-                    className="border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400"
-                  />
-                </div>
-              )}
-            </>
-          ) : (
-            <p className="mt-1 text-ui text-muted-foreground">
-              {ghNote ?? (
-                <>
-                  No open PR for <span className="font-mono">{data.branch}</span>
-                  {baseRef && (
-                    <>
-                      {" "}
-                      — showing changes vs <span className="font-mono">{baseRef}</span>
-                    </>
-                  )}
-                  .
-                </>
-              )}
-            </p>
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <a
+              href={pr.url}
+              target="_blank"
+              rel="noreferrer"
+              className="group inline-flex min-w-0 items-center gap-1 text-ui font-medium hover:underline"
+            >
+              <span className="truncate">{pr.title}</span>
+              <span className="shrink-0 text-muted-foreground">#{pr.number}</span>
+              <ExternalLinkIcon className="size-3 shrink-0 text-muted-foreground" />
+            </a>
+          </div>
+          {/* CI status checks (from the PR's statusCheckRollup), on their own
+            line as pills; hover a pill to see the job names in that bucket. */}
+          {checks.total > 0 && (
+            <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-muted-foreground">
+              <span className="text-ui font-medium">Checks</span>
+              <CheckPill
+                label="passed"
+                count={checks.passing}
+                runs={checks.runs.filter((r) => r.bucket === "passing")}
+                icon={<CircleCheckIcon className="size-2.5 text-green-600 dark:text-green-400" />}
+                className="border-green-500/25 bg-green-500/10 text-green-700 dark:text-green-400"
+              />
+              <CheckPill
+                label="pending"
+                count={checks.pending}
+                runs={checks.runs.filter((r) => r.bucket === "pending")}
+                icon={<CircleDotIcon className="size-2.5 text-amber-600 dark:text-amber-400" />}
+                className="border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-400"
+              />
+              <CheckPill
+                label="failed"
+                count={checks.failing}
+                runs={checks.runs.filter((r) => r.bucket === "failing")}
+                icon={<CircleXIcon className="size-2.5 text-red-600 dark:text-red-400" />}
+                className="border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400"
+              />
+            </div>
           )}
           {/* Controls bar: hide the file list (left); toggle layout + expand/
             collapse every diff (right). */}

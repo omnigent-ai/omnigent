@@ -1707,6 +1707,22 @@
             "title": "Code",
             "type": "string"
           },
+          "level": {
+            "anyOf": [
+              {
+                "enum": [
+                  "error",
+                  "info"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Rendering level. `\"info\"` renders the banner as a neutral notice (e.g. codex started a fresh thread) rather than a failure; `None` / `\"error\"` is the destructive default and is omitted from the wire so existing error items are unchanged.",
+            "title": "Level"
+          },
           "message": {
             "description": "Human-readable error message, e.g. `\"Native Codex requires the 'codex' CLI on PATH.\"`.",
             "title": "Message",
@@ -1849,6 +1865,331 @@
           "error"
         ],
         "title": "ErrorEvent",
+        "type": "object"
+      },
+      "ExtensionAssetErrorResponse": {
+        "description": "Concise diagnostic for one unresolved browser bundle.",
+        "properties": {
+          "error": {
+            "title": "Error",
+            "type": "string"
+          },
+          "extension_id": {
+            "title": "Extension Id",
+            "type": "string"
+          },
+          "status": {
+            "const": "unresolved",
+            "default": "unresolved",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "extension_id",
+          "error"
+        ],
+        "title": "ExtensionAssetErrorResponse",
+        "type": "object"
+      },
+      "ExtensionBrowserBundleResponse": {
+        "description": "Opaque browser-bundle availability and content-addressed asset URLs.",
+        "properties": {
+          "declared": {
+            "title": "Declared",
+            "type": "boolean"
+          },
+          "digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Digest"
+          },
+          "has_styles": {
+            "title": "Has Styles",
+            "type": "boolean"
+          },
+          "script_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Script Url"
+          },
+          "style_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Style Url"
+          }
+        },
+        "required": [
+          "declared",
+          "has_styles"
+        ],
+        "title": "ExtensionBrowserBundleResponse",
+        "type": "object"
+      },
+      "ExtensionDiagnosticsResponse": {
+        "description": "Administrator view of accepted and rejected extensions.",
+        "properties": {
+          "asset_errors": {
+            "items": {
+              "$ref": "#/components/schemas/ExtensionAssetErrorResponse"
+            },
+            "title": "Asset Errors",
+            "type": "array"
+          },
+          "extensions": {
+            "items": {
+              "$ref": "#/components/schemas/ExtensionResponse"
+            },
+            "title": "Extensions",
+            "type": "array"
+          },
+          "load_errors": {
+            "items": {
+              "$ref": "#/components/schemas/ExtensionLoadErrorResponse"
+            },
+            "title": "Load Errors",
+            "type": "array"
+          },
+          "object": {
+            "const": "extension_diagnostics",
+            "default": "extension_diagnostics",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "required": [
+          "extensions",
+          "load_errors",
+          "asset_errors"
+        ],
+        "title": "ExtensionDiagnosticsResponse",
+        "type": "object"
+      },
+      "ExtensionListResponse": {
+        "description": "Public catalog of accepted extensions.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ExtensionResponse"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "ExtensionListResponse",
+        "type": "object"
+      },
+      "ExtensionLoadErrorResponse": {
+        "description": "Concise diagnostic for one rejected entry point.",
+        "properties": {
+          "entry_point": {
+            "title": "Entry Point",
+            "type": "string"
+          },
+          "error": {
+            "title": "Error",
+            "type": "string"
+          },
+          "status": {
+            "const": "rejected",
+            "default": "rejected",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "entry_point",
+          "error"
+        ],
+        "title": "ExtensionLoadErrorResponse",
+        "type": "object"
+      },
+      "ExtensionPageResponse": {
+        "description": "One namespaced page contribution.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "route": {
+            "title": "Route",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "view": {
+            "title": "View",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "route",
+          "view"
+        ],
+        "title": "ExtensionPageResponse",
+        "type": "object"
+      },
+      "ExtensionPrimaryNavigationResponse": {
+        "description": "One primary-sidebar navigation contribution.",
+        "properties": {
+          "icon": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Icon"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "order": {
+            "format": "int64",
+            "title": "Order",
+            "type": "integer"
+          },
+          "page": {
+            "title": "Page",
+            "type": "string"
+          },
+          "when": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "When"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "page",
+          "icon",
+          "order",
+          "when"
+        ],
+        "title": "ExtensionPrimaryNavigationResponse",
+        "type": "object"
+      },
+      "ExtensionResponse": {
+        "description": "Public metadata for one accepted extension.",
+        "properties": {
+          "browser": {
+            "$ref": "#/components/schemas/ExtensionBrowserBundleResponse"
+          },
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          },
+          "distribution": {
+            "title": "Distribution",
+            "type": "string"
+          },
+          "extension_api": {
+            "format": "int64",
+            "title": "Extension Api",
+            "type": "integer"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "object": {
+            "const": "extension",
+            "default": "extension",
+            "title": "Object",
+            "type": "string"
+          },
+          "pages": {
+            "items": {
+              "$ref": "#/components/schemas/ExtensionPageResponse"
+            },
+            "title": "Pages",
+            "type": "array"
+          },
+          "permissions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Permissions",
+            "type": "array"
+          },
+          "primary_navigation": {
+            "items": {
+              "$ref": "#/components/schemas/ExtensionPrimaryNavigationResponse"
+            },
+            "title": "Primary Navigation",
+            "type": "array"
+          },
+          "status": {
+            "enum": [
+              "enabled",
+              "unavailable"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "display_name",
+          "distribution",
+          "version",
+          "extension_api",
+          "status",
+          "permissions",
+          "pages",
+          "primary_navigation",
+          "browser"
+        ],
+        "title": "ExtensionResponse",
         "type": "object"
       },
       "FailedEvent": {
@@ -8353,6 +8694,167 @@
         "summary": "Branding Logo"
       }
     },
+    "/v1/extensions": {
+      "get": {
+        "description": "List extensions installed and enabled when the server started.\n\nV1 treats operator installation as enablement. Installing, removing, or\nupgrading a package requires a server restart to refresh this snapshot.",
+        "operationId": "list_extensions_v1_extensions_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtensionListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Extensions",
+        "tags": [
+          "extensions"
+        ]
+      }
+    },
+    "/v1/extensions/diagnostics": {
+      "get": {
+        "description": "Show accepted extensions and concise discovery failures to administrators.",
+        "operationId": "extension_diagnostics_v1_extensions_diagnostics_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtensionDiagnosticsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Extension Diagnostics",
+        "tags": [
+          "extensions"
+        ]
+      }
+    },
+    "/v1/extensions/{extension_id}": {
+      "get": {
+        "description": "Return one installed extension's public contribution metadata.",
+        "operationId": "get_extension_v1_extensions__extension_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "extension_id",
+            "required": true,
+            "schema": {
+              "title": "Extension Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtensionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Extension",
+        "tags": [
+          "extensions"
+        ]
+      }
+    },
+    "/v1/extensions/{extension_id}/assets/{digest}/{asset_name}": {
+      "get": {
+        "description": "Return a declared asset only when its bundle digest still matches.",
+        "operationId": "get_extension_asset_v1_extensions__extension_id__assets__digest___asset_name__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "extension_id",
+            "required": true,
+            "schema": {
+              "title": "Extension Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "digest",
+            "required": true,
+            "schema": {
+              "title": "Digest",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "asset_name",
+            "required": true,
+            "schema": {
+              "title": "Asset Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              },
+              "text/css": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "text/javascript": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Extension JavaScript or CSS asset"
+          },
+          "404": {
+            "description": "Extension asset not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Extension Asset",
+        "tags": [
+          "extensions"
+        ]
+      }
+    },
     "/v1/harnesses": {
       "get": {
         "operationId": "list_harnesses_v1_harnesses_get",
@@ -13861,6 +14363,11 @@
       "description": "Discover the built-in agents available to bind to a session.",
       "name": "agents",
       "x-displayName": "Agents"
+    },
+    {
+      "description": "Inspect installed extension pages and navigation contributions.",
+      "name": "extensions",
+      "x-displayName": "Extensions"
     },
     {
       "description": "Hosts that can launch runners. Browse the host filesystem and create directories.",

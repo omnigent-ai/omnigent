@@ -193,6 +193,9 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
     "connection_error": "The connection to the agent dropped mid-turn.",
     "context_length_exceeded": "The conversation grew past the model's context window.",
     "executor_error": "The agent runtime hit an error while running the turn.",
+    "codex_thread_reset": (
+        "Codex hit an error reloading the earlier transcript, so it started a fresh thread."
+    ),
 }
 
 

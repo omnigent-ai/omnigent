@@ -3809,7 +3809,7 @@ async def _codex_elicitation_hook_result(
     :param client: HTTP client for Omnigent hook posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param event: Codex JSON-RPC request envelope.
-    :returns: Parsed JSON-RPC result payload, or ``None``.
+    :returns: Parsed JSON-RPC result, a safe command rejection, or ``None``.
     """
     method = event.get("method")
     request_id = event.get("id")
@@ -3827,6 +3827,10 @@ async def _codex_elicitation_hook_result(
             response.status_code,
             response.text[:512],
         )
+        # A malformed optional execpolicy decision must not leave Codex's
+        # command request unanswered and strand the active turn.
+        if method == _CODEX_COMMAND_EXECUTION_REQUEST_APPROVAL_METHOD:
+            return {"decision": "decline"}
         return None
     if not response.content:
         _logger.info(
