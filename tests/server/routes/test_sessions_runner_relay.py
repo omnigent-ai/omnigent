@@ -249,6 +249,64 @@ class _ScriptedRunnerClient:
 
 
 @pytest.mark.asyncio
+async def test_relay_persists_acp_reported_model(db_uri: str) -> None:
+    """A vendor-owned ACP model becomes the session's durable active model."""
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    sessions_module._runner_relay_tasks.clear()
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation()
+    store.update_conversation(conv.id, harness_override="grok")
+    release = asyncio.Event()
+    fake_runner = _ScriptedRunnerClient(
+        release,
+        [
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_grok_model",
+                    "model": "polly",
+                    "usage": {"model": "grok-4.6"},
+                },
+            }
+        ],
+    )
+
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            conv.id,
+            "runner_grok_model",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(conv.id)
+        release.set()
+
+        model_event = await collector.next_event()
+        assert model_event["type"] == "session.model"
+        assert model_event["conversation_id"] == conv.id
+        assert model_event["model"] == "grok-4.6"
+        # Reports and requests are separate roles: the harness's report lands
+        # on ``reported_model`` (the display authority) and must not touch the
+        # user's ``model_override`` request.
+        refreshed = store.get_conversation(conv.id)
+        assert refreshed.reported_model == "grok-4.6"
+        assert refreshed.model_override is None
+    finally:
+        release.set()
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.get(conv.id)
+        if handle is not None:
+            await asyncio.wait_for(handle.task, timeout=1.0)
+        sessions_module._runner_relay_tasks.clear()
+        session_stream.close(conv.id)
+
+
+@pytest.mark.asyncio
 async def test_relay_text_flush_publishes_persisted_item(db_uri: str) -> None:
     """
     The relay's text flush publishes the persisted message to live clients.

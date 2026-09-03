@@ -350,6 +350,64 @@ async def test_session_snapshot_uses_child_spec_metadata(
 
 
 @pytest.mark.asyncio
+async def test_session_snapshot_does_not_claim_agent_model_for_vendor_owned_acp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Grok override must not inherit the bound agent's unrelated model pin."""
+    spec = AgentSpec(
+        spec_version=1,
+        name="polly",
+        executor=ExecutorSpec(
+            config={"harness": "claude-sdk"},
+            model="claude-opus-5",
+            context_window=1_000_000,
+        ),
+    )
+    conv = Conversation(
+        id="conv_grok",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_grok",
+        agent_id="ag_polly",
+        harness_override="grok",
+    )
+    store = _ConversationStore([], conversations={conv.id: conv})
+
+    class _AgentStore:
+        @staticmethod
+        def get(agent_id: str) -> Any:
+            return type(
+                "StoredAgent",
+                (),
+                {
+                    "id": agent_id,
+                    "name": "polly",
+                    "bundle_location": "bundle",
+                    "session_id": None,
+                },
+            )()
+
+    class _AgentCache:
+        @staticmethod
+        def load(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
+            return type("LoadedAgent", (), {"spec": spec})()
+
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    snapshot = await _get_session_snapshot(
+        store,  # type: ignore[arg-type]
+        conv.id,
+        agent_store=_AgentStore(),  # type: ignore[arg-type]
+        agent_cache=_AgentCache(),  # type: ignore[arg-type]
+    )
+
+    assert snapshot.harness == "grok"
+    assert snapshot.llm_model is None
+    assert snapshot.context_window is None
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_unresolvable_sub_agent_warns_and_reports_parent(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,

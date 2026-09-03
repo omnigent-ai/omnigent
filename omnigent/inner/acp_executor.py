@@ -336,6 +336,7 @@ class AcpExecutor(Executor):
         # and the live model value, both learned from ``config_option_update``.
         self._config_option_ids: set[str] = set()
         self._active_model: str | None = None
+        self._model_config_option_id: str | None = None
         # Latches off once an agent proves it can't warm-switch, so we don't
         # retry a failing request on every turn.
         self._model_switch_supported: bool = True
@@ -714,6 +715,12 @@ class AcpExecutor(Executor):
             )
         result = resp.get("result", {})
         server_session_id = result.get("sessionId") if isinstance(result, dict) else None
+        if isinstance(result, dict):
+            self._note_config_options(result.get("configOptions"))
+        models = result.get("models") if isinstance(result, dict) else None
+        current_model = models.get("currentModelId") if isinstance(models, dict) else None
+        if self._active_model is None and isinstance(current_model, str) and current_model:
+            self._active_model = current_model
         session_id = server_session_id or client_id
         if not session_id:
             raise RuntimeError(
@@ -1359,7 +1366,8 @@ class AcpExecutor(Executor):
             if not isinstance(opt_id, str):
                 continue
             self._config_option_ids.add(opt_id)
-            if opt_id == _CONFIG_OPTION_MODEL:
+            if opt.get("category") == _CONFIG_OPTION_MODEL or opt_id == _CONFIG_OPTION_MODEL:
+                self._model_config_option_id = opt_id
                 current = opt.get("currentValue")
                 if isinstance(current, str) and current:
                     self._active_model = current
@@ -1387,7 +1395,7 @@ class AcpExecutor(Executor):
             return
         # Before the first ``config_option_update`` we don't know what's settable;
         # attempting is harmless because a rejection just latches the feature off.
-        if self._config_option_ids and _CONFIG_OPTION_MODEL not in self._config_option_ids:
+        if self._config_option_ids and self._model_config_option_id is None:
             self._model_switch_supported = False
             logger.info(
                 "acp[%s] agent exposes no %r config option; leaving model as-is",
@@ -1398,7 +1406,11 @@ class AcpExecutor(Executor):
 
         response = await self._rpc(
             _AGENT_METHOD_SET_CONFIG_OPTION,
-            {"sessionId": session_id, "configId": _CONFIG_OPTION_MODEL, "value": model},
+            {
+                "sessionId": session_id,
+                "configId": self._model_config_option_id or _CONFIG_OPTION_MODEL,
+                "value": model,
+            },
         )
         if "error" in response:
             self._model_switch_supported = False
@@ -1522,7 +1534,18 @@ class AcpExecutor(Executor):
                 stale = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-            if isinstance(stale, dict) and stale.get("id") is not None and stale.get("method"):
+            if not isinstance(stale, dict):
+                continue
+            if stale.get("method") == _CLIENT_NOTIFICATION_SESSION_UPDATE:
+                # A pre-prompt model report (e.g. sent right after session/new)
+                # must not be lost to the drain: note it before discarding.
+                update = (stale.get("params") or {}).get("update")
+                if (
+                    isinstance(update, dict)
+                    and update.get("sessionUpdate") == _UPDATE_CONFIG_OPTION
+                ):
+                    self._note_config_options(update.get("configOptions"))
+            elif stale.get("id") is not None and stale.get("method"):
                 await self._respond_to_agent_request(stale)
 
         self._rpc_id += 1
@@ -1567,6 +1590,8 @@ class AcpExecutor(Executor):
                     return
                 result = response.get("result", {}) if isinstance(response, dict) else {}
                 usage = self._usage_from_result(result) if isinstance(result, dict) else None
+                if self._active_model:
+                    usage = {**(usage or {}), "model": self._active_model}
                 yield TurnComplete(response="".join(accumulated_text), usage=usage)
                 return
 
