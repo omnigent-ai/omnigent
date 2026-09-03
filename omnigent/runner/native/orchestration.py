@@ -6884,12 +6884,12 @@ async def _auto_create_claude_terminal(
 
             # Only rows that are fresh may retire the pick: a stale entry may
             # predate a provider change, so it is re-probed first, and a
-            # failed probe leaves no trusted rows at all.
-            trusted_rows: list[dict[str, object]] | None = launch_catalog
+            # failed probe leaves no fresh rows at all.
+            fresh_rows: list[dict[str, object]] | None = launch_catalog
             if launch_catalog_was_stale and not _serves_pick(launch_catalog):
-                trusted_rows = await claude_reprobed_launch_catalog(claude_config)
-                if trusted_rows:
-                    launch_catalog = trusted_rows
+                fresh_rows = await claude_reprobed_launch_catalog(claude_config)
+                if fresh_rows:
+                    launch_catalog = fresh_rows
                     launch_catalog_was_stale = False
             if not _serves_pick(launch_catalog):
                 # The pick outlives the provider it was made under (a later
@@ -6899,7 +6899,7 @@ async def _auto_create_claude_terminal(
                 offered = ", ".join(
                     str(row.get("id") or row.get("model") or "") for row in launch_catalog
                 )
-                if trusted_rows:
+                if fresh_rows:
                     reset_pick_after_launch = True
                     outcome = "launching on the provider default and resetting the pick to Default"
                 else:
