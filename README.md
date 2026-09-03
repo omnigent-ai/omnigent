@@ -625,3 +625,5 @@ Thanks to all of our amazing contributors!
 <a href="https://github.com/omnigent-ai/omnigent/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=omnigent-ai/omnigent" />
 </a>
+
+<!-- Test edit for PR workflow verification — safe to revert. -->
