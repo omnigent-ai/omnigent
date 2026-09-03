@@ -666,6 +666,69 @@ class CompactionConfig:
 
 
 @dataclass
+class MemoryConfig:
+    """
+    Automatic long-term memory configuration.
+
+    Parsed from the top-level ``memory:`` block in config.yaml. Unlike
+    the ``hindsight_*`` built-in tools (which the model must *choose* to
+    call), this block wires memory into the turn lifecycle
+    deterministically: recalled context is injected before the model
+    sees the turn, and the user's turn is persisted after dispatch —
+    neither depends on the model electing to call a tool.
+
+    ``memory:`` is the generic *feature*; the *backend* is selected by
+    ``provider`` (default and, today, only value ``hindsight``), so the
+    feature name stays independent of any one integration. The Hindsight
+    backend shares the same ``hindsight-client`` SDK and bank-resolution
+    rule as the ``hindsight_*`` tools, so tool-based and automatic memory
+    share a bank.
+
+    The block is **opt-in**: an agent with no ``memory:`` block gets
+    ``None`` here and the runtime skips the whole layer. Setting
+    ``enabled: true`` turns on both ``auto_recall`` and ``auto_retain``
+    unless either is individually disabled.
+
+    :param enabled: Master switch. ``False`` (the default) means the
+        runtime does no automatic recall or retain, even if the other
+        fields are set.
+    :param auto_recall: When enabled, recall relevant memories before
+        each turn and inject them. Defaults to ``True``.
+    :param auto_retain: When enabled, persist the user's turn to
+        long-term memory after dispatch. Defaults to ``True``.
+    :param provider: Memory backend to use. Defaults to ``"hindsight"``,
+        currently the only supported value; the field exists so the
+        generic ``memory:`` feature can gain other backends without a
+        spec change.
+    :param api_key: Backend API key (for Hindsight, typically
+        ``${HINDSIGHT_API_KEY}`` in YAML, expanded at parse time).
+        Required when ``enabled``.
+    :param api_url: Backend API base URL. ``None`` uses the provider
+        default (Hindsight Cloud for the ``hindsight`` provider).
+    :param bank_id: Memory bank to read/write. ``None`` falls back to the
+        run's ``agent_id`` then ``conversation_id`` (matching the
+        ``hindsight_*`` tools), so a single block isolates memory per
+        agent out of the box.
+    :param budget: Recall budget level — ``low`` / ``mid`` / ``high``.
+    :param max_tokens: Max tokens of recalled memory injected per turn.
+    :param recall_timeout: Seconds to wait for a recall before giving up
+        and dispatching the turn without injected memory. Bounds the
+        latency a slow or unreachable backend can add to a turn.
+    """
+
+    enabled: bool = False
+    auto_recall: bool = True
+    auto_retain: bool = True
+    provider: str = "hindsight"
+    api_key: str | None = None
+    api_url: str | None = None
+    bank_id: str | None = None
+    budget: str = "mid"
+    max_tokens: int = 4096
+    recall_timeout: float = 10.0
+
+
+@dataclass
 class LLMConfig:  # type: ignore[explicit-any]  # extra: dict[str, Any] field (see below)
     """
     LLM configuration block from config.yaml.
@@ -1461,6 +1524,17 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         ``guardrails:`` block — runtime builds a no-op engine
         with zero policies and an empty label cache. See
         POLICIES.md §3, §4.
+    :param memory: Automatic long-term memory configuration from the
+        top-level ``memory:`` block (a generic feature whose backend is
+        chosen by ``provider``, default ``hindsight``).
+        ``None`` only when the block is **absent**; a present block
+        always parses to a populated :class:`MemoryConfig` (even with
+        ``enabled: false``), so callers gate on ``memory.enabled``, not
+        ``memory is None``. When enabled, recalled memories are injected
+        before each turn and the user's turn is persisted after
+        dispatch; otherwise the runtime does no automatic recall/retain
+        and memory is available only through the ``hindsight_*`` built-in
+        tools if declared.
     :param async_enabled: Whether the LLM-callable async-dispatch
         builtins (``sys_call_async``, ``sys_read_inbox``,
         ``sys_cancel_async``) are registered. YAML key is
@@ -1583,6 +1657,7 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     executor: ExecutorSpec = field(default_factory=ExecutorSpec)
     compaction: CompactionConfig | None = None
     guardrails: GuardrailsSpec | None = None
+    memory: MemoryConfig | None = None
     async_enabled: bool = True
     os_env: OSEnvSpec | None = None
     terminals: dict[str, TerminalEnvSpec] | None = None

@@ -7303,6 +7303,40 @@ def create_runner_app(
             extra={"session_id": conv},
         )
 
+        # Automatic long-term memory (opt-in via the spec ``memory:`` block).
+        # Recall runs before the model sees the turn and augments the system
+        # prompt; retain persists the user's turn. Both are best effort and
+        # never block or fail the turn — recall is time-bounded and retain
+        # runs in the background (see omnigent/runtime/memory.py). Runs here,
+        # at the shared dispatch chokepoint, so every harness gets the same
+        # behaviour without per-runtime wiring.
+        _mem_cfg = cached_spec.memory if cached_spec is not None else None
+        if _mem_cfg is not None and _mem_cfg.enabled:
+            from omnigent.runtime import memory as auto_memory
+
+            _mem_bank = auto_memory.resolve_bank(_mem_cfg, msg_body.get("agent_id"), conv)
+            _mem_query = auto_memory.extract_latest_user_text(harness_body.get("content"))
+            if _mem_bank and _mem_query:
+                if _mem_cfg.auto_recall:
+                    _recalled = await auto_memory.recall_instructions(
+                        _mem_cfg, _mem_bank, _mem_query
+                    )
+                    if _recalled:
+                        if is_native_harness(harness_name):
+                            # Native harnesses ignore per-turn instructions
+                            # (system prompt is fixed at spawn); the user
+                            # message content is the only per-turn channel to
+                            # the model, so inject the recalled memory there.
+                            harness_body["content"] = auto_memory.prepend_memory_to_content(
+                                harness_body.get("content"), _recalled
+                            )
+                        else:
+                            instructions = (
+                                f"{instructions}\n\n{_recalled}" if instructions else _recalled
+                            )
+                if _mem_cfg.auto_retain:
+                    auto_memory.schedule_retain(_mem_cfg, _mem_bank, _mem_query)
+
         if instructions:
             harness_body["instructions"] = instructions
 

@@ -40,6 +40,7 @@ from omnigent.spec.types import (
     LLMConfig,
     LocalToolInfo,
     MCPServerConfig,
+    MemoryConfig,
     ModalityConfig,
     Phase,
     PhaseSelector,
@@ -53,6 +54,17 @@ from omnigent.spec.types import (
 )
 
 _log = logging.getLogger(__name__)
+
+# Valid recall/reflect budget levels for the ``memory:`` block, matching
+# the ``hindsight_*`` built-in tools' accepted values.
+_MEMORY_BUDGETS = frozenset({"low", "mid", "high"})
+
+# Selectable backends for the ``memory:`` block's ``provider`` key. The block
+# is a generic memory *feature*; the backend is chosen here (Hindsight is the
+# default and, today, only value) so the feature stays independent of any one
+# integration. Mirrors the runtime backend registry in
+# ``omnigent/runtime/memory.py`` — keep the two in sync when adding a backend.
+_MEMORY_PROVIDERS = frozenset({"hindsight"})
 
 # Context files scanned in priority order when ``instructions:`` is absent.
 # First file found wins (no merge).
@@ -244,6 +256,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         )
     compaction = _parse_compaction(raw.get("compaction"))
     guardrails = _parse_guardrails(raw.get("guardrails"), expand_env=expand_env)
+    memory = _parse_memory(raw.get("memory"), expand_env=expand_env)
     os_env = _parse_os_env(raw.get("os_env"))
     terminals = _parse_terminals(raw.get("terminals"))
     params = raw.get("params", {})
@@ -302,6 +315,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         executor=executor,
         compaction=compaction,
         guardrails=guardrails,
+        memory=memory,
         params=params,
         instructions=instructions,
         skills=skills,
@@ -2029,6 +2043,94 @@ def _parse_compaction(
         recent_window=_parse_int_field(
             raw.get("recent_window", 5),
             "compaction.recent_window",
+        ),
+    )
+
+
+def _parse_memory(
+    raw: dict[str, object] | None,
+    *,
+    expand_env: bool = True,
+) -> MemoryConfig | None:
+    """
+    Parse the ``memory:`` block from config.yaml into a
+    :class:`MemoryConfig`.
+
+    Returns ``None`` when the block is absent — the runtime does no
+    automatic recall/retain in that case. When present but
+    ``enabled: false``, a populated (disabled) config is still returned
+    so the runtime's own opt-in check is the single source of truth.
+
+    ``api_key`` / ``api_url`` are env-expanded (like other secret-bearing
+    blocks) so ``${HINDSIGHT_API_KEY}`` resolves at parse time. When
+    ``enabled`` is true, ``api_key`` is required — a missing key is a
+    load-time error rather than a per-turn failure.
+
+    :param raw: The ``memory:`` mapping from config.yaml, or ``None``
+        when the block was absent. Example:
+        ``{"enabled": True, "api_key": "${HINDSIGHT_API_KEY}",
+        "bank_id": "acme", "budget": "high"}``.
+    :param expand_env: Whether to expand ``${VAR}`` references in
+        ``api_key`` / ``api_url``. Disabled for scaffolding/validation.
+    :returns: A populated :class:`MemoryConfig`, or ``None`` when *raw*
+        is ``None``.
+    :raises OmnigentError: If *raw* is not a mapping, a field has the
+        wrong type, or ``enabled`` is true without an ``api_key``.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise OmnigentError(
+            f"memory: must be a mapping, got {type(raw).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+    secrets = {
+        key: value for key in ("api_key", "api_url") if isinstance(value := raw.get(key), str)
+    }
+    if expand_env and secrets:
+        secrets = expand_env_vars(secrets)
+
+    enabled = bool(raw.get("enabled", False))
+    provider = raw.get("provider", "hindsight")
+    if not isinstance(provider, str) or provider not in _MEMORY_PROVIDERS:
+        raise OmnigentError(
+            f"memory.provider must be one of {sorted(_MEMORY_PROVIDERS)}, got {provider!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    budget = raw.get("budget", "mid")
+    if not isinstance(budget, str) or budget not in _MEMORY_BUDGETS:
+        raise OmnigentError(
+            f"memory.budget must be one of {sorted(_MEMORY_BUDGETS)}, got {budget!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    bank_id = raw.get("bank_id")
+    if bank_id is not None and not isinstance(bank_id, str):
+        raise OmnigentError(
+            f"memory.bank_id must be a string, got {type(bank_id).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    api_key = secrets.get("api_key")
+    if enabled and not api_key:
+        raise OmnigentError(
+            "memory.api_key is required when memory.enabled is true "
+            "(e.g. api_key: ${HINDSIGHT_API_KEY}).",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+    return MemoryConfig(
+        enabled=enabled,
+        auto_recall=bool(raw.get("auto_recall", True)),
+        auto_retain=bool(raw.get("auto_retain", True)),
+        provider=provider,
+        api_key=api_key,
+        api_url=secrets.get("api_url"),
+        bank_id=bank_id,
+        budget=budget,
+        max_tokens=_parse_int_field(raw.get("max_tokens", 4096), "memory.max_tokens"),
+        recall_timeout=_parse_float_field(
+            raw.get("recall_timeout", 10.0),
+            "memory.recall_timeout",
         ),
     )
 
