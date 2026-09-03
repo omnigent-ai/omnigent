@@ -1322,6 +1322,11 @@ async def test_native_subagent_session_stamps_terminal_ui_labels(
             ["--permission-mode", "bypassPermissions"],
         ),
         (
+            "antigravity-native",
+            {"permission_mode": "bypassPermissions"},
+            ["--dangerously-skip-permissions"],
+        ),
+        (
             "codex-native",
             {"yolo": True},
             ["--dangerously-bypass-approvals-and-sandbox"],
@@ -1343,7 +1348,7 @@ async def test_native_subagent_yolo_args_derived_from_trusted_spec(
     A YOLO-declaring native worker bundle gets bypass ``terminal_launch_args``.
 
     The worker sub-agent's own bundle declares its full-bypass intent
-    (``permission_mode: bypassPermissions`` for claude-native,
+    (``permission_mode: bypassPermissions`` for claude-native / antigravity-native,
     ``yolo: true`` for codex-native / cursor-native). On a sub-agent create,
     the server derives the matching flag list from that trusted,
     server-loaded spec and persists it as the child session's

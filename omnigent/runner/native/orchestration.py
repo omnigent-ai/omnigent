@@ -4813,16 +4813,11 @@ async def _auto_create_antigravity_terminal(
     over tmux whether or not a web client has opened the Terminal panel (see
     the ``tmux_start_on_attach`` note on the spec below).
 
-    **Permissions are web-attended, not headless.** The web client attaches
-    to the agy pane through the runner tunnel and answers agy's
-    ``request-review`` TUI prompt there, so the launch is treated as
-    *attended* (``headless=False``). Auto-bypass comes only from the user's
-    persisted ``terminal_launch_args`` (which carry
-    ``--dangerously-skip-permissions`` when the user asked for bypass) —
-    the same pass-through mechanism codex/claude use. A server-spawned
-    launch must NOT key headlessness on the runner process's (absent) TTY,
-    which would silently disable the per-tool prompt for a watching web
-    user.
+    **Permissions are explicit in the persisted launch configuration.** The
+    server derives ``--dangerously-skip-permissions`` from a trusted worker's
+    ``permission_mode: bypassPermissions`` declaration and persists it in
+    ``terminal_launch_args``. The runner passes that intent to the launch
+    builder, which appends the flag without relying on a human-attached TTY.
 
     Fresh sessions launch with no ``--conversation``: the runner cold-starts
     the conversation over connect-RPC (11a) so the reader binds agy's real id
@@ -4877,9 +4872,9 @@ async def _auto_create_antigravity_terminal(
         raise RuntimeError(f"Invalid workspace for Antigravity session {session_id!r}.")
     workspace = _codex_session_workspace(session_workspace)
 
-    # The user's pass-through agy args (e.g. ``--dangerously-skip-permissions``)
-    # persisted by the CLI/web launch. Appended verbatim — bypass only happens
-    # when the user put the flag here (see the docstring on web-attended perms).
+    # The server-derived agy args (e.g. ``--dangerously-skip-permissions``)
+    # persisted by the trusted worker spec. Appended verbatim and also used to
+    # preserve the declared permission mode at the launch-builder seam.
     raw_launch_args = snapshot.get("terminal_launch_args")
     terminal_launch_args: tuple[str, ...] = ()
     if raw_launch_args is not None:
@@ -4904,6 +4899,9 @@ async def _auto_create_antigravity_terminal(
     # agy model label from the session's model_override (None lets agy default).
     _model_override = snapshot.get("model_override")
     model = _model_override if isinstance(_model_override, str) and _model_override else None
+    permission_mode = (
+        "bypassPermissions" if "--dangerously-skip-permissions" in terminal_launch_args else None
+    )
 
     # Bridge id mirrors the CLI/harness derivation: the session's bridge-id
     # label when present (so the spawn env built by
@@ -4935,11 +4933,7 @@ async def _auto_create_antigravity_terminal(
         conversation_id=external_session_id if resume else None,
         model=model,
         resume=resume,
-        # Web-attended: a web client drives agy's request-review prompt over the
-        # tunnel, so this is NOT headless. Bypass comes only via the pass-through
-        # args below (see docstring). permission_mode is left unset for the same
-        # reason — the runner has no separate per-tool mode to map here.
-        permission_mode=None,
+        permission_mode=permission_mode,
         headless=False,
         extra_args=terminal_launch_args,
     )

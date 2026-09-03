@@ -1982,10 +1982,9 @@ async def test_auto_create_antigravity_forwards_launch_args_to_agy_argv(
     This is the seam the server-derived bypass flag rides: a named
     antigravity-native sub-agent with ``permission_mode: bypassPermissions``
     persists ``["--dangerously-skip-permissions"]`` on the session, and the
-    runner's auto-create must forward it verbatim into the agy argv (with the
-    web-attended stance kept: ``permission_mode=None`` / ``headless=False`` so
-    bypass comes ONLY from the pass-through args). A failure means the derived
-    flag is dropped and the worker parks on approval cards.
+    runner's auto-create must forward it verbatim into the agy argv while
+    preserving the declared mode at the launch-builder seam. A failure means
+    the derived flag is dropped and the worker parks on approval cards.
     """
     launch_calls: list[dict[str, Any]] = []
     await _run_antigravity_auto_create(
@@ -1999,8 +1998,7 @@ async def test_auto_create_antigravity_forwards_launch_args_to_agy_argv(
     assert len(launch_calls) == 1
     call = launch_calls[0]
     assert call["extra_args"] == ("--dangerously-skip-permissions",)
-    # Bypass must come only from the pass-through args on this attended path.
-    assert call["permission_mode"] is None
+    assert call["permission_mode"] == "bypassPermissions"
     assert call["headless"] is False
 
 
