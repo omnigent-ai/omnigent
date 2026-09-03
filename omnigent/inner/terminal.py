@@ -121,7 +121,7 @@ def _tmux_managed_option_commands(
     if keep_alive_after_exit:
         commands.extend(_tmux_session_persistence_commands())
     if allow_passthrough:
-        commands.append(["set-option", "-g", "allow-passthrough", "on"])
+        commands.append(["set-option", "-gq", "allow-passthrough", "on"])
     return commands
 
 

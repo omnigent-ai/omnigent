@@ -62,6 +62,16 @@ def contains_subsequence(values: list[str], expected: list[str]) -> bool:
     )
 
 
+def test_allow_passthrough_option_is_quiet_for_older_tmux() -> None:
+    """An unsupported allow-passthrough option must not abort terminal launch."""
+    commands = terminal_mod._tmux_managed_option_commands(
+        10_000,
+        allow_passthrough=True,
+    )
+
+    assert ["set-option", "-gq", "allow-passthrough", "on"] in commands
+
+
 def test_threaded_idle_watcher_reports_terminal_exit(tmp_path: Path) -> None:
     """
     The threaded watcher reports tmux disappearance instead of exiting silently.
