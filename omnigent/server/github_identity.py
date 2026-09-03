@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import logging
 
+import httpx
+
 from omnigent.connections.github import GithubConnectionStore
 from omnigent.db.utils import now_epoch
 from omnigent.server.github_app import GitHubAppError
@@ -29,9 +31,11 @@ async def resolve_access_token(
 ) -> str | None:
     """Resolve a valid user access token for *user_id*, or ``None``.
 
-    Reads the stored connection and transparently refreshes a token that is
-    at/near expiry (persisting the refresh). Best-effort: any failure (no
-    connection, no refresh token, refresh rejected) returns ``None``.
+    Reads the stored connection and, when the token is at/near expiry, refreshes
+    it (persisting the new token). Best-effort and **non-raising**: a transient
+    refresh failure (network/timeout, a rejected refresh, a malformed response)
+    never discards a token that is still valid and never propagates — the broker
+    degrades to ``{"connected": false}`` rather than a 500.
 
     :param user_id: The user whose token to resolve.
     :param store: The connection store (also used to persist a refresh).
@@ -41,19 +45,48 @@ async def resolve_access_token(
     connection = await _run_sync(store.get, user_id, with_tokens=True)
     if connection is None or not connection.access_token:
         return None
-    access_token = connection.access_token
     expires_at = connection.token_expires_at
-    if expires_at is not None and expires_at <= now_epoch() + _REFRESH_MARGIN_S:
-        if not connection.refresh_token:
-            return None
-        try:
-            refreshed = await client.refresh_token(connection.refresh_token)
-        except GitHubAppError as exc:
-            _logger.warning("GitHub token refresh failed for %s: %s", user_id, exc)
-            return None
+    # Non-expiring, or comfortably ahead of the margin: use as-is.
+    if expires_at is None or expires_at > now_epoch() + _REFRESH_MARGIN_S:
+        return connection.access_token
+    refreshed = await _try_refresh(user_id, connection.refresh_token, store=store, client=client)
+    if refreshed is not None:
+        return refreshed
+    # Refresh could not produce a new token; the current one is still usable
+    # until it actually lapses (up to the margin remains), so prefer it and only
+    # give up once it has truly expired.
+    if expires_at > now_epoch():
+        return connection.access_token
+    return None
+
+
+async def _try_refresh(
+    user_id: str,
+    refresh_token: str | None,
+    *,
+    store: GithubConnectionStore,
+    client: GitHubAppClient,
+) -> str | None:
+    """Refresh and persist the user's token; ``None`` on any failure.
+
+    Catches every expected failure so the caller never sees an exception: no
+    refresh token, a non-200 (:class:`GitHubAppError`), a transient
+    network/timeout (:class:`httpx.HTTPError`), or a malformed token payload
+    (:class:`ValueError` from parsing ``expires_in``). A persist failure keeps
+    the freshly minted token rather than dropping it.
+    """
+    if not refresh_token:
+        return None
+    try:
+        refreshed = await client.refresh_token(refresh_token)
+    except (GitHubAppError, httpx.HTTPError, ValueError) as exc:
+        _logger.warning("GitHub token refresh failed for %s: %s", user_id, exc)
+        return None
+    try:
         await _run_sync(store.update_tokens, user_id, refreshed)
-        access_token = refreshed.access_token
-    return access_token
+    except Exception as exc:  # noqa: BLE001 - a persist error must not drop a minted token
+        _logger.warning("GitHub token refresh could not be persisted for %s: %s", user_id, exc)
+    return refreshed.access_token
 
 
 async def _run_sync(func, /, *args, **kwargs):
