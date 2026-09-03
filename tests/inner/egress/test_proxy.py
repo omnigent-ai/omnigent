@@ -1155,6 +1155,212 @@ def _mitm_client_send_inner(
             raw.close()
 
 
+def _mitm_client_selected_alpn(
+    proxy_port: int,
+    connect_target: str,
+    server_hostname: str,
+    ca_bundle: Path,
+) -> str | None:
+    raw = socket.create_connection(("127.0.0.1", proxy_port), timeout=10)
+    try:
+        connect = f"CONNECT {connect_target} HTTP/1.1\r\nHost: {server_hostname}\r\n\r\n"
+        raw.sendall(connect.encode("latin-1"))
+        established = b""
+        while b"\r\n\r\n" not in established:
+            chunk = raw.recv(4096)
+            if not chunk:
+                break
+            established += chunk
+
+        ctx = ssl.create_default_context(cafile=str(ca_bundle))
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.set_alpn_protocols(["h2", "http/1.1"])
+        tls = ctx.wrap_socket(raw, server_hostname=server_hostname)
+        try:
+            return tls.selected_alpn_protocol()
+        finally:
+            with contextlib.suppress(Exception):
+                tls.close()
+    finally:
+        with contextlib.suppress(Exception):
+            raw.close()
+
+
+@pytest.mark.asyncio
+async def test_connect_relays_http2_for_unrestricted_host(
+    ca_paths: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cert_path, key_path, bundle_path = ca_paths
+    host = "agent.example.com"
+    request = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\nopaque-client-frames"
+    response = b"opaque-server-frames"
+    received: list[bytes] = []
+
+    async def _upstream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        received.append(await reader.readexactly(len(request)))
+        writer.write(response)
+        await writer.drain()
+        writer.close()
+
+    upstream_ctx = HostCertCache(cert_path, key_path).get_ssl_context(host)
+    upstream_ctx.set_alpn_protocols(["h2"])
+    upstream = await asyncio.start_server(_upstream, "127.0.0.1", 0, ssl=upstream_ctx)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+    proxy = EgressProxy(
+        parse_rules([f"* {host}/**"]),
+        cert_path,
+        key_path,
+        upstream_ca_bundle=bundle_path,
+        block_private_destinations=False,
+    )
+    proxy_port = await proxy.start_tcp()
+    monkeypatch.setattr(asyncio.get_event_loop(), "getaddrinfo", _resolve_to_loopback())
+
+    try:
+        observed = await asyncio.wait_for(
+            asyncio.to_thread(
+                _mitm_client_send_inner,
+                proxy_port,
+                f"{host}:{upstream_port}",
+                host,
+                bundle_path,
+                request,
+            ),
+            timeout=15,
+        )
+        assert received == [request]
+        assert observed == response
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_connect_advertises_http2_only_for_safe_passthrough(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    cert_path, key_path, bundle_path = ca_paths
+    unrestricted_host = "unrestricted.example.com"
+    restricted_host = "restricted.example.com"
+    credential_host = "credential.example.com"
+    proxy = EgressProxy(
+        parse_rules(
+            [
+                f"* {unrestricted_host}/**",
+                f"POST {restricted_host}/allowed/**",
+                f"* {credential_host}/**",
+            ]
+        ),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        credential_rewrites=[
+            CredentialRewriteRule(
+                host=credential_host,
+                scheme="bearer",
+                synthetic=f"{SYNTHETIC_CREDENTIAL_PREFIX}test",
+                real_secret="real-secret",
+            )
+        ],
+    )
+    proxy_port = await proxy.start_tcp()
+
+    try:
+        for host, expected in (
+            (unrestricted_host, "h2"),
+            (restricted_host, "http/1.1"),
+            (credential_host, "http/1.1"),
+        ):
+            selected = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _mitm_client_selected_alpn,
+                    proxy_port,
+                    f"{host}:443",
+                    host,
+                    bundle_path,
+                ),
+                timeout=15,
+            )
+            assert selected == expected
+    finally:
+        await proxy.stop()
+
+
+@pytest.mark.asyncio
+async def test_connect_blocks_http2_for_path_restricted_host(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    cert_path, key_path, bundle_path = ca_paths
+    host = "restricted.example.com"
+    proxy = EgressProxy(
+        parse_rules([f"POST {host}/allowed/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+    )
+    proxy_port = await proxy.start_tcp()
+
+    try:
+        observed = await asyncio.wait_for(
+            asyncio.to_thread(
+                _mitm_client_send_inner,
+                proxy_port,
+                f"{host}:443",
+                host,
+                bundle_path,
+                b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+            ),
+            timeout=15,
+        )
+        assert b"403 Forbidden" in observed
+        assert b"unrestricted host rule" in observed
+    finally:
+        await proxy.stop()
+
+
+@pytest.mark.asyncio
+async def test_connect_blocks_http2_when_host_has_credential_rewrite(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    cert_path, key_path, bundle_path = ca_paths
+    host = "credential.example.com"
+    connect_host = "Credential.Example.Com"
+    proxy = EgressProxy(
+        parse_rules([f"* {host}/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        credential_rewrites=[
+            CredentialRewriteRule(
+                host=host,
+                scheme="bearer",
+                synthetic=f"{SYNTHETIC_CREDENTIAL_PREFIX}test",
+                real_secret="real-secret",
+            )
+        ],
+    )
+    proxy_port = await proxy.start_tcp()
+
+    try:
+        observed = await asyncio.wait_for(
+            asyncio.to_thread(
+                _mitm_client_send_inner,
+                proxy_port,
+                f"{connect_host}:443",
+                host,
+                bundle_path,
+                b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+            ),
+            timeout=15,
+        )
+        assert b"403 Forbidden" in observed
+        assert b"credential rewrite rule" in observed
+    finally:
+        await proxy.stop()
+
+
 @pytest.mark.asyncio
 async def test_s6_connect_rejects_control_byte_in_inner_request_line(
     ca_paths: tuple[Path, Path, Path],
