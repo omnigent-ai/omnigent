@@ -69,6 +69,7 @@ from omnigent.process_logging import (
 from omnigent.spec import load as load_spec
 from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
 from omnigent.spec.parser import discover_host_skills
+from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
 from omnigent.spec.types import AgentSpec, SkillSpec
 
 if TYPE_CHECKING:
@@ -428,7 +429,10 @@ def run_chat(
             )
         # Discover host-scope skills from cwd so ``/skill-name`` slash
         # commands work even when connecting to a remote server with no
-        # local agent spec.
+        # local agent spec. The generic walk rather than the harness-aware
+        # resolver: without a spec there is no harness to dispatch on until
+        # the session exists, so vendor extras (Claude plugin skills) stay
+        # out of this menu.
         host_skills = discover_host_skills(Path.cwd(), "all")
         _chat_with_server(
             target,
@@ -3458,11 +3462,20 @@ def _merge_host_skills(
     spec_path: Path,
 ) -> list[SkillSpec]:
     """
-    Merge bundled skills with host-scope skills for the REPL.
+    Merge bundled skills with the ones the session's harness exposes.
 
-    Discovers ``.claude/skills/`` and ``.agents/skills/`` walking
-    up from the agent root, deduplicates by name (bundled wins),
-    and returns the combined list.
+    Resolution goes through :func:`resolve_harness_skills`, the same
+    entry point the runner's ``_resolve_session_skills`` uses to build
+    the web composer's slash-command menu, so the two composers offer
+    the same commands for the same session. For a Claude harness that
+    means enabled plugin skills (``<plugin>:<skill>``) as well as the
+    ``.claude/skills`` / ``.agents/skills`` walk; a harness with no
+    dedicated provider keeps the generic walk.
+
+    The workspace is searched ahead of the agent root, matching the
+    runner: a generated launcher spec (``omnigent run --harness
+    claude``) lives in a temp directory, and the ``.claude/skills`` the
+    user cares about is next to the code they are working on.
 
     :param agent_spec: Parsed AgentSpec with ``.skills`` and
         ``.skills_filter``.
@@ -3470,14 +3483,35 @@ def _merge_host_skills(
     :returns: Combined skill list, or empty list.
     """
     bundled: list[SkillSpec] = agent_spec.skills or []
-    skills_filter = agent_spec.skills_filter
     agent_root = spec_path if spec_path.is_dir() else spec_path.parent
-    host = discover_host_skills(agent_root, skills_filter)
-    bundled_names = {s.name for s in bundled}
+    roots: list[Path] = []
+    for candidate in (Path.cwd(), agent_root):
+        resolved = candidate.resolve()
+        if resolved not in roots:
+            roots.append(resolved)
+    ctx = SkillSourceContext(
+        roots=tuple(roots),
+        home=Path.home(),
+        skills_filter=agent_spec.skills_filter,
+        bundle_dir=agent_root,
+    )
+    harness = canonicalize_harness(agent_spec.executor.harness_kind)
+    seen = {s.name for s in bundled}
+    # Also by directory: a bundled skill whose folder and frontmatter ``name``
+    # differ is one skill, and the runner drops the host copy on either match.
+    # Registering it twice would put a second command in the menu that resolves
+    # to nothing.
+    seen_dirs = {s.skill_dir.resolve() for s in bundled if s.skill_dir is not None}
     merged = list(bundled)
-    for hs in host:
-        if hs.name not in bundled_names:
-            merged.append(hs)
+    for hs in resolve_harness_skills(ctx, harness):
+        if hs.name in seen:
+            continue
+        if hs.skill_dir is not None and hs.skill_dir.resolve() in seen_dirs:
+            continue
+        seen.add(hs.name)
+        if hs.skill_dir is not None:
+            seen_dirs.add(hs.skill_dir.resolve())
+        merged.append(hs)
     return merged
 
 
