@@ -1263,3 +1263,235 @@ class TestStreamProjection:
                 item = event.data.get("item_data")
                 call_id = item.get("call_id", "") if isinstance(item, dict) else ""
                 assert "orphan" not in str(call_id), f"{path.stem} minted {call_id}"
+
+
+# ---------------------------------------------------------------------------
+# Turn-state classification (the completion gate's pure core)
+#
+# These pin the answer both callers depend on — the read driver's session-status
+# edges and the write path's completion gate. The gate exists because the
+# executor used to report a turn complete as soon as the text was typed into the
+# agy TUI; every case below distinguishes "delivered" from "finished".
+# ---------------------------------------------------------------------------
+
+
+def _user_step(text: str) -> dict[str, Any]:
+    """
+    Build a USER_INPUT step carrying ``text``.
+
+    :param text: The user turn text agy recorded.
+    :returns: One USER_INPUT step dict.
+    """
+    return {"type": "CORTEX_STEP_TYPE_USER_INPUT", "userInput": {"userResponse": text}}
+
+
+def _planner_step(
+    *, status: str, text: str | None = None, error: str | None = None
+) -> dict[str, Any]:
+    """
+    Build a PLANNER_RESPONSE step at ``status``.
+
+    :param status: ``CORTEX_STEP_STATUS_*`` value.
+    :param text: Assistant text the planner carries, if any.
+    :param error: agy error detail, for the ERROR shape.
+    :returns: One PLANNER_RESPONSE step dict.
+    """
+    planner: dict[str, Any] = {}
+    if text is not None:
+        planner["response"] = text
+    if error is not None:
+        planner["error"] = error
+    return {
+        "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+        "status": status,
+        "plannerResponse": planner,
+    }
+
+
+def _tool_step(status: str) -> dict[str, Any]:
+    """
+    Build a RUN_COMMAND tool step at ``status``.
+
+    :param status: ``CORTEX_STEP_STATUS_*`` value.
+    :returns: One tool step dict.
+    """
+    return {
+        "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+        "status": status,
+        "runCommand": {"command": "pytest"},
+    }
+
+
+class TestFindTurnStartIndex:
+    """``find_turn_start_index`` identifies the caller's OWN turn, never an older one."""
+
+    def test_positional_tier_finds_the_new_user_step(self) -> None:
+        """A USER_INPUT at or after the pre-delivery step count is this turn's."""
+        from omnigent.antigravity_native_steps import find_turn_start_index
+
+        steps = [
+            _user_step("old"),
+            _planner_step(status="CORTEX_STEP_STATUS_DONE", text="old answer"),
+            _user_step("new"),
+        ]
+        assert find_turn_start_index(steps, baseline_step_count=2) == 2
+
+    def test_previous_turns_user_step_is_not_this_turn(self) -> None:
+        """
+        REGRESSION: an older USER_INPUT must never open the gate's turn.
+
+        Before delivery is reflected in the trajectory the newest USER_INPUT is
+        still the PREVIOUS turn's — and it is already followed by that turn's
+        closing planner. Accepting it is exactly the false success the gate
+        exists to prevent, so this returns ``None`` (not yet recorded).
+        """
+        from omnigent.antigravity_native_steps import find_turn_start_index
+
+        steps = [
+            _user_step("old"),
+            _planner_step(status="CORTEX_STEP_STATUS_DONE", text="old answer"),
+        ]
+        assert find_turn_start_index(steps, baseline_step_count=2) is None
+
+    def test_text_tier_used_only_without_a_baseline(self) -> None:
+        """
+        With no pre-delivery snapshot, the delivered text identifies the turn.
+
+        The positional tier is unavailable when the pre-delivery read failed, so
+        matching agy's recorded turn text is what keeps the gate from waiting on
+        a turn it cannot see — and it still cannot match an older turn's text
+        while ours is unrecorded, because only the NEWEST USER_INPUT is tested.
+        """
+        from omnigent.antigravity_native_steps import find_turn_start_index
+
+        steps = [_user_step("old"), _user_step("  build the thing\n")]
+        found = find_turn_start_index(
+            steps, baseline_step_count=None, delivered_text="build the thing"
+        )
+        assert found == 1
+        missed = find_turn_start_index(
+            steps, baseline_step_count=None, delivered_text="something else"
+        )
+        assert missed is None
+
+    def test_no_signals_or_no_user_step_yields_none(self) -> None:
+        """Without either signal — or without any USER_INPUT — the turn is unidentified."""
+        from omnigent.antigravity_native_steps import find_turn_start_index
+
+        assert find_turn_start_index([], baseline_step_count=0) is None
+        unidentified = find_turn_start_index(
+            [_user_step("hi")], baseline_step_count=None, delivered_text=None
+        )
+        assert unidentified is None
+
+
+class TestClassifyTurnOutcome:
+    """``classify_turn_outcome`` reports DONE / ERROR / still-running for one turn."""
+
+    def test_done_planner_with_text_completes_and_carries_the_text(self) -> None:
+        """A DONE planner carrying text is the terminal success, and supplies the reply."""
+        from omnigent.antigravity_native_steps import classify_turn_outcome
+
+        steps = [
+            _user_step("go"),
+            _tool_step("CORTEX_STEP_STATUS_DONE"),
+            _planner_step(status="CORTEX_STEP_STATUS_DONE", text="finished the refactor"),
+        ]
+        outcome = classify_turn_outcome(steps, start_index=0)
+        assert outcome.state == "done"
+        assert outcome.text == "finished the refactor"
+
+    def test_error_planner_is_an_error_not_a_success(self) -> None:
+        """
+        An ERROR planner surfaces as ``"error"`` with agy's own detail.
+
+        Collapsing it into a success is what makes a rate-limited or
+        safety-blocked turn indistinguishable from a completed one.
+        """
+        from omnigent.antigravity_native_steps import classify_turn_outcome
+
+        steps = [
+            _user_step("go"),
+            _planner_step(status="CORTEX_STEP_STATUS_ERROR", error="resource exhausted"),
+        ]
+        outcome = classify_turn_outcome(steps, start_index=0)
+        assert outcome.state == "error"
+        assert outcome.error == "resource exhausted"
+
+    def test_work_in_progress_is_still_running(self) -> None:
+        """A dispatched tool, a GENERATING planner and a running tool all keep the turn open."""
+        from omnigent.antigravity_native_steps import classify_turn_outcome
+
+        steps = [
+            _user_step("go"),
+            _planner_step(status="CORTEX_STEP_STATUS_GENERATING", text="I'll start by"),
+            _tool_step("CORTEX_STEP_STATUS_RUNNING"),
+        ]
+        outcome = classify_turn_outcome(steps, start_index=0)
+        assert outcome.state == "running"
+        assert outcome.text == "I'll start by"
+
+    def test_errored_tool_step_does_not_end_the_turn(self) -> None:
+        """
+        A tool that ERRORs is not a turn outcome — agy routinely recovers from one.
+
+        Only the planner's own terminal state ends the turn.
+        """
+        from omnigent.antigravity_native_steps import classify_turn_outcome
+
+        steps = [_user_step("go"), _tool_step("CORTEX_STEP_STATUS_ERROR")]
+        assert classify_turn_outcome(steps, start_index=0).state == "running"
+
+    def test_waiting_interaction_is_reported_while_running(self) -> None:
+        """A WAITING step keeps the turn running and flags WHY it is not progressing."""
+        from omnigent.antigravity_native_steps import classify_turn_outcome
+
+        steps = [_user_step("go"), _tool_step("CORTEX_STEP_STATUS_WAITING")]
+        outcome = classify_turn_outcome(steps, start_index=0)
+        assert outcome.state == "running"
+        assert outcome.waiting_on_user is True
+
+    def test_previous_turns_close_is_never_scanned(self) -> None:
+        """
+        Only steps AFTER this turn's USER_INPUT count.
+
+        The previous turn's closing planner sits earlier in the same trajectory;
+        scanning it would report a brand-new turn complete before agy touched it.
+        """
+        from omnigent.antigravity_native_steps import classify_turn_outcome
+
+        steps = [
+            _user_step("old"),
+            _planner_step(status="CORTEX_STEP_STATUS_DONE", text="old answer"),
+            _user_step("new"),
+        ]
+        assert classify_turn_outcome(steps, start_index=2).state == "running"
+
+    def test_degenerate_close_stays_running_for_the_idle_backstop(self) -> None:
+        """
+        A DONE planner with NO text is not a close — it is indistinguishable from
+        a streamed dispatch, so agy's own cascade status settles it instead.
+        """
+        from omnigent.antigravity_native_steps import classify_turn_outcome
+
+        steps = [_user_step("go"), _planner_step(status="CORTEX_STEP_STATUS_DONE")]
+        assert classify_turn_outcome(steps, start_index=0).state == "running"
+
+
+class TestCascadeIsIdle:
+    """``cascade_is_idle`` fails closed on anything but an explicit idle status."""
+
+    def test_explicit_idle_only(self) -> None:
+        """Only agy's own IDLE status reports idle; anything else does not."""
+        from omnigent.antigravity_native_steps import cascade_is_idle
+
+        assert cascade_is_idle({"c1": {"status": "CASCADE_RUN_STATUS_IDLE"}}, "c1") is True
+        assert cascade_is_idle({"c1": {"status": "CASCADE_RUN_STATUS_RUNNING"}}, "c1") is False
+
+    def test_missing_or_malformed_is_not_idle(self) -> None:
+        """An absent or non-dict summary is unknown, and unknown is never finished."""
+        from omnigent.antigravity_native_steps import cascade_is_idle
+
+        assert cascade_is_idle({}, "c1") is False
+        assert cascade_is_idle({"c1": "nope"}, "c1") is False
+        assert cascade_is_idle({"c1": {}}, "c1") is False

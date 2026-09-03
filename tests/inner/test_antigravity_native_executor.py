@@ -3,19 +3,26 @@
 These pin the write path: a web/mobile turn is delivered to the running agy by
 TYPING IT INTO the agy TUI pane over tmux (``inject_user_message_via_tui``,
 mocked here), which agy records as a real ``USER_INPUT`` step on the cascade the
-TUI displays; agy's reply is mirrored back by the read driver — so the executor
-yields a ``TurnComplete`` with no text rather than fabricating a reply. Typing
-into the TUI (not headless ``SendUserCascadeMessage`` RPC) is what unifies the
-agy TUI and the web mirror onto ONE cascade, giving claude/codex-native parity
-(#1156/#1158). Here the inject is stubbed so the tests assert the executor's
-wiring — what text it delivers and how it maps success/failure to events.
+TUI displays. Typing into the TUI (not headless ``SendUserCascadeMessage`` RPC)
+is what unifies the agy TUI and the web mirror onto ONE cascade, giving
+claude/codex-native parity (#1156/#1158).
+
+They also pin the **completion gate**. Delivery is not completion: the executor
+used to yield ``TurnComplete`` the instant the text had been typed and
+submitted, so a dispatched implementation task returned an immediate empty
+success before agy had run a single tool. The gate polls agy's own RPC
+trajectory until the turn reaches a terminal state, and the ``agy`` fixture below
+fakes that trajectory — a turn OPENS when the inject lands and only ever
+completes when the faked trajectory says agy finished.
 """
 
 from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 
+import httpx
 import pytest
 
 import omnigent.inner.antigravity_native_executor as executor_mod
@@ -31,6 +38,54 @@ _PLACEHOLDER_ID = "agy_conv_placeholder123"
 _PORT = 52548
 _ECHOED_MODEL = "MODEL_PLACEHOLDER_M20"
 _RECOMMENDED_MODEL = "MODEL_PLACEHOLDER_M132"
+_DEFAULT_REPLY_TEXT = "all done"
+
+
+def _user_step(text: str) -> dict[str, Any]:
+    """
+    Build the USER_INPUT step agy records for a delivered turn.
+
+    :param text: The delivered text agy echoed back onto the cascade.
+    :returns: One USER_INPUT step dict.
+    """
+    return {"type": "CORTEX_STEP_TYPE_USER_INPUT", "userInput": {"userResponse": text}}
+
+
+def _planner_step(
+    *, status: str, text: str | None = None, error: str | None = None
+) -> dict[str, Any]:
+    """
+    Build a PLANNER_RESPONSE step at ``status``.
+
+    :param status: ``CORTEX_STEP_STATUS_*`` value.
+    :param text: Assistant text the planner carries, if any.
+    :param error: agy error detail, for the ERROR shape.
+    :returns: One PLANNER_RESPONSE step dict.
+    """
+    planner: dict[str, Any] = {}
+    if text is not None:
+        planner["response"] = text
+    if error is not None:
+        planner["error"] = error
+    return {
+        "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+        "status": status,
+        "plannerResponse": planner,
+    }
+
+
+def _tool_step(status: str) -> dict[str, Any]:
+    """
+    Build a RUN_COMMAND tool step at ``status``.
+
+    :param status: ``CORTEX_STEP_STATUS_*`` value.
+    :returns: One tool step dict.
+    """
+    return {
+        "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+        "status": status,
+        "runCommand": {"command": "pytest"},
+    }
 
 
 def _executor(tmp_path: Path) -> AntigravityNativeExecutor:
@@ -88,17 +143,47 @@ def _steps_with_model(model: str) -> list[dict[str, object]]:
 @pytest.fixture
 def injected(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     """
-    Stub the agy TUI inject, recording each turn the executor delivers.
+    Fake one running agy: the TUI inject AND the RPC trajectory the gate polls.
 
     The write path types the turn into the agy TUI pane via
     ``inject_user_message_via_tui``; this records every ``{bridge_dir, content}``
     call and, when ``rec["raise"]`` is set, raises it (modeling a dead/unavailable
-    TUI pane).
+    TUI pane) WITHOUT recording a turn — a failed delivery never opens one.
+
+    A successful inject appends ``rec["reply"]`` to ``rec["steps"]``, which is
+    what ``GetCascadeTrajectorySteps`` then returns, so the completion gate sees
+    exactly the turn shape a test asks for. The default reply is a completed turn
+    (USER_INPUT + a DONE planner carrying text) so tests that are not about the
+    gate read as before.
+
+    Knobs, all mutable by the test before it drives ``run_turn``:
+
+    * ``steps`` — the trajectory BEFORE delivery (default empty).
+    * ``reply`` — steps appended on a successful inject; ``None`` means agy
+      records nothing at all.
+    * ``cascade_status`` — agy's own run status for the idle backstop.
+    * ``on_poll`` — ``callable(rec, poll_index)`` run before each trajectory read,
+      for a trajectory that evolves across polls. Poll 0 is the executor's
+      pre-delivery snapshot; poll 1 is the gate's first read.
+    * ``read_error`` — ``callable(poll_index) -> Exception | None``, to fail
+      specific reads.
+    * ``port`` — resolved connect-RPC port, or ``None`` for "agy not found".
 
     :param monkeypatch: pytest monkeypatch fixture.
-    :returns: A mutable dict: ``calls`` (recorded injects) + ``raise`` (optional).
+    :returns: The mutable fake-agy record described above.
     """
-    rec: dict[str, object] = {"calls": [], "raise": None}
+    rec: dict[str, object] = {
+        "calls": [],
+        "raise": None,
+        "steps": [],
+        "reply": None,
+        "cascade_status": "CASCADE_RUN_STATUS_RUNNING",
+        "on_poll": None,
+        "read_error": None,
+        "port": _PORT,
+        "polls": 0,
+        "idle_checks": 0,
+    }
 
     def _inject(bridge_dir: Path, *, content: str, **_kw: object) -> None:
         calls = rec["calls"]
@@ -108,8 +193,46 @@ def injected(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
         if exc is not None:
             assert isinstance(exc, BaseException)
             raise exc
+        reply = rec["reply"]
+        if reply is None:
+            reply = [
+                _user_step(content),
+                _planner_step(status="CORTEX_STEP_STATUS_DONE", text=_DEFAULT_REPLY_TEXT),
+            ]
+        steps = rec["steps"]
+        assert isinstance(steps, list) and isinstance(reply, list)
+        steps.extend(reply)
+
+    def _steps(_port: int, _cascade_id: str) -> list[dict[str, object]]:
+        index = rec["polls"]
+        assert isinstance(index, int)
+        rec["polls"] = index + 1
+        on_poll = rec["on_poll"]
+        if callable(on_poll):
+            on_poll(rec, index)
+        read_error = rec["read_error"]
+        if callable(read_error):
+            exc = read_error(index)
+            if exc is not None:
+                raise exc
+        steps = rec["steps"]
+        assert isinstance(steps, list)
+        return list(steps)
+
+    def _trajectories(_port: int) -> dict[str, object]:
+        checks = rec["idle_checks"]
+        assert isinstance(checks, int)
+        rec["idle_checks"] = checks + 1
+        return {"trajectorySummaries": {_CONVERSATION_ID: {"status": rec["cascade_status"]}}}
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
 
     monkeypatch.setattr(executor_mod, "inject_user_message_via_tui", _inject)
+    monkeypatch.setattr(executor_mod, "get_trajectory_steps", _steps)
+    monkeypatch.setattr(executor_mod, "get_all_cascade_trajectories", _trajectories)
+    monkeypatch.setattr(executor_mod, "resolve_language_server_port", lambda _c: rec["port"])
+    monkeypatch.setattr(executor_mod, "_sleep", _no_sleep)
     return rec
 
 
@@ -174,12 +297,12 @@ def test_run_turn_delivers_via_tui_and_completes(
     tmp_path: Path, injected: dict[str, object]
 ) -> None:
     """
-    ``run_turn`` types the user text into the agy TUI and yields a text-less TurnComplete.
+    ``run_turn`` types the user text into the agy TUI and completes on agy's DONE turn.
 
     The turn is injected into the TUI pane (#1156/#1158) — agy records it as a
-    real USER_INPUT on the cascade the TUI displays and the read driver mirrors
-    the reply, so the executor yields ``TurnComplete`` with ``response=None``
-    (fabricating text here would duplicate the mirrored reply).
+    real USER_INPUT on the cascade the TUI displays — and the executor then waits
+    for agy's terminal DONE planner before reporting completion, carrying that
+    step's text so the caller receives the agent's actual answer.
     """
     _seed_state(tmp_path)
     events = asyncio.run(_run(_executor(tmp_path), "what is 2+2?"))
@@ -189,7 +312,7 @@ def test_run_turn_delivers_via_tui_and_completes(
     assert calls[0]["bridge_dir"] == tmp_path
     assert len(events) == 1
     assert isinstance(events[0], TurnComplete)
-    assert events[0].response is None
+    assert events[0].response == _DEFAULT_REPLY_TEXT
 
 
 def test_run_turn_flattens_content_blocks(tmp_path: Path, injected: dict[str, object]) -> None:
@@ -371,7 +494,9 @@ def test_run_turn_tui_inject_error_surfaces(tmp_path: Path, injected: dict[str, 
 
     The inject raises when the agy pane is gone / never advertised / the submit
     never started a turn; the executor must surface it (so the UI can prompt a
-    restart) rather than report a fake success the mirror never fills.
+    restart) rather than report a fake success the mirror never fills. The
+    completion gate must not swallow or soften that — a delivery failure is still
+    a failure, reported without waiting on a turn that was never delivered.
     """
     _seed_state(tmp_path)
     injected["raise"] = RuntimeError("the agy terminal is no longer running (the TUI exited)")
@@ -379,6 +504,270 @@ def test_run_turn_tui_inject_error_surfaces(tmp_path: Path, injected: dict[str, 
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
     assert "the agy TUI" in events[0].message
+    # Only the pre-delivery snapshot ran; the gate was never entered.
+    assert injected["polls"] == 1
+
+
+# ---------------------------------------------------------------------------
+# run_turn — the completion gate
+#
+# The defect these pin: the executor reported a turn complete as soon as the
+# text was typed into the TUI, so an orchestrator dispatching an implementation
+# task collected an immediate empty success before agy had done any work.
+# ---------------------------------------------------------------------------
+
+
+def _drive_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    start_timeout_s: float = 180.0,
+    completion_timeout_s: float = 3600.0,
+    idle_every: int = 5,
+    idle_confirmations: int = 2,
+    text: str = "implement the thing",
+) -> list[ExecutorEvent]:
+    """
+    Run one gated turn with the gate's budgets pinned for the test.
+
+    :param tmp_path: Bridge directory.
+    :param monkeypatch: pytest monkeypatch fixture.
+    :param start_timeout_s: Budget for agy to record the delivery as a turn.
+    :param completion_timeout_s: Budget for the open turn to reach a terminal state.
+    :param idle_every: Polls between idle-backstop checks.
+    :param idle_confirmations: Consecutive idle readings required to close.
+    :param text: User text to deliver.
+    :returns: The yielded executor events.
+    """
+    monkeypatch.setattr(executor_mod, "_TURN_START_TIMEOUT_S", start_timeout_s)
+    monkeypatch.setattr(executor_mod, "_TURN_COMPLETION_TIMEOUT_S", completion_timeout_s)
+    monkeypatch.setattr(executor_mod, "_IDLE_CHECK_EVERY_N_POLLS", idle_every)
+    monkeypatch.setattr(executor_mod, "_IDLE_CONFIRM_CHECKS", idle_confirmations)
+    return asyncio.run(_run(_executor(tmp_path), text))
+
+
+def test_gate_waits_for_a_terminal_done_state(
+    tmp_path: Path, injected: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    REGRESSION: the turn completes only once agy's trajectory reaches DONE.
+
+    agy is still running a tool on the first gate poll and only closes the turn
+    on a later one. The old executor yielded ``TurnComplete`` straight off the
+    successful inject, which here would mean completing while the tool was still
+    running and returning no text at all.
+    """
+    _seed_state(tmp_path)
+    injected["reply"] = [
+        _user_step("implement the thing"),
+        _tool_step("CORTEX_STEP_STATUS_RUNNING"),
+    ]
+
+    def _finish_on_third_read(rec: dict[str, object], index: int) -> None:
+        if index == 3:
+            steps = rec["steps"]
+            assert isinstance(steps, list)
+            steps.append(_planner_step(status="CORTEX_STEP_STATUS_DONE", text="refactor applied"))
+
+    injected["on_poll"] = _finish_on_third_read
+
+    events = _drive_gate(tmp_path, monkeypatch)
+    assert len(events) == 1
+    assert isinstance(events[0], TurnComplete)
+    assert events[0].response == "refactor applied"
+    # Poll 0 was the pre-delivery snapshot, so the gate itself polled repeatedly
+    # instead of completing off the inject.
+    assert injected["polls"] == 4
+
+
+def test_gate_does_not_complete_on_the_previous_turns_close(
+    tmp_path: Path, injected: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    REGRESSION: an earlier turn's DONE planner never satisfies the new turn.
+
+    The trajectory already ends in a completed turn when the new one is
+    delivered. Scanning the whole trajectory (rather than only the steps after
+    THIS turn's USER_INPUT) would report the new turn complete immediately, with
+    the old turn's text.
+    """
+    _seed_state(tmp_path)
+    injected["steps"] = [
+        _user_step("previous question"),
+        _planner_step(status="CORTEX_STEP_STATUS_DONE", text="previous answer"),
+    ]
+    injected["reply"] = [
+        _user_step("implement the thing"),
+        _tool_step("CORTEX_STEP_STATUS_RUNNING"),
+    ]
+
+    events = _drive_gate(tmp_path, monkeypatch, completion_timeout_s=0.0)
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert "did not reach a terminal state" in events[0].message
+
+
+def test_gate_reports_an_agy_error_state_as_a_failure(
+    tmp_path: Path, injected: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A turn whose planner ends in ERROR is a failure, distinguishable from success.
+
+    agy's own error detail is carried through so the caller can tell a
+    rate-limit from a safety block, and the failure is marked retryable because
+    that class of error often survives a retry.
+    """
+    _seed_state(tmp_path)
+    injected["reply"] = [
+        _user_step("implement the thing"),
+        _planner_step(status="CORTEX_STEP_STATUS_ERROR", error="resource exhausted"),
+    ]
+
+    events = _drive_gate(tmp_path, monkeypatch)
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert not any(isinstance(event, TurnComplete) for event in events)
+    assert "ERROR state" in events[0].message
+    assert "resource exhausted" in events[0].message
+    assert events[0].retryable is True
+
+
+def test_gate_times_out_with_a_diagnosable_failure(
+    tmp_path: Path, injected: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A turn that never reaches a terminal state fails, naming the budget and the cause.
+
+    agy is parked on a WAITING permission gate that nobody answers. The result
+    must be a bounded, explicit failure — never a hang, and never a success that
+    claims unconfirmed work was done.
+    """
+    _seed_state(tmp_path)
+    injected["reply"] = [
+        _user_step("implement the thing"),
+        _tool_step("CORTEX_STEP_STATUS_WAITING"),
+    ]
+
+    events = _drive_gate(tmp_path, monkeypatch, completion_timeout_s=0.0)
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert "did not reach a terminal state within 0s" in events[0].message
+    assert "WAITING interaction" in events[0].message
+    assert "NOT confirmed" in events[0].message
+    assert events[0].retryable is False
+
+
+def test_gate_fails_when_agy_never_records_the_turn(
+    tmp_path: Path, injected: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A delivery agy never turns into a USER_INPUT step fails on the start budget.
+
+    The submit was footer-verified, so nothing appearing on the cascade means the
+    text did not open a turn. Reporting that promptly beats waiting out the full
+    completion budget — and beats reporting success.
+    """
+    _seed_state(tmp_path)
+    injected["reply"] = []
+
+    events = _drive_gate(tmp_path, monkeypatch, start_timeout_s=0.0)
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert "never recorded it as a turn" in events[0].message
+
+
+def test_gate_keeps_waiting_through_transient_rpc_failures(
+    tmp_path: Path, injected: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An unreadable trajectory is "unknown", never "finished".
+
+    The first gate reads fail (transport error, then no resolvable agy port).
+    Neither may end the turn: the gate retries and completes only when agy's
+    trajectory actually says DONE.
+    """
+    _seed_state(tmp_path)
+
+    def _fail_first_gate_read(index: int) -> Exception | None:
+        return httpx.ConnectError("connection refused") if index == 1 else None
+
+    injected["read_error"] = _fail_first_gate_read
+
+    events = _drive_gate(tmp_path, monkeypatch)
+    assert len(events) == 1
+    assert isinstance(events[0], TurnComplete)
+    assert events[0].response == _DEFAULT_REPLY_TEXT
+    assert injected["polls"] >= 3
+
+
+def test_gate_closes_a_degenerate_turn_on_agys_own_idle_status(
+    tmp_path: Path, injected: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A turn that closes without a text planner is settled by agy's cascade status.
+
+    No step-based rule can tell that shape from a streamed dispatch, so the gate
+    falls back to agy's own run status — and only after consecutive idle
+    readings, so a turn agy has not started yet can never pass as finished.
+    """
+    _seed_state(tmp_path)
+    injected["reply"] = [
+        _user_step("implement the thing"),
+        _planner_step(status="CORTEX_STEP_STATUS_DONE"),
+    ]
+    injected["cascade_status"] = "CASCADE_RUN_STATUS_IDLE"
+
+    events = _drive_gate(tmp_path, monkeypatch, idle_every=1, idle_confirmations=2)
+    assert len(events) == 1
+    assert isinstance(events[0], TurnComplete)
+    assert injected["idle_checks"] == 2
+
+
+def test_idle_status_alone_never_completes_an_unrecorded_turn(
+    tmp_path: Path, injected: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An idle cascade with no recorded turn is not a completion.
+
+    agy reports idle in the window between a delivery and the turn being
+    recorded; treating that as terminal would reinstate the false success in its
+    worst form.
+    """
+    _seed_state(tmp_path)
+    injected["reply"] = []
+    injected["cascade_status"] = "CASCADE_RUN_STATUS_IDLE"
+
+    events = _drive_gate(tmp_path, monkeypatch, start_timeout_s=0.0, idle_every=1)
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert injected["idle_checks"] == 0
+
+
+def test_gate_identifies_the_turn_by_text_when_the_snapshot_failed(
+    tmp_path: Path, injected: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    With no pre-delivery snapshot, the delivered text identifies this turn.
+
+    The pre-delivery read fails, so the positional signal is unavailable. The
+    gate must still find THIS turn (not the previous one, whose closing planner
+    is right there in the trajectory) and wait for its own terminal step.
+    """
+    _seed_state(tmp_path)
+    injected["steps"] = [
+        _user_step("previous question"),
+        _planner_step(status="CORTEX_STEP_STATUS_DONE", text="previous answer"),
+    ]
+
+    def _fail_snapshot(index: int) -> Exception | None:
+        return httpx.ConnectError("agy not up yet") if index == 0 else None
+
+    injected["read_error"] = _fail_snapshot
+
+    events = _drive_gate(tmp_path, monkeypatch)
+    assert len(events) == 1
+    assert isinstance(events[0], TurnComplete)
+    assert events[0].response == _DEFAULT_REPLY_TEXT
 
 
 # ---------------------------------------------------------------------------
@@ -755,3 +1144,46 @@ def test_content_to_text_handles_string_blocks_none_and_other(tmp_path: Path) ->
     assert _content_to_text(None, tmp_path) == ""
     # Defensive fallback for an unexpected shape: encoded, not crashed.
     assert _content_to_text(123, tmp_path) == "123"
+
+
+def test_gate_releases_on_interrupt_without_claiming_completion(
+    tmp_path: Path, injected: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Interrupting a gated turn releases the gate as CANCELLED, not as complete.
+
+    Stop must not have to wait out the completion budget, and an interrupted
+    turn must never be reported as finished work.
+    """
+    from omnigent.inner.executor import TurnCancelled
+
+    _seed_state(tmp_path)
+    injected["reply"] = [
+        _user_step("implement the thing"),
+        _tool_step("CORTEX_STEP_STATUS_RUNNING"),
+    ]
+    monkeypatch.setattr(executor_mod, "cancel_cascade_steps", lambda _p, _c: True)
+    monkeypatch.setattr(executor_mod, "_TURN_COMPLETION_TIMEOUT_S", 3600.0)
+    executor = _executor(tmp_path)
+
+    # Interrupt between the gate's first and second polls, the way a user hitting
+    # stop mid-turn does.
+    async def _interrupt_instead_of_sleeping(_seconds: float) -> None:
+        await executor.interrupt_session("main")
+
+    monkeypatch.setattr(executor_mod, "_sleep", _interrupt_instead_of_sleeping)
+
+    async def _drive() -> list[ExecutorEvent]:
+        return [
+            event
+            async for event in executor.run_turn(
+                messages=[{"role": "user", "content": "implement the thing"}],
+                tools=[],
+                system_prompt="",
+            )
+        ]
+
+    events = asyncio.run(_drive())
+    assert len(events) == 1
+    assert isinstance(events[0], TurnCancelled)
+    assert not any(isinstance(event, TurnComplete) for event in events)

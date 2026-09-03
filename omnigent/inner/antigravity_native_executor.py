@@ -28,11 +28,47 @@ executor:
 
 * does NOT stream (``supports_streaming() -> False``) — the read driver posts the
   assistant message;
-* yields a single :class:`TurnComplete` with ``response=None`` on a successful
-  send (fabricating text here would double the read driver's mirrored message);
+* yields ONE terminal event per turn, and only once agy has actually FINISHED the
+  turn (see the completion gate below);
 * supports a live message queue (``supports_live_message_queue() -> True``) — a
   mid-turn web message is delivered over the same RPC, which is how web steering
   works.
+
+**The completion gate (the load-bearing correctness detail).** Delivery and
+completion are two different events, and this executor used to conflate them: it
+yielded ``TurnComplete`` the moment ``_deliver`` returned, i.e. as soon as the
+text had been TYPED AND SUBMITTED in the TUI. Nothing waited for agy to do the
+work. A caller that dispatches an implementation task — a polly orchestrator
+running agy as a worker — therefore collected an immediate, empty success before
+agy had run a single tool, and read "no changes" as "the task is done". Unlike
+the claude/codex harnesses there is no headless per-turn subprocess whose exit
+supplies that signal, so this executor supplies it itself: after a successful
+delivery it polls agy's own RPC trajectory (``GetCascadeTrajectorySteps``, the
+same surface the read driver mirrors) until the turn reaches a TERMINAL state,
+classified by the shared, pure helpers in
+:mod:`omnigent.antigravity_native_steps`:
+
+* a DONE ``PLANNER_RESPONSE`` carrying assistant text → :class:`TurnComplete`,
+  carrying agy's final text (the harness adapter does not re-emit it as a
+  conversation item, so the read driver stays the sole mirror source and nothing
+  double-renders);
+* an ERROR ``PLANNER_RESPONSE`` → :class:`ExecutorError`, so a model / safety /
+  rate-limit / provider failure is never collapsed into a success;
+* a degenerate turn that closes without a text planner → reconciled against agy's
+  OWN cascade run status (``GetAllCascadeTrajectories``), the same idle backstop
+  the read driver uses, confirmed over consecutive checks;
+* neither, within the budget → :class:`ExecutorError` naming the timeout.
+
+The gate is bounded by two named budgets, :data:`_TURN_START_TIMEOUT_S` and
+:data:`_TURN_COMPLETION_TIMEOUT_S`. Note that the bridge's tmux timeouts
+(``_TMUX_SEND_TIMEOUT_S`` / ``_TMUX_READY_TIMEOUT_S`` / ``_PASTE_COMMIT_TIMEOUT_S``
+/ ``_SUBMIT_VERIFY_TIMEOUT_S``) cover only local TUI delivery, and agy's own
+``--print-timeout`` never applies because this path does not use ``--print`` — so
+before the gate there was NO task-completion budget of any kind here.
+
+Mid-turn steering (:meth:`AntigravityNativeExecutor.enqueue_session_message`) is
+deliberately NOT gated: it is a delivery, not a turn, and the ``run_turn`` gate
+that is already open is what waits for the steered work to finish.
 
 **Per-turn model (the load-bearing detail).** ``SendUserCascadeMessage`` REQUIRES
 a ``planModel`` enum per turn (omitting it errors "neither PlanModel nor
@@ -59,8 +95,12 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
+
+import httpx
 
 from omnigent.antigravity_native_bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_DIR_ENV_VAR,
@@ -71,7 +111,14 @@ from omnigent.antigravity_native_bridge import (
 )
 from omnigent.antigravity_native_rpc import (
     cancel_cascade_steps,
+    get_all_cascade_trajectories,
+    get_trajectory_steps,
     resolve_language_server_port,
+)
+from omnigent.antigravity_native_steps import (
+    cascade_is_idle,
+    classify_turn_outcome,
+    find_turn_start_index,
 )
 from omnigent.inner.executor import (
     EnqueuedContent,
@@ -81,6 +128,7 @@ from omnigent.inner.executor import (
     ExecutorEvent,
     Message,
     ToolSpec,
+    TurnCancelled,
     TurnComplete,
     describe_exception,
 )
@@ -92,6 +140,90 @@ _logger = logging.getLogger(__name__)
 # agy step type for a committed user turn; its ``userConfig`` carries the model
 # the user was on for that turn (the tier-1 model-echo source, design §10.4).
 _USER_INPUT_STEP_TYPE = "CORTEX_STEP_TYPE_USER_INPUT"
+
+# --- Completion-gate budgets (see the module docstring) --------------------
+#
+# These are the ONLY task-completion budgets on this path. The bridge's tmux
+# timeouts bound local TUI delivery, not the work; agy's ``--print-timeout``
+# never applies because this path does not use ``--print``.
+
+# Seconds between trajectory polls while waiting for the turn to finish. agy's
+# steps finalize at DONE (no token streaming on this surface) and the gate only
+# needs the terminal edge, not a live mirror — that is the read driver's job at
+# its own much faster cadence — so this is deliberately slow enough to be free
+# next to a multi-minute agent turn.
+_TURN_POLL_INTERVAL_S = 2.0
+
+# Seconds after a SUCCESSFUL delivery in which agy must record the turn — a
+# USER_INPUT step for our text must appear on a reachable cascade. The submit was
+# already footer-verified by the injector, so this only has to absorb agy minting
+# its cascade on a first turn plus RPC-port discovery. Blowing this budget means
+# the paste landed somewhere that is not a turn, which is a failure, not a slow
+# agent: it is reported as one rather than waiting out the full completion
+# budget.
+_TURN_START_TIMEOUT_S = 180.0
+
+# Total seconds an OPEN turn may run before the gate gives up. Sized for
+# long-running implementation work, which is the case that motivated the gate: a
+# dispatched worker editing several files, running a build and a test suite is
+# routinely tens of minutes, so anything in the low minutes (agy's own 5-minute
+# ``--print-timeout`` default, say) would abort real work and be worse than the
+# bug. One hour is long enough that a legitimate implementation turn finishes
+# inside it, and short enough that a wedged agy — one parked forever on a
+# permission gate, or hung mid-tool — frees the caller's slot the same day
+# instead of never. A turn that hits this yields an ExecutorError naming the
+# budget; it never degrades into a success.
+_TURN_COMPLETION_TIMEOUT_S = 3600.0
+
+# The idle backstop. A turn can close without a text-carrying planner step (the
+# degenerate shape the read driver documents), which no step-based rule can tell
+# apart from a dispatch. agy's own cascade run status settles it, but a single
+# reading can catch the gap between the turn being recorded and agy starting it,
+# so the gate requires consecutive idle readings, spaced by whole poll cycles,
+# and consults it only AFTER the turn is confirmed open.
+_IDLE_CHECK_EVERY_N_POLLS = 5
+_IDLE_CONFIRM_CHECKS = 2
+
+
+@dataclass(frozen=True)
+class _GateResult:
+    """
+    Outcome of the post-delivery completion gate for one turn.
+
+    :param completed: ``True`` when agy reached a terminal DONE state for this
+        turn. ``False`` for every non-success — an agy ERROR, a timeout, or a
+        turn that never became observable — which the caller surfaces as an
+        :class:`ExecutorError`.
+    :param text: agy's final assistant text for the turn, when the closing step
+        carried any.
+    :param error: Human-readable, diagnosable failure description. Always set
+        when ``completed`` is ``False``.
+    :param retryable: ``True`` when the failure is one a retry might survive
+        (agy reported a model/provider ERROR), ``False`` for structural failures
+        (the turn never started, or it exhausted its budget — retrying either
+        would just burn the budget again).
+    :param cancelled: ``True`` when the gate stopped because the turn was
+        interrupted. Neither a success nor a failure of the turn's work.
+    """
+
+    completed: bool
+    text: str | None = None
+    error: str | None = None
+    retryable: bool = False
+    cancelled: bool = False
+
+
+async def _sleep(seconds: float) -> None:
+    """
+    Stubbable indirection for the completion gate's poll delay.
+
+    Exists so tests can drive the gate without real delays without patching
+    ``asyncio.sleep`` globally (mirrors the read driver's ``_sleep``).
+
+    :param seconds: Delay in seconds.
+    :returns: None after the sleep completes.
+    """
+    await asyncio.sleep(seconds)
 
 
 class AntigravityNativeExecutor(Executor):
@@ -113,6 +245,15 @@ class AntigravityNativeExecutor(Executor):
         # enqueue_session_message (mid-turn steer, live message queue) don't send
         # to agy at once or deliver out of order.
         self._send_lock = asyncio.Lock()
+        # Completion-gate RPC target cache. Port discovery scans processes, so it
+        # is resolved once per cascade and re-resolved only when a read fails or
+        # the bridge rebinds to a different cascade (a TUI ``/clear``).
+        self._rpc_port: int | None = None
+        self._rpc_cascade_id: str | None = None
+        # Set by interrupt_session so the completion gate stops waiting as soon
+        # as the user hits stop. Without it a cancelled turn would sit in the gate
+        # until agy's own trajectory reflected the cancel.
+        self._interrupted = asyncio.Event()
 
     def supports_streaming(self) -> bool:
         """:returns: ``False`` — assistant output is emitted by the RPC read driver."""
@@ -126,9 +267,13 @@ class AntigravityNativeExecutor(Executor):
         """
         Steer an active native Antigravity turn by delivering another message.
 
-        Mid-turn web steering uses the exact same RPC turn-send path as
-        :meth:`run_turn` (``SendUserCascadeMessage``), so the two need no
-        special-casing.
+        Mid-turn web steering uses the exact same delivery path as
+        :meth:`run_turn`, so the two need no special-casing.
+
+        This deliberately does NOT wait for completion. A steer is a delivery
+        into a turn that is already open, and the ``run_turn`` completion gate
+        holding that turn is what waits for the steered work to finish; gating
+        here too would block the caller that is trying to steer.
 
         :param session_key: Adapter session key. Unused; the native bridge is
             per conversation.
@@ -170,6 +315,10 @@ class AntigravityNativeExecutor(Executor):
             failed.
         """
         del session_key
+        # Release the completion gate FIRST and unconditionally: the user asked
+        # to stop, so the turn must stop being waited on whether or not agy
+        # accepts the cancel below.
+        self._interrupted.set()
         state = await asyncio.to_thread(read_bridge_state, self._bridge_dir)
         if state is None or not _session_is_active(state.session_id, self._request_session_id):
             return False
@@ -203,14 +352,15 @@ class AntigravityNativeExecutor(Executor):
         """
         Deliver the latest web/mobile user message to the running agy over RPC.
 
-        Resolves agy's conversation/cascade id (waiting briefly for the runner to
-        mint it on the first turn), discovers the connect-RPC port, resolves the
-        per-turn model, and delivers the message via ``SendUserCascadeMessage``
-        (:func:`omnigent.antigravity_native_rpc.send_user_cascade_message`), which
-        agy records as a real ``USER_INPUT`` turn. The assistant reply is mirrored
-        back by the RPC read driver, so this yields a single :class:`TurnComplete`
-        with no text on success (never a fabricated reply). On any failure it
-        yields one :class:`ExecutorError`.
+        Delivers the latest user message by typing it into the agy TUI, then
+        WAITS for agy to finish the turn before reporting anything
+        (:meth:`_await_turn_completion`). Successful delivery is not completion:
+        reporting on delivery alone is what let a dispatched implementation task
+        return an immediate empty success (see the module docstring). Exactly one
+        terminal event is yielded — :class:`TurnComplete` carrying agy's final
+        text once the turn reaches a terminal DONE state, or
+        :class:`ExecutorError` when delivery fails, when agy's turn ends in ERROR,
+        or when the turn exhausts its budget.
 
         :param messages: Conversation history in executor message shape; the
             latest user message is delivered.
@@ -238,11 +388,25 @@ class AntigravityNativeExecutor(Executor):
         if not text:
             yield ExecutorError(message="Antigravity native turn had no user text to send")
             return
-        outcome = await self._deliver(text)
-        if outcome is not None:
-            yield ExecutorError(message=outcome)
+        self._interrupted.clear()
+        # Snapshot BEFORE delivering: the step count is what tells this turn's
+        # USER_INPUT step apart from the previous turn's, whose closing planner
+        # would otherwise satisfy the gate instantly.
+        baseline = await self._snapshot_step_count()
+        failure = await self._deliver(text)
+        if failure is not None:
+            yield ExecutorError(message=failure)
+            return
+        result = await self._await_turn_completion(delivered_text=text, baseline=baseline)
+        if result.cancelled:
+            yield TurnCancelled()
+        elif result.completed:
+            yield TurnComplete(response=result.text)
         else:
-            yield TurnComplete(response=None)
+            yield ExecutorError(
+                message=result.error or "Antigravity native turn did not complete",
+                retryable=result.retryable,
+            )
 
     async def _deliver(self, text: str) -> str | None:
         """
@@ -302,6 +466,236 @@ class AntigravityNativeExecutor(Executor):
                 state.session_id,
             )
             return None
+
+    async def _await_turn_completion(
+        self, *, delivered_text: str, baseline: int | None
+    ) -> _GateResult:
+        """
+        Block until agy finishes the delivered turn, or a budget runs out.
+
+        The completion gate. Polls ``GetCascadeTrajectorySteps`` — the same
+        surface the read driver mirrors — and classifies the turn with the shared
+        pure helpers in :mod:`omnigent.antigravity_native_steps`, so the gate and
+        the mirrored session status can never disagree about whether a turn ended.
+
+        Two phases, each with its own budget:
+
+        #. **Start** (:data:`_TURN_START_TIMEOUT_S`): agy must record the delivery
+           as a USER_INPUT step (:func:`find_turn_start_index`). Until that step
+           exists there is no turn to wait on, and a delivery that never becomes
+           one is a failure worth reporting promptly rather than waiting out the
+           full completion budget.
+        #. **Completion** (:data:`_TURN_COMPLETION_TIMEOUT_S`, measured from
+           delivery): the open turn must reach a terminal state — a DONE planner
+           with text, an ERROR planner, or agy's own cascade status settling to
+           idle across :data:`_IDLE_CONFIRM_CHECKS` consecutive checks for the
+           degenerate close.
+
+        A trajectory read that fails (transport, non-2xx, non-JSON body, no
+        resolvable RPC port yet) is transient: it is logged, the cached port is
+        dropped so the next pass re-resolves, and the loop retries until a budget
+        expires. It never short-circuits into a success.
+
+        :param delivered_text: The exact text delivered, used to identify this
+            turn's USER_INPUT step when the pre-delivery snapshot was unavailable.
+        :param baseline: Step count observed before delivery, or ``None`` when it
+            could not be read (see :meth:`_snapshot_step_count`).
+        :returns: The turn's :class:`_GateResult`.
+        """
+        started_at = time.monotonic()
+        start_index: int | None = None
+        # Counted from the poll that first saw the turn OPEN, not from gate
+        # entry, so the idle backstop can never fire on the very reading that
+        # discovered the turn — the one reading agy may not have started yet.
+        polls_since_open = -1
+        idle_checks = 0
+        latest_text: str | None = None
+        waiting_on_user = False
+        while True:
+            if self._interrupted.is_set():
+                _logger.info("antigravity native completion gate released by interrupt")
+                return _GateResult(completed=False, text=latest_text, cancelled=True)
+            steps = await self._read_trajectory()
+            if steps is not None:
+                if start_index is None:
+                    start_index = find_turn_start_index(
+                        steps,
+                        baseline_step_count=baseline,
+                        delivered_text=delivered_text,
+                    )
+                if start_index is not None:
+                    polls_since_open += 1
+                    outcome = classify_turn_outcome(steps, start_index=start_index)
+                    latest_text = outcome.text or latest_text
+                    waiting_on_user = outcome.waiting_on_user
+                    if outcome.state == "done":
+                        _logger.info(
+                            "antigravity native turn completed (DONE planner) after %.1fs",
+                            time.monotonic() - started_at,
+                        )
+                        return _GateResult(completed=True, text=outcome.text)
+                    if outcome.state == "error":
+                        detail = f": {outcome.error}" if outcome.error else ""
+                        return _GateResult(
+                            completed=False,
+                            text=outcome.text,
+                            error=(
+                                "Antigravity native turn ended in an agy ERROR state"
+                                f"{detail} (the model did not complete the turn)"
+                            ),
+                            # A model / safety / rate-limit / provider-overload
+                            # failure is exactly the transient class the workflow
+                            # may retry; a structural gate failure below is not.
+                            retryable=True,
+                        )
+                    # Still running. The degenerate close (a turn that ends with
+                    # no text-carrying planner) is only visible in agy's own
+                    # cascade status, and only after enough consecutive idle
+                    # readings that a not-yet-started turn cannot masquerade as a
+                    # finished one.
+                    if polls_since_open > 0 and polls_since_open % _IDLE_CHECK_EVERY_N_POLLS == 0:
+                        if await self._cascade_reports_idle():
+                            idle_checks += 1
+                            if idle_checks >= _IDLE_CONFIRM_CHECKS:
+                                _logger.info(
+                                    "antigravity native turn completed (cascade idle) after %.1fs",
+                                    time.monotonic() - started_at,
+                                )
+                                return _GateResult(completed=True, text=latest_text)
+                        else:
+                            idle_checks = 0
+
+            elapsed = time.monotonic() - started_at
+            if start_index is None and elapsed >= _TURN_START_TIMEOUT_S:
+                return _GateResult(
+                    completed=False,
+                    error=(
+                        "Antigravity native turn was delivered to the agy TUI but agy never "
+                        f"recorded it as a turn within {_TURN_START_TIMEOUT_S:.0f}s "
+                        "(no matching USER_INPUT step; the agy connect-RPC may be unreachable "
+                        "or the submitted text never opened a cascade turn)"
+                    ),
+                )
+            if elapsed >= _TURN_COMPLETION_TIMEOUT_S:
+                blocked = (
+                    " — agy is parked on a WAITING interaction (an ask-question or "
+                    "permission gate nobody answered)"
+                    if waiting_on_user
+                    else ""
+                )
+                return _GateResult(
+                    completed=False,
+                    text=latest_text,
+                    error=(
+                        "Antigravity native turn did not reach a terminal state within "
+                        f"{_TURN_COMPLETION_TIMEOUT_S:.0f}s{blocked}. The turn was delivered "
+                        "and may still be running in the agy TUI; its work is NOT confirmed"
+                    ),
+                )
+            await _sleep(_TURN_POLL_INTERVAL_S)
+
+    async def _snapshot_step_count(self) -> int | None:
+        """
+        Read the cascade's step count before delivering, for turn identification.
+
+        The gate needs to tell THIS turn's USER_INPUT step from the previous
+        turn's; the pre-delivery step count does that positionally.
+
+        :returns: ``0`` when agy has not minted the conversation yet (a first
+            turn has no earlier step to be confused with), the current step count
+            when the trajectory reads cleanly, or ``None`` when it could not be
+            read — in which case the gate identifies the turn by its text instead
+            (see :func:`find_turn_start_index`).
+        """
+        state = await asyncio.to_thread(read_bridge_state, self._bridge_dir)
+        if state is None:
+            return None
+        if is_placeholder_conversation_id(state.conversation_id):
+            return 0
+        steps = await self._read_trajectory()
+        return None if steps is None else len(steps)
+
+    async def _resolve_rpc_target(self) -> tuple[int, str] | None:
+        """
+        Resolve the ``(port, cascade_id)`` the gate should query, using a cache.
+
+        Re-reads bridge state every call so a cascade rotation (a TUI ``/clear``
+        rebinding the bridge) invalidates the cached port rather than polling a
+        stale conversation.
+
+        :returns: The connect-RPC port and cascade id, or ``None`` when there is
+            no real cascade yet (missing state / an ``agy_conv_*`` placeholder) or
+            no agy port could be discovered.
+        """
+        state = await asyncio.to_thread(read_bridge_state, self._bridge_dir)
+        if state is None:
+            return None
+        cascade_id = state.conversation_id
+        if is_placeholder_conversation_id(cascade_id):
+            return None
+        if self._rpc_port is not None and self._rpc_cascade_id == cascade_id:
+            return self._rpc_port, cascade_id
+        port = await asyncio.to_thread(resolve_language_server_port, cascade_id)
+        if port is None:
+            return None
+        self._rpc_port, self._rpc_cascade_id = port, cascade_id
+        return port, cascade_id
+
+    async def _read_trajectory(self) -> list[dict[str, object]] | None:
+        """
+        Read the bound cascade's trajectory steps, or ``None`` when unavailable.
+
+        :returns: The ordered step list, or ``None`` when no cascade/port is
+            resolvable yet or the read failed. ``None`` is "unknown", never
+            "finished" — the caller keeps waiting on it.
+        """
+        target = await self._resolve_rpc_target()
+        if target is None:
+            return None
+        port, cascade_id = target
+        try:
+            return await asyncio.to_thread(get_trajectory_steps, port, cascade_id)
+        except (httpx.HTTPError, ValueError) as exc:
+            # Transport / non-2xx / non-JSON 200. Drop the cached port so the
+            # next pass rediscovers agy (it may have restarted on a new port).
+            self._rpc_port = None
+            _logger.warning(
+                "antigravity native completion gate trajectory read failed; retrying: "
+                "cascade=%s port=%s error=%r",
+                cascade_id,
+                port,
+                exc,
+            )
+            return None
+
+    async def _cascade_reports_idle(self) -> bool:
+        """
+        Whether agy's own run status says the bound cascade is no longer working.
+
+        The idle backstop for a turn that closes without a text-carrying planner
+        step. Fails closed: any read failure reports "not idle", so an unreadable
+        agy can never be mistaken for a finished turn.
+
+        :returns: ``True`` only on an explicit idle status for the bound cascade.
+        """
+        target = await self._resolve_rpc_target()
+        if target is None:
+            return False
+        port, cascade_id = target
+        try:
+            body = await asyncio.to_thread(get_all_cascade_trajectories, port)
+        except (httpx.HTTPError, ValueError) as exc:
+            self._rpc_port = None
+            _logger.warning(
+                "antigravity native completion gate idle check failed: cascade=%s error=%r",
+                cascade_id,
+                exc,
+            )
+            return False
+        summaries = body.get("trajectorySummaries")
+        if not isinstance(summaries, dict):
+            return False
+        return cascade_is_idle(summaries, cascade_id)
 
 
 def _bridge_dir_from_env() -> Path:
