@@ -17,6 +17,8 @@
 import { useEffect, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useSession } from "@/hooks/useSession";
+import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { authenticatedFetch } from "@/lib/identity";
 import { useChatStore } from "@/store/chatStore";
 
@@ -146,13 +148,9 @@ export class PathUnreachableError extends Error {
 
 // ── Runner-boot retry policy ──────────────────────────────────────────────────
 //
-// A freshly-bound session whose runner is still booting/connecting its WS
-// tunnel answers 503 (``runner_unavailable``) until it comes up. The previous
-// budget — 3 retries at a flat 1.5s (~4.5s) — gave up before a cold runner
-// finished, so the Working-folder panel flashed "Failed to load: 503". These
-// queries instead retry the runner-offline case with capped exponential
-// backoff for ~2 minutes, long enough to outlast a cold boot; the reconnect
-// hint only shows once that budget is exhausted (a genuinely offline runner).
+// A runner that is still connecting answers 503 (``runner_unavailable``).
+// Retry only while session liveness says that connection is imminent; a 503
+// from a stale or dead runner will not clear because of a background GET.
 
 /**
  * Max retry attempts for a still-connecting runner. With the backoff schedule
@@ -175,16 +173,20 @@ export function shouldRetryRunnerOffline(failureCount: number, error: Error): bo
 }
 
 /**
- * Whether a 503 response is the app's `runner_unavailable` error rather
- * than a generic infrastructure 503.
- *
- * A 503 is NOT always the bound runner being offline: the Databricks Apps
- * front door / gateway returns 503 while the app restarts or cold-starts.
- * Only the app-level error carries `{"error": {"code": "runner_unavailable"}}`,
- * so match on that — a bare/HTML 503 falls through to the normal
- * error+retry path instead of the (misleading) "agent is asleep" hint.
+ * Whether retrying a runner-offline response can plausibly succeed.
  */
+function useRunnerRecovering(conversationId: string | undefined): boolean {
+  const { session, isLoading } = useSession(conversationId);
+  const turnActive = useSessionActive(conversationId);
+  const liveness = useSessionLiveness(conversationId, livenessRowFromSession(session), {
+    turnActive,
+  });
+  return isLoading || liveness.kind === "starting";
+}
+
+/** Whether `res` is the app's runner-offline 503 response. */
 export async function isRunnerUnavailable503(res: Response): Promise<boolean> {
+  if (res.status !== 503) return false;
   try {
     const body = (await res.json()) as { error?: { code?: string } };
     return body?.error?.code === "runner_unavailable";
@@ -264,6 +266,7 @@ export function useWorkspaceChangedFiles(
 ) {
   const queryEnabled = options.enabled ?? true;
   const serveable = useWorkspaceServeable(conversationId);
+  const recovering = useRunnerRecovering(conversationId);
   const environmentQuery = useWorkspaceEnvironment(conversationId, {
     enabled: queryEnabled,
   });
@@ -277,11 +280,7 @@ export function useWorkspaceChangedFiles(
       !!conversationId &&
       serveable !== false &&
       environmentQuery.data?.available === true,
-    // Capped-backoff retry of the runner-offline case (see
-    // shouldRetryRunnerOffline). Whether the eventual error reads as
-    // "asleep" vs the plain empty state is decided by the session's
-    // `failed` status, not by retries.
-    retry: shouldRetryRunnerOffline,
+    retry: (failureCount, error) => recovering && shouldRetryRunnerOffline(failureCount, error),
     retryDelay: runnerOfflineRetryDelay,
     // No polling: the SSE ``session.changed_files.invalidated`` event
     // (runner-emitted after file-mutating tools, throttled) drives
@@ -405,6 +404,7 @@ export function useWorkspaceAllFiles(
 ) {
   const queryEnabled = options.enabled ?? true;
   const serveable = useWorkspaceServeable(conversationId);
+  const recovering = useRunnerRecovering(conversationId);
   const environmentQuery = useWorkspaceEnvironment(conversationId, {
     enabled: queryEnabled,
   });
@@ -418,10 +418,7 @@ export function useWorkspaceAllFiles(
       !!conversationId &&
       serveable !== false &&
       environmentQuery.data?.available === true,
-    // Capped-backoff retry of the runner-offline case (see
-    // shouldRetryRunnerOffline). The asleep-vs-empty decision is made by
-    // the session's `failed` status downstream, not by retries.
-    retry: shouldRetryRunnerOffline,
+    retry: (failureCount, error) => recovering && shouldRetryRunnerOffline(failureCount, error),
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 5_000,
   });
@@ -529,6 +526,7 @@ async function fetchWorkspaceFileSearch(
   // agent).  Mirror the behaviour of useWorkspaceAllFiles: return empty
   // results rather than surfacing an error.
   if (res.status === 404) return [];
+  if (await isRunnerUnavailable503(res)) return [];
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return mapFilesystemEntries((await res.json()) as FilesystemListResponse, location);
 }
@@ -718,6 +716,7 @@ async function fetchDirEntriesTolerant(
   // 404 = the directory (or the whole OS environment) is absent, so the file
   // can't exist. Degrade to "no entries" rather than surfacing an error.
   if (res.status === 404) return [];
+  if (await isRunnerUnavailable503(res)) return [];
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return mapFilesystemEntries((await res.json()) as FilesystemListResponse);
 }
@@ -842,11 +841,12 @@ export function useWorkspaceEnvironment(
   options: WorkspaceQueryOptions = {},
 ) {
   const serveable = useWorkspaceServeable(conversationId);
+  const recovering = useRunnerRecovering(conversationId);
   return useQuery({
     queryKey: ["workspace-environment", conversationId],
     queryFn: () => fetchWorkspaceEnvironment(conversationId!),
     enabled: (options.enabled ?? true) && !!conversationId && serveable !== false,
-    retry: shouldRetryRunnerOffline,
+    retry: (failureCount, error) => recovering && shouldRetryRunnerOffline(failureCount, error),
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 60_000,
   });
