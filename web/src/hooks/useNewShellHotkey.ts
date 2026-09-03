@@ -24,6 +24,11 @@ function isMacPlatform(): boolean {
 export function isNewShellHotkey(e: globalThis.KeyboardEvent, isMac = isMacPlatform()): boolean {
   const platformModifier = isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
   if (!platformModifier || !e.altKey || e.shiftKey) return false;
+  // AltGr reports as Ctrl+Alt on Windows/Linux, so an ordinary AltGr+T
+  // keystroke on an international layout would otherwise match this chord (and
+  // get swallowed). Bail so intl typing never launches a shell — same guard the
+  // sibling hotkeys carry.
+  if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return false;
   // Match the physical key: Alt remaps the character on many layouts (e.g.
   // ⌥T is "†" on macOS), so keying off e.key would miss the chord.
   return e.code === "KeyT";

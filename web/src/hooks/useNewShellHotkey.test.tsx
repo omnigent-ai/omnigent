@@ -12,6 +12,13 @@ function event(init: KeyboardEventInit): KeyboardEvent {
   return new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init });
 }
 
+/** An event whose getModifierState reports AltGraph active (jsdom can't set it via init). */
+function altGraphEvent(init: KeyboardEventInit): KeyboardEvent {
+  const e = event(init);
+  Object.defineProperty(e, "getModifierState", { value: (k: string) => k === "AltGraph" });
+  return e;
+}
+
 function press(init: KeyboardEventInit, target: HTMLElement = document.body): KeyboardEvent {
   const e = event(init);
   target.dispatchEvent(e);
@@ -38,6 +45,14 @@ describe("isNewShellHotkey", () => {
     // Shift added → reserved (browser reopen-tab); not ours.
     expect(
       isNewShellHotkey(event({ code: "KeyT", metaKey: true, altKey: true, shiftKey: true }), true),
+    ).toBe(false);
+  });
+
+  it("rejects AltGr+T — reported as Ctrl+Alt on intl layouts, must not be the chord", () => {
+    // A bare AltGr+T (no real Ctrl) on Windows/Linux would otherwise match the
+    // Ctrl+Alt predicate and swallow the character; the AltGraph guard bails.
+    expect(
+      isNewShellHotkey(altGraphEvent({ code: "KeyT", ctrlKey: true, altKey: true }), false),
     ).toBe(false);
   });
 
@@ -104,6 +119,20 @@ describe("useNewShellHotkey", () => {
     press({ code: "KeyT", ctrlKey: true, altKey: true }, input);
 
     expect(onLaunch).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not fire or swallow an AltGr+T keystroke (intl layouts type into the composer)", () => {
+    const onLaunch = vi.fn();
+    renderHook(() => useNewShellHotkey(onLaunch, true, false));
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+    input.focus();
+
+    const e = altGraphEvent({ code: "KeyT", ctrlKey: true, altKey: true });
+    input.dispatchEvent(e);
+
+    expect(onLaunch).not.toHaveBeenCalled();
+    expect(e.defaultPrevented).toBe(false);
   });
 
   it("ignores auto-repeat", () => {
