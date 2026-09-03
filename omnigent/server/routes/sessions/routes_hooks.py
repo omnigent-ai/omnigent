@@ -1669,6 +1669,7 @@ def register_hooks_routes(
                 session_id=session_id,
                 runner_client=runner_client,
                 catalog=catalog,
+                reasoning_effort=conv.reasoning_effort if conv is not None else None,
                 gateway_backed=turn_gateway_backed,
                 allow_static_fallback=turn_gateway_backed,
             )

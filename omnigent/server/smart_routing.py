@@ -275,6 +275,34 @@ class _RunnerModel:
     family: str | None
     cost_tier: str | None
     wire_apis: frozenset[ModelWireAPI]
+    #: Reasoning efforts this model's live entry advertises; empty = unknown.
+    efforts: frozenset[str] = frozenset()
+
+
+def _catalog_reasoning_efforts(model_row: Mapping[str, Any]) -> frozenset[str]:
+    """Parse the reasoning efforts a catalog/model-list row advertises.
+
+    Accepts both wire shapes: Codex ``model/list`` rows carry
+    ``supportedReasoningEfforts: [{"reasoningEffort": ...}]`` and
+    ``sys_list_models`` catalog rows carry ``reasoning: {"efforts": [...]}``.
+    An empty result means the row advertises nothing, not "supports none".
+
+    :param model_row: One model row as a parsed JSON object.
+    :returns: Advertised effort values, e.g. ``frozenset({"low", "xhigh"})``.
+    """
+    efforts: set[str] = set()
+    supported = model_row.get("supportedReasoningEfforts")
+    if isinstance(supported, list):
+        for item in supported:
+            value = item.get("reasoningEffort") if isinstance(item, dict) else item
+            if isinstance(value, str) and value:
+                efforts.add(value)
+    reasoning = model_row.get("reasoning")
+    if isinstance(reasoning, dict):
+        raw = reasoning.get("efforts")
+        if isinstance(raw, list):
+            efforts.update(value for value in raw if isinstance(value, str) and value)
+    return frozenset(efforts)
 
 
 def _catalog_wire_apis(raw: object) -> frozenset[ModelWireAPI]:
@@ -435,6 +463,7 @@ async def _load_runner_catalog(
                             else None
                         ),
                         wire_apis=_catalog_wire_apis(model.get("wire_apis")),
+                        efforts=_catalog_reasoning_efforts(model),
                     ),
                 )
             )
@@ -460,6 +489,71 @@ async def fetch_runner_models(
     if catalog is None:
         return None
     return {worker: [model.id for model in models] for worker, models in catalog.items()}
+
+
+def _harness_advertises_efforts(harness: str | None) -> bool:
+    """Whether *harness*'s live model list is the authority on effort pairings.
+
+    Codex-family native panes surface per-model ``supportedReasoningEfforts``
+    via the app-server's ``model/list`` and reject an unsupported
+    (model, effort) pairing with ``invalid_value`` — so their routing
+    candidates must be gated on the advertised ladder. Other harnesses treat
+    effort as a session-wide hint their provider clamps, so no gate applies.
+    """
+    from omnigent.harness_aliases import canonicalize_harness
+
+    return canonicalize_harness(harness) in ("codex-native", "opencode-native")
+
+
+async def _live_model_efforts(
+    session_id: str,
+    runner_client: httpx.AsyncClient,
+) -> dict[str, frozenset[str]] | None:
+    """Per-model reasoning efforts this session's live model list advertises.
+
+    Reads the runner catalog's ``"self"`` row first (its rows carry effort
+    ladders when the provider listing knows them), then falls back to the
+    runner's ``codex-model-options`` route — the raw Codex ``model/list``
+    rows. Only models advertising at least one effort appear in the result.
+
+    :param session_id: Session/conversation identifier.
+    :param runner_client: Async HTTP client pointed at the runner.
+    :returns: Model id → advertised efforts, or ``None`` when live effort
+        capabilities are unavailable.
+    """
+    import httpx as _httpx
+
+    catalog = await _fetch_runner_catalog(session_id, runner_client)
+    own_models = (catalog or {}).get("self", [])
+    efforts = {model.id: model.efforts for model in own_models if model.efforts}
+    if efforts:
+        return efforts
+    try:
+        resp = await runner_client.get(
+            f"/v1/sessions/{session_id}/codex-model-options", timeout=5.0
+        )
+        resp.raise_for_status()
+        rows = resp.json().get("models", [])
+    except (_httpx.HTTPError, ValueError):
+        _logger.debug(
+            "smart_routing: codex-model-options unavailable for session=%s",
+            session_id,
+            exc_info=True,
+        )
+        return None
+    if not isinstance(rows, list):
+        return None
+    result: dict[str, frozenset[str]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        model_id = row.get("model") or row.get("id")
+        if not isinstance(model_id, str) or not model_id:
+            continue
+        advertised = _catalog_reasoning_efforts(row)
+        if advertised:
+            result[model_id] = advertised
+    return result or None
 
 
 def _flatten_models(available_models: dict[str, list[str]]) -> list[str]:
@@ -608,7 +702,7 @@ class LLMRoutingClient:
             # INFO; the chosen model is logged by the caller either way.
             _logger.debug("LLMRoutingClient: raw response: %s", text[:500])
             verdict = json.loads(text)
-        except Exception as exc:  # noqa: BLE001  # fail-open
+        except Exception as exc:  # fail-open
             _logger.warning("LLMRoutingClient: judge call failed", exc_info=True)
             self.last_error = f"routing judge call failed: {failure_detail(exc)}"
             return None
@@ -688,7 +782,7 @@ def _config_bearer(
     """
     try:
         headers = config.authenticate()
-    except Exception:  # noqa: BLE001 — auth failure degrades to unauthenticated
+    except Exception:
         _logger.warning(
             "ExternalRoutingClient: could not resolve auth from %s", label, exc_info=True
         )
@@ -1732,7 +1826,7 @@ class ExternalRoutingClient:
         """Call the injected provider for this request's auth headers."""
         try:
             headers = self._auth_provider() if self._auth_provider is not None else None
-        except Exception:  # noqa: BLE001 — a caller with no credential still routes
+        except Exception:
             _logger.warning(
                 "ExternalRoutingClient: auth_provider raised; sending no credential",
                 exc_info=True,
@@ -1747,7 +1841,7 @@ class ExternalRoutingClient:
                 from databricks.sdk.config import Config
 
                 self._sdk_config = Config(profile=self._databricks_profile)
-            except Exception:  # noqa: BLE001 — auth failure degrades to unauthenticated
+            except Exception:
                 _logger.warning(
                     "ExternalRoutingClient: could not resolve auth for profile %r",
                     self._databricks_profile,
@@ -1781,7 +1875,7 @@ class ExternalRoutingClient:
                 from databricks.sdk.config import Config
 
                 config = Config()
-            except Exception:  # noqa: BLE001 — no ambient credential is the normal case
+            except Exception:
                 _logger.debug(
                     "ExternalRoutingClient: no ambient Databricks credential", exc_info=True
                 )
@@ -2248,6 +2342,7 @@ async def route_turn(
     session_id: str | None = None,
     runner_client: httpx.AsyncClient | None = None,
     catalog: Sequence[str] | None = None,
+    reasoning_effort: str | None = None,
     gateway_backed: bool = True,
     allow_static_fallback: bool = True,
 ) -> tuple[str | None, dict[str, Any] | None]:
@@ -2263,6 +2358,13 @@ async def route_turn(
         vocabulary. Authoritative: its gateway serves more models than the
         running CLI can be switched to, and offering those routes the turn
         onto a model the switch would silently drop.
+    :param reasoning_effort: The session's explicit effort, when it has one.
+        On a harness whose live model list advertises per-model effort
+        ladders (codex-family natives), only models advertising this exact
+        effort are candidates — the CLI rejects any other pairing with
+        ``invalid_value``, failing the turn. When no live model advertises
+        it (or capabilities are unavailable), the turn is declined so the
+        session keeps its working model.
     :param gateway_backed: Whether this session's harness resolves
         AI-Gateway-backed inference on its host. ``False`` takes the external
         router out of play and the built-in judge answers instead.
@@ -2349,6 +2451,51 @@ async def route_turn(
                 "harness=%s bars every candidate model",
                 session_id,
                 harness,
+            )
+            return None, None
+
+    # A session with an explicit effort must not be routed onto a model whose
+    # live entry does not advertise it: the codex-family CLI validates the
+    # pairing and rejects it with ``invalid_value``, failing the user's turn.
+    # No live capabilities, or no advertising model, means no safe pick exists
+    # — decline so the session keeps the model it is already working on.
+    if reasoning_effort is not None and _harness_advertises_efforts(harness):
+        if session_id is None or runner_client is None:
+            _logger.info(
+                "smart_routing: route_turn declined for session=%s: effort=%s is "
+                "set but live effort capabilities cannot be read",
+                session_id,
+                reasoning_effort,
+            )
+            return None, None
+        live_efforts = await _live_model_efforts(session_id, runner_client)
+        if not live_efforts:
+            _logger.info(
+                "smart_routing: route_turn declined for session=%s: effort=%s is "
+                "set but the runner advertises no effort capabilities",
+                session_id,
+                reasoning_effort,
+            )
+            return None, None
+        # Live rows and routing candidates can spell one model differently
+        # (picker ``gpt-5.6-sol`` vs catalog ``databricks-gpt-5-6-sol``), so
+        # compare in the bare spelling both sides share.
+        compatible = {
+            _bare_id(model_id)
+            for model_id, efforts in live_efforts.items()
+            if reasoning_effort in efforts
+        }
+        available = {
+            name: kept
+            for name, models in available.items()
+            if (kept := [m for m in models if _bare_id(m) in compatible])
+        }
+        if not available:
+            _logger.info(
+                "smart_routing: route_turn declined for session=%s: no live model "
+                "advertises effort=%s; keeping the session's model",
+                session_id,
+                reasoning_effort,
             )
             return None, None
 

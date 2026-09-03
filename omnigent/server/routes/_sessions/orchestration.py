@@ -5227,6 +5227,7 @@ async def _forward_event_to_runner(
                     session_id=session_id,
                     runner_client=runner_client,
                     catalog=await _native_turn_catalog(session_id, conv, runner_client),
+                    reasoning_effort=conv.reasoning_effort,
                     gateway_backed=_turn_backed,
                     allow_static_fallback=_turn_backed,
                 )
@@ -5730,6 +5731,7 @@ async def _dispatch_session_event_to_runner_impl(
                     session_id=session_id,
                     runner_client=_native_runner_client,
                     catalog=await _native_turn_catalog(session_id, conv, _native_runner_client),
+                    reasoning_effort=conv.reasoning_effort,
                     gateway_backed=_native_backed,
                     allow_static_fallback=_native_backed,
                 )
