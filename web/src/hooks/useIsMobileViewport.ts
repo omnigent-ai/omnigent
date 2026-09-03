@@ -3,25 +3,21 @@
 // The shell's responsive layout pivots on Tailwind's `md` breakpoint
 // (`min-width: 768px`), used both as CSS classes (`md:` / `max-md:`) and as
 // the JS threshold in AppShell's `initialSidebarOpen`. This hook exposes the
-// `max-md` side of that line to component logic that can't be expressed in
+// mobile side of that line to component logic that can't be expressed in
 // CSS alone (e.g. swapping a hover flyout for an in-place page on touch).
 
 import { useSyncExternalStore } from "react";
 
-// Mirror Tailwind's `max-md` variant exactly so this hook stays in lockstep
-// with the `max-md:` / `md:` classes already used across the shell.
-const MOBILE_QUERY = "(max-width: 767.98px)";
+import { MD_MIN_WIDTH_QUERY, isMobileViewport, subscribeMatchMedia } from "@/lib/breakpoints";
 
 function subscribe(callback: () => void): () => void {
-  if (typeof window === "undefined" || !window.matchMedia) return () => {};
-  const mql = window.matchMedia(MOBILE_QUERY);
-  mql.addEventListener("change", callback);
-  return () => mql.removeEventListener("change", callback);
+  return subscribeMatchMedia([MD_MIN_WIDTH_QUERY], callback);
 }
 
+// One canonical predicate: the snapshot IS the imperative helper, so the
+// reactive and point-in-time answers can never diverge.
 function getSnapshot(): boolean {
-  if (typeof window === "undefined" || !window.matchMedia) return false;
-  return window.matchMedia(MOBILE_QUERY).matches;
+  return isMobileViewport();
 }
 
 /**
