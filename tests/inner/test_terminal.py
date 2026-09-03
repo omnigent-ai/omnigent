@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -1639,3 +1640,100 @@ def test_apply_utf8_locale_default_noop_on_windows(
     _apply_utf8_locale_default(env)
     assert "LC_ALL" not in env
     assert env["LANG"] == ""
+
+
+# ── tmux version probe and the allow-passthrough gate ────────────
+
+
+def _fake_tmux_v(stdout: str, returncode: int = 0) -> Callable[..., SimpleNamespace]:
+    def runner(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(returncode=returncode, stdout=stdout)
+
+    return runner
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        ("tmux 3.2a\n", (3, 2)),
+        ("tmux 3.3\n", (3, 3)),
+        ("tmux 3.5a\n", (3, 5)),
+        ("tmux 3.10\n", (3, 10)),
+        ("tmux next-3.4\n", (3, 4)),
+        ("", None),
+        ("tmux unknown\n", None),
+    ],
+)
+def test_tmux_version_reads_major_minor(
+    monkeypatch: pytest.MonkeyPatch, stdout: str, expected: tuple[int, int] | None
+) -> None:
+    monkeypatch.setattr(subprocess, "run", _fake_tmux_v(stdout))
+    assert terminal_mod._tmux_version() == expected
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        FileNotFoundError("tmux"),
+        subprocess.TimeoutExpired(cmd="tmux", timeout=5.0),
+        OSError("exec format error"),
+    ],
+)
+def test_tmux_version_is_none_when_the_probe_cannot_run(
+    monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    def _raise(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        raise failure
+
+    monkeypatch.setattr(subprocess, "run", _raise)
+    assert terminal_mod._tmux_version() is None
+
+
+def test_tmux_version_is_none_on_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(subprocess, "run", _fake_tmux_v("", returncode=1))
+    assert terminal_mod._tmux_version() is None
+
+
+def test_allow_passthrough_is_set_on_tmux_33(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(terminal_mod, "_tmux_version", lambda: (3, 3))
+    commands = terminal_mod._tmux_managed_option_commands(10000, allow_passthrough=True)
+    assert ["set-option", "-g", "allow-passthrough", "on"] in commands
+
+
+@pytest.mark.parametrize("version", [(3, 2), None])
+def test_allow_passthrough_is_skipped_when_tmux_cannot_support_it(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    version: tuple[int, int] | None,
+) -> None:
+    monkeypatch.setattr(terminal_mod, "_tmux_version", lambda: version)
+    with caplog.at_level(logging.WARNING, logger=terminal_mod.__name__):
+        commands = terminal_mod._tmux_managed_option_commands(10000, allow_passthrough=True)
+    assert not any("allow-passthrough" in command for command in commands)
+    assert "allow-passthrough" in caplog.text
+    assert "3.3" in caplog.text
+
+
+def test_skipping_allow_passthrough_keeps_every_other_managed_option(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(terminal_mod, "_tmux_version", lambda: (3, 2))
+    commands = terminal_mod._tmux_managed_option_commands(
+        4242, allow_passthrough=True, keep_alive_after_exit=True
+    )
+    assert ["set-option", "-g", "history-limit", "4242"] in commands
+    assert ["set-option", "-g", "prefix", "None"] in commands
+    assert ["set-option", "-g", "status", "on"] in commands
+    assert ["set-option", "-gq", "remain-on-exit", "on"] in commands
+    assert ["set-option", "-sq", "exit-empty", "off"] in commands
+
+
+def test_allow_passthrough_disabled_does_not_probe_tmux(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _unexpected() -> tuple[int, int] | None:
+        raise AssertionError("tmux version probed without an allow_passthrough request")
+
+    monkeypatch.setattr(terminal_mod, "_tmux_version", _unexpected)
+    commands = terminal_mod._tmux_managed_option_commands(10000)
+    assert not any("allow-passthrough" in command for command in commands)
