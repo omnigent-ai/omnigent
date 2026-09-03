@@ -65,13 +65,11 @@ export function normalizeSwipeActions(value: unknown): SwipeActionPreferences {
  * missing/malformed — never throws, so a corrupt entry can't break app boot.
  */
 export function readSwipeActions(): SwipeActionPreferences {
-  if (typeof window === "undefined") return { ...DEFAULT_SWIPE_ACTIONS };
+  if (typeof window === "undefined") return normalizeSwipeActions(null);
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return { ...DEFAULT_SWIPE_ACTIONS };
-    return normalizeSwipeActions(JSON.parse(raw));
+    return normalizeSwipeActions(JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? "null"));
   } catch {
-    return { ...DEFAULT_SWIPE_ACTIONS };
+    return normalizeSwipeActions(null);
   }
 }
 
