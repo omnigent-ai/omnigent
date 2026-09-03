@@ -1,24 +1,54 @@
 // Resize hook for the always-visible left sidebar (the conversations aside in
 // AppShell/Sidebar). Mirrors useResizableInlinePanel's persistence + keyboard
-// behavior, but for a LEFT-edge panel: the drag handle lives on the sidebar's
-// right edge, so the live width tracks the cursor's distance from the
-// viewport's left edge (``e.clientX``) and ArrowRight grows / ArrowLeft
-// shrinks. It keeps its own module-level store + preference key so resizing the
-// sidebar never disturbs the right rail's inline-panel width (and vice versa).
+// behavior, but for the inline-start panel: the drag handle lives on the
+// sidebar's inline-end edge, so the live width tracks the cursor's distance
+// from the viewport's inline-start edge. It keeps its own module-level store +
+// preference key so resizing the sidebar never disturbs the right rail's
+// inline-panel width (and vice versa).
 //
 // Unlike the inline panel this has no "boost" machinery — nothing auto-widens
 // the sidebar — so the store is just a persisted, viewport-clamped width.
 
-import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useReducer, useRef } from "react";
+import { createResizableWidthStore, useResizableWidthSnapshot } from "@/hooks/resizableWidthStore";
+import { useInputCapabilities } from "@/hooks/useInputCapabilities";
+import { useResizeDrag } from "@/hooks/useResizeDrag";
+import { MD_MIN_WIDTH_QUERY, isMobileViewport, subscribeMatchMedia } from "@/lib/breakpoints";
 import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 
-// Default 320px (20rem) — wider than the old fixed ``md:w-64`` (256px) sidebar
-// so conversation titles have more room before truncating. The floor keeps the
-// search box + "New session" button usable; the viewport-relative ceiling keeps
-// the sidebar from consuming more than half of the desktop layout.
+// The default gives conversation titles room before truncating. The floor keeps
+// controls usable; the viewport-relative ceiling preserves the main content.
 const DEFAULT_WIDTH_PX = 320;
 const MIN_WIDTH_PX = 220;
 const MAX_WIDTH_RATIO = 0.5;
+const PAINTED_STRIP_PX = 4; // must match the handle's `w-1` class
+const COARSE_GUTTER_PX = 8;
+const FINE_GUTTER_PX = 6;
+const INWARD_SLIVER_PX = 8;
+const OUTWARD_SLIVER_PX = 10;
+
+function gutterStyle(coarsePointer: boolean): React.CSSProperties {
+  const gutter = coarsePointer ? COARSE_GUTTER_PX : FINE_GUTTER_PX;
+  const inset = (gutter - PAINTED_STRIP_PX) / 2;
+  // The handle is absolutely anchored to the sidebar's right edge (the seam),
+  // NOT an in-flow flex gutter, so it must position with an explicit negative
+  // end inset: on an absolutely positioned right-anchored box the flex hooks'
+  // negative `marginInlineStart` is absorbed by the auto left inset, which
+  // shifted the whole hit box inward — overlapping the conversation rows'
+  // hover kebab — and pulled the painted strip off the seam. Anchoring the
+  // border box at seam + OUTWARD_SLIVER and padding the 4px strip back to the
+  // seam makes the hit box span
+  // [seam − INWARD_SLIVER − inset, seam + OUTWARD_SLIVER + inset], matching
+  // the flex-gutter hooks' inward/outward reach.
+  return {
+    touchAction: "none",
+    boxSizing: "content-box",
+    paddingInlineStart: INWARD_SLIVER_PX - PAINTED_STRIP_PX + inset,
+    paddingInlineEnd: OUTWARD_SLIVER_PX + inset,
+    insetInlineEnd: -(OUTWARD_SLIVER_PX + inset),
+    backgroundClip: "content-box",
+  };
+}
 
 function clamp(w: number): number {
   // No viewport available off the DOM (SSR / node test env) — this runs during
@@ -32,47 +62,13 @@ function clamp(w: number): number {
 // Module-level width store (independent of the inline panel / push-panel stores)
 // ---------------------------------------------------------------------------
 
-// ``preferredWidth`` mirrors the persisted user choice; ``storedWidth`` is the
-// effective (viewport-clamped) width. Keeping the preference in memory lets a
-// viewport-resize re-derive the effective width from it — springing back to the
-// larger choice when space returns — without ever touching disk.
-let preferredWidth: number | null = readPanelSizePreference("sidebarWidthPx");
-let storedWidth: number | null = preferredWidth;
-const listeners = new Set<() => void>();
-
-function persistWidth(value: number | null) {
-  preferredWidth = value;
-  writePanelSizePreference("sidebarWidthPx", value);
-}
-
-function setStoredWidthRaw(value: number | null, persist = false) {
-  if (value === storedWidth) return;
-  storedWidth = value;
-  if (persist) persistWidth(value);
-  for (const l of listeners) l();
-}
-
-function setStoredWidth(next: number | ((prev: number | null) => number), persist = false) {
-  setStoredWidthRaw(typeof next === "function" ? next(storedWidth) : next, persist);
-}
-
-function subscribe(cb: () => void): () => void {
-  listeners.add(cb);
-  return () => listeners.delete(cb);
-}
-
-function getSnapshot(): number | null {
-  return storedWidth;
-}
-
-function getServerSnapshot(): number | null {
-  return null;
-}
+const widthStore = createResizableWidthStore(readPanelSizePreference("sidebarWidthPx"), (width) =>
+  writePanelSizePreference("sidebarWidthPx", width),
+);
 
 /** Reset module-level state. Only for use in tests. */
 export function resetSidebarWidthStoreForTesting(): void {
-  preferredWidth = readPanelSizePreference("sidebarWidthPx");
-  setStoredWidthRaw(preferredWidth);
+  widthStore.reset(readPanelSizePreference("sidebarWidthPx"));
 }
 
 // ---------------------------------------------------------------------------
@@ -89,27 +85,60 @@ export function resetSidebarWidthStoreForTesting(): void {
  * mobile (where the sidebar is a full-screen overlay).
  */
 export function useResizableSidebar() {
-  const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
+  const { anyCoarse } = useInputCapabilities();
+  const raw = useResizableWidthSnapshot(widthStore);
   const width = clamp(raw ?? DEFAULT_WIDTH_PX);
-  const dragging = useRef(false);
+  const [, bumpViewport] = useReducer((version: number) => version + 1, 0);
 
   // Re-clamp on viewport resize so a shrunken window pulls the sidebar back
   // under the ceiling; widening re-derives from the persisted preference so the
   // user's chosen width springs back when space returns.
   useEffect(() => {
     function onResize() {
-      setStoredWidth((prev) => clamp(preferredWidth ?? prev ?? DEFAULT_WIDTH_PX));
+      widthStore.set((prev) => clamp(widthStore.getPreferred() ?? prev ?? DEFAULT_WIDTH_PX));
+      bumpViewport();
     }
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
-  const onMouseDown = useCallback((e: React.MouseEvent) => {
-    e.preventDefault();
-    dragging.current = true;
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-  }, []);
+  // Cancellation (Escape, blur, …) restores the width the drag started from —
+  // onMove writes the live store on every pointermove, so without the
+  // snapshot an aborted drag would keep the dragged width on screen while the
+  // persisted preference still held the old one.
+  const dragStartWidth = useRef<number | null>(null);
+  const dragDirection = useRef<"ltr" | "rtl">("ltr");
+  const resizeDrag = useResizeDrag({
+    onStart: useCallback((event: React.PointerEvent<HTMLElement>) => {
+      dragStartWidth.current = widthStore.getSnapshot();
+      dragDirection.current =
+        getComputedStyle(event.currentTarget).direction === "rtl" ? "rtl" : "ltr";
+    }, []),
+    onCancel: useCallback(() => {
+      widthStore.set(dragStartWidth.current);
+    }, []),
+    onCommit: widthStore.persist,
+    onMove: useCallback((e: React.PointerEvent<HTMLElement>) => {
+      const inlineStartDistance =
+        dragDirection.current === "rtl" ? window.innerWidth - e.clientX : e.clientX;
+      widthStore.set(clamp(inlineStartDistance));
+    }, []),
+    observeHandleRemoval: true,
+  });
+
+  // A touch/pen drag started at desktop width can outlive the viewport
+  // crossing below the md breakpoint: the handle hides (the sidebar becomes a
+  // full-screen overlay) but pointer capture persists, so release would write
+  // an unintended width. Cancel — restoring the pre-drag width — the moment
+  // the desktop query stops matching.
+  const cancelResizeDrag = resizeDrag.cancelDrag;
+  useEffect(
+    () =>
+      subscribeMatchMedia([MD_MIN_WIDTH_QUERY], () => {
+        if (isMobileViewport()) cancelResizeDrag();
+      }),
+    [cancelResizeDrag],
+  );
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -117,55 +146,32 @@ export function useResizableSidebar() {
       // Right edge of a left panel: ArrowRight widens, ArrowLeft narrows.
       if (e.key === "ArrowRight") {
         e.preventDefault();
-        setStoredWidth((prev) => clamp((prev ?? width) + step), true);
+        widthStore.set((prev) => clamp((prev ?? width) + step), true);
       } else if (e.key === "ArrowLeft") {
         e.preventDefault();
-        setStoredWidth((prev) => clamp((prev ?? width) - step), true);
+        widthStore.set((prev) => clamp((prev ?? width) - step), true);
       }
     },
     [width],
   );
 
-  useEffect(() => {
-    function onMouseMove(e: MouseEvent) {
-      if (!dragging.current) return;
-      // Left panel: width is the cursor's distance from the viewport's left
-      // edge. Update the live width only; persist once on release to avoid a
-      // synchronous localStorage write per mousemove.
-      setStoredWidth(clamp(e.clientX));
-    }
-
-    function onMouseUp() {
-      if (!dragging.current) return;
-      dragging.current = false;
-      persistWidth(storedWidth);
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    }
-
-    window.addEventListener("mousemove", onMouseMove);
-    window.addEventListener("mouseup", onMouseUp);
-    return () => {
-      window.removeEventListener("mousemove", onMouseMove);
-      window.removeEventListener("mouseup", onMouseUp);
-      if (dragging.current) {
-        dragging.current = false;
-        document.body.style.cursor = "";
-        document.body.style.userSelect = "";
-      }
-    };
-  }, []);
-
   return {
     /** Current sidebar width in px (already viewport-clamped). */
     width,
     handleProps: {
-      onMouseDown,
+      ...resizeDrag.handleProps,
       onKeyDown,
       role: "separator" as const,
       "aria-orientation": "vertical" as const,
       "aria-label": "Resize sidebar",
+      "aria-valuenow": width,
+      "aria-valuemin": MIN_WIDTH_PX,
+      "aria-valuemax":
+        typeof window === "undefined"
+          ? width
+          : Math.max(MIN_WIDTH_PX, window.innerWidth * MAX_WIDTH_RATIO),
       tabIndex: 0,
+      style: gutterStyle(anyCoarse),
     },
   };
 }
