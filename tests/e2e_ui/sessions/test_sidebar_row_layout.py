@@ -16,19 +16,9 @@ import httpx
 from playwright.sync_api import Browser, Locator, Page, expect
 
 from tests._helpers.session import post_session_bundle
-from tests.e2e_ui.conftest import _build_hello_world_bundle
+from tests.e2e_ui.conftest import _build_hello_world_bundle, set_session_title
 
 _SWIPE_ACTIONS_KEY = "omnigent:swipe-actions"
-
-
-def _set_title(base_url: str, session_id: str, title: str) -> None:
-    """Give the seeded session a unique, deliberately long title."""
-    response = httpx.patch(
-        f"{base_url}/v1/sessions/{session_id}",
-        json={"title": title},
-        timeout=10.0,
-    )
-    response.raise_for_status()
 
 
 def _row(page: Page, session_id: str) -> Locator:
@@ -43,7 +33,7 @@ def _seed_titled_session(base_url: str, title: str) -> str:
     )
     response.raise_for_status()
     session_id = response.json()["session_id"]
-    _set_title(base_url, session_id, title)
+    set_session_title(base_url, session_id, title)
     return session_id
 
 
@@ -141,7 +131,7 @@ def test_session_row_uses_full_title_width_until_actions_are_revealed(
     """The compact row expands its title by default and reserves hover actions."""
     base_url, session_id = seeded_session
     title = f"e2e-sidebar-row-layout-{uuid.uuid4().hex[:12]}-with-a-long-session-title"
-    _set_title(base_url, session_id, title)
+    set_session_title(base_url, session_id, title)
 
     page.goto(f"{base_url}/c/{session_id}")
 
@@ -225,7 +215,7 @@ def test_partial_swipe_reveal_is_adjacent_to_ellipsis_surface(
     """Real layout keeps left/delete and right/archive reveals gapless and disjoint."""
     base_url, session_id = seeded_session
     title = f"e2e-swipe-geometry-{uuid.uuid4().hex}-with-a-title-that-must-ellipsis"
-    _set_title(base_url, session_id, title)
+    set_session_title(base_url, session_id, title)
     page.add_init_script(
         f"""Object.defineProperty(navigator, "maxTouchPoints", {{value: 1}});
         localStorage.setItem(
