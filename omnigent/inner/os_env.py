@@ -6,6 +6,7 @@ import atexit
 import base64
 import codecs
 import contextlib
+import difflib
 import json
 import os
 import shutil
@@ -1353,15 +1354,80 @@ def _read_impl(
     }
 
 
+# Cap on the ``diff`` field a write result carries: it rides in the tool
+# result (transcript + model context), so an overwrite that rewrites a huge
+# file must not echo an unbounded diff back.
+_MAX_WRITE_DIFF_CHARS = 20_000
+# Skip diffing overwrites of very large files entirely — the previous content
+# is read only to render what changed, never to serve the write itself.
+_MAX_WRITE_DIFF_SOURCE_BYTES = 1_000_000
+
+
+def _diff_display_lines(text: str) -> list[str]:
+    """Split for difflib, terminating the final line so hunks don't run together."""
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return []
+    if lines[-1].endswith(("\n", "\r")):
+        return lines
+    return [*lines[:-1], f"{lines[-1]}\n"]
+
+
+def _overwrite_diff(path: Path, old_content: str | None, new_content: str) -> str:
+    """Unified diff of an overwrite so frontends can render what changed.
+
+    :param path: Target path, used for the ``---``/``+++`` header labels.
+    :param old_content: Pre-write content, or ``None`` when there is no
+        usable "before" side (new file, unreadable, binary, oversized).
+    :param new_content: The content that was written.
+    :returns: A unified diff, truncated to :data:`_MAX_WRITE_DIFF_CHARS`;
+        empty string when there is nothing to diff.
+    """
+    if (
+        old_content is None
+        or old_content == new_content
+        or len(new_content) > _MAX_WRITE_DIFF_SOURCE_BYTES
+    ):
+        return ""
+    diff = "".join(
+        difflib.unified_diff(
+            _diff_display_lines(old_content),
+            _diff_display_lines(new_content),
+            fromfile=str(path),
+            tofile=str(path),
+        )
+    )
+    if len(diff) > _MAX_WRITE_DIFF_CHARS:
+        omitted = len(diff) - _MAX_WRITE_DIFF_CHARS
+        diff = diff[:_MAX_WRITE_DIFF_CHARS] + f"\n[diff truncated: {omitted:,} characters omitted]"
+    return diff
+
+
 def _write_impl(path: Path, content: str) -> OpResult:
     path.parent.mkdir(parents=True, exist_ok=True)
     existed = path.exists()
+    # Capture the replaced content BEFORE writing so the result can carry a
+    # diff — the only moment the "before" side of a full-file write exists.
+    old_content: str | None = None
+    try:
+        if (
+            path.is_file()
+            and path.stat().st_size <= _MAX_WRITE_DIFF_SOURCE_BYTES
+            and not _is_binary_file(path)
+        ):
+            old_content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        old_content = None
     path.write_text(content, encoding="utf-8")
-    return {
+    result: OpResult = {
         "path": str(path),
         "bytes_written": len(content.encode("utf-8")),
         "created": not existed,
     }
+    diff = _overwrite_diff(path, old_content, content)
+    if diff:
+        result["diff"] = diff
+    return result
 
 
 def _edit_impl(
