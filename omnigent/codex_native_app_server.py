@@ -1577,12 +1577,12 @@ class CodexNativeAppServer:
                 if self.listen_url and self.listen_url.startswith("ws://"):
                     client = CodexAppServerClient(
                         ws_url=self.listen_url,
-                        client_name="omnigent-probe",
+                        client_name="omnigent-codex-native",
                     )
                 else:
                     client = CodexAppServerClient(
                         self.socket_path,
-                        client_name="omnigent-probe",
+                        client_name="omnigent-codex-native",
                     )
                 await client.connect()
                 await client.close()
