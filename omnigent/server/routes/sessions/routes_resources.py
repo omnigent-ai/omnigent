@@ -561,9 +561,13 @@ def register_resources_routes(
     def _browse_level(client_path: str, *, within_workspace: int) -> int:
         """Permission level a filesystem request needs for *client_path*.
 
-        Inside the workspace, the caller's usual bar (``LEVEL_READ`` to read,
-        ``LEVEL_EDIT`` to mutate) — the workspace is the session's shared
-        context, so a collaborator granted the session gets it.
+        Inside the workspace, ``LEVEL_EDIT`` for reads and mutations alike —
+        the workspace is the session's shared *working* context, so an edit
+        collaborator (who can already write files and run shell commands
+        there) gets it. A view-only grant shares the conversation, not the
+        raw filesystem: workspace files routinely hold secrets (``.env``,
+        key files), so serving their contents to a read-level viewer would
+        turn every read-only share into a credential leak.
 
         Outside it, ``LEVEL_OWNER``, for reads as much as writes. Everything
         past the workspace is the owner's own machine, and the host-scoped
@@ -1924,7 +1928,7 @@ def register_resources_routes(
             params["before"] = before
         qs = urllib.parse.urlencode(params)
         path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/filesystem?{qs}"
-        conv = await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
         return _skip_gzip_for_binary(
             request,
             await _fs_get_with_host_fallback(
@@ -2050,7 +2054,7 @@ def register_resources_routes(
 
         absolute, path = _resolve_browse_path(request, path)
         conv = await _validate_session(
-            session_id, request, _browse_level(path, within_workspace=LEVEL_READ)
+            session_id, request, _browse_level(path, within_workspace=LEVEL_EDIT)
         )
 
         qs = urllib.parse.urlencode(params)
@@ -2099,7 +2103,7 @@ def register_resources_routes(
         :returns: Flat list of changed filesystem entries with ``status``.
         """
         path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/changes"
-        conv = await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
@@ -2137,7 +2141,7 @@ def register_resources_routes(
             f"/v1/sessions/{session_id}/resources/environments"
             f"/{environment_id}/diff/{relative_path}"
         )
-        conv = await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
@@ -2167,7 +2171,7 @@ def register_resources_routes(
         :param session_id: Session/conversation identifier.
         :returns: JSON with the ``patch`` text.
         """
-        conv = await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
@@ -2201,7 +2205,7 @@ def register_resources_routes(
         :param base: Base branch name; the default is derived when omitted.
         :returns: JSON with ``before`` and ``after`` content strings.
         """
-        conv = await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
@@ -2272,7 +2276,7 @@ def register_resources_routes(
         # way around the owner-scoped host filesystem endpoint.
         absolute, relative_path = _resolve_browse_path(request, relative_path)
         conv = await _validate_session(
-            session_id, request, _browse_level(relative_path, within_workspace=LEVEL_READ)
+            session_id, request, _browse_level(relative_path, within_workspace=LEVEL_EDIT)
         )
 
         qs = urllib.parse.urlencode(params)
@@ -2498,7 +2502,7 @@ def register_resources_routes(
         :param session_id: Session/conversation identifier.
         :returns: Flat list of changed files with ``status`` and line counts.
         """
-        conv = await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
         return await _fs_get_with_host_fallback(
             session_id,
             conv,

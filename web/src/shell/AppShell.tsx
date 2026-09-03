@@ -20,7 +20,7 @@ import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
-import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
+import { derivePermissionLevel, isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
   isAndroidShell,
   isIOSShell,
@@ -736,11 +736,25 @@ export function AppShell() {
   // a one-entry list, not a dead end).
   const agentCount = childSessions.length + 1;
 
-  // Hide the files panel entirely when the agent spec has no os_env. Probe
+  // Hide the files panel entirely when the agent spec has no os_env (probe
   // the default environment resource instead of the root filesystem listing:
-  // it is enough to prove availability without paying for directory contents.
-  const environmentQuery = useWorkspaceEnvironment(conversationId);
-  const showFilesPanel = environmentQuery.data?.available !== false;
+  // it is enough to prove availability without paying for directory contents),
+  // or when the viewer holds only a view-level grant. A read-only share is the
+  // conversation, not the raw workspace — files there routinely carry secrets
+  // (.env, key files), and the server refuses sub-edit filesystem reads, so
+  // surfacing the panel would only render request failures. Visibility reads
+  // the KNOWN level (snapshot, else sidebar row) and stays permissive while
+  // it's unresolved — no flicker for owners; the server gate is what actually
+  // protects the bytes — unlike ``derivePermissionLevel``'s conservative
+  // read-only fallback, which is right for the composer but would blank the
+  // whole rail whenever the snapshot fetch fails.
+  const canBrowseWorkspace = isEditorLevel(
+    activeSession?.permissionLevel ?? activeConv?.permission_level ?? null,
+  );
+  const environmentQuery = useWorkspaceEnvironment(conversationId, {
+    enabled: canBrowseWorkspace,
+  });
+  const showFilesPanel = canBrowseWorkspace && environmentQuery.data?.available !== false;
   // The GitHub tab needs a git checkout on disk: hide it once the session's
   // GitHub info resolves to "not a git repo" — that panel is a dead end. Other
   // unavailable reasons keep the tab: `host_outdated` renders an actionable
@@ -916,7 +930,11 @@ export function AppShell() {
   // can tell BlockRenderer which inline code spans are real workspace files.
   // We use the changed-files list (not the flat top-level directory listing)
   // because it contains full relative paths like `web/src/shell/Foo.tsx`.
-  const changedFilesQuery = useWorkspaceChangedFiles(conversationId);
+  // Disabled for view-only collaborators: the server refuses sub-edit
+  // workspace reads, so the fetch would only 403.
+  const changedFilesQuery = useWorkspaceChangedFiles(conversationId, {
+    enabled: canBrowseWorkspace,
+  });
   const changedFilePaths = useMemo(
     () => new Set(changedFilesQuery.data?.data.map((f) => f.path) ?? []),
     [changedFilesQuery.data],
@@ -2062,8 +2080,12 @@ export function AppShell() {
                     subagentsWorking={subagentsWorking}
                     agentCount={agentCount}
                     rootSessionId={rootSessionId}
-                    selectedFilePath={selectedFilePath}
-                    openFiles={openFiles}
+                    // A view-only collaborator gets no file tabs/viewer: the
+                    // workspace filesystem is not part of a read-level share
+                    // (secrets — the server refuses those reads). The persisted
+                    // tab state is left intact for when access is raised.
+                    selectedFilePath={showFilesPanel ? selectedFilePath : null}
+                    openFiles={showFilesPanel ? openFiles : []}
                     openFileViewer={openFileViewer}
                     onCloseFile={closeFile}
                     onShowScopeView={showScopeView}
@@ -2159,7 +2181,7 @@ export function AppShell() {
                 </MobilePanelDrawer>
               )}
               {/* Mobile-only push panel — on desktop the viewer lives inside the inline aside. */}
-              {conversationId && selectedFilePath !== null && (
+              {conversationId && showFilesPanel && selectedFilePath !== null && (
                 <div className="md:hidden">
                   <FileViewer
                     open

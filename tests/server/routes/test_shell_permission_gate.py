@@ -20,11 +20,14 @@ out-of-root/sensitive files via shell — is pinned by
 the strict-xfail matrix in ``test_filesystem_path_isolation_e2e.py``.
 
 The filesystem proxy carries a second, stricter gate. A path under the
-workspace is the session's shared context and stays at ``LEVEL_EDIT``; an
-ABSOLUTE path is the owner's own machine and requires ``LEVEL_OWNER``. That
-matches the host-scoped ``/v1/hosts/{id}/filesystem`` endpoint behind the
-workspace picker, which is owner-scoped — without it, a shared session would
-be a weaker route to the very same files.
+workspace is the session's shared *working* context and requires
+``LEVEL_EDIT`` for reads and mutations alike — workspace files routinely
+hold secrets (``.env``, key files), so a view-only grant shares the
+conversation, never the raw filesystem. An ABSOLUTE path is the owner's own
+machine and requires ``LEVEL_OWNER``. That matches the host-scoped
+``/v1/hosts/{id}/filesystem`` endpoint behind the workspace picker, which is
+owner-scoped — without it, a shared session would be a weaker route to the
+very same files.
 """
 
 from __future__ import annotations
@@ -376,6 +379,70 @@ async def test_filesystem_allows_edit_collaborator_inside_the_workspace(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url",
+    [
+        _FS_RELATIVE,
+        _FS_BASE,
+        "/v1/sessions/conv_share/resources/environments/default/changes",
+        "/v1/sessions/conv_share/resources/environments/default/diff/src/app.py",
+        "/v1/sessions/conv_share/resources/github/changes",
+        "/v1/sessions/conv_share/resources/github/diff",
+        "/v1/sessions/conv_share/resources/github/diff/src/app.py",
+    ],
+    ids=[
+        "file-read",
+        "root-list",
+        "changed-files",
+        "file-diff",
+        "github-changes",
+        "github-pr-diff",
+        "github-file-diff",
+    ],
+)
+async def test_workspace_reads_deny_view_only_collaborator(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    url: str,
+) -> None:
+    """A view-only grant shares the conversation, never the raw workspace.
+
+    Workspace files routinely hold secrets (``.env``, key files), so every
+    content-bearing read — file reads, listings, changed files, diffs, and
+    the GitHub diff views — requires an edit-level grant. Decisive: the
+    request never reaches the runner, so no file bytes can leak.
+    """
+    resp = await client.get(url, headers={"X-Forwarded-Email": "viewer@example.com"})
+
+    assert resp.status_code == 403, resp.text
+    assert runner_client.gets == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url",
+    [
+        _FS_BASE,
+        "/v1/sessions/conv_share/resources/environments/default/changes",
+        "/v1/sessions/conv_share/resources/environments/default/diff/src/app.py",
+    ],
+    ids=["root-list", "changed-files", "file-diff"],
+)
+async def test_workspace_reads_stay_open_to_edit_collaborators(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    url: str,
+) -> None:
+    """Control: the edit-level bar cannot pass by breaking shared browsing —
+    an edit collaborator (who can already write files and run shell commands
+    in the workspace) keeps every read surface."""
+    resp = await client.get(url, headers={"X-Forwarded-Email": "owner@example.com"})
+
+    assert resp.status_code == 200, resp.text
+    assert len(runner_client.gets) == 1
+
+
+@pytest.mark.asyncio
 async def test_filesystem_denies_edit_collaborator_outside_the_workspace(
     client: httpx.AsyncClient,
     runner_client: _RecordingRunnerClient,
@@ -528,19 +595,35 @@ async def test_filesystem_absolute_rejects_unauthenticated_before_runner(
 
 
 @pytest.mark.asyncio
-async def test_filesystem_relative_search_stays_open_to_collaborators(
+async def test_filesystem_relative_search_stays_open_to_edit_collaborators(
     client: httpx.AsyncClient,
     runner_client: _RecordingRunnerClient,
 ) -> None:
     """Control: the owner-only bar applies to absolute paths ONLY. Searching
-    the workspace is still available to a read-only collaborator, so the gate
-    cannot pass by having broken shared sessions."""
+    the workspace is still available to an edit collaborator, so the gate
+    cannot pass by having broken shared sessions. (A view-only grant is
+    refused — search results leak filenames and paths from the same
+    filesystem the read gate protects.)"""
     resp = await client.get(
-        _FS_SEARCH_RELATIVE, headers={"X-Forwarded-Email": "viewer@example.com"}
+        _FS_SEARCH_RELATIVE, headers={"X-Forwarded-Email": "owner@example.com"}
     )
 
     assert resp.status_code == 200, resp.text
     assert len(runner_client.gets) == 1
+
+
+@pytest.mark.asyncio
+async def test_filesystem_relative_search_denies_view_only_collaborator(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+) -> None:
+    """Workspace search carries the same edit bar as workspace reads."""
+    resp = await client.get(
+        _FS_SEARCH_RELATIVE, headers={"X-Forwarded-Email": "viewer@example.com"}
+    )
+
+    assert resp.status_code == 403, resp.text
+    assert runner_client.gets == []
 
 
 @pytest.mark.asyncio
