@@ -2839,14 +2839,14 @@ class HostProcess:
         if op == "github_info":
             return r.github_info()
         if op == "github_changes":
-            return r.github_changes(cast("str | None", params.get("base")))
+            return r.github_changes()
         if op == "github_diff":
             return r.github_file_diff(
                 cast("str | None", params.get("base")),
                 str(params.get("path", "")),
             )
         if op == "github_pr_diff":
-            return r.github_pr_diff(cast("str | None", params.get("base")))
+            return r.github_pr_diff()
         raise ValueError(f"unknown fs op: {op!r}")
 
     async def _handle_create_worktree(

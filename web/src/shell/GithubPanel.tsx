@@ -544,9 +544,13 @@ function SidebarNode({
 export function GithubPanel({ conversationId }: { conversationId: string }) {
   const queryClient = useQueryClient();
   const info = useGithubInfo(conversationId);
+  // The tab is a pure PR view: the list + patch are the PR's, fetched only when
+  // one exists. `baseRef` is kept for the on-demand expand-context loader
+  // (git show <base>:<path>) and the "branch → base" label.
   const baseRef = info.data?.base_ref ?? undefined;
-  const changes = useGithubChangedFiles(conversationId, baseRef);
-  const prDiff = useGithubPrDiff(conversationId, baseRef);
+  const hasPr = !!info.data?.pr;
+  const changes = useGithubChangedFiles(conversationId, hasPr);
+  const prDiff = useGithubPrDiff(conversationId, hasPr);
 
   const themeType = useResolvedThemeMode();
   // Diff layout is the app-global FileViewer preference (unified/split); seed

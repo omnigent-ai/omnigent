@@ -9753,10 +9753,12 @@ def create_runner_app(
             },
         )
 
-    # ── GitHub integration (read-only): PR metadata + branch-vs-base diff ──
-    # Backed by the ``gh`` CLI and ``git``; see omnigent.runner.github_resource.
-    # Each shells out synchronously, so it is offloaded to a thread like the
-    # changed-files / diff routes above (a blocked loop 503s the session).
+    # ── GitHub integration (read-only): PR metadata + the PR's files / diff ──
+    # The list and patch come from the ``gh`` CLI (the PR's "Files changed");
+    # only the per-file expand-context reader uses ``git show``. See
+    # omnigent.runner.github_resource. Each shells out synchronously, so it is
+    # offloaded to a thread like the changed-files / diff routes above (a blocked
+    # loop 503s the session).
 
     async def _github_workspace_root(session_id: str) -> str:
         """Resolve the workspace root for GitHub routes, or 404 when headless."""
@@ -9780,36 +9782,23 @@ def create_runner_app(
         return JSONResponse(status_code=200, content=info)
 
     @app.get("/v1/sessions/{session_id}/resources/github/changes")
-    async def read_github_changes(
-        session_id: str,
-        base: str | None = Query(default=None),
-    ) -> JSONResponse:
+    async def read_github_changes(session_id: str) -> JSONResponse:
         import asyncio as _asyncio
 
-        from omnigent.runner.github_resource import github_changed_files, resolve_base_ref
+        from omnigent.runner.github_resource import github_changed_files
 
         root = await _github_workspace_root(session_id)
-        resolved_base = await _asyncio.to_thread(resolve_base_ref, root, base)
-        if not resolved_base:
-            return JSONResponse(
-                status_code=200,
-                content={"object": "list", "data": [], "has_more": False},
-            )
-        result = await _asyncio.to_thread(github_changed_files, root, resolved_base)
+        result = await _asyncio.to_thread(github_changed_files, root)
         return JSONResponse(status_code=200, content=result)
 
     @app.get("/v1/sessions/{session_id}/resources/github/diff")
-    async def read_github_pr_diff(
-        session_id: str,
-        base: str | None = Query(default=None),
-    ) -> JSONResponse:
+    async def read_github_pr_diff(session_id: str) -> JSONResponse:
         import asyncio as _asyncio
 
-        from omnigent.runner.github_resource import github_pr_diff, resolve_base_ref
+        from omnigent.runner.github_resource import github_pr_diff
 
         root = await _github_workspace_root(session_id)
-        resolved_base = await _asyncio.to_thread(resolve_base_ref, root, base)
-        result = await _asyncio.to_thread(github_pr_diff, root, resolved_base or "")
+        result = await _asyncio.to_thread(github_pr_diff, root)
         return JSONResponse(status_code=200, content=result)
 
     @app.get("/v1/sessions/{session_id}/resources/github/diff/{relative_path:path}")

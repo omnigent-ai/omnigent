@@ -2,9 +2,9 @@
 //
 //   useGithubInfo        — GET /resources/github
 //                          repo / branch / base ref / associated PR + CI summary.
-//   useGithubChangedFiles — GET /resources/github/changes?base=<ref>
-//                          files changed on the branch vs its base (sidebar list).
-//   useGithubPrDiff      — GET /resources/github/diff?base=<ref>
+//   useGithubChangedFiles — GET /resources/github/changes
+//                          the PR's changed files (sidebar list).
+//   useGithubPrDiff      — GET /resources/github/diff
 //                          the whole PR as one unified-diff patch.
 //   fetchGithubFileContents — GET /resources/github/diff/{path}?base=<ref>
 //                          before/after full content for one file, fetched on
@@ -79,7 +79,7 @@ export interface GithubInfo {
   authenticated?: boolean;
   branch?: string;
   repo?: GithubRepo | null;
-  /** Branch the diff is computed against (PR base, gh default, else git default). */
+  /** The PR's base branch; null when there's no PR (the tab is a PR view). */
   base_ref?: string | null;
   pr?: GithubPr | null;
 }
@@ -182,13 +182,9 @@ export function useGithubInfo(conversationId: string | undefined) {
   });
 }
 
-async function fetchGithubChangedFiles(
-  conversationId: string,
-  base: string | undefined,
-): Promise<GithubChangedFilesResult> {
-  const params = base ? `?base=${encodeURIComponent(base)}` : "";
+async function fetchGithubChangedFiles(conversationId: string): Promise<GithubChangedFilesResult> {
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/changes${params}`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/changes`,
   );
   if (res.status === 404) return { available: false, data: [] };
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
@@ -200,22 +196,18 @@ async function fetchGithubChangedFiles(
 }
 
 /**
- * Fetch files changed on the branch relative to `base` (the PR "Files
- * changed"). Pass the `base_ref` from {@link useGithubInfo}; when omitted the
- * runner derives the default branch (an extra gh call).
+ * Fetch the PR's changed files (the "Files changed" list). Enabled only when a
+ * PR exists (pass `hasPr` from {@link useGithubInfo}); the runner returns an
+ * empty list otherwise.
  */
-export function useGithubChangedFiles(
-  conversationId: string | undefined,
-  base: string | undefined,
-) {
+export function useGithubChangedFiles(conversationId: string | undefined, hasPr: boolean) {
   const serveable = useWorkspaceServeable(conversationId);
   return useQuery({
-    queryKey: ["github-changed-files", conversationId, base ?? null],
-    queryFn: () => fetchGithubChangedFiles(conversationId!, base),
-    // Wait for a base ref (from useGithubInfo) — without one there's nothing to
-    // diff against, and it also skips the query when GitHub is
-    // unavailable/unauthenticated (no base ref is resolved in those states).
-    enabled: !!conversationId && !!base && serveable !== false,
+    queryKey: ["github-changed-files", conversationId],
+    queryFn: () => fetchGithubChangedFiles(conversationId!),
+    // Only a PR has files to show — skip the call in every no-PR / unavailable
+    // / unauthenticated state (the panel shows an empty state instead).
+    enabled: !!conversationId && hasPr && serveable !== false,
     retry: shouldRetryRunnerOffline,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
@@ -252,13 +244,9 @@ export interface GithubPrDiffResponse {
   patch: string;
 }
 
-async function fetchGithubPrDiff(
-  conversationId: string,
-  base: string | undefined,
-): Promise<GithubPrDiffResponse> {
-  const params = base ? `?base=${encodeURIComponent(base)}` : "";
+async function fetchGithubPrDiff(conversationId: string): Promise<GithubPrDiffResponse> {
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/diff${params}`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/diff`,
   );
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
     throw new RunnerOfflineError();
@@ -270,15 +258,15 @@ async function fetchGithubPrDiff(
 /**
  * Fetch the whole PR as one unified diff patch. The panel parses it
  * client-side into per-file diffs, so the entire PR renders from a single
- * call. Waits for a base ref (from {@link useGithubInfo}); disabled when the
- * runner is known offline.
+ * call. Enabled only when a PR exists (pass `hasPr` from {@link useGithubInfo});
+ * disabled when the runner is known offline.
  */
-export function useGithubPrDiff(conversationId: string | undefined, base: string | undefined) {
+export function useGithubPrDiff(conversationId: string | undefined, hasPr: boolean) {
   const serveable = useWorkspaceServeable(conversationId);
   return useQuery({
-    queryKey: ["github-pr-diff", conversationId, base ?? null],
-    queryFn: () => fetchGithubPrDiff(conversationId!, base),
-    enabled: !!conversationId && !!base && serveable !== false,
+    queryKey: ["github-pr-diff", conversationId],
+    queryFn: () => fetchGithubPrDiff(conversationId!),
+    enabled: !!conversationId && hasPr && serveable !== false,
     retry: shouldRetryRunnerOffline,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,

@@ -13303,7 +13303,7 @@
     },
     "/v1/sessions/{session_id}/resources/github/changes": {
       "get": {
-        "description": "List files changed on the branch relative to its base (PR diff).\n\n**Returns:** Flat list of changed files with `status` and line counts.",
+        "description": "List the PR's changed files (empty when the branch has no PR).\n\n**Returns:** Flat list of changed files with `status` and line counts.",
         "operationId": "list_session_github_changes_v1_sessions__session_id__resources_github_changes_get",
         "parameters": [
           {
@@ -13314,23 +13314,6 @@
             "schema": {
               "title": "Session Id",
               "type": "string"
-            }
-          },
-          {
-            "description": "Base branch name; the runner derives the default when omitted.",
-            "in": "query",
-            "name": "base",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Base"
             }
           }
         ],
