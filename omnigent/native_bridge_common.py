@@ -63,8 +63,7 @@ def prune_orphaned_dirs(bridge_root: Path) -> int:
     Dirs with no marker (or an unparseable one) are left untouched: they are
     either from an older version or not ours.
 
-    Reuses the canonical liveness predicate from
-    ``inner/terminal.py:_process_alive``.
+    Reuses ``inner/terminal.py:_process_alive`` as the liveness predicate.
 
     :param bridge_root: The harness's bridge root, e.g.
         ``~/.omnigent/codex-native``.
@@ -72,6 +71,8 @@ def prune_orphaned_dirs(bridge_root: Path) -> int:
     """
     if not bridge_root.exists():
         return 0
+    from omnigent.inner.terminal import _process_alive
+
     pruned = 0
     for entry in bridge_root.iterdir():
         if not entry.is_dir():
@@ -81,9 +82,7 @@ def prune_orphaned_dirs(bridge_root: Path) -> int:
             pid = int(marker.read_text(encoding="utf-8").strip())
         except (OSError, ValueError):
             continue
-        from omnigent.inner.terminal import _process_alive as _owner_pid_alive
-
-        if _owner_pid_alive(pid):
+        if _process_alive(pid):
             continue
         # Accepted residual race: the owner pid could in principle be reused
         # by a new live process between this check and the rmtree below. The
