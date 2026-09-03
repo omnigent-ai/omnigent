@@ -60,6 +60,7 @@ import "katex/dist/katex.min.css";
 import "streamdown/styles.css";
 import "./index.css";
 import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
+import { ExtensionProvider } from "./extensions/ExtensionProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
 
 export type { OmnigentHostConfig } from "./lib/host";
@@ -282,7 +283,9 @@ export function OmnigentApp({
   // reads it back via `useQueryClient()` under this provider.
   return (
     <QueryClientProvider client={queryClient}>
-      <OmnigentProviders routing={routingApi} basename={basename} isDarkMode={isDarkMode} />
+      <ExtensionProvider>
+        <OmnigentProviders routing={routingApi} basename={basename} isDarkMode={isDarkMode} />
+      </ExtensionProvider>
     </QueryClientProvider>
   );
 }
