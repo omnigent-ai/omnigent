@@ -664,10 +664,9 @@ export interface ChatActions {
    */
   reorderQueuedMessage: (queueId: string, beforeQueueId: string | null) => void;
   /**
-   * Send a queued message NOW instead of waiting for the idle flush (the
-   * strip's per-row steer). Removes it from the queue and POSTs it: on an
-   * SDK harness the server live-injects it into the running turn; the
-   * optimistic bubble promotes on POST. No-op if the id isn't queued.
+   * Send a queued message now instead of waiting for idle. Native harnesses
+   * may inject it live; SDK harnesses typically deliver it as the next turn.
+   * Removes before POST to avoid double sends; unknown ids are no-ops.
    */
   steerMessage: (queueId: string) => void;
   /**
