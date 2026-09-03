@@ -58,16 +58,24 @@ export interface GithubRepo {
   name_with_owner: string | null;
 }
 
+/** Why the panel can't show GitHub content.
+ *  - `not_a_git_repo` — the workspace exists but isn't a git checkout.
+ *  - `no_os_env` — no workspace/filesystem to read (404 from a current host).
+ *  - `host_outdated` — the host predates the `/resources/github` route and
+ *    404s "Resource 'github' not found"; synthesized in {@link fetchGithubInfo}. */
+export type GithubUnavailableReason = "not_a_git_repo" | "no_os_env" | "host_outdated";
+
 export interface GithubInfo {
   object: "session.github.info";
   /** False only when this isn't a git repo (see reason); the diff needs one. */
   available: boolean;
-  /** Why unavailable: "not_a_git_repo" | "no_os_env". */
-  reason?: string;
-  /** Whether the `gh` CLI is present. When false, PR/repo are null but the
-   *  branch-vs-base diff still renders from git. */
+  /** Why unavailable — see {@link GithubUnavailableReason}. */
+  reason?: GithubUnavailableReason;
+  /** Whether the `gh` CLI is present on the host. When false, PR/repo are null
+   *  (the panel prompts to install `gh`). */
   gh_available?: boolean;
-  /** Whether gh has an authenticated host (false → prompt `gh auth login`). */
+  /** Whether gh has an authenticated host (false → the panel points at
+   *  `gh auth status`). */
   authenticated?: boolean;
   branch?: string;
   repo?: GithubRepo | null;
@@ -109,12 +117,44 @@ async function errorFromResponse(res: Response): Promise<Error> {
   return new Error(message);
 }
 
+/** Classify a 404 body from the GitHub resource endpoint.
+ *
+ * A host/runner predating the `/resources/github` route has no such resource,
+ * so its generic resource lookup 404s "Resource 'github' not found". That
+ * distinct message is the only signal that the host is too old (an old host
+ * can't advertise a version field the new UI would know to read), so we match
+ * it to steer the panel to its "update your host" state rather than the
+ * generic "unavailable" one. Every other 404 (no workspace, missing dir) is a
+ * genuine `no_os_env`.
+ *
+ * Temporary: the route ships in 0.13.0, so this shim is only for hosts below
+ * it. @deprecated — expected removal ~0.16.0, once <0.13.0 hosts have aged out.
+ */
+export function githubNotFoundReason(message: string | undefined): GithubUnavailableReason {
+  return message && /resource\b.*\bgithub\b.*not found/i.test(message)
+    ? "host_outdated"
+    : "no_os_env";
+}
+
 async function fetchGithubInfo(conversationId: string): Promise<GithubInfo> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github`,
   );
   if (res.status === 404) {
-    return { object: "session.github.info", available: false, reason: "no_os_env" };
+    // Preserve the server's message so an outdated host (no github route) is
+    // told to update, rather than collapsing every 404 to "unavailable".
+    let message: string | undefined;
+    try {
+      const body = (await res.json()) as { error?: { message?: string } };
+      message = body?.error?.message;
+    } catch {
+      // Non-JSON body — fall back to the generic reason.
+    }
+    return {
+      object: "session.github.info",
+      available: false,
+      reason: githubNotFoundReason(message),
+    };
   }
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
     throw new RunnerOfflineError();
