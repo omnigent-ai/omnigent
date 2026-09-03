@@ -133,7 +133,10 @@ class _OpenShellClient:
             cli_bootstrap=True,
             managed_launch=True,
             local_port_forward=False,
-            resume_stopped=False,
+            resume_stopped=True,
+            # Flips once the gateway's agent-sandbox backend exposes its
+            # suspend+snapshot restore through the SDK.
+            snapshot_restore=False,
             programmatic_terminate=True,
             file_copy=True,
             streaming_exec=False,
@@ -276,6 +279,35 @@ class _OpenShellClient:
         thread.start()
         self._bg_threads.append(thread)
 
+    def resume_sandbox(self, name: str) -> None:
+        """Resume a stopped sandbox in place and wait until it is ready again.
+
+        The gateway delegates the actual restart to its compute driver; the
+        sandbox keeps its name and persistent volume. Gateways whose SDK
+        predates the sandbox resume primitive get an actionable error — the
+        server's wake path surfaces it without tearing the sandbox down.
+        """
+        resume = getattr(self._client, "resume", None)
+        if resume is None:
+            raise click.ClickException(
+                f"Could not resume OpenShell sandbox '{name}': the installed "
+                "openshell SDK exposes no sandbox resume primitive. Upgrade the "
+                "openshell package (`uv pip install --upgrade 'omnigent[openshell]'`) "
+                "to a version whose gateway supports suspend/resume."
+            )
+        ws = self._workspace
+        self._guard(
+            f"Could not resume OpenShell sandbox '{name}'",
+            lambda: resume(name, workspace=ws),
+        )
+        ready = self._guard(
+            f"OpenShell sandbox '{name}' did not become ready after resume",
+            lambda: self._client.wait_ready(name, workspace=ws, timeout_seconds=_READY_TIMEOUT_S),
+        )
+        # The resumed instance may carry a fresh opaque id; recache it so
+        # subsequent execs reach the live instance.
+        self._ids[name] = ready.id
+
     def get_status(self, name: str) -> None:
         """Resolve a sandbox by name (validates access) and cache its id."""
         ws = self._workspace
@@ -342,6 +374,10 @@ class OpenShellSandboxLauncher(SandboxLauncher):
 
     provider: ClassVar[str] = "openshell"
     supports_local_port_forward: ClassVar[bool] = False
+    # The gateway's compute backend keeps a stopped sandbox and its volume, so
+    # a dormant managed host is woken in place via :meth:`resume`; a gateway
+    # without the resume primitive fails the wake with an actionable error.
+    can_resume: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -490,6 +526,12 @@ class OpenShellSandboxLauncher(SandboxLauncher):
     def wheel_install_command(self, remote_tgz_path: str) -> str:
         """Overlay shipped wheels onto the prebaked host image."""
         return host_image_wheel_install_command(remote_tgz_path)
+
+    def resume(self, sandbox_id: str) -> None:
+        """Resume a stopped OpenShell sandbox in place, keeping name + volume."""
+        click.echo(f"▸ Resuming OpenShell sandbox '{sandbox_id}'")
+        self._openshell().resume_sandbox(sandbox_id)
+        click.echo(f"  → resumed {sandbox_id}")
 
     def terminate(self, sandbox_id: str) -> None:
         """Delete a sandbox, releasing its compute."""

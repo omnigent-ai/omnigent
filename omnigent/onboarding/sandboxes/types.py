@@ -70,6 +70,10 @@ class SandboxCapabilities:
         sandbox for the App OAuth callback flow.
     :param resume_stopped: Provider can resume a stopped sandbox in place
         with its persistent volume.
+    :param snapshot_restore: Resuming a stopped sandbox restores a
+        suspend-time snapshot (dependencies installed, caches warm)
+        rather than cold-starting it. Only meaningful alongside
+        ``resume_stopped``.
     :param programmatic_terminate: Provider can terminate a sandbox
         programmatically.
     :param file_copy: Provider supports copying files into the sandbox.
@@ -89,6 +93,7 @@ class SandboxCapabilities:
     managed_launch: bool = False
     local_port_forward: bool = False
     resume_stopped: bool = False
+    snapshot_restore: bool = False
     programmatic_terminate: bool = False
     file_copy: bool = False
     streaming_exec: bool = False
