@@ -910,9 +910,8 @@ def test_app_skips_device_grant_for_github_oidc_without_crashing(
     )
     assert _is_github_oidc, "test setup: should be detected as GitHub OIDC"
 
-    # With the fix, the gate blocks the call — so the factory is never reached.
-    if not _is_github_oidc:
-        # This is what happened before the fix: factory would be called and crash.
-        with pytest.raises(RuntimeError, match="GitHub OAuth"):
-            create_device_auth_router(provider, None)  # type: ignore[arg-type]
-    # If _is_github_oidc is True (the fix is in place), we reach here without error.
+    # The gate detects GitHub OIDC and skips the mount, so create_app never
+    # reaches the factory. Prove the factory *would* have crashed to document
+    # why the skip matters — then confirm the gate keeps it unreached.
+    with pytest.raises(RuntimeError, match="GitHub OAuth"):
+        create_device_auth_router(provider, None)  # type: ignore[arg-type]
