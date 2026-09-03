@@ -2068,6 +2068,197 @@ class TestSkillsFilterTranslation(unittest.TestCase):
         self.assertIsNone(_resolve_skills_option("bogus"))
 
 
+class TestSeedBundleSkillsWhenHermetic(unittest.TestCase):
+    """
+    ``skills: none`` must not also disable the agent's own bundled
+    skill.
+
+    ``_resolve_skills_option("none")`` alone produces an empty
+    ``skills`` allowlist, which blocks the native ``Skill`` tool
+    outright — including for a skill loaded from the bundle itself
+    via ``--plugin-dir``, which stays *listed* but becomes
+    permanently un-invokable. ``_seed_bundle_skills_when_hermetic``
+    is the fix: it re-seeds that empty allowlist with the bundle's
+    own skill names, read straight off ``<bundle_dir>/skills/*/SKILL.md``.
+    """
+
+    def _bundle(self, tmp_path, skills: dict[str, str]):
+        """Write ``<tmp_path>/skills/<dir>/SKILL.md`` for each entry.
+
+        :param skills: Maps a skill's on-disk directory name to the
+            ``name`` it declares in its frontmatter (may differ, per
+            :class:`SkillSpec`'s own docstring).
+        """
+        import pathlib
+
+        bundle_dir = pathlib.Path(tmp_path)
+        for dir_name, frontmatter_name in skills.items():
+            skill_dir = bundle_dir / "skills" / dir_name
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: {frontmatter_name}\ndescription: A test skill.\n---\n\nBody.\n"
+            )
+        return bundle_dir
+
+    def test_none_with_bundle_skill_seeds_both_name_forms(self) -> None:
+        """The empty ``"none"`` allowlist is replaced with bare + plugin-qualified names."""
+        import tempfile
+
+        from omnigent.inner.claude_sdk_executor import (
+            _ResolvedSkills,
+            _seed_bundle_skills_when_hermetic,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = self._bundle(tmp, {"my-skill-dir": "my-skill"})
+            resolved = _seed_bundle_skills_when_hermetic(
+                _ResolvedSkills(skills=[], setting_sources=[]),
+                skills_filter="none",
+                bundle_dir=bundle_dir,
+                agent_name="testagent",
+            )
+        self.assertEqual(resolved.skills, ["my-skill", "testagent:my-skill"])
+        # setting_sources stays [] — host discovery is still suppressed,
+        # only the skills allowlist changes.
+        self.assertEqual(resolved.setting_sources, [])
+
+    def test_manifest_name_wins_over_agent_name(self) -> None:
+        """A bundle's own ``.claude-plugin/plugin.json`` name qualifies the
+        seeded ``plugin:skill`` entries — the CLI labels plugin skills by
+        the manifest, not the agent display name."""
+        import json as _json
+        import tempfile
+
+        from omnigent.inner.claude_sdk_executor import (
+            _ResolvedSkills,
+            _seed_bundle_skills_when_hermetic,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = self._bundle(tmp, {"my-skill-dir": "my-skill"})
+            manifest_dir = bundle_dir / ".claude-plugin"
+            manifest_dir.mkdir()
+            (manifest_dir / "plugin.json").write_text(_json.dumps({"name": "custom-plugin"}))
+            resolved = _seed_bundle_skills_when_hermetic(
+                _ResolvedSkills(skills=[], setting_sources=[]),
+                skills_filter="none",
+                bundle_dir=bundle_dir,
+                agent_name="testagent",
+            )
+        self.assertEqual(resolved.skills, ["my-skill", "custom-plugin:my-skill"])
+
+    def test_agent_name_none_falls_back_to_bundle_dir_basename(self) -> None:
+        """Matches ``ensure_bundle_plugin_manifest``'s own fallback for the qualified name."""
+        import tempfile
+
+        from omnigent.inner.claude_sdk_executor import (
+            _ResolvedSkills,
+            _seed_bundle_skills_when_hermetic,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = self._bundle(tmp, {"my-skill-dir": "my-skill"})
+            resolved = _seed_bundle_skills_when_hermetic(
+                _ResolvedSkills(skills=[], setting_sources=[]),
+                skills_filter="none",
+                bundle_dir=bundle_dir,
+                agent_name=None,
+            )
+        self.assertIn(f"{bundle_dir.name}:my-skill", resolved.skills)
+
+    def test_multiple_bundle_skills_all_seeded(self) -> None:
+        """Every bundled skill gets both name forms, not just the first."""
+        import tempfile
+
+        from omnigent.inner.claude_sdk_executor import (
+            _ResolvedSkills,
+            _seed_bundle_skills_when_hermetic,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = self._bundle(tmp, {"a-dir": "skill-a", "b-dir": "skill-b"})
+            resolved = _seed_bundle_skills_when_hermetic(
+                _ResolvedSkills(skills=[], setting_sources=[]),
+                skills_filter="none",
+                bundle_dir=bundle_dir,
+                agent_name="agent",
+            )
+        self.assertEqual(
+            set(resolved.skills),
+            {"skill-a", "agent:skill-a", "skill-b", "agent:skill-b"},
+        )
+
+    def test_no_bundle_dir_returns_resolved_unchanged(self) -> None:
+        """An agent with no bundle (``bundle_dir=None``) is untouched."""
+        from omnigent.inner.claude_sdk_executor import (
+            _ResolvedSkills,
+            _seed_bundle_skills_when_hermetic,
+        )
+
+        original = _ResolvedSkills(skills=[], setting_sources=[])
+        resolved = _seed_bundle_skills_when_hermetic(
+            original, skills_filter="none", bundle_dir=None, agent_name="agent"
+        )
+        self.assertIs(resolved, original)
+
+    def test_bundle_with_no_skills_dir_returns_resolved_unchanged(self) -> None:
+        """A bundle directory that ships no ``skills/`` at all is a no-op, not an error."""
+        import pathlib
+        import tempfile
+
+        from omnigent.inner.claude_sdk_executor import (
+            _ResolvedSkills,
+            _seed_bundle_skills_when_hermetic,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            original = _ResolvedSkills(skills=[], setting_sources=[])
+            resolved = _seed_bundle_skills_when_hermetic(
+                original,
+                skills_filter="none",
+                bundle_dir=pathlib.Path(tmp),
+                agent_name="agent",
+            )
+        self.assertIs(resolved, original)
+
+    def test_filter_all_is_untouched_even_with_bundle_skills(self) -> None:
+        """Only the ``"none"`` shape is re-seeded — ``"all"`` and explicit lists pass through."""
+        import tempfile
+
+        from omnigent.inner.claude_sdk_executor import (
+            _ResolvedSkills,
+            _seed_bundle_skills_when_hermetic,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = self._bundle(tmp, {"my-skill-dir": "my-skill"})
+            original = _ResolvedSkills(skills="all", setting_sources=None)
+            resolved = _seed_bundle_skills_when_hermetic(
+                original, skills_filter="all", bundle_dir=bundle_dir, agent_name="agent"
+            )
+        self.assertIs(resolved, original)
+
+    def test_filter_list_is_untouched_even_with_bundle_skills(self) -> None:
+        """An explicit list filter already names its own skills — not re-seeded."""
+        import tempfile
+
+        from omnigent.inner.claude_sdk_executor import (
+            _ResolvedSkills,
+            _seed_bundle_skills_when_hermetic,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = self._bundle(tmp, {"my-skill-dir": "my-skill"})
+            original = _ResolvedSkills(skills=["explicit"], setting_sources=None)
+            resolved = _seed_bundle_skills_when_hermetic(
+                original,
+                skills_filter=["explicit"],
+                bundle_dir=bundle_dir,
+                agent_name="agent",
+            )
+        self.assertIs(resolved, original)
+
+
 # ---------------------------------------------------------------------------
 # Tests: StreamEvent-based streaming
 # ---------------------------------------------------------------------------

@@ -13,6 +13,8 @@ from pathlib import Path
 import pytest
 
 from omnigent.inner.bundle_skills import (
+    bundle_plugin_name,
+    bundle_skill_names,
     claude_native_skill_args,
     ensure_bundle_plugin_manifest,
 )
@@ -130,3 +132,124 @@ def test_claude_native_skill_args_bundle_without_skills_dir(tmp_path: Path) -> N
     """
     (tmp_path / "no_skills").mkdir()
     assert "--plugin-dir" not in claude_native_skill_args(tmp_path / "no_skills")
+
+
+def _write_skill(bundle: Path, dir_name: str, *, name: str, description: str = "desc") -> None:
+    """Write ``<bundle>/skills/<dir_name>/SKILL.md`` with the given frontmatter."""
+    skill_dir = bundle / "skills" / dir_name
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {description}\n---\n\nBody.\n"
+    )
+
+
+def test_bundle_skill_names_reads_frontmatter_name(tmp_path: Path) -> None:
+    """
+    The returned name comes from the frontmatter ``name`` field, not the
+    directory name — they may differ, per ``SkillSpec``'s own docstring.
+    """
+    _write_skill(tmp_path, "on-disk-dir", name="feature-brainstorming")
+    assert bundle_skill_names(tmp_path) == ["feature-brainstorming"]
+
+
+def test_bundle_skill_names_multiple_skills_sorted_by_dir(tmp_path: Path) -> None:
+    """Multiple skills are all returned, in directory-listing (sorted) order."""
+    _write_skill(tmp_path, "b-dir", name="skill-b")
+    _write_skill(tmp_path, "a-dir", name="skill-a")
+    assert bundle_skill_names(tmp_path) == ["skill-a", "skill-b"]
+
+
+def test_bundle_skill_names_no_skills_dir_returns_empty(tmp_path: Path) -> None:
+    """A bundle with no ``skills/`` directory at all returns ``[]``, not an error."""
+    assert bundle_skill_names(tmp_path) == []
+
+
+def test_bundle_skill_names_empty_skills_dir_returns_empty(tmp_path: Path) -> None:
+    """An empty ``skills/`` directory (no subdirectories) returns ``[]``."""
+    (tmp_path / "skills").mkdir()
+    assert bundle_skill_names(tmp_path) == []
+
+
+def test_bundle_skill_names_skips_missing_frontmatter(tmp_path: Path) -> None:
+    """
+    A ``SKILL.md`` with no ``---`` frontmatter delimiters is skipped, not
+    raised — this is a best-effort read, not spec validation (the parser
+    already validated strictly before the bundle ever reached this code).
+    """
+    skill_dir = tmp_path / "skills" / "broken"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("Just plain text, no frontmatter.\n")
+    assert bundle_skill_names(tmp_path) == []
+
+
+def test_bundle_skill_names_skips_missing_name_field(tmp_path: Path) -> None:
+    """Frontmatter present but missing the required ``name`` key is skipped."""
+    skill_dir = tmp_path / "skills" / "no-name"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\ndescription: no name here\n---\n\nBody.\n")
+    assert bundle_skill_names(tmp_path) == []
+
+
+def test_bundle_skill_names_skips_invalid_yaml(tmp_path: Path) -> None:
+    """Malformed YAML frontmatter is skipped rather than raising."""
+    skill_dir = tmp_path / "skills" / "bad-yaml"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: [unclosed\n---\n\nBody.\n")
+    assert bundle_skill_names(tmp_path) == []
+
+
+def test_bundle_skill_names_partial_failure_keeps_valid_ones(tmp_path: Path) -> None:
+    """One broken SKILL.md doesn't take down the whole bundle's skill list."""
+    _write_skill(tmp_path, "good", name="good-skill")
+    broken_dir = tmp_path / "skills" / "broken"
+    broken_dir.mkdir(parents=True)
+    (broken_dir / "SKILL.md").write_text("no frontmatter here\n")
+    assert bundle_skill_names(tmp_path) == ["good-skill"]
+
+
+def test_bundle_plugin_name_prefers_manifest_name(tmp_path: Path) -> None:
+    """
+    A user-authored manifest whose ``name`` differs from the agent's
+    display name wins: the CLI labels plugin skills by the manifest, so
+    the ``<plugin>:<skill>`` allowlist entries must use that name or the
+    qualified form never matches.
+    """
+    manifest_dir = tmp_path / ".claude-plugin"
+    manifest_dir.mkdir()
+    (manifest_dir / "plugin.json").write_text(json.dumps({"name": "custom-plugin"}))
+    assert bundle_plugin_name(tmp_path, "display-name") == "custom-plugin"
+
+
+def test_bundle_plugin_name_falls_back_to_agent_name(tmp_path: Path) -> None:
+    """No manifest present: fall back to the agent display name."""
+    assert bundle_plugin_name(tmp_path, "display-name") == "display-name"
+
+
+def test_bundle_plugin_name_falls_back_to_basename_without_agent(tmp_path: Path) -> None:
+    """No manifest and no agent name: fall back to the bundle basename."""
+    assert bundle_plugin_name(tmp_path, None) == tmp_path.name
+
+
+def test_bundle_plugin_name_ignores_malformed_manifest(tmp_path: Path) -> None:
+    """A manifest that is not JSON (or has no usable name) is skipped."""
+    manifest_dir = tmp_path / ".claude-plugin"
+    manifest_dir.mkdir()
+    (manifest_dir / "plugin.json").write_text("{not json")
+    assert bundle_plugin_name(tmp_path, "display-name") == "display-name"
+    (manifest_dir / "plugin.json").write_text(json.dumps({"name": ""}))
+    assert bundle_plugin_name(tmp_path, "display-name") == "display-name"
+    (manifest_dir / "plugin.json").write_text(json.dumps(["not", "a", "dict"]))
+    assert bundle_plugin_name(tmp_path, None) == tmp_path.name
+
+
+def test_frontmatter_regex_matches_spec_parser() -> None:
+    """
+    The tolerant reader's frontmatter regex is a deliberate copy of the
+    spec parser's; if the parser's grammar ever changes, this copy must
+    follow or the two would disagree on which SKILL.md files parse.
+    """
+    from omnigent.inner import bundle_skills
+    from omnigent.spec import parser
+
+    assert bundle_skills._FRONTMATTER_RE.pattern == parser._FRONTMATTER_RE.pattern
+    assert bundle_skills._FRONTMATTER_RE.flags == parser._FRONTMATTER_RE.flags

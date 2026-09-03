@@ -48,7 +48,11 @@ from omnigent.claude_model_vocabulary import ALIAS_MODEL_ENV_VARS, served_alias_
 from omnigent.cli_invocation import cli_invocation
 from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
 from omnigent.inner import _proc
-from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
+from omnigent.inner.bundle_skills import (
+    bundle_plugin_name,
+    bundle_skill_names,
+    ensure_bundle_plugin_manifest,
+)
 from omnigent.inner.hook_scripts import subagent_router
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
@@ -1439,8 +1443,13 @@ def _resolve_skills_option(
       the ``Skill`` tool listing AND the scope-based discovery
       are suppressed: no host skills appear in the system
       prompt or as invokable. Bundled skills (loaded via
-      ``--plugin-dir``) are unaffected by ``setting_sources``
-      and remain visible.
+      ``--plugin-dir``) are unaffected by ``setting_sources`` and
+      remain listed — but an empty ``skills`` allowlist also
+      blocks them from being *invoked*, so the caller
+      (:meth:`ClaudeSDKExecutor.run_turn`) re-seeds this result's
+      ``skills`` with the bundle's own skill names before use.
+      This function's return value
+      alone is not the final word for ``"none"``.
     - ``list[str]`` → ``skills=[names]``, ``setting_sources=None``.
       Only the named subset is in the model's listing; the SDK's
       auto-default still loads user and project sources for
@@ -1463,6 +1472,60 @@ def _resolve_skills_option(
     if isinstance(skills_filter, list):
         return _ResolvedSkills(skills=list(skills_filter), setting_sources=None)
     return None
+
+
+def _seed_bundle_skills_when_hermetic(
+    resolved: _ResolvedSkills,
+    *,
+    skills_filter: str | list[str],
+    bundle_dir: pathlib.Path | None,
+    agent_name: str | None,
+) -> _ResolvedSkills:
+    """
+    Re-seed a hermetic (``"none"``) skills resolution with the bundle's
+    own skill names, so they stay invocable through the native
+    ``Skill`` tool.
+
+    ``_resolve_skills_option("none")`` returns an empty ``skills``
+    allowlist, which blocks the ``Skill`` tool outright — including
+    for the bundle's OWN skills, which are still listed (via
+    ``--plugin-dir``, wired by the caller) but then can never actually
+    be invoked. Every other *resolved*
+    value (``"all"``, or an explicit list of names) is returned
+    unchanged: this only affects the specific ``skills=[]`` shape that
+    ``"none"`` produces.
+
+    Both the bare skill name and the plugin-qualified
+    ``<plugin>:<name>`` form are added for each skill, since the CLI's
+    exact matching convention for a plugin-provided skill isn't part
+    of the SDK's public contract; an unmatched extra allowlist entry
+    is inert.
+
+    :param resolved: The ``_resolve_skills_option`` result to
+        (possibly) re-seed.
+    :param skills_filter: The spec's raw ``skills_filter``, checked
+        against ``"none"`` to scope this to the hermetic case.
+    :param bundle_dir: Materialized agent-bundle root, or ``None``
+        when the agent ships no bundle.
+    :param agent_name: Agent display name, used by
+        :func:`omnigent.inner.bundle_skills.bundle_plugin_name` as the
+        fallback when the bundle's ``.claude-plugin/plugin.json`` carries
+        no usable ``name`` — the manifest's own name wins otherwise,
+        since that is the label the CLI qualifies plugin skills with.
+    :returns: *resolved* unchanged, or a new :class:`_ResolvedSkills`
+        with ``skills`` seeded from the bundle's own skill names.
+    """
+    if skills_filter != "none" or bundle_dir is None:
+        return resolved
+    skill_names = bundle_skill_names(bundle_dir)
+    if not skill_names:
+        return resolved
+    plugin_name = bundle_plugin_name(bundle_dir, agent_name)
+    seeded: list[str] = []
+    for name in skill_names:
+        seeded.append(name)
+        seeded.append(f"{plugin_name}:{name}")
+    return _ResolvedSkills(skills=seeded, setting_sources=resolved.setting_sources)
 
 
 class ClaudeSDKExecutor(Executor):
@@ -1567,14 +1630,13 @@ class ClaudeSDKExecutor(Executor):
             skills_filter: Host-skill filter (``"all"`` / ``"none"`` /
                 ``list[str]``). Maps to the SDK's ``skills`` option:
                 ``"all"`` → enable every host-discovered skill,
-                ``"none"`` → empty list (no host skills exposed),
-                list of names → only the named skills. Bundled
-                skills loaded via ``bundle_dir`` are subject to the
-                same listing filter (so ``"none"`` hides every skill
-                from the model, bundled or host); agents that want
-                bundled skills always visible while opting out of
-                host skills should set this to a list naming their
-                bundled skills explicitly. Defaults to ``"all"``.
+                ``"none"`` → no host skills exposed, list of names →
+                only the named skills. Bundled skills loaded via
+                ``bundle_dir`` stay listed AND invocable under
+                ``"none"`` — the allowlist is seeded with the
+                bundle's own skill names so opting out of host
+                skills doesn't also disable the agent's own bundled
+                skill. Defaults to ``"all"``.
             api_key_helper: Shell command the Claude CLI will invoke to
                 retrieve a bearer token, e.g.
                 ``"printf %s sk-ant-..."`` (set by the harness when
@@ -2507,6 +2569,12 @@ class ClaudeSDKExecutor(Executor):
         # this is belt-and-suspenders).
         resolved = _resolve_skills_option(self._skills_filter) or _ResolvedSkills(
             skills="all", setting_sources=None
+        )
+        resolved = _seed_bundle_skills_when_hermetic(
+            resolved,
+            skills_filter=self._skills_filter,
+            bundle_dir=self._bundle_dir,
+            agent_name=self._agent_name,
         )
         # Bundle skills are exposed via the SDK's plugin mechanism.
         # The bundle's ``<bundle>/skills/<dir>/SKILL.md`` files are
