@@ -2,14 +2,12 @@ spec_version: 1
 name: hermes
 description: Hermes Agent coding sub-agent — implements, cross-vendor reviews, or explores a scoped task in its own worktree.
 
-# Native Hermes Agent (Nous Research) TUI harness: runs in its own terminal the
-# human can open in the UI's Subagents panel and TAKE OVER. Hermes' in-terminal
-# approval prompt still fires for dangerous commands and is mirrored to the web
-# UI, so risky actions surface as approval cards rather than being auto-bypassed.
+# SDK harness: runs headless, no terminal. Tool calls flow through the policy
+# layer; dangerous commands surface as web approval cards.
 executor:
   type: omnigent
   config:
-    harness: hermes-native
+    harness: hermes
 
 prompt: |
   You are Hermes, a coding sub-agent dispatched by the polly
