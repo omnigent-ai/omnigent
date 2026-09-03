@@ -1613,10 +1613,10 @@ class SessionCreateMetadata(BaseModel):
         manages runner spawning.
     :param workspace: Absolute path on the host where the runner
         should start, e.g. ``"/Users/corey/universe/src/foo"``.
-        Required when ``host_id`` is set; validated against the
-        uploaded agent's ``os_env.cwd`` boundary at session create
-        (per designs/SESSION_WORKSPACE_SELECTION.md). Optional
-        otherwise.
+        Required when ``host_id`` is set; validated on the host
+        against the uploaded agent's ``os_env.cwd`` boundary at
+        session create (per designs/SESSION_WORKSPACE_SELECTION.md)
+        and stored as the host's canonical path. Optional otherwise.
     :param terminal_launch_args: Optional pass-through CLI args for a
         native terminal wrapper (claude / codex), e.g.
         ``["--dangerously-skip-permissions"]``. Set at create-time so
@@ -1706,6 +1706,27 @@ class SessionCreateMetadata(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _check_host_requires_workspace(self) -> SessionCreateMetadata:
+        """
+        Reject ``host_id`` without ``workspace`` at validation time.
+
+        The inline runner launch needs a working directory on the host.
+        The JSON create enforces the rule (with the same message) at the
+        route, where it runs after a ``project_id`` create may have
+        default-filled ``workspace`` from the project config; a project
+        create is therefore deferred to that same route-level check here
+        (mirroring :meth:`_SessionCreateRequestBase._check_git_requires_host`),
+        and every other create fails fast before the bundle is even read.
+
+        :returns: The validated instance.
+        :raises ValueError: If ``host_id`` is set but ``workspace`` is not
+            and no project config can supply it.
+        """
+        if self.host_id is not None and self.workspace is None and self.project_id is None:
+            raise ValueError("workspace required when host_id is set")
+        return self
+
 
 class CreatedSessionResponse(BaseModel):
     """
@@ -1717,11 +1738,21 @@ class CreatedSessionResponse(BaseModel):
         from the uploaded bundle, e.g. ``"ag_abc123"``.
     :param agent_name: Agent name loaded from the uploaded bundle's
         spec, e.g. ``"code-assistant"``.
+    :param host_id: Host the runner was launched on, e.g.
+        ``"host_a1b2c3d4..."``, when ``metadata.host_id`` triggered an
+        inline launch. ``None`` on every other path: no host targeted,
+        or a sub-agent child that co-locates on its parent's runner
+        (its row still records the host and the inherited runner).
+    :param runner_id: Token-bound runner id that launch bound to the
+        session, e.g. ``"runner_token_abc123..."``. ``None`` whenever
+        ``host_id`` is.
     """
 
     session_id: str
     agent_id: str
     agent_name: str
+    host_id: str | None = None
+    runner_id: str | None = None
 
 
 class SessionLabelsResponse(BaseModel):

@@ -25,6 +25,7 @@ from omnigent.reasoning_effort import EFFORT_VALUES, validate_effort
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, local_single_user_enabled
 from omnigent.server.routes._auth_helpers import require_access
+from omnigent.spec.types import AgentSpec
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.host_store import host_is_live
 from omnigent.stores.project_store import ProjectStore
@@ -333,100 +334,146 @@ async def validate_session_agent(
     return agent
 
 
-async def validate_existing_host_workspace(
-    *,
-    user_id: str | None,
-    host_id: str,
-    workspace: str | None,
-    agent: Any,
-    agent_cache: AgentCache | None,
-    host_store: Any | None,
-    host_registry: Any | None,
-) -> str:
-    """Validate a connected-host workspace against the agent's os_env boundary."""
-    from omnigent.server.routes._workspace_validation import (
-        WorkspaceValidationError,
-        validate_workspace,
-    )
+def _require_absolute_host_workspace(workspace: str | None) -> str:
+    """Return *workspace* once it satisfies the ``host_id`` contract.
+
+    A host-bound session needs a directory for its runner to start in, and
+    the host resolves a relative path against its own daemon cwd, so only an
+    absolute path is accepted.
+
+    :param workspace: Caller-supplied workspace, e.g.
+        ``"/Users/corey/universe"``, or ``None``.
+    :returns: The same workspace string.
+    :raises OmnigentError: 400 when the workspace is missing or relative.
+    """
+    from omnigent.server.routes._workspace_validation import _is_windows_absolute_path
 
     if workspace is None:
         raise OmnigentError(
             "workspace required when host_id is set",
             code=ErrorCode.INVALID_INPUT,
         )
-    from omnigent.server.routes._workspace_validation import _is_windows_absolute_path
-
     if not workspace.startswith("/") and not _is_windows_absolute_path(workspace):
         raise OmnigentError(
             "workspace must be an absolute path starting with /",
             code=ErrorCode.INVALID_INPUT,
         )
-    if agent_cache is None:
-        # Should never happen in production — the route factory always wires
-        # an agent cache. Fail loud rather than silently skipping validation,
-        # which would let bad workspaces through.
-        raise OmnigentError(
-            "workspace validation requires an agent cache",
-            code=ErrorCode.INTERNAL_ERROR,
-        )
-    if host_registry is None:
-        raise OmnigentError(
-            "host registry is not configured on this server",
-            code=ErrorCode.INTERNAL_ERROR,
-        )
+    return workspace
 
+
+async def _authorize_workspace_host(
+    *,
+    user_id: str | None,
+    host_id: str,
+    host_store: Any | None,
+    host_registry: Any,
+) -> str | None:
+    """Authorize the caller's host before anything is sent to it.
+
+    Runs before the agent spec is loaded and before the ``host.stat``
+    round-trips: a non-owner must be rejected (403/404 via the shared
+    ``resolve_host_owner``) without touching the host or reading the agent
+    bundle (cross-user host probe).
+
+    A host that is live per the store but whose tunnel is not on this
+    replica is a wrong-replica landing: ``validate_workspace`` would only
+    report "host is offline", which the client cannot recover from, so
+    surface ``WRONG_REPLICA`` (a distinct 400 code) and let the client
+    re-address without the key. A genuinely offline host falls through to
+    the offline error. Safe to raise here: nothing has been persisted yet.
+
+    :param user_id: Authenticated caller, or ``None`` when auth is disabled.
+    :param host_id: Target host id, e.g. ``"host_a1b2c3d4..."``.
+    :param host_store: Persistent host registrations; ``None`` skips the
+        ownership and replica checks (host support not wired).
+    :param host_registry: This replica's live host connections.
+    :returns: The host's display name for error messages, or ``None``
+        when no host store is wired.
+    :raises HTTPException: 404 if the host is unknown; 403 if it belongs
+        to another user.
+    :raises OmnigentError: ``WRONG_REPLICA`` when the host is live on
+        another replica.
+    """
+    if host_store is None:
+        return None
     from omnigent.server.routes._host_launch import resolve_host_owner
 
-    # Authorize host ownership FIRST — before loading the agent spec or the
-    # host.stat round-trip below. A non-owner must be rejected (403/404 via the
-    # shared resolve_host_owner) before we touch the host or even read the agent
-    # bundle (cross-user host probe). The returned host also gives the display
-    # name for error messages.
-    host_name: str | None = None
-    if host_store is not None:
-        host = await asyncio.to_thread(
-            resolve_host_owner,
-            user_id=user_id,
-            host_id=host_id,
-            host_store=host_store,
+    host = await asyncio.to_thread(
+        resolve_host_owner,
+        user_id=user_id,
+        host_id=host_id,
+        host_store=host_store,
+    )
+    if host_registry.get(host_id) is None and host_is_live(host):
+        raise OmnigentError(
+            f"host {host.name or host_id!r} is on another replica; retry",
+            code=ErrorCode.WRONG_REPLICA,
         )
-        host_name = host.name
-        # Wrong-replica classification, same as the /v1/hosts/* endpoints and
-        # RunnerRouter: validate_workspace below does a local host_registry miss
-        # → "host is offline" (invalid_input), which the client can't recover
-        # from. If the host is live per the store but its tunnel isn't on this
-        # replica, the create landed on the wrong replica — surface WRONG_REPLICA
-        # so the client re-addresses WITHOUT the key. A genuinely offline host
-        # falls through to the invalid_input case. Both are 400; the distinct
-        # code, not the status, is what tells the client to re-address rather
-        # than give up. Safe to raise here: workspace validation runs BEFORE
-        # create_conversation, so no orphan row is left.
-        if host_registry is not None and host_registry.get(host_id) is None and host_is_live(host):
-            raise OmnigentError(
-                f"host {host_name or host_id!r} is on another replica; retry",
-                code=ErrorCode.WRONG_REPLICA,
-            )
+    return host.name
 
-    # Read the agent's os_env.cwd — None when the spec has no os_env block
-    # (headless agents). Headless agents have no filesystem access at all but
-    # still get launched on hosts for sessions that don't need it; treat their
-    # cwd as relative-equivalent so the boundary is unrestricted.
-    spec_cwd: str | None = None
-    if agent.bundle_location is not None:
-        try:
-            loaded = await asyncio.to_thread(
-                agent_cache.load,
-                agent.id,
-                agent.bundle_location,
-            )
-            os_env = getattr(loaded.spec, "os_env", None)
-            spec_cwd = getattr(os_env, "cwd", None) if os_env is not None else None
-        except Exception as exc:
-            _logger.exception("Failed to load agent spec for workspace validation")
-            raise OmnigentError(
-                f"failed to load agent spec: {exc}",
-                code=ErrorCode.INTERNAL_ERROR,
-            ) from exc
+
+def _spec_cwd(spec: Any) -> str | None:
+    """Return a parsed spec's ``os_env.cwd`` for boundary computation.
+
+    ``None`` when the spec has no ``os_env`` block (headless agents): they
+    have no filesystem access but still launch on hosts, so their cwd is
+    treated as relative-equivalent and the boundary is unrestricted.
+
+    :param spec: A parsed :class:`~omnigent.spec.types.AgentSpec`.
+    :returns: The declared cwd, e.g. ``"~/universe"``, or ``None``.
+    """
+    os_env = getattr(spec, "os_env", None)
+    return getattr(os_env, "cwd", None) if os_env is not None else None
+
+
+async def _agent_spec_cwd(*, agent: Any, agent_cache: AgentCache) -> str | None:
+    """Load an agent row's bundle and return its ``os_env.cwd``.
+
+    :param agent: The agent row the session binds to.
+    :param agent_cache: Cache used to load the parsed bundle.
+    :returns: The spec's cwd, or ``None`` when the agent has no bundle or
+        no ``os_env`` block.
+    :raises OmnigentError: ``INTERNAL_ERROR`` when the bundle fails to load.
+    """
+    if agent.bundle_location is None:
+        return None
+    try:
+        loaded = await asyncio.to_thread(
+            agent_cache.load,
+            agent.id,
+            agent.bundle_location,
+        )
+    except Exception as exc:
+        _logger.exception("Failed to load agent spec for workspace validation")
+        raise OmnigentError(
+            f"failed to load agent spec: {exc}",
+            code=ErrorCode.INTERNAL_ERROR,
+        ) from exc
+    return _spec_cwd(loaded.spec)
+
+
+async def _validate_workspace_on_host(
+    *,
+    host_registry: Any,
+    host_id: str,
+    workspace: str,
+    spec_cwd: str | None,
+    host_name: str | None,
+) -> str:
+    """Run the host-side workspace checks and map a failure to a 400.
+
+    :param host_registry: This replica's live host connections.
+    :param host_id: Target host id.
+    :param workspace: Absolute workspace path supplied by the caller.
+    :param spec_cwd: The agent's ``os_env.cwd`` boundary, or ``None``.
+    :param host_name: Display name for error messages, or ``None``.
+    :returns: The canonical workspace path reported by the host.
+    :raises OmnigentError: ``INVALID_INPUT`` on any validation failure.
+    """
+    from omnigent.server.routes._workspace_validation import (
+        WorkspaceValidationError,
+        validate_workspace,
+    )
 
     try:
         return await validate_workspace(
@@ -441,3 +488,97 @@ async def validate_existing_host_workspace(
             exc.message,
             code=ErrorCode.INVALID_INPUT,
         ) from exc
+
+
+async def validate_existing_host_workspace(
+    *,
+    user_id: str | None,
+    host_id: str,
+    workspace: str | None,
+    agent: Any,
+    agent_cache: AgentCache | None,
+    host_store: Any | None,
+    host_registry: Any | None,
+) -> str:
+    """Validate a connected-host workspace against the agent's os_env boundary."""
+    workspace = _require_absolute_host_workspace(workspace)
+    if agent_cache is None:
+        # Should never happen in production — the route factory always wires
+        # an agent cache. Fail loud rather than silently skipping validation,
+        # which would let bad workspaces through.
+        raise OmnigentError(
+            "workspace validation requires an agent cache",
+            code=ErrorCode.INTERNAL_ERROR,
+        )
+    if host_registry is None:
+        raise OmnigentError(
+            "host registry is not configured on this server",
+            code=ErrorCode.INTERNAL_ERROR,
+        )
+    host_name = await _authorize_workspace_host(
+        user_id=user_id,
+        host_id=host_id,
+        host_store=host_store,
+        host_registry=host_registry,
+    )
+    spec_cwd = await _agent_spec_cwd(agent=agent, agent_cache=agent_cache)
+    return await _validate_workspace_on_host(
+        host_registry=host_registry,
+        host_id=host_id,
+        workspace=workspace,
+        spec_cwd=spec_cwd,
+        host_name=host_name,
+    )
+
+
+async def validate_existing_host_workspace_for_spec(
+    *,
+    user_id: str | None,
+    host_id: str,
+    workspace: str | None,
+    spec: AgentSpec,
+    host_store: Any | None,
+    host_registry: Any | None,
+) -> str:
+    """Validate a connected-host workspace for an uploaded bundle's spec.
+
+    The multipart create parses its bundle before any agent row exists,
+    so the boundary comes straight from the parsed spec. Every other rule
+    is the one :func:`validate_existing_host_workspace` applies to the
+    JSON create: a missing or relative workspace, host ownership and
+    replica placement (checked before any frame reaches the host), and
+    the ``host.stat`` existence / boundary checks that yield the canonical
+    path to store.
+
+    :param user_id: Authenticated caller, or ``None`` when auth is disabled.
+    :param host_id: Target host id, e.g. ``"host_a1b2c3d4..."``.
+    :param workspace: Caller-supplied absolute path on the host, or
+        ``None`` (rejected with the same message as the JSON create).
+    :param spec: The uploaded bundle's validated spec.
+    :param host_store: Persistent host registrations, or ``None``.
+    :param host_registry: This replica's live host connections.
+    :returns: The canonical workspace path to store on the session row.
+    :raises OmnigentError: ``INVALID_INPUT`` on any validation failure,
+        ``WRONG_REPLICA`` for a live host on another replica,
+        ``INTERNAL_ERROR`` when no host registry is configured.
+    :raises HTTPException: 404/403 when the caller may not use the host.
+    """
+    workspace = _require_absolute_host_workspace(workspace)
+    if host_registry is None:
+        raise OmnigentError(
+            "host registry is not configured on this server",
+            code=ErrorCode.INTERNAL_ERROR,
+        )
+    host_name = await _authorize_workspace_host(
+        user_id=user_id,
+        host_id=host_id,
+        host_store=host_store,
+        host_registry=host_registry,
+    )
+    return await _validate_workspace_on_host(
+        host_registry=host_registry,
+        host_id=host_id,
+        workspace=workspace,
+        spec_cwd=_spec_cwd(spec),
+        host_name=host_name,
+    )

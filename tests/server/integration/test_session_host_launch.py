@@ -27,6 +27,7 @@ import httpx
 import pytest
 from asgiref.testing import ApplicationCommunicator
 from fastapi import FastAPI
+from starlette.requests import HTTPConnection
 
 from omnigent.entities import Conversation
 from omnigent.host.frames import (
@@ -45,6 +46,7 @@ from omnigent.host.frames import (
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
+from omnigent.server.auth import AuthProvider
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -53,7 +55,8 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
-from tests.server.helpers import create_test_agent
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from tests.server.helpers import build_agent_bundle, create_test_agent
 
 pytestmark = pytest.mark.asyncio
 
@@ -122,10 +125,61 @@ def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
     )
 
 
-def _websocket_scope(path: str) -> dict[str, object]:
+class _HeaderAuthProvider(AuthProvider):
+    """Auth provider that reads the caller's identity from ``x-test-user``.
+
+    Lets one test act as two users on a permission-wired app without the
+    env-driven provider the auth suites configure.
+    """
+
+    def get_user_id(self, request: HTTPConnection) -> str | None:
+        """Return the ``x-test-user`` header value, or ``None`` when absent.
+
+        :param request: The HTTP request or WebSocket handshake.
+        :returns: The caller's user id, e.g. ``"alice"``.
+        """
+        return request.headers.get("x-test-user")
+
+
+@pytest.fixture()
+def multi_user_app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
+    """Host-wired app that ALSO wires a permission store and header auth.
+
+    The module's default ``app`` has no permission store, so the inline
+    launch's session-owner check (``resolve_host_launch``) is skipped
+    there and cannot observe whether the creator's ownership grant
+    preceded the launch. This app runs that check for real.
+
+    :param runtime_init: Initializes the runtime + mock LLM.
+    :param db_uri: SQLite database URI.
+    :param tmp_path: Pytest temp dir for artifacts and cache.
+    :returns: A configured FastAPI app with hosts, permissions, and auth.
+    """
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    return create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / "cache",
+        ),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        host_store=HostStore(db_uri),
+        permission_store=SqlAlchemyPermissionStore(db_uri),
+        auth_provider=_HeaderAuthProvider(),
+    )
+
+
+def _websocket_scope(
+    path: str, *, headers: list[tuple[bytes, bytes]] | None = None
+) -> dict[str, object]:
     """Build a minimal ASGI WebSocket scope for the host tunnel.
 
     :param path: WebSocket path, e.g. ``"/v1/hosts/<id>/tunnel"``.
+    :param headers: Optional handshake headers, e.g.
+        ``[(b"x-test-user", b"alice")]`` on an auth-wired app.
     :returns: ASGI WebSocket scope dict.
     """
     return {
@@ -135,23 +189,27 @@ def _websocket_scope(path: str) -> dict[str, object]:
         "path": path,
         "raw_path": path.encode("ascii"),
         "query_string": b"",
-        "headers": [],
+        "headers": list(headers or []),
         "client": ("127.0.0.1", 50000),
         "server": ("testserver", 80),
         "subprotocols": [],
     }
 
 
-async def _connect_host(app: FastAPI) -> ApplicationCommunicator:
+async def _connect_host(app: FastAPI, *, user_id: str | None = None) -> ApplicationCommunicator:
     """Connect a mock host over the WebSocket tunnel and wait for it
     to register in the app's host registry.
 
     :param app: The FastAPI app under test (its ``state.host_registry``
         is the same instance the session-create launch path reads).
+    :param user_id: Owner to connect as on an auth-wired app (sent as the
+        ``x-test-user`` handshake header), e.g. ``"alice"``; ``None`` on
+        the default auth-disabled app.
     :returns: The connected ASGI communicator, ready to exchange frames.
     """
     path = f"/v1/hosts/{_HOST_ID}/tunnel"
-    comm = ApplicationCommunicator(app, _websocket_scope(path))
+    headers = [(b"x-test-user", user_id.encode())] if user_id is not None else None
+    comm = ApplicationCommunicator(app, _websocket_scope(path, headers=headers))
     await comm.send_input({"type": "websocket.connect"})
     accepted = await comm.receive_output(timeout=1.0)
     assert accepted["type"] == "websocket.accept"
@@ -256,6 +314,70 @@ async def _serve_one_launch(
             )
             return frame
     raise AssertionError("host never received a launch frame from the inline path")
+
+
+async def _answer_stat(comm: ApplicationCommunicator, *, exists: bool) -> HostStatFrame:
+    """Answer the host's next ``host.stat`` round-trip and return the frame.
+
+    Used where a test drives only the workspace-validation half of a
+    create: replies "exists/directory" (echoing the path as canonical) or
+    "missing", then returns so the caller can assert what the server does
+    next (a launch frame, or nothing at all).
+
+    :param comm: The connected host communicator.
+    :param exists: Whether the fake host reports the path as an existing
+        directory.
+    :returns: The ``host.stat`` frame the server sent.
+    :raises AssertionError: If no stat frame arrives within the budget.
+    """
+    for _ in range(40):
+        output = await comm.receive_output(timeout=3.0)
+        if output["type"] != "websocket.send":
+            continue
+        frame = decode_host_frame(output["text"])
+        if isinstance(frame, HostStatFrame):
+            await comm.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_host_frame(
+                        HostStatResultFrame(
+                            request_id=frame.request_id,
+                            status="ok",
+                            exists=exists,
+                            type="directory" if exists else None,
+                            canonical_path=frame.path if exists else None,
+                        )
+                    ),
+                }
+            )
+            return frame
+    raise AssertionError("host never received a stat frame")
+
+
+async def _stat_or_launch_frames_within(
+    comm: ApplicationCommunicator, *, budget_s: float
+) -> list[HostStatFrame | HostLaunchRunnerFrame]:
+    """Collect the stat / launch frames the host receives until it goes quiet.
+
+    :param comm: Connected host communicator.
+    :param budget_s: Seconds to wait on each receive before concluding
+        nothing more is coming, e.g. ``0.5``.
+    :returns: The decoded frames in arrival order; empty when the server
+        contacted the host with neither a stat nor a launch.
+    """
+    frames: list[HostStatFrame | HostLaunchRunnerFrame] = []
+    try:
+        # Bounded so a chatty ping loop can't spin forever.
+        for _ in range(40):
+            output = await comm.receive_output(timeout=budget_s)
+            if output["type"] != "websocket.send":
+                continue
+            frame = decode_host_frame(output["text"])
+            if isinstance(frame, (HostStatFrame, HostLaunchRunnerFrame)):
+                frames.append(frame)
+    except asyncio.TimeoutError:
+        pass
+    return frames
 
 
 async def _serve_one_stop(comm: ApplicationCommunicator) -> str:
@@ -847,6 +969,507 @@ async def _stop_host_session(
     # stop_session is a control event, not a persisted item.
     assert stop_resp.json() == {"queued": False}, stop_resp.json()
     return stopped_runner_id
+
+
+def _multipart_create_kwargs(
+    metadata: dict[str, object],
+    *,
+    agent_name: str,
+    harness: str = "codex",
+) -> dict[str, Any]:
+    """Build the form parts for a bundled multipart ``POST /v1/sessions``.
+
+    :param metadata: The JSON ``metadata`` part, e.g.
+        ``{"host_id": "host_abc", "workspace": "/work/repo"}``.
+    :param agent_name: Name written into the uploaded bundle's spec,
+        e.g. ``"multipart-launch-agent"``.
+    :param harness: Harness the bundle's executor declares, e.g.
+        ``"codex"`` (gets the omnigent REPL terminal) or
+        ``"claude-native"`` (a vendor TUI instead).
+    :returns: ``data`` / ``files`` keyword arguments for ``client.post``.
+    """
+    bundle = build_agent_bundle(
+        name=agent_name,
+        executor={"type": "omnigent", "config": {"harness": harness}},
+    )
+    return {
+        "data": {"metadata": json.dumps(metadata)},
+        "files": {"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    }
+
+
+async def _list_session_ids(client: httpx.AsyncClient) -> list[str]:
+    """Return every session id ``GET /v1/sessions`` lists.
+
+    :param client: Test HTTP client.
+    :returns: Session ids in listing order; empty when nothing was
+        created.
+    """
+    listing = await client.get("/v1/sessions")
+    assert listing.status_code == 200, listing.text
+    return [row["id"] for row in listing.json()["data"]]
+
+
+async def test_multipart_inline_launch_binds_runner_and_returns_host(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+) -> None:
+    """Multipart ``POST /v1/sessions`` with ``metadata.host_id`` +
+    ``workspace`` validates the workspace, binds a runner, and launches
+    it, exactly like the JSON form.
+
+    A failure here means the bundle-upload form persists ``workspace``
+    but drops ``host_id``: the session is created unbound, no launch
+    frame is sent, and the first message can never be delivered. The
+    launch frame must target the new session on the requested workspace
+    and carry the uploaded bundle's canonical harness so the host can
+    run its configured-harness check. The snapshot must also carry the
+    JSON form's create-time terminal-view label and spin-up flag, or the
+    Web UI falls back to the passive "Connecting…" band for these
+    sessions.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    comm = await _connect_host(app)
+
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    resp = await client.post(
+        "/v1/sessions",
+        **_multipart_create_kwargs(
+            {"host_id": _HOST_ID, "workspace": _WORKSPACE},
+            agent_name="multipart-launch-agent",
+        ),
+    )
+    launch_frame = await responder
+
+    assert resp.status_code == 201, f"expected 201, got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    try:
+        # The multipart response must carry the binding so a client can
+        # route to the runner; a None here means the launch branch didn't run.
+        assert body["host_id"] == _HOST_ID
+        assert body["runner_id"].startswith("runner_token_"), (
+            f"runner_id should be derived from the server binding token, got {body['runner_id']!r}"
+        )
+        assert launch_frame.session_id == body["session_id"]
+        assert launch_frame.workspace == _WORKSPACE
+        assert launch_frame.harness == "codex", (
+            f"launch frame should carry the bundle's harness, got {launch_frame.harness!r}"
+        )
+
+        # The snapshot a reloading UI reads must show the same binding as
+        # the create response: host, token-bound runner, and workspace.
+        snapshot = await client.get(f"/v1/sessions/{body['session_id']}")
+        assert snapshot.status_code == 200, snapshot.text
+        snap = snapshot.json()
+        assert snap["host_id"] == _HOST_ID
+        assert snap["runner_id"] == body["runner_id"]
+        assert snap["workspace"] == _WORKSPACE
+        # Parity with the JSON form's create-time stamp: the terminal-view
+        # label is persisted and the spin-up flag is raised (the fake
+        # runner never boots, so nothing clears it here).
+        assert snap["labels"].get("omnigent.ui") == "terminal", (
+            f"multipart host launch must stamp the terminal-view label; got {snap['labels']}"
+        )
+        assert snap["terminal_pending"] is True
+
+        conv = SqlAlchemyConversationStore(db_uri).get_conversation(body["session_id"])
+        assert conv is not None
+        assert conv.runner_id == body["runner_id"]
+        assert conv.host_id == _HOST_ID
+        assert conv.workspace == _WORKSPACE
+    finally:
+        sessions_module._session_terminal_pending_cache.pop(body["session_id"], None)
+
+
+async def test_multipart_inline_launch_skips_terminal_view_label_for_native_harness(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """A native-harness bundle launches without the terminal-view label.
+
+    Native harnesses run a vendor TUI instead of the omnigent REPL
+    terminal, so their runner never auto-creates one; stamping the label
+    (or raising the spin-up flag) would leave the Web UI waiting on a
+    terminal that never arrives. Mirrors the JSON form's native case.
+    """
+    comm = await _connect_host(app)
+
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    resp = await client.post(
+        "/v1/sessions",
+        **_multipart_create_kwargs(
+            {"host_id": _HOST_ID, "workspace": _WORKSPACE},
+            agent_name="multipart-native-agent",
+            harness="claude-native",
+        ),
+    )
+    launch_frame = await responder
+
+    assert resp.status_code == 201, f"expected 201, got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    assert body["runner_id"] is not None
+    assert launch_frame.harness == "claude-native"
+    snapshot = await client.get(f"/v1/sessions/{body['session_id']}")
+    assert snapshot.status_code == 200, snapshot.text
+    assert "omnigent.ui" not in snapshot.json()["labels"]
+    assert snapshot.json()["terminal_pending"] is False
+
+
+async def test_multipart_create_without_host_skips_launch(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """A multipart create that names no host stays unbound.
+
+    This is the CLI-initiated shape (``omnigent run`` uploads its bundle
+    and spawns its own runner): the response reports no binding, the
+    connected host receives no launch frame, and — with no runner to
+    auto-create a REPL terminal — neither the terminal-view label nor
+    the spin-up flag is set.
+    """
+    comm = await _connect_host(app)
+
+    resp = await client.post(
+        "/v1/sessions",
+        **_multipart_create_kwargs(
+            {"workspace": _WORKSPACE},
+            agent_name="multipart-unbound-agent",
+        ),
+    )
+
+    assert resp.status_code == 201, f"expected 201, got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    assert body["host_id"] is None
+    assert body["runner_id"] is None
+    assert not await _expect_no_launch(comm, budget_s=0.5), (
+        "a create without host_id must not send a host.launch_runner frame"
+    )
+
+    snapshot = await client.get(f"/v1/sessions/{body['session_id']}")
+    assert snapshot.status_code == 200, snapshot.text
+    snap = snapshot.json()
+    assert snap["host_id"] is None
+    assert snap["runner_id"] is None
+    assert "omnigent.ui" not in snap["labels"]
+    assert snap["terminal_pending"] is False
+
+
+async def test_multipart_inline_launch_failure_still_returns_bound_session(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+) -> None:
+    """A host that declines the launch of a bundled session still yields
+    201 with the runner bound — the same lenient contract as the JSON
+    form, leaving the session recoverable via the first-message relaunch.
+
+    The declined launch also clears the spin-up flag the create raised,
+    so the Terminal pill is not left spinning for a runner that never
+    booted.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    comm = await _connect_host(app)
+
+    responder = asyncio.create_task(
+        _serve_one_launch(comm, launch_status="failed", launch_error="disk full")
+    )
+    resp = await client.post(
+        "/v1/sessions",
+        **_multipart_create_kwargs(
+            {"host_id": _HOST_ID, "workspace": _WORKSPACE},
+            agent_name="multipart-failed-launch-agent",
+        ),
+    )
+    await responder
+
+    # Lenient: launch failure does NOT fail the create.
+    assert resp.status_code == 201, f"expected 201 despite launch failure, got {resp.status_code}"
+    body = resp.json()
+    try:
+        assert body["host_id"] == _HOST_ID
+        assert body["runner_id"].startswith("runner_token_"), (
+            f"a token-bound runner_id should survive a failed launch, got {body['runner_id']!r}"
+        )
+
+        # The binding stays in place for a later relaunch rather than being
+        # rolled back when the host declines.
+        conv = SqlAlchemyConversationStore(db_uri).get_conversation(body["session_id"])
+        assert conv is not None
+        assert conv.runner_id == body["runner_id"]
+        assert conv.host_id == _HOST_ID
+
+        snapshot = await client.get(f"/v1/sessions/{body['session_id']}")
+        assert snapshot.status_code == 200, snapshot.text
+        assert snapshot.json()["labels"].get("omnigent.ui") == "terminal"
+        assert snapshot.json()["terminal_pending"] is False, (
+            "a declined launch must clear the spin-up flag the create raised"
+        )
+    finally:
+        sessions_module._session_terminal_pending_cache.pop(body["session_id"], None)
+
+
+@pytest.mark.parametrize(
+    "workspace,expected_detail",
+    [
+        (None, "workspace required"),
+        ("relative/path", "absolute path"),
+    ],
+)
+async def test_multipart_create_rejects_bad_workspace(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    workspace: str | None,
+    expected_detail: str,
+) -> None:
+    """``metadata.host_id`` with a missing or non-absolute ``workspace``
+    is rejected with 400 before any host contact and before any row
+    exists — the JSON form's route-level rule (the missing case is also
+    caught by the metadata schema, with the same message).
+
+    Without the absolute-path half, a relative workspace would be sent
+    to the host, which resolves it against its own daemon cwd.
+    """
+    comm = await _connect_host(app)
+    metadata: dict[str, object] = {"host_id": _HOST_ID}
+    if workspace is not None:
+        metadata["workspace"] = workspace
+
+    resp = await client.post(
+        "/v1/sessions",
+        **_multipart_create_kwargs(metadata, agent_name="multipart-bad-workspace-agent"),
+    )
+
+    assert resp.status_code == 400, f"expected 400, got {resp.status_code}: {resp.text}"
+    assert expected_detail in resp.text
+    assert await _stat_or_launch_frames_within(comm, budget_s=0.5) == [], (
+        "a rejected workspace must not reach the host"
+    )
+    assert await _list_session_ids(client) == [], (
+        "a rejected create must not leave a session row behind"
+    )
+
+
+async def test_multipart_create_missing_workspace_path_leaves_no_row(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """The host's ``host.stat`` verdict gates the multipart create the way
+    it gates the JSON form: a workspace that does not exist on the host
+    is a 400, no launch frame follows, and no session row exists.
+
+    Validating only after the insert would leave an orphan host-bound
+    session (owned and announced) behind every rejected create.
+    """
+    comm = await _connect_host(app)
+
+    responder = asyncio.create_task(_answer_stat(comm, exists=False))
+    resp = await client.post(
+        "/v1/sessions",
+        **_multipart_create_kwargs(
+            {"host_id": _HOST_ID, "workspace": "/does/not/exist"},
+            agent_name="multipart-missing-path-agent",
+        ),
+    )
+    stat_frame = await responder
+
+    assert stat_frame.path == "/does/not/exist"
+    assert resp.status_code == 400, f"expected 400, got {resp.status_code}: {resp.text}"
+    assert "does not exist" in resp.text
+    assert await _stat_or_launch_frames_within(comm, budget_s=0.5) == [], (
+        "a rejected workspace must not be followed by a launch frame"
+    )
+    assert await _list_session_ids(client) == []
+
+
+async def test_multipart_create_unknown_host_leaves_no_row(
+    client: httpx.AsyncClient,
+) -> None:
+    """An unknown ``metadata.host_id`` fails before the row, bundle,
+    ownership grant, or ``session.added`` announcement exist — the same
+    404 the JSON form returns for the input — so a rejected create cannot
+    strand an orphan host-bound session.
+    """
+    resp = await client.post(
+        "/v1/sessions",
+        **_multipart_create_kwargs(
+            {"host_id": _HOST_ID, "workspace": _WORKSPACE},
+            agent_name="multipart-unknown-host-agent",
+        ),
+    )
+
+    assert resp.status_code == 404, f"expected 404, got {resp.status_code}: {resp.text}"
+    assert resp.json().get("detail") == "host not found"
+    assert await _list_session_ids(client) == []
+
+
+async def test_multipart_child_on_inherited_runner_skips_launch(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+) -> None:
+    """A bundled sub-agent child of a host-launched parent co-locates on
+    the parent's runner: ``host_id`` in its metadata launches nothing.
+
+    The child inherits the parent's binding, so a second launch would
+    either bind a competing runner or 409 on the already-bound row. The
+    workspace is still validated on the host (one ``host.stat``), as the
+    JSON form does for a child that names a host; the response reports
+    no launch while the row keeps the inherited runner, the host, and
+    the canonical workspace. Like a JSON sub-agent child, it gets no
+    create-time terminal-view label and no spin-up flag.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    comm = await _connect_host(app)
+    parent = await _inline_launch_session(client, comm)
+
+    responder = asyncio.create_task(_answer_stat(comm, exists=True))
+    resp = await client.post(
+        "/v1/sessions",
+        **_multipart_create_kwargs(
+            {
+                "parent_session_id": parent["id"],
+                "host_id": _HOST_ID,
+                "workspace": _WORKSPACE,
+            },
+            agent_name="multipart-child-agent",
+        ),
+    )
+    await responder
+
+    assert resp.status_code == 201, f"expected 201, got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    try:
+        assert body["host_id"] is None
+        assert body["runner_id"] is None
+        assert not await _expect_no_launch(comm, budget_s=0.5), (
+            "a child on an inherited runner must not send a host.launch_runner frame"
+        )
+
+        conv = SqlAlchemyConversationStore(db_uri).get_conversation(body["session_id"])
+        assert conv is not None
+        assert conv.parent_conversation_id == parent["id"]
+        assert conv.runner_id == parent["runner_id"]
+        assert conv.host_id == _HOST_ID
+        assert conv.workspace == _WORKSPACE
+        snapshot = await client.get(f"/v1/sessions/{body['session_id']}")
+        assert snapshot.status_code == 200, snapshot.text
+        assert "omnigent.ui" not in snapshot.json()["labels"]
+        assert snapshot.json()["terminal_pending"] is False
+    finally:
+        sessions_module._session_terminal_pending_cache.pop(body["session_id"], None)
+        sessions_module._session_terminal_pending_cache.pop(parent["id"], None)
+
+
+async def test_inline_launch_timeout_keeps_binding_and_clears_pending(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host that never answers the launch frame is handled like a refusal.
+
+    The create still returns 201 with the token-bound runner kept for the
+    first-message relaunch, the spin-up flag is cleared, and the pending
+    launch future is evicted so the host connection does not accumulate
+    stale waiters. Pins the timeout branch of the inline-launch helper
+    both create forms share, with the timeout patched on the facade (the
+    target impl modules read at call time).
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_INLINE_HOST_LAUNCH_RESULT_TIMEOUT_S", 0.2)
+    comm = await _connect_host(app)
+    agent = await create_test_agent(client)
+
+    responder = asyncio.create_task(_answer_stat(comm, exists=True))
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    await responder
+
+    assert resp.status_code == 201, f"expected 201 despite the timeout, got {resp.status_code}"
+    body = resp.json()
+    try:
+        assert body["host_id"] == _HOST_ID
+        assert body["runner_id"].startswith("runner_token_")
+        launch_frame = await _wait_for_launch(comm, budget_s=1.0)
+        assert launch_frame is not None and launch_frame.session_id == body["id"]
+        conn = app.state.host_registry.get(_HOST_ID)
+        assert conn is not None
+        assert conn.pending_launches == {}, "the timed-out launch future must be evicted"
+
+        conv = SqlAlchemyConversationStore(db_uri).get_conversation(body["id"])
+        assert conv is not None
+        assert conv.runner_id == body["runner_id"]
+        snapshot = await client.get(f"/v1/sessions/{body['id']}")
+        assert snapshot.status_code == 200, snapshot.text
+        assert snapshot.json()["terminal_pending"] is False
+    finally:
+        sessions_module._session_terminal_pending_cache.pop(body["id"], None)
+
+
+async def test_multipart_inline_launch_authorizes_after_ownership_grant(
+    multi_user_app: FastAPI,
+    db_uri: str,
+) -> None:
+    """On a permission-wired server the multipart launch runs AFTER the
+    creator's ownership grant, so the launch's session-owner check passes
+    and the runner binds; a foreign host is refused before any row exists.
+
+    The module's default app skips the owner check (no permission store),
+    so only this test can catch the launch being reordered ahead of the
+    grant: that surfaces here as a 404 "session not found" from
+    ``resolve_host_launch`` instead of a 201 with a bound runner.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    comm = await _connect_host(multi_user_app, user_id="alice")
+    store = SqlAlchemyConversationStore(db_uri)
+    transport = httpx.ASGITransport(app=multi_user_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+        resp = await client.post(
+            "/v1/sessions",
+            headers={"x-test-user": "alice"},
+            **_multipart_create_kwargs(
+                {"host_id": _HOST_ID, "workspace": _WORKSPACE},
+                agent_name="multipart-owned-launch-agent",
+            ),
+        )
+        launch_frame = await responder
+
+        assert resp.status_code == 201, f"expected 201, got {resp.status_code}: {resp.text}"
+        body = resp.json()
+        try:
+            assert body["host_id"] == _HOST_ID
+            assert body["runner_id"].startswith("runner_token_")
+            assert launch_frame.session_id == body["session_id"]
+            conv = store.get_conversation(body["session_id"])
+            assert conv is not None
+            assert conv.runner_id == body["runner_id"]
+
+            # Bob may not launch on Alice's host: refused by the pre-persist
+            # host check, so nothing reaches the host and no row is written.
+            bob = await client.post(
+                "/v1/sessions",
+                headers={"x-test-user": "bob"},
+                **_multipart_create_kwargs(
+                    {"host_id": _HOST_ID, "workspace": _WORKSPACE},
+                    agent_name="multipart-foreign-host-agent",
+                ),
+            )
+            assert bob.status_code == 403, f"expected 403, got {bob.status_code}: {bob.text}"
+            assert bob.json().get("detail") == "not your host"
+            assert await _stat_or_launch_frames_within(comm, budget_s=0.5) == []
+            listed = store.list_conversations(limit=100).data
+            assert [c.id for c in listed] == [body["session_id"]]
+        finally:
+            sessions_module._session_terminal_pending_cache.pop(body["session_id"], None)
 
 
 async def test_stop_session_stops_host_launched_runner(

@@ -3159,6 +3159,34 @@ def test_create_session_with_agent_records_workspace(
     assert fetched.host_id is None
 
 
+def test_create_session_with_agent_records_host_binding(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Verify create_session_with_agent stores host_id alongside workspace
+    on the conversation row.
+
+    The multipart create passes the host the session should launch on;
+    if the column stays NULL the inline launch has nothing to bind and
+    the row reads as a CLI-launched session everywhere host liveness and
+    relaunch are decided.
+    """
+    created = conversation_store.create_session_with_agent(
+        agent_id="6b1f0e4c2d9a4f1e8c3b7a5d9e2f1c0b",
+        agent_name="host-bound-agent",
+        agent_bundle_location="6b1f0e4c2d9a4f1e8c3b7a5d9e2f1c0b/bundle1",
+        agent_description=None,
+        host_id="c2d81b1a6812ae1cf32221c5a2a70ba0",
+        workspace="/work/repo",
+    )
+    assert created.conversation.host_id == "c2d81b1a6812ae1cf32221c5a2a70ba0"
+
+    fetched = conversation_store.get_conversation(created.conversation.id)
+    assert fetched is not None
+    assert fetched.host_id == "c2d81b1a6812ae1cf32221c5a2a70ba0"
+    assert fetched.workspace == "/work/repo"
+
+
 def test_create_session_with_agent_workspace_defaults_to_none(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

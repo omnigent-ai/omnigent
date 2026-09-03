@@ -313,6 +313,7 @@ def _new_session_metadata_row(
     conversation_id: str,
     parent_conversation_id: str | None = None,
     runner_id: str | None = None,
+    host_id: str | None = None,
     workspace: str | None = None,
     terminal_launch_args: list[str] | None = None,
     project_id: str | None = None,
@@ -325,6 +326,8 @@ def _new_session_metadata_row(
         sub-agent child (``kind="sub_agent"``); ``None`` → ``"default"``.
     :param runner_id: Optional runner binding inherited from the
         parent session. ``None`` leaves the column NULL.
+    :param host_id: Optional host that should launch the runner.
+        ``None`` leaves the column NULL.
     :param workspace: Optional starting cwd. ``None`` leaves it NULL.
     :param terminal_launch_args: Optional pass-through CLI args for a
         native terminal wrapper. ``None`` leaves it NULL; a list
@@ -335,6 +338,7 @@ def _new_session_metadata_row(
         id=conversation_id,
         kind=encode_conversation_kind("sub_agent" if parent_conversation_id else "default"),
         runner_id=runner_id,
+        host_id=host_id,
         project_id=project_id,
         workspace=workspace,
         terminal_launch_args=(
@@ -3365,6 +3369,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         title: str | None = None,
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
+        host_id: str | None = None,
         workspace: str | None = None,
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
@@ -3396,15 +3401,18 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param reasoning_effort: Optional per-session
             reasoning-effort hint, e.g. ``"high"``. ``None``
             means use the agent default.
+        :param host_id: Optional host that should launch the runner
+            for this session, e.g. ``"host_a1b2c3d4..."``. ``None``
+            for CLI-initiated sessions where the caller manages
+            runner spawning.
         :param workspace: Optional starting cwd to record on the
             session for display, e.g.
             ``"/Users/corey/projects/myapp"``. CLI-launched
             sessions populate this with ``os.getcwd()``;
             multipart bundle uploads from the Web UI may pass
-            ``None``. ``None`` is allowed because this path
-            doesn't set ``host_id`` (so the
-            ``ck_conversations_workspace_required_for_host``
-            constraint isn't active).
+            ``None`` when no host is targeted. Required when
+            ``host_id`` is set (DB check constraint
+            ``ck_conversations_workspace_required_for_host``).
         :param terminal_launch_args: Optional pass-through CLI args
             for a native terminal wrapper (claude / codex), e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves
@@ -3422,6 +3430,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         :raises ConversationNotFoundError: If
             ``parent_conversation_id`` is set but no such
             conversation exists.
+        :raises IntegrityError: If ``host_id`` is set without
+            ``workspace`` (the check constraint catches it).
         """
         return self._create_session_with_agent_with_id(
             generate_conversation_id(),
@@ -3432,6 +3442,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             title=title,
             labels=labels,
             reasoning_effort=reasoning_effort,
+            host_id=host_id,
             workspace=workspace,
             terminal_launch_args=terminal_launch_args,
             parent_conversation_id=parent_conversation_id,
@@ -3450,6 +3461,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         title: str | None = None,
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
+        host_id: str | None = None,
         workspace: str | None = None,
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
@@ -3502,6 +3514,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             conversation_id,
             parent_conversation_id=parent_conversation_id,
             runner_id=runner_id,
+            host_id=host_id,
             project_id=project_id,
             workspace=workspace,
             terminal_launch_args=terminal_launch_args,
