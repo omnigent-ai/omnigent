@@ -67,3 +67,32 @@ def test_configure_host_git_noop_without_token(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(h.subprocess, "run", lambda *a, **k: calls.append(a))
     h.configure_host_git("http://srv", "host1")
     assert calls == []  # no token → nothing configured
+
+
+def test_credential_url_targets_the_generic_provider_path() -> None:
+    # The helper hits the provider-generic broker with provider=github.
+    assert h._credential_url("http://s", "hid") == "http://s/v1/hosts/hid/credentials/github"
+    assert h._credential_url("http://s/", "hid") == "http://s/v1/hosts/hid/credentials/github"
+
+
+def test_fetch_sends_launch_token_as_header_not_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Exercise the real request construction (the other tests stub _fetch): the
+    # launch token must ride the header so it can't land in server access logs.
+    seen: dict = {}
+
+    class _Resp:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {"connected": True, "token": "T", "username": "x-access-token"}
+
+    def fake_get(url: str, headers: dict, timeout: float) -> _Resp:
+        seen["url"], seen["headers"] = url, headers
+        return _Resp()
+
+    monkeypatch.setattr(h.httpx, "get", fake_get)
+    data = h._fetch("http://s", "hid", "launch-tok")
+    assert data is not None and data["token"] == "T"
+    assert seen["url"] == "http://s/v1/hosts/hid/credentials/github"
+    assert seen["headers"][h.MANAGED_HOST_TOKEN_HEADER] == "launch-tok"
+    assert "launch-tok" not in seen["url"]

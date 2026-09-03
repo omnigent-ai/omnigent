@@ -3,8 +3,9 @@
 Installed in a managed sandbox as git's ``credential.helper`` for
 ``github.com``. On each HTTPS auth challenge git runs this with ``get`` and the
 request on stdin; the helper calls the server's host-facing credential endpoint
-(:mod:`omnigent.server.routes.host_github`) over the sandbox's existing
-authenticated channel and prints back ``username`` / ``password``.
+(:mod:`omnigent.server.routes.host_credentials`, with ``provider=github``) over
+the sandbox's existing authenticated channel and prints back ``username`` /
+``password``.
 
 Why this shape:
 - The **GitHub token is never persisted** in the sandbox — it's fetched fresh
@@ -60,7 +61,7 @@ def _read_git_request() -> dict[str, str]:
 
 
 def _credential_url(server: str, host_id: str) -> str:
-    return f"{server.rstrip('/')}/v1/hosts/{host_id}/github-credential"
+    return f"{server.rstrip('/')}/v1/hosts/{host_id}/credentials/github"
 
 
 def _fetch(server: str, host_id: str, host_token: str) -> dict | None:

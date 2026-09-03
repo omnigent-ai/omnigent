@@ -22,6 +22,10 @@ _logger = logging.getLogger(__name__)
 # mid-launch (or shortly after) inside the sandbox.
 _REFRESH_MARGIN_S = 300
 
+# The username git uses with a token over HTTPS (``https://<user>:<token>@…``);
+# GitHub ignores the value but requires a non-empty one.
+_GIT_TOKEN_USERNAME = "x-access-token"
+
 
 async def resolve_access_token(
     user_id: str,
@@ -87,6 +91,31 @@ async def _try_refresh(
     except Exception as exc:  # noqa: BLE001 - a persist error must not drop a minted token
         _logger.warning("GitHub token refresh could not be persisted for %s: %s", user_id, exc)
     return refreshed.access_token
+
+
+async def resolve_github_credential(
+    user_id: str,
+    *,
+    store: GithubConnectionStore,
+    client: GitHubAppClient,
+) -> dict[str, object] | None:
+    """Resolve the GitHub broker payload for *user_id*, or ``None``.
+
+    The provider adapter the generic credential broker
+    (:mod:`omnigent.server.routes.host_credentials`) calls: returns the vended
+    token plus the attribution metadata git needs (``username``/``login``), or
+    ``None`` when the owner has not linked GitHub. The ``owner``/``login`` let
+    the host attribute commits to the human, decoupled from the push credential.
+    """
+    token = await resolve_access_token(user_id, store=store, client=client)
+    if token is None:
+        return None
+    connection = await _run_sync(store.get, user_id)
+    return {
+        "username": _GIT_TOKEN_USERNAME,
+        "token": token,
+        "login": connection.github_login if connection is not None else None,
+    }
 
 
 async def _run_sync(func, /, *args, **kwargs):
