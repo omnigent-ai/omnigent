@@ -17,6 +17,11 @@ import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 // inert. subscribe/subscribeStatus return no-op unsubscribers.
 const setWatched = vi.fn();
 const subscribe = vi.fn((_fn: () => void) => () => {});
+const notifySessionSummariesMayHaveChanged = vi.fn();
+vi.mock("@/lib/sessionSummaryChanges", () => ({
+  notifySessionSummariesMayHaveChanged: (...args: unknown[]) =>
+    notifySessionSummariesMayHaveChanged(...args),
+}));
 vi.mock("@/lib/sessionUpdatesSocket", () => ({
   sessionUpdatesSocket: {
     start: vi.fn(),
@@ -87,6 +92,7 @@ function lastWatched(): string[] {
 beforeEach(() => {
   setWatched.mockClear();
   subscribe.mockClear();
+  notifySessionSummariesMayHaveChanged.mockClear();
 });
 
 afterEach(() => {
@@ -157,6 +163,23 @@ function frameHandler(): (frame: unknown) => void {
   if (!call) throw new Error("provider never subscribed to the socket");
   return call[0] as unknown as (frame: unknown) => void;
 }
+
+describe("SessionUpdatesProvider summary invalidation", () => {
+  it("notifies for session data frames but not transport-only frames", () => {
+    const client = new QueryClient();
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+
+    act(() => handler({ type: "heartbeat" }));
+    act(() => handler({ type: "hosts_changed" }));
+    expect(notifySessionSummariesMayHaveChanged).not.toHaveBeenCalled();
+
+    act(() => handler({ type: "snapshot", items: [] }));
+    act(() => handler({ type: "changed", items: [] }));
+    act(() => handler({ type: "removed", ids: [] }));
+    expect(notifySessionSummariesMayHaveChanged).toHaveBeenCalledTimes(3);
+  });
+});
 
 // Wire-shaped session row carrying a comments fingerprint. Frames send full
 // rows with explicit nulls (comments_updated_at: null when no comments).

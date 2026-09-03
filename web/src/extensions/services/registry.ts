@@ -10,6 +10,7 @@ export const HOST_METHOD_PERMISSIONS = {
   "storage.user.set": "storage.user",
   "storage.user.delete": "storage.user",
   "sessions.listPage": "sessions.read",
+  "sessions.subscribe": "sessions.read",
 } as const satisfies Record<string, string | null>;
 
 export function grantedHostMethods<T extends Record<string, unknown>>(

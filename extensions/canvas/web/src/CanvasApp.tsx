@@ -33,6 +33,7 @@ import { SessionCardNode, type SessionCardData } from "./SessionCardNode";
 const nodeTypes = { session: SessionCardNode };
 const proOptions = { hideAttribution: true };
 const defaultViewport: CanvasViewport = { x: 0, y: 0, zoom: 1 };
+const RECONCILE_INTERVAL_MS = 30_000;
 type SessionNode = Node<SessionCardData, "session">;
 
 function isMobileViewport(): boolean {
@@ -51,6 +52,7 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [storageWarning, setStorageWarning] = useState<string | null>(null);
+  const [liveWarning, setLiveWarning] = useState<string | null>(null);
   const [savedViewport, setSavedViewport] = useState<CanvasViewport | null>(
     null,
   );
@@ -62,6 +64,13 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
   const initializedRef = useRef(false);
   const viewportTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const aliveRef = useRef(true);
+  const liveDirtyRef = useRef(false);
+  const refreshQueuedRef = useRef(false);
+  const refreshInFlightRef = useRef<Promise<void> | null>(null);
+  const refreshRef = useRef<(() => Promise<void>) | null>(null);
+  const liveCooldownTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
 
   useEffect(() => {
     return () => {
@@ -155,38 +164,68 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
     [context.storage.user, nodesFor],
   );
 
-  const refresh = useCallback(
-    async (initial = false) => {
-      setRefreshing(!initial);
-      if (initial) setLoading(true);
-      try {
-        const items = await loadSessions(context);
-        if (!aliveRef.current) return;
-        await applySessions(items, !initial);
-        if (!aliveRef.current) return;
-        setError(null);
-        if (initial && !savedViewport) {
-          requestAnimationFrame(() =>
-            flow.fitView({ padding: 0.2, duration: 0 }),
-          );
-        }
-      } catch (reason) {
-        if (aliveRef.current) {
-          setError(
-            reason instanceof Error
-              ? reason.message
-              : "Could not load sessions",
-          );
-        }
-      } finally {
-        if (aliveRef.current) {
-          setLoading(false);
-          setRefreshing(false);
-        }
+  const performRefresh = useCallback(async () => {
+    try {
+      const items = await loadSessions(context);
+      if (!aliveRef.current) return;
+      await applySessions(items, true);
+      if (aliveRef.current) setError(null);
+    } catch (reason) {
+      if (aliveRef.current) {
+        setError(
+          reason instanceof Error ? reason.message : "Could not load sessions",
+        );
       }
-    },
-    [applySessions, context, flow, savedViewport],
-  );
+    }
+  }, [applySessions, context]);
+
+  const refresh = useCallback((): Promise<void> => {
+    if (refreshInFlightRef.current) {
+      refreshQueuedRef.current = true;
+      return refreshInFlightRef.current;
+    }
+    if (aliveRef.current) setRefreshing(true);
+    const scheduleCooldownRefresh = () => {
+      if (liveCooldownTimerRef.current) return;
+      liveCooldownTimerRef.current = setTimeout(() => {
+        liveCooldownTimerRef.current = null;
+        if (
+          aliveRef.current &&
+          liveDirtyRef.current &&
+          document.visibilityState === "visible"
+        ) {
+          liveDirtyRef.current = false;
+          void refreshRef.current?.();
+        }
+      }, 1_000);
+    };
+    const drain = async () => {
+      refreshQueuedRef.current = false;
+      await performRefresh();
+      if (!aliveRef.current || !refreshQueuedRef.current) return;
+      if (document.visibilityState !== "visible") {
+        liveDirtyRef.current = true;
+        refreshQueuedRef.current = false;
+        return;
+      }
+      refreshQueuedRef.current = false;
+      await performRefresh();
+      if (refreshQueuedRef.current) {
+        liveDirtyRef.current = true;
+        refreshQueuedRef.current = false;
+        scheduleCooldownRefresh();
+      }
+    };
+    const current = drain().finally(() => {
+      if (refreshInFlightRef.current === current) {
+        refreshInFlightRef.current = null;
+      }
+      if (aliveRef.current) setRefreshing(false);
+    });
+    refreshInFlightRef.current = current;
+    return current;
+  }, [performRefresh]);
+  refreshRef.current = refresh;
 
   useEffect(() => {
     if (initializedRef.current) return;
@@ -224,8 +263,67 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
     return () => {
       cancelled = true;
       if (viewportTimerRef.current) clearTimeout(viewportTimerRef.current);
+      if (liveCooldownTimerRef.current)
+        clearTimeout(liveCooldownTimerRef.current);
     };
   }, [applySessions, context, flow]);
+
+  useEffect(() => {
+    if (loading || !context.capabilities.includes("sessions.subscribe")) return;
+    let disposed = false;
+    let subscription: { dispose(): void } | null = null;
+    const consumeDirty = () => {
+      if (
+        document.visibilityState !== "visible" ||
+        liveCooldownTimerRef.current
+      ) {
+        return;
+      }
+      liveDirtyRef.current = false;
+      void refresh();
+    };
+    const onSessionChange = () => {
+      liveDirtyRef.current = true;
+      consumeDirty();
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== "visible") return;
+      liveDirtyRef.current = true;
+      consumeDirty();
+    };
+    const reconcileTimer = setInterval(() => {
+      liveDirtyRef.current = true;
+      consumeDirty();
+    }, RECONCILE_INTERVAL_MS);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    void context.sessions.subscribe(onSessionChange).then(
+      (nextSubscription) => {
+        if (disposed) nextSubscription.dispose();
+        else {
+          subscription = nextSubscription;
+          if (aliveRef.current) {
+            setLiveWarning(null);
+            liveDirtyRef.current = true;
+            consumeDirty();
+          }
+        }
+      },
+      (reason: unknown) => {
+        if (disposed || !aliveRef.current) return;
+        setLiveWarning(
+          reason instanceof Error
+            ? `Live updates unavailable: ${reason.message}`
+            : "Live updates are unavailable.",
+        );
+      },
+    );
+    return () => {
+      disposed = true;
+      subscription?.dispose();
+      clearInterval(reconcileTimer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [context, loading, refresh]);
 
   const onNodesChange = useCallback((changes: NodeChange<SessionNode>[]) => {
     setNodes((current) => applyNodeChanges(changes, current));
@@ -311,7 +409,7 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
       <div className="canvas-state" role="alert">
         <strong>Canvas could not load</strong>
         <span>{error}</span>
-        <button type="button" onClick={() => void refresh(true)}>
+        <button type="button" onClick={() => void refresh()}>
           Retry
         </button>
       </div>
@@ -378,6 +476,11 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
       {storageWarning && (
         <div className="canvas-banner" role="status">
           {storageWarning}
+        </div>
+      )}
+      {liveWarning && (
+        <div className="canvas-banner" role="status">
+          {liveWarning}
         </div>
       )}
       <div className="canvas-flow" style={{ flex: 1, minHeight: 0 }}>

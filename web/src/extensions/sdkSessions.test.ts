@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   drainSessionPages,
   type ExtensionSessionPage,
+  SessionRevisionTracker,
   validateSessionPageLimit,
   type ExtensionSessionSummary,
 } from "../../../sdks/web-extension/src/sessions";
@@ -20,6 +21,31 @@ function session(id: string): ExtensionSessionSummary {
 function failure(code: string, message: string): Error {
   return Object.assign(new Error(message), { code });
 }
+
+describe("SessionRevisionTracker", () => {
+  it("ignores the initial revision and accepts only newer revisions", () => {
+    const tracker = new SessionRevisionTracker();
+    expect(tracker.accept({ revision: 4 })).toBe(false);
+    expect(tracker.initialize({ revision: 4 }, failure)).toBe(false);
+    expect(tracker.accept({ revision: 4 })).toBe(false);
+    expect(tracker.accept({ revision: 5 })).toBe(true);
+    expect(tracker.accept({ revision: 3 })).toBe(false);
+    expect(tracker.accept({ sessionId: "hidden" })).toBe(false);
+  });
+
+  it("reports an event that races with subscription setup", () => {
+    const tracker = new SessionRevisionTracker();
+    expect(tracker.accept({ revision: 8 })).toBe(false);
+    expect(tracker.initialize({ revision: 7 }, failure)).toBe(true);
+  });
+
+  it("rejects a malformed initial response", () => {
+    const tracker = new SessionRevisionTracker();
+    expect(() => tracker.initialize({ revision: -1 }, failure)).toThrow(
+      "Session subscription revision is invalid",
+    );
+  });
+});
 
 describe("drainSessionPages", () => {
   it("drains pages in server order and stops on hasMore false", async () => {

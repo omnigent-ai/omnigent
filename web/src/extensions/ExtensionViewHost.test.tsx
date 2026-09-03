@@ -83,6 +83,58 @@ describe("ExtensionViewHost", () => {
     await waitFor(() => expect(screen.queryByRole("status")).toBeNull());
   });
 
+  it("forwards only host event values that changed", async () => {
+    const themeEvent = { theme: "dark" };
+    const sessionEvent = { revision: 1 };
+    const { rerender } = render(
+      <ExtensionViewHost
+        extension={extension}
+        page={page}
+        refresh={refresh}
+        events={{ "theme.changed": themeEvent, "sessions.changed": sessionEvent }}
+      />,
+    );
+    await screen.findByTitle("Dashboard");
+    await waitFor(() => expect(FakeMessageChannel.latest).not.toBeNull());
+    act(() => {
+      FakeMessageChannel.latest!.port1.onmessage?.({
+        data: { ...identity, source: EXTENSION_RPC_SOURCE, type: "ready" },
+      } as MessageEvent<unknown>);
+    });
+    await waitFor(() =>
+      expect(FakeMessageChannel.latest!.port1.postMessage).toHaveBeenCalledTimes(2),
+    );
+
+    rerender(
+      <ExtensionViewHost
+        extension={extension}
+        page={page}
+        refresh={refresh}
+        events={{ "theme.changed": themeEvent, "sessions.changed": sessionEvent }}
+      />,
+    );
+    expect(FakeMessageChannel.latest!.port1.postMessage).toHaveBeenCalledTimes(2);
+
+    rerender(
+      <ExtensionViewHost
+        extension={extension}
+        page={page}
+        refresh={refresh}
+        events={{ "theme.changed": themeEvent, "sessions.changed": { revision: 2 } }}
+      />,
+    );
+    await waitFor(() =>
+      expect(FakeMessageChannel.latest!.port1.postMessage).toHaveBeenCalledTimes(3),
+    );
+    expect(FakeMessageChannel.latest!.port1.postMessage).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        type: "event",
+        event: "sessions.changed",
+        value: { revision: 2 },
+      }),
+    );
+  });
+
   it("rejects an incompatible extension SDK explicitly", async () => {
     render(<ExtensionViewHost extension={extension} page={page} refresh={refresh} />);
     await screen.findByTitle("Dashboard");

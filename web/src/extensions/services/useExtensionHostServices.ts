@@ -1,7 +1,11 @@
-import { useMemo } from "react";
+import { useCallback, useMemo, useSyncExternalStore } from "react";
 import { useTheme } from "next-themes";
 import { resolveIdentity } from "@/lib/identity";
 import { getOmnigentServerIdentity } from "@/lib/host";
+import {
+  getSessionSummaryRevision,
+  subscribeSessionSummaryChanges,
+} from "@/lib/sessionSummaryChanges";
 import { useNavigate } from "@/lib/routing";
 import type { ExtensionCatalogItem } from "../types";
 import { ExtensionHostServiceError } from "./errors";
@@ -70,6 +74,21 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
   const theme = resolvedTheme === "dark" ? "dark" : "light";
   const writeLimiter = useMemo(() => new ExtensionStorageWriteLimiter(), []);
   const sessionReadLimiter = useMemo(() => new SessionReadLimiter(), []);
+  const sessionsGranted = extension.permissions.includes("sessions.read");
+  const subscribeSessionRevision = useCallback(
+    (listener: () => void) =>
+      sessionsGranted ? subscribeSessionSummaryChanges(listener) : () => {},
+    [sessionsGranted],
+  );
+  const readSessionRevision = useCallback(
+    () => (sessionsGranted ? getSessionSummaryRevision() : 0),
+    [sessionsGranted],
+  );
+  const sessionRevision = useSyncExternalStore(
+    subscribeSessionRevision,
+    readSessionRevision,
+    readSessionRevision,
+  );
 
   const methods = useMemo(() => {
     const implementations = {
@@ -132,9 +151,21 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
         }),
       "sessions.listPage": (params: unknown, signal: AbortSignal) =>
         sessionReadLimiter.run(signal, () => listSessionPage(params, signal)),
+      "sessions.subscribe": (_params: unknown, signal: AbortSignal) => {
+        throwIfAborted(signal);
+        return { revision: sessionRevision };
+      },
     };
     return grantedHostMethods(extension, implementations);
-  }, [extension, navigate, sessionReadLimiter, theme, writeLimiter]);
-  const events = useMemo(() => ({ "theme.changed": { theme } }), [theme]);
+  }, [extension, navigate, sessionReadLimiter, sessionRevision, theme, writeLimiter]);
+  const themeEvent = useMemo(() => ({ theme }), [theme]);
+  const sessionEvent = useMemo(() => ({ revision: sessionRevision }), [sessionRevision]);
+  const events = useMemo(
+    () => ({
+      "theme.changed": themeEvent,
+      ...(sessionsGranted ? { "sessions.changed": sessionEvent } : {}),
+    }),
+    [sessionEvent, sessionsGranted, themeEvent],
+  );
   return { methods, events };
 }

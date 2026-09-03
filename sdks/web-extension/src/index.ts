@@ -15,6 +15,7 @@ import {
 import {
   drainSessionPages,
   type ExtensionSessionPage,
+  SessionRevisionTracker,
   validateSessionPageLimit,
   type ExtensionSessionSummary,
 } from "./sessions";
@@ -70,6 +71,7 @@ export interface ExtensionContext {
     listAll(options?: {
       pageLimit?: number;
     }): Promise<ExtensionSessionSummary[]>;
+    subscribe(listener: () => void): Promise<Disposable>;
   };
 }
 
@@ -243,6 +245,33 @@ export function defineExtension(lifecycle: ExtensionLifecycle): void {
             }),
           (code, message) => new ExtensionApiError(code, message),
         );
+      },
+      async subscribe(listener) {
+        const tracker = new SessionRevisionTracker();
+        let handlers = listeners.get("sessions.changed");
+        if (!handlers) {
+          handlers = new Set();
+          listeners.set("sessions.changed", handlers);
+        }
+        const handler = (value: unknown) => {
+          if (tracker.accept(value)) listener();
+        };
+        handlers.add(handler);
+        try {
+          const initial = await request<unknown>("sessions.subscribe", {});
+          if (
+            tracker.initialize(
+              initial,
+              (code, message) => new ExtensionApiError(code, message),
+            )
+          ) {
+            listener();
+          }
+        } catch (error) {
+          handlers.delete(handler);
+          throw error;
+        }
+        return { dispose: () => handlers?.delete(handler) };
       },
     },
   });

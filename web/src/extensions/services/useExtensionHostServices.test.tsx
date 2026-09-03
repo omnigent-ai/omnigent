@@ -19,6 +19,7 @@ vi.mock("@/lib/identity", () => ({
 vi.mock("@/lib/host", () => ({ getOmnigentServerIdentity: () => serverRef.current }));
 vi.mock("next-themes", () => ({ useTheme: () => ({ resolvedTheme: "dark" }) }));
 
+import { notifySessionSummariesMayHaveChanged } from "@/lib/sessionSummaryChanges";
 import { useExtensionHostServices } from "./useExtensionHostServices";
 
 const extension: ExtensionCatalogItem = {
@@ -98,7 +99,22 @@ describe("useExtensionHostServices", () => {
     const { result } = renderHook(() => useExtensionHostServices(extension));
 
     expect(result.current.methods["theme.getCurrent"]?.({}, signal())).toEqual({ theme: "dark" });
-    expect(result.current.events).toEqual({ "theme.changed": { theme: "dark" } });
+    expect(result.current.events["theme.changed"]).toEqual({ theme: "dark" });
+  });
+
+  it("exposes an ID-free session invalidation revision", () => {
+    const { result } = renderHook(() => useExtensionHostServices(extension));
+    const before = result.current.events["sessions.changed"];
+
+    act(() => notifySessionSummariesMayHaveChanged());
+
+    expect(result.current.events["sessions.changed"]).toEqual({
+      revision: (before as { revision: number }).revision + 1,
+    });
+    expect(result.current.methods["sessions.subscribe"]?.({}, signal())).toEqual(
+      result.current.events["sessions.changed"],
+    );
+    expect(JSON.stringify(result.current.events["sessions.changed"])).not.toContain("conv_");
   });
 
   it("lists only the projected session summary through the host method", async () => {
@@ -145,6 +161,8 @@ describe("useExtensionHostServices", () => {
     const { result } = renderHook(() => useExtensionHostServices(existing));
 
     expect(result.current.methods["sessions.listPage"]).toBeUndefined();
+    expect(result.current.methods["sessions.subscribe"]).toBeUndefined();
+    expect(result.current.events["sessions.changed"]).toBeUndefined();
     expect(result.current.methods["navigation.openSession"]).toBeDefined();
     expect(result.current.methods["storage.user.get"]).toBeDefined();
   });

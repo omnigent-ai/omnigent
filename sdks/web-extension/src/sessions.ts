@@ -18,6 +18,47 @@ export const SESSION_PAGE_MAX_LIMIT = 25;
 export const SESSIONS_LIST_ALL_MAX_PAGES = 200;
 export const SESSIONS_LIST_ALL_MAX_SESSIONS = 5_000;
 
+function parseRevision(value: unknown): number | null {
+  if (!value || typeof value !== "object") return null;
+  const revision = (value as { revision?: unknown }).revision;
+  return typeof revision === "number" &&
+    Number.isSafeInteger(revision) &&
+    revision >= 0
+    ? revision
+    : null;
+}
+
+export class SessionRevisionTracker {
+  private baseline: number | null = null;
+  private pendingRevision = -1;
+
+  accept(value: unknown): boolean {
+    const revision = parseRevision(value);
+    if (revision === null) return false;
+    if (this.baseline === null) {
+      this.pendingRevision = Math.max(this.pendingRevision, revision);
+      return false;
+    }
+    if (revision <= this.baseline) return false;
+    this.baseline = revision;
+    return true;
+  }
+
+  initialize(
+    value: unknown,
+    fail: (code: string, message: string) => Error,
+  ): boolean {
+    const revision = parseRevision(value);
+    if (revision === null) {
+      throw fail("InvalidResponse", "Session subscription revision is invalid");
+    }
+    this.baseline = revision;
+    if (this.pendingRevision <= revision) return false;
+    this.baseline = this.pendingRevision;
+    return true;
+  }
+}
+
 export function validateSessionPageLimit(
   value: number | undefined,
   fail: (code: string, message: string) => Error,

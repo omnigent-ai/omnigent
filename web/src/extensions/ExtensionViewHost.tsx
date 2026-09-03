@@ -50,6 +50,7 @@ export function ExtensionViewHost({
   const staleRetryDoneRef = useRef(false);
   const pendingRef = useRef(new Map<string, PendingRequest>());
   const methodsRef = useRef(methods);
+  const sentEventsRef = useRef(new Map<string, unknown>());
   const [frameDocument, setFrameDocument] = useState<DocumentState | null>(null);
   const [status, setStatus] = useState<"loading" | "activating" | "ready" | "error">("loading");
   const [error, setError] = useState<string | null>(null);
@@ -63,6 +64,7 @@ export function ExtensionViewHost({
       pending.controller.abort();
     }
     pendingRef.current.clear();
+    sentEventsRef.current.clear();
     const port = portRef.current;
     const identity = identityRef.current;
     if (port && identity) {
@@ -127,6 +129,7 @@ export function ExtensionViewHost({
     const identity = identityRef.current;
     if (status !== "ready" || !port || !identity) return;
     for (const [event, value] of Object.entries(events)) {
+      if (Object.is(sentEventsRef.current.get(event), value)) continue;
       const message: ExtensionEventMessage = {
         ...identity,
         source: EXTENSION_RPC_SOURCE,
@@ -134,7 +137,10 @@ export function ExtensionViewHost({
         event,
         value,
       };
-      if (isExtensionPayloadWithinBudget(message)) port.postMessage(message);
+      if (isExtensionPayloadWithinBudget(message)) {
+        port.postMessage(message);
+        sentEventsRef.current.set(event, value);
+      }
     }
   }, [events, status]);
 

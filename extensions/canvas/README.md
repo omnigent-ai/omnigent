@@ -30,4 +30,6 @@ The committed build artifacts live in `src/omnigent_canvas/dist/` so the Python 
 
 ## Storage and privacy
 
-The extension requests only `navigation`, `sessions.read`, and `storage.user`. The host filters the session list to the current user's accessible, top-level, non-archived sessions. Manually arranged card positions and the viewport are stored locally in extension-scoped browser storage; transcript content is never read by this extension.
+The extension requests only `navigation`, `sessions.read`, and `storage.user`. The host filters the session list to the current user's accessible, top-level, non-archived sessions. While Canvas is open, the parent session stream sends ID-free invalidation events so visible cards refresh immediately. Hidden tabs defer and coalesce updates until they become visible. A low-rate 30-second reconciliation covers sessions outside the parent stream's bounded watch set. Every refresh performs a new permission-filtered list operation.
+
+Manually arranged card positions and the viewport are stored locally in extension-scoped browser storage; transcript content is never read by this extension.

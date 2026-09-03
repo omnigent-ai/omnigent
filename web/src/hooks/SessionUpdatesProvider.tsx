@@ -32,6 +32,7 @@ import {
   removeIdsFromPages,
 } from "@/lib/sessionListCache";
 import { isModalHostResolved, resolveModalHost } from "@/lib/sessionHost";
+import { notifySessionSummariesMayHaveChanged } from "@/lib/sessionSummaryChanges";
 import { type SessionUpdatesFrame, sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
 
 // Coalesce bursts of structural changes / watch-set recomputes into one
@@ -308,11 +309,13 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           void queryClient.invalidateQueries({ queryKey: ["hosts"] });
           return;
         case "removed":
+          notifySessionSummariesMayHaveChanged();
           for (const id of frame.ids) commentsFingerprintsRef.current.delete(id);
           if (removeIdsFromCache(queryClient, frame.ids)) scheduleInvalidate();
           return;
         case "snapshot":
         case "changed": {
+          notifySessionSummariesMayHaveChanged();
           syncCommentsFingerprints(frame.items);
           if (frame.type === "snapshot") {
             // A snapshot restates the full watch-set, so fingerprints for

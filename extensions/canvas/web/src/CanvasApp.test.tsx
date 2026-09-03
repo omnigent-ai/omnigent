@@ -78,18 +78,26 @@ const sessions: ExtensionSessionSummary[] = [
   },
 ];
 
-function contextWith(items: ExtensionSessionSummary[] = sessions): {
+function contextWith(
+  items: ExtensionSessionSummary[] = sessions,
+  live = false,
+): {
   context: ExtensionContext;
   openSession: ReturnType<typeof vi.fn>;
   values: Map<string, unknown>;
+  emitLive(): void;
+  disposeLive: ReturnType<typeof vi.fn>;
 } {
   const values = new Map<string, unknown>();
   const openSession = vi.fn(async () => undefined);
+  const disposeLive = vi.fn();
+  let liveListener: (() => void) | null = null;
   const context = {
     capabilities: [
       "navigation.openSession",
       "navigation.openNewSession",
       "sessions.listPage",
+      ...(live ? ["sessions.subscribe"] : []),
     ],
     navigation: {
       openSession,
@@ -97,6 +105,15 @@ function contextWith(items: ExtensionSessionSummary[] = sessions): {
     },
     sessions: {
       listAll: vi.fn(async () => items),
+      subscribe: vi.fn(async (listener: () => void) => {
+        liveListener = listener;
+        return {
+          dispose: () => {
+            liveListener = null;
+            disposeLive();
+          },
+        };
+      }),
     },
     storage: {
       user: {
@@ -110,7 +127,13 @@ function contextWith(items: ExtensionSessionSummary[] = sessions): {
       },
     },
   } as unknown as ExtensionContext;
-  return { context, openSession, values };
+  return {
+    context,
+    openSession,
+    values,
+    emitLive: () => liveListener?.(),
+    disposeLive,
+  };
 }
 
 beforeEach(() => {
@@ -123,7 +146,10 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
 
 describe("CanvasApp", () => {
   it("loads every session into a draggable controlled canvas", async () => {
@@ -235,6 +261,121 @@ describe("CanvasApp", () => {
       screen.queryByRole("button", { name: "Arrange" }),
     ).not.toBeInTheDocument();
     expect(flowProps.current?.nodesDraggable).toBe(true);
+  });
+
+  it("refreshes from a visible live-update event and preserves positions", async () => {
+    const live = contextWith(sessions, true);
+    const updated = sessions.map((session) =>
+      session.id === "conv_1"
+        ? { ...session, status: "waiting" as const }
+        : session,
+    );
+    vi.mocked(live.context.sessions.listAll)
+      .mockResolvedValueOnce(sessions)
+      .mockResolvedValueOnce(sessions)
+      .mockResolvedValueOnce(updated);
+    render(<CanvasApp context={live.context} />);
+    await screen.findByText("2 sessions");
+    await waitFor(() =>
+      expect(live.context.sessions.subscribe).toHaveBeenCalledOnce(),
+    );
+    await waitFor(() =>
+      expect(live.context.sessions.listAll).toHaveBeenCalledTimes(2),
+    );
+    const before = (
+      flowProps.current?.nodes as Array<{ id: string; position: unknown }>
+    ).find((node) => node.id === "conv_1")?.position;
+
+    act(() => live.emitLive());
+
+    await waitFor(() =>
+      expect(live.context.sessions.listAll).toHaveBeenCalledTimes(3),
+    );
+    const refreshed = (
+      flowProps.current?.nodes as Array<{
+        id: string;
+        position: unknown;
+        data: { session: ExtensionSessionSummary };
+      }>
+    ).find((node) => node.id === "conv_1");
+    expect(refreshed?.position).toEqual(before);
+    expect(refreshed?.data.session.status).toBe("waiting");
+  });
+
+  it("bounds sustained events to one trailing refresh before cooldown", async () => {
+    const live = contextWith(sessions, true);
+    let finishFirst: ((items: ExtensionSessionSummary[]) => void) | undefined;
+    let finishTrailing:
+      ((items: ExtensionSessionSummary[]) => void) | undefined;
+    const firstRefresh = new Promise<ExtensionSessionSummary[]>((resolve) => {
+      finishFirst = resolve;
+    });
+    const trailingRefresh = new Promise<ExtensionSessionSummary[]>(
+      (resolve) => {
+        finishTrailing = resolve;
+      },
+    );
+    vi.mocked(live.context.sessions.listAll)
+      .mockResolvedValueOnce(sessions)
+      .mockReturnValueOnce(firstRefresh)
+      .mockReturnValueOnce(trailingRefresh)
+      .mockResolvedValue(sessions);
+    render(<CanvasApp context={live.context} />);
+    await screen.findByText("2 sessions");
+    await waitFor(() =>
+      expect(live.context.sessions.listAll).toHaveBeenCalledTimes(2),
+    );
+
+    act(() => {
+      live.emitLive();
+      live.emitLive();
+      finishFirst?.(sessions);
+    });
+    await waitFor(() =>
+      expect(live.context.sessions.listAll).toHaveBeenCalledTimes(3),
+    );
+    act(() => {
+      live.emitLive();
+      live.emitLive();
+      finishTrailing?.(sessions);
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    act(() => live.emitLive());
+    expect(live.context.sessions.listAll).toHaveBeenCalledTimes(3);
+    await waitFor(
+      () => expect(live.context.sessions.listAll).toHaveBeenCalledTimes(4),
+      { timeout: 1_500 },
+    );
+  });
+
+  it("defers and coalesces hidden live updates until visible", async () => {
+    let visibility: DocumentVisibilityState = "hidden";
+    vi.spyOn(document, "visibilityState", "get").mockImplementation(
+      () => visibility,
+    );
+    const live = contextWith(sessions, true);
+    const rendered = render(<CanvasApp context={live.context} />);
+    await screen.findByText("2 sessions");
+    await waitFor(() =>
+      expect(live.context.sessions.subscribe).toHaveBeenCalledOnce(),
+    );
+
+    act(() => {
+      live.emitLive();
+      live.emitLive();
+      live.emitLive();
+    });
+    expect(live.context.sessions.listAll).toHaveBeenCalledOnce();
+
+    visibility = "visible";
+    act(() => document.dispatchEvent(new Event("visibilitychange")));
+    await waitFor(() =>
+      expect(live.context.sessions.listAll).toHaveBeenCalledTimes(2),
+    );
+
+    rendered.unmount();
+    expect(live.disposeLive).toHaveBeenCalledOnce();
   });
 
   it("shows explicit empty and initial error states", async () => {
