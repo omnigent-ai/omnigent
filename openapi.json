@@ -9000,6 +9000,76 @@
         ]
       }
     },
+    "/v1/hosts/{host_id}/credentials/{provider}": {
+      "get": {
+        "description": "Return the session owner's *provider* credential for *host_id*.\n\nAuthenticated by the launch token (constant-time, expiry-aware, and\nbound to *host_id*), exactly like the host tunnel. `401` when the\ntoken doesn't resolve; `404` for a provider with no broker resolver or\nnot configured on this server; `{\"connected\": false}` when the owner\nhasn't linked it, so a caller can fall back cleanly.",
+        "operationId": "host_credential_v1_hosts__host_id__credentials__provider__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "provider",
+            "required": true,
+            "schema": {
+              "title": "Provider",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-omnigent-host-token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Omnigent-Host-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Host Credential V1 Hosts  Host Id  Credentials  Provider  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Host Credential",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
     "/v1/hosts/{host_id}/directories": {
       "post": {
         "description": "Create a new directory on a host.\n\nBacks the Web UI workspace picker's \"New folder\" action so a\nuser can make a fresh directory to start a session in without\ndropping to a terminal. Owner-scoped exactly like the\nfilesystem browse endpoints (`GET /v1/hosts/{id}/filesystem`):\nonly the host owner can create directories, and \u2014 like browse \u2014\nthis is NOT scoped to a session. The workspace-boundary check\nstill runs at session-create time, so creating a directory here\ndoes not by itself grant an agent access to it.\n\n**Parameters**\n\n- `body` \u2014 Request body carrying the absolute (or tilde-prefixed) `path` to create.\n\n**Returns:** `{\"object\": \"directory\", \"path\": \"<created abs path>\"}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 403 if not owned by caller, 409 if host is offline or the directory could not be created (already exists / permission denied), 400 on path validation, 504 on host timeout, 502 on host I/O failure.",
