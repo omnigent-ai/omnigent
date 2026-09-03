@@ -612,6 +612,11 @@ async def test_launch_keeps_server_alive_when_opted_in(
     cmd = await _capture_launch_argv(tmp_path, monkeypatch, keep_alive_after_exit=True)
     assert contains_subsequence(cmd, ["set-option", "-gq", "remain-on-exit", "on"])
     assert contains_subsequence(cmd, ["set-option", "-sq", "exit-empty", "off"])
+    assert contains_subsequence(
+        cmd,
+        ["set-hook", "-t", "main", "pane-died", "detach-client -a"],
+    )
+    assert not contains_subsequence(cmd, ["set-hook", "-w", "pane-died"])
 
 
 @pytest.mark.asyncio

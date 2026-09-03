@@ -1079,12 +1079,18 @@ class TerminalInstance:
                     f"wait-for -S {_TMUX_START_ON_ATTACH_CHANNEL}",
                 ]
             )
-        # ``pane-died`` is a window-scope hook that fires when remain-on-exit
-        # keeps the pane alive after the inner process exits. We need to set
-        # it AFTER new-session (not before) because window scope requires an
-        # existing window, and global scope (-g) does not fire for pane-died.
+        # Each managed terminal has an isolated tmux server and one session.
+        # Session scope keeps this compatible with tmux 3.0 and later.
         pane_died_hook: list[list[str]] = (
-            [["set-hook", "-w", "pane-died", "detach-client -a"]]
+            [
+                [
+                    "set-hook",
+                    "-t",
+                    self.tmux_target,
+                    "pane-died",
+                    "detach-client -a",
+                ]
+            ]
             if self.keep_alive_after_exit
             else []
         )
