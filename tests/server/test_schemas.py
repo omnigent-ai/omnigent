@@ -1000,6 +1000,48 @@ def test_session_metadata_external_rejects_repo_url_workspace() -> None:
         SessionCreateMetadata(workspace="https://github.com/org/repo")
 
 
+def test_session_metadata_host_id_requires_workspace() -> None:
+    """
+    Multipart ``host_id`` without ``workspace`` is rejected at validation
+    with the JSON create's route-level message: the launch frame needs a
+    working directory on the host. Failing in the model rejects the
+    request before the bundle is even read and keeps the launch helper's
+    internal "host_id but no workspace" guard unreachable; the absolute-
+    path half of the rule runs at the route, pinned by the multipart
+    launch integration tests.
+    """
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    with pytest.raises(ValidationError, match="workspace required when host_id is set"):
+        SessionCreateMetadata(host_id="host_abc")
+
+
+def test_session_metadata_project_create_defers_workspace_rule() -> None:
+    """
+    A ``project_id`` create may omit ``workspace`` alongside ``host_id``:
+    the route default-fills it from the project config and re-checks the
+    rule after resolution, so the model must not reject it first (the
+    same carve-out :class:`SessionCreateRequest` makes for ``git``).
+    """
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    meta = SessionCreateMetadata(project_id="proj_abc", host_id="host_abc")
+    assert meta.host_id == "host_abc"
+    assert meta.workspace is None
+
+
+def test_session_metadata_host_id_with_workspace_ok() -> None:
+    """
+    ``host_id`` with an absolute ``workspace`` validates cleanly on the
+    default external host type — the shape that launches a runner inline.
+    """
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    meta = SessionCreateMetadata(host_id="host_abc", workspace="/repo")
+    assert meta.host_id == "host_abc"
+    assert meta.workspace == "/repo"
+
+
 @pytest.mark.parametrize("status", ["idle", "running", "waiting", "failed"])
 def test_session_response_status_accepts_canonical_set(status: str) -> None:
     """

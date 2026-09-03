@@ -8760,8 +8760,6 @@ def _repl_terminal_ui_labels(
     :returns: ``{ui_key: "terminal"}`` when the runner will host a REPL
         terminal, else ``{}``.
     """
-    from omnigent.harness_aliases import is_native_harness
-
     if agent_cache is None or harness_override == "auto":
         return {}
     if harness_override:
@@ -8776,7 +8774,25 @@ def _repl_terminal_ui_labels(
             # own later stamp rather than guessing at creation.
             return {}
         harness = _spec_harness(spec)
-    if is_native_harness(harness):
+    return _repl_terminal_ui_labels_for_harness(harness)
+
+
+def _repl_terminal_ui_labels_for_harness(harness: str | None) -> dict[str, str]:
+    """
+    Resolve the terminal-view label for a session on a known harness.
+
+    The harness-in-hand half of :func:`_repl_terminal_ui_labels`: the
+    multipart create parses its uploaded bundle before persisting, so it
+    derives the harness from that spec and skips the cache load.
+
+    :param harness: The session's canonical harness, e.g.
+        ``"claude-sdk"``; ``None`` (unresolvable) stamps nothing.
+    :returns: ``{ui_key: "terminal"}`` when the runner will host a REPL
+        terminal (a non-native harness), else ``{}``.
+    """
+    from omnigent.harness_aliases import is_native_harness
+
+    if harness is None or is_native_harness(harness):
         return {}
     return {_CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
 
@@ -8931,7 +8947,9 @@ def _persist_stored_session_bundle(
     :param artifact_store: Store for deleting the bundle on failure.
     :param metadata: Validated session metadata. A set
         ``parent_session_id`` creates the conversation as a
-        sub-agent child of that session.
+        sub-agent child of that session; a set ``host_id`` (with
+        its ``workspace``) is recorded on the row for the caller's
+        inline runner launch.
     :param agent_id: New agent id, e.g. ``"ag_abc123"``.
     :param agent_name: Agent name loaded from the uploaded spec.
     :param agent_bundle_location: Artifact key for the stored bundle.
@@ -8953,6 +8971,7 @@ def _persist_stored_session_bundle(
             title=metadata.title,
             labels=metadata.labels,
             reasoning_effort=metadata.reasoning_effort,
+            host_id=metadata.host_id,
             workspace=metadata.workspace,
             terminal_launch_args=metadata.terminal_launch_args,
             parent_conversation_id=metadata.parent_session_id,
@@ -10263,6 +10282,7 @@ __all__ = [
     "_relay_persist_error_once",
     "_remove_session_worktree_best_effort",
     "_repl_terminal_ui_labels",
+    "_repl_terminal_ui_labels_for_harness",
     "_replace_text_in_message_body",
     "_require_collaboration_mode_forward",
     "_require_cost_control_label_authority",

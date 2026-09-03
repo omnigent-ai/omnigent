@@ -1497,6 +1497,7 @@ class ConversationStore(ABC):
         title: str | None = None,
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
+        host_id: str | None = None,
         workspace: str | None = None,
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
@@ -1525,9 +1526,14 @@ class ConversationStore(ABC):
         :param reasoning_effort: Optional per-session
             reasoning-effort hint, e.g. ``"high"``. ``None``
             means use the agent default.
+        :param host_id: Optional host that should launch the runner
+            for this session, e.g. ``"host_a1b2c3d4..."``. ``None``
+            for CLI-initiated sessions where the caller manages
+            runner spawning.
         :param workspace: Optional starting cwd to record on the
             session, e.g. ``"/Users/corey/projects/myapp"``.
-            ``None`` leaves the column NULL.
+            Required when ``host_id`` is set; ``None`` otherwise
+            leaves the column NULL.
         :param terminal_launch_args: Optional pass-through CLI args
             for a native terminal wrapper (claude / codex), e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves
@@ -1544,7 +1550,9 @@ class ConversationStore(ABC):
         :raises ConversationNotFoundError: If
             ``parent_conversation_id`` is set but no such
             conversation exists.
-        :raises Exception: Backend errors propagate after rollback.
+        :raises Exception: Backend errors propagate after rollback,
+            including the check-constraint violation for ``host_id``
+            without ``workspace``.
         """
         ...
 

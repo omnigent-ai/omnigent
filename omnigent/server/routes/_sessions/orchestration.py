@@ -8735,15 +8735,37 @@ async def _create_session_from_existing_agent(
     )
 
 
+def _validate_uploaded_bundle(bundle_bytes: bytes) -> AgentSpec:
+    """
+    Parse and validate an uploaded agent bundle for a bundled create.
+
+    Enforces the policy-handler allowlist only on a shared / multi-user
+    server. On a trusted single-user/local server ``omnigent run``
+    uploads the operator's own bundle through this same path, so custom
+    handlers must keep working (the operator already has code execution
+    — the restriction would add no security there).
+
+    :param bundle_bytes: Raw uploaded ``.tar.gz`` agent bundle.
+    :returns: The validated :class:`AgentSpec`; its name is present.
+    :raises OmnigentError: If the bundle or its spec is invalid.
+    """
+    return validate_agent_bundle(
+        bundle_bytes,
+        enforce_handler_allowlist=not local_single_user_enabled(),
+    )
+
+
 def _create_session_from_bundle(
     conversation_store: ConversationStore,
     artifact_store: ArtifactStore,
     metadata: SessionCreateMetadata,
     bundle_bytes: bytes,
+    *,
+    spec: AgentSpec,
     runner_id: str | None = None,
 ) -> CreatedSessionResponse:
     """
-    Validate, store, and persist a bundled session request.
+    Store and persist a validated bundled session request.
 
     Each upload creates a session-scoped agent row, even when a
     template agent with the same spec name already exists. Agent
@@ -8759,28 +8781,26 @@ def _create_session_from_bundle(
     :param metadata: Validated session metadata. When
         ``metadata.parent_session_id`` is set (already authorized by
         the caller), the session is created as a sub-agent
-        child of that conversation.
+        child of that conversation. A set ``host_id`` (with its
+        already-validated ``workspace``) is recorded on the row for
+        the caller's inline runner launch.
     :param bundle_bytes: Raw uploaded ``.tar.gz`` agent bundle.
+    :param spec: The bundle's spec from
+        :func:`_validate_uploaded_bundle`; the caller parses once so a
+        host workspace can be validated against ``os_env.cwd`` before
+        any row exists.
     :param runner_id: Optional runner binding inherited from the
         parent session (caller-resolved, ownership-checked),
         e.g. ``"runner_abc123"``. ``None`` leaves the session
         unbound.
     :returns: Response with the new session id.
-    :raises OmnigentError: If bundle validation or agent insert
-        integrity checks fail, or the parent session vanished
-        between authorization and insert.
+    :raises OmnigentError: If the agent insert violates integrity
+        checks, or the parent session vanished between
+        authorization and insert.
     :raises SQLAlchemyError: If the database transaction fails for
         any non-integrity reason.
     """
-    # Enforce the policy-handler allowlist only on a shared /
-    # multi-user server. On a trusted single-user/local server,
-    # ``omnigent run`` uploads the operator's own bundle through this same
-    # path, so custom handlers must keep working (the operator already has
-    # code execution — the restriction would add no security there).
-    spec = validate_agent_bundle(
-        bundle_bytes,
-        enforce_handler_allowlist=not local_single_user_enabled(),
-    )
+    # validate_agent_bundle rejects a nameless spec; narrow for the insert.
     assert spec.name is not None
 
     if metadata.reasoning_effort is None and spec.executor.reasoning_effort is not None:
@@ -9812,6 +9832,7 @@ __all__ = [
     "_spawn_gateway_backed",
     "_spawn_native_approval_popup_forward",
     "_spawn_native_blocked_notice_forward",
+    "_validate_uploaded_bundle",
     "_wait_for_host_bound_runner_client",
     "_wake_parent_for_blocked_child",
     "configure_subagent_block_notifier",
