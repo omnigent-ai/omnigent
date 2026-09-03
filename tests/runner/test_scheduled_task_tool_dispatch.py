@@ -103,6 +103,29 @@ async def test_create_posts_payload() -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_forwards_active_range() -> None:
+    client = _RecordingClient(_Resp(body={"id": "t1"}))
+    await _execute_scheduled_task_tool(
+        "sys_scheduled_task_create",
+        json.dumps(
+            {
+                "name": "nightly",
+                "prompt": "go",
+                "rrule": "FREQ=HOURLY",
+                "agent_id": "ag_1",
+                "active_range_start": "09:00",
+                "active_range_end": "17:00",
+            }
+        ),
+        server_client=client,
+    )
+    _, _, body = client.calls[0]
+    assert body is not None
+    assert body["active_range_start"] == "09:00"
+    assert body["active_range_end"] == "17:00"
+
+
+@pytest.mark.asyncio
 async def test_list_gets() -> None:
     client = _RecordingClient(_Resp(body={"scheduled_tasks": []}))
     out = await _execute_scheduled_task_tool("sys_scheduled_task_list", "", server_client=client)
@@ -156,6 +179,44 @@ async def test_update_forwards_agent_switch_and_cost_cap() -> None:
     )
     _, _, body = client.calls[0]
     assert body == {"agent_id": "ag_pi", "max_cost_usd": 2.5}
+
+
+@pytest.mark.asyncio
+async def test_update_forwards_active_range() -> None:
+    client = _RecordingClient(_Resp(body={"id": "t1"}))
+    await _execute_scheduled_task_tool(
+        "sys_scheduled_task_update",
+        json.dumps(
+            {
+                "scheduled_task_id": _TASK_ID,
+                "active_range_start": "09:00",
+                "active_range_end": "17:00",
+            }
+        ),
+        server_client=client,
+    )
+    _, _, body = client.calls[0]
+    assert body == {"active_range_start": "09:00", "active_range_end": "17:00"}
+
+
+@pytest.mark.asyncio
+async def test_update_forwards_active_range_null_clear() -> None:
+    """An explicit ``null`` for both fields survives the dispatch allowlist
+    verbatim, so the update tool can clear a task back to always-active."""
+    client = _RecordingClient(_Resp(body={"id": "t1"}))
+    await _execute_scheduled_task_tool(
+        "sys_scheduled_task_update",
+        json.dumps(
+            {
+                "scheduled_task_id": _TASK_ID,
+                "active_range_start": None,
+                "active_range_end": None,
+            }
+        ),
+        server_client=client,
+    )
+    _, _, body = client.calls[0]
+    assert body == {"active_range_start": None, "active_range_end": None}
 
 
 @pytest.mark.asyncio
