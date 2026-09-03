@@ -13,6 +13,7 @@ from omnigent.claude_native_bridge import (
     BRIDGE_DIR_ENV_VAR,
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
+    ClaudePromptBlocked,
     ClaudePromptTimeout,
     TmuxSessionNotAdvertised,
     inject_slash_command,
@@ -198,6 +199,15 @@ class ClaudeNativeExecutor(Executor):
                         self._bridge_dir,
                         content=text,
                     )
+        except ClaudePromptBlocked as exc:
+            # Parked on a dialog, so there is nothing to reap: killing the pane
+            # would discard the session and the prompt awaiting an answer.
+            _logger.warning(
+                "claude-native: harness is waiting on a dialog; message not delivered",
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(message=describe_exception(exc))
+            return
         except ClaudePromptTimeout as exc:
             _logger.exception(
                 "claude-native: prompt delivery to harness timed out",
