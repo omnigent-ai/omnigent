@@ -71,6 +71,7 @@ from omnigent.runner.subagent_routing import (
     ROUTING_DECISION_LABEL_KEY,
     auto_harness_session,
     harness_family,
+    routing_class_from_snapshot,
     subagent_routing_enabled,
 )
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
@@ -4664,6 +4665,11 @@ def _pinned_spawn_family(parent: Conversation | None) -> str | None:
     the family choice to the router, and a parent that routes no spawns at
     all confines nothing.
 
+    The switch alone is not enough: the runner hides out-of-family agents
+    only from a parent whose routing class is routed and pinned, so a
+    session that flipped the subagent switch with Smart Routing off is
+    listed the whole agent surface and must be able to create from it too.
+
     :param parent: The parent session's row, or ``None`` for a top-level
         create (nothing to stay in family with).
     :returns: ``"claude"`` / ``"gpt"`` / ``"pi"``, or ``None`` when the
@@ -4671,7 +4677,12 @@ def _pinned_spawn_family(parent: Conversation | None) -> str | None:
     """
     if parent is None or not subagent_routing_enabled(parent.subagent_routing_override):
         return None
-    if auto_harness_session(parent):
+    routing_class = routing_class_from_snapshot(
+        cost_control_mode=parent.cost_control_mode_override,
+        harness_override=parent.harness_override,
+        labels=parent.labels,
+    )
+    if not routing_class.routing_enabled or routing_class.auto_harness:
         return None
     return harness_family(_resolve_harness(parent))
 
@@ -4734,11 +4745,13 @@ def _out_of_family_spawn_notice(
     """
     if parent is None or auto_harness_session(conv, parent):
         return None
-    parent_harness = _resolve_harness(parent)
-    parent_family = harness_family(parent_harness)
+    # Through the create gate's own answer, so a pane is declined here only
+    # when its create would have been refused too.
+    parent_family = _pinned_spawn_family(parent)
     child_family = harness_family(harness)
     if parent_family is None or child_family is None or parent_family == child_family:
         return None
+    parent_harness = _resolve_harness(parent)
     return (
         f"Not routed: a {parent_harness} session's spawns stay in its own model "
         f"family, and this sub-agent runs on {harness}."
