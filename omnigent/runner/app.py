@@ -7786,438 +7786,499 @@ def create_runner_app(
             event_body = _wrap_as_message_event(_instr_body)
             _inject_mcp_schemas(event_body, _mcp_schemas)
             _response_id: str | None = None
-            try:
-                async with client.stream(
-                    "POST",
-                    f"/v1/sessions/{conv_id}/events",
-                    json=event_body,
-                    timeout=None,
-                ) as harness_resp:
-                    if harness_resp.status_code != 200:
-                        _logger.error(
-                            "harness rejected turn delivery for %s with status %d",
-                            conv_id,
-                            harness_resp.status_code,
-                            extra={"session_id": conv_id},
-                        )
-                        _fail_status = {
-                            "type": "response.failed",
-                            "source": "harness",
-                            "error": {
-                                "status": harness_resp.status_code,
-                            },
-                        }
-                        _publish_event(
-                            conv_id,
-                            _fail_status,
-                        )
-                        _on_proxy_stream_end(
-                            conv_id,
-                            error={"status": harness_resp.status_code},
-                        )
-                        yield _response_failed_event(
-                            {"status": harness_resp.status_code}, source="harness"
-                        )
-                        return
-
-                    _omnigent_task_id = cast(str | None, body.get("task_id"))
-                    _buffer = ""
-                    _dispatch_tasks: list[_asyncio.Task[object]] = []
-                    # Sub-agent start edge → minted child id, so the completion
-                    # edge can address the child it created. Per-stream.
-                    _subagent_child_futures: dict[str, _asyncio.Future[str]] = {}
-                    # Sub-agent start edge → its title, so the completion edge can
-                    # author the summary message (assistant messages need one).
-                    _subagent_titles: dict[str, str] = {}
-                    # Sub-agent child_key → its latest transcript-post task, so the
-                    # mint / tool-call / completion posts for one child land in
-                    # order instead of racing.
-                    _subagent_post_chains: dict[str, _asyncio.Task[object]] = {}
-                    _text_acc: list[str] = []
-                    _stream_failed_error: _JsonObject | None = None
-                    async for chunk in harness_resp.aiter_text():
-                        _buffer += chunk
-                        while "\n\n" in _buffer:
-                            frame, _, _buffer = _buffer.partition("\n\n")
-                            raw_sse_bytes = (frame + "\n\n").encode("utf-8")
-
-                            data_line = next(
-                                (line for line in frame.splitlines() if line.startswith("data:")),
-                                None,
+            # Retry once on a dead-channel drop (httpx.ReadError,
+            # RemoteProtocolError, etc.) mid-stream, as long as no
+            # model output has been delivered yet -- the same recovery
+            # the policy-verdict delivery path already applies.
+            _text_yielded = False
+            # _dispatch_tasks is initialized inside the stream block on each
+            # attempt; pre-initialise here so the except clause can safely read
+            # it even if the exception fires before the inner assignment.
+            _dispatch_tasks: list[_asyncio.Task[object]] = []
+            for _stream_attempt in range(2):
+                try:
+                    async with client.stream(
+                        "POST",
+                        f"/v1/sessions/{conv_id}/events",
+                        json=event_body,
+                        timeout=None,
+                    ) as harness_resp:
+                        if harness_resp.status_code != 200:
+                            _logger.error(
+                                "harness rejected turn delivery for %s with status %d",
+                                conv_id,
+                                harness_resp.status_code,
+                                extra={"session_id": conv_id},
                             )
-                            if data_line is not None:
-                                try:
-                                    event = _json.loads(data_line[5:].strip())
-                                except _json.JSONDecodeError:
+                            _fail_status = {
+                                "type": "response.failed",
+                                "source": "harness",
+                                "error": {
+                                    "status": harness_resp.status_code,
+                                },
+                            }
+                            _publish_event(
+                                conv_id,
+                                _fail_status,
+                            )
+                            _on_proxy_stream_end(
+                                conv_id,
+                                error={"status": harness_resp.status_code},
+                            )
+                            yield _response_failed_event(
+                                {"status": harness_resp.status_code}, source="harness"
+                            )
+                            return
+
+                        _omnigent_task_id = cast(str | None, body.get("task_id"))
+                        _buffer = ""
+                        _dispatch_tasks: list[_asyncio.Task[object]] = []
+                        # Sub-agent start edge → minted child id, so the completion
+                        # edge can address the child it created. Per-stream.
+                        _subagent_child_futures: dict[str, _asyncio.Future[str]] = {}
+                        # Sub-agent start edge → its title, so the completion edge can
+                        # author the summary message (assistant messages need one).
+                        _subagent_titles: dict[str, str] = {}
+                        # Sub-agent child_key → its latest transcript-post task, so the
+                        # mint / tool-call / completion posts for one child land in
+                        # order instead of racing.
+                        _subagent_post_chains: dict[str, _asyncio.Task[object]] = {}
+                        _text_acc: list[str] = []
+                        _stream_failed_error: _JsonObject | None = None
+                        async for chunk in harness_resp.aiter_text():
+                            _buffer += chunk
+                            while "\n\n" in _buffer:
+                                frame, _, _buffer = _buffer.partition("\n\n")
+                                raw_sse_bytes = (frame + "\n\n").encode("utf-8")
+
+                                data_line = next(
+                                    (
+                                        line
+                                        for line in frame.splitlines()
+                                        if line.startswith("data:")
+                                    ),
+                                    None,
+                                )
+                                if data_line is not None:
+                                    try:
+                                        event = _json.loads(data_line[5:].strip())
+                                    except _json.JSONDecodeError:
+                                        event = None
+                                else:
                                     event = None
-                            else:
-                                event = None
 
-                            _defer_publish = False
-                            if event is not None:
-                                if event.get("type") == "response.created":
-                                    resp_obj = event.get("response") or {}
-                                    _response_id = resp_obj.get("id")
-                                    if _response_id and conv_id:
-                                        _resp_to_conv[_response_id] = conv_id
-                                        _live_response_id[conv_id] = _response_id
-                                        manager.mark_in_flight(conv_id, _response_id)
+                                _defer_publish = False
+                                if event is not None:
+                                    if event.get("type") == "response.created":
+                                        resp_obj = event.get("response") or {}
+                                        _response_id = resp_obj.get("id")
+                                        if _response_id and conv_id:
+                                            _resp_to_conv[_response_id] = conv_id
+                                            _live_response_id[conv_id] = _response_id
+                                            manager.mark_in_flight(conv_id, _response_id)
 
-                                _overflow = _is_context_overflow_error(event)
-                                if _overflow is not None:
-                                    raise _ContextWindowOverflow(*_overflow)
+                                    _overflow = _is_context_overflow_error(event)
+                                    if _overflow is not None:
+                                        raise _ContextWindowOverflow(*_overflow)
 
-                                _evt_type = event.get("type")
-                                if _evt_type == "injection.consumed":
-                                    _inj_id = event.get("injection_id")
-                                    _buf = _session_message_buffers.get(conv_id)
-                                    if _inj_id is not None and _buf:
-                                        _consumed = [
-                                            _m for _m in _buf if _m.get("injection_id") == _inj_id
-                                        ]
-                                        _remaining = [
-                                            _m for _m in _buf if _m.get("injection_id") != _inj_id
-                                        ]
-                                        _session_message_buffers[conv_id] = _remaining
-                                        for _m in _consumed:
+                                    _evt_type = event.get("type")
+                                    if _evt_type == "injection.consumed":
+                                        _inj_id = event.get("injection_id")
+                                        _buf = _session_message_buffers.get(conv_id)
+                                        if _inj_id is not None and _buf:
+                                            _consumed = [
+                                                _m
+                                                for _m in _buf
+                                                if _m.get("injection_id") == _inj_id
+                                            ]
+                                            _remaining = [
+                                                _m
+                                                for _m in _buf
+                                                if _m.get("injection_id") != _inj_id
+                                            ]
+                                            _session_message_buffers[conv_id] = _remaining
+                                            for _m in _consumed:
+                                                _session_histories.setdefault(conv_id, []).append(
+                                                    {
+                                                        "type": "message",
+                                                        "role": _m.get("role", "user"),
+                                                        "content": _m.get("content", []),
+                                                    }
+                                                )
+                                        continue
+                                    if _evt_type == "response.output_text.delta":
+                                        delta = event.get("delta")
+                                        if delta is not None:
+                                            _text_acc.append(delta)
+                                            _text_yielded = True
+                                    elif _evt_type == "response.completed":
+                                        _stream_failed_error = None
+                                        if _text_acc:
                                             _session_histories.setdefault(conv_id, []).append(
                                                 {
                                                     "type": "message",
-                                                    "role": _m.get("role", "user"),
-                                                    "content": _m.get("content", []),
+                                                    "role": "assistant",
+                                                    "content": [
+                                                        {
+                                                            "type": "output_text",
+                                                            "text": "".join(_text_acc),
+                                                        }
+                                                    ],
                                                 }
                                             )
-                                    continue
-                                if _evt_type == "response.output_text.delta":
-                                    delta = event.get("delta")
-                                    if delta is not None:
-                                        _text_acc.append(delta)
-                                elif _evt_type == "response.completed":
-                                    _stream_failed_error = None
-                                    if _text_acc:
-                                        _session_histories.setdefault(conv_id, []).append(
-                                            {
-                                                "type": "message",
-                                                "role": "assistant",
-                                                "content": [
+                                            _text_acc.clear()
+                                    elif _evt_type == "response.failed":
+                                        _err = event.get("error") or (
+                                            event.get("response") or {}
+                                        ).get("error")
+                                        _stream_failed_error = (
+                                            _err
+                                            if isinstance(_err, dict)
+                                            else {"message": "harness turn failed"}
+                                        )
+                                    elif _evt_type == "response.output_item.done":
+                                        _item = event.get("item")
+                                        if isinstance(_item, dict):
+                                            _it = _item.get("type")
+                                            if _it == "function_call":
+                                                _session_histories.setdefault(conv_id, []).append(
                                                     {
-                                                        "type": "output_text",
-                                                        "text": "".join(_text_acc),
+                                                        "type": "function_call",
+                                                        "call_id": _item["call_id"],
+                                                        "name": _item["name"],
+                                                        "arguments": _item["arguments"],
                                                     }
-                                                ],
-                                            }
-                                        )
-                                        _text_acc.clear()
-                                elif _evt_type == "response.failed":
-                                    _err = event.get("error") or (event.get("response") or {}).get(
-                                        "error"
-                                    )
-                                    _stream_failed_error = (
-                                        _err
-                                        if isinstance(_err, dict)
-                                        else {"message": "harness turn failed"}
-                                    )
-                                elif _evt_type == "response.output_item.done":
-                                    _item = event.get("item")
-                                    if isinstance(_item, dict):
-                                        _it = _item.get("type")
-                                        if _it == "function_call":
-                                            _session_histories.setdefault(conv_id, []).append(
-                                                {
-                                                    "type": "function_call",
-                                                    "call_id": _item["call_id"],
-                                                    "name": _item["name"],
-                                                    "arguments": _item["arguments"],
-                                                }
-                                            )
-                                        elif _it == "function_call_output":
-                                            _session_histories.setdefault(conv_id, []).append(
-                                                {
-                                                    "type": "function_call_output",
-                                                    "call_id": _item["call_id"],
-                                                    "output": _item["output"],
-                                                }
-                                            )
-                                elif _evt_type == "response.compaction.completed" and event.get(
-                                    "summary"
-                                ):
-                                    await _handle_harness_compaction(conv_id, event)
-
-                                if is_action_required(event):
-                                    tool_name = get_tool_name(event)
-                                    is_mcp = tool_name in _mcp_tool_names
-                                    _spec_for_dispatch_hint = _unwrap_resolved_spec(
-                                        _session_spec_cache.get(conv_id)
-                                    )
-                                    _is_spec_local = _is_spec_local_native_python_tool(
-                                        _spec_for_dispatch_hint,
-                                        tool_name,
-                                    )
-                                    if (
-                                        not _is_spec_local
-                                        and not is_mcp
-                                        and not should_dispatch_locally(tool_name)
+                                                )
+                                            elif _it == "function_call_output":
+                                                _session_histories.setdefault(conv_id, []).append(
+                                                    {
+                                                        "type": "function_call_output",
+                                                        "call_id": _item["call_id"],
+                                                        "output": _item["output"],
+                                                    }
+                                                )
+                                    elif (
+                                        _evt_type == "response.compaction.completed"
+                                        and event.get("summary")
                                     ):
-                                        (
-                                            _spec_for_dispatch_hint_entry,
-                                            _lazy_hint_err,
-                                        ) = await _resolve_turn_spec_lazy()
-                                        if _lazy_hint_err is None:
-                                            _spec_for_dispatch_hint = _unwrap_resolved_spec(
-                                                _spec_for_dispatch_hint_entry
-                                            )
-                                            _is_spec_local = _is_spec_local_native_python_tool(
-                                                _spec_for_dispatch_hint,
-                                                tool_name,
-                                            )
-                                    _should_dispatch = _should_dispatch_tool_locally(
-                                        tool_name,
-                                        dispatch=dispatch,
-                                        is_mcp=is_mcp,
-                                        is_runner_builtin=should_dispatch_locally(tool_name),
-                                        is_spec_local=_is_spec_local,
-                                    )
-                                    if _should_dispatch and _response_id:
-                                        _defer_publish = True
-                                        (
-                                            _spec_for_dispatch_entry,
-                                            _lazy_err,
-                                        ) = await _resolve_turn_spec_lazy()
-                                        if _lazy_err is not None:
-                                            _err_type, _err_msg = _lazy_err
-                                            _fail = {
-                                                "type": "response.failed",
-                                                "error": {
-                                                    "message": _err_msg,
-                                                    "type": _err_type,
-                                                },
-                                            }
-                                            _publish_event(conv_id, _fail)
-                                            _on_proxy_stream_end(
-                                                conv_id,
-                                                error={
-                                                    "message": _err_msg,
-                                                    "type": _err_type,
-                                                },
-                                                owner_response_id=_response_id,
-                                            )
-                                            yield _response_failed_event(
-                                                {"message": _err_msg, "type": _err_type}
-                                            )
-                                            return
-                                        _dispatch_workdir = (
-                                            _resolved_workdir_for_spec(
+                                        await _handle_harness_compaction(conv_id, event)
+
+                                    if is_action_required(event):
+                                        tool_name = get_tool_name(event)
+                                        is_mcp = tool_name in _mcp_tool_names
+                                        _spec_for_dispatch_hint = _unwrap_resolved_spec(
+                                            _session_spec_cache.get(conv_id)
+                                        )
+                                        _is_spec_local = _is_spec_local_native_python_tool(
+                                            _spec_for_dispatch_hint,
+                                            tool_name,
+                                        )
+                                        if (
+                                            not _is_spec_local
+                                            and not is_mcp
+                                            and not should_dispatch_locally(tool_name)
+                                        ):
+                                            (
+                                                _spec_for_dispatch_hint_entry,
+                                                _lazy_hint_err,
+                                            ) = await _resolve_turn_spec_lazy()
+                                            if _lazy_hint_err is None:
+                                                _spec_for_dispatch_hint = _unwrap_resolved_spec(
+                                                    _spec_for_dispatch_hint_entry
+                                                )
+                                                _is_spec_local = _is_spec_local_native_python_tool(
+                                                    _spec_for_dispatch_hint,
+                                                    tool_name,
+                                                )
+                                        _should_dispatch = _should_dispatch_tool_locally(
+                                            tool_name,
+                                            dispatch=dispatch,
+                                            is_mcp=is_mcp,
+                                            is_runner_builtin=should_dispatch_locally(tool_name),
+                                            is_spec_local=_is_spec_local,
+                                        )
+                                        if _should_dispatch and _response_id:
+                                            _defer_publish = True
+                                            (
                                                 _spec_for_dispatch_entry,
-                                                runner_workspace,
+                                                _lazy_err,
+                                            ) = await _resolve_turn_spec_lazy()
+                                            if _lazy_err is not None:
+                                                _err_type, _err_msg = _lazy_err
+                                                _fail = {
+                                                    "type": "response.failed",
+                                                    "error": {
+                                                        "message": _err_msg,
+                                                        "type": _err_type,
+                                                    },
+                                                }
+                                                _publish_event(conv_id, _fail)
+                                                _on_proxy_stream_end(
+                                                    conv_id,
+                                                    error={
+                                                        "message": _err_msg,
+                                                        "type": _err_type,
+                                                    },
+                                                    owner_response_id=_response_id,
+                                                )
+                                                yield _response_failed_event(
+                                                    {"message": _err_msg, "type": _err_type}
+                                                )
+                                                return
+                                            _dispatch_workdir = (
+                                                _resolved_workdir_for_spec(
+                                                    _spec_for_dispatch_entry,
+                                                    runner_workspace,
+                                                )
+                                                if _is_spec_local
+                                                else runner_workspace
                                             )
-                                            if _is_spec_local
-                                            else runner_workspace
-                                        )
-                                        _spec_for_dispatch = _unwrap_resolved_spec(
-                                            _spec_for_dispatch_entry
-                                        )
-                                        event[_RUNNER_DISPATCHED_FIELD] = True
-                                        raw_sse_bytes = _encode_sse_event(event)
-                                        _agent_id_for_dispatch = cast(
-                                            str | None, body.get("agent_id")
-                                        )
-                                        _dispatch_mcp = ProxyMcpManager(
-                                            conv_id,
-                                            server_client,
-                                            publish_event=_publish_event,
-                                        )
+                                            _spec_for_dispatch = _unwrap_resolved_spec(
+                                                _spec_for_dispatch_entry
+                                            )
+                                            event[_RUNNER_DISPATCHED_FIELD] = True
+                                            raw_sse_bytes = _encode_sse_event(event)
+                                            _agent_id_for_dispatch = cast(
+                                                str | None, body.get("agent_id")
+                                            )
+                                            _dispatch_mcp = ProxyMcpManager(
+                                                conv_id,
+                                                server_client,
+                                                publish_event=_publish_event,
+                                            )
+                                            _dispatch_tasks.append(
+                                                _asyncio.create_task(
+                                                    dispatch_tool_locally(
+                                                        tool_name=tool_name,
+                                                        call_id=get_call_id(event),
+                                                        arguments=get_arguments(event),
+                                                        response_id=_response_id,
+                                                        harness_client=client,
+                                                        server_client=server_client,
+                                                        terminal_registry=terminal_registry,
+                                                        resource_registry=resource_registry,
+                                                        agent_spec=_spec_for_dispatch,
+                                                        conversation_id=conv_id,
+                                                        task_id=_omnigent_task_id or _response_id,
+                                                        agent_id=_agent_id_for_dispatch,
+                                                        agent_name=cast(
+                                                            str | None, body.get("model")
+                                                        ),
+                                                        runner_workspace=_dispatch_workdir,
+                                                        mcp_manager=cast(
+                                                            "RunnerMcpManager", _dispatch_mcp
+                                                        ),
+                                                        session_inbox=_session_inboxes.get(
+                                                            conv_id
+                                                        ),
+                                                        session_async_tasks=_session_async_tasks.get(
+                                                            conv_id
+                                                        ),
+                                                        publish_event=_publish_event,
+                                                        filesystem_registry=filesystem_registry,
+                                                    )
+                                                )
+                                            )
+
+                                    if _evt_type == "policy_evaluation.requested":
+                                        _eval_id = event.get("evaluation_id", "")
+                                        _eval_phase = event.get("phase", "")
+                                        _eval_data = event.get("data") or {}
                                         _dispatch_tasks.append(
                                             _asyncio.create_task(
-                                                dispatch_tool_locally(
-                                                    tool_name=tool_name,
-                                                    call_id=get_call_id(event),
-                                                    arguments=get_arguments(event),
-                                                    response_id=_response_id,
-                                                    harness_client=client,
+                                                _evaluate_policy_via_omnigent(
                                                     server_client=server_client,
-                                                    terminal_registry=terminal_registry,
-                                                    resource_registry=resource_registry,
-                                                    agent_spec=_spec_for_dispatch,
+                                                    harness_client=client,
                                                     conversation_id=conv_id,
-                                                    task_id=_omnigent_task_id or _response_id,
-                                                    agent_id=_agent_id_for_dispatch,
-                                                    agent_name=cast(str | None, body.get("model")),
-                                                    runner_workspace=_dispatch_workdir,
-                                                    mcp_manager=cast(
-                                                        "RunnerMcpManager", _dispatch_mcp
+                                                    evaluation_id=_eval_id,
+                                                    phase=_eval_phase,
+                                                    data=_eval_data,
+                                                    # A dead verdict-delivery channel
+                                                    # parks the harness turn forever;
+                                                    # route it to the recovery entry,
+                                                    # binding THIS turn's response id
+                                                    # so a delayed failure can't cancel
+                                                    # a newer turn (ownership gate).
+                                                    on_delivery_failure=functools.partial(
+                                                        _resync_turn_state_on_delivery_failure,
+                                                        response_id=_response_id,
                                                     ),
-                                                    session_inbox=_session_inboxes.get(conv_id),
-                                                    session_async_tasks=_session_async_tasks.get(
-                                                        conv_id
-                                                    ),
-                                                    publish_event=_publish_event,
-                                                    filesystem_registry=filesystem_registry,
                                                 )
                                             )
                                         )
+                                        continue
 
-                                if _evt_type == "policy_evaluation.requested":
-                                    _eval_id = event.get("evaluation_id", "")
-                                    _eval_phase = event.get("phase", "")
-                                    _eval_data = event.get("data") or {}
-                                    _dispatch_tasks.append(
-                                        _asyncio.create_task(
-                                            _evaluate_policy_via_omnigent(
-                                                server_client=server_client,
-                                                harness_client=client,
-                                                conversation_id=conv_id,
-                                                evaluation_id=_eval_id,
-                                                phase=_eval_phase,
-                                                data=_eval_data,
-                                                # A dead verdict-delivery channel
-                                                # parks the harness turn forever;
-                                                # route it to the recovery entry,
-                                                # binding THIS turn's response id
-                                                # so a delayed failure can't cancel
-                                                # a newer turn (ownership gate).
-                                                on_delivery_failure=functools.partial(
-                                                    _resync_turn_state_on_delivery_failure,
-                                                    response_id=_response_id,
+                                    if _evt_type == "subagent.started":
+                                        # A harness reported spawning a sub-agent; mint
+                                        # a child session so it shows in the Subagents
+                                        # panel. Swallowed (never relayed to clients).
+                                        # The mint task heads the child's post chain, so
+                                        # its tool calls and summary land after it.
+                                        _sa_key = event.get("child_key", "")
+                                        if isinstance(_sa_key, str) and _sa_key:
+                                            _sa_start_future: _asyncio.Future[str] = (
+                                                _asyncio.get_running_loop().create_future()
+                                            )
+                                            _subagent_child_futures[_sa_key] = _sa_start_future
+                                            _subagent_titles[_sa_key] = event.get("title", "")
+                                            _sa_mint_task = _asyncio.create_task(
+                                                _mint_acp_subagent_child(
+                                                    server_client,
+                                                    parent_id=conv_id,
+                                                    child_key=_sa_key,
+                                                    title=event.get("title", ""),
+                                                    task=event.get("task", ""),
+                                                    child_id_future=_sa_start_future,
+                                                )
+                                            )
+                                            _subagent_post_chains[_sa_key] = _sa_mint_task
+                                            _dispatch_tasks.append(_sa_mint_task)
+                                        continue
+
+                                    if _evt_type == "subagent.tool_call":
+                                        # A tool call the sub-agent ran; append it to the
+                                        # child's transcript, chained after the child's
+                                        # previous post so it stays ordered.
+                                        _sa_tc_key = event.get("child_key", "")
+                                        _sa_tc_future = (
+                                            _subagent_child_futures.get(_sa_tc_key)
+                                            if isinstance(_sa_tc_key, str)
+                                            else None
+                                        )
+                                        if _sa_tc_future is not None:
+                                            _sa_tc_task = _chain_acp_subagent_post(
+                                                _subagent_post_chains.get(_sa_tc_key),
+                                                _post_acp_subagent_tool_call(
+                                                    server_client,
+                                                    child_key=_sa_tc_key,
+                                                    call_id=event.get("call_id", ""),
+                                                    name=event.get("name", "tool"),
+                                                    arguments=event.get("arguments", ""),
+                                                    child_id_future=_sa_tc_future,
+                                                    title=_subagent_titles.get(_sa_tc_key, ""),
                                                 ),
                                             )
-                                        )
-                                    )
-                                    continue
+                                            _subagent_post_chains[_sa_tc_key] = _sa_tc_task
+                                            _dispatch_tasks.append(_sa_tc_task)
+                                        continue
 
-                                if _evt_type == "subagent.started":
-                                    # A harness reported spawning a sub-agent; mint
-                                    # a child session so it shows in the Subagents
-                                    # panel. Swallowed (never relayed to clients).
-                                    # The mint task heads the child's post chain, so
-                                    # its tool calls and summary land after it.
-                                    _sa_key = event.get("child_key", "")
-                                    if isinstance(_sa_key, str) and _sa_key:
-                                        _sa_start_future: _asyncio.Future[str] = (
-                                            _asyncio.get_running_loop().create_future()
+                                    if _evt_type == "subagent.completed":
+                                        _sa_done_key = event.get("child_key", "")
+                                        _sa_done_future = (
+                                            _subagent_child_futures.get(_sa_done_key)
+                                            if isinstance(_sa_done_key, str)
+                                            else None
                                         )
-                                        _subagent_child_futures[_sa_key] = _sa_start_future
-                                        _subagent_titles[_sa_key] = event.get("title", "")
-                                        _sa_mint_task = _asyncio.create_task(
-                                            _mint_acp_subagent_child(
-                                                server_client,
-                                                parent_id=conv_id,
-                                                child_key=_sa_key,
-                                                title=event.get("title", ""),
-                                                task=event.get("task", ""),
-                                                child_id_future=_sa_start_future,
+                                        if _sa_done_future is not None:
+                                            _sa_done_task = _chain_acp_subagent_post(
+                                                _subagent_post_chains.get(_sa_done_key),
+                                                _complete_acp_subagent_child(
+                                                    server_client,
+                                                    child_key=_sa_done_key,
+                                                    ok=bool(event.get("ok", True)),
+                                                    summary=event.get("summary", ""),
+                                                    child_id_future=_sa_done_future,
+                                                    title=_subagent_titles.get(_sa_done_key, ""),
+                                                ),
                                             )
-                                        )
-                                        _subagent_post_chains[_sa_key] = _sa_mint_task
-                                        _dispatch_tasks.append(_sa_mint_task)
+                                            _subagent_post_chains[_sa_done_key] = _sa_done_task
+                                            _dispatch_tasks.append(_sa_done_task)
+                                        continue
+
+                                if event is None:
+                                    yield raw_sse_bytes
                                     continue
+                                if not _defer_publish and event.get("type") != "response.created":
+                                    _publish_event(conv_id, event)
+                                if dispatch is not None and event.get(_RUNNER_DISPATCHED_FIELD):
+                                    pass
+                                else:
+                                    yield raw_sse_bytes
 
-                                if _evt_type == "subagent.tool_call":
-                                    # A tool call the sub-agent ran; append it to the
-                                    # child's transcript, chained after the child's
-                                    # previous post so it stays ordered.
-                                    _sa_tc_key = event.get("child_key", "")
-                                    _sa_tc_future = (
-                                        _subagent_child_futures.get(_sa_tc_key)
-                                        if isinstance(_sa_tc_key, str)
-                                        else None
-                                    )
-                                    if _sa_tc_future is not None:
-                                        _sa_tc_task = _chain_acp_subagent_post(
-                                            _subagent_post_chains.get(_sa_tc_key),
-                                            _post_acp_subagent_tool_call(
-                                                server_client,
-                                                child_key=_sa_tc_key,
-                                                call_id=event.get("call_id", ""),
-                                                name=event.get("name", "tool"),
-                                                arguments=event.get("arguments", ""),
-                                                child_id_future=_sa_tc_future,
-                                                title=_subagent_titles.get(_sa_tc_key, ""),
-                                            ),
-                                        )
-                                        _subagent_post_chains[_sa_tc_key] = _sa_tc_task
-                                        _dispatch_tasks.append(_sa_tc_task)
-                                    continue
+                        if _dispatch_tasks:
+                            await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
 
-                                if _evt_type == "subagent.completed":
-                                    _sa_done_key = event.get("child_key", "")
-                                    _sa_done_future = (
-                                        _subagent_child_futures.get(_sa_done_key)
-                                        if isinstance(_sa_done_key, str)
-                                        else None
-                                    )
-                                    if _sa_done_future is not None:
-                                        _sa_done_task = _chain_acp_subagent_post(
-                                            _subagent_post_chains.get(_sa_done_key),
-                                            _complete_acp_subagent_child(
-                                                server_client,
-                                                child_key=_sa_done_key,
-                                                ok=bool(event.get("ok", True)),
-                                                summary=event.get("summary", ""),
-                                                child_id_future=_sa_done_future,
-                                                title=_subagent_titles.get(_sa_done_key, ""),
-                                            ),
-                                        )
-                                        _subagent_post_chains[_sa_done_key] = _sa_done_task
-                                        _dispatch_tasks.append(_sa_done_task)
-                                    continue
+                        _on_proxy_stream_end(
+                            conv_id, error=_stream_failed_error, owner_response_id=_response_id
+                        )
 
-                            if event is None:
-                                yield raw_sse_bytes
-                                continue
-                            if not _defer_publish and event.get("type") != "response.created":
-                                _publish_event(conv_id, event)
-                            if dispatch is not None and event.get(_RUNNER_DISPATCHED_FIELD):
-                                pass
-                            else:
-                                yield raw_sse_bytes
+                    break  # completed normally; no retry needed
 
-                    if _dispatch_tasks:
-                        await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
+                except _ContextWindowOverflow as overflow:
+                    _error = {
+                        "code": "context_length_exceeded",
+                        "message": (
+                            f"Context window exceeded: {overflow.actual_tokens} tokens "
+                            f"> {overflow.max_tokens} max"
+                        ),
+                        "type": "_ContextWindowOverflow",
+                    }
+                    _overflow_fail = {
+                        "type": "response.failed",
+                        "source": "llm",
+                        "response": {"status": "failed", "error": _error},
+                        "error": _error,
+                    }
+                    _publish_event(conv_id, _overflow_fail)
+                    _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
+                    yield _response_failed_event(_error, source="llm")
 
-                    _on_proxy_stream_end(
-                        conv_id, error=_stream_failed_error, owner_response_id=_response_id
+                    break  # context overflow is terminal, no retry
+
+                except (httpx.HTTPError, RuntimeError) as exc:
+                    # Retry once if it is a dead-channel error and no model
+                    # output has been delivered yet (no text deltas, no local
+                    # dispatch pending): safe to re-POST.  Clear any in-flight
+                    # markers from this attempt first — a response.created may
+                    # have arrived and called mark_in_flight before the drop;
+                    # resetting ensures the retry starts clean so mark_in_flight
+                    # is called exactly once for the successful attempt.
+                    if (
+                        isinstance(exc, _DEAD_HARNESS_CHANNEL_ERRORS)
+                        and not _text_yielded
+                        and not _dispatch_tasks
+                        and _stream_attempt == 0
+                    ):
+                        # Clear all in-flight state from this attempt before
+                        # retrying: response.created may have arrived and called
+                        # mark_in_flight; releasing here ensures the retry starts
+                        # clean so mark_in_flight fires exactly once for the
+                        # attempt that succeeds.
+                        _release_live_turn_markers(conv_id)
+                        # Also evict the stale response_id from the reverse
+                        # lookup so it does not outlive the retry attempt.
+                        if _response_id is not None:
+                            _resp_to_conv.pop(_response_id, None)
+                        _response_id = None
+                        _logger.warning(
+                            "proxy stream dead-channel drop for %s on attempt 1/2,"
+                            " retrying (no output yet): %s",
+                            conv_id,
+                            exc,
+                            extra={"session_id": conv_id},
+                        )
+                        continue
+                    _logger.exception(
+                        "proxy stream connection error for %s: %s",
+                        conv_id,
+                        exc,
+                        extra={"session_id": conv_id},
                     )
-
-            except _ContextWindowOverflow as overflow:
-                _error = {
-                    "code": "context_length_exceeded",
-                    "message": (
-                        f"Context window exceeded: {overflow.actual_tokens} tokens "
-                        f"> {overflow.max_tokens} max"
-                    ),
-                    "type": "_ContextWindowOverflow",
-                }
-                _overflow_fail = {
-                    "type": "response.failed",
-                    "source": "llm",
-                    "response": {"status": "failed", "error": _error},
-                    "error": _error,
-                }
-                _publish_event(conv_id, _overflow_fail)
-                _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
-                yield _response_failed_event(_error, source="llm")
-
-            except (httpx.HTTPError, RuntimeError) as exc:
-                _logger.exception(
-                    "proxy stream connection error for %s: %s",
-                    conv_id,
-                    exc,
-                    extra={"session_id": conv_id},
-                )
-                _error = {
-                    "code": "connection_error",
-                    "message": "Harness stream connection error.",
-                    "type": type(exc).__name__,
-                }
-                _http_fail = {
-                    "type": "response.failed",
-                    "source": "harness",
-                    "response": {"status": "failed", "error": _error},
-                    "error": _error,
-                }
-                _publish_event(conv_id, _http_fail)
-                _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
-                yield _response_failed_event(_error, source="harness")
+                    _error = {
+                        "code": "connection_error",
+                        "message": "Harness stream connection error.",
+                        "type": type(exc).__name__,
+                    }
+                    _http_fail = {
+                        "type": "response.failed",
+                        "source": "harness",
+                        "response": {"status": "failed", "error": _error},
+                        "error": _error,
+                    }
+                    _publish_event(conv_id, _http_fail)
+                    _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
+                    yield _response_failed_event(_error, source="harness")
+                    break  # terminal error
 
         return StreamingResponse(
             proxy_stream(),

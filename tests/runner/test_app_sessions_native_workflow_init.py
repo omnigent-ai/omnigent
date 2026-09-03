@@ -1443,6 +1443,11 @@ async def test_sessions_native_clears_in_flight_when_stream_errors() -> None:
     error.") must still clear the marker; a missed clear would leave the entry
     permanently in-flight and therefore never reaped — the inverse of #1414
     (cf. #1349).
+
+    When a dead-channel drop occurs before any text delta, proxy_stream retries
+    once.  The harness here always fails, so both attempts reach response.created
+    then drop: mark_in_flight fires once per attempt, but clear_in_flight must
+    always match so the session is never left permanently in-flight.
     """
     sse_frames = [
         _sse({"type": "response.created", "response": {"id": "resp_drop"}}),
@@ -1480,10 +1485,15 @@ async def test_sessions_native_clears_in_flight_when_stream_errors() -> None:
             await asyncio.sleep(0.05)
 
     # Marked live on response.created, then cleared despite the mid-stream drop.
-    assert pm.marked_in_flight == [("9217a860245985f541fd686eb2a32b73", "resp_drop")], (
-        pm.marked_in_flight
-    )
-    assert pm.cleared_in_flight == ["9217a860245985f541fd686eb2a32b73"], pm.cleared_in_flight
+    # With the dead-channel retry the harness is attempted twice (both error),
+    # so mark_in_flight fires once per attempt and clear_in_flight fires once
+    # between attempts (via the retry clear) and once at terminal failure.
+    conv_id_err = "9217a860245985f541fd686eb2a32b73"
+    assert pm.marked_in_flight == [
+        (conv_id_err, "resp_drop"),
+        (conv_id_err, "resp_drop"),
+    ], pm.marked_in_flight
+    assert conv_id_err in pm.cleared_in_flight, pm.cleared_in_flight
 
 
 @pytest.mark.asyncio
