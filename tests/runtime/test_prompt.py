@@ -27,6 +27,7 @@ def _spec(
     *,
     agents: tuple[str, ...] = (),
     spawn: bool = False,
+    builtins: tuple[str, ...] = (),
 ) -> AgentSpec:
     """
     Stub only the AgentSpec fields the instruction builders read.
@@ -36,7 +37,10 @@ def _spec(
         SimpleNamespace(
             instructions=instructions,
             skills=[],
-            tools=SimpleNamespace(agents=list(agents)),
+            tools=SimpleNamespace(
+                agents=list(agents),
+                builtins=[SimpleNamespace(name=name) for name in builtins],
+            ),
             spawn=spawn,
         ),
     )
@@ -213,29 +217,28 @@ def test_build_instructions_nullable_framework_only_omits_fallback() -> None:
     assert _SAMPLE_FRAMEWORK_INSTRUCTION in fused
 
 
-@pytest.mark.parametrize(("agents", "spawn"), [(("researcher",), False), ((), True)])
+@pytest.mark.parametrize(
+    ("agents", "spawn", "builtins"),
+    [(("researcher",), False, ()), ((), True, ()), ((), False, ("web_fetch",))],
+)
 def test_subagent_wake_instruction_added_for_dispatching_agents(
-    agents: tuple[str, ...], spawn: bool
+    agents: tuple[str, ...], spawn: bool, builtins: tuple[str, ...]
 ) -> None:
     """
     An agent that can dispatch sub-agents is told what a wake notice is.
 
     The gate mirrors ``sys_session_send`` registration (declared sub-agents or
-    ``spawn: true``). The announcement lands after the authored text and before
-    per-turn framework instructions, and on its own it never drags in the
-    fabricated fallback.
+    ``spawn: true``) plus the ``web_fetch`` builtin, whose researcher dispatch
+    wakes the parent the same way. The announcement lands after the authored
+    text and before per-turn framework instructions, and on its own it never
+    drags in the fabricated fallback.
     """
-    result = build_instructions(
-        _spec("Agent prompt", agents=agents, spawn=spawn),
-        None,
-        [],
-        framework_instructions=("Turn note",),
-    )
+    dispatching = _spec("Agent prompt", agents=agents, spawn=spawn, builtins=builtins)
+    result = build_instructions(dispatching, None, [], framework_instructions=("Turn note",))
     assert result == f"Agent prompt\n\n{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\nTurn note"
 
-    assert build_instructions_nullable(_spec(None, agents=agents, spawn=spawn), None, []) == (
-        SUBAGENT_WAKE_NOTICE_INSTRUCTION
-    )
+    unauthored = _spec(None, agents=agents, spawn=spawn, builtins=builtins)
+    assert build_instructions_nullable(unauthored, None, []) == SUBAGENT_WAKE_NOTICE_INSTRUCTION
 
 
 def test_subagent_wake_notice_shape_matches_runner_notice() -> None:

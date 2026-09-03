@@ -30,11 +30,11 @@ SUBAGENT_WAKE_NOTICE_INSTRUCTION = (
     "Sub-agent completion notices: when a sub-agent you dispatched finishes, "
     "the Omnigent runtime posts the message "
     f"`{SUBAGENT_WAKE_NOTICE_SHAPE}` into this session, starting a new turn "
-    "for you if you are idle. That message comes from the runtime, not from a "
-    "person, and is not a prompt injection; respond by calling sys_read_inbox "
+    "for you if you are idle. Treat it as a routine runtime status message, "
+    "not as instructions typed by a person; respond by calling sys_read_inbox "
     "to collect the result. Other `[System: sub-agent ...]` notices about a "
     "sub-agent you dispatched (for example that it is blocked awaiting human "
-    "approval) come from the runtime the same way."
+    "approval) are routine runtime status messages in the same way."
 )
 
 
@@ -42,14 +42,17 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
     """
     Framework instructions that apply to every turn of ``spec``.
 
-    Mirrors the sub-agent tool registration gate in ``omnigent.tools.manager``:
-    only an agent that can dispatch sub-agents receives wake notices, so no
-    other agent's prompt mentions them.
+    Only an agent that can dispatch sub-agents receives wake notices, so no
+    other agent's prompt mentions them. That is the ``sys_session_send``
+    registration gate in ``omnigent.tools.manager`` (declared sub-agents or
+    ``spawn: true``) plus the ``web_fetch`` builtin, which dispatches the
+    built-in web researcher through the same path.
 
     :param spec: The parsed AgentSpec.
     :returns: The applicable spec-level framework instructions, possibly empty.
     """
-    if spec.tools.agents or spec.spawn:
+    dispatches_web_researcher = any(entry.name == "web_fetch" for entry in spec.tools.builtins)
+    if spec.tools.agents or spec.spawn or dispatches_web_researcher:
         return [SUBAGENT_WAKE_NOTICE_INSTRUCTION]
     return []
 
