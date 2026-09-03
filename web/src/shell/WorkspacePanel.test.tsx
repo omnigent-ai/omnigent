@@ -526,6 +526,8 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     const shellItem = await screen.findByRole("menuitem", { name: /shell \(zsh\)/i });
     shellItem.focus();
     fireEvent.keyDown(shellItem, { key: "ArrowRight" });
+    expect(await screen.findByText("Other shells")).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /^Other shells$/i })).toBeNull();
     expect(await screen.findByRole("menuitem", { name: /^bash$/i })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /^fish$/i })).toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: /^zsh$/i })).toBeNull();

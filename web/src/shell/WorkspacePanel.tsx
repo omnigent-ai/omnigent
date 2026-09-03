@@ -256,6 +256,7 @@ function NewTabMenu({
             {/* min-w-0 drops the default 96px floor so the box hugs the shell
                 name (e.g. "bash") instead of padding it out. */}
             <DropdownMenuSubContent className="min-w-0">
+              <DropdownMenuLabel>Other shells</DropdownMenuLabel>
               {otherShells.map((name) => (
                 <DropdownMenuItem
                   key={name}
