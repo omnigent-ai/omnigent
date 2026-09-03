@@ -454,7 +454,7 @@ def create_oauth_token_router(
             device_grant_store.purge_expired(
                 int(now_wall), max_lifetime_seconds=_grant_max_lifetime
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 — housekeeping must never fail a refresh
             _logger.debug("oauth/token: opportunistic grant purge failed", exc_info=True)
 
     def _issue_access_token(grant_id: str, user_id: str, client_id: str) -> str:

@@ -761,7 +761,7 @@ def _ensure_default_acp_agents(
 
         configured = list(acp_agents())
         shadowed: frozenset[str] = shadowed_builtin_acp_rows(configured)
-    except Exception:
+    except Exception:  # noqa: BLE001 — a malformed acp: block must never break startup
         _logger.debug("acp agent seeding skipped (config unreadable)", exc_info=True)
         configured = []
         shadowed = frozenset()

@@ -182,10 +182,7 @@ def create_auth_router(
         # re-authenticate rather than reusing an existing session
         # (OIDC Core 3.1.2.1 `prompt=login`, `max_age=0`).
         # Not applicable to GitHub OAuth, which has no prompt parameter.
-        reauth = (
-            request.query_params.get("reauth") == "1"
-            and config.provider_type != "github"
-        )
+        reauth = request.query_params.get("reauth") == "1" and config.provider_type != "github"
 
         # Store state + code_verifier in a short-lived signed cookie.
         state_payload: dict[str, str | int] = {
