@@ -24,6 +24,7 @@ vi.mock("./WorkspacePathField", () => ({
 vi.mock("./WorkspacePicker", () => ({
   WorkspacePicker: () => <div data-testid="mock-workspace-picker" />,
   isNavigablePath: () => false,
+  isUnresolvedWorkspacePath: () => false,
 }));
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
 vi.mock("@/hooks/useDirectorySessions", () => ({ useDirectorySessions: vi.fn() }));

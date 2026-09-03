@@ -74,7 +74,7 @@ import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { agentRootName, forkTargetCarriesHistory, harnessFamily } from "@/lib/forkHarness";
 import { checkHostDirectory, hostDirectoryMissing } from "@/hooks/useHostFilesystem";
 import { getCliServerUrl } from "@/lib/host";
-import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
+import { WorkspacePicker, isNavigablePath, isUnresolvedWorkspacePath } from "./WorkspacePicker";
 import { WorkspacePathField } from "./WorkspacePathField";
 import {
   ConnectHostInstructions,
@@ -964,6 +964,16 @@ export function ForkSessionForm({
     setBrowseNonce((n) => n + 1);
   }
 
+  // A committed "~/…" path is a real directory the host can list, but
+  // isValidWorkspace accepts only absolute paths (the server never expands
+  // ~), so the submit would stay greyed out. When the tree browser resolves
+  // the committed path to its absolute form, adopt that as the form value.
+  // Once the value is absolute, browsing deeper no longer rewrites it —
+  // that still takes the explicit "Select" click.
+  function onPickerNavigate(path: string): void {
+    if (isUnresolvedWorkspacePath(workspace)) setWorkspace(path);
+  }
+
   async function handleFork(): Promise<void> {
     if (!canSubmit) return;
     setSubmitting(true);
@@ -1361,6 +1371,7 @@ export function ForkSessionForm({
                             initialPath={
                               isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined
                             }
+                            onNavigate={onPickerNavigate}
                             onSelect={(path) => {
                               setWorkspace(path);
                               setBrowsing(false);

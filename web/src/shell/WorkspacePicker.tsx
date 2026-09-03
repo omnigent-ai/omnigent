@@ -215,6 +215,21 @@ export function isNavigablePath(path: string): boolean {
   );
 }
 
+/**
+ * True when a workspace value is committed but not yet resolved: navigable
+ * enough for the tree browser to open at it (a ``~``-relative path the host
+ * expands), yet not the absolute form the server requires. Dialogs use this
+ * to adopt the browser's resolved absolute path (via ``onNavigate``) as the
+ * form value, so committing a real directory leaves the form submittable.
+ *
+ * @param value Raw workspace text, e.g. ``"~/projects"`` or ``"/tmp"``.
+ * @returns Whether the value still needs the browser's resolution.
+ */
+export function isUnresolvedWorkspacePath(value: string): boolean {
+  const trimmed = value.trim();
+  return isNavigablePath(trimmed) && !isHostAbsolutePath(trimmed);
+}
+
 export function listingFilter(
   pathInput: string,
   currentAbsolute: string,

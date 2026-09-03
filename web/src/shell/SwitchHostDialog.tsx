@@ -17,7 +17,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { WorkspacePicker, isNavigablePath, parentOf } from "./WorkspacePicker";
+import {
+  WorkspacePicker,
+  isNavigablePath,
+  isUnresolvedWorkspacePath,
+  parentOf,
+} from "./WorkspacePicker";
 import { WorkspacePathField } from "./WorkspacePathField";
 import { HostLabel } from "./HostLabel";
 import { isValidWorkspace, normalizeWorkspacePath } from "./NewChatDialog";
@@ -173,6 +178,16 @@ export function SwitchHostDialog({
     setBrowseNonce((n) => n + 1);
   }
 
+  // A committed "~/…" path is a real directory the host can list, but
+  // isValidWorkspace accepts only absolute paths (the server never expands
+  // ~), so the submit would stay greyed out. When the tree browser resolves
+  // the committed path to its absolute form, adopt that as the form value.
+  // Once the value is absolute, browsing deeper no longer rewrites it —
+  // that still takes the explicit "Select" click.
+  function onPickerNavigate(path: string): void {
+    if (isUnresolvedWorkspacePath(workspace)) handleWorkspaceChange(path);
+  }
+
   async function handleSwitch(): Promise<void> {
     if (!selectedHostId || !workspaceValid) return;
     setSubmitting(true);
@@ -264,6 +279,7 @@ export function SwitchHostDialog({
                       key={browseNonce}
                       hostId={selectedHostId}
                       initialPath={isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined}
+                      onNavigate={onPickerNavigate}
                       onSelect={(path) => {
                         handleWorkspaceChange(path);
                         setBrowsing(false);
