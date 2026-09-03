@@ -3197,9 +3197,11 @@ def test_create_session_with_agent_host_id_requires_workspace(
     workspace must fail loudly instead of writing a row the launch
     flow can't use.
     """
-    from sqlalchemy.exc import IntegrityError
+    # MySQL reports check-constraint violations (error 3819) as
+    # OperationalError rather than IntegrityError.
+    from sqlalchemy.exc import IntegrityError, OperationalError
 
-    with pytest.raises(IntegrityError):
+    with pytest.raises((IntegrityError, OperationalError)):
         conversation_store.create_session_with_agent(
             agent_id="9d1de2b7dd35c74faf05ff54c99ab222",
             agent_name="host-no-ws-agent",
