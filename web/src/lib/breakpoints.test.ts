@@ -3,27 +3,7 @@ import { describe, expect, it, vi, afterEach } from "vitest";
 
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { MD_BREAKPOINT_PX, MD_MIN_WIDTH_QUERY, isMobileViewport } from "./breakpoints";
-
-// Evaluate min-/max-width queries against a simulated viewport width, so
-// boundary behavior at fractional widths can be exercised.
-function stubViewportWidth(width: number) {
-  Object.defineProperty(window, "matchMedia", {
-    writable: true,
-    configurable: true,
-    value: vi.fn((query: string) => ({
-      matches: (() => {
-        const min = query.match(/^\(min-width: ([\d.]+)px\)$/);
-        if (min) return width >= parseFloat(min[1]);
-        const max = query.match(/^\(max-width: ([\d.]+)px\)$/);
-        if (max) return width <= parseFloat(max[1]);
-        return false;
-      })(),
-      media: query,
-      addEventListener: () => {},
-      removeEventListener: () => {},
-    })),
-  });
-}
+import { stubMatchMedia } from "@/test-helpers/matchMedia";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -37,10 +17,10 @@ describe("breakpoints", () => {
   });
 
   it("isMobileViewport is true below md and false at md+", () => {
-    stubViewportWidth(MD_BREAKPOINT_PX);
+    stubMatchMedia({ width: MD_BREAKPOINT_PX });
     expect(isMobileViewport()).toBe(false);
 
-    stubViewportWidth(MD_BREAKPOINT_PX - 1);
+    stubMatchMedia({ width: MD_BREAKPOINT_PX - 1 });
     expect(isMobileViewport()).toBe(true);
   });
 
@@ -56,7 +36,7 @@ describe("breakpoints", () => {
     [767.99, true],
     [768, false],
   ])("hook, helper, and published signal agree at %spx", (width, mobile) => {
-    stubViewportWidth(width);
+    stubMatchMedia({ width: width });
     expect(isMobileViewport()).toBe(mobile);
     expect(window["__omnigentIsMobileViewport"]?.()).toBe(mobile);
     const { result } = renderHook(() => useIsMobileViewport());

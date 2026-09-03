@@ -1,16 +1,50 @@
-import { renderSidebar } from "@/test/sidebarTestHelpers";
-import { conversation as conv, conversationPage } from "@/test/sidebarMockHelpers";
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Mobile drawer: a strip of chat stays visible and dismisses it on tap, Search
 // floats at the top, and Settings sits in the profile footer.
 
-import { act, cleanup, fireEvent, screen, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 
-vi.mock("@/hooks/useConversations", async () => {
-  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
-  return conversationHooksMock();
-});
+vi.mock("@/hooks/useConversations", () => ({
+  useConversations: vi.fn(),
+  useConnectedConversations: () => [],
+  useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
+  usePinnedConversations: () => ({
+    data: { conversations: [], filterHonored: true },
+    isSuccess: true,
+  }),
+  useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
+  setConversationPinned: vi.fn(() => Promise.resolve({})),
+  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
+  useRenameConversation: () => ({ mutate: vi.fn() }),
+  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
+  useArchiveConversation: () => ({ mutate: vi.fn() }),
+  useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useStopSession: () => ({ mutate: vi.fn() }),
+  useProjects: () => ({ data: [] }),
+  useProjectSessions: () => ({
+    data: undefined,
+    isLoading: false,
+    hasNextPage: false,
+    isFetchingNextPage: false,
+    fetchNextPage: vi.fn(),
+  }),
+  useMoveToProject: () => ({ mutate: vi.fn() }),
+  useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useProjectConfig: () => ({ data: undefined, isLoading: false }),
+  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  fetchProjectSessionIds: () => Promise.resolve([]),
+  PROJECT_LABEL_KEY: "omni_project",
+}));
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
@@ -22,35 +56,68 @@ vi.mock("@/lib/serverOrigin", () => ({
 }));
 
 import { useConversations } from "@/hooks/useConversations";
+import { Sidebar } from "./Sidebar";
+import { stubMatchMedia } from "@/test-helpers/matchMedia";
 
 const useConvMock = vi.mocked(useConversations);
 const originalMatchMedia = window.matchMedia;
 
-function stubViewportWidth(width: number): void {
-  window.matchMedia = ((query: string) => ({
-    matches: (() => {
-      const min = query.match(/^\(min-width: ([\d.]+)px\)$/);
-      if (min) return width >= parseFloat(min[1]);
-      const max = query.match(/^\(max-width: ([\d.]+)px\)$/);
-      if (max) return width <= parseFloat(max[1]);
-      return false;
-    })(),
-    media: query,
-    onchange: null,
-    addListener: () => {},
-    removeListener: () => {},
-    addEventListener: () => {},
-    removeEventListener: () => {},
-    dispatchEvent: () => false,
-  })) as typeof window.matchMedia;
+function conv(id: string, partial: Partial<Conversation> = {}): Conversation {
+  return {
+    id,
+    object: "conversation",
+    title: id,
+    created_at: 0,
+    updated_at: 0,
+    labels: {},
+    permission_level: null,
+    status: "idle",
+    ...partial,
+  };
 }
 
 function mockConversations(conversations: Conversation[]) {
-  useConvMock.mockImplementation(() => conversationPage(conversations));
+  useConvMock.mockImplementation(
+    () =>
+      ({
+        data: {
+          pages: [
+            {
+              data: conversations,
+              first_id: conversations[0]?.id ?? null,
+              last_id: conversations.at(-1)?.id ?? null,
+              has_more: false,
+            },
+          ],
+          pageParams: [undefined],
+        },
+        isLoading: false,
+        isError: false,
+        error: null,
+        fetchNextPage: vi.fn(),
+        hasNextPage: false,
+        isFetchingNextPage: false,
+      }) as unknown as ReturnType<typeof useConversations>,
+  );
+}
+
+function renderSidebar(props: { open?: boolean; onClose?: () => void; route?: string } = {}) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={qc}>
+      <SidebarDataProvider>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={[props.route ?? "/"]}>
+            <Sidebar open={props.open ?? true} onClose={props.onClose ?? vi.fn()} />
+          </MemoryRouter>
+        </TooltipProvider>
+      </SidebarDataProvider>
+    </QueryClientProvider>,
+  );
 }
 
 beforeEach(() => {
-  stubViewportWidth(375);
+  stubMatchMedia({ width: 375 });
   mockConversations([conv("conv_a")]);
 });
 

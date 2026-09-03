@@ -20,17 +20,36 @@ export const MD_BREAKPOINT_PX = 768;
 /** `(min-width: …)` media query — matches Tailwind's `md:` variant. */
 export const MD_MIN_WIDTH_QUERY = `(min-width: ${MD_BREAKPOINT_PX}px)`;
 
+// One MediaQueryList for the breakpoint, shared by every reader and
+// subscriber (the sidebar calls `isMobileViewport` per row per render, so a
+// fresh `matchMedia` each time is measurable). Created lazily and dropped when
+// the last subscriber leaves, so tests that swap `window.matchMedia` see the
+// replacement on the next read.
+let mdList: MediaQueryList | null = null;
+const subscribers = new Set<() => void>();
+
+function list(): MediaQueryList {
+  return (mdList ??= window.matchMedia(MD_MIN_WIDTH_QUERY));
+}
+
+function emit(): void {
+  for (const subscriber of subscribers) subscriber();
+}
+
 /**
- * Subscribe to change events on a set of media queries. SSR-safe (no-op
- * teardown when matchMedia is unavailable). Returns the unsubscribe function
- * expected by `useSyncExternalStore` subscribe callbacks.
+ * Subscribe to the breakpoint's change events. SSR-safe (no-op teardown when
+ * matchMedia is unavailable). Returns the unsubscribe function expected by
+ * `useSyncExternalStore` subscribe callbacks.
  */
-export function subscribeMatchMedia(queries: readonly string[], callback: () => void): () => void {
+export function subscribeMdBreakpoint(callback: () => void): () => void {
   if (typeof window === "undefined" || !window.matchMedia) return () => {};
-  const lists = queries.map((q) => window.matchMedia(q));
-  for (const mql of lists) mql.addEventListener("change", callback);
+  if (subscribers.size === 0) list().addEventListener("change", emit);
+  subscribers.add(callback);
   return () => {
-    for (const mql of lists) mql.removeEventListener("change", callback);
+    subscribers.delete(callback);
+    if (subscribers.size !== 0 || !mdList) return;
+    mdList.removeEventListener("change", emit);
+    mdList = null;
   };
 }
 
@@ -43,7 +62,9 @@ export function subscribeMatchMedia(queries: readonly string[], callback: () => 
  */
 export function isMobileViewport(): boolean {
   if (typeof window === "undefined" || !window.matchMedia) return false;
-  return !window.matchMedia(MD_MIN_WIDTH_QUERY).matches;
+  // Read through the cached list only while a subscriber keeps it alive;
+  // otherwise query fresh so a swapped `matchMedia` (tests) is honored.
+  return !(mdList ?? window.matchMedia(MD_MIN_WIDTH_QUERY)).matches;
 }
 
 declare global {
