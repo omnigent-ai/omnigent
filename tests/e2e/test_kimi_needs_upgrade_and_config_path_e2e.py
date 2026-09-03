@@ -283,8 +283,7 @@ def test_kimi_auth_rejection_names_the_real_kimi_code_config_path(tmp_path: Path
     # Control: the journey reached the kimi auth rejection (not some earlier
     # gate like "harness 'kimi' is not configured on host").
     assert "does not support per-invocation provider" in output, (
-        "the run never reached the kimi executor.auth rejection; output was:\n"
-        f"{output[-3000:]}"
+        f"the run never reached the kimi executor.auth rejection; output was:\n{output[-3000:]}"
     )
 
     # The actual bug: the guidance names the legacy kimi-cli path instead of
