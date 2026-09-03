@@ -330,6 +330,32 @@ async def test_registry_is_resolved_once_at_app_construction(
     assert calls == 1
 
 
+def test_development_bundle_overrides_are_explicit_and_loud(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    state = ExtensionPluginState(manifests=())
+    captured = None
+
+    def build_index(_state, *, overrides=None):
+        nonlocal captured
+        captured = overrides
+        return {}, {}
+
+    monkeypatch.setenv(
+        "OMNIGENT_EXTENSION_DEV_BUNDLES",
+        f'{{"acme.review": "{tmp_path}"}}',
+    )
+    monkeypatch.setattr(app_module, "build_asset_index", build_index)
+
+    with caplog.at_level("WARNING"):
+        app_module._resolve_extension_assets(state)
+
+    assert captured == {"acme.review": tmp_path}
+    assert "using development extension bundle overrides" in caplog.text
+
+
 async def test_global_discovery_failure_does_not_stop_server(
     db_uri: str,
     tmp_path: Path,

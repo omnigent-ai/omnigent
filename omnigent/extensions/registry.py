@@ -410,9 +410,16 @@ def _entry_point_asset_package(entry_point: Any) -> str | None:
 
     dist = getattr(entry_point, "dist", None)
     files = getattr(dist, "files", None)
-    if files is None:
-        return None
-    owned_packages = {str(file).replace("\\", "/").split("/", 1)[0] for file in files}
+    owned_packages = (
+        {str(file).replace("\\", "/").split("/", 1)[0] for file in files}
+        if files is not None
+        else set()
+    )
+    read_text = getattr(dist, "read_text", None)
+    if callable(read_text):
+        top_level = read_text("top_level.txt")
+        if isinstance(top_level, str):
+            owned_packages.update(line.strip() for line in top_level.splitlines() if line.strip())
     return package if package in owned_packages else None
 
 
