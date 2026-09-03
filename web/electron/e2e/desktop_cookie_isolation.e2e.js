@@ -62,15 +62,19 @@ async function waitForViewOnOrigin(window, conversationId, origin, timeoutMs = 3
   const deadline = Date.now() + timeoutMs;
   let last = "no probe completed";
   for (;;) {
+    // oxlint-disable-next-line no-await-in-loop -- Poll each navigation probe sequentially.
     const r = await Promise.race([
       execInView(window, conversationId, "location.origin"),
-      new Promise((resolve) => setTimeout(() => resolve(null), 3_000)),
+      new Promise((resolve) => {
+        setTimeout(() => resolve(null), 3_000);
+      }),
     ]);
     if (r && r.ok && String(r.result).startsWith(origin)) return;
     if (r) last = JSON.stringify(r);
     if (Date.now() > deadline) {
       throw new Error(`view ${conversationId} never landed on ${origin} — last: ${last}`);
     }
+    // oxlint-disable-next-line no-await-in-loop -- Wait before starting the next probe.
     await window.waitForTimeout(500);
   }
 }

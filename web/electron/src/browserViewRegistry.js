@@ -36,8 +36,8 @@ const DEFAULT_CAP = 10;
  * server — two windows connected to different servers could carry the same
  * conversationId and would otherwise share a cookie jar.
  *
- * `conversationId` is interpolated raw and assumed to be the server's opaque
- * `conv_*` token; encode it (or switch delimiters) if that ever loosens.
+ * `conversationId` is interpolated raw. Production ids are opaque 32-character
+ * UUID hex strings; encode them if that contract ever loosens.
  *
  * @param {string} scope Registry-unique namespace (one per shell window).
  * @param {string} conversationId
