@@ -11,8 +11,10 @@ password field even when the user is already signed in).  In OIDC mode
 ``prompt=login`` plus ``max_age=0`` — so the IdP cannot silently reuse an
 existing IdP session.
 
-On today's build ``/auth/login`` never reads ``reauth=1`` and never adds
-``prompt=login`` to the authorization URL.  The result:
+``/auth/login`` must both (a) forward ``prompt=login`` + ``max_age=0`` to the
+IdP and (b) stamp ``reauth_at`` into the signed state cookie so the callback can
+verify the id_token's ``auth_time`` proves a real re-authentication.  Without
+(a) the bypass was:
 
     stale session → bounce /auth/login?reauth=1
       → IdP recognises its own live session
@@ -21,8 +23,9 @@ On today's build ``/auth/login`` never reads ``reauth=1`` and never adds
       → consent page's iat ≥ created_at check passes
       → user approves without actually re-authenticating
 
-No error, no failing test on today's build.  This is the regression guard that
-catches the silent bypass.
+These guard (a) and (b); the callback-side ``auth_time`` enforcement (which
+closes the residual "IdP ignored prompt=login" hole) is covered in
+``test_oidc_callback.py``.
 """
 
 from __future__ import annotations
@@ -161,6 +164,33 @@ def github_client(tmp_path, db_uri: str) -> TestClient:
     )
     with TestClient(app, follow_redirects=False) as client:
         return client
+
+
+def test_login_with_reauth_stamps_reauth_at_in_state(login_client: TestClient) -> None:
+    """OIDC /auth/login?reauth=1 records reauth_at in the signed state cookie.
+
+    The callback needs a timestamp to compare the id_token's auth_time
+    against, so it can tell a genuine re-authentication from an IdP that
+    silently reused its session. This proves the marker is written (and is
+    absent on a plain login).
+    """
+    import jwt
+
+    r = login_client.get("/auth/login", params={"reauth": "1"})
+    assert r.status_code == 302
+    state_cookie = r.cookies.get("ap_auth_state") or r.cookies.get("__Host-ap_auth_state")
+    assert state_cookie is not None, "login must set the auth-state cookie"
+    payload = jwt.decode(state_cookie, _TEST_SECRET, algorithms=["HS256"])
+    assert isinstance(payload.get("reauth_at"), int), (
+        "reauth login must stamp an integer reauth_at into the state cookie"
+    )
+
+    # A plain login must NOT stamp it.
+    r2 = login_client.get("/auth/login")
+    plain_cookie = r2.cookies.get("ap_auth_state") or r2.cookies.get("__Host-ap_auth_state")
+    assert plain_cookie is not None
+    plain_payload = jwt.decode(plain_cookie, _TEST_SECRET, algorithms=["HS256"])
+    assert "reauth_at" not in plain_payload
 
 
 def test_github_provider_reauth_sends_no_prompt(github_client: TestClient) -> None:
