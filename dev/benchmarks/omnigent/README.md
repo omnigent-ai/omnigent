@@ -72,11 +72,22 @@ they still work with no runner or LLM.
 
 | Journey | Operation timed |
 | --- | --- |
-| `native_hook_spawn` | Spawn the per-chunk `MessageDisplay` hook exactly as Claude Code does — isolated interpreter, module entrypoint, JSON payload on stdin |
+| `native_hook_spawn` | Spawn one **Python** command hook — isolated interpreter, module entrypoint, JSON payload on stdin — and time its whole lifetime |
 
 Claude Code **blocks its TUI** on command hooks, so one hook subprocess's
-lifetime is user-visible streaming latency, and the same interpreter+import
-cost fronts every statusline refresh and per-tool-call policy hook. The
+lifetime is user-visible latency. Read this number as *"what a hook costs if it
+is Python"*.
+
+It is **not** the per-chunk streaming cost, and treating it as one leads
+straight to wasted work. The hooks that fire per chunk (`MessageDisplay`) and
+per tool call (`evaluate-policy`) were deliberately moved off the interpreter —
+a `/bin/sh` appender and a `curl` to the runner's relay — and
+`test_message_display_shell_command_round_trips` pins that by asserting
+`"python"` is absent from the installed command. What still pays this number is
+the per-turn set (`SessionStart` / `Stop` / `UserPromptSubmit` / `PreCompact` /
+`Task*`), the `PostToolUse` `TodoWrite`+`TaskUpdate` matchers, and the policy
+hook's Python fallback before the relay is up. So the journey's real job is to
+keep the argument for staying off the interpreter measurable. The
 journey needs no server or runner; registering it here rides hook spawn cost
 on the same nightly/release regression comparison as everything else
 (`omnigent/__init__` re-exports lazily so this stays ~interpreter-sized). The
