@@ -334,7 +334,12 @@ export function InboxPage() {
                       </span>
                     </>
                   )}
-                  <span className="min-w-0 shrink-0 truncate text-ui font-medium">
+                  {/* No shrink-0 here: a filed session's project tag eats into this
+                      row's width budget, and a long title needs to be able to
+                      truncate under that pressure — otherwise it overflows and
+                      visually collides with the time/Open-session group instead
+                      of giving way. */}
+                  <span className="min-w-0 truncate text-ui font-medium">
                     {title}
                     {agentLabel !== title && (
                       <span className="ml-2 text-sm font-normal text-muted-foreground">
