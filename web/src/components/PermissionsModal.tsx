@@ -9,6 +9,8 @@
 import {
   type FormEvent,
   type KeyboardEvent,
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useId,
@@ -16,7 +18,6 @@ import {
   useState,
 } from "react";
 import { CheckIcon, LinkIcon, QrCodeIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
-import { QRCodeSVG } from "qrcode.react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -532,6 +533,11 @@ function CopyLinkButton({ sessionId }: { sessionId: string }) {
  * (a dark-on-dark QR won't read). Error correction is bumped to M for
  * resilience against partial occlusion.
  */
+// `qrcode.react` is only ever rendered inside the mobile-handoff dialog below,
+// which Radix does not mount until it opens. Loading it lazily keeps the encoder
+// out of the entry chunk that every page load fetches.
+const QRCodeSVG = lazy(() => import("qrcode.react").then((m) => ({ default: m.QRCodeSVG })));
+
 function QrCodeDialog({
   sessionId,
   open,
@@ -558,16 +564,20 @@ function QrCodeDialog({
         </DialogHeader>
         <div className="flex justify-center">
           <div className="rounded-lg bg-white p-3">
-            <QRCodeSVG
-              value={deepLink}
-              size={200}
-              level="M"
-              // White tile + explicit module colors keep the code scannable in dark
-              // mode; the padding also serves as the QR quiet zone.
-              bgColor="#ffffff"
-              fgColor="#000000"
-              aria-label="QR code to open this session in the Omnigent app"
-            />
+            {/* Fixed 200px box matches the rendered code, so the dialog keeps
+                its size while the encoder chunk loads. */}
+            <Suspense fallback={<div className="size-[200px]" />}>
+              <QRCodeSVG
+                value={deepLink}
+                size={200}
+                level="M"
+                // White tile + explicit module colors keep the code scannable in dark
+                // mode; the padding also serves as the QR quiet zone.
+                bgColor="#ffffff"
+                fgColor="#000000"
+                aria-label="QR code to open this session in the Omnigent app"
+              />
+            </Suspense>
           </div>
         </div>
         <DialogFooter>
