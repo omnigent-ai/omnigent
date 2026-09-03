@@ -50,6 +50,7 @@ from omnigent.server.auth import (
     AuthProvider,
 )
 from omnigent.server.host_registry import HostRegistry
+from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
@@ -1112,6 +1113,17 @@ def register_resources_routes(
             bool(body.get("ensure_native_terminal") or body.get("bridge_inject_dir"))
             and native_coding_agent_for_terminal_name(body.get("terminal")) is not None
             and body.get("session_key") == "main"
+            and (
+                permission_store is None
+                or await asyncio.to_thread(
+                    check_session_access,
+                    _get_user_id(request, auth_provider),
+                    session_id,
+                    LEVEL_OWNER,
+                    permission_store,
+                    conversation_store,
+                )
+            )
         )
         if not is_native_bootstrap:
             spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
