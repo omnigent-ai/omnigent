@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://omnigent.example/dpia/verification.schema.json",
+  "title": "DPIA Recommendation Verification",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "artifact",
+    "case_id",
+    "processing_model_version",
+    "policy_pack_version",
+    "stage_1_artifact_sha256",
+    "verdict",
+    "citation_checks",
+    "unsupported_claim_ids",
+    "disagreement",
+    "recommendation_check",
+    "notes"
+  ],
+  "properties": {
+    "artifact": { "const": "verification" },
+    "case_id": { "const": "student-success-alert" },
+    "processing_model_version": { "type": "integer", "minimum": 1 },
+    "policy_pack_version": { "type": "string", "minLength": 1 },
+    "stage_1_artifact_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "verdict": { "enum": ["verified", "verified_with_caveats", "failed"] },
+    "citation_checks": {
+      "type": "array",
+      "minItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["finding_id", "evidence_valid", "policy_valid", "notes"],
+        "properties": {
+          "finding_id": { "type": "string" },
+          "evidence_valid": { "type": "boolean" },
+          "policy_valid": { "type": "boolean" },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "unsupported_claim_ids": { "type": "array", "items": { "type": "string" } },
+    "disagreement": { "type": "array", "items": { "type": "string" } },
+    "recommendation_check": { "type": "string", "minLength": 1 },
+    "notes": { "type": "array", "items": { "type": "string" } }
+  }
+}

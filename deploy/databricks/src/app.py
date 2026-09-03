@@ -187,6 +187,7 @@ try:
     from omnigent.stores.conversation_store.sqlalchemy_store import (
         SqlAlchemyConversationStore,
     )
+    from omnigent.stores.dpia_case_store.sqlalchemy_store import SqlAlchemyDpiaCaseStore
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
     from omnigent.stores.host_store import HostStore
     from omnigent.stores.permission_store.sqlalchemy_store import (
@@ -238,6 +239,7 @@ try:
     project_store = SqlAlchemyProjectStore(DB_URI)
     host_store = HostStore(DB_URI)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(DB_URI)
+    dpia_case_store = SqlAlchemyDpiaCaseStore(DB_URI)
 
     agent_cache = AgentCache(artifact_store=artifact_store, cache_dir=CACHE_DIR)
 
@@ -278,6 +280,7 @@ try:
         project_store=project_store,
         host_store=host_store,
         scheduled_task_store=scheduled_task_store,
+        dpia_case_store=dpia_case_store,
         auth_provider=auth_provider,
     )
 

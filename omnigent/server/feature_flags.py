@@ -22,6 +22,7 @@ class Feature(StrEnum):
 
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
+    DPIA = "dpia"
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Install and configure missing harnesses from the web UI",
         owner="onboarding",
         review_by_release="0.11.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.DPIA,
+        description="DPIA investigation desk, intake, and review workflows",
+        owner="web",
+        review_by_release="0.13.0",
     ),
 )
 

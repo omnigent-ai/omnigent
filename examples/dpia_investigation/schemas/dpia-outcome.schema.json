@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://omnigent.example/dpia/dpia-outcome.schema.json",
+  "title": "DPIA Outcome",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "artifact",
+    "request_id",
+    "decision",
+    "reasons",
+    "conditions",
+    "review_date",
+    "contact",
+    "decided_by",
+    "decided_at"
+  ],
+  "properties": {
+    "artifact": { "const": "dpia-outcome" },
+    "request_id": { "type": "string", "minLength": 1 },
+    "case_id": { "type": "string", "minLength": 1 },
+    "decision": {
+      "enum": ["approved", "approved-with-conditions", "rejected", "not-required"]
+    },
+    "reasons": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 5 }
+    },
+    "conditions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["action", "owner", "due"],
+        "properties": {
+          "action": { "type": "string", "minLength": 5 },
+          "owner": { "type": "string", "minLength": 2 },
+          "due": { "type": "string", "minLength": 4 }
+        }
+      }
+    },
+    "review_date": { "type": "string", "minLength": 4 },
+    "contact": { "type": "string", "minLength": 3 },
+    "decided_by": { "type": "string", "minLength": 2 },
+    "decided_at": { "type": "string", "minLength": 10 }
+  },
+  "if": { "properties": { "decision": { "const": "approved-with-conditions" } } },
+  "then": { "properties": { "conditions": { "minItems": 1 } } }
+}

@@ -22,15 +22,19 @@ def test_features_default_off() -> None:
     assert flags.frontend_dict() == {
         "usage_page": False,
         "harness_install": False,
+        "dpia": False,
     }
 
 
 def test_resolves_comma_separated_enabled_set() -> None:
-    flags = resolve_feature_flags({FEATURES_ENV_VAR: " usage_page, harness_install,usage_page "})
+    flags = resolve_feature_flags(
+        {FEATURES_ENV_VAR: " usage_page, harness_install,dpia,usage_page "}
+    )
 
     assert flags.enabled(Feature.USAGE_PAGE)
     assert flags.enabled(Feature.HARNESS_INSTALL)
-    assert flags.enabled_names() == ("harness_install", "usage_page")
+    assert flags.enabled(Feature.DPIA)
+    assert flags.enabled_names() == ("dpia", "harness_install", "usage_page")
 
 
 def test_empty_entries_are_ignored() -> None:
@@ -56,6 +60,7 @@ def test_unknown_feature_fails_with_known_names() -> None:
     assert "usage-pgae" in message
     assert "usage_page" in message
     assert "harness_install" in message
+    assert "dpia" in message
 
 
 def test_snapshot_is_immutable_and_does_not_follow_environment_mutation() -> None:

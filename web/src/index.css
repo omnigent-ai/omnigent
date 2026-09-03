@@ -1897,3 +1897,172 @@ aside[aria-label="Workspace"][data-maximized] {
   height: var(--emoji-picker-height, 420px) !important;
   min-height: 0 !important;
 }
+
+.dpia-print-pack {
+  display: none;
+}
+
+@media print {
+  @page {
+    size: A4;
+    margin: 14mm;
+  }
+
+  html,
+  body,
+  #root,
+  .app-shell,
+  main {
+    height: auto !important;
+    min-height: 0 !important;
+    overflow: visible !important;
+    background: #fff !important;
+    color: #111 !important;
+  }
+
+  body * {
+    visibility: hidden !important;
+  }
+
+  .dpia-print-pack,
+  .dpia-print-pack * {
+    visibility: visible !important;
+  }
+
+  .dpia-print-pack {
+    position: absolute;
+    inset: 0;
+    display: block !important;
+    width: 100%;
+    padding: 0;
+    color: #111;
+    font-family: ui-sans-serif, system-ui, sans-serif;
+    font-size: 10pt;
+    line-height: 1.45;
+  }
+
+  .dpia-print-pack header {
+    border-bottom: 2px solid #111;
+    padding-bottom: 6mm;
+  }
+
+  .dpia-print-pack h1 {
+    margin: 1mm 0 2mm;
+    font-size: 22pt;
+    line-height: 1.15;
+  }
+
+  .dpia-print-pack h2 {
+    margin: 7mm 0 3mm;
+    border-bottom: 1px solid #aaa;
+    padding-bottom: 1.5mm;
+    font-size: 15pt;
+  }
+
+  .dpia-print-pack h3 {
+    margin: 0 0 1mm;
+    font-size: 10.5pt;
+  }
+
+  .dpia-print-pack p {
+    margin: 1.5mm 0;
+  }
+
+  .dpia-print-kicker {
+    font-size: 8.5pt;
+    font-weight: 700;
+    letter-spacing: 0;
+    text-transform: uppercase;
+  }
+
+  .dpia-print-warning {
+    margin-top: 4mm;
+    border: 1px solid #b7791f;
+    padding: 2.5mm 3mm;
+    background: #fffbea !important;
+    font-weight: 600;
+  }
+
+  .dpia-print-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 3mm;
+    margin: 3mm 0;
+  }
+
+  .dpia-print-grid > div {
+    border: 1px solid #bbb;
+    padding: 2mm;
+  }
+
+  .dpia-print-grid dt {
+    color: #555;
+    font-size: 8pt;
+  }
+
+  .dpia-print-grid dd {
+    margin: 0.5mm 0 0;
+    font-weight: 700;
+  }
+
+  .dpia-print-lifecycle {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 2mm;
+  }
+
+  .dpia-print-lifecycle > div,
+  .dpia-print-finding {
+    break-inside: avoid;
+    border: 1px solid #bbb;
+    padding: 2.5mm;
+  }
+
+  .dpia-print-lifecycle span,
+  .dpia-print-lifecycle small {
+    display: block;
+    margin-top: 1mm;
+  }
+
+  .dpia-print-finding {
+    margin-bottom: 2.5mm;
+  }
+
+  .dpia-print-pack table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+    font-size: 8pt;
+  }
+
+  .dpia-print-pack th,
+  .dpia-print-pack td {
+    border: 1px solid #aaa;
+    padding: 1.8mm;
+    text-align: left;
+    vertical-align: top;
+    overflow-wrap: anywhere;
+  }
+
+  .dpia-print-pack th {
+    background: #eee !important;
+    font-weight: 700;
+  }
+
+  .dpia-print-pack tr,
+  .dpia-print-pack li {
+    break-inside: avoid;
+  }
+
+  .dpia-print-pack ol {
+    padding-left: 5mm;
+  }
+
+  .dpia-print-pack li {
+    margin-bottom: 2mm;
+  }
+
+  .dpia-print-break {
+    break-before: page;
+  }
+}

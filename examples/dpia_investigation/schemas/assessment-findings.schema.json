@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://omnigent.example/dpia/assessment-findings.schema.json",
+  "title": "DPIA Assessment Findings",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "artifact",
+    "case_id",
+    "processing_model_version",
+    "policy_pack_version",
+    "determinations",
+    "risks",
+    "recommendation",
+    "recommendation_rationale",
+    "unresolved_gaps",
+    "specialist_disagreement"
+  ],
+  "properties": {
+    "artifact": { "const": "assessment-findings" },
+    "case_id": { "const": "student-success-alert" },
+    "processing_model_version": { "type": "integer", "minimum": 1 },
+    "policy_pack_version": { "type": "string", "minLength": 1 },
+    "determinations": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "items": { "$ref": "#/$defs/determination" }
+    },
+    "risks": {
+      "type": "array",
+      "minItems": 8,
+      "items": { "$ref": "#/$defs/risk" }
+    },
+    "recommendation": {
+      "enum": ["full_dpia_likely", "no_full_dpia_indicated", "more_information_required"]
+    },
+    "recommendation_rationale": { "type": "string", "minLength": 1 },
+    "unresolved_gaps": { "type": "array", "items": { "type": "string" } },
+    "specialist_disagreement": { "type": "array", "items": { "type": "string" } }
+  },
+  "$defs": {
+    "dimension": {
+      "enum": [
+        "purpose-scope",
+        "lifecycle-flows",
+        "legal-basis",
+        "necessity-proportionality",
+        "student-harms-rights",
+        "vendor-transfer",
+        "security-controls",
+        "transparency-retention"
+      ]
+    },
+    "determination": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "dimension_id",
+        "question",
+        "rule_result",
+        "status",
+        "policy_criteria",
+        "professional_judgement",
+        "reasoning",
+        "evidence_ids",
+        "policy_rule_ids",
+        "gaps"
+      ],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "dimension_id": { "$ref": "#/$defs/dimension" },
+        "question": { "type": "string", "minLength": 1 },
+        "rule_result": { "enum": ["met", "not_met", "unclear"] },
+        "status": { "enum": ["confirmed", "needs_judgement", "potential_issue", "missing_evidence"] },
+        "policy_criteria": { "type": "string", "minLength": 1 },
+        "professional_judgement": { "type": "string", "minLength": 1 },
+        "reasoning": { "type": "string", "minLength": 1 },
+        "evidence_ids": { "type": "array", "items": { "type": "string" } },
+        "policy_rule_ids": { "type": "array", "items": { "type": "string" } },
+        "gaps": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "harm",
+        "affected_subjects",
+        "likelihood",
+        "severity",
+        "inherent_rating",
+        "controls",
+        "mitigation",
+        "residual_rating",
+        "owner",
+        "due_date",
+        "evidence_ids"
+      ],
+      "properties": {
+        "id": {
+          "enum": [
+            "risk-false-positive",
+            "risk-false-negative",
+            "risk-discrimination",
+            "risk-disability-disclosure",
+            "risk-chilling-effect",
+            "risk-function-creep",
+            "risk-unauthorised-access",
+            "risk-transfer"
+          ]
+        },
+        "harm": { "type": "string", "minLength": 1 },
+        "affected_subjects": { "type": "string", "minLength": 1 },
+        "likelihood": { "enum": ["low", "medium", "high"] },
+        "severity": { "enum": ["low", "medium", "high"] },
+        "inherent_rating": { "enum": ["low", "medium", "high", "critical"] },
+        "controls": { "type": "array", "items": { "type": "string" } },
+        "mitigation": { "type": "string", "minLength": 1 },
+        "residual_rating": { "enum": ["low", "medium", "high", "critical"] },
+        "owner": { "type": "string", "minLength": 1 },
+        "due_date": { "type": "string", "format": "date" },
+        "evidence_ids": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

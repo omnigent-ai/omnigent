@@ -1,0 +1,57 @@
+{
+  "jurisdiction": "UK",
+  "version": "uk-dpia-2026.08-demo.1",
+  "effective_date": "2026-08-01",
+  "rules": [
+    {
+      "id": "uk-gdpr-art35",
+      "source": "UK GDPR Article 35",
+      "criterion": "Assess whether proposed processing is likely to result in high risk, including systematic and extensive evaluation with significant effects and large-scale special-category processing."
+    },
+    {
+      "id": "ico-high-risk-criteria",
+      "source": "ICO Data protection impact assessments guidance",
+      "criterion": "Consider evaluation or scoring, automated decisions, systematic monitoring, special-category data, matching datasets, vulnerable subjects, innovative technology, and barriers to rights or services; do not mechanically decide from a count of criteria."
+    },
+    {
+      "id": "uk-gdpr-art5",
+      "source": "UK GDPR Article 5",
+      "criterion": "Assess fairness, transparency, purpose limitation, minimisation, accuracy, storage limitation, security, and accountability."
+    },
+    {
+      "id": "uk-gdpr-art6",
+      "source": "UK GDPR Article 6",
+      "criterion": "Identify and evidence a lawful basis for each purpose; public task requires a basis in law and necessity."
+    },
+    {
+      "id": "uk-gdpr-art9",
+      "source": "UK GDPR Article 9 and Data Protection Act 2018 Schedule 1",
+      "criterion": "Identify an Article 9 condition and any associated Schedule 1 condition, safeguards, and policy-document requirement."
+    },
+    {
+      "id": "uk-gdpr-art22",
+      "source": "UK GDPR Article 22 and ICO AI guidance",
+      "criterion": "Establish whether profiling produces or materially influences decisions, whether human involvement is meaningful, and how students can contest outcomes."
+    },
+    {
+      "id": "uk-gdpr-arts13-14",
+      "source": "UK GDPR Articles 13 and 14",
+      "criterion": "Provide clear information about sources, purposes, recipients, retention, profiling logic, consequences, and rights."
+    },
+    {
+      "id": "uk-gdpr-art28",
+      "source": "UK GDPR Article 28",
+      "criterion": "Evidence processor instructions, confidentiality, security, subprocessor controls, assistance, deletion or return, and audit rights."
+    },
+    {
+      "id": "uk-gdpr-chapter-v",
+      "source": "UK GDPR Chapter V",
+      "criterion": "Identify remote access and onward transfers, transfer mechanism, risk assessment, and supplementary measures."
+    },
+    {
+      "id": "uk-gdpr-art36",
+      "source": "UK GDPR Article 36",
+      "criterion": "Escalate for prior consultation where identified high residual risk cannot be reduced before processing begins."
+    }
+  ]
+}

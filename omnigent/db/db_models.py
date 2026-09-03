@@ -1650,3 +1650,54 @@ class SqlScheduledTaskRun(OmnigentBase):
             "conversation_id",
         ),
     )
+
+
+class SqlDpiaCase(OmnigentBase):
+    __tablename__ = "dpia_cases"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    case_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    snapshot_json: Mapped[str] = mapped_column(CompressedText, nullable=False)
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    updated_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("revision > 0", name="ck_dpia_cases_revision"),
+        Index("ix_dpia_cases_updated", "workspace_id", "updated_at", "case_id"),
+    )
+
+
+class SqlDpiaCaseRevision(OmnigentBase):
+    __tablename__ = "dpia_case_revisions"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    case_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, primary_key=True)
+    snapshot_json: Mapped[str] = mapped_column(CompressedText, nullable=False)
+    actor: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("revision > 0", name="ck_dpia_case_revisions_revision"),
+        Index(
+            "ix_dpia_case_revisions_case",
+            "workspace_id",
+            "case_id",
+            "revision",
+        ),
+    )

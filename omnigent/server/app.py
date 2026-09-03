@@ -74,6 +74,7 @@ from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
 from omnigent.server.routes.dictation import create_dictation_router
+from omnigent.server.routes.dpia_cases import create_dpia_cases_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
@@ -99,6 +100,7 @@ from omnigent.stores import (
     AgentStore,
     ArtifactStore,
     ConversationStore,
+    DpiaCaseStore,
     FileStore,
 )
 from omnigent.stores.comment_store import CommentStore
@@ -1026,6 +1028,7 @@ def create_app(
     policy_store: PolicyStore | None = None,
     permission_store: PermissionStore | None = None,
     scheduled_task_store: ScheduledTaskStore | None = None,
+    dpia_case_store: DpiaCaseStore | None = None,
     project_store: ProjectStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
@@ -2610,6 +2613,17 @@ def create_app(
             ),
             prefix="/v1",
             tags=["scheduled_tasks"],
+        )
+    if dpia_case_store is not None:
+        app.include_router(
+            create_dpia_cases_router(
+                dpia_case_store,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+                admin_list=admin_list,
+            ),
+            prefix="/v1",
+            tags=["dpia_cases"],
         )
     # Admin control for the server-wide sharing settings. Always mounted (the
     # handlers self-gate on admin); PUT is a no-op-reject unless this server

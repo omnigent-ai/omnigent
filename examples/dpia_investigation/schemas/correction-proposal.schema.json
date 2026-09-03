@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://omnigent.example/dpia/correction-proposal.schema.json",
+  "title": "DPIA Correction Proposal",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "artifact",
+    "case_id",
+    "processing_model_version",
+    "policy_pack_version",
+    "instruction",
+    "target_facts",
+    "new_evidence_refs",
+    "affected_finding_ids",
+    "expected_version_bump",
+    "stale_finding_ids",
+    "role_to_reassess",
+    "rationale"
+  ],
+  "properties": {
+    "artifact": { "const": "correction-proposal" },
+    "case_id": { "const": "student-success-alert" },
+    "processing_model_version": { "type": "integer", "minimum": 1 },
+    "policy_pack_version": { "type": "string", "minLength": 1 },
+    "instruction": { "type": "string", "minLength": 1 },
+    "target_facts": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/target_fact" }
+    },
+    "new_evidence_refs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/evidence_ref" }
+    },
+    "affected_finding_ids": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "expected_version_bump": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from", "to"],
+      "properties": {
+        "from": { "type": "integer", "minimum": 1 },
+        "to": { "type": "integer", "minimum": 2 }
+      }
+    },
+    "stale_finding_ids": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "role_to_reassess": {
+      "enum": ["process_investigator", "privacy_assessor", "independent_verifier"]
+    },
+    "rationale": { "type": "string", "minLength": 10 }
+  },
+  "$defs": {
+    "target_fact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fact_id", "current_value", "proposed_value"],
+      "properties": {
+        "fact_id": { "type": "string", "minLength": 1 },
+        "current_value": { "type": ["string", "null"] },
+        "proposed_value": { "type": "string", "minLength": 1 }
+      }
+    },
+    "evidence_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evidence_id", "excerpt"],
+      "properties": {
+        "evidence_id": { "type": "string", "minLength": 1 },
+        "excerpt": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

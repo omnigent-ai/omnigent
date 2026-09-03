@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://omnigent.example/dpia/verification-stage-1.schema.json",
+  "title": "Blind Evidence Review",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "artifact",
+    "case_id",
+    "processing_model_version",
+    "policy_pack_version",
+    "blind_review_completed",
+    "blind_review_compromised",
+    "evidence_coverage",
+    "contradictions",
+    "unsupported_claims",
+    "missing_material_facts",
+    "policy_application_notes",
+    "frozen_at"
+  ],
+  "properties": {
+    "artifact": { "const": "verification-stage-1" },
+    "case_id": { "const": "student-success-alert" },
+    "processing_model_version": { "type": "integer", "minimum": 1 },
+    "policy_pack_version": { "type": "string", "minLength": 1 },
+    "blind_review_completed": { "type": "boolean" },
+    "blind_review_compromised": { "type": "boolean" },
+    "evidence_coverage": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["dimension_id", "status", "evidence_ids", "notes"],
+        "properties": {
+          "dimension_id": { "$ref": "#/$defs/dimension" },
+          "status": { "enum": ["supported", "partially_supported", "unsupported"] },
+          "evidence_ids": { "type": "array", "items": { "type": "string" } },
+          "notes": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "contradictions": { "type": "array", "items": { "type": "string" } },
+    "unsupported_claims": { "type": "array", "items": { "type": "string" } },
+    "missing_material_facts": { "type": "array", "items": { "type": "string" } },
+    "policy_application_notes": { "type": "array", "items": { "type": "string" } },
+    "frozen_at": { "type": "string", "format": "date-time" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "blind_review_compromised": { "const": true } },
+        "required": ["blind_review_compromised"]
+      },
+      "then": {
+        "properties": {
+          "blind_review_completed": { "const": false },
+          "evidence_coverage": { "maxItems": 0 }
+        }
+      },
+      "else": {
+        "properties": {
+          "blind_review_completed": { "const": true },
+          "evidence_coverage": { "minItems": 8, "maxItems": 8 }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "dimension": {
+      "enum": [
+        "purpose-scope",
+        "lifecycle-flows",
+        "legal-basis",
+        "necessity-proportionality",
+        "student-harms-rights",
+        "vendor-transfer",
+        "security-controls",
+        "transparency-retention"
+      ]
+    }
+  }
+}

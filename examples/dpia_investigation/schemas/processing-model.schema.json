@@ -1,0 +1,220 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://omnigent.example/dpia/processing-model.schema.json",
+  "title": "DPIA Processing Model",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "artifact",
+    "case_id",
+    "processing_model_version",
+    "evidence",
+    "facts",
+    "lifecycle",
+    "evidence_gaps",
+    "contradictions",
+    "stakeholder_questions"
+  ],
+  "properties": {
+    "artifact": { "const": "processing-model" },
+    "case_id": { "const": "student-success-alert" },
+    "processing_model_version": { "type": "integer", "minimum": 1 },
+    "evidence": {
+      "type": "array",
+      "minItems": 10,
+      "items": { "$ref": "#/$defs/evidence" }
+    },
+    "facts": {
+      "type": "array",
+      "minItems": 12,
+      "items": { "$ref": "#/$defs/fact" }
+    },
+    "lifecycle": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "items": { "$ref": "#/$defs/lifecycle" }
+    },
+    "evidence_gaps": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/gap" }
+    },
+    "contradictions": {
+      "type": "array",
+      "minItems": 2,
+      "items": { "$ref": "#/$defs/contradiction" }
+    },
+    "stakeholder_questions": {
+      "type": "array",
+      "minItems": 6,
+      "items": { "$ref": "#/$defs/question" }
+    }
+  },
+  "$defs": {
+    "dimension": {
+      "enum": [
+        "purpose-scope",
+        "lifecycle-flows",
+        "legal-basis",
+        "necessity-proportionality",
+        "student-harms-rights",
+        "vendor-transfer",
+        "security-controls",
+        "transparency-retention"
+      ]
+    },
+    "stage": {
+      "enum": [
+        "collection",
+        "storage",
+        "access",
+        "use",
+        "sharing",
+        "transfer",
+        "retention",
+        "deletion"
+      ]
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "source", "owner", "collected_at", "excerpt", "synthetic"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "title": { "type": "string", "minLength": 1 },
+        "source": { "type": "string", "minLength": 1 },
+        "owner": { "type": "string", "minLength": 1 },
+        "collected_at": { "type": "string", "format": "date-time" },
+        "excerpt": { "type": "string", "minLength": 1 },
+        "synthetic": { "const": true }
+      }
+    },
+    "fact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "field",
+        "value",
+        "status",
+        "lifecycle_stage",
+        "evidence_ids",
+        "dependent_dimension_ids",
+        "processing_model_version"
+      ],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "field": { "type": "string", "minLength": 1 },
+        "value": { "type": ["string", "null"] },
+        "status": { "enum": ["confirmed", "missing", "unclear"] },
+        "lifecycle_stage": { "oneOf": [{ "$ref": "#/$defs/stage" }, { "type": "null" }] },
+        "evidence_ids": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "dependent_dimension_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/dimension" }
+        },
+        "processing_model_version": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "lifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stage",
+        "data",
+        "purpose",
+        "actors",
+        "systems",
+        "location",
+        "recipients",
+        "legal_basis",
+        "article_9_condition",
+        "retention",
+        "controls",
+        "missing_facts"
+      ],
+      "properties": {
+        "stage": { "$ref": "#/$defs/stage" },
+        "data": { "type": "array", "items": { "type": "string" } },
+        "purpose": { "type": "string", "minLength": 1 },
+        "actors": { "type": "array", "items": { "type": "string" } },
+        "systems": { "type": "array", "items": { "type": "string" } },
+        "location": { "type": "string", "minLength": 1 },
+        "recipients": { "type": "array", "items": { "type": "string" } },
+        "legal_basis": { "type": "string", "minLength": 1 },
+        "article_9_condition": { "type": ["string", "null"] },
+        "retention": { "type": "string", "minLength": 1 },
+        "controls": { "type": "array", "items": { "type": "string" } },
+        "missing_facts": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "gap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "fact", "blocked_dimension_ids", "owner", "material"],
+      "properties": {
+        "id": { "type": "string" },
+        "fact": { "type": "string", "minLength": 1 },
+        "blocked_dimension_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/dimension" }
+        },
+        "owner": { "type": "string", "minLength": 1 },
+        "material": { "type": "boolean" }
+      }
+    },
+    "contradiction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "summary", "source_evidence_ids", "dimension_ids", "resolved"],
+      "properties": {
+        "id": { "type": "string" },
+        "summary": { "type": "string", "minLength": 1 },
+        "source_evidence_ids": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": { "type": "string" }
+        },
+        "dimension_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/dimension" }
+        },
+        "resolved": { "type": "boolean" },
+        "resolution": { "type": ["string", "null"] }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "resolved": { "const": true } },
+            "required": ["resolved"]
+          },
+          "then": { "properties": { "resolution": { "type": "string", "minLength": 1 } } }
+        }
+      ]
+    },
+    "question": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "stakeholder", "text", "blocked_dimension_ids", "status"],
+      "properties": {
+        "id": { "type": "string" },
+        "stakeholder": { "type": "string", "minLength": 1 },
+        "text": { "type": "string", "minLength": 1 },
+        "blocked_dimension_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/dimension" }
+        },
+        "status": { "enum": ["draft", "approved", "answered", "unanswered"] },
+        "response": { "type": ["string", "null"] },
+        "answered_by": { "type": ["string", "null"] },
+        "answered_at": { "type": ["string", "null"], "format": "date-time" }
+      }
+    }
+  }
+}

@@ -35,7 +35,7 @@
  * the prompt timing out) is what clears an approval.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangleIcon,
@@ -47,10 +47,16 @@ import {
 import { ApprovalCard, type SubmitApprovalFn } from "@/components/blocks/ApprovalCard";
 import { PageScroll } from "@/components/PageScroll";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useCommentInbox } from "@/hooks/useCommentInbox";
 import { useConversations } from "@/hooks/useConversations";
+import { useDpiaCases } from "@/hooks/useDpiaCases";
+import { useDpiaContributorResponses, useDpiaRequests } from "@/hooks/useDpiaRequests";
+import { deriveDpiaAttentionItems, type DpiaAttentionItem } from "@/lib/dpia/inbox";
 import { collectInboxItems, type InboxItem, type InboxSource } from "@/lib/inbox";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { relativeTime } from "@/lib/relativeTime";
 import { Link } from "@/lib/routing";
 import { useOmnigentAnalytics } from "@/lib/analytics";
@@ -72,6 +78,8 @@ type RespondedMap = Record<
 export function InboxPage() {
   const queryClient = useQueryClient();
   const { trackClick } = useOmnigentAnalytics();
+  const serverInfo = useServerInfo();
+  const dpiaEnabled = isFeatureEnabled(serverInfo, "dpia");
   const conversationsQuery = useConversations("", false, { reconcileWhileConnected: true });
   const [responded, setResponded] = useState<RespondedMap>({});
   // Manual expand/collapse toggles keyed by elicitation id. Anything
@@ -79,6 +87,43 @@ export function InboxPage() {
   // first (newest) item. Keying by id (not index) keeps a user's
   // explicit toggles stable when new items shift positions.
   const [expandedOverrides, setExpandedOverrides] = useState<Record<string, boolean>>({});
+  const dpiaCases = useDpiaCases(dpiaEnabled);
+  const dpiaRequests = useDpiaRequests({ enabled: dpiaEnabled });
+  const dpiaResponses = useDpiaContributorResponses("student-success-alert", {
+    enabled: dpiaEnabled,
+  });
+  const dpiaItems = useMemo(() => {
+    const caseItems = dpiaCases.flatMap((caseData) => deriveDpiaAttentionItems(caseData));
+    const requestItems: DpiaAttentionItem[] = (dpiaRequests.data ?? [])
+      .filter((summary) => summary.status === "submitted" && summary.requestId !== null)
+      .map((summary) => ({
+        id: `request-${summary.requestId}`,
+        kind: "incoming-request",
+        caseId: summary.request?.project.title ?? summary.requestId!,
+        title: "DPIA request awaiting triage",
+        detail: summary.request
+          ? `${summary.request.requester.name} (${summary.request.requester.team}) — ${summary.request.project.purpose}`
+          : "Structured request pending in the requester conversation.",
+        severity: "medium",
+        timestamp: summary.request?.submitted_at ?? new Date(0).toISOString(),
+        href: `/dpia/requests/${summary.requestId}`,
+      }));
+    const responseItems: DpiaAttentionItem[] = (dpiaResponses.data ?? [])
+      .filter((row) => row.status === "submitted" && row.response !== null)
+      .map((row) => ({
+        id: `response-${row.sessionId}`,
+        kind: "pending-response",
+        caseId: row.caseId,
+        title: "Stakeholder response awaiting review",
+        detail: `${row.contributor} answered ${row.response!.answers.length} question${
+          row.response!.answers.length === 1 ? "" : "s"
+        }.`,
+        severity: "medium",
+        timestamp: row.response!.submitted_at,
+        href: `/dpia/cases/${row.caseId}`,
+      }));
+    return [...requestItems, ...responseItems, ...caseItems];
+  }, [dpiaCases, dpiaRequests.data, dpiaResponses.data]);
 
   // The sidebar pages lazily on scroll, but the inbox must consider
   // EVERY session — an approval can be pending in a session that 20+
@@ -194,7 +239,7 @@ export function InboxPage() {
     <PageScroll contentClassName="px-6">
       <div className="mb-6 flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Inbox</h1>
-        {(items.length > 0 || commentInbox.items.length > 0) && (
+        {(items.length > 0 || commentInbox.items.length > 0 || dpiaItems.length > 0) && (
           <span className="text-ui text-muted-foreground">
             {[
               items.length > 0 && (items.length === 1 ? "1 approval" : `${items.length} approvals`),
@@ -202,6 +247,8 @@ export function InboxPage() {
                 (commentInbox.items.length === 1
                   ? "1 comment"
                   : `${commentInbox.items.length} comments`),
+              dpiaItems.length > 0 &&
+                (dpiaItems.length === 1 ? "1 DPIA item" : `${dpiaItems.length} DPIA items`),
             ]
               .filter(Boolean)
               .join(" · ")}{" "}
@@ -234,6 +281,70 @@ export function InboxPage() {
         </div>
       )}
 
+      {dpiaEnabled && (
+        <section
+          className="mb-6"
+          aria-labelledby="dpia-inbox-heading"
+          data-testid="dpia-inbox-section"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border pb-3">
+            <div>
+              <h2 id="dpia-inbox-heading" className="font-semibold">
+                DPIA cases
+              </h2>
+              <p className="mt-1 text-sm text-muted-foreground">
+                Officer decisions and agent work that need attention.
+              </p>
+            </div>
+            <Badge variant="outline">
+              {dpiaItems.length === 0
+                ? "Up to date"
+                : `${dpiaItems.length} need${dpiaItems.length === 1 ? "s" : ""} attention`}
+            </Badge>
+          </div>
+          {dpiaItems.length === 0 ? (
+            <p className="py-4 text-sm text-muted-foreground">
+              No DPIA case actions need attention.
+            </p>
+          ) : (
+            <div className="divide-y divide-border">
+              {dpiaItems.map((item) => {
+                const caseData = dpiaCases.find(({ id }) => id === item.caseId);
+                return (
+                  <div
+                    key={item.id}
+                    data-testid="dpia-inbox-item"
+                    className="flex flex-wrap items-start justify-between gap-3 py-3"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="font-medium">{item.title}</p>
+                        <Badge variant="outline">{item.kind.replaceAll("-", " ")}</Badge>
+                      </div>
+                      <p className="mt-1 text-sm text-muted-foreground">
+                        {caseData?.title ?? item.caseId}
+                      </p>
+                      <p className="mt-1 text-sm">{item.detail}</p>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2">
+                      <span className="text-sm text-muted-foreground">
+                        {relativeTime(new Date(item.timestamp).getTime())}
+                      </span>
+                      <Button asChild variant="ghost" size="sm">
+                        <Link to={item.href}>
+                          {item.kind === "incoming-request" ? "Review request" : "Open case"}
+                          <ArrowRightIcon className="ml-1 size-3.5" />
+                        </Link>
+                      </Button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
+      )}
+
       {assembling && items.length === 0 && commentInbox.items.length === 0 && (
         <div className="flex items-center gap-2 py-12 text-ui text-muted-foreground">
           <Loader2Icon className="size-4 animate-spin" />
@@ -244,7 +355,8 @@ export function InboxPage() {
       {!assembling &&
         failedSessionCount === 0 &&
         items.length === 0 &&
-        commentInbox.items.length === 0 && (
+        commentInbox.items.length === 0 &&
+        dpiaItems.length === 0 && (
           <div className="flex flex-col items-center gap-2 py-16 text-center">
             <InboxIcon className="size-8 text-muted-foreground/50" />
             <p className="text-ui font-medium">Nothing waiting on you</p>

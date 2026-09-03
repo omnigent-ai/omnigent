@@ -56,6 +56,40 @@ const UsagePage = withPageView(
   "usage",
   lazy(() => import("@/pages/UsagePage").then((m) => ({ default: m.UsagePage }))),
 );
+const DpiaPortfolioPage = withPageView(
+  "dpia.portfolio",
+  lazy(() =>
+    import("@/pages/dpia/DpiaPortfolioPage").then((m) => ({ default: m.DpiaPortfolioPage })),
+  ),
+);
+const DpiaNewAssessmentPage = withPageView(
+  "dpia.new",
+  lazy(() =>
+    import("@/pages/dpia/DpiaNewAssessmentPage").then((m) => ({
+      default: m.DpiaNewAssessmentPage,
+    })),
+  ),
+);
+const DpiaCasePage = withPageView(
+  "dpia.case",
+  lazy(() => import("@/pages/dpia/DpiaCasePage").then((m) => ({ default: m.DpiaCasePage }))),
+);
+const DpiaRequestPage = withPageView(
+  "dpia.request",
+  lazy(() => import("@/pages/dpia/DpiaRequestPage").then((m) => ({ default: m.DpiaRequestPage }))),
+);
+const DpiaRequestReviewPage = withPageView(
+  "dpia.request_review",
+  lazy(() =>
+    import("@/pages/dpia/DpiaRequestReviewPage").then((m) => ({
+      default: m.DpiaRequestReviewPage,
+    })),
+  ),
+);
+const DpiaRespondPage = withPageView(
+  "dpia.respond",
+  lazy(() => import("@/pages/dpia/DpiaRespondPage").then((m) => ({ default: m.DpiaRespondPage }))),
+);
 const SettingsPage = lazy(() =>
   import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
 );
@@ -154,6 +188,19 @@ function App({ basename }: AppProps = {}) {
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
           <Route path={`${prefix}/tasks`} element={<TasksPage />} />
+          {isFeatureEnabled(info, "dpia") && (
+            <>
+              <Route path={`${prefix}/dpia`} element={<DpiaPortfolioPage />} />
+              <Route path={`${prefix}/dpia/new`} element={<DpiaNewAssessmentPage />} />
+              <Route path={`${prefix}/dpia/request`} element={<DpiaRequestPage />} />
+              <Route
+                path={`${prefix}/dpia/requests/:requestId`}
+                element={<DpiaRequestReviewPage />}
+              />
+              <Route path={`${prefix}/dpia/respond/:sessionId`} element={<DpiaRespondPage />} />
+              <Route path={`${prefix}/dpia/cases/:caseId`} element={<DpiaCasePage />} />
+            </>
+          )}
           {isFeatureEnabled(info, "usage_page") && (
             <Route path={`${prefix}/usage`} element={<UsagePage />} />
           )}

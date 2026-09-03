@@ -23,6 +23,7 @@ import {
   ChevronRightIcon,
   ClockIcon,
   CircleStopIcon,
+  FileCheck2Icon,
   FolderIcon,
   FolderInputIcon,
   FolderMinusIcon,
@@ -67,10 +68,10 @@ import {
   useSensor,
   useSensors,
 } from "@dnd-kit/core";
+import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { useQueryClient } from "@tanstack/react-query";
 import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
 import { SidebarHeaderActions, SidebarSettingsButton } from "./SidebarHeaderActions";
-import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -146,6 +147,8 @@ import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
 import { useCommentInbox } from "@/hooks/useCommentInbox";
+import { useDpiaCases } from "@/hooks/useDpiaCases";
+import { countDpiaAttentionItems } from "@/lib/dpia/inbox";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
@@ -329,6 +332,7 @@ function useActiveNavItem(): {
   isInboxPage: boolean;
   isTasksPage: boolean;
   isUsagePage: boolean;
+  isDpiaPage: boolean;
   newSessionProjectName: string | null;
 } {
   const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
@@ -337,8 +341,9 @@ function useActiveNavItem(): {
   const isInboxPage = leaf === "inbox";
   const isTasksPage = leaf === "tasks";
   const isUsagePage = leaf === "usage";
+  const isDpiaPage = location.pathname.split("/").filter(Boolean).includes("dpia");
   const isNewSessionRoute =
-    activeConversationId == null && !isInboxPage && !isTasksPage && !isUsagePage;
+    activeConversationId == null && !isInboxPage && !isTasksPage && !isUsagePage && !isDpiaPage;
   const requestedProject = isNewSessionRoute
     ? new URLSearchParams(location.search).get("project")
     : null;
@@ -347,7 +352,14 @@ function useActiveNavItem(): {
   // would otherwise light up the "New session" button. A project-prefilled
   // new session belongs to that project row instead of the global nav item.
   const isNewChatPage = isNewSessionRoute && newSessionProjectName == null;
-  return { isNewChatPage, isInboxPage, isTasksPage, isUsagePage, newSessionProjectName };
+  return {
+    isNewChatPage,
+    isInboxPage,
+    isTasksPage,
+    isUsagePage,
+    isDpiaPage,
+    newSessionProjectName,
+  };
 }
 
 /**
@@ -508,6 +520,7 @@ export function Sidebar({
   const branding = useBranding();
   const serverInfo = useServerInfo();
   const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
+  const dpiaEnabled = isFeatureEnabled(serverInfo, "dpia");
   const [selectionMode, setSelectionMode] = useState(false);
   // Which rows the current selection targets: the flat "Sessions" list, or the
   // sessions nested inside project folders. Set when selection mode is entered
@@ -608,7 +621,9 @@ export function Sidebar({
   // page lists. Comment queries are shared with the page/FileViewer
   // (same ["comments", id] keys), so this adds no duplicate fetches.
   const unseenComments = useCommentInbox(loadedRows).items.length;
-  const inboxCount = pendingApprovals + unseenComments;
+  const dpiaCases = useDpiaCases(dpiaEnabled);
+  const dpiaAttentionCount = useMemo(() => countDpiaAttentionItems(dpiaCases), [dpiaCases]);
+  const inboxCount = pendingApprovals + unseenComments + dpiaAttentionCount;
 
   // Click handler for conversation-row Links in the sidebar. The Link
   // handles navigation natively, so cmd/ctrl/middle-click opens new
@@ -623,8 +638,14 @@ export function Sidebar({
   }
 
   // Which top-level nav button to highlight for the current route.
-  const { isNewChatPage, isInboxPage, isTasksPage, isUsagePage, newSessionProjectName } =
-    useActiveNavItem();
+  const {
+    isNewChatPage,
+    isInboxPage,
+    isTasksPage,
+    isUsagePage,
+    isDpiaPage,
+    newSessionProjectName,
+  } = useActiveNavItem();
 
   // On /settings the card keeps its chrome but swaps the conversation list
   // for the settings section nav (see settingsNav.tsx) — entering settings
@@ -704,6 +725,10 @@ export function Sidebar({
   // visually open so it isn't `inert`/`aria-hidden` mid-gesture.
   const dragging = dragProgress != null;
   const effectiveOpen = open || dragging || peek;
+  const sidebarRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (sidebarRef.current) sidebarRef.current.inert = !effectiveOpen;
+  }, [effectiveOpen]);
 
   // While peeking, leaving the card closes it after a short grace period;
   // re-entering before that fires cancels the close so a wobble doesn't
@@ -753,6 +778,7 @@ export function Sidebar({
         />
       )}
       <aside
+        ref={sidebarRef}
         aria-label="Conversations"
         onPointerEnter={cancelPeekClose}
         onPointerLeave={() => {
@@ -831,9 +857,6 @@ export function Sidebar({
         // don't see the empty-state contents while focus is elsewhere.
         aria-hidden={!effectiveOpen}
         data-collapsed={!effectiveOpen || undefined}
-        // Match the keyboard-focus story: when closed, the sidebar's
-        // children shouldn't receive tabs.
-        inert={!effectiveOpen}
       >
         {/* Right-edge resize handle (desktop only), mirroring the right rail's
           left-edge handle. Hidden on mobile, where the sidebar is a
@@ -966,6 +989,31 @@ export function Sidebar({
                   Automations
                 </Link>
               </Button>
+              {dpiaEnabled && (
+                <Button
+                  asChild
+                  variant="ghost"
+                  className={cn(
+                    SIDEBAR_ROW,
+                    "w-full justify-start border-0 font-normal",
+                    SIDEBAR_HOVER_HIGHLIGHT,
+                    isDpiaPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                  )}
+                  data-testid="dpia-nav"
+                >
+                  <Link to="/dpia" onClick={onNavClick} componentId="sidebar.dpia">
+                    <FileCheck2Icon
+                      className={cn(
+                        "ui-icon",
+                        isDpiaPage
+                          ? "text-[var(--sidebar-active-foreground)]"
+                          : "text-muted-foreground",
+                      )}
+                    />
+                    DPIA desk
+                  </Link>
+                </Button>
+              )}
               <Button
                 asChild
                 variant="ghost"

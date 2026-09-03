@@ -339,6 +339,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     from omnigent.stores.conversation_store.sqlalchemy_store import (
         SqlAlchemyConversationStore,
     )
+    from omnigent.stores.dpia_case_store.sqlalchemy_store import SqlAlchemyDpiaCaseStore
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
     from omnigent.stores.host_store import HostStore
     from omnigent.stores.permission_store.sqlalchemy_store import (
@@ -360,6 +361,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     host_store = HostStore(database_url)
     policy_store = SqlAlchemyPolicyStore(database_url)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(database_url)
+    dpia_case_store = SqlAlchemyDpiaCaseStore(database_url)
     project_store = SqlAlchemyProjectStore(database_url)
     # Fail startup loud on a malformed `sandbox:` section (an operator
     # typo should not surface as a runtime 502 on the first managed
@@ -446,6 +448,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         policy_store=policy_store,
         host_store=host_store,
         scheduled_task_store=scheduled_task_store,
+        dpia_case_store=dpia_case_store,
         project_store=project_store,
         auth_provider=auth_provider,
         account_store=account_store,
