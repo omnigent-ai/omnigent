@@ -14,10 +14,9 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 from omnigent.entities.pagination import PagedList
-from omnigent.terminals.registry import TerminalListEntry
 
 if TYPE_CHECKING:
-    from omnigent.terminals.registry import TerminalRegistry
+    from omnigent.terminals.registry import TerminalListEntry, TerminalRegistry
 
 DEFAULT_ENVIRONMENT_ID = "default"
 
