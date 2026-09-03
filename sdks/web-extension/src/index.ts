@@ -12,6 +12,12 @@ import {
   type ExtensionRequestMessage,
   type ExtensionResponseMessage,
 } from "./protocol";
+import {
+  drainSessionPages,
+  type ExtensionSessionPage,
+  validateSessionPageLimit,
+  type ExtensionSessionSummary,
+} from "./sessions";
 
 export interface Disposable {
   dispose(): void;
@@ -55,6 +61,15 @@ export interface ExtensionContext {
       set(key: string, value: unknown): Promise<void>;
       delete(key: string): Promise<void>;
     };
+  };
+  sessions: {
+    listPage(options?: {
+      after?: string | null;
+      limit?: number;
+    }): Promise<ExtensionSessionPage>;
+    listAll(options?: {
+      pageLimit?: number;
+    }): Promise<ExtensionSessionSummary[]>;
   };
 }
 
@@ -204,6 +219,32 @@ export function defineExtension(lifecycle: ExtensionLifecycle): void {
         },
       },
     },
+    sessions: {
+      listPage(options) {
+        const limit = validateSessionPageLimit(
+          options?.limit,
+          (code, message) => new ExtensionApiError(code, message),
+        );
+        return request<ExtensionSessionPage>("sessions.listPage", {
+          after: options?.after ?? null,
+          limit,
+        });
+      },
+      listAll(options) {
+        const limit = validateSessionPageLimit(
+          options?.pageLimit,
+          (code, message) => new ExtensionApiError(code, message),
+        );
+        return drainSessionPages(
+          (after) =>
+            request<ExtensionSessionPage>("sessions.listPage", {
+              after,
+              limit,
+            }),
+          (code, message) => new ExtensionApiError(code, message),
+        );
+      },
+    },
   });
 
   const handleInit = (event: MessageEvent<unknown>) => {
@@ -297,3 +338,4 @@ export function defineExtension(lifecycle: ExtensionLifecycle): void {
 }
 
 export { EXTENSION_RPC_VERSION } from "./protocol";
+export type { ExtensionSessionPage, ExtensionSessionSummary } from "./sessions";

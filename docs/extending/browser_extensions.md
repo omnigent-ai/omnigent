@@ -39,7 +39,9 @@ defineExtension({
   async activate(context) {
     const theme = await context.theme.getCurrent();
     const value = await context.storage.user.get("key");
-    await context.navigation.openPage("publisher.extension.page", { tab: "one" });
+    await context.navigation.openPage("publisher.extension.page", {
+      tab: "one",
+    });
   },
   deactivate() {},
 });
@@ -50,7 +52,17 @@ Available V1 methods:
 - `navigation.openPage`, `openSession`, and `openNewSession` with the
   `navigation` permission;
 - `theme.getCurrent` and `theme.subscribe`;
-- `storage.user.get`, `set`, and `delete` with the `storage.user` permission.
+- `storage.user.get`, `set`, and `delete` with the `storage.user` permission;
+- `sessions.listPage` and the SDK's `sessions.listAll` helper with the
+  `sessions.read` permission.
+
+The sessions API exposes only top-level, non-archived sessions the current user
+can already read. Because operator-installed extension bundles are trusted code,
+requesting `sessions.read` grants access to session titles and absolute working
+directory paths visible to that user. Summaries contain ID, title, status, working directory, and
+created/updated timestamps. Pages are capped at 25 rows and the
+SDK drains at most 200 pages or 5,000 sessions. Extensions receive neither raw
+authenticated fetch nor the internal session WebSocket.
 
 Storage uses parent-owned IndexedDB, not `localStorage`: 32 KB per value,
 256 KB and 128 keys per extension namespace. Writes are paced and quota errors

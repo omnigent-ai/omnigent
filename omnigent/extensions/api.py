@@ -17,6 +17,7 @@ class ExtensionPermission(StrEnum):
     """Host capabilities an extension may request."""
 
     NAVIGATION = "navigation"
+    SESSIONS_READ = "sessions.read"
     STORAGE_USER = "storage.user"
 
 

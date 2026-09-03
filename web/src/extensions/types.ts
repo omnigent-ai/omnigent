@@ -14,6 +14,21 @@ export interface ExtensionPrimaryNavigation {
   when: string | null;
 }
 
+export interface ExtensionSessionSummary {
+  id: string;
+  title: string | null;
+  status: "idle" | "running" | "waiting" | "failed";
+  workspace: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ExtensionSessionPage {
+  sessions: ExtensionSessionSummary[];
+  nextCursor: string | null;
+  hasMore: boolean;
+}
+
 export interface ExtensionBrowserBundle {
   declared: boolean;
   has_styles: boolean;
