@@ -371,3 +371,42 @@ def test_select_servable_model_matches_legacy_spelling() -> None:
     assert select_servable_model("databricks-gpt-5-6-luna", servable) == "system.ai.gpt-5-6-luna"
     # A model the workspace does not serve is left for the caller to pass through.
     assert select_servable_model("databricks-gpt-9-9", servable) is None
+
+
+def test_claude_catalog_issues_both_listings_concurrently() -> None:
+    """
+    The UC and legacy-gateway listings overlap rather than serialize.
+
+    Both are always issued and neither feeds the other, so discovery runs
+    them together — it sits on the ``omnigent claude`` startup path, where
+    serializing them adds a whole round trip. A barrier proves the
+    overlap: it only releases once *both* handlers have arrived, so a
+    sequential implementation blocks here until the barrier times out and
+    the test fails.
+    """
+    import threading
+
+    barrier = threading.Barrier(2, timeout=10.0)
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Answer only after its counterpart request has also arrived.
+
+        :param request: The intercepted discovery request.
+        :returns: A minimal successful listing for the matched endpoint.
+        """
+        barrier.wait()
+        if request.url.path.endswith("/model-services"):
+            return httpx.Response(
+                200,
+                json={"model_services": [{"name": "model-services/system.ai.claude-opus-5"}]},
+                request=request,
+            )
+        return httpx.Response(200, json={"data": []}, request=request)
+
+    catalog = discover_databricks_claude_catalog(
+        "https://workspace.example.com",
+        "token",
+        transport=httpx.MockTransport(_handler),
+    )
+
+    assert catalog.families == {"opus": "system.ai.claude-opus-5"}
