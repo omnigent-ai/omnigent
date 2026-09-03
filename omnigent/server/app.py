@@ -1767,7 +1767,20 @@ def create_app(
         :param exc: The application error.
         :returns: A JSON response with the error code and message.
         """
-        if exc.http_status >= 500:
+        if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
+            # A session state, not a fault: the user's machine is asleep or
+            # the host disconnected, and clients render it as a reconnect
+            # affordance. Through the 5xx arm every poll of an offline
+            # session added an "Internal error" plus a stack, which is what
+            # buried the real 500s.
+            _logger.warning(
+                "Runner unavailable: %s",
+                exc.message,
+                extra=_error_audit_extra(
+                    request, phase="unavailable", code=str(exc.code), http_status="503"
+                ),
+            )
+        elif exc.http_status >= 500:
             _logger.error(
                 "Internal error: %s",
                 exc.message,
