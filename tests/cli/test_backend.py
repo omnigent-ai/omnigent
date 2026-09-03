@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import itertools
 import json
 import logging
 import re
@@ -2818,3 +2819,204 @@ def test_resume_command_defaults_scheme_https(monkeypatch: pytest.MonkeyPatch) -
     assert result.exit_code == 0, result.output
     assert seen == ["https://dbc-x.cloud.databricks.com/omnigent"]
     assert captured["server"] == _expand_marker("https://dbc-x.cloud.databricks.com/omnigent")
+
+
+def _remote_record() -> cli._HostDaemonRecord:
+    """Build a background remote-target daemon record.
+
+    :returns: A ``server``-mode record carrying a log path (background-spawned).
+    """
+    return cli._HostDaemonRecord(
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+        log_path="/tmp/daemon.log",
+        started_at=1_000_000,
+        host_id="host_abc",
+        resolved_server_url=None,
+    )
+
+
+def test_daemon_host_state_distinguishes_offline_from_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed probe reports offline; an incomplete one reports unknown."""
+    monkeypatch.setattr(
+        cli,
+        "_host_http_json",
+        lambda **_kw: cli._HostHttpResult(status_code=200, body={"status": "offline"}),
+    )
+    assert cli._daemon_host_state(_online_record()) == "offline"
+
+    monkeypatch.setattr(
+        cli,
+        "_host_http_json",
+        lambda **_kw: cli._HostHttpResult(status_code=0, body="ConnectError: refused"),
+    )
+    assert cli._daemon_host_state(_online_record()) == "unknown"
+
+    # A 404 is not evidence either: the row may be missing because we asked
+    # with different credentials than the daemon registered under.
+    monkeypatch.setattr(
+        cli,
+        "_host_http_json",
+        lambda **_kw: cli._HostHttpResult(status_code=404, body={"detail": "host not found"}),
+    )
+    assert cli._daemon_host_state(_online_record()) == "unknown"
+
+
+def test_daemon_host_definitely_offline_only_on_a_server_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreachable server must never read as a definite offline."""
+    monkeypatch.setattr(cli.time, "sleep", lambda _s: None)
+
+    monkeypatch.setattr(cli, "_daemon_host_state", lambda record, **_kw: "offline")
+    assert cli._daemon_host_definitely_offline(_remote_record(), grace_s=0.0) is True
+
+    monkeypatch.setattr(cli, "_daemon_host_state", lambda record, **_kw: "unknown")
+    assert cli._daemon_host_definitely_offline(_remote_record(), grace_s=0.0) is False
+
+    monkeypatch.setattr(cli, "_daemon_host_state", lambda record, **_kw: "online")
+    assert cli._daemon_host_definitely_offline(_remote_record(), grace_s=0.0) is False
+
+
+def test_daemon_host_definitely_offline_waits_for_a_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A daemon that re-registers inside the grace window is not offline."""
+    monkeypatch.setattr(cli.time, "sleep", lambda _s: None)
+    states = iter(["offline", "offline", "online"])
+    monkeypatch.setattr(cli, "_daemon_host_state", lambda record, **_kw: next(states))
+
+    assert cli._daemon_host_definitely_offline(_remote_record(), grace_s=5.0) is False
+
+
+def test_ensure_host_daemon_respawns_zombie_remote_daemon(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A remote daemon the server calls offline is torn down and respawned.
+
+    Without this every later command waits out ``wait_for_host_online`` and
+    fails with "did not come online", leaving ``omnigent host stop`` as the
+    only remedy.
+    """
+    captured: dict[str, object] = {}
+    _patch_daemon_spawn(monkeypatch, tmp_path, captured)
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+        log_path=str(tmp_path / "daemon.log"),
+        started_at=1_000_000,
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    # Old enough to be eligible for the tunnel-health check.
+    monkeypatch.setattr(cli.time, "time", lambda: 1_000_100.0)
+    monkeypatch.setattr(cli, "_daemon_host_definitely_offline", lambda record, **_kw: True)
+    torn_down: list[str] = []
+    monkeypatch.setattr(
+        cli, "_terminate_host_unit", lambda record, *, reason: torn_down.append(reason)
+    )
+
+    _ensure_host_daemon("https://server.example.com")
+
+    assert torn_down == ["host tunnel is offline"]
+    assert "args" in captured  # a fresh daemon was spawned
+
+
+def test_ensure_host_daemon_keeps_remote_daemon_when_probe_inconclusive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An unreachable server must not cost the user a healthy remote daemon.
+
+    The daemon has its own reconnect loop; a blip on the CLI's side is no
+    reason to tear it down.
+    """
+    captured: dict[str, object] = {}
+    _patch_daemon_spawn(monkeypatch, tmp_path, captured)
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+        log_path=str(tmp_path / "daemon.log"),
+        started_at=1_000_000,
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli.time, "time", lambda: 1_000_100.0)
+    monkeypatch.setattr(cli.time, "sleep", lambda _s: None)
+    # Advance the monotonic clock so the grace window elapses without waiting.
+    ticks = itertools.count(0.0, 10.0)
+    monkeypatch.setattr(cli.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(cli, "_daemon_host_state", lambda record, **_kw: "unknown")
+    torn_down: list[str] = []
+    monkeypatch.setattr(
+        cli, "_terminate_host_unit", lambda record, *, reason: torn_down.append(reason)
+    )
+
+    _ensure_host_daemon("https://server.example.com")
+
+    assert torn_down == []
+    assert "args" not in captured  # reused, not respawned
+
+
+def test_ensure_host_daemon_keeps_young_remote_daemon(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A just-spawned remote daemon is not judged before it can connect."""
+    captured: dict[str, object] = {}
+    _patch_daemon_spawn(monkeypatch, tmp_path, captured)
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+        log_path=str(tmp_path / "daemon.log"),
+        started_at=1_000_000,
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    # Younger than _DAEMON_REUSE_MIN_AGE_S.
+    monkeypatch.setattr(cli.time, "time", lambda: 1_000_001.0)
+
+    def _must_not_probe(record: object, **_kw: object) -> bool:
+        raise AssertionError("a young daemon must not be probed for tunnel health")
+
+    monkeypatch.setattr(cli, "_daemon_host_definitely_offline", _must_not_probe)
+
+    _ensure_host_daemon("https://server.example.com")
+
+    assert "args" not in captured  # reused, not respawned
+
+
+def test_ensure_host_daemon_keeps_foreground_remote_daemon(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A foreground ``omnigent host`` is never silently killed by the heal."""
+    captured: dict[str, object] = {}
+    _patch_daemon_spawn(monkeypatch, tmp_path, captured)
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+        log_path=None,  # foreground
+        started_at=1_000_000,
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli.time, "time", lambda: 1_000_100.0)
+
+    def _must_not_probe(record: object, **_kw: object) -> bool:
+        raise AssertionError("a foreground daemon must not be probed for tunnel health")
+
+    monkeypatch.setattr(cli, "_daemon_host_definitely_offline", _must_not_probe)
+
+    _ensure_host_daemon("https://server.example.com")
+
+    assert "args" not in captured  # reused, not respawned

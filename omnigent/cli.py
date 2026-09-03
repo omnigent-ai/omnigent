@@ -2574,32 +2574,44 @@ def _normalize_daemon_target(server_url: str | None) -> str:
     return _normalize_daemon_target_impl(server_url)
 
 
-def _daemon_host_online(record: _HostDaemonRecord, *, timeout_s: float = 2.0) -> bool:
+_DaemonHostState: TypeAlias = Literal["online", "offline", "unknown"]
+
+
+def _daemon_host_state(
+    record: _HostDaemonRecord,
+    *,
+    timeout_s: float = 2.0,
+) -> _DaemonHostState:
     """
-    Probe whether a daemon's host is currently online on its server.
+    Probe a daemon's host registration, separating offline from unreachable.
 
     A daemon process being alive (PID check) does not mean its WebSocket
     tunnel to the Omnigent server is up: the server only reports the host
     ``online`` while a daemon holds an authenticated tunnel and has
     heartbeated within ``HOST_LIVENESS_TTL_S``. After a server restart,
     an ungraceful daemon death, or a flapping tunnel, the daemon can be a
-    "zombie" — alive but not registered. This probe distinguishes the two
-    so reuse can heal instead of polling a zombie until timeout.
+    "zombie" — alive but not registered.
+
+    ``"unknown"`` is deliberately distinct from ``"offline"``: we could not
+    complete the probe (no host id, unreachable server, a non-200, an
+    unparseable body), which says nothing about the daemon. Only a server that
+    answers and reports a non-online status is evidence the tunnel is really
+    gone — the difference between healing a zombie and killing a healthy
+    daemon over a network blip.
 
     :param record: Daemon record to probe.
     :param timeout_s: Per-request HTTP timeout in seconds, e.g. ``2.0``.
-    :returns: ``True`` only when the server reports the record's host id
-        as ``"online"``; ``False`` if the host id is unknown, the server
-        is unreachable, or the host reports offline.
+    :returns: ``"online"`` / ``"offline"`` when the server answered,
+        ``"unknown"`` when the probe could not be completed.
     """
     from omnigent.claude_native_bridge import url_component
 
     host_id = record.host_id or _load_existing_host_id()
     if host_id is None:
-        return False
+        return "unknown"
     base_url = _daemon_base_url(record)
     if base_url is None:
-        return False
+        return "unknown"
     result = _host_http_json(
         base_url=base_url,
         method="GET",
@@ -2608,8 +2620,21 @@ def _daemon_host_online(record: _HostDaemonRecord, *, timeout_s: float = 2.0) ->
         host_id=host_id,
     )
     if result.status_code != 200 or not isinstance(result.body, dict):
-        return False
-    return result.body.get("status") == "online"
+        return "unknown"
+    return "online" if result.body.get("status") == "online" else "offline"
+
+
+def _daemon_host_online(record: _HostDaemonRecord, *, timeout_s: float = 2.0) -> bool:
+    """
+    Probe whether a daemon's host is currently online on its server.
+
+    :param record: Daemon record to probe.
+    :param timeout_s: Per-request HTTP timeout in seconds, e.g. ``2.0``.
+    :returns: ``True`` only when the server reports the record's host id
+        as ``"online"``; ``False`` if the host id is unknown, the server
+        is unreachable, or the host reports offline.
+    """
+    return _daemon_host_state(record, timeout_s=timeout_s) == "online"
 
 
 def _daemon_registry_dir() -> Path:
@@ -2859,6 +2884,38 @@ def _daemon_tunnel_recovers(
     return False
 
 
+def _daemon_host_definitely_offline(
+    record: _HostDaemonRecord,
+    *,
+    grace_s: float = _DAEMON_RECONNECT_GRACE_S,
+) -> bool:
+    """
+    Return whether the server insists a daemon's host is offline.
+
+    Like :func:`_daemon_tunnel_recovers` this polls for up to *grace_s* to let
+    a daemon mid-reconnect re-register, but it answers the stricter question:
+    did the server actually tell us the host is offline? A probe we could not
+    complete (``"unknown"``) is never evidence — it usually means *we* cannot
+    reach the server, and tearing down a healthy remote daemon over the
+    caller's own network blip would be worse than the zombie we are hunting.
+
+    :param record: Daemon record to probe.
+    :param grace_s: Seconds to keep polling for recovery, e.g. ``5.0``.
+    :returns: ``True`` only if the host never reported online during the grace
+        window and the final answer was a definite ``"offline"``.
+    """
+    state = _daemon_host_state(record)
+    if state == "online":
+        return False
+    deadline = time.monotonic() + grace_s
+    while time.monotonic() < deadline:
+        time.sleep(0.5)
+        state = _daemon_host_state(record)
+        if state == "online":
+            return False
+    return state == "offline"
+
+
 def _daemon_host_identity_changed(record: _HostDaemonRecord) -> bool:
     """
     Return whether a daemon record belongs to a different current host id.
@@ -2979,11 +3036,25 @@ def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
 
     if target != _LOCAL_DAEMON_MARKER:
         # Remote / explicit ``--server`` mode: the daemon connects to a server
-        # we don't own and can't restart, so the config-signature / heal /
-        # "re-run" semantics below don't apply (auth posture is the remote's
-        # concern; its own reconnect loop covers transient tunnel drops). Keep
-        # the original PID-liveness reuse so a live daemon for the URL is
-        # reused as-is.
+        # we don't own and can't restart, so the config-signature and "re-run"
+        # semantics below don't apply — auth posture is the remote's concern.
+        #
+        # Tunnel health still does. A daemon whose tunnel is gone for good is
+        # a zombie either way: every later command waits out
+        # ``wait_for_host_online`` and fails with "did not come online", which
+        # is what made `omnigent host stop` the standing remedy. Heal it the
+        # way local mode does, with one extra guard — only on a definite
+        # "the server says offline", never on a probe we could not complete,
+        # since the daemon's own reconnect loop handles transient drops and we
+        # must not kill a healthy daemon over our own network blip.
+        age_s = time.time() - existing.started_at
+        if (
+            background
+            and age_s >= _DAEMON_REUSE_MIN_AGE_S
+            and _daemon_host_definitely_offline(existing)
+        ):
+            _terminate_host_unit(existing, reason="host tunnel is offline")
+            return _DaemonReuseDecision(reuse=False, config_changed=False)
         return _DaemonReuseDecision(reuse=True, config_changed=False)
 
     if not background:
