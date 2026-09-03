@@ -8520,6 +8520,10 @@ def create_runner_app(
         sandbox_override = body.get("sandbox")
         spec = body.get("spec") or {}
 
+        # Captured before spec resolution: a reset landing after this point
+        # retires the spec this launch is about to build from.
+        registration_is_current = _terminal_registration_fence(session_id)
+
         agent_spec = await _resolve_session_agent_spec(session_id)
         agent_os_env = getattr(agent_spec, "os_env", None) if agent_spec is not None else None
 
@@ -8599,6 +8603,29 @@ def create_runner_app(
                     "error": {
                         "code": "terminal_launch_failed",
                         "message": _client_safe_error_detail(exc, context="terminal launch"),
+                    }
+                },
+            )
+
+        if not registration_is_current():
+            # Same fence as the native paths: a reset that landed mid-start
+            # retired this terminal's spec, so drop it rather than attach it.
+            _logger.info(
+                "Discarding terminal %s:%s for %s: session was reset mid-launch",
+                terminal_name,
+                session_key,
+                session_id,
+                extra={"session_id": session_id},
+            )
+            if launched_relay is not None:
+                _discard_comment_relay(session_id, launched_relay)
+            await resource_registry.close_terminal(session_id, resource_view.id)
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": {
+                        "code": "session_reset_during_launch",
+                        "message": "The session was reset while this terminal was starting.",
                     }
                 },
             )
@@ -10013,6 +10040,9 @@ def create_runner_app(
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         await _teardown_session_terminals(session_id)
+        # A codex app-server stored before its terminal registered is invisible
+        # to the teardown above; close it or the subprocess outlives the reset.
+        await _native_runtime.teardown_codex_native_app_server(session_id)
         await resource_registry.cleanup_session(session_id)
         _clear_session_agent_caches(session_id, _session_agent_ids.get(session_id))
         return JSONResponse(
