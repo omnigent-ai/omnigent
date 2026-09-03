@@ -1926,14 +1926,14 @@ def test_wait_for_prompt_submit_ack_accepts_matching_prompt(tmp_path: Path) -> N
         {
             "hook_event_name": "UserPromptSubmit",
             "session_id": "active-session",
-            "prompt": "line one\r\nline two\n",
+            "prompt": "line one\r\nline two",
         },
     )
 
     claude_native_bridge._wait_for_user_prompt_submit_ack(
         bridge_dir,
         byte_offset=0,
-        expected_prompt="line one\nline two",
+        expected_prompt="line one\nline two \t\n",
         expected_claude_session_id="active-session",
         timeout_s=0.1,
     )
@@ -2017,6 +2017,58 @@ def test_wait_for_prompt_submit_ack_ignores_subagent_session_start(tmp_path: Pat
         expected_claude_session_id="parent-session",
         timeout_s=0.1,
     )
+
+
+def test_wait_for_prompt_submit_ack_cold_start_timeout_is_not_restart(tmp_path: Path) -> None:
+    """The first observed session is startup, not evidence of a restart."""
+    bridge_dir = tmp_path / "bridge"
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "initial-session",
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="did not acknowledge"):
+        claude_native_bridge._wait_for_user_prompt_submit_ack(
+            bridge_dir,
+            byte_offset=0,
+            expected_prompt="expected prompt",
+            expected_claude_session_id=None,
+            timeout_s=0.01,
+        )
+
+
+def test_wait_for_prompt_submit_ack_detects_restart_after_unpinned_startup(
+    tmp_path: Path,
+) -> None:
+    """A startup hook before the injection offset establishes the prior session."""
+    bridge_dir = tmp_path / "bridge"
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "initial-session",
+        },
+    )
+    hook_offset = claude_native_bridge._hook_file_size(bridge_dir)
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "replacement-session",
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="restarted"):
+        claude_native_bridge._wait_for_user_prompt_submit_ack(
+            bridge_dir,
+            byte_offset=hook_offset,
+            expected_prompt="expected prompt",
+            expected_claude_session_id=None,
+            timeout_s=0.01,
+        )
 
 
 def test_read_transcript_items_since_surfaces_skill_as_slash_command(
@@ -9354,7 +9406,11 @@ def test_inject_user_message_whitespace_only_content_submits_blind(
     behavior.  This must not raise: the best-effort path is retained for content
     whose draft position cannot be determined.
     """
-    _bypass_delivery_ack(monkeypatch)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_wait_for_user_prompt_submit_ack",
+        lambda *_args, **_kwargs: pytest.fail("whitespace-only input must not wait for an ack"),
+    )
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
     monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_COMMIT_TIMEOUT_S", 0.1)

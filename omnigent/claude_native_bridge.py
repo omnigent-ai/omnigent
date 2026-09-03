@@ -2808,7 +2808,7 @@ def _is_subagent_hook_record(record: ClaudeHookRecord) -> bool:
 
 def _normalized_delivery_prompt(prompt: str) -> str:
     """Normalize hook and injected prompt text for acknowledgement matching."""
-    return prompt.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
+    return prompt.replace("\r\n", "\n").replace("\r", "\n").rstrip()
 
 
 def _wait_for_user_prompt_submit_ack(
@@ -2824,7 +2824,18 @@ def _wait_for_user_prompt_submit_ack(
         timeout_s = _DELIVERY_ACK_TIMEOUT_S
     deadline = time.monotonic() + timeout_s
     current_session_id = expected_claude_session_id
-    initial_session_id = expected_claude_session_id
+    if current_session_id is None and byte_offset:
+        prior = read_hook_events_from_offset(bridge_dir, 0, start_event_count=0)
+        for record in prior.records:
+            if record.byte_offset > byte_offset:
+                break
+            if (
+                record.event_name == "SessionStart"
+                and record.claude_session_id
+                and not _is_subagent_hook_record(record)
+            ):
+                current_session_id = record.claude_session_id
+    restart_seen = False
     expected = _normalized_delivery_prompt(expected_prompt)
     offset = byte_offset
     while time.monotonic() < deadline:
@@ -2838,6 +2849,8 @@ def _wait_for_user_prompt_submit_ack(
             if _is_subagent_hook_record(record):
                 continue
             if record.event_name == "SessionStart" and record.claude_session_id:
+                if current_session_id and record.claude_session_id != current_session_id:
+                    restart_seen = True
                 current_session_id = record.claude_session_id
                 continue
             if record.event_name != "UserPromptSubmit" or record.prompt is None:
@@ -2849,7 +2862,7 @@ def _wait_for_user_prompt_submit_ack(
             return
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
-    if current_session_id and current_session_id != initial_session_id:
+    if restart_seen:
         raise RuntimeError(
             "Claude Code restarted while the message was being submitted and the new "
             "session did not acknowledge it. The message was not delivered."
@@ -3286,9 +3299,12 @@ def inject_user_message(
     # ``/model``, ``/fork``, skills, etc.) pass through unchanged.
     injected_text = _escape_unsupported_slash_command(content)
     command_name = _first_slash_command_name(content)
+    needle = _submit_needle(content)
     # Built-in lifecycle commands do not consistently emit UserPromptSubmit;
-    # ordinary prompts, escaped commands, and skills do.
-    require_delivery_ack = command_name not in _CLAUDE_NATIVE_ALLOWED_USER_SLASH_COMMANDS
+    # whitespace-only submissions do not emit it at all.
+    require_delivery_ack = bool(needle) and (
+        command_name not in _CLAUDE_NATIVE_ALLOWED_USER_SLASH_COMMANDS
+    )
     hook_offset = _hook_file_size(bridge_dir) if require_delivery_ack else 0
     expected_claude_session_id = read_claude_session_id(bridge_dir)
     # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
@@ -3331,7 +3347,6 @@ def inject_user_message(
     # the message (the caller gets no error but the turn never runs).
     # When the needle is empty (whitespace-only content) the draft cannot
     # be confirmed either way; fall through to best-effort blind submit.
-    needle = _submit_needle(content)
     draft_seen = False
     deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
     while time.monotonic() < deadline:
