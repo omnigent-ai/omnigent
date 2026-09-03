@@ -2049,14 +2049,13 @@ function MainAgentSurface({
     if (!mountTerminal || !conversationId) return;
     setWarmTerminals((prev) => updateWarmTerminalSurfaces(prev, conversationId, terminalReadOnly));
   }, [mountTerminal, conversationId, terminalReadOnly]);
-  // Render from a derived list that already includes the active session,
-  // so a fresh session's surface mounts in the same commit (the effect
-  // above persists it one commit later) and its readOnly snapshot tracks
-  // a late permission hydrate while it is the active session.
-  const renderedTerminals =
-    mountTerminal && conversationId
-      ? updateWarmTerminalSurfaces(warmTerminals, conversationId, terminalReadOnly)
-      : warmTerminals;
+  // Derive from warmTerminals only — the effect above adds the active session
+  // after the first paint, so xterm (a lazy chunk) never loads on the initial
+  // render. Previously the active session was included here same-commit to
+  // avoid the one-frame delay; that optimization is removed so the terminal
+  // chunk defers until after first paint. Returning to an already-warm
+  // background session is still same-commit (it's already in warmTerminals).
+  const renderedTerminals = warmTerminals;
   const handleTerminalResume = useCallback(async () => {
     if (!conversationId) throw new Error("Session is not available");
     if (liveness.kind === "host_offline" || liveness.kind === "local_stranded") {

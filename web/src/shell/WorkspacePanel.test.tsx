@@ -331,7 +331,7 @@ describe("WorkspacePanel shell tabs", () => {
     expect(shellTab).not.toHaveClass("h-[32px]");
   });
 
-  it("surfaces the active shell's xterm in the content slot", () => {
+  it("surfaces the active shell's xterm in the content slot", async () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
     renderWorkspace({
       openTerminals: [termKey],
@@ -340,7 +340,9 @@ describe("WorkspacePanel shell tabs", () => {
 
     // The selected shell tab owns the single content slot — its terminal id is
     // attached, and neither the files scope view nor a file viewer mounts.
-    expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_zsh_s1");
+    // findByTestId waits for the lazy TerminalView chunk to resolve through
+    // its Suspense boundary.
+    expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("terminal_zsh_s1");
     expect(screen.queryByTestId("files-panel-stub")).toBeNull();
     expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
   });
