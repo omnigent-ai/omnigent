@@ -104,6 +104,7 @@ if TYPE_CHECKING:
 
     import httpx
 
+    from omnigent.host.service import HostServiceStatus
     from omnigent.install_ledger import InstallLedger
     from omnigent.onboarding.acp_auth import AcpAgentEntry
     from omnigent.server.smart_routing import LLMRoutingClient
@@ -9504,8 +9505,34 @@ def _echo_daemon_payloads(payloads: list[_HostPayload]) -> None:
         _add_host_payload_sessions_table(console, payload)
 
 
+def _echo_host_service_status(status: HostServiceStatus) -> None:
+    """Render the per-user host service as a separate status block."""
+    click.echo(_cli_style("User service", bold=True))
+    if not status.supported:
+        click.echo(f"  state:   unavailable ({status.manager_error or 'unsupported platform'})")
+        return
+    click.echo(f"  state:   {status.manager_state}")
+    click.echo(f"  installed: {'yes' if status.installed else 'no'}")
+    if status.path is not None:
+        click.echo(f"  file:    {_display_path(status.path)}")
+    if status.configured_target is not None:
+        click.echo(f"  target:  {status.configured_target}")
+    if status.manager_pid is not None:
+        click.echo(f"  pid:     {status.manager_pid}")
+    if status.enabled is not None:
+        click.echo(f"  autostart: {'enabled' if status.enabled else 'disabled'}")
+    if status.log is not None:
+        log = _display_path(Path(status.log)) if status.kind == "launchd" else status.log
+        click.echo(f"  logs:    {log}")
+    if status.definition_error is not None:
+        click.echo(f"  definition error: {status.definition_error}", err=True)
+    if status.manager_error is not None:
+        click.echo(f"  manager error: {status.manager_error}", err=True)
+    click.echo()
+
+
 @host.command("enable")
-@click.option("--server", default=None, help="Server target for the persistent service.")
+@click.option("--server", default=None, help="Server target for the single persistent service.")
 @click.option(
     "--non-interactive",
     is_flag=True,
@@ -9519,6 +9546,10 @@ def host_enable(
     non_interactive: bool,
 ) -> None:
     """Install and start the host as a per-user system service.
+
+    Each user has one persistent service target. Enabling a different target
+    replaces the prior service definition; unmanaged hosts may still use
+    multiple targets.
 
     :param ctx: Click context carrying group-level options.
     :param server: Optional server target; empty selects local mode.
@@ -9535,6 +9566,9 @@ def host_enable(
             non_interactive=non_interactive or not _stdin_is_tty(),
         )
 
+    from omnigent.host.service import user_host_service_status
+
+    previous_service = user_host_service_status(probe_manager=False)
     target = _normalize_daemon_target(resolved_server)
     record = _find_daemon_record(target)
     if record is not None:
@@ -9550,7 +9584,18 @@ def host_enable(
     except HostServiceError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    click.echo(f"Enabled the Omnigent host user service for {_host_display_url(target)}.")
+    if (
+        previous_service.installed
+        and previous_service.configured_target is not None
+        and previous_service.configured_target != target
+    ):
+        click.echo(
+            "Replaced the persistent host service target "
+            f"{_host_display_url(previous_service.configured_target)} with "
+            f"{_host_display_url(target)}."
+        )
+    else:
+        click.echo(f"Enabled the Omnigent host user service for {_host_display_url(target)}.")
     click.echo(f"Service definition: {_display_path(service.path)}")
     if service.log_path is not None:
         click.echo(f"Service output: {_display_path(service.log_path)}")
@@ -9601,6 +9646,10 @@ def host_status(
         server = _host_group_option(ctx, "server")
     records = _selected_daemon_records(server=server, all_targets=all_targets, default_all=True)
 
+    from omnigent.host.service import user_host_service_status
+
+    service_status = user_host_service_status()
+
     # Build payloads in parallel so HTTP calls to independent servers overlap.
     # Dead-process records skip the network entirely (see _add_daemon_host_status),
     # but live ones each take a full auth-resolution + round-trip — parallelising
@@ -9615,8 +9664,15 @@ def host_status(
     with concurrent.futures.ThreadPoolExecutor() as pool:
         payloads = list(pool.map(_build, records))
     if json_output:
-        click.echo(json.dumps({"daemons": payloads}, indent=2, sort_keys=True))
+        click.echo(
+            json.dumps(
+                {"service": service_status.to_dict(), "daemons": payloads},
+                indent=2,
+                sort_keys=True,
+            )
+        )
         return
+    _echo_host_service_status(service_status)
     _echo_daemon_payloads(payloads)
 
 
