@@ -27,6 +27,15 @@ from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
 # the SQLAlchemy store both import it.
 FORK_SOURCE_LABEL_KEY = "omnigent.fork.source_id"
 
+# Server-internal label set on archive when a session's git worktree was
+# left in place instead of removed. The value is a small JSON object:
+# either ``{"reason": "in_use" | "host_offline" | "unknown"}`` when no
+# safety check could run, or ``{"dirty_files": N, "unpushed_commits": M,
+# "merged": bool, "default_ref": str | null}`` when the host inspected
+# the worktree and found work that removing it would lose. The Archived
+# settings page renders this as a "Worktree kept — …" note.
+WORKTREE_KEPT_LABEL_KEY = "omnigent.worktree_kept"
+
 # One-shot fork directive: the SOURCE session's runtime-native session id
 # (e.g. the source claude-native Claude Code session uuid), stamped on the
 # clone at fork time when the source had one. A native harness launching

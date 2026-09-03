@@ -939,6 +939,40 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("location").textContent).toBe("/c/conv_archived");
   });
 
+  it("shows the kept-worktree note when archive cleanup left the directory", () => {
+    mocks.conversations = [
+      conv("conv_archived", {
+        archived: true,
+        title: "Old chat",
+        labels: {
+          "omnigent.worktree_kept": JSON.stringify({
+            dirty_files: 2,
+            unpushed_commits: 1,
+            merged: false,
+            default_ref: "origin/main",
+          }),
+        },
+      }),
+    ];
+    renderPage("/settings/archived");
+
+    // The user archived expecting cleanup; the note tells them the
+    // directory is still on disk and what removing it would have lost.
+    const note = screen.getByTestId("worktree-kept-note");
+    expect(note.textContent).toBe(
+      "Worktree kept — 2 uncommitted changes, 1 unpushed commit, " +
+        "branch not merged into origin/main.",
+    );
+  });
+
+  it("shows no kept-worktree note when the label is absent", () => {
+    mocks.conversations = [conv("conv_archived", { archived: true, title: "Old chat" })];
+    renderPage("/settings/archived");
+
+    expect(screen.getByTestId("archived-row")).toBeInTheDocument();
+    expect(screen.queryByTestId("worktree-kept-note")).toBeNull();
+  });
+
   it("deletes an archived session after confirming, with no row-click navigation", () => {
     mocks.conversations = [conv("conv_archived", { archived: true, title: "Old chat" })];
     renderPage("/settings/archived");
