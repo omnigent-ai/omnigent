@@ -537,8 +537,8 @@ export function AppShell() {
   const isKnownTopLevel =
     activeConv != null ||
     (activeSessionMatchesRoute && activeSession != null && activeSession.parentSessionId == null);
-  const actionConversation = useMemo<Conversation | null>(() => {
-    if (!isKnownTopLevel || !isOwnerLevel(permissionLevel)) return null;
+  const managedActiveConversation = useMemo<Conversation | null>(() => {
+    if (!isOwnerLevel(permissionLevel)) return null;
     if (activeConv) return activeConv;
     if (!activeSessionMatchesRoute || !activeSession) return null;
     return {
@@ -556,7 +556,8 @@ export function AppShell() {
       agent_name: activeSession.agentName,
       git_branch: activeSession.gitBranch ?? null,
     };
-  }, [activeConv, activeSession, activeSessionMatchesRoute, isKnownTopLevel, permissionLevel]);
+  }, [activeConv, activeSession, activeSessionMatchesRoute, permissionLevel]);
+  const actionConversation = isKnownTopLevel ? managedActiveConversation : null;
   // Header action gating, hoisted so the desktop buttons and the mobile
   // three-dot menu render the exact same set (they can't drift apart).
   // Stop session is not a header action — it lives in the sidebar row's
@@ -2216,6 +2217,7 @@ export function AppShell() {
             onOpenChange={setCommandPaletteOpen}
             onToggleLeftSidebar={toggleLeftSidebar}
             onToggleRightSidebar={toggleRightPanel}
+            activeConversation={managedActiveConversation}
           />
           {/* Transient toasts (e.g. "session archived"). Mounted once here so
               any surface can fire one via showToast(). */}
