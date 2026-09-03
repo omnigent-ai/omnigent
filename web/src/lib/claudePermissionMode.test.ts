@@ -30,10 +30,10 @@ describe("claudePermissionMode", () => {
     expect(startup).toContain("bypassPermissions");
   });
 
-  it("labels the prompting mode the way Claude Code does", () => {
-    // Claude's own TUI renders "manual mode on" for the `default` value, so
-    // the web label matches what users see in the pane.
-    expect(claudePermissionModeLabel("default")).toBe("Manual");
+  it("labels the prompting mode after its wire value", () => {
+    // The `default` value is labelled "Default" here, matching the other
+    // unset-state selects in the dialog rather than Claude's TUI wording.
+    expect(claudePermissionModeLabel("default")).toBe("Default");
     expect(claudePermissionModeLabel("auto")).toBe("Auto");
   });
 

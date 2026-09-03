@@ -27,9 +27,9 @@ export const CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE = "default";
 
 // Claude Code's `claude --permission-mode` choices (v2.1). Keep in sync
 // with `claude --help`. The prompting mode is spelled `default` on the
-// wire and labelled "Manual" in Claude's own UI, which this mirrors.
+// wire and labelled "Default" here (Claude's own TUI calls it "manual").
 export const CLAUDE_NATIVE_PERMISSION_MODES: ClaudePermissionModeOption[] = [
-  { value: "default", label: "Manual", description: "Prompts before edits and commands" },
+  { value: "default", label: "Default", description: "Prompts before edits and commands" },
   {
     value: "auto",
     label: "Auto",
@@ -72,7 +72,7 @@ export function claudePermissionModeLabel(mode: string | null | undefined): stri
  * Prefers the label the server stamps after a confirmed switch, then the
  * launch flag. Returns `null` rather than assuming Claude's default: a
  * `permissions.defaultMode` in a settings file boots the session into a mode
- * that never appears in `terminal_launch_args`, so guessing "Manual" would
+ * that never appears in `terminal_launch_args`, so guessing "Default" would
  * display a mode the session isn't in. Callers hide the picker on `null`.
  */
 export function claudePermissionModeFromSession(
