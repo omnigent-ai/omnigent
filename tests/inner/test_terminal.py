@@ -1367,20 +1367,46 @@ def test_idle_detector_suppress_activity_discounts_client_driven_repaint() -> No
     )
 
 
-def _write_instance_dir(root: Path, name: str, owner_pid: int | None) -> Path:
+def _write_instance_dir(
+    root: Path,
+    name: str,
+    owner_pid: int | None,
+    *,
+    pid_ns: str | None = None,
+    boot_id: str | None = None,
+    legacy: bool = False,
+) -> Path:
     """
     Create a fake terminal instance dir under the sweep root.
+
+    Writes the same marker shape ``create_terminal_instance`` does: the
+    pid, plus the pid domain that makes it resolvable.
 
     :param root: Fake temp root the sweep scans.
     :param name: Directory name, e.g. ``"omnigent-terminal-dead1"``.
     :param owner_pid: Owner pid to record, or ``None`` for no marker
         (an unrelated / pre-marker dir the sweep must not touch).
+    :param pid_ns: Pid namespace to record; defaults to this process's.
+    :param boot_id: Boot id to record; defaults to this boot's.
+    :param legacy: Write a bare pid with no domain fields, as builds
+        before the sweep learned that a pid is domain-relative did.
     :returns: The created directory path.
     """
     instance_dir = root / name
     instance_dir.mkdir()
-    if owner_pid is not None:
+    if owner_pid is None:
+        return instance_dir
+    if legacy:
         (instance_dir / "owner.pid").write_text(str(owner_pid), encoding="utf-8")
+        return instance_dir
+    lines = [str(owner_pid)]
+    effective_ns = pid_ns if pid_ns is not None else terminal_mod._current_pid_ns()
+    if effective_ns is not None:
+        lines.append(f"pid_ns={effective_ns}")
+    effective_boot = boot_id if boot_id is not None else terminal_mod._current_boot_id()
+    if effective_boot is not None:
+        lines.append(f"boot={effective_boot}")
+    (instance_dir / "owner.pid").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return instance_dir
 
 
@@ -1489,6 +1515,157 @@ def test_reap_orphaned_terminals_kills_server_for_dead_owner_socket(
     # kill-server targeted exactly this instance's socket; a missing
     # call means the tmux server (the real leak) survives dir removal.
     assert kill_calls == [["tmux", "-S", str(socket_path), "kill-server"]]
+
+
+def test_reap_orphaned_terminals_keeps_dirs_claimed_in_another_pid_namespace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A pid from a foreign pid namespace never condemns a terminal.
+
+    Instance dirs live in a temp root shared by every process on the
+    box, but a pid only names a process inside the namespace that
+    minted it. Read as a local pid, another namespace's live runner
+    looks dead — and the sweep then kills the tmux server under a
+    running agent, ending its in-flight turn. So a claim stamped with
+    a namespace this process is not in yields no conclusion, even
+    though the pid resolves to nothing here.
+
+    :param tmp_path: Fake temp root the sweep scans.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+
+    def _raise_if_called(*args: object, **kwargs: object) -> None:
+        """Fail the test if the sweep tries to kill a foreign server."""
+        raise AssertionError(f"kill-server must not run: {args} {kwargs}")
+
+    monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
+    monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
+    monkeypatch.setattr(
+        terminal_mod,
+        "subprocess",
+        SimpleNamespace(run=_raise_if_called, TimeoutExpired=TimeoutError),
+    )
+    foreign_dir = _write_instance_dir(
+        tmp_path,
+        "omnigent-terminal-foreignns",
+        _dead_pid(),
+        pid_ns="pid:[4026599999]",
+    )
+    (foreign_dir / "tmux.sock").touch()
+
+    reaped = terminal_mod.reap_orphaned_terminals()
+
+    assert reaped == 0
+    assert foreign_dir.exists()
+
+
+def test_reap_orphaned_terminals_keeps_legacy_bare_pid_dirs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A marker with no pid domain is unplaceable, so it is left alone.
+
+    Builds predating the domain fields wrote a bare pid, and hosts run
+    several builds at once (a released runner beside a dev checkout).
+    Such a pid cannot be placed in a namespace, so the sweep has no
+    basis to call its owner dead and must not act on it.
+
+    :param tmp_path: Fake temp root the sweep scans.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
+    monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
+    legacy_dir = _write_instance_dir(
+        tmp_path, "omnigent-terminal-legacy1", _dead_pid(), legacy=True
+    )
+
+    reaped = terminal_mod.reap_orphaned_terminals()
+
+    assert reaped == 0
+    assert legacy_dir.exists()
+
+
+def test_reap_orphaned_terminals_reaps_dirs_from_a_previous_boot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A dir stamped with an earlier boot is garbage regardless of its pid.
+
+    Nothing the marker named survived the reboot — the tmux server
+    included — so the dir is collectable even though the recorded pid
+    is live in this boot (pids are reused across boots, which would
+    otherwise pin the leak forever).
+
+    :param tmp_path: Fake temp root the sweep scans.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import os
+
+    monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
+    monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
+    monkeypatch.setattr(
+        terminal_mod,
+        "subprocess",
+        SimpleNamespace(
+            run=lambda *a, **k: SimpleNamespace(returncode=0), TimeoutExpired=TimeoutError
+        ),
+    )
+    # A boot id is only published on Linux; elsewhere the marker carries
+    # none and the pid stays the only signal (see _owner_is_gone).
+    monkeypatch.setattr(terminal_mod, "_current_boot_id", lambda: "boot-now")
+    stale_dir = _write_instance_dir(
+        tmp_path, "omnigent-terminal-prevboot", os.getpid(), boot_id="boot-before"
+    )
+
+    reaped = terminal_mod.reap_orphaned_terminals()
+
+    assert reaped == 1
+    assert not stale_dir.exists()
+
+
+def test_create_terminal_instance_records_a_placeable_owner_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The marker a real instance writes is one the sweep can act on.
+
+    Guards the seam between the writer and the sweep: if the two ever
+    disagree on the marker shape, every dir reads as unplaceable and
+    the leak the sweep exists for comes back silently.
+
+    :param tmp_path: Working directory for the terminal spec.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import os
+
+    # create_terminal_instance only guards on tmux availability, so
+    # faking the predicate keeps this runnable without tmux installed.
+    monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
+
+    result = create_terminal_instance(
+        name="bash",
+        session_key="s1",
+        spec=TerminalEnvSpec(
+            command="bash", os_env=OSEnvSpec(type="caller_process", cwd=str(tmp_path))
+        ),
+    )
+    claim = terminal_mod._read_owner_claim(result.instance.private_dir)
+
+    assert claim is not None, "the writer must produce a marker the sweep can parse"
+    assert claim.pid == os.getpid()
+    assert claim.pid_ns == terminal_mod._current_pid_ns()
+    assert claim.boot_id == terminal_mod._current_boot_id()
+    # This process owns it and is alive, so it is not collectable.
+    assert terminal_mod._owner_is_gone(claim) is False
 
 
 @pytest.mark.skipif(
