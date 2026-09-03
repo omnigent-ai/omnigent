@@ -1,9 +1,9 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import type { Bubble } from "@/lib/renderItems";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
-import { BubbleView } from "./ChatPage";
+import { BackgroundTaskPill, BubbleView } from "./ChatPage";
 import {
   ConnectionIndicator,
   RunnerStartingIndicator,
@@ -420,5 +420,87 @@ describe("BubbleView dispatch", () => {
     expect(indicator).toHaveTextContent("Compacting conversation…");
     // Initially shows no elapsed time or (0s)
     // (timer ticks immediately on mount, so we can't reliably assert the exact initial state)
+  });
+});
+
+describe("BackgroundTaskPill working cue", () => {
+  beforeEach(() => {
+    useChatStore.setState({
+      sessionStatus: "idle",
+      status: "idle",
+      backgroundTaskCount: 1,
+      backgroundTasks: [],
+    });
+  });
+
+  afterEach(() => {
+    // Unmount first: a bare setState against mounted components trips React's
+    // act() warning.
+    cleanup();
+    useChatStore.setState({
+      sessionStatus: "idle",
+      status: "idle",
+      backgroundTaskCount: 0,
+      backgroundTasks: [],
+    });
+  });
+
+  it("renders the idle tally with no spinner once the turn has ended", () => {
+    // WHY: background-tasks-only is the pill's baseline — it must read as a
+    // quiet tally, not as the agent still thinking.
+    render(<BackgroundTaskPill />);
+    const pill = screen.getByTestId("background-task-pill");
+    expect(pill).toHaveAttribute("aria-label", "1 background task still running");
+    expect(screen.queryByTestId("background-task-pill-working")).not.toBeInTheDocument();
+  });
+
+  it("shows a spinner and says the agent is working while the turn is active", () => {
+    // WHY: on a phone the end-of-thread shimmer scrolls out of the viewport,
+    // leaving this pill as the only status surface — it must carry a visible
+    // working cue and say so in its accessible name.
+    useChatStore.setState({ sessionStatus: "running" });
+    render(<BackgroundTaskPill />);
+    const pill = screen.getByTestId("background-task-pill");
+    expect(pill).toHaveAttribute("aria-label", "Agent working — 1 background task still running");
+    expect(screen.getByTestId("background-task-pill-working")).toBeInTheDocument();
+  });
+
+  it("treats a local send in flight as working before the server confirms", () => {
+    // WHY: the working cue must light the moment the user presses Enter (like
+    // the shimmer's localSending bridge), not only after the `running` edge.
+    useChatStore.setState({ status: "streaming" });
+    render(<BackgroundTaskPill />);
+    expect(screen.getByTestId("background-task-pill")).toHaveAttribute(
+      "aria-label",
+      "Agent working — 1 background task still running",
+    );
+    expect(screen.getByTestId("background-task-pill-working")).toBeInTheDocument();
+  });
+
+  it("drops the working cue when the turn settles back to idle", () => {
+    // WHY: the cue must be an edge-accurate state, not a latch — once the turn
+    // ends the pill returns to its plain tally.
+    useChatStore.setState({ sessionStatus: "running" });
+    render(<BackgroundTaskPill />);
+    expect(screen.getByTestId("background-task-pill-working")).toBeInTheDocument();
+    act(() => {
+      useChatStore.setState({ sessionStatus: "idle" });
+    });
+    expect(screen.queryByTestId("background-task-pill-working")).not.toBeInTheDocument();
+    expect(screen.getByTestId("background-task-pill")).toHaveAttribute(
+      "aria-label",
+      "1 background task still running",
+    );
+  });
+
+  it("pluralizes the working announcement with the tally", () => {
+    // WHY: the accessible name must keep the count accurate while adding the
+    // working state — neither signal may clobber the other.
+    useChatStore.setState({ sessionStatus: "running", backgroundTaskCount: 3 });
+    render(<BackgroundTaskPill />);
+    expect(screen.getByTestId("background-task-pill")).toHaveAttribute(
+      "aria-label",
+      "Agent working — 3 background tasks still running",
+    );
   });
 });

@@ -4224,10 +4224,16 @@ function SubagentComposerTray({ label }: { label: string }) {
  * corner radius (CSS can't animate to an `auto` size), growing upward out of an
  * absolute layer over a hidden spacer so the composer below never shifts. A
  * count-only edge (older runner, no per-shell detail) stays a plain tally.
+ *
+ * While the agent's turn is active the pill carries the working state too — a
+ * spinner replaces the terminal icon and the accessible name says so. On a
+ * phone the end-of-thread "Working…" shimmer scrolls out of the viewport, so
+ * this always-on-screen pill is the only working/idle cue left.
  */
-function BackgroundTaskPill() {
+export function BackgroundTaskPill() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
   const bgTasks = useChatStore((s) => s.backgroundTasks);
+  const agentWorking = useAgentTurnActive();
   const [open, setOpen] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
   const [box, setBox] = useState<{ width: number; height: number } | null>(null);
@@ -4242,11 +4248,12 @@ function BackgroundTaskPill() {
   useLayoutEffect(() => {
     const el = contentRef.current;
     if (el) setBox({ width: el.offsetWidth, height: el.offsetHeight });
-  }, [open, canExpand, bgCount, bgTasks]);
+  }, [open, canExpand, bgCount, bgTasks, agentWorking]);
 
   if (bgCount <= 0) return null;
 
   const showCard = open && canExpand;
+  const countLabel = `${bgCount} background task${bgCount === 1 ? "" : "s"}`;
 
   return (
     <div className={cn("mx-auto flex w-full px-1 pb-1.5", CHAT_COLUMN_WIDTH)}>
@@ -4256,15 +4263,17 @@ function BackgroundTaskPill() {
         <div aria-hidden className="invisible px-3 py-1.5 text-sm">
           <div className="flex items-center gap-1.5 whitespace-nowrap">
             <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
-            <span>
-              {bgCount} background task{bgCount === 1 ? "" : "s"}
-            </span>
+            <span>{countLabel}</span>
           </div>
         </div>
         <div
           role="status"
           data-testid="background-task-pill"
-          aria-label={`${bgCount} background task${bgCount === 1 ? "" : "s"} still running`}
+          aria-label={
+            agentWorking
+              ? `Agent working — ${countLabel} still running`
+              : `${countLabel} still running`
+          }
           tabIndex={canExpand ? 0 : undefined}
           // Hover opens ONLY for a real mouse. On touch, opening on emulated
           // hover triggers iOS's "first tap reveals hover, second tap clicks"
@@ -4333,10 +4342,18 @@ function BackgroundTaskPill() {
               </ul>
             ) : (
               <div className="flex items-center gap-1.5 whitespace-nowrap text-muted-foreground">
-                <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
-                <span>
-                  {bgCount} background task{bgCount === 1 ? "" : "s"}
-                </span>
+                {/* The spinner is the visible working cue: same footprint as the
+                    terminal icon, so the tween never jumps on a state edge. */}
+                {agentWorking ? (
+                  <Loader2Icon
+                    data-testid="background-task-pill-working"
+                    className="size-3.5 shrink-0 animate-spin"
+                    aria-hidden="true"
+                  />
+                ) : (
+                  <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
+                )}
+                <span>{countLabel}</span>
               </div>
             )}
           </div>
