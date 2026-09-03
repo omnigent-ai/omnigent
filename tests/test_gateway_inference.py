@@ -569,3 +569,124 @@ def test_gateway_url_accepts_databricks_owned_hosts(gateway_url: str) -> None:
 )
 def test_gateway_url_rejects_lookalike_hosts(gateway_url: str) -> None:
     assert is_databricks_ai_gateway_url(gateway_url) is False
+
+
+def test_introspection_does_not_narrate_launch_routing(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Resolving a launch to inspect it must not log as if it launched.
+
+    A long-lived host daemon re-runs these checks every minute, so narrating
+    each one buried the host's own lifecycle lines under thousands of
+    identical routing lines — 98% of one 7-hour daemon log.
+    """
+    import logging
+
+    resolver = logging.getLogger("omnigent.claude_native")
+
+    def _resolve_and_narrate(**kwargs: Any) -> ClaudeNativeUcodeConfig:
+        # Stand in for the real resolver, which narrates the routing it picked.
+        resolver.info("native-claude routing: provider 'gw' (base_url=%s)", _GATEWAY_ANTHROPIC_URL)
+        return ClaudeNativeUcodeConfig(
+            env={"ANTHROPIC_BASE_URL": _GATEWAY_ANTHROPIC_URL},
+            api_key_helper="databricks auth token --profile dev",
+        )
+
+    monkeypatch.setattr(claude_native, "resolve_native_claude_config", _resolve_and_narrate)
+
+    with caplog.at_level(logging.INFO):
+        assert claude_gateway_inference_backed() is True
+
+    routing = [r.getMessage() for r in caplog.records if "routing" in r.getMessage()]
+    assert routing == [], f"introspection must not narrate routing, got {routing}"
+
+
+def test_a_real_launch_still_narrates_its_routing(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The filter must not become a blanket mute on the resolver's logger.
+
+    The routing line is exactly what an operator wants when a session really
+    launches; only the repeated introspection is noise.
+    """
+    import logging
+
+    resolver = logging.getLogger("omnigent.claude_native")
+    _stub_claude(
+        monkeypatch,
+        ClaudeNativeUcodeConfig(
+            env={"ANTHROPIC_BASE_URL": _GATEWAY_ANTHROPIC_URL},
+            api_key_helper="databricks auth token --profile dev",
+        ),
+    )
+
+    with caplog.at_level(logging.INFO):
+        # Install the filter via one introspection pass, then log as a launch would.
+        assert claude_gateway_inference_backed() is True
+        resolver.info("native-claude routing: provider 'gw' (real launch)")
+
+    routing = [r.getMessage() for r in caplog.records if "routing" in r.getMessage()]
+    assert routing == ["native-claude routing: provider 'gw' (real launch)"]
+
+
+def test_narration_survives_a_launch_on_another_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Suppression is scoped to the introspecting thread.
+
+    Host launches run as tasks on the daemon's event loop while these checks
+    run in a worker thread, so a process-wide mute would swallow the routing
+    line of a session that really did launch.
+    """
+    import logging
+    import threading
+
+    records: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record.getMessage())
+
+    resolver = logging.getLogger("omnigent.claude_native")
+    handler = _Capture()
+    resolver.addHandler(handler)
+    resolver.setLevel(logging.INFO)
+    started = threading.Event()
+
+    def _concurrent_launch() -> None:
+        started.wait(timeout=5)
+        resolver.info("native-claude routing: concurrent launch")
+
+    try:
+        with gateway_inference._quiet_resolver_narration():
+            thread = threading.Thread(target=_concurrent_launch)
+            thread.start()
+            started.set()
+            thread.join(timeout=5)
+            resolver.info("native-claude routing: suppressed on this thread")
+    finally:
+        resolver.removeHandler(handler)
+
+    assert records == ["native-claude routing: concurrent launch"]
+
+
+def test_nested_introspection_restores_narration(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Leaving a nested check does not un-suppress its caller."""
+    import logging
+
+    resolver = logging.getLogger("omnigent.claude_native")
+
+    with caplog.at_level(logging.INFO):
+        with gateway_inference._quiet_resolver_narration():
+            with gateway_inference._quiet_resolver_narration():
+                pass
+            resolver.info("native-claude routing: still inside")
+        resolver.info("native-claude routing: after")
+
+    messages = [r.getMessage() for r in caplog.records if "routing" in r.getMessage()]
+    assert messages == ["native-claude routing: after"]

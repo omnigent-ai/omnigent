@@ -9,11 +9,73 @@ report the answer alongside harness readiness on every registration.
 
 from __future__ import annotations
 
+import contextlib
 import logging
-from collections.abc import Iterable, Mapping
+import threading
+from collections.abc import Iterable, Iterator, Mapping
 from typing import Final
 
 _logger = logging.getLogger(__name__)
+
+# Loggers of the launch resolvers these checks call. The resolvers narrate the
+# routing they picked at INFO, which is what an operator wants when a session
+# actually launches — and pure noise when the host is only asking a question.
+_RESOLVER_LOGGERS: Final[tuple[str, ...]] = (
+    "omnigent.claude_native",
+    "omnigent.codex_native_app_server",
+)
+
+# Set only on the thread running an introspection check. Host launches run as
+# tasks on the daemon's event loop while these checks run in a worker thread
+# (``asyncio.to_thread``), so keying suppression to the thread keeps a real
+# concurrent launch's routing line intact.
+_introspecting = threading.local()
+
+
+def _suppress_resolver_narration(record: logging.LogRecord) -> bool:
+    """Drop a resolver's routing narration on an introspecting thread.
+
+    :param record: The candidate log record.
+    :returns: ``False`` to drop the record, ``True`` to keep it.
+    """
+    del record
+    return not getattr(_introspecting, "active", False)
+
+
+_filters_installed = False
+_filters_lock = threading.Lock()
+
+
+def _install_resolver_filters() -> None:
+    """Attach the narration filter to the resolver loggers once."""
+    global _filters_installed
+    if _filters_installed:
+        return
+    with _filters_lock:
+        if _filters_installed:
+            return
+        for name in _RESOLVER_LOGGERS:
+            logging.getLogger(name).addFilter(_suppress_resolver_narration)
+        _filters_installed = True
+
+
+@contextlib.contextmanager
+def _quiet_resolver_narration() -> Iterator[None]:
+    """Silence resolver routing narration for this thread's duration.
+
+    These checks resolve a launch purely to inspect where it would route. On a
+    long-lived host daemon the readiness loop repeats that every minute, which
+    otherwise buries the host's own lifecycle lines under thousands of
+    identical routing lines.
+    """
+    _install_resolver_filters()
+    previous = getattr(_introspecting, "active", False)
+    _introspecting.active = True
+    try:
+        yield
+    finally:
+        _introspecting.active = previous
+
 
 # Every spelling the Claude family travels under on the wire.
 CLAUDE_GATEWAY_HARNESSES: Final[tuple[str, ...]] = ("claude-native", "native-claude")
@@ -52,7 +114,8 @@ def claude_gateway_inference_backed() -> bool:
     )
     from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
 
-    config = resolve_native_claude_config(spec=None, refresh_models=False)
+    with _quiet_resolver_narration():
+        config = resolve_native_claude_config(spec=None, refresh_models=False)
     if config is not None:
         base_url = config.env.get("ANTHROPIC_BASE_URL")
         if base_url and config.api_key_helper and is_databricks_ai_gateway_url(base_url):
@@ -81,7 +144,8 @@ def codex_gateway_inference_backed() -> bool:
     )
     from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
 
-    base_url = native_codex_launch_base_url(resolve_native_codex_launch(model=None))
+    with _quiet_resolver_narration():
+        base_url = native_codex_launch_base_url(resolve_native_codex_launch(model=None))
     if not base_url:
         return False
     if not is_databricks_ai_gateway_url(base_url):
