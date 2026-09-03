@@ -103,7 +103,6 @@ def test_genie_auth_is_profile_based_no_baked_secret(genie_spec: AgentSpec) -> N
     auth = (genie.headers or {}).get("Authorization")
     if auth is not None:
         assert "${" in auth, "Authorization header must reference an env var, not a baked token"
-        assert "Bearer ${" in auth or "${" in auth
 
 
 def test_genie_is_read_only(genie_spec: AgentSpec) -> None:
