@@ -1470,6 +1470,13 @@ class SqlScheduledTask(OmnigentBase):
         deterministic id at fire time, so there is nothing to pin).
     :param timezone: IANA timezone the trigger is evaluated in, e.g.
         ``"America/Los_Angeles"``.
+    :param active_range_start: Start of the daily time-of-day window (``"HH:MM"``,
+        24-hour) that gates which rule occurrences are allowed to fire,
+        evaluated in ``timezone``. ``None``, together with
+        ``active_range_end``, means unrestricted (fires on every rule
+        occurrence). Always set together with ``active_range_end``.
+    :param active_range_end: End of the active-range window (``"HH:MM"``),
+        evaluated in ``timezone``. See ``active_range_start``.
     :param state: Lifecycle state — ``active``/``paused``/``deleted``.
         The scheduler only dispatches ``active`` tasks.
         Stored as a stable int code (see omnigent.db.enum_codecs
@@ -1539,6 +1546,13 @@ class SqlScheduledTask(OmnigentBase):
     # there is nothing to pin here).
     host_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
     timezone: Mapped[str] = mapped_column(String(64), nullable=False, server_default="UTC")
+    # Daily time-of-day window ("HH:MM", 24-hour) gating which rule
+    # occurrences are allowed to fire, evaluated in `timezone`. Both NULL
+    # means unrestricted (today's behavior); always set together. No CHECK
+    # constraint enforcing that pairing — SQLite regex CHECKs are unavailable
+    # under batch mode, and the route is the only writer, which validates.
+    active_range_start: Mapped[str | None] = mapped_column(String(5), nullable=True)
+    active_range_end: Mapped[str | None] = mapped_column(String(5), nullable=True)
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
     # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3). The
     # store converts to/from the string name at the row↔entity boundary.

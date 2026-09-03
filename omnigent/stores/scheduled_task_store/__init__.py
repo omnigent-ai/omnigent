@@ -55,6 +55,8 @@ class ScheduledTaskStore(ABC):
         workspace: str | None = None,
         host_id: str | None = None,
         state: str = "active",
+        active_range_start: str | None = None,
+        active_range_end: str | None = None,
     ) -> ScheduledTask:
         """
         Insert a new scheduled task.
@@ -77,6 +79,12 @@ class ScheduledTaskStore(ABC):
         :param host_id: The connected host to pin the run to.
         :param state: Lifecycle state — ``active``/``paused``/``deleted``.
             Defaults to ``"active"``.
+        :param active_range_start: Optional start of the daily time-of-day
+            window (``"HH:MM"``) gating which rule occurrences fire. Must be
+            set together with ``active_range_end``; ``None`` for both means
+            unrestricted.
+        :param active_range_end: Optional end of the active-range window
+            (``"HH:MM"``). See ``active_range_start``.
         :returns: The newly created :class:`ScheduledTask`.
         :raises ValueError: If ``state`` is not a recognized value.
         """
@@ -144,18 +152,23 @@ class ScheduledTaskStore(ABC):
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
+        active_range_start: str | None = _UNSET,
+        active_range_end: str | None = _UNSET,
     ) -> ScheduledTask | None:
         """
         Update mutable fields of a task.
 
         Most parameters use ``None`` to mean "leave unchanged". For the per-task
         overrides (``model_override``, ``reasoning_effort``,
-        ``permission_mode``), ``host_id``, ``max_cost_usd``, and
-        ``last_run_conversation_id``, the sentinel default means "not provided /
+        ``permission_mode``), ``host_id``, ``max_cost_usd``,
+        ``last_run_conversation_id``, ``active_range_start``, and
+        ``active_range_end``, the sentinel default means "not provided /
         leave unchanged"; passing ``None`` explicitly sets the column to NULL —
         so resetting an override to the agent default actually clears it (e.g.
-        turning a set ``bypassPermissions`` back off), and clearing a host
-        binding or nulling out a deleted last-run conversation.
+        turning a set ``bypassPermissions`` back off), clearing a host
+        binding or nulling out a deleted last-run conversation, and clearing
+        ``active_range_start``/``active_range_end`` back to an always-active
+        task.
 
         Passing ``rrule`` updates the recurring trigger; ``None``
         leaves it unchanged.

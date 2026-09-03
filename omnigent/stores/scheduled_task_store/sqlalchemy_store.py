@@ -59,6 +59,8 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         base_branch=row.base_branch,
         execution_target=decode_scheduled_task_execution_target(row.execution_target),
         host_id=row.host_id,
+        active_range_start=row.active_range_start,
+        active_range_end=row.active_range_end,
         state=decode_scheduled_task_state(row.state),
         last_run_at=row.last_run_at,
         last_run_conversation_id=row.last_run_conversation_id,
@@ -134,6 +136,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         workspace: str | None = None,
         host_id: str | None = None,
         state: str = "active",
+        active_range_start: str | None = None,
+        active_range_end: str | None = None,
     ) -> ScheduledTask:
         """Insert a new scheduled task with a required recurring ``rrule``."""
         row = SqlScheduledTask(
@@ -152,6 +156,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             base_branch=None,
             execution_target=encode_scheduled_task_execution_target("connected_host"),
             host_id=host_id,
+            active_range_start=active_range_start,
+            active_range_end=active_range_end,
             state=encode_scheduled_task_state(state),
             last_run_at=None,
             last_run_conversation_id=None,
@@ -260,19 +266,23 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
+        active_range_start: str | None = _UNSET,
+        active_range_end: str | None = _UNSET,
     ) -> ScheduledTask | None:
         """Update mutable fields.
 
         ``None`` leaves most fields unchanged. For the per-task overrides
         (``model_override``, ``reasoning_effort``, ``permission_mode``),
-        ``host_id``, ``max_cost_usd``, and ``last_run_conversation_id``, the
-        sentinel default means "not provided / leave unchanged"; passing
-        ``None`` explicitly sets the column to NULL — so resetting an override
-        to the agent default actually clears it (a set ``bypassPermissions``
-        can be turned back off). Passing ``rrule`` updates the recurring
-        trigger and ``agent_id`` rebinds the task to a different agent
-        (switching the harness future firings run); ``None`` leaves either
-        unchanged.
+        ``host_id``, ``max_cost_usd``, ``last_run_conversation_id``,
+        ``active_range_start``, and ``active_range_end``, the sentinel default
+        means "not provided / leave unchanged"; passing ``None`` explicitly
+        sets the column to NULL — so resetting an override to the agent
+        default actually clears it (a set ``bypassPermissions`` can be turned
+        back off), and explicitly passing ``None`` for both active-range bounds
+        clears the task back to always-active. Passing ``rrule`` updates the
+        recurring trigger and ``agent_id`` rebinds the task to a different
+        agent (switching the harness future firings run); ``None`` leaves
+        either unchanged.
         """
         with self._session("update_task") as session:
             row = session.get(SqlScheduledTask, (current_workspace_id(), scheduled_task_id))
@@ -311,6 +321,12 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 changed = True
             if host_id is not _UNSET and row.host_id != host_id:
                 row.host_id = host_id
+                changed = True
+            if active_range_start is not _UNSET and row.active_range_start != active_range_start:
+                row.active_range_start = active_range_start
+                changed = True
+            if active_range_end is not _UNSET and row.active_range_end != active_range_end:
+                row.active_range_end = active_range_end
                 changed = True
             if state is not None:
                 encoded_state = encode_scheduled_task_state(state)
