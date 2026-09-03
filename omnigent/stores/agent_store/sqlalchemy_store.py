@@ -6,15 +6,18 @@ import builtins
 
 from sqlalchemy import and_, asc, desc, or_, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, aliased
 
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
+    DEFAULT_WORKSPACE_ID,
     SqlAgent,
     SqlConversation,
     current_workspace_id,
 )
 from omnigent.db.enum_codecs import encode_agent_kind
 from omnigent.db.utils import (
+    builtin_agent_id,
     get_or_create_conversation_engine,
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -22,6 +25,18 @@ from omnigent.db.utils import (
 )
 from omnigent.entities import Agent, PagedList
 from omnigent.stores.agent_store import AgentStore
+
+
+def _is_workspace_agnostic_builtin(row: SqlAgent) -> bool:
+    """True for an operator-seeded built-in readable from every workspace.
+
+    Built-in agents are seeded by the server lifespan with no workspace
+    bound, so their rows live in the default workspace only. Their identity
+    is verifiable — kind ``template`` plus the name-derived deterministic id
+    — which is what makes a cross-workspace read safe: a user-created agent
+    (random id, or session-scoped) never matches, so tenant isolation holds.
+    """
+    return row.kind == encode_agent_kind("template") and row.id == builtin_agent_id(row.name)
 
 
 class SqlAlchemyAgentStore(AgentStore):
@@ -162,6 +177,8 @@ class SqlAlchemyAgentStore(AgentStore):
         with self._session("select_agent_by_id") as session:
             row = session.get(SqlAgent, (current_workspace_id(), agent_id))
             if row is None:
+                row = self._default_workspace_builtin(session, agent_id)
+            if row is None:
                 return None
         # For session-scoped agents, derive the owning conversation id
         # from the forward pointer so callers can use agent.session_id.
@@ -170,6 +187,25 @@ class SqlAlchemyAgentStore(AgentStore):
         if row.kind == encode_agent_kind("session"):
             session_id = self._session_id_for_agent(agent_id)
         return sql_agent_to_entity(row, session_id=session_id)
+
+    @staticmethod
+    def _default_workspace_builtin(session: Session, agent_id: str) -> SqlAgent | None:
+        """Resolve a built-in seeded into the default workspace, read-only.
+
+        Built-ins are seeded context-free (workspace 0) at server startup,
+        while a multi-tenant request binds a non-default workspace — without
+        this fallback a second workspace cannot list built-ins, bind one at
+        session create, or serve the runner's spec resolve. Only genuine
+        built-ins qualify (see :func:`_is_workspace_agnostic_builtin`);
+        writes never fall back, keeping built-ins read-only outside their
+        home workspace.
+        """
+        if current_workspace_id() == DEFAULT_WORKSPACE_ID:
+            return None
+        row = session.get(SqlAgent, (DEFAULT_WORKSPACE_ID, agent_id))
+        if row is not None and _is_workspace_agnostic_builtin(row):
+            return row
+        return None
 
     def get_by_name(self, name: str) -> Agent | None:
         """
@@ -190,6 +226,18 @@ class SqlAlchemyAgentStore(AgentStore):
                     SqlAgent.kind == encode_agent_kind("template"),
                 )
             ).scalar_one_or_none()
+            if row is None and current_workspace_id() != DEFAULT_WORKSPACE_ID:
+                # Built-ins live in the default workspace only; resolve them
+                # from any workspace (verified identity, read-only).
+                fallback = session.execute(
+                    select(SqlAgent).where(
+                        SqlAgent.workspace_id == DEFAULT_WORKSPACE_ID,
+                        SqlAgent.name == name,
+                        SqlAgent.kind == encode_agent_kind("template"),
+                    )
+                ).scalar_one_or_none()
+                if fallback is not None and _is_workspace_agnostic_builtin(fallback):
+                    row = fallback
             return sql_agent_to_entity(row) if row else None
 
     def list(
@@ -218,23 +266,47 @@ class SqlAlchemyAgentStore(AgentStore):
             is_desc = order == "desc"
             sort_fn = desc if is_desc else asc
             is_template = SqlAgent.kind == encode_agent_kind("template")
-            in_workspace = SqlAgent.workspace_id == current_workspace_id()
+            workspace_id = current_workspace_id()
+            # A non-default workspace also reads the default workspace's rows
+            # so operator-seeded built-ins appear in every workspace's picker;
+            # non-builtin default-workspace rows are filtered out post-query.
+            if workspace_id == DEFAULT_WORKSPACE_ID:
+                in_workspace = SqlAgent.workspace_id == workspace_id
+            else:
+                in_workspace = SqlAgent.workspace_id.in_((DEFAULT_WORKSPACE_ID, workspace_id))
             stmt = select(SqlAgent).where(in_workspace, is_template)
-            if after:
-                sub = (
+            if workspace_id != DEFAULT_WORKSPACE_ID:
+                # Drop default-workspace rows shadowed by a same-id row in the
+                # caller's workspace — in SQL, so the dedup holds across pages.
+                shadow = aliased(SqlAgent)
+                shadowed = (
+                    select(shadow.id)
+                    .where(
+                        shadow.workspace_id == workspace_id,
+                        shadow.id == SqlAgent.id,
+                    )
+                    .exists()
+                )
+                stmt = stmt.where(or_(SqlAgent.workspace_id == workspace_id, ~shadowed))
+
+            def _cursor_created_at(cursor_id: str):
+                # With the two-workspace read a shadowing same-id row could
+                # match twice; prefer the caller's own workspace and cap at 1.
+                return (
                     select(SqlAgent.created_at)
-                    .where(in_workspace, SqlAgent.id == after, is_template)
+                    .where(in_workspace, SqlAgent.id == cursor_id, is_template)
+                    .order_by(asc(SqlAgent.workspace_id != workspace_id))
+                    .limit(1)
                     .scalar_subquery()
                 )
+
+            if after:
+                sub = _cursor_created_at(after)
                 ts_cmp = SqlAgent.created_at < sub if is_desc else SqlAgent.created_at > sub
                 id_cmp = SqlAgent.id < after if is_desc else SqlAgent.id > after
                 stmt = stmt.where(or_(ts_cmp, and_(SqlAgent.created_at == sub, id_cmp)))
             if before:
-                sub = (
-                    select(SqlAgent.created_at)
-                    .where(in_workspace, SqlAgent.id == before, is_template)
-                    .scalar_subquery()
-                )
+                sub = _cursor_created_at(before)
                 ts_cmp = SqlAgent.created_at > sub if is_desc else SqlAgent.created_at < sub
                 id_cmp = SqlAgent.id > before if is_desc else SqlAgent.id < before
                 stmt = stmt.where(or_(ts_cmp, and_(SqlAgent.created_at == sub, id_cmp)))
@@ -242,9 +314,22 @@ class SqlAlchemyAgentStore(AgentStore):
                 limit + 1
             )
             rows = list(session.execute(stmt).scalars().all())
+            # Computed on the raw page so a post-filter drop below can only
+            # over-report (an extra short page), never truncate pagination.
             has_more = len(rows) > limit
-            if has_more:
-                rows = rows[:limit]
+            if workspace_id != DEFAULT_WORKSPACE_ID:
+                # Keep this workspace's own rows; keep default-workspace rows
+                # only when they are genuine built-ins (verified in Python —
+                # the name-derived id is a hash SQL can't compute). Multi-tenant
+                # deployments bind a workspace to every user request, so the
+                # default workspace holds only lifespan-seeded built-ins and
+                # this filter is a no-op there.
+                rows = [
+                    r
+                    for r in rows
+                    if r.workspace_id == workspace_id or _is_workspace_agnostic_builtin(r)
+                ]
+            rows = rows[:limit]
             entities = [sql_agent_to_entity(r) for r in rows]
             return PagedList(
                 data=entities,
@@ -274,7 +359,25 @@ class SqlAlchemyAgentStore(AgentStore):
                     SqlAgent.id.in_(agent_ids),
                 )
             ).all()
-            return {row.id: row.name for row in rows}
+            names = {row.id: row.name for row in rows}
+            missing = [i for i in agent_ids if i not in names]
+            if missing and current_workspace_id() != DEFAULT_WORKSPACE_ID:
+                # Sessions in any workspace may be bound to a built-in agent,
+                # whose row lives in the default workspace only.
+                fallback_rows = (
+                    session.execute(
+                        select(SqlAgent).where(
+                            SqlAgent.workspace_id == DEFAULT_WORKSPACE_ID,
+                            SqlAgent.id.in_(missing),
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                for row in fallback_rows:
+                    if _is_workspace_agnostic_builtin(row):
+                        names[row.id] = row.name
+            return names
 
     def update(
         self,

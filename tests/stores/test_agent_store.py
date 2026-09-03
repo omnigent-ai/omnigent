@@ -503,3 +503,171 @@ def test_session_scoped_agent_resolves_to_root_split_db(tmp_path: Path) -> None:
     fetched = agent_store.get(created.agent.id)
     assert fetched is not None
     assert fetched.session_id == mint_id
+
+
+# --- built-ins resolve from every workspace -------------------------------
+#
+# The server lifespan seeds built-in agents context-free, so their rows land
+# in the default workspace (0) only. A multi-tenant deployment binds a
+# non-default workspace per request; without a verified read-only fallback,
+# built-ins would be invisible there and no session could start at all.
+
+
+def _create_builtin(agent_store: SqlAlchemyAgentStore, name: str) -> str:
+    """Seed a genuine built-in the way the lifespan does (no workspace bound)."""
+    from omnigent.db.utils import builtin_agent_id
+
+    agent_id = builtin_agent_id(name)
+    agent_store.create(
+        agent_id=agent_id,
+        name=name,
+        bundle_location=f"{agent_id}/fakehash",
+    )
+    return agent_id
+
+
+def test_get_builtin_resolves_from_non_default_workspace(
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    from omnigent.db.db_models import workspace_scope
+
+    agent_id = _create_builtin(agent_store, "claude-native-ui")
+    with workspace_scope(2):
+        fetched = agent_store.get(agent_id)
+    assert fetched is not None
+    assert fetched.name == "claude-native-ui"
+
+
+def test_get_non_builtin_stays_workspace_isolated(
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """A user-created template (random id) must NOT leak across workspaces."""
+    from omnigent.db.db_models import workspace_scope
+
+    agent = agent_store.create(
+        agent_id="88089a8b5dd4eb29fe17d41b2b028cfb",
+        name="user-template",
+        bundle_location="ag_user/fakehash",
+    )
+    with workspace_scope(2):
+        assert agent_store.get(agent.id) is None
+
+
+def test_get_by_name_builtin_resolves_from_non_default_workspace(
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    from omnigent.db.db_models import workspace_scope
+
+    _create_builtin(agent_store, "codex-native-ui")
+    with workspace_scope(3):
+        fetched = agent_store.get_by_name("codex-native-ui")
+    assert fetched is not None
+    assert fetched.name == "codex-native-ui"
+
+
+def test_get_by_name_prefers_own_workspace_row(
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """A same-name template in the caller's workspace shadows the built-in."""
+    from omnigent.db.db_models import workspace_scope
+
+    _create_builtin(agent_store, "polly")
+    with workspace_scope(4):
+        own = agent_store.create(
+            agent_id="4b000000000000000000000000000001",
+            name="polly",
+            bundle_location="ag_ws4_polly/fakehash",
+        )
+        fetched = agent_store.get_by_name("polly")
+    assert fetched is not None
+    assert fetched.id == own.id
+
+
+def test_get_by_name_non_builtin_stays_workspace_isolated(
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    from omnigent.db.db_models import workspace_scope
+
+    agent_store.create(
+        agent_id="88089a8b5dd4eb29fe17d41b2b028cfc",
+        name="private-template",
+        bundle_location="ag_private/fakehash",
+    )
+    with workspace_scope(2):
+        assert agent_store.get_by_name("private-template") is None
+
+
+def test_list_includes_builtins_in_non_default_workspace(
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """The picker in a second workspace offers built-ins but not workspace-0
+    user templates."""
+    from omnigent.db.db_models import workspace_scope
+
+    builtin_id = _create_builtin(agent_store, "claude-native-ui")
+    agent_store.create(
+        agent_id="88089a8b5dd4eb29fe17d41b2b028cfd",
+        name="ws0-user-template",
+        bundle_location="ag_ws0_user/fakehash",
+    )
+    with workspace_scope(2):
+        own = agent_store.create(
+            agent_id="2b000000000000000000000000000001",
+            name="ws2-template",
+            bundle_location="ag_ws2/fakehash",
+        )
+        page = agent_store.list(limit=100, order="asc")
+    listed = {agent.id for agent in page.data}
+    assert builtin_id in listed
+    assert own.id in listed
+    assert "88089a8b5dd4eb29fe17d41b2b028cfd" not in listed
+
+
+def test_list_shadowed_builtin_returns_own_workspace_row_once(
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """A same-id row in the caller's workspace wins; no duplicate entries."""
+    from omnigent.db.db_models import workspace_scope
+
+    builtin_id = _create_builtin(agent_store, "claude-native-ui")
+    with workspace_scope(2):
+        agent_store.create(
+            agent_id=builtin_id,
+            name="claude-native-ui",
+            bundle_location="ag_ws2_shadow/fakehash",
+        )
+        page = agent_store.list(limit=100, order="asc")
+    matches = [agent for agent in page.data if agent.id == builtin_id]
+    assert len(matches) == 1
+    assert matches[0].bundle_location == "ag_ws2_shadow/fakehash"
+
+
+def test_get_names_resolves_builtins_from_non_default_workspace(
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    from omnigent.db.db_models import workspace_scope
+
+    builtin_id = _create_builtin(agent_store, "claude-native-ui")
+    with workspace_scope(2):
+        own = agent_store.create(
+            agent_id="2b000000000000000000000000000002",
+            name="ws2-own",
+            bundle_location="ag_ws2_own/fakehash",
+        )
+        names = agent_store.get_names([builtin_id, own.id])
+    assert names == {builtin_id: "claude-native-ui", own.id: "ws2-own"}
+
+
+def test_update_and_delete_do_not_cross_workspaces(
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """Built-ins are read-only outside their home workspace: no write fallback."""
+    from omnigent.db.db_models import workspace_scope
+
+    agent_id = _create_builtin(agent_store, "claude-native-ui")
+    with workspace_scope(2):
+        assert agent_store.update(agent_id, "ag_tampered/fakehash") is None
+        assert agent_store.delete(agent_id) is False
+    fetched = agent_store.get(agent_id)
+    assert fetched is not None
+    assert fetched.bundle_location.endswith("/fakehash")
