@@ -3322,9 +3322,7 @@ async def test_list_session_items_big_page_survives_bounded_read_backend(
         ],
     )
 
-    def _choke_on_oversized_reads(
-        conn, clauseelement, multiparams, params, execution_options
-    ):
+    def _choke_on_oversized_reads(conn, clauseelement, multiparams, params, execution_options):
         limit_clause = getattr(clauseelement, "_limit_clause", None)
         value = getattr(limit_clause, "value", None)
         if (

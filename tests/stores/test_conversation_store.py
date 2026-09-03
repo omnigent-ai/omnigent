@@ -1149,9 +1149,7 @@ def test_list_items_cursor_scoped_to_conversation(
     assert before_page.data == []
 
 
-def _captured_item_statement_limits(
-    store: SqlAlchemyConversationStore, run
-) -> list[int]:
+def _captured_item_statement_limits(store: SqlAlchemyConversationStore, run) -> list[int]:
     """
     Capture the LIMIT value of every ``conversation_items`` SELECT that
     ``run()`` sends to the database.
@@ -1178,9 +1176,7 @@ def _captured_item_statement_limits(
     return limits
 
 
-def _append_n_messages(
-    conversation_store: SqlAlchemyConversationStore, conv_id: str, n: int
-):
+def _append_n_messages(conversation_store: SqlAlchemyConversationStore, conv_id: str, n: int):
     """Helper: append ``n`` small messages and return the persisted items."""
     return conversation_store.append(
         conv_id,
