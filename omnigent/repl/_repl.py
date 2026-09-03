@@ -141,6 +141,9 @@ class _SessionSnapshot(Protocol):
     """
     Minimal snapshot shape returned by ``client.sessions``.
 
+    :param id: Session/conversation id the snapshot describes, e.g.
+        ``"conv_abc123"``. Lets a caller that already holds a snapshot
+        prove it names the session in hand before reusing it.
     :param agent_id: Durable agent id, e.g. ``"ag_abc123"``.
     :param agent_name: Human-readable name of the bound agent,
         e.g. ``"polly"``. Changes when the session is switched
@@ -160,6 +163,9 @@ class _SessionSnapshot(Protocol):
         or ``None`` when no task has completed yet. Used to seed the
         context-ring on resume without waiting for the first response.
     """
+
+    @property
+    def id(self) -> str: ...
 
     @property
     def agent_id(self) -> str: ...
@@ -1672,7 +1678,7 @@ class _SessionsChatReplAdapter:
         self._context_window = session.context_window
         self._last_total_tokens = session.last_total_tokens
 
-    async def _ensure_session(self) -> str:
+    async def _ensure_session(self, *, snapshot: _SessionSnapshot | None = None) -> str:
         """
         Lazily create the session and start the persistent stream.
 
@@ -1684,6 +1690,11 @@ class _SessionsChatReplAdapter:
         Set ``OMNIGENT_SESSIONS_ADAPTER_DEBUG=1`` to trace
         construction + per-event flow on stderr.
 
+        :param snapshot: An already-fetched snapshot of this adapter's
+            session, e.g. the one the resume path just read. Reused in
+            place of ``GET /v1/sessions/{id}`` when it names the same
+            session, which saves a full round trip on every startup
+            attach; ignored otherwise.
         :returns: The durable session id, e.g. ``"conv_abc123"``.
         """
         _dbg = bool(os.environ.get("OMNIGENT_SESSIONS_ADAPTER_DEBUG"))
@@ -1705,7 +1716,10 @@ class _SessionsChatReplAdapter:
                         file=sys.stderr,
                         flush=True,
                     )
-                session = await self._client.sessions.get(self._session_id)
+                if snapshot is not None and snapshot.id == self._session_id:
+                    session = snapshot
+                else:
+                    session = await self._client.sessions.get(self._session_id)
                 self._hydrate_from_session_snapshot(session)
             await self._bind_runner_if_needed()
             if self._stream_task is None:
@@ -5635,16 +5649,20 @@ async def _attach_to_conversation(
     # Fail loud on a bad session id: _list_all_conversation_items
     # silently falls back to the legacy items endpoint (which returns
     # [] for missing conversations), hiding the 404 until first send.
+    snapshot: _SessionSnapshot | None = None
     if hasattr(session, "session_id"):
-        await client.sessions.get(conversation_id)
+        snapshot = await client.sessions.get(conversation_id)
 
     # Eagerly bind THIS REPL's runner and start the SSE pump so
     # turns posted from the web UI / another client stream into the
     # local REPL right away — without this, they only surface after
     # the local user sends a message and triggers the lazy bind.
     # Idempotent: a later ``send()`` short-circuits in ``_ensure_session``.
+    # The probe above already holds the snapshot the adapter would
+    # otherwise re-fetch, so hand it over instead of paying a second
+    # round trip for the same document.
     if isinstance(session, _SessionsChatReplAdapter):
-        await session._ensure_session()
+        await session._ensure_session(snapshot=snapshot)
 
     items = await _list_all_conversation_items(client, conversation_id)
 
