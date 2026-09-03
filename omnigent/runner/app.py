@@ -2858,6 +2858,12 @@ def create_runner_app(
     def _has_active_work() -> bool:
         if _active_turns:
             return True
+        # Native harnesses publish ``running`` while terminal-owned work is
+        # active, including work that outlives the HTTP turn task. ``waiting``
+        # is the session-level turn-ended state; counting it here pins a
+        # suspendable provider's activity lease forever after a completed turn.
+        if any(status == "running" for status in _native_pane_status.values()):
+            return True
         if _has_live_async_tasks(_session_async_tasks):
             return True
         for timers in _session_timers.values():

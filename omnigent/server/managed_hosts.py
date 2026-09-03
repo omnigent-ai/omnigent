@@ -32,7 +32,7 @@ stores into ``create_app``):
    ``<data_dir>/config.yaml``)::
 
        sandbox:
-         # lakebox|modal|daytona|blaxel|boxlite|cwsandbox|islo|e2b|openshell|kubernetes
+         # lakebox|modal|daytona|sprites|blaxel|boxlite|cwsandbox|islo|e2b|openshell|kubernetes
          provider: modal
          server_url: https://omnigent.example.com
          # For SEVERAL providers, replace `provider:` with a `providers:`
@@ -73,6 +73,12 @@ stores into ``create_app``):
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES whose
                                              # values are injected as
                                              # sandbox env
+         sprites:                 # optional block (provider: sprites)
+           env: [ANTHROPIC_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
+           allow_control_plane_credentials: true  # required when env is non-empty
+           runtime: default       # optional: default|dev
+           install_spec: omnigent==0.11.0  # optional pip requirement
+           api_url: https://api.sprites.dev  # optional API override
          blaxel:                  # optional block (provider: blaxel)
            image: blaxel/omnigent-host:TAG  # optional fixed tag override
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES
@@ -108,7 +114,8 @@ stores into ``create_app``):
    (12-factor): the Modal launcher reads ``MODAL_TOKEN_ID`` /
    ``MODAL_TOKEN_SECRET`` (or ``~/.modal.toml``) and the Daytona
    launcher reads ``DAYTONA_API_KEY`` (plus optional
-   ``DAYTONA_API_URL`` / ``DAYTONA_TARGET``), and the Islo launcher
+   ``DAYTONA_API_URL`` / ``DAYTONA_TARGET``), the Sprites launcher reads
+   ``SPRITE_TOKEN`` (plus optional ``SPRITES_API_URL``), and the Islo launcher
    reads ``ISLO_API_KEY`` (plus optional ``ISLO_BASE_URL``) from the
    server process environment. The Blaxel launcher reads ``BL_WORKSPACE``
    and ``BL_API_KEY`` or the local ``bl login`` profile. The OpenShell
@@ -117,7 +124,7 @@ stores into ``create_app``):
    select`` (``$OPENSHELL_GATEWAY`` / ``~/.config/openshell/active_gateway``,
    or ``sandbox.openshell.cluster``), so the server process needs
    OpenShell gateway access. ``modal``, ``daytona``, ``blaxel``, ``cwsandbox``,
-   ``islo``, and ``openshell`` have managed-launch support; ``lakebox``
+   ``sprites``, ``islo``, and ``openshell`` have managed-launch support; ``lakebox``
    parses but rejects at launch.
 
 2. **Direct construction** (embedding deployments): build
@@ -173,6 +180,7 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
         "lakebox",
         "modal",
         "daytona",
+        "sprites",
         "blaxel",
         "boxlite",
         "cwsandbox",
@@ -186,6 +194,7 @@ PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
     {
         "modal",
         "daytona",
+        "sprites",
         "blaxel",
         "boxlite",
         "cwsandbox",
@@ -220,6 +229,10 @@ MODAL_MANAGED_TOKEN_TTL_S = 25 * 3600
 # session past 7 days going through the dead-host relaunch path) mints
 # a fresh token.
 DAYTONA_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+# Sprites preserve their filesystem and service definitions across warm/cold
+# transitions. Each resume mints and installs a fresh host token.
+SPRITES_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
 # The blaxel launch-token TTL is NOT a constant: Blaxel reaps a sandbox at its
 # configured max age (sandbox.blaxel.ttl, 24h by default), so the TTL is derived
@@ -838,6 +851,30 @@ def _modal_launcher_factory(
     return _build
 
 
+def _sprites_launcher_factory(
+    *,
+    api_url: str | None,
+    env: list[str] | None,
+    allow_control_plane_credentials: bool,
+    runtime: str | None,
+    install_spec: str | None,
+) -> Callable[[], SandboxHostLauncher]:
+    """Build the launcher factory for the YAML ``provider: sprites`` path."""
+
+    def _build() -> SandboxHostLauncher:
+        from omnigent.onboarding.sandboxes.sprites import SpritesSandboxLauncher
+
+        return SpritesSandboxLauncher(
+            api_url=api_url,
+            env=env,
+            allow_control_plane_credentials=allow_control_plane_credentials,
+            runtime=runtime,
+            install_spec=install_spec,
+        )
+
+    return _build
+
+
 def _community_sandbox_providers() -> frozenset[str]:
     """Provider names contributed by packages, excluding every built-in.
 
@@ -1157,6 +1194,39 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             _parse_daytona_image(raw), _parse_daytona_env(raw)
         )
         token_ttl_s = DAYTONA_MANAGED_TOKEN_TTL_S
+    elif provider == "sprites":
+        section = _parse_provider_section(raw, "sprites")
+        if section is not None:
+            _reject_unknown_keys(
+                section,
+                {
+                    "api_url",
+                    "env",
+                    "allow_control_plane_credentials",
+                    "runtime",
+                    "install_spec",
+                },
+                "sandbox.sprites",
+            )
+        sprites_env = _parse_provider_env(raw, "sprites")
+        allow_control_plane_credentials = (
+            _parse_provider_bool(raw, "sprites", "allow_control_plane_credentials") or False
+        )
+        if sprites_env and not allow_control_plane_credentials:
+            raise ValueError(
+                "server config 'sandbox.sprites.env' sends credential values through "
+                "the Sprites control plane; set "
+                "'sandbox.sprites.allow_control_plane_credentials: true' to acknowledge "
+                "that boundary, or remove 'sandbox.sprites.env'"
+            )
+        launcher_factory = _sprites_launcher_factory(
+            api_url=_parse_provider_string(raw, "sprites", "api_url"),
+            env=sprites_env,
+            allow_control_plane_credentials=allow_control_plane_credentials,
+            runtime=_parse_sprites_runtime(raw),
+            install_spec=_parse_provider_string(raw, "sprites", "install_spec"),
+        )
+        token_ttl_s = SPRITES_MANAGED_TOKEN_TTL_S
     elif provider == "blaxel":
         from omnigent.onboarding.sandboxes.blaxel import managed_token_ttl_s
 
@@ -2094,6 +2164,14 @@ def _parse_provider_string(raw: dict[str, object], provider: str, key: str) -> s
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"server config 'sandbox.{provider}.{key}' must be a non-empty string")
     return value.strip()
+
+
+def _parse_sprites_runtime(raw: dict[str, object]) -> str | None:
+    """Extract and validate the optional Sprites runtime channel."""
+    runtime = _parse_provider_string(raw, "sprites", "runtime")
+    if runtime is not None and runtime not in {"default", "dev"}:
+        raise ValueError("server config 'sandbox.sprites.runtime' must be 'default' or 'dev'")
+    return runtime
 
 
 def _parse_provider_positive_int(raw: dict[str, object], provider: str, key: str) -> int | None:

@@ -84,6 +84,9 @@ deploy/
 ├── blaxel/            ← Blaxel sandbox-provider guide + managed-host config;
 │   └── README.md         NOT a server deploy target.
 │
+├── sprites/           ← Sprites managed sandbox-provider guide (persistent
+│   └── README.md         filesystem + native bootstrap); NOT a server target.
+│
 ├── islo/              ← Islo sandbox-provider guide (gateway credential
 │   └── README.md         injection); NOT a server deploy target.
 │
@@ -281,7 +284,7 @@ omnigent sandbox connect --provider modal --sandbox-id <id> --server https://you
 > rather than a registry image — build it once first; see
 > [`e2b/README.md`](e2b/README.md).
 
-**Server-managed (Modal, Daytona, Blaxel, Islo, or E2B).** With *managed hosts*, creating a
+**Server-managed (Modal, Daytona, Sprites, Blaxel, Islo, or E2B).** With *managed hosts*, creating a
 session with `"host_type": "managed"` (e.g.
 `POST /v1/sessions {"agent_id": ..., "host_type": "managed"}`) makes the
 server provision a sandbox, start a host in it, and run the session there.
@@ -297,7 +300,7 @@ sandbox:
 
 Modal credentials come from the server's environment (`MODAL_TOKEN_ID` /
 `MODAL_TOKEN_SECRET`, or a mounted `~/.modal.toml`), not the config file.
-Daytona reads `DAYTONA_API_KEY`. Blaxel reads `BL_WORKSPACE` and `BL_API_KEY`. Islo reads `ISLO_API_KEY` and optional `ISLO_BASE_URL`. E2B reads `E2B_API_KEY` from the server environment.
+Daytona reads `DAYTONA_API_KEY`. Sprites reads `SPRITE_TOKEN`. Blaxel reads `BL_WORKSPACE` and `BL_API_KEY`. Islo reads `ISLO_API_KEY` and optional `ISLO_BASE_URL`. E2B reads `E2B_API_KEY` from the server environment.
 Each sandbox authenticates back with a server-minted, per-launch token, so
 no user credentials ever enter the sandbox.
 
@@ -318,6 +321,12 @@ sandbox:
 ```
 
 For private registries, set `OMNIGENT_MODAL_REGISTRY_SECRET` on the server to the name of a Modal secret holding `REGISTRY_USERNAME` and `REGISTRY_PASSWORD`. For CLI-launched sandboxes, `OMNIGENT_MODAL_HOST_IMAGE`, `OMNIGENT_DAYTONA_HOST_IMAGE`, `OMNIGENT_BLAXEL_HOST_IMAGE`, or `OMNIGENT_ISLO_HOST_IMAGE` overrides the image.
+
+Sprites are the exception: they do not accept a caller-supplied container
+image. Their persistent Ubuntu filesystem is bootstrapped once with OS tools,
+an isolated Omnigent install, and the coding-harness CLIs, then reused across
+wakes. See the [Sprites guide](sprites/README.md#why-there-is-no-custom-image)
+for the `install_spec` workflow and first-launch tradeoff.
 
 **LLM credentials for managed sessions.** A fresh sandbox has no API keys.
 Park your provider credentials in a [Modal secret](https://modal.com/secrets)
@@ -345,7 +354,7 @@ sandbox:
     secrets: [omnigent-llm]
 ```
 
-For Daytona, Blaxel, and Islo, list server environment variable names under `sandbox.daytona.env`, `sandbox.blaxel.env`, or `sandbox.islo.env`. The launcher copies the current server values into each sandbox:
+For Daytona, Sprites, Blaxel, and Islo, list server environment variable names under the provider's `env` block. The launcher copies the current server values into each sandbox:
 
 ```yaml
 sandbox:
@@ -370,7 +379,7 @@ a Modal secret (GitLab: add `GIT_USERNAME=oauth2`). The host image's git
 credential helper picks it up for the clone and for the agent's later
 fetch/push.
 
-See the [`modal`](modal/README.md), [`daytona`](daytona/README.md), [`blaxel`](blaxel/README.md), and [`islo`](islo/README.md) guides for provider setup and troubleshooting.
+See the [`modal`](modal/README.md), [`daytona`](daytona/README.md), [`sprites`](sprites/README.md), [`blaxel`](blaxel/README.md), and [`islo`](islo/README.md) guides for provider setup and troubleshooting.
 
 ## Auth
 

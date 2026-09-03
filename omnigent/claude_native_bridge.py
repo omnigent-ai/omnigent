@@ -75,6 +75,8 @@ from omnigent.tools.base import Tool, ToolContext
 
 _logger = logging.getLogger(__name__)
 
+CLAUDE_BYPASS_WARNING_ACCEPT_ENV_VAR = "OMNIGENT_CLAUDE_AUTO_ACCEPT_BYPASS_WARNING"
+_SANDBOX_ENV_VAR = "IS_SANDBOX"
 BRIDGE_DIR_ENV_VAR = "HARNESS_CLAUDE_NATIVE_BRIDGE_DIR"
 REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CLAUDE_NATIVE_REQUEST_SESSION_ID"
 BRIDGE_ID_LABEL_KEY = "omnigent.claude_native.bridge_id"
@@ -1428,10 +1430,10 @@ def build_hook_settings(
     api_key_helper: str | None = None,
     launch_model: str | None = None,
     launch_permission_mode: str | None = None,
-    launch_bypass_permissions: bool = False,
     launch_effort: str | None = None,
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
+    accept_bypass_permissions_warning: bool = False,
 ) -> _JsonObject:
     """
     Build invocation-local Claude Code hook settings.
@@ -1458,11 +1460,6 @@ def build_hook_settings(
     :param launch_permission_mode: Effective launch permission mode from
         ``--permission-mode``. Mirrored into ``permissions.defaultMode``
         for the same re-exec hardening.
-    :param launch_bypass_permissions: ``True`` when this launch requests
-        bypass mode (``--dangerously-skip-permissions`` or
-        ``--permission-mode bypassPermissions``), which sets
-        ``skipDangerousModePermissionPrompt`` so the one-time acceptance
-        dialog never blocks a host-spawned terminal.
     :param launch_effort: Effective launch effort from ``--effort``.
         Mirrored into ``effortLevel`` for restart/re-exec parity.
     :param subagent_router_dir: Directory where the runner advertises its
@@ -1475,6 +1472,10 @@ def build_hook_settings(
         routing round trip (25s worst case on a degraded server) in front of
         every prompt of every native session, to be told every time that the
         session does not route.
+    :param accept_bypass_permissions_warning: Allow the invocation settings
+        to acknowledge Claude Code's one-time dangerous-mode warning. The
+        setting is emitted only when the effective launch mode is exactly
+        ``bypassPermissions``.
     :returns: JSON-serializable Claude settings fragment.
     """
     python = python_executable or sys.executable
@@ -1716,13 +1717,7 @@ def build_hook_settings(
         settings["model"] = launch_model
     if launch_permission_mode:
         settings["permissions"] = {"defaultMode": launch_permission_mode}
-    if launch_bypass_permissions:
-        # Bypass mode shows a one-time "Bypass Permissions mode" acceptance
-        # dialog. Like the trust/onboarding gates it fires no
-        # PermissionRequest hook, so a host-spawned terminal has nobody to
-        # answer it and the session hangs with a blank web UI. Claude checks
-        # the org policy (``disableBypassPermissionsMode``) BEFORE this
-        # consent gate, so a managed host still strips bypass regardless.
+    if accept_bypass_permissions_warning and launch_permission_mode == "bypassPermissions":
         settings["skipDangerousModePermissionPrompt"] = True
     if launch_effort and launch_effort in CLAUDE_EFFORTS:
         settings["effortLevel"] = launch_effort
@@ -1824,6 +1819,7 @@ def augment_claude_args(
     allowed_tools: tuple[str, ...] = (),
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
+    accept_bypass_permissions_warning: bool = False,
 ) -> list[str]:
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
@@ -1872,6 +1868,9 @@ def augment_claude_args(
         Routing on, threaded to :func:`build_hook_settings` so the
         ``UserPromptSubmit`` first-message routing hook is registered.
         ``False`` keeps every prompt off the routing round trip.
+    :param accept_bypass_permissions_warning: Explicit sandbox-launcher opt-in
+        for Claude Code's one-time dangerous-mode warning. Non-bypass launches
+        ignore it.
     :returns: Augmented argument list for the terminal resource.
     """
     mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
@@ -1883,10 +1882,10 @@ def augment_claude_args(
         api_key_helper=api_key_helper,
         launch_model=_arg_value(claude_args, "--model"),
         launch_permission_mode=_arg_value(claude_args, "--permission-mode"),
-        launch_bypass_permissions=_args_request_bypass_permissions(claude_args),
         launch_effort=_arg_value(claude_args, "--effort"),
         subagent_router_dir=subagent_router_dir,
         turn_routing=turn_routing,
+        accept_bypass_permissions_warning=accept_bypass_permissions_warning,
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)
@@ -1915,6 +1914,24 @@ def augment_claude_args(
     return args
 
 
+def sandbox_bypass_warning_acceptance_enabled(
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    """Return whether this process explicitly permits warning acceptance.
+
+    A generic sandbox marker is insufficient by itself. The sandbox launcher
+    must also opt in through the dedicated Claude setting.
+
+    :param environ: Environment mapping; ``None`` reads :data:`os.environ`.
+    :returns: ``True`` only when both gates are exactly ``"1"``.
+    """
+    values = os.environ if environ is None else environ
+    return (
+        values.get(_SANDBOX_ENV_VAR) == "1"
+        and values.get(CLAUDE_BYPASS_WARNING_ACCEPT_ENV_VAR) == "1"
+    )
+
+
 def _arg_value(args: tuple[str, ...], flag: str) -> str | None:
     """Return the effective CLI flag value from ``args``.
 
@@ -1939,21 +1956,6 @@ def _arg_value(args: tuple[str, ...], flag: str) -> str | None:
             if candidate and not candidate.startswith("--"):
                 value = candidate
     return value
-
-
-def _args_request_bypass_permissions(args: tuple[str, ...]) -> bool:
-    """Return whether ``args`` launch Claude Code in bypass-permissions mode.
-
-    Both spellings count: the standalone ``--dangerously-skip-permissions``
-    flag, and ``--permission-mode bypassPermissions`` (the form
-    ``permission_mode: bypassPermissions`` in a worker bundle becomes).
-
-    :param args: Claude CLI args, e.g. ``("--dangerously-skip-permissions",)``.
-    :returns: ``True`` when this launch requests bypass mode.
-    """
-    return "--dangerously-skip-permissions" in args or (
-        _arg_value(args, "--permission-mode") == "bypassPermissions"
-    )
 
 
 def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
