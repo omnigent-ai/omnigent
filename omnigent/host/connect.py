@@ -549,6 +549,13 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # auth, which fails for non-AWS proxies. Same rationale as
         # CLAUDE_CODE_USE_BEDROCK above. Safe to propagate: not a secret.
         "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+        # Claude Code's telemetry opt-in: a non-secret boolean the claude-sdk
+        # harness reads to export claude_code.* metrics/events. Must survive
+        # the CLI→daemon→runner env strips alongside its OTEL_* exporter
+        # config (prefix allowlist) and OMNIGENT_TELEMETRY_ENABLED below —
+        # otherwise a background daemon silently disables Claude Code
+        # telemetry that a foreground run exports fine.
+        "CLAUDE_CODE_ENABLE_TELEMETRY",
         # Non-secret Claude Code flags the native-claude provider path reads from
         # os.environ. If stripped, the runner re-adds CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1,
         # which turns off MCP tool search and loads every tool schema eagerly.
