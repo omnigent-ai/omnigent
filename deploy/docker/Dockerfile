@@ -120,6 +120,9 @@ COPY omnigent/ ./omnigent/
 # symlink resolves at boot; without it the new-session picker silently drops
 # polly (the seeder skips it when its bundle is absent). ~120K of YAML.
 COPY examples/ ./examples/
+# setup.py's _bundle_scripts copies this into omnigent/resources/scripts/
+# and aborts the build when it's absent (`omnigent uninstall` needs it).
+COPY scripts/uninstall_oss.sh ./scripts/uninstall_oss.sh
 
 # Standalone venv we can copy out as a single directory. VIRTUAL_ENV
 # tells uv to install into this venv (not the slim image's system
