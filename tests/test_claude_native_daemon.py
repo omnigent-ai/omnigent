@@ -179,6 +179,145 @@ async def test_launch_or_reuse_daemon_runner_fresh_skips_session_get() -> None:
     assert gets == []
 
 
+async def test_wait_online_reuse_asks_status_once() -> None:
+    """
+    Guaranteeing online costs no extra request on the reuse path.
+
+    The reuse check and the online wait poll the same
+    ``GET /v1/runners/{id}/status``, milliseconds apart, so asking twice was
+    a wasted round trip on every resume into a live session.
+    """
+    status_probes: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Serve a live-runner snapshot and count status probes."""
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_a":
+            return httpx.Response(200, json={"runner_id": "runner_live"})
+        if request.method == "GET" and path == "/v1/runners/runner_live/status":
+            status_probes.append(path)
+            return httpx.Response(200, json={"runner_id": "runner_live", "online": True})
+        return httpx.Response(404, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://e.com"
+    ) as client:
+        runner_id = await daemon_launch.launch_or_reuse_daemon_runner(
+            client,
+            host_id="host_1",
+            session_id="conv_a",
+            workspace="/w",
+            wait_online_timeout_s=60.0,
+        )
+
+    assert runner_id == "runner_live"
+    assert len(status_probes) == 1
+
+
+async def test_wait_online_launch_path_waits_for_the_tunnel() -> None:
+    """A freshly launched runner is polled until its tunnel registers."""
+    polls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Report the new runner offline once, then online."""
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_a":
+            return httpx.Response(200, json={})
+        if request.method == "POST" and path == "/v1/hosts/host_1/runners":
+            return httpx.Response(200, json={"runner_id": "runner_new", "status": "launching"})
+        if request.method == "GET" and path == "/v1/runners/runner_new/status":
+            polls["n"] += 1
+            return httpx.Response(200, json={"runner_id": "runner_new", "online": polls["n"] > 1})
+        return httpx.Response(404, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://e.com"
+    ) as client:
+        runner_id = await daemon_launch.launch_or_reuse_daemon_runner(
+            client,
+            host_id="host_1",
+            session_id="conv_a",
+            workspace="/w",
+            wait_online_timeout_s=60.0,
+        )
+
+    assert runner_id == "runner_new"
+    assert polls["n"] >= 2  # returned only once the tunnel was up
+
+
+async def test_wait_online_relaunches_a_runner_the_registry_calls_dead() -> None:
+    """
+    A runner the status endpoint reports offline is relaunched, not reused.
+
+    ``GET /v1/sessions/{id}``'s ``runner_online`` is a superset of this:
+    it also reads ``True`` from a fresh ``runner_last_seen`` stamp for up to
+    ``RUNNER_LIVENESS_TTL_S`` after an ungraceful death (see
+    ``test_health_derives_runner_online_from_fresh_row_stamp``). Deciding
+    reuse from the snapshot would strand a resume on a dead runner until the
+    online wait timed out, so the reuse check stays on the registry.
+    """
+    events: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Snapshot claims the runner is live; the registry says otherwise."""
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_a":
+            # Exactly the post-crash divergence: a stale-but-fresh stamp.
+            return httpx.Response(200, json={"runner_id": "runner_dead", "runner_online": True})
+        if request.method == "GET" and path == "/v1/runners/runner_dead/status":
+            return httpx.Response(200, json={"runner_id": "runner_dead", "online": False})
+        if request.method == "PATCH" and path == "/v1/sessions/conv_a":
+            events.append("clear")
+            return httpx.Response(200, json={})
+        if request.method == "POST" and path == "/v1/hosts/host_1/runners":
+            events.append("launch")
+            return httpx.Response(200, json={"runner_id": "runner_fresh"})
+        if request.method == "GET" and path == "/v1/runners/runner_fresh/status":
+            return httpx.Response(200, json={"runner_id": "runner_fresh", "online": True})
+        return httpx.Response(404, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://e.com"
+    ) as client:
+        runner_id = await daemon_launch.launch_or_reuse_daemon_runner(
+            client,
+            host_id="host_1",
+            session_id="conv_a",
+            workspace="/w",
+            wait_online_timeout_s=60.0,
+        )
+
+    assert runner_id == "runner_fresh"
+    assert events == ["clear", "launch"]
+
+
+async def test_default_still_returns_before_the_runner_is_online() -> None:
+    """Without the new argument the historical contract is unchanged."""
+    polls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Serve the launch and record any status poll."""
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_a":
+            return httpx.Response(200, json={})
+        if request.method == "POST" and path == "/v1/hosts/host_1/runners":
+            return httpx.Response(200, json={"runner_id": "runner_new"})
+        if request.method == "GET" and path.endswith("/status"):
+            polls.append(path)
+            return httpx.Response(200, json={"runner_id": "runner_new", "online": False})
+        return httpx.Response(404, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://e.com"
+    ) as client:
+        runner_id = await daemon_launch.launch_or_reuse_daemon_runner(
+            client, host_id="host_1", session_id="conv_a", workspace="/w"
+        )
+
+    assert runner_id == "runner_new"
+    assert polls == []  # the caller still owns the wait
+
+
 async def test_create_claude_session_persists_terminal_launch_args() -> None:
     """
     The daemon-flow create persists pass-through args and omits the

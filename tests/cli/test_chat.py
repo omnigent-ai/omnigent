@@ -15,6 +15,7 @@ from omnigent_client import QueryResult
 
 import omnigent.chat as chat_module
 from omnigent.chat import (
+    _DAEMON_CHAT_RUNNER_ONLINE_TIMEOUT_S,
     _SERVER_READY_BACKOFF_POLL_SECONDS,
     _SERVER_READY_FAST_POLL_WINDOW_SECONDS,
     _SERVER_READY_INITIAL_POLL_SECONDS,
@@ -1301,9 +1302,18 @@ def _patch_daemon_launch(monkeypatch: pytest.MonkeyPatch, captured: dict[str, ob
         return None
 
     async def _fake_launch(
-        client: object, *, host_id: str, session_id: str, workspace: str, fresh: bool = False
+        client: object,
+        *,
+        host_id: str,
+        session_id: str,
+        workspace: str,
+        fresh: bool = False,
+        wait_online_timeout_s: float | None = None,
     ) -> str:
         captured["launch"] = {"host_id": host_id, "session_id": session_id, "workspace": workspace}
+        # The chat path asks the helper to guarantee the runner is online
+        # rather than re-polling the status endpoint itself.
+        captured["launch_wait_online_timeout_s"] = wait_online_timeout_s
         return "runner_daemon"
 
     async def _no_runner_wait(client: object, runner_id: str, *, timeout_s: float) -> None:
@@ -1348,6 +1358,10 @@ def test_prepare_chat_session_via_daemon_creates_fresh_and_launches(
         "session_id": "conv_created",
         "workspace": "/tmp/proj",
     }
+    # The helper owns the online wait, so the chat path must pass its budget —
+    # otherwise the returned runner isn't guaranteed registered and the
+    # bind PATCH below would 400 on an unregistered runner id.
+    assert captured["launch_wait_online_timeout_s"] == _DAEMON_CHAT_RUNNER_ONLINE_TIMEOUT_S
 
 
 def test_prepare_chat_session_via_daemon_resume_skips_create(

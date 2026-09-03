@@ -1691,7 +1691,6 @@ async def _prepare_chat_session_via_daemon(
         launch_or_reuse_daemon_runner,
         open_daemon_client,
         wait_for_host_online,
-        wait_for_runner_online,
     )
     from omnigent.native_terminal import bind_session_runner
 
@@ -1742,20 +1741,21 @@ async def _prepare_chat_session_via_daemon(
             # Record the session's host so its turn/resource/stream traffic reaches
             # the replica holding the host's runner tunnel.
             set_session_host(session_id, host_id)
+            # ``wait_online_timeout_s`` folds in the online wait, so a resume
+            # into a live session does not re-ask the status endpoint what the
+            # reuse check just answered.
             runner_id = await launch_or_reuse_daemon_runner(
                 client,
                 host_id=host_id,
                 session_id=session_id,
                 workspace=workspace,
                 fresh=fresh_session,
-            )
-            await wait_for_runner_online(
-                client, runner_id, timeout_s=_DAEMON_CHAT_RUNNER_ONLINE_TIMEOUT_S
+                wait_online_timeout_s=_DAEMON_CHAT_RUNNER_ONLINE_TIMEOUT_S,
             )
             # launch_or_reuse_daemon_runner's atomic-bind / online-reuse paths
             # don't pass through replace_runner_id, so re-bind via PATCH to
             # clear the ``omnigent.stopped`` marker on resumed sessions. Must run
-            # AFTER wait_for_runner_online — a freshly launched runner isn't
+            # AFTER the runner is online — a freshly launched runner isn't
             # registered until then, and replace_runner_id 400s on an unregistered id.
             await bind_session_runner(client, session_id, runner_id)
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError) as exc:
