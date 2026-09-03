@@ -17,6 +17,7 @@ import pytest
 from omnigent.entities import Conversation, ConversationItem
 from omnigent.entities.agent import Agent, LoadedAgent
 from omnigent.entities.conversation import FunctionCallData
+from omnigent.entities.policy import Policy as StoredPolicy
 from omnigent.policies.types import PolicyAction, PolicyResult
 from omnigent.server.routes.sessions import (
     _build_evaluation_context,
@@ -210,6 +211,7 @@ _CACHE_PATCH = "omnigent.server.routes.sessions.get_agent_cache"
 _ENGINE_PATCH = "omnigent.server.routes.sessions.build_policy_engine"
 _HOLD_GATE_PATCH = "omnigent.server.routes.sessions._hold_native_ask_gate"
 _STREAM_PATCH = "omnigent.server.routes.sessions.session_stream"
+_TREE_PATCH = "omnigent.runtime.policies.builder.load_verified_session_tree"
 
 
 @pytest.mark.asyncio
@@ -448,19 +450,29 @@ def _make_user_message_body(
 
 
 def _make_spec_with_guardrails() -> AgentSpec:
-    """Build an AgentSpec with a guardrails block (but no policies).
+    """Build an AgentSpec declaring one guardrail policy.
 
-    The presence of ``guardrails`` triggers policy engine
-    construction; the empty policy list means ALLOW by default.
+    A policy must actually be declared: with none, the input gate
+    short-circuits via ``any_policies_apply`` and never builds an engine,
+    so a test that stubs the engine would assert on a code path the
+    request never reaches.
 
-    :returns: AgentSpec with guardrails enabled.
+    :returns: AgentSpec with one function policy declared.
     """
-    from omnigent.spec.types import GuardrailsSpec
+    from omnigent.spec.types import FunctionPolicySpec, FunctionRef, GuardrailsSpec
 
     return AgentSpec(
         spec_version=1,
         name="test-agent",
-        guardrails=GuardrailsSpec(),
+        guardrails=GuardrailsSpec(
+            policies=[
+                FunctionPolicySpec(
+                    name="test_policy",
+                    on=None,
+                    function=FunctionRef(path="tests.fake.policy"),
+                )
+            ]
+        ),
     )
 
 
@@ -638,6 +650,175 @@ async def test_input_no_guardrails_skips_policy():
         )
 
     assert result is None
+
+
+@dataclass
+class _FakePolicyStore:
+    """Minimal policy store for the input-gate fast-path tests.
+
+    :param session_policies: Rows returned for ``list_for_session``.
+    :param default_policies: Rows returned for ``list_defaults``.
+    """
+
+    session_policies: list[StoredPolicy] = field(default_factory=list)
+    default_policies: list[StoredPolicy] = field(default_factory=list)
+
+    def list_for_session(self, session_id: str) -> list[StoredPolicy]:
+        """Return this session's stored policies.
+
+        :param session_id: Session id, e.g. ``"sess_1"``.
+        :returns: The configured session rows.
+        """
+        return list(self.session_policies)
+
+    def list_defaults(self) -> list[StoredPolicy]:
+        """Return server-wide default policies.
+
+        :returns: The configured default rows.
+        """
+        return list(self.default_policies)
+
+
+def _make_stored_policy(name: str, session_id: str | None) -> StoredPolicy:
+    """Build an enabled python-handler stored policy row.
+
+    :param name: Policy name, e.g. ``"deny_pii"``.
+    :param session_id: Owning session, or ``None`` for a default policy.
+    :returns: A :class:`Policy` entity the builder can convert to a spec.
+    """
+    return StoredPolicy(
+        id=f"pol_{name}",
+        name=name,
+        session_id=session_id,
+        scope="session" if session_id else "default",
+        created_at=1,
+        type="python",
+        handler="tests.fake.policy",
+    )
+
+
+@pytest.fixture
+def policy_store(monkeypatch: pytest.MonkeyPatch):
+    """Install an empty policy store and reset the builder's spec caches.
+
+    A store is always configured in a real deployment, so these tests must
+    run with one bound; the module-level spec caches are process-wide, so
+    they are cleared on entry and exit to keep the tests hermetic.
+
+    :param monkeypatch: pytest patcher, used to bind the runtime global.
+    :returns: The installed :class:`_FakePolicyStore`.
+    """
+    store = _FakePolicyStore()
+    monkeypatch.setattr("omnigent.runtime._globals._policy_store", store)
+    _clear_policy_spec_caches()
+    yield store
+    _clear_policy_spec_caches()
+
+
+def _clear_policy_spec_caches() -> None:
+    """Evict the builder's default/session policy-spec caches."""
+    from omnigent.runtime.policies.builder import (
+        invalidate_default_policy_specs_cache,
+        invalidate_session_policy_specs_cache,
+    )
+
+    invalidate_default_policy_specs_cache()
+    invalidate_session_policy_specs_cache("sess_1")
+
+
+@pytest.mark.asyncio
+async def test_input_no_policies_skips_engine_and_tree_scan(policy_store):
+    """A configured-but-empty policy store must not build an engine.
+
+    The gate used to skip only when ``get_policy_store() is None`` — never
+    true in a real deployment — so every user message built an engine and
+    paid its O(spawn-tree) scan even with zero policies anywhere.
+    """
+    conv_store = _FakeConversationStore()
+    agent_store = _FakeAgentStore(agent=_make_agent())
+    conv = conv_store.get_conversation("sess_1")
+    body = _make_user_message_body()
+
+    loaded = LoadedAgent(spec=_make_spec_no_guardrails(), workdir="/tmp/fake")
+
+    with (
+        patch(_CACHE_PATCH) as mock_cache,
+        patch(_ENGINE_PATCH) as mock_build,
+        patch(_TREE_PATCH) as mock_tree,
+    ):
+        mock_cache.return_value.load.return_value = loaded
+        result = await _evaluate_input_policy(
+            _FakeRequest(),
+            "sess_1",
+            conv,
+            body,
+            conv_store,
+            agent_store,
+            None,
+        )
+
+    assert result is None
+    mock_build.assert_not_called()
+    mock_tree.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_input_policy_added_mid_session_is_enforced(policy_store):
+    """A policy created after the session is live still gates the next message.
+
+    Guards the fast path against caching a stale "no policies" verdict: the
+    first message legitimately skips, and once a session policy exists (with
+    the store's cache invalidated, as the CRUD routes do) the very next
+    message must reach the engine and be denied.
+    """
+    conv_store = _FakeConversationStore()
+    agent_store = _FakeAgentStore(agent=_make_agent())
+    conv = conv_store.get_conversation("sess_1")
+    body = _make_user_message_body()
+
+    loaded = LoadedAgent(spec=_make_spec_no_guardrails(), workdir="/tmp/fake")
+    deny_result = PolicyResult(action=PolicyAction.DENY, reason="Denied mid-session")
+
+    async def _eval(_ctx: Any) -> PolicyResult:
+        return deny_result
+
+    async def _evaluate_once() -> tuple[dict[str, Any] | None, bool]:
+        """Run the input gate once against the current store contents.
+
+        :returns: ``(verdict, engine_was_built)`` — the verdict dict (or
+            ``None`` on allow/skip) and whether an engine was constructed.
+        """
+        with (
+            patch(_CACHE_PATCH) as mock_cache,
+            patch(_ENGINE_PATCH) as mock_build,
+        ):
+            mock_cache.return_value.load.return_value = loaded
+            mock_engine = mock_build.return_value
+            mock_engine.evaluate = _eval
+            mock_engine.apply_label_writes = lambda x: None
+            verdict = await _evaluate_input_policy(
+                _FakeRequest(),
+                "sess_1",
+                conv,
+                body,
+                conv_store,
+                agent_store,
+                None,
+            )
+            return verdict, mock_build.called
+
+    # No policies yet: the message is allowed without an engine build.
+    assert await _evaluate_once() == (None, False)
+
+    # A policy is added mid-session, exactly as POST /sessions/{id}/policies does.
+    policy_store.session_policies.append(_make_stored_policy("deny_all", "sess_1"))
+    _clear_policy_spec_caches()
+
+    verdict, built = await _evaluate_once()
+    assert built is True
+    assert verdict is not None
+    assert verdict["verdict"] == "deny"
+    assert verdict["reason"] == "Denied mid-session"
 
 
 @pytest.mark.asyncio

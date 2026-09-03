@@ -22,6 +22,7 @@ from omnigent.runtime.policies.builder import (
     _load_default_policy_specs,
     _load_session_policy_specs,
     _stored_policy_to_spec,
+    any_policies_apply,
     build_policy_engine,
     invalidate_default_policy_specs_cache,
     invalidate_session_policy_specs_cache,
@@ -31,6 +32,7 @@ from omnigent.spec.types import (
     FunctionPolicySpec,
     FunctionRef,
     GuardrailsSpec,
+    Phase,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -403,6 +405,56 @@ def test_subagent_inherits_root_session_policies(db_uri: str) -> None:
     assert "root_guard" in names, f"root session policy not inherited by sub-agent; got {names}"
     # Root policy should come before the ask_on_add_policy sentinel.
     assert names.index("root_guard") < names.index("__ask_on_add_policy")
+
+
+def test_any_policies_apply_sees_the_root_policy_a_subagent_inherits(db_uri: str) -> None:
+    """The fast-path check must agree with the engine about inherited policies.
+
+    ``any_policies_apply`` gates whether the engine is built at all, so a
+    sub-agent whose only applicable policy lives on the root must still report
+    ``True``. Reporting ``False`` here silently disables a guardrail the parent
+    session configured — a fail-open, not a slow path.
+
+    :param db_uri: Per-test SQLite URI.
+    """
+    handler = "tests.resources.examples._shared.tool_functions.block_long_sleep"
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    root_conv = conv_store.create_conversation()
+    child_conv = conv_store.create_conversation(
+        parent_conversation_id=root_conv.id,
+        kind="sub_agent",
+    )
+
+    policy_store = SqlAlchemyPolicyStore(db_uri)
+    policy_store.create(
+        policy_id="c6de31de238a26c347a7c3d8d5a74c3a",
+        session_id=root_conv.id,
+        name="root_guard",
+        type="python",
+        handler=handler,
+    )
+
+    child = conv_store.get_conversation(child_conv.id)
+    assert child is not None
+
+    # The engine the check stands in for does carry the inherited policy.
+    engine = build_policy_engine(
+        spec=_make_minimal_spec(),
+        conversation_id=child_conv.id,
+        conversation_store=conv_store,
+        policy_store=policy_store,
+    )
+    assert "root_guard" in [p.spec.name for p in engine.policies]
+
+    assert any_policies_apply(
+        spec=_make_minimal_spec(),
+        conversation_id=child_conv.id,
+        default_policies=None,
+        policy_store=policy_store,
+        root_conversation_id=child.root_conversation_id,
+        phase=Phase.REQUEST,
+    ), "fast path missed the root policy the sub-agent inherits"
 
 
 def test_subagent_deduplicates_same_name_policy(db_uri: str) -> None:

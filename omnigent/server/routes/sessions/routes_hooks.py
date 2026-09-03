@@ -769,6 +769,7 @@ def register_hooks_routes(
             conversation_id=session_id,
             default_policies=_caps.default_policies,
             policy_store=get_policy_store(),
+            root_conversation_id=conv.root_conversation_id if conv is not None else None,
             phase=phase,
             tool_name=data.get("name") if isinstance(data, dict) else None,
             # A sub-agent conversation's own guardrails live on the CHILD

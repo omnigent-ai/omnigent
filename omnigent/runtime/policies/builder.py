@@ -220,6 +220,7 @@ def any_policies_apply(
     conversation_id: str,
     default_policies: list[PolicySpec] | None,
     policy_store: PolicyStore | None,
+    root_conversation_id: str | None,
     phase: Phase | None = None,
     tool_name: str | None = None,
     conversation: Conversation | None = None,
@@ -239,6 +240,11 @@ def any_policies_apply(
     :param default_policies: Server-wide policies from ``RuntimeCaps``.
     :param policy_store: Session-scoped policy store; ``None`` means no DB
         policies are configured.
+    :param root_conversation_id: Root of this conversation's tree, so an
+        inherited root policy is counted (see :func:`build_policy_engine`).
+        Required rather than defaulted: omitting it silently under-reports for
+        sub-agents, which is a fail-open. Pass ``None`` only when the
+        conversation is genuinely a root or no row is available.
     :param phase: The evaluation phase, if known.
     :param tool_name: The tool being called (for ``PHASE_TOOL_CALL`` events).
     :param conversation: The conversation row when the caller holds one. For
@@ -267,6 +273,14 @@ def any_policies_apply(
     # this is a cache hit on any call after the first for this session.
     if _load_session_policy_specs(conversation_id, policy_store):
         return True
+    # Sub-agents inherit the root session's policies, so a child carrying none
+    # of its own still runs the parent's — a guardrail added to a top-level
+    # session governs the sub-agents it spawns. Unlike build_policy_engine this
+    # takes the root unverified: for a pure "would anything fire" check a wrong
+    # root can only over-report, which leaves the caller evaluating.
+    if root_conversation_id is not None and root_conversation_id != conversation_id:
+        if _load_session_policy_specs(root_conversation_id, policy_store):
+            return True
     return False
 
 

@@ -88,6 +88,7 @@ from omnigent.runtime.policies.approval import (
 from omnigent.runtime.policies.builder import (
     _sum_subtree_usage,
     ancestor_ids_from_tree,
+    any_policies_apply,
     load_session_tree,
     load_session_usage,
 )
@@ -6973,11 +6974,20 @@ async def _evaluate_input_policy(
     spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
     if spec is None:
         return None
-    # Skip only when there are no agent guardrails AND no server-wide
-    # default policies AND no session policies. Without this, default/
-    # session policies (e.g. deny_pii_in_llm_request added via the UI)
-    # are silently skipped for agents without a guardrails: YAML block.
-    if not spec.guardrails and not get_caps().default_policies and get_policy_store() is None:
+    # Skip only when no policy could fire: no agent guardrail policies, no
+    # server-wide defaults (YAML or DB) and no session policies. Reads the
+    # builder's own invalidation-based caches, so a policy added mid-session is
+    # honored on the very next message. Declared labels still build the engine —
+    # it seeds their initial values.
+    declares_labels = bool(spec.guardrails and spec.guardrails.labels)
+    if not declares_labels and not any_policies_apply(
+        spec=spec,
+        conversation_id=session_id,
+        default_policies=get_caps().default_policies,
+        policy_store=get_policy_store(),
+        root_conversation_id=conv.root_conversation_id,
+        phase=Phase.REQUEST,
+    ):
         return None
 
     # Text-like attachments (e.g. an uploaded CSV) arrive as ``input_file`` blocks
