@@ -90,54 +90,88 @@ def _fetch_credential(server: str, host_id: str, host_token: str) -> tuple[str, 
     return str(data.get("username") or "x-access-token"), str(data["token"])
 
 
-def configure_host_git(server_url: str, host_id: str) -> None:
-    """Configure git in a managed sandbox to use the GitHub credential broker.
+def _git_config(*args: str) -> None:
+    """Run ``git config --global`` best-effort (never raises; git may be absent)."""
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run(
+            ["git", "config", "--global", *args],
+            check=False,
+            capture_output=True,
+            timeout=_TIMEOUT_S,
+        )
 
-    Called by ``omnigent host`` at startup — executor-agnostic, since the host
-    runs in every executor and holds ``$OMNIGENT_HOST_TOKEN``. Sets a github.com
-    ``credential.helper`` that fetches the owner's token from the server per git
-    op (the GitHub token is never written to disk), and, when the owner has
-    GitHub connected, sets the commit author to them. Best-effort: never raises
-    (git may be absent, or GitHub not configured on the server).
+
+def _install_broker_helper(server_url: str, host_id: str, token: str) -> None:
+    """Make the per-user broker the sole github.com credential helper.
+
+    Bakes the (lesser, expiring) launch token into the helper invocation so it
+    works regardless of whether the agent's process inherited the env; the GitHub
+    token itself is fetched per-op and never stored. Resets the github.com helper
+    chain first: git accumulates credential helpers across scopes and runs them in
+    parse order (system → global), stopping at the first that returns a full
+    credential. A managed image installs a wider-scope helper that answers
+    github.com from a shared ``$GIT_TOKEN``; parsed before this --global entry it
+    would vend first and silently bypass the per-user broker. An empty value
+    clears the inherited chain for github.com, so only the broker remains.
+
+    Idempotent by ``--replace-all``: the workspace-prep init container and the
+    host both wire the broker into the same shared ~/.gitconfig (and the host
+    re-runs on every resume). A plain set can't overwrite the 2+ values that
+    leaves, so without ``--replace-all`` broker entries would pile up.
     """
-    token = (os.environ.get(_HOST_TOKEN_ENV_VAR) or "").strip()
-    if not token:
-        return
-
-    def _git(*args: str) -> None:
-        with contextlib.suppress(OSError, subprocess.SubprocessError):
-            subprocess.run(
-                ["git", "config", "--global", *args],
-                check=False,
-                capture_output=True,
-                timeout=_TIMEOUT_S,
-            )
-
-    # Bake the (lesser, expiring) launch token into the helper invocation so the
-    # helper works regardless of whether the agent's process inherited the env;
-    # the GitHub token itself is still fetched per-op and never stored.
     helper = (
         "!python3 -m omnigent.git_credential_github "
         f"--server {shlex.quote(server_url)} --host-id {shlex.quote(host_id)} "
         f"--host-token {shlex.quote(token)}"
     )
-    # Reset the github.com helper chain before adding ours. Git accumulates
-    # credential helpers across scopes and runs them in parse order (system →
-    # global), stopping at the first that returns a full credential. A managed
-    # image installs a wider-scope helper that answers github.com from a shared
-    # ``$GIT_TOKEN``; parsed before this --global entry, it would vend first and
-    # silently bypass the per-user broker — while the owner attribution set below
-    # still stamps commits as the owner, mis-attributing them. An empty value
-    # clears the inherited chain for github.com, so only the broker remains.
-    _git("credential.https://github.com.helper", "")
-    _git("--add", "credential.https://github.com.helper", helper)
+    _git_config("--replace-all", "credential.https://github.com.helper", "")
+    _git_config("--add", "credential.https://github.com.helper", helper)
 
+
+def configure_host_git(server_url: str, host_id: str) -> None:
+    """Configure git in a managed sandbox to use the GitHub credential broker.
+
+    Called by ``omnigent host`` at startup — executor-agnostic, since the host
+    runs in every executor and holds ``$OMNIGENT_HOST_TOKEN``. Makes the broker
+    the authoritative github.com ``credential.helper`` (fetching the owner's
+    token from the server per git op; never written to disk) and, when the owner
+    has GitHub connected, sets the commit author to them. Best-effort: never
+    raises (git may be absent, or GitHub not configured on the server).
+    """
+    token = (os.environ.get(_HOST_TOKEN_ENV_VAR) or "").strip()
+    if not token:
+        return
+    _install_broker_helper(server_url, host_id, token)
     data = _fetch(server_url, host_id, token) or {}
     owner = str(data.get("owner") or "")
     if data.get("connected") and "@" in owner:
-        _git("user.email", owner)
+        _git_config("user.email", owner)
         login = data.get("login")
-        _git("user.name", str(login) if login else owner.split("@", 1)[0])
+        _git_config("user.name", str(login) if login else owner.split("@", 1)[0])
+
+
+def configure_clone_credentials(server_url: str, host_id: str) -> bool:
+    """Wire the per-user broker for the initial workspace clone — only if connected.
+
+    Called by the managed-sandbox ``workspace-prep`` init container BEFORE it
+    clones the workspace repo. Unlike :func:`configure_host_git` (which makes the
+    broker authoritative for the running host unconditionally), this leaves the
+    ambient credential chain — notably the image's shared ``$GIT_TOKEN`` helper —
+    intact when the owner has NOT linked GitHub, so a shared-token clone still
+    works. When the owner IS connected, the broker becomes the sole github.com
+    helper so the clone authenticates as them. Best-effort: never raises.
+
+    :returns: ``True`` when the per-user broker was wired (owner connected);
+        ``False`` otherwise (ambient credentials left untouched).
+    """
+    token = (os.environ.get(_HOST_TOKEN_ENV_VAR) or "").strip()
+    if not token:
+        return False
+    data = _fetch(server_url, host_id, token) or {}
+    if not data.get("connected"):
+        return False
+    _install_broker_helper(server_url, host_id, token)
+    return True
 
 
 def main(argv: list[str] | None = None) -> int:

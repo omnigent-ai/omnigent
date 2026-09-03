@@ -64,7 +64,7 @@ def test_configure_host_git_resets_then_adds_broker_helper(
     reset_idx = next(
         i
         for i, c in enumerate(calls)
-        if c[:4] == ["git", "config", "--global", key] and c[-1] == ""
+        if c[:5] == ["git", "config", "--global", "--replace-all", key] and c[-1] == ""
     )
     add_idx = next(
         i
@@ -113,3 +113,45 @@ def test_fetch_sends_launch_token_as_header_not_url(monkeypatch: pytest.MonkeyPa
     assert seen["url"] == "http://s/v1/hosts/hid/credentials/github"
     assert seen["headers"][h.MANAGED_HOST_TOKEN_HEADER] == "launch-tok"
     assert "launch-tok" not in seen["url"]
+
+
+def test_configure_clone_credentials_wires_broker_when_connected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
+    monkeypatch.setattr(h, "_fetch", lambda *a, **k: {"connected": True, "owner": "a@b.com"})
+    assert h.configure_clone_credentials("http://srv", "host1") is True
+    key = "credential.https://github.com.helper"
+    reset_idx = next(
+        i
+        for i, c in enumerate(calls)
+        if c[:5] == ["git", "config", "--global", "--replace-all", key] and c[-1] == ""
+    )
+    add_idx = next(
+        i
+        for i, c in enumerate(calls)
+        if c[:5] == ["git", "config", "--global", "--add", key] and "host1" in c[-1]
+    )
+    assert reset_idx < add_idx
+
+
+def test_configure_clone_credentials_noop_when_not_connected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Not connected → leave the ambient (image GIT_TOKEN) helper intact; no git config.
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
+    monkeypatch.setattr(h, "_fetch", lambda *a, **k: {"connected": False})
+    assert h.configure_clone_credentials("http://srv", "host1") is False
+    assert calls == []
+
+
+def test_configure_clone_credentials_noop_without_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
+    calls: list[object] = []
+    monkeypatch.setattr(h.subprocess, "run", lambda *a, **k: calls.append(a))
+    assert h.configure_clone_credentials("http://srv", "host1") is False
+    assert calls == []

@@ -112,14 +112,28 @@ def test_build_job_manifest_init_container_prepares_and_clones_workspace() -> No
     assert "mkdir -p /home/omnigent/workspace" in script
     assert "git clone --branch main --single-branch -- " in script
     assert "https://github.com/org/repo.git /home/omnigent/workspace/repo" in script
+    # The per-user broker is wired before the clone, and the init container gets
+    # the launch token (secretKeyRef) so it can reach the broker.
+    assert "configure_clone_credentials" in script
+    assert script.index("configure_clone_credentials") < script.index("git clone")
+    init_env = init[0]["env"]
+    assert any(
+        e["name"] == "OMNIGENT_HOST_TOKEN" and "secretKeyRef" in e.get("valueFrom", {})
+        for e in init_env
+    )
 
 
 def test_build_job_manifest_without_repo_has_no_clone() -> None:
     """No repo → the init container only makes the workspace, no git clone."""
     manifest = build_job_manifest(**_MANIFEST_KW)
-    script = _pod_spec(manifest)["initContainers"][0]["command"][2]
+    init = _pod_spec(manifest)["initContainers"][0]
+    script = init["command"][2]
     assert "mkdir -p /home/omnigent/workspace" in script
     assert "git clone" not in script
+    # No repo → no broker wiring, and the launch token is NOT exposed to the
+    # workspace-less init container.
+    assert "configure_clone_credentials" not in script
+    assert all(e["name"] != "OMNIGENT_HOST_TOKEN" for e in init["env"])
 
 
 def test_build_job_manifest_host_config_is_written_by_init_container() -> None:
@@ -470,11 +484,15 @@ def test_render_workspace_prep_command(
     expect_branch: bool,
 ) -> None:
     """The init command always mkdir's the workspace and clones only when asked."""
-    command = k8s._render_workspace_prep_command("/ws", clone_dir, repo_url, repo_branch)
+    command = k8s._render_workspace_prep_command(
+        "/ws", clone_dir, repo_url, repo_branch, "http://srv.example.com", "host_abc"
+    )
     script = command[2]
     assert "mkdir -p /ws" in script
     assert ("git clone" in script) is expect_clone
     assert ("--branch release-1.2 --single-branch" in script) is expect_branch
+    # The per-user broker is wired (connected-gated at runtime) only when cloning.
+    assert ("configure_clone_credentials" in script) is expect_clone
 
 
 def test_new_pod_name_and_token_secret_name() -> None:
