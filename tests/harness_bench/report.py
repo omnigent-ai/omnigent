@@ -252,6 +252,8 @@ def _skip_lines(matrix: BenchMatrix) -> list[str]:
 def render_json(matrix: BenchMatrix) -> str:
     """Render *matrix* as indented JSON (stable key order) for tooling."""
     payload = {
+        "dimensions": [name for name, _title in _matrix_dimensions(matrix)],
+        "schema_version": 1,
         "harnesses": [_report_json(r) for r in matrix.reports],
         "has_drift": matrix.has_drift,
     }

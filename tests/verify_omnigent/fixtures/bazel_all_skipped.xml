@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="all-skipped" tests="2" failures="0" errors="0" skipped="2">
+  <testcase classname="fixture" name="first">
+    <skipped />
+  </testcase>
+  <testcase classname="fixture" name="second">
+    <skipped />
+  </testcase>
+</testsuite>

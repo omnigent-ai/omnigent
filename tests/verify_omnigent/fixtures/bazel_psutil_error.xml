@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="collection" tests="1" failures="0" errors="1" skipped="0">
+  <testcase classname="" name="agentbricks/mas/python/tests/test_managed_host_edge_bearer_patch.py" time="0">
+    <error message="ImportError">ImportError: cannot import name '_psutil_osx' from partially initialized module 'psutil'</error>
+  </testcase>
+</testsuite>

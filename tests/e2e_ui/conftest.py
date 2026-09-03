@@ -33,6 +33,7 @@ pytest tmp dir so the test never touches the user's default
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -43,6 +44,7 @@ import socket
 import subprocess
 import sys
 import tarfile
+import tempfile
 import textwrap
 import time
 from collections.abc import Generator, Iterator
@@ -53,7 +55,9 @@ from typing import Any
 import filelock
 import httpx
 import pytest
-from playwright.sync_api import APIResponse, Error, Locator, Page, Route, expect
+from _pytest.nodes import Node
+from playwright.async_api import BrowserType as AsyncBrowserType
+from playwright.sync_api import APIResponse, Browser, Error, Locator, Page, Route, expect
 
 from tests._helpers.compat import apply_server_env, compat_server_cwd, server_executable
 from tests.codex_parity.helpers import ev_assistant_message, ev_completed, ev_response_created
@@ -61,6 +65,11 @@ from tests.codex_parity.sidecar_harness import (
     CodexResponsesSidecar,
     build_sidecar_bin,
     start_codex_responses_sidecar,
+)
+from tests.e2e_ui.playwright_evidence import (
+    VERIFY_RUN_DIR_ENV,
+    AsyncEvidenceBrowser,
+    SyncEvidenceBrowser,
 )
 from tests.e2e_ui.url_safety import DEV_PORTS, unsafe_ui_base_url_reason
 
@@ -141,7 +150,11 @@ def switch_markdown_view_mode(page: Page, file_viewer: Locator, mode: str) -> No
 # type (which other tests depend on).
 _server_state: dict[str, int | str] = {}
 _WEB_DIR = _REPO_ROOT / "web"
-_BUILD_OUTPUT = _REPO_ROOT / "omnigent" / "server" / "static" / "web-ui"
+_BUILD_OUTPUT = Path(
+    os.environ.get("OMNIGENT_WEB_UI_DIST")
+    or (_REPO_ROOT / "omnigent" / "server" / "static" / "web-ui")
+)
+_BROWSER_CONTEXT_COUNT_KEY = pytest.StashKey[int]()
 
 # ``omnigent server --agent`` runs the spec through the strict
 # validator at registration time (no shim defaults applied), so the
@@ -296,6 +309,71 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+def _record_canonical_nodeid(
+    request: pytest.FixtureRequest,
+    record_property: Any,
+) -> Iterator[None]:
+    request.node.stash[_BROWSER_CONTEXT_COUNT_KEY] = 0
+    record_property(
+        "omnigent_nodeid_sha256",
+        hashlib.sha256(request.node.nodeid.encode("utf-8")).hexdigest(),
+    )
+    yield
+    record_property(
+        "omnigent_browser_context_count",
+        str(request.node.stash[_BROWSER_CONTEXT_COUNT_KEY]),
+    )
+
+
+def _mark_browser_context(node: Node) -> None:
+    node.stash[_BROWSER_CONTEXT_COUNT_KEY] = node.stash.get(_BROWSER_CONTEXT_COUNT_KEY, 0) + 1
+
+
+def _validate_vite_output(output: Path, trusted_root: Path) -> None:
+    output = output.absolute()
+    trusted_root = trusted_root.absolute()
+    try:
+        output.relative_to(trusted_root)
+    except ValueError:
+        pytest.fail("Verification UI output must be inside its trusted root.")
+    current = output
+    while True:
+        if current.is_symlink():
+            pytest.fail(f"Refusing Vite output through symlink: {current}")
+        if current.exists() and current == output and not current.is_dir():
+            pytest.fail(f"Vite output exists but is not a directory: {current}")
+        if current == trusted_root:
+            return
+        if current.parent == current:
+            pytest.fail("Vite output is not below its trusted root.")
+        current = current.parent
+
+
+def _vite_build_lock_path() -> Path:
+    return Path(tempfile.gettempdir()) / "omnigent-vite-build.lock"
+
+
+def _vite_build_command(vite: Path, output: Path) -> list[str]:
+    """Build without Vite's bundled config loader writing below node_modules."""
+    return [
+        "node",
+        str(vite),
+        "build",
+        "--configLoader",
+        "runner",
+        "--outDir",
+        str(output),
+        "--emptyOutDir",
+    ]
+
+
+def _assert_spa_build(output: Path) -> None:
+    index = output / "index.html"
+    if not index.is_file() or index.stat().st_size == 0:
+        pytest.fail(f"Vite build did not produce a nonempty {index}")
+
+
 def pytest_configure(config: pytest.Config) -> None:
     """Fail fast on unsafe e2e-ui harness options.
 
@@ -361,6 +439,73 @@ def browser_context_args(
     return {**browser_context_args}
 
 
+@pytest.fixture
+def browser(
+    browser: Browser,
+    browser_context_args: dict[str, Any],
+    _artifacts_recorder: Any,
+    request: pytest.FixtureRequest,
+) -> Iterator[SyncEvidenceBrowser]:
+    """Record plugin-managed and directly-created synchronous contexts alike."""
+    evidence_browser = SyncEvidenceBrowser(
+        browser,
+        _artifacts_recorder,
+        request.node.nodeid,
+        browser_context_args,
+        lambda: _mark_browser_context(request.node),
+    )
+    yield evidence_browser
+    evidence_browser.close_contexts()
+
+
+@pytest.fixture
+def new_context(
+    browser: SyncEvidenceBrowser,
+    request: pytest.FixtureRequest,
+) -> Iterator[Any]:
+    """Create managed contexts through the same evidence-aware Browser facade."""
+    context_args: dict[str, Any] = {}
+    marker = next(request.node.iter_markers("browser_context_args"), None)
+    if marker is not None:
+        context_args.update(marker.kwargs)
+    contexts: list[Any] = []
+
+    def create_context(**kwargs: Any) -> Any:
+        context = browser._create_context("managed-sync", **{**context_args, **kwargs})
+        contexts.append(context)
+        return context
+
+    yield create_context
+    for context in contexts:
+        if context in browser._contexts:
+            context.close()
+
+
+@pytest.fixture(autouse=True)
+def _capture_direct_async_contexts(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Wrap direct async Playwright launches without forcing a browser launch."""
+    if not os.environ.get(VERIFY_RUN_DIR_ENV):
+        return
+    original_launch = AsyncBrowserType.launch
+
+    async def launch_with_evidence(
+        browser_type: AsyncBrowserType,
+        *args: Any,
+        **kwargs: Any,
+    ) -> AsyncEvidenceBrowser:
+        browser = await original_launch(browser_type, *args, **kwargs)
+        return AsyncEvidenceBrowser(
+            browser,
+            request.node.nodeid,
+            lambda: _mark_browser_context(request.node),
+        )
+
+    monkeypatch.setattr(AsyncBrowserType, "launch", launch_with_evidence)
+
+
 def _validate_ui_base_url(base_url: str) -> None:
     reason = unsafe_ui_base_url_reason(base_url)
     if reason is None or os.environ.get(_ALLOW_DEV_BASE_URL_ENV) == "1":
@@ -407,6 +552,21 @@ def pytest_collection_modifyitems(
     if not 1 <= group <= splits:
         raise pytest.UsageError(f"--group must be between 1 and {splits}")
     items[:] = items[group - 1 :: splits]
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Atomically confirm that pytest reached session cleanup."""
+    marker_value = os.environ.get("OMNIGENT_VERIFY_CLEANUP_MARKER")
+    if not marker_value:
+        return
+    marker = Path(marker_value)
+    temporary = marker.with_name(f".{marker.name}.{os.getpid()}.tmp")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    temporary.write_text(
+        json.dumps({"schema_version": 1, "status": "completed", "exit_status": exitstatus}) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, marker)
 
 
 def _register_agent_yaml(
@@ -777,29 +937,31 @@ def built_spa(request: pytest.FixtureRequest) -> None:
     if request.config.getoption("--ui-skip-build"):
         return
 
-    lock_path = _WEB_DIR / ".build.lock"
+    run_dir_value = os.environ.get("OMNIGENT_VERIFY_RUN_DIR")
+    if run_dir_value:
+        run_dir = Path(run_dir_value).absolute()
+        output = _BUILD_OUTPUT.absolute()
+    else:
+        run_dir = _REPO_ROOT
+        output = _BUILD_OUTPUT.absolute()
+    _validate_vite_output(output, run_dir)
+
+    lock_path = _vite_build_lock_path()
     with filelock.FileLock(str(lock_path), timeout=600):
-        # pnpm frozen-lockfile uses the root workspace lockfile, which
-        # keeps the pinned tree matching CI and avoids re-resolving the
-        # React peer conflicts that used to require --legacy-peer-deps.
-        # COREPACK_ENABLE_DOWNLOAD_PROMPT=0 keeps a corepack `pnpm` shim
-        # from blocking on its download confirmation under captured
-        # pytest output, which reads as a hung test run.
-        env = {**os.environ, "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"}
+        _validate_vite_output(output, run_dir)
+        vite = _WEB_DIR / "node_modules" / "vite" / "bin" / "vite.js"
+        if not vite.is_file():
+            pytest.fail(
+                "Web dependencies are not provisioned. Run: CI=true pnpm install --frozen-lockfile"
+            )
         subprocess.run(
-            ["pnpm", "install", "--frozen-lockfile", "--filter", "web"],
-            cwd=_REPO_ROOT,
+            _vite_build_command(vite, output),
+            cwd=_WEB_DIR,
             check=True,
             stdin=subprocess.DEVNULL,
-            env=env,
         )
-        subprocess.run(
-            ["pnpm", "--filter", "web", "run", "build"],
-            cwd=_REPO_ROOT,
-            check=True,
-            stdin=subprocess.DEVNULL,
-            env=env,
-        )
+
+    _assert_spa_build(output)
 
 
 def _spawn_runner_against_external_server(

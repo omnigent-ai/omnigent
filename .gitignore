@@ -33,11 +33,29 @@ omnigent/_build_info.py
 !web/.storybook/
 !web/.storybook/**
 
+# Exception: track cross-agent project skills.
+!.agents/
+.agents/*
+!.agents/skills/
+!.agents/skills/**
+.agents/skills/verify-omnigent/**/__pycache__/
+
 # Exception: track .claude/skills/ (project-wide dev-time skills for Claude Code).
 # The .*/ rule above would otherwise exclude everything under .claude/.
 !.claude/
 .claude/*
 !.claude/skills/
+!.claude/skills/**
+
+# Exception: track Cursor's thin adapter to the canonical cross-agent skill.
+!.cursor/
+.cursor/*
+!.cursor/skills/
+!.cursor/skills/**
+
+# Reassert generated Python ignores after hidden skill-tree negations.
+**/__pycache__/
+**/*.py[cod]
 
 # Local helper scripts
 run-ap-chat.sh
@@ -67,6 +85,7 @@ dev/omnidev/target/
 # Playwright test run output (screenshots, traces, videos).
 test-results/
 output/playwright/
+.artifacts/verify-omnigent/
 
 # Visual-snapshot failure output (actual/expected/diff PNGs from the UI diff
 # gate). Regenerated each run; only the baseline under

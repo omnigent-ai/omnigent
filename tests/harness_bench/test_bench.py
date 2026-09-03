@@ -287,6 +287,8 @@ async def test_offline_render_produces_matrix() -> None:
     assert "`claude-sdk [full-server]`" in md
     assert "`claude-native [native]`" in md
     payload = json.loads(render_json(matrix))
+    assert payload["schema_version"] == 1
+    assert payload["dimensions"]
     assert {h["harness"] for h in payload["harnesses"]} == {p.harness for p in _OFFICIAL}
     by_harness = {h["harness"]: h for h in payload["harnesses"]}
     assert by_harness["claude-sdk"]["resolved_transport"] == "full-server"

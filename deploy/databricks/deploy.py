@@ -710,6 +710,18 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Resolve the deploy plan — ordered steps, the deploy version "
+            "each one lands, and the config the bundle would apply — print "
+            "it as a table, and exit 0. Makes no API calls and mutates "
+            "nothing: no build, no version stamp, no file writes, no "
+            "bundle deploy/run. Combine with --skip-build to preview a "
+            "redeploy of the wheels already in dist/."
+        ),
+    )
+    parser.add_argument(
         "--skip-build",
         action="store_true",
         help="Reuse existing dist/ wheels — skip the npm + uv build.",
@@ -918,6 +930,13 @@ def _grant_failure_detail(exc: subprocess.CalledProcessError) -> str:
     return _SECRET_ECHO_RE.sub(r"\1<redacted>", first_line)[:200]
 
 
+def _validate_volume_name(value: str) -> tuple[str, str, str]:
+    parts = value.split(".")
+    if len(parts) != 3 or any(not part or part.strip() != part for part in parts):
+        raise SystemExit(f"--volume-name {value!r} must be catalog.schema.volume")
+    return parts[0], parts[1], parts[2]
+
+
 def _ensure_app_sp_uc_traversal(
     args: argparse.Namespace,
     app_sp: str | None,
@@ -940,10 +959,7 @@ def _ensure_app_sp_uc_traversal(
         _log("app SP not resolved yet; skipping UC traversal grants")
         return
 
-    parts = args.volume_name.split(".")
-    if len(parts) != 3:
-        raise SystemExit(f"--volume-name {args.volume_name!r} must be catalog.schema.volume")
-    catalog, schema_only, _ = parts
+    catalog, schema_only, _ = _validate_volume_name(args.volume_name)
     schema_fqn = f"{catalog}.{schema_only}"
 
     import json as _json
@@ -974,14 +990,197 @@ def _ensure_app_sp_uc_traversal(
             _log(f"warning: {priv} grant on {fqn} failed ({_grant_failure_detail(exc)})")
 
 
+def _reused_wheels() -> list[Path]:
+    """Wheels in ``dist/`` to redeploy under ``--skip-build``.
+
+    :returns: Sorted wheel paths from ``dist/``.
+    :raises SystemExit: If ``dist/`` holds no wheels.
+    """
+    wheels = sorted((_repo_root() / "dist").glob("*.whl"))
+    if not wheels:
+        raise SystemExit("--skip-build was set but dist/ has no wheels to redeploy")
+    return wheels
+
+
+@dataclass(frozen=True)
+class _DeployStep:
+    """One ordered action the deploy performs.
+
+    :param action: What the deploy does, e.g. ``"bundle deploy"``.
+    :param target: What it acts on, e.g. the app or bundle resource name.
+    :param version: Deploy version the step lands, or ``""`` when the
+        step carries no version (grants, resize, smoke check).
+    :param notes: Short qualifier, e.g. ``"skipped if already matching"``.
+    """
+
+    action: str
+    target: str
+    version: str = ""
+    notes: str = ""
+
+
+@dataclass(frozen=True)
+class _DeployPlan:
+    """Fully resolved deploy, with nothing built, uploaded, or mutated.
+
+    :param base_version: On-disk version from the top-level pyproject.
+    :param deploy_version: Version this deploy stamps into every wheel.
+    :param version_source: How ``deploy_version`` was resolved, e.g.
+        ``"reuse dist/ wheels"``.
+    :param config: Ordered ``(key, value)`` rows the deploy applies —
+        bundle vars plus the out-of-band app settings.
+    :param steps: Ordered actions the deploy performs.
+    """
+
+    base_version: str
+    deploy_version: str
+    version_source: str
+    config: list[tuple[str, str]]
+    steps: list[_DeployStep]
+
+
+def _resolve_version(args: argparse.Namespace) -> tuple[str, str, str]:
+    """Resolve the deploy version without building or writing anything.
+
+    :param args: Parsed CLI args.
+    :returns: ``(base_version, deploy_version, version_source)``.
+    :raises SystemExit: If ``--version`` conflicts with reused wheels.
+    """
+    base = _read_base_version()
+    if not args.skip_build:
+        return base, _compute_deploy_version(base, args.version), "computed"
+    wheels = _reused_wheels()
+    classified = _classify_wheels(wheels)
+    if classified.oversize:
+        names = ", ".join(wheel.name for wheel in classified.oversize)
+        raise SystemExit(f"reused wheel is over 10 MB and cannot be deployed: {names}")
+    wheel_version = _derive_deploy_version_from_wheels(wheels)
+    if args.version and args.version != wheel_version:
+        raise SystemExit(
+            f"--version {args.version!r} does not match reused wheel version {wheel_version!r}"
+        )
+    return base, wheel_version, "reuse dist/ wheels"
+
+
+def _resolve_plan(args: argparse.Namespace) -> _DeployPlan:
+    """Resolve the full deploy plan. Read-only: no API calls, no writes.
+
+    Both the real deploy and ``--dry-run`` go through here, so the
+    printed plan can't drift from what a real deploy would do.
+
+    :param args: Parsed CLI args.
+    :returns: The resolved plan.
+    """
+    _validate_volume_name(args.volume_name)
+    base_version, deploy_version, version_source = _resolve_version(args)
+
+    # Read the bundle vars back off the real `--var` argv the deploy
+    # passes, so a var added there shows up in the plan automatically.
+    bundle_vars = _bundle_vars(args)
+    config = [
+        (pair.split("=", 1)[0], pair.split("=", 1)[1]) for pair in bundle_vars if pair != "--var"
+    ]
+    config += [
+        ("compute_size", args.compute_size),
+        ("bundle target", args.target),
+        ("profile", args.profile or "(env-based auth)"),
+    ]
+
+    wheel_source = (
+        f"reuse dist/ ({', '.join(w.name for w in _reused_wheels())})"
+        if args.skip_build
+        else "build.sh" + (" (SKIP_WEB_UI=1)" if args.skip_web_ui else "")
+    )
+    steps = [
+        _DeployStep("resolve wheels", wheel_source, deploy_version),
+        _DeployStep(
+            "sync wheels", "deploy/databricks/src/", deploy_version, "sweeps stale wheels"
+        ),
+        _DeployStep("write uv files", "src/pyproject.toml + src/uv.lock", deploy_version),
+        _DeployStep(
+            "bundle deployment bind",
+            f"{_BUNDLE_RESOURCE_KEY} → {args.app_name}",
+            "",
+            "no-op if bound",
+        ),
+        _DeployStep(
+            "app resize", args.app_name, "", f"→ {args.compute_size}, skipped if matching"
+        ),
+        _DeployStep(f"bundle deploy --target {args.target}", args.app_name, deploy_version),
+        _DeployStep(
+            f"bundle run {_BUNDLE_RESOURCE_KEY} --target {args.target}",
+            args.app_name,
+            deploy_version,
+            "restarts the app",
+        ),
+        _DeployStep(
+            "UC traversal grants", args.volume_name, "", "USE_CATALOG + USE_SCHEMA to app SP"
+        ),
+    ]
+    if not args.no_smoke_check:
+        steps.append(
+            _DeployStep(
+                "smoke-check",
+                f"{args.app_url or '<resolved app URL>'}/health",
+                "",
+                "polls up to 60s",
+            )
+        )
+    return _DeployPlan(base_version, deploy_version, version_source, config, steps)
+
+
+def _render_table(headers: list[str], rows: list[list[str]]) -> list[str]:
+    """Render ``rows`` as a fixed-width text table, header + rule first."""
+    widths = [
+        max(len(h), *(len(row[i]) for row in rows)) if rows else len(h)
+        for i, h in enumerate(headers)
+    ]
+    lines = ["  ".join(h.ljust(widths[i]) for i, h in enumerate(headers)).rstrip()]
+    lines.append("  ".join("-" * w for w in widths))
+    for row in rows:
+        lines.append("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip())
+    return lines
+
+
+def _render_plan(plan: _DeployPlan) -> str:
+    """Format a resolved plan as a human-readable table."""
+    lines = [
+        "dry run: resolved deploy plan. Nothing is built, uploaded, or mutated.",
+        "",
+        f"deploy version: {plan.deploy_version}  "
+        f"(base {plan.base_version}, {plan.version_source})",
+        "",
+        "config changes:",
+    ]
+    lines += [
+        f"  {line}" for line in _render_table(["key", "value"], [[k, v] for k, v in plan.config])
+    ]
+    lines += ["", "steps, in order:"]
+    rows = [
+        [str(i), step.action, step.target, step.version or "-", step.notes or "-"]
+        for i, step in enumerate(plan.steps, start=1)
+    ]
+    lines += [
+        f"  {line}" for line in _render_table(["#", "action", "target", "version", "notes"], rows)
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def main() -> int:
     args = _parse_args()
+
+    if args.dry_run:
+        # Resolve and print, then stop — before the env scrub, the
+        # clean-tree git calls, and anything that touches the workspace.
+        print(_render_plan(_resolve_plan(args)), end="", flush=True)
+        return 0
+
     _clear_env_vars()
     _assert_clean_tree(skip=args.allow_dirty)
 
-    base_version = _read_base_version()
-    deploy_version = _compute_deploy_version(base_version, args.version)
-    _log(f"deploy version: {deploy_version} (base: {base_version})")
+    plan = _resolve_plan(args)
+    deploy_version = plan.deploy_version
+    _log(f"deploy version: {deploy_version} (base: {plan.base_version}, {plan.version_source})")
 
     backups: dict[Path, str] = {}
     try:
@@ -990,18 +1189,7 @@ def main() -> int:
             backups = _stamp_versions(deploy_version)
             wheels = _build_wheels(skip_web_ui=args.skip_web_ui)
         else:
-            dist = _repo_root() / "dist"
-            wheels = sorted(dist.glob("*.whl"))
-            if not wheels:
-                raise SystemExit("--skip-build was set but dist/ has no wheels to redeploy")
-            wheel_version = _derive_deploy_version_from_wheels(wheels)
-            if args.version and args.version != wheel_version:
-                raise SystemExit(
-                    f"--version {args.version!r} does not match reused wheel "
-                    f"version {wheel_version!r}"
-                )
-            deploy_version = wheel_version
-            _log(f"deploy version from reused wheels: {deploy_version}")
+            wheels = _reused_wheels()
             _log(f"reusing wheels: {[w.name for w in wheels]}")
     finally:
         if backups and not args.keep_version_bump:

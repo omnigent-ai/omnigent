@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="host_slice_key" tests="2" failures="0" errors="0" skipped="0">
+  <testcase classname="HostSliceKeyGatePatchTest" name="test_marker_present" time="0.01" />
+  <testcase classname="HostSliceKeyGatePatchTest" name="test_gate_defaults_off" time="0.02" />
+</testsuite>

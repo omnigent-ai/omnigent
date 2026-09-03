@@ -253,7 +253,7 @@ export default defineConfig({
   ],
   resolve: {
     alias: {
-      "@": path.resolve(__dirname, "./src"),
+      "@": path.resolve(import.meta.dirname, "./src"),
     },
   },
   // React reads process.env.NODE_ENV; replace at build time so the bundle
@@ -262,7 +262,7 @@ export default defineConfig({
     "process.env.NODE_ENV": JSON.stringify("production"),
   },
   build: {
-    outDir: path.resolve(__dirname, "./dist-embed"),
+    outDir: path.resolve(import.meta.dirname, "./dist-embed"),
     emptyOutDir: true,
     cssCodeSplit: false,
     // Emit source maps so downstream bundlers embedding this build (e.g. the
@@ -271,7 +271,7 @@ export default defineConfig({
     // omnigent-embed.js:<line>. Consumed at the host build via source-map-loader.
     sourcemap: true,
     lib: {
-      entry: path.resolve(__dirname, "./src/embed.tsx"),
+      entry: path.resolve(import.meta.dirname, "./src/embed.tsx"),
       formats: ["es"],
     },
     rollupOptions: {

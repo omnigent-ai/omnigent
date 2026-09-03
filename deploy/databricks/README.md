@@ -266,6 +266,13 @@ routine redeploys only ever update in place.
 ## Common deploy modes
 
 ```bash
+# Preview only: print the resolved plan (ordered steps, deploy version,
+# config) and exit 0. No build, no file writes, no bundle or API calls.
+uv run python deploy/databricks/deploy.py --dry-run ...
+
+# Preview a redeploy of the wheels already in dist/.
+uv run python deploy/databricks/deploy.py --dry-run --skip-build ...
+
 # Iterate without rebuilding wheels (reuses dist/; useful when you only
 # changed app.py / app.yaml). Skips the clean-tree check.
 uv run python deploy/databricks/deploy.py --skip-build --allow-dirty ...
