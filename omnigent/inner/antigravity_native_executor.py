@@ -56,15 +56,31 @@ classified by the shared, pure helpers in
   rate-limit / provider failure is never collapsed into a success;
 * a degenerate turn that closes without a text planner → reconciled against agy's
   OWN cascade run status (``GetAllCascadeTrajectories``), the same idle backstop
-  the read driver uses, confirmed over consecutive checks;
+  the read driver uses, confirmed over consecutive checks AND only once agy has
+  recorded a planner or tool step for this turn (agy reports the cascade idle
+  between recording the user step and starting the model, so consecutive idle
+  readings alone would let that pre-start gap pass as a finished turn);
 * neither, within the budget → :class:`ExecutorError` naming the timeout.
 
+**Which turn is "this turn".** The trajectory holds every previous turn too, each
+already ending in its own closing planner, so the gate must know exactly which
+USER_INPUT step is its own or it will read a stale close as this turn's success.
+The executor snapshots the step count BEFORE delivering; only a USER_INPUT step
+at or past that index can be the one it just delivered. That snapshot is retried
+(:data:`_SNAPSHOT_TIMEOUT_S`) because nothing else can substitute for it — an
+earlier revision fell back to matching the delivered TEXT, which silently
+accepted the PREVIOUS turn whenever the same text was sent twice and the new step
+had not yet appeared. A turn whose snapshot never succeeds is reported as
+delivered-but-unverifiable, never guessed at.
+
 The gate is bounded by two named budgets, :data:`_TURN_START_TIMEOUT_S` and
-:data:`_TURN_COMPLETION_TIMEOUT_S`. Note that the bridge's tmux timeouts
-(``_TMUX_SEND_TIMEOUT_S`` / ``_TMUX_READY_TIMEOUT_S`` / ``_PASTE_COMMIT_TIMEOUT_S``
-/ ``_SUBMIT_VERIFY_TIMEOUT_S``) cover only local TUI delivery, and agy's own
-``--print-timeout`` never applies because this path does not use ``--print`` — so
-before the gate there was NO task-completion budget of any kind here.
+:data:`_TURN_COMPLETION_TIMEOUT_S`; the latter documents why the harness idle
+watchdog, not this constant, is the real outer bound. Note that the bridge's tmux
+timeouts (``_TMUX_SEND_TIMEOUT_S`` / ``_TMUX_READY_TIMEOUT_S`` /
+``_PASTE_COMMIT_TIMEOUT_S`` / ``_SUBMIT_VERIFY_TIMEOUT_S``) cover only local TUI
+delivery, and agy's own ``--print-timeout`` never applies because this path does
+not use ``--print`` — so before the gate there was NO task-completion budget of
+any kind here.
 
 Mid-turn steering (:meth:`AntigravityNativeExecutor.enqueue_session_message`) is
 deliberately NOT gated: it is a delivery, not a turn, and the ``run_turn`` gate
@@ -119,6 +135,7 @@ from omnigent.antigravity_native_steps import (
     cascade_is_idle,
     classify_turn_outcome,
     find_turn_start_index,
+    is_user_turn_step,
 )
 from omnigent.inner.executor import (
     EnqueuedContent,
@@ -155,32 +172,57 @@ _USER_INPUT_STEP_TYPE = "CORTEX_STEP_TYPE_USER_INPUT"
 _TURN_POLL_INTERVAL_S = 2.0
 
 # Seconds after a SUCCESSFUL delivery in which agy must record the turn — a
-# USER_INPUT step for our text must appear on a reachable cascade. The submit was
-# already footer-verified by the injector, so this only has to absorb agy minting
-# its cascade on a first turn plus RPC-port discovery. Blowing this budget means
-# the paste landed somewhere that is not a turn, which is a failure, not a slow
-# agent: it is reported as one rather than waiting out the full completion
-# budget.
+# USER_INPUT step past the pre-delivery baseline must appear on a reachable
+# cascade. The submit was already footer-verified by the injector, so this only
+# has to absorb agy minting its cascade on a first turn plus RPC-port discovery.
+# Blowing this budget means the paste landed somewhere that is not a turn, which
+# is a failure, not a slow agent: it is reported as one rather than waiting out
+# the full completion budget.
 _TURN_START_TIMEOUT_S = 180.0
 
-# Total seconds an OPEN turn may run before the gate gives up. Sized for
-# long-running implementation work, which is the case that motivated the gate: a
-# dispatched worker editing several files, running a build and a test suite is
-# routinely tens of minutes, so anything in the low minutes (agy's own 5-minute
-# ``--print-timeout`` default, say) would abort real work and be worse than the
-# bug. One hour is long enough that a legitimate implementation turn finishes
-# inside it, and short enough that a wedged agy — one parked forever on a
-# permission gate, or hung mid-tool — frees the caller's slot the same day
-# instead of never. A turn that hits this yields an ExecutorError naming the
-# budget; it never degrades into a success.
-_TURN_COMPLETION_TIMEOUT_S = 3600.0
+# Total seconds an OPEN turn may run before the gate gives up.
+#
+# **This is NOT the effective production budget on its own.** The harness wraps
+# every ``run_turn`` in an IDLE watchdog (``_scaffold._TURN_IDLE_TIMEOUT_S``, env
+# ``HARNESS_TURN_TIMEOUT_S``, default 3600s at the time of writing — raised from
+# 600s in #6204). That watchdog is reset only by a NON-HEARTBEAT ``ctx.emit``,
+# and this gate emits nothing while it polls: the read driver mirrors agy's
+# output by POSTing session events directly, not through the harness stream. So
+# a healthy but silent gated turn is racing the harness watchdog, and the real
+# ceiling is whichever of the two fires first.
+#
+# The gate budget therefore sits deliberately BELOW the harness default, so a
+# turn that overruns fails with the diagnosable message below rather than an
+# opaque harness ``response.failed``. Raising it past ``HARNESS_TURN_TIMEOUT_S``
+# buys nothing: the watchdog would win. Emitting a real progress signal from here
+# would need a change in the harness adapter (out of this change's scope), and
+# every event the adapter currently translates would double-render against the
+# read driver's mirror.
+#
+# 50 minutes is sized for the case that motivated the gate — a dispatched worker
+# editing several files, running a build and a test suite, routinely tens of
+# minutes. Anything in the low minutes (agy's own 5-minute ``--print-timeout``
+# default, say) would abort real work and be worse than the bug; anything past
+# the harness watchdog is fiction. A turn that hits this yields an ExecutorError
+# naming the budget; it never degrades into a success.
+_TURN_COMPLETION_TIMEOUT_S = 3000.0
+
+# Budget for the PRE-delivery trajectory snapshot, which is the sole signal that
+# identifies this turn's USER_INPUT step (see :func:`find_turn_start_index` — the
+# unsound text-matching fallback was removed). Without it the turn cannot be
+# verified at all, so a transient RPC blip is retried rather than accepted; a
+# failure that outlives this budget is reported, never guessed around.
+_SNAPSHOT_TIMEOUT_S = 10.0
+_SNAPSHOT_RETRY_INTERVAL_S = 1.0
 
 # The idle backstop. A turn can close without a text-carrying planner step (the
 # degenerate shape the read driver documents), which no step-based rule can tell
-# apart from a dispatch. agy's own cascade run status settles it, but a single
-# reading can catch the gap between the turn being recorded and agy starting it,
-# so the gate requires consecutive idle readings, spaced by whole poll cycles,
-# and consults it only AFTER the turn is confirmed open.
+# apart from a dispatch. agy's own cascade run status settles it — but agy
+# publishes the USER_INPUT step BEFORE it starts generating and reports the
+# cascade idle throughout that window, so consecutive idle readings alone do not
+# close the gap; they only require it to persist. The backstop is therefore
+# gated on ``TurnOutcome.model_started`` (a planner or tool step recorded FOR
+# THIS TURN) as well as on consecutive idle readings spaced by whole poll cycles.
 _IDLE_CHECK_EVERY_N_POLLS = 5
 _IDLE_CONFIRM_CHECKS = 2
 
@@ -388,25 +430,59 @@ class AntigravityNativeExecutor(Executor):
         if not text:
             yield ExecutorError(message="Antigravity native turn had no user text to send")
             return
-        self._interrupted.clear()
-        # Snapshot BEFORE delivering: the step count is what tells this turn's
-        # USER_INPUT step apart from the previous turn's, whose closing planner
-        # would otherwise satisfy the gate instantly.
-        baseline = await self._snapshot_step_count()
-        failure = await self._deliver(text)
-        if failure is not None:
-            yield ExecutorError(message=failure)
-            return
-        result = await self._await_turn_completion(delivered_text=text, baseline=baseline)
-        if result.cancelled:
+        # A stop that arrived before this turn began running (the harness
+        # registers the turn context before it starts iterating ``run_turn``, so
+        # an interrupt CAN land in that window). Honour it here instead of
+        # clearing it: clearing at entry is what dropped such a stop, and
+        # delivering text for a request the user already cancelled is worse than
+        # reporting it cancelled.
+        if self._interrupted.is_set():
+            self._interrupted.clear()
             yield TurnCancelled()
-        elif result.completed:
-            yield TurnComplete(response=result.text)
-        else:
-            yield ExecutorError(
-                message=result.error or "Antigravity native turn did not complete",
-                retryable=result.retryable,
-            )
+            return
+        try:
+            # Snapshot BEFORE delivering: the step count is the ONLY signal that
+            # tells this turn's USER_INPUT step apart from the previous turn's,
+            # whose closing planner would otherwise satisfy the gate instantly.
+            baseline = await self._snapshot_step_count()
+            failure = await self._deliver(text)
+            if failure is not None:
+                yield ExecutorError(message=failure)
+                return
+            if baseline is None:
+                # Delivered, but unverifiable: agy's trajectory stayed unreadable
+                # across the whole snapshot budget, so there is no way to tell
+                # this turn's USER_INPUT step from an earlier one. Guessing is
+                # what produced the original false success, so this reports the
+                # truth instead. NOT retryable: the text was already typed into
+                # the TUI, and a retry would deliver it twice.
+                yield ExecutorError(
+                    message=(
+                        "Antigravity native turn was delivered to the agy TUI but could not be "
+                        "verified: agy's trajectory was unreadable for "
+                        f"{_SNAPSHOT_TIMEOUT_S:.0f}s before delivery, so this turn cannot be "
+                        "told apart from the previous one. agy may still run the turn; its "
+                        "completion is NOT confirmed"
+                    ),
+                )
+                return
+            result = await self._await_turn_completion(baseline=baseline)
+            if result.cancelled:
+                yield TurnCancelled()
+            elif result.completed:
+                yield TurnComplete(response=result.text)
+            else:
+                yield ExecutorError(
+                    message=result.error or "Antigravity native turn did not complete",
+                    retryable=result.retryable,
+                )
+        finally:
+            # Consume the interrupt HERE rather than at entry. The harness calls
+            # ``interrupt_session`` a second time once it sees the cancelled
+            # event, and that call lands before this generator is closed — so
+            # clearing on the way out leaves no stale stop for the next turn,
+            # while an interrupt racing the START of a turn is no longer lost.
+            self._interrupted.clear()
 
     async def _deliver(self, text: str) -> str | None:
         """
@@ -467,9 +543,7 @@ class AntigravityNativeExecutor(Executor):
             )
             return None
 
-    async def _await_turn_completion(
-        self, *, delivered_text: str, baseline: int | None
-    ) -> _GateResult:
+    async def _await_turn_completion(self, *, baseline: int) -> _GateResult:
         """
         Block until agy finishes the delivered turn, or a budget runs out.
 
@@ -481,32 +555,42 @@ class AntigravityNativeExecutor(Executor):
         Two phases, each with its own budget:
 
         #. **Start** (:data:`_TURN_START_TIMEOUT_S`): agy must record the delivery
-           as a USER_INPUT step (:func:`find_turn_start_index`). Until that step
-           exists there is no turn to wait on, and a delivery that never becomes
-           one is a failure worth reporting promptly rather than waiting out the
-           full completion budget.
+           as a USER_INPUT step past ``baseline`` (:func:`find_turn_start_index`).
+           Until that step exists there is no turn to wait on, and a delivery that
+           never becomes one is a failure worth reporting promptly rather than
+           waiting out the full completion budget.
         #. **Completion** (:data:`_TURN_COMPLETION_TIMEOUT_S`, measured from
            delivery): the open turn must reach a terminal state — a DONE planner
            with text, an ERROR planner, or agy's own cascade status settling to
-           idle across :data:`_IDLE_CONFIRM_CHECKS` consecutive checks for the
-           degenerate close.
+           idle across :data:`_IDLE_CONFIRM_CHECKS` consecutive checks once the
+           model has demonstrably started (the degenerate close).
 
         A trajectory read that fails (transport, non-2xx, non-JSON body, no
         resolvable RPC port yet) is transient: it is logged, the cached port is
         dropped so the next pass re-resolves, and the loop retries until a budget
         expires. It never short-circuits into a success.
 
-        :param delivered_text: The exact text delivered, used to identify this
-            turn's USER_INPUT step when the pre-delivery snapshot was unavailable.
-        :param baseline: Step count observed before delivery, or ``None`` when it
-            could not be read (see :meth:`_snapshot_step_count`).
+        .. note:: **Positional assumption.** ``start_index`` is an index into the
+           ``steps`` LIST, and the gate keeps using it across polls. That assumes
+           agy only ever APPENDS to a cascade's trajectory — which is what has
+           been observed, but is not guaranteed: the read driver keys step
+           identity on ``(trajectory_id, step_index)`` precisely because those are
+           the stable fields, and whether agy ever prunes, compacts or reorders
+           the list is UNVERIFIED. So the position is re-validated on every poll
+           (the step there must still be a USER_INPUT step); when it is not, the
+           gate reports a failure naming the mutation rather than classifying a
+           window that may belong to a different turn. Moving to
+           ``(trajectory_id, step_index)`` identity would remove the assumption
+           and is the right fix if agy is ever seen mutating the list.
+
+        :param baseline: Step count observed before delivery (see
+            :meth:`_snapshot_step_count`).
         :returns: The turn's :class:`_GateResult`.
         """
         started_at = time.monotonic()
         start_index: int | None = None
         # Counted from the poll that first saw the turn OPEN, not from gate
-        # entry, so the idle backstop can never fire on the very reading that
-        # discovered the turn — the one reading agy may not have started yet.
+        # entry, so the idle backstop's spacing is measured from the turn.
         polls_since_open = -1
         idle_checks = 0
         latest_text: str | None = None
@@ -518,10 +602,21 @@ class AntigravityNativeExecutor(Executor):
             steps = await self._read_trajectory()
             if steps is not None:
                 if start_index is None:
-                    start_index = find_turn_start_index(
-                        steps,
-                        baseline_step_count=baseline,
-                        delivered_text=delivered_text,
+                    start_index = find_turn_start_index(steps, baseline_step_count=baseline)
+                elif not _still_opens_a_turn(steps, start_index):
+                    # The list changed shape under us (see the positional note
+                    # above). Everything after ``start_index`` now describes some
+                    # other turn, so classifying it could report a stale close as
+                    # this turn's completion. Fail loudly instead.
+                    return _GateResult(
+                        completed=False,
+                        text=latest_text,
+                        error=(
+                            "Antigravity native turn could not be tracked: agy's trajectory "
+                            f"changed shape under the completion gate (step {start_index} is no "
+                            "longer this turn's user input). The turn was delivered and may "
+                            "still be running; its completion is NOT confirmed"
+                        ),
                     )
                 if start_index is not None:
                     polls_since_open += 1
@@ -550,10 +645,21 @@ class AntigravityNativeExecutor(Executor):
                         )
                     # Still running. The degenerate close (a turn that ends with
                     # no text-carrying planner) is only visible in agy's own
-                    # cascade status, and only after enough consecutive idle
-                    # readings that a not-yet-started turn cannot masquerade as a
-                    # finished one.
-                    if polls_since_open > 0 and polls_since_open % _IDLE_CHECK_EVERY_N_POLLS == 0:
+                    # cascade status — but that status is ALSO idle in the window
+                    # between agy recording the user step and the model starting,
+                    # and consecutive readings do not close that window, they only
+                    # require it to persist. So the backstop additionally demands
+                    # positive evidence the model started on THIS turn: a planner
+                    # or tool step recorded after its user input. (A non-idle
+                    # cascade reading is deliberately NOT accepted as that
+                    # evidence — ``_cascade_reports_idle`` fails closed, so False
+                    # is indistinguishable from a failed read.)
+                    ready_to_check = (
+                        outcome.model_started
+                        and polls_since_open > 0
+                        and polls_since_open % _IDLE_CHECK_EVERY_N_POLLS == 0
+                    )
+                    if ready_to_check:
                         if await self._cascade_reports_idle():
                             idle_checks += 1
                             if idle_checks >= _IDLE_CONFIRM_CHECKS:
@@ -599,21 +705,37 @@ class AntigravityNativeExecutor(Executor):
         Read the cascade's step count before delivering, for turn identification.
 
         The gate needs to tell THIS turn's USER_INPUT step from the previous
-        turn's; the pre-delivery step count does that positionally.
+        turn's, and the pre-delivery step count is the ONLY signal that does it
+        (:func:`find_turn_start_index`). Since nothing else can substitute, a
+        failed read is RETRIED within :data:`_SNAPSHOT_TIMEOUT_S` rather than
+        waved through — a transient RPC blip must not cost the turn its only
+        means of verification.
 
         :returns: ``0`` when agy has not minted the conversation yet (a first
             turn has no earlier step to be confused with), the current step count
-            when the trajectory reads cleanly, or ``None`` when it could not be
-            read — in which case the gate identifies the turn by its text instead
-            (see :func:`find_turn_start_index`).
+            when the trajectory reads cleanly, or ``None`` when it stayed
+            unreadable for the whole budget — the caller reports that turn as
+            unverifiable rather than guessing which USER_INPUT step is its own.
         """
-        state = await asyncio.to_thread(read_bridge_state, self._bridge_dir)
-        if state is None:
-            return None
-        if is_placeholder_conversation_id(state.conversation_id):
-            return 0
-        steps = await self._read_trajectory()
-        return None if steps is None else len(steps)
+        deadline = time.monotonic() + _SNAPSHOT_TIMEOUT_S
+        while True:
+            state = await asyncio.to_thread(read_bridge_state, self._bridge_dir)
+            if state is None:
+                # Broken wiring, not a transient fault; ``_deliver`` reports it.
+                return None
+            if is_placeholder_conversation_id(state.conversation_id):
+                return 0
+            steps = await self._read_trajectory()
+            if steps is not None:
+                return len(steps)
+            if time.monotonic() >= deadline:
+                _logger.warning(
+                    "antigravity native could not snapshot the trajectory in %.0fs; "
+                    "this turn will be delivered but cannot be verified",
+                    _SNAPSHOT_TIMEOUT_S,
+                )
+                return None
+            await _sleep(_SNAPSHOT_RETRY_INTERVAL_S)
 
     async def _resolve_rpc_target(self) -> tuple[int, str] | None:
         """
@@ -696,6 +818,27 @@ class AntigravityNativeExecutor(Executor):
         if not isinstance(summaries, dict):
             return False
         return cascade_is_idle(summaries, cascade_id)
+
+
+def _still_opens_a_turn(steps: list[dict[str, object]], start_index: int) -> bool:
+    """
+    Whether ``start_index`` still points at the USER_INPUT step the gate recorded.
+
+    The completion gate holds a LIST index across polls, which is only valid
+    while agy appends to the trajectory (see the note on
+    :meth:`AntigravityNativeExecutor._await_turn_completion`). This is the cheap
+    re-validation: if the slot no longer holds a turn-opening step, the list was
+    pruned, compacted or reordered underneath the gate and the index now
+    addresses someone else's turn.
+
+    :param steps: The trajectory as read on this poll.
+    :param start_index: The index recorded when the turn was identified.
+    :returns: ``True`` when the position is still this turn's user input.
+    """
+    if start_index >= len(steps):
+        return False
+    step = steps[start_index]
+    return isinstance(step, dict) and is_user_turn_step(step)
 
 
 def _bridge_dir_from_env() -> Path:

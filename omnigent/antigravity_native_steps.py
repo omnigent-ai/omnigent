@@ -1169,12 +1169,19 @@ class TurnOutcome:
         ``CORTEX_STEP_STATUS_WAITING`` — agy is parked on an ask-question /
         permission gate. Only ever set alongside ``"running"``; a caller that
         gives up on a turn uses it to say WHY it never finished.
+    :param model_started: ``True`` once agy has recorded a planner or tool step
+        FOR THIS TURN, i.e. positive evidence the model actually began working on
+        it. A bare recorded USER_INPUT does NOT set this: agy publishes the user
+        step before it starts generating, and during that window its cascade
+        still reports idle. Any caller inferring completion from an idle cascade
+        must require this first, or the pre-start gap reads as a finished turn.
     """
 
     state: TurnState
     text: str | None = None
     error: str | None = None
     waiting_on_user: bool = False
+    model_started: bool = False
 
 
 def is_user_turn_step(step: dict[str, object]) -> bool:
@@ -1185,19 +1192,6 @@ def is_user_turn_step(step: dict[str, object]) -> bool:
     :returns: ``True`` for a ``CORTEX_STEP_TYPE_USER_INPUT`` step.
     """
     return step.get("type") == _TYPE_USER_INPUT
-
-
-def user_turn_text(step: dict[str, object]) -> str:
-    """
-    Return the user text agy recorded for a USER_INPUT step.
-
-    :param step: One RPC step dict.
-    :returns: The turn's user text, or ``""`` for a non-USER_INPUT step or one
-        whose ``userInput`` is missing/unparseable.
-    """
-    if not is_user_turn_step(step):
-        return ""
-    return _user_input_text(step.get("userInput"))
 
 
 def planner_response_text(step: dict[str, object]) -> str | None:
@@ -1345,39 +1339,34 @@ def cascade_is_idle(summaries: dict[str, object], cascade_id: str) -> bool:
 def find_turn_start_index(
     steps: list[dict[str, object]],
     *,
-    baseline_step_count: int | None,
-    delivered_text: str | None = None,
+    baseline_step_count: int,
 ) -> int | None:
     """
     Locate the USER_INPUT step that opened the turn a caller just delivered.
 
-    Only the NEWEST USER_INPUT step can be the caller's: deliveries are
-    serialized and agy appends, so this walks back to the newest USER_INPUT and
-    tests THAT one — never an older turn, which is what would let a previous
-    turn's closing planner be mistaken for this turn's completion.
+    **Position is the only signal, deliberately.** The caller snapshots the step
+    count BEFORE delivering, so a USER_INPUT at or after that index necessarily
+    appeared afterwards and is therefore the caller's own turn. Only the NEWEST
+    USER_INPUT is ever tested — deliveries are serialized and agy appends — so an
+    older turn, whose closing planner is already sitting in the same trajectory,
+    can never be adopted.
 
-    Two tiers, in order:
-
-    #. **Position** (``baseline_step_count``): the caller snapshotted the step
-       count before delivering, so any USER_INPUT at or after that index is
-       necessarily new. This is the reliable tier and the only one consulted when
-       the snapshot succeeded.
-    #. **Text** (``delivered_text``): used only when the caller could NOT
-       snapshot (``baseline_step_count is None`` — the pre-delivery read failed).
-       Matching agy's recorded turn text against what was delivered still
-       identifies the turn, without a false "already complete" read of the
-       previous one. Compared on stripped text because agy round-trips the paste.
-
-    A caller with neither signal gets ``None`` (turn not identified) rather than
-    a guess.
+    An earlier revision fell back to matching the delivered TEXT when the
+    snapshot failed. That fallback was unsound: when the identical text had been
+    sent in the previous turn and the new USER_INPUT step had not yet appeared,
+    the OLD turn matched and its DONE planner was accepted as this turn's
+    completion — the exact false success this whole gate exists to prevent. There
+    is no text-only rule that separates two identical turns, so a caller that
+    cannot snapshot has no way to identify its turn and must report that rather
+    than guess (see
+    :meth:`omnigent.inner.antigravity_native_executor.AntigravityNativeExecutor._snapshot_step_count`,
+    which retries before giving up).
 
     :param steps: The full ordered trajectory from
         :func:`~omnigent.antigravity_native_rpc.get_trajectory_steps`.
-    :param baseline_step_count: ``len(steps)`` observed before delivery, ``0``
-        for a conversation agy has not minted yet, or ``None`` when the
-        pre-delivery read failed.
-    :param delivered_text: The exact text the caller delivered, used only for
-        the text tier.
+    :param baseline_step_count: ``len(steps)`` observed before delivery; ``0``
+        for a conversation agy has not minted yet (nothing earlier exists to be
+        confused with).
     :returns: Index of this turn's USER_INPUT step, or ``None`` when agy has not
         recorded it yet.
     """
@@ -1385,11 +1374,7 @@ def find_turn_start_index(
         step = steps[index]
         if not isinstance(step, dict) or not is_user_turn_step(step):
             continue
-        if baseline_step_count is not None:
-            return index if index >= baseline_step_count else None
-        if delivered_text is not None and user_turn_text(step).strip() == delivered_text.strip():
-            return index
-        return None
+        return index if index >= baseline_step_count else None
     return None
 
 
@@ -1405,6 +1390,14 @@ def classify_turn_outcome(steps: list[dict[str, object]], *, start_index: int) -
     ``"running"`` — a tool step that ERRORs does NOT end the turn, because agy
     routinely recovers from one and keeps working.
 
+    It also reports ``model_started``: whether agy has recorded a planner or tool
+    step for this turn. A recorded USER_INPUT alone does NOT count. agy publishes
+    the user step before it begins generating, and its cascade still reports idle
+    in that window, so a caller that closes a turn on an idle cascade must wait
+    for this evidence — otherwise the pre-start gap reads as a finished turn. A
+    mid-turn steering USER_INPUT is likewise not evidence: it is another
+    delivery, not the model working.
+
     :param steps: The full ordered trajectory.
     :param start_index: Index of this turn's USER_INPUT step, from
         :func:`find_turn_start_index`.
@@ -1412,16 +1405,29 @@ def classify_turn_outcome(steps: list[dict[str, object]], *, start_index: int) -
     """
     latest_text: str | None = None
     waiting = False
+    model_started = False
     for step in steps[start_index + 1 :]:
         if not isinstance(step, dict):
             continue
+        if step.get("type") == _TYPE_PLANNER_RESPONSE or _is_tool_step(step):
+            model_started = True
         if is_planner_error_step(step):
-            return TurnOutcome(state="error", text=latest_text, error=planner_error_detail(step))
+            return TurnOutcome(
+                state="error",
+                text=latest_text,
+                error=planner_error_detail(step),
+                model_started=True,
+            )
         text = planner_response_text(step)
         if text:
             latest_text = text
         if is_assistant_text_close_step(step):
-            return TurnOutcome(state="done", text=text)
+            return TurnOutcome(state="done", text=text, model_started=True)
         if step.get("status") == _STATUS_WAITING:
             waiting = True
-    return TurnOutcome(state="running", text=latest_text, waiting_on_user=waiting)
+    return TurnOutcome(
+        state="running",
+        text=latest_text,
+        waiting_on_user=waiting,
+        model_started=model_started,
+    )

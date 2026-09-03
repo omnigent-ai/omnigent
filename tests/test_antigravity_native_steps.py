@@ -1319,6 +1319,9 @@ def _tool_step(status: str) -> dict[str, Any]:
         "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
         "status": status,
         "runCommand": {"command": "pytest"},
+        # ``metadata.toolAction`` is what marks a step as a tool call on the live
+        # wire, in both RPC shapes (see ``_is_tool_step``).
+        "metadata": {"toolAction": "Running command"},
     }
 
 
@@ -1353,36 +1356,40 @@ class TestFindTurnStartIndex:
         ]
         assert find_turn_start_index(steps, baseline_step_count=2) is None
 
-    def test_text_tier_used_only_without_a_baseline(self) -> None:
+    def test_identical_text_in_the_previous_turn_is_not_this_turn(self) -> None:
         """
-        With no pre-delivery snapshot, the delivered text identifies the turn.
+        REGRESSION: repeated text must not resolve to the earlier, finished turn.
 
-        The positional tier is unavailable when the pre-delivery read failed, so
-        matching agy's recorded turn text is what keeps the gate from waiting on
-        a turn it cannot see — and it still cannot match an older turn's text
-        while ours is unrecorded, because only the NEWEST USER_INPUT is tested.
+        A text-matching rule cannot separate two identical turns. When the same
+        text was sent last turn and the new USER_INPUT step has not yet appeared,
+        matching on text selects the OLD turn — whose DONE planner is sitting
+        right there — and reports it as this turn's completion. Position is the
+        only signal, so this is ``None`` until the new step actually lands.
         """
         from omnigent.antigravity_native_steps import find_turn_start_index
 
-        steps = [_user_step("old"), _user_step("  build the thing\n")]
-        found = find_turn_start_index(
-            steps, baseline_step_count=None, delivered_text="build the thing"
-        )
-        assert found == 1
-        missed = find_turn_start_index(
-            steps, baseline_step_count=None, delivered_text="something else"
-        )
-        assert missed is None
+        same_text = "run the test suite"
+        steps = [
+            _user_step(same_text),
+            _planner_step(status="CORTEX_STEP_STATUS_DONE", text="ran it, all green"),
+        ]
+        assert find_turn_start_index(steps, baseline_step_count=2) is None
+        # Once agy records the repeat, the NEW step is found — not the old one.
+        steps.append(_user_step(same_text))
+        assert find_turn_start_index(steps, baseline_step_count=2) == 2
 
-    def test_no_signals_or_no_user_step_yields_none(self) -> None:
-        """Without either signal — or without any USER_INPUT — the turn is unidentified."""
+    def test_no_user_step_yields_none(self) -> None:
+        """Without any USER_INPUT step the turn is unidentified."""
         from omnigent.antigravity_native_steps import find_turn_start_index
 
         assert find_turn_start_index([], baseline_step_count=0) is None
-        unidentified = find_turn_start_index(
-            [_user_step("hi")], baseline_step_count=None, delivered_text=None
+        assert (
+            find_turn_start_index(
+                [_planner_step(status="CORTEX_STEP_STATUS_DONE", text="x")],
+                baseline_step_count=0,
+            )
+            is None
         )
-        assert unidentified is None
 
 
 class TestClassifyTurnOutcome:
@@ -1470,12 +1477,46 @@ class TestClassifyTurnOutcome:
     def test_degenerate_close_stays_running_for_the_idle_backstop(self) -> None:
         """
         A DONE planner with NO text is not a close — it is indistinguishable from
-        a streamed dispatch, so agy's own cascade status settles it instead.
+        a streamed dispatch, so agy's own cascade status settles it instead. The
+        planner step IS evidence the model ran, which is what permits that
+        backstop.
         """
         from omnigent.antigravity_native_steps import classify_turn_outcome
 
         steps = [_user_step("go"), _planner_step(status="CORTEX_STEP_STATUS_DONE")]
-        assert classify_turn_outcome(steps, start_index=0).state == "running"
+        outcome = classify_turn_outcome(steps, start_index=0)
+        assert outcome.state == "running"
+        assert outcome.model_started is True
+
+    def test_a_bare_recorded_user_step_is_not_model_activity(self) -> None:
+        """
+        REGRESSION: a recorded USER_INPUT alone is NOT evidence the model started.
+
+        agy publishes the user step before it begins generating and reports the
+        cascade idle throughout that window. Treating the bare step as "the turn
+        is under way" is what lets an idle-based backstop declare success before
+        any work happens, so ``model_started`` stays False until a planner or
+        tool step exists.
+        """
+        from omnigent.antigravity_native_steps import classify_turn_outcome
+
+        outcome = classify_turn_outcome([_user_step("go")], start_index=0)
+        assert outcome.state == "running"
+        assert outcome.model_started is False
+
+    def test_a_steering_user_step_is_not_model_activity(self) -> None:
+        """A mid-turn steering USER_INPUT is another delivery, not the model working."""
+        from omnigent.antigravity_native_steps import classify_turn_outcome
+
+        steps = [_user_step("go"), _user_step("actually, do it this way")]
+        assert classify_turn_outcome(steps, start_index=0).model_started is False
+
+    def test_a_tool_step_is_model_activity(self) -> None:
+        """A tool step recorded for this turn proves agy started working on it."""
+        from omnigent.antigravity_native_steps import classify_turn_outcome
+
+        steps = [_user_step("go"), _tool_step("CORTEX_STEP_STATUS_RUNNING")]
+        assert classify_turn_outcome(steps, start_index=0).model_started is True
 
 
 class TestCascadeIsIdle:
