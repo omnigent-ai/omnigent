@@ -270,10 +270,18 @@ function textarea() {
   return screen.getByLabelText("Message the agent") as HTMLTextAreaElement;
 }
 
+// A coarse pointer at a desktop width: the width queries keep answering as a
+// 1280px viewport so `useIsMobileViewport` stays false and the test exercises
+// the coarse-pointer branch alone rather than the mobile branch.
 function forceDesktopCoarsePointer(): () => void {
   const original = window.matchMedia;
   window.matchMedia = ((query: string) => ({
-    matches: query.includes("pointer: coarse"),
+    matches:
+      query.includes("pointer: coarse") ||
+      (() => {
+        const min = query.match(/^\(min-width: ([\d.]+)px\)$/);
+        return min !== null && 1280 >= parseFloat(min[1]);
+      })(),
     media: query,
     onchange: null,
     addListener: () => {},
