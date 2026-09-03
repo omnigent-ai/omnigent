@@ -72,6 +72,7 @@ from omnigent.tools.builtins.async_inbox import (
     SysCancelTaskTool,
     SysReadInboxTool,
 )
+from omnigent.tools.builtins.browser import BROWSER_TOOL_NAMES
 from omnigent.tools.builtins.download_file import DownloadFileTool
 from omnigent.tools.builtins.list_comments import ListCommentsTool
 from omnigent.tools.builtins.os_env import (
@@ -413,15 +414,7 @@ _SCHEDULED_TASK_TOOLS = frozenset(
 # result back. Execution lives HERE (not in Tool.invoke) because the browser
 # protocol needs the runner's ``server_client`` and ``ToolContext`` carries
 # none. See omnigent/tools/builtins/browser.py for the schema-only classes.
-_BROWSER_TOOLS = frozenset(
-    {
-        "browser_navigate",
-        "browser_snapshot",
-        "browser_click",
-        "browser_type",
-        "browser_screenshot",
-    }
-)
+_BROWSER_TOOLS = BROWSER_TOOL_NAMES
 
 # Runner-side outer HTTP read timeout for a browser action POST. The read
 # budget (60s) MUST exceed the server-side browser-action await (30s) so the
@@ -469,9 +462,9 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
     # runs native (claude/codex/pi) sessions, which ignore ``request.tools``
     # and see ONLY this relay surface — without this union member the
-    # feature is dead for its real target. The relay still filters
-    # ``ToolManager(spec).get_tool_schemas()``, so browser schemas appear
-    # only when the spec declares the builtins (see builtins/__init__.py).
+    # feature is dead for its real target. ToolManager auto-registers these
+    # framework-owned schemas for every spec, so the native relay surface is
+    # session-static and always includes them.
     | _BROWSER_TOOLS
     # Memory builtins are relayed to native harnesses too — unlike web_search,
     # native harnesses have no built-in long-term memory of their own.
@@ -486,10 +479,11 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
 def strip_browser_tool_schemas(schemas: list[_JsonObject]) -> list[_JsonObject]:
     """Drop the ``browser_*`` tool schemas from a tool-schema list.
 
-    Used when the turn's dispatch says no renderer is subscribed to the
-    session stream: a browser tool advertised then can only stall for the
-    full server-side await and fail, so a headless turn must not offer it
-    to the model at all. Handles both the nested OpenAI shape
+    Used for request-driven harnesses when the turn's dispatch says no
+    renderer is subscribed to the session stream. Native harnesses use a
+    session-scoped relay surface instead of the per-turn schema list, so they
+    retain the browser tools and rely on the server's prompt failure path.
+    Handles both the nested OpenAI shape
     (``{"function": {"name": ...}}``) and the flat relay shape
     (``{"name": ...}``).
 

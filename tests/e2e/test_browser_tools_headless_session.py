@@ -1,4 +1,4 @@
-"""End-to-end coverage for browser tools without a connected renderer."""
+"""End-to-end coverage for browser mitigation without a connected renderer."""
 
 from __future__ import annotations
 
@@ -69,7 +69,7 @@ def test_browser_action_request_fails_fast_without_renderer(
     assert elapsed < 2.0, f"browser action took {elapsed:.1f}s without a renderer"
 
 
-def test_browser_tools_not_advertised_without_renderer(
+def test_browser_tools_not_advertised_to_request_harness_without_renderer(
     http_client: httpx.Client,
     live_runner_id: str,
     mock_llm_server_url: str | None,
@@ -109,6 +109,8 @@ def test_browser_tools_not_advertised_without_renderer(
     )
     assert body["status"] == "completed", body
 
+    # openai-agents consumes the per-turn request schema. Native harnesses use
+    # a session-scoped relay and are covered only by the prompt failure path.
     advertised = set().union(
         *(
             _tool_names_in_request(request)

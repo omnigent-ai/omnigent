@@ -134,7 +134,12 @@ def register_browser_routes(
                     timeout=_sessions_facade._BROWSER_ACTION_CLAIM_GRACE_S,
                 )
             except TimeoutError:
-                return _BROWSER_ACTION_NO_RENDERER_RESULT
+                # ``wait_for`` can time out in the same event-loop tick that
+                # the claim handler sets the event. Honor that accepted lease
+                # so the renderer cannot execute a side effect after we report
+                # that no renderer claimed it.
+                if not claimed.is_set():
+                    return _BROWSER_ACTION_NO_RENDERER_RESULT
             done, _pending = await asyncio.wait(
                 {future},
                 timeout=_sessions_facade._BROWSER_ACTION_AWAIT_S,

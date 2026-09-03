@@ -375,6 +375,9 @@ _browser_action_claims: dict[str, str] = {}
 _browser_action_claim_events: dict[str, asyncio.Event] = {}
 
 
+# The Electron relay claims before doing browser work, so this only budgets
+# event delivery plus the claim round-trip. Keep it short enough that a generic
+# stream subscriber cannot recreate the old 30-second no-renderer stall.
 _BROWSER_ACTION_CLAIM_GRACE_S = 2.0
 
 

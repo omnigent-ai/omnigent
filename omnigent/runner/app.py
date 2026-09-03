@@ -6970,10 +6970,11 @@ def create_runner_app(
                     )
 
         _spec_tools = _session_tool_schemas.get(conv) or []
-        # Headless sessions must not advertise browser tools: with no
-        # renderer subscribed to the session stream, every ``browser_*``
-        # call can only stall and fail. The server stamps the hint on the
-        # forwarded turn; absent (older server) keeps them advertised.
+        # Request-driven harnesses should not advertise browser tools when no
+        # renderer is subscribed. Native harnesses ignore this per-turn list
+        # and keep their session-scoped relay surface; their calls still use
+        # the prompt no-renderer failure below. An absent hint from an older
+        # server preserves the previous advertised surface.
         if msg_body.get("browser_renderer_available") is False:
             from omnigent.runner.tool_dispatch import strip_browser_tool_schemas
 
