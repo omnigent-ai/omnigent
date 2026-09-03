@@ -1074,7 +1074,7 @@ describe("TerminalFirstContext", () => {
     expect(regularProbe).toHaveAttribute("data-is-claude-native", "false");
   });
 
-  it("targets the agent terminal while a user shell remains open in the workspace rail", () => {
+  it("targets the agent terminal while a user shell remains open in the workspace rail", async () => {
     writeSessionWorkspaceState("conv_native", {
       open: true,
       selectedTerminalKey: "terminal:terminal_bash_s1",
@@ -1104,7 +1104,8 @@ describe("TerminalFirstContext", () => {
 
     renderShell("/c/conv_native");
 
-    expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_bash_s1");
+    // findByTestId waits for the lazy TerminalView chunk to resolve through its Suspense boundary.
+    expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("terminal_bash_s1");
     fireEvent.click(screen.getByTestId("view-mode-terminal"));
     expect(screen.getByTestId("view-probe")).toHaveAttribute(
       "data-terminal-view-key",

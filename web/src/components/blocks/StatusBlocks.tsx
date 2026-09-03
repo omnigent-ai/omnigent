@@ -15,6 +15,7 @@ import {
   ChevronRightIcon,
   CopyIcon,
   InfoIcon,
+  Loader2Icon,
   RotateCcwIcon,
   RotateCwIcon,
   ShieldXIcon,
@@ -227,6 +228,7 @@ export function ErrorBanner({
           aria-atomic="true"
           className="relative z-10 h-auto rounded-xl border-border bg-background px-4 py-2 text-sm font-normal text-muted-foreground shadow-xs"
         >
+          <Loader2Icon aria-hidden="true" className="animate-spin" />
           Reconnecting
         </Badge>
       </div>

@@ -222,6 +222,7 @@ def any_policies_apply(
     policy_store: PolicyStore | None,
     phase: Phase | None = None,
     tool_name: str | None = None,
+    conversation: Conversation | None = None,
 ) -> bool:
     """Return ``True`` when at least one policy would run for this evaluation.
 
@@ -240,6 +241,11 @@ def any_policies_apply(
         policies are configured.
     :param phase: The evaluation phase, if known.
     :param tool_name: The tool being called (for ``PHASE_TOOL_CALL`` events).
+    :param conversation: The conversation row when the caller holds one. For
+        sub-agent conversations this lets the check see the CHILD spec's own
+        guardrails (which :func:`build_policy_engine` enforces), so a bundle
+        whose only policies live on a sub-agent is not fast-path skipped.
+        ``None`` checks the passed *spec* alone.
     :returns: ``False`` when the engine would have an empty policy list and
         ``evaluate()`` would unconditionally return ALLOW/UNSPECIFIED.
     """
@@ -250,6 +256,9 @@ def any_policies_apply(
         return True
     if spec.guardrails and spec.guardrails.policies:
         return True
+    child_spec = _resolve_sub_agent_spec(spec, conversation)
+    if child_spec is not None and child_spec.guardrails and child_spec.guardrails.policies:
+        return True
     if default_policies:
         return True
     if _load_default_policy_specs(policy_store):
@@ -259,6 +268,41 @@ def any_policies_apply(
     if _load_session_policy_specs(conversation_id, policy_store):
         return True
     return False
+
+
+def _resolve_sub_agent_spec(
+    spec: AgentSpec,
+    conversation: Conversation | None,
+) -> AgentSpec | None:
+    """
+    Resolve a sub-agent conversation's own child :class:`AgentSpec`.
+
+    Engine-build sites resolve a session's agent binding to the ROOT
+    bundle spec, so a sub-agent conversation's engine would otherwise
+    hold only the parent's guardrails and silently drop the child's
+    (e.g. a stricter ``max_tool_calls_per_session`` on the child).
+    This looks up ``conversation.sub_agent_name`` in the root spec's
+    ``sub_agents`` tree.
+
+    :param spec: The spec the caller resolved for this session —
+        the root bundle spec for sub-agent conversations.
+    :param conversation: The conversation row, or ``None`` when the
+        caller could not load one.
+    :returns: The child :class:`AgentSpec`, or ``None`` when the
+        conversation is not a sub-agent or the name does not resolve
+        in the tree (native-harness children store a display label
+        here).
+    """
+    if conversation is None or not conversation.sub_agent_name:
+        return None
+    # Lazy import: workflow imports the policies package at runtime, so a
+    # module-level import here would be circular.
+    from omnigent.runtime.workflow import _find_spec_by_name
+
+    child_spec = _find_spec_by_name(spec, conversation.sub_agent_name)
+    if child_spec is None or child_spec is spec:
+        return None
+    return child_spec
 
 
 def build_policy_engine(
@@ -400,7 +444,7 @@ def build_policy_engine(
     # is no longer reachable since all_policy_specs is never empty).
     all_policy_specs.append(_ASK_ON_ADD_POLICY_SPEC)
 
-    label_defs = (guardrails.labels or {}) if guardrails else {}
+    label_defs = dict((guardrails.labels or {}) if guardrails else {})
     # One conversation read (``conv``, resolved above for policy
     # inheritance) and ONE spawn-tree load feed everything below: labels,
     # session state (own + inherited root keys), both usage seeds, and the
@@ -475,6 +519,34 @@ def build_policy_engine(
                 code=ErrorCode.CONFLICT,
             )
         conv = confirmed
+    # A sub-agent conversation runs the CHILD agent's spec, but every
+    # engine-build site resolves the session's agent binding to the ROOT
+    # bundle spec. Resolve ``conv.sub_agent_name`` to the child spec so the
+    # child's own guardrails are enforced too. Resolved from the REFRESHED
+    # row (after the tree/identity checks above), per the freshness contract
+    # — a delete/recreate race must not enforce a stale child's policies.
+    # The child's policies are APPENDED after the parent's and same-name
+    # collisions are NOT deduplicated: both instances run, and DENY
+    # short-circuit makes the stricter limit the effective one, so a child
+    # redeclaring a parent policy name with a looser configuration cannot
+    # weaken the parent's fence. Native-harness children whose
+    # ``sub_agent_name`` is a display label resolve to no spec and are
+    # unaffected.
+    child_spec = _resolve_sub_agent_spec(spec, conv)
+    child_guardrails = child_spec.guardrails if child_spec is not None else None
+    if child_guardrails is not None and child_guardrails.policies:
+        agent_policy_specs = agent_policy_specs + list(child_guardrails.policies)
+        all_policy_specs = (
+            session_policy_specs
+            + agent_policy_specs
+            + admin_policy_specs
+            + [_ASK_ON_ADD_POLICY_SPEC]
+        )
+        if child_guardrails.labels:
+            # Child label schemas ADD keys; the parent's schema wins on a
+            # collision so a child cannot loosen a parent-declared label
+            # constraint.
+            label_defs = {**child_guardrails.labels, **label_defs}
     # Session policies are per-conversation, but sub-agents inherit the root
     # conversation's policies so guardrails set on the top-level session (e.g.
     # via sys_add_policy) also govern spawned children. Loaded from the
@@ -555,11 +627,15 @@ def build_policy_engine(
     # Session model: the conversation's model_override (set when a user
     # picks a model mid-session) wins over the spec's llm.model; None when
     # neither is available and cost policies treat it as undeterminable.
-    initial_model = (
-        conv.model_override
-        if conv is not None and conv.model_override
+    # A sub-agent session runs the CHILD spec's model, so its declaration
+    # (falling back to the root's when the child declares none) is the
+    # spec-level default here.
+    spec_model = (
+        child_spec.llm.model
+        if child_spec is not None and child_spec.llm and child_spec.llm.model
         else (spec.llm.model if spec.llm else None)
     )
+    initial_model = conv.model_override if conv is not None and conv.model_override else spec_model
     # Pass the full ModelPricing so the engine can price cache-read and
     # cache-write tokens at their own rates via compute_llm_cost(). Check
     # provider config first for custom pricing (self-hosted models), then
@@ -572,11 +648,15 @@ def build_policy_engine(
 
         provider_config = load_config()
         # Match the harness running this session; an override wins over the
-        # agent's configured executor harness.
-        harness = (
-            conv.harness_override
-            if conv is not None and conv.harness_override
+        # agent's configured executor harness. A sub-agent session runs the
+        # CHILD spec's executor.
+        spec_harness = (
+            child_spec.executor.harness_kind
+            if child_spec is not None
             else spec.executor.harness_kind
+        )
+        harness = (
+            conv.harness_override if conv is not None and conv.harness_override else spec_harness
         )
         token_pricing = fetch_model_pricing_with_provider(
             initial_model, provider_config=provider_config, harness=harness
@@ -601,7 +681,13 @@ def build_policy_engine(
             for s in all_policy_specs
         ],
         label_defs=label_defs,
-        ask_timeout=guardrails.ask_timeout if guardrails else DEFAULT_ASK_TIMEOUT,
+        # A sub-agent's ASKs resolve under its own declared timeout; fall
+        # back to the root's, then the default.
+        ask_timeout=(
+            child_guardrails.ask_timeout
+            if child_guardrails is not None
+            else (guardrails.ask_timeout if guardrails else DEFAULT_ASK_TIMEOUT)
+        ),
         conversation_id=conversation_id,
         initial_labels=initial_labels,
         initial_session_state=initial_session_state,

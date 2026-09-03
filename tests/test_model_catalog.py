@@ -26,9 +26,11 @@ from omnigent.codex_model_vocabulary import codex_spawn_model
 from omnigent.model_catalog import (
     ModelEntry,
     ModelListing,
+    ResolvedModelProvider,
     catalog_for_spec,
     catalog_model_entries,
     list_models_for_worker,
+    model_configuration_source,
     model_family_token,
     resolve_catalog_model,
     resolve_model_provider,
@@ -100,6 +102,125 @@ def _worker_spec(harness: str, **executor_kwargs: object) -> AgentSpec:
         name="worker",
         executor=ExecutorSpec(type="omnigent", config={"harness": harness}, **executor_kwargs),  # type: ignore[arg-type]
     )
+
+
+@pytest.mark.parametrize(
+    ("provider", "expected"),
+    [
+        pytest.param(ResolvedModelProvider(kind="none"), None, id="none"),
+        pytest.param(
+            ResolvedModelProvider(kind="subscription", cli="claude"),
+            {"kind": "subscription", "label": "Subscription", "name": "claude"},
+            id="subscription",
+        ),
+        pytest.param(
+            ResolvedModelProvider(kind="databricks", profile="production-west"),
+            {"kind": "databricks", "label": "Workspace", "name": "production-west"},
+            id="databricks",
+        ),
+        pytest.param(
+            ResolvedModelProvider(
+                kind="gateway",
+                detail="provider 'production'",
+                base_url="https://gateway.example.com/v1",
+            ),
+            {
+                "kind": "gateway",
+                "label": "AI Gateway",
+                "name": "production",
+                "host": "gateway.example.com",
+            },
+            id="gateway",
+        ),
+        pytest.param(
+            ResolvedModelProvider(
+                kind="local",
+                detail="provider 'ollama'",
+                base_url="http://localhost:11434/v1",
+            ),
+            {
+                "kind": "local",
+                "label": "Local",
+                "name": "ollama",
+                "host": "localhost:11434",
+            },
+            id="local",
+        ),
+        pytest.param(
+            ResolvedModelProvider(
+                kind="bedrock",
+                family="anthropic",
+                detail="provider 'production-bedrock'",
+                base_url="https://bedrock-runtime.us-west-2.amazonaws.com",
+            ),
+            {
+                "kind": "bedrock",
+                "label": "Bedrock",
+                "name": "production-bedrock",
+                "host": "bedrock-runtime.us-west-2.amazonaws.com",
+            },
+            id="bedrock",
+        ),
+        pytest.param(
+            ResolvedModelProvider(kind="cli-config", cli="codex", detail="config.toml"),
+            {"kind": "cli-config", "label": "CLI config", "name": "config.toml"},
+            id="cli-config",
+        ),
+        pytest.param(
+            ResolvedModelProvider(
+                kind="key",
+                family="anthropic",
+                base_url="https://must-not-leak:secret@api.anthropic.com:8443/v1",
+                api_key="must-not-leak",
+            ),
+            {
+                "kind": "key",
+                "label": "API key",
+                "name": "anthropic",
+                "host": "api.anthropic.com:8443",
+            },
+            id="api-key",
+        ),
+        pytest.param(
+            ResolvedModelProvider(
+                kind="gateway",
+                detail="provider 'production'",
+                base_url="https://[malformed/v1",
+            ),
+            {"kind": "gateway", "label": "AI Gateway", "name": "production"},
+            id="malformed-url",
+        ),
+    ],
+)
+def test_model_configuration_source_exposes_only_safe_coordinates(
+    provider: ResolvedModelProvider, expected: dict[str, str] | None
+) -> None:
+    """Composer metadata identifies the connection without serializing credentials."""
+    source = model_configuration_source(provider)
+    assert source == expected
+    assert "must-not-leak" not in repr(source)
+    assert "secret" not in repr(source)
+
+
+def test_native_claude_legacy_api_key_source_is_its_cli_subscription() -> None:
+    """Native Claude ignores legacy API-key auth while SDK Claude consumes it."""
+    provider = ResolvedModelProvider(
+        kind="key",
+        family="anthropic",
+        api_key="must-not-leak",
+        detail="api_key auth",
+    )
+
+    assert model_configuration_source(provider, harness="claude-native") == {
+        "kind": "subscription",
+        "label": "Subscription",
+        "name": "claude",
+    }
+    assert model_configuration_source(provider, harness="claude-sdk") == {
+        "kind": "key",
+        "label": "API key",
+        "name": "anthropic",
+    }
 
 
 _DATABRICKS_DEFAULT_CONFIG = (

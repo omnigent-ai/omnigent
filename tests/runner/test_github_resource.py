@@ -1,16 +1,18 @@
 """Tests for :mod:`omnigent.runner.github_resource`.
 
-The ``git``-backed functions (:func:`github_changed_files`,
-:func:`github_file_diff`) run against a real temp repo so the subprocess path is
-fully exercised. The ``gh``-backed :func:`github_info` is covered for its
-availability fallbacks (``gh`` missing, not a git repo) and its check-summary
-reducer, which don't require ``gh`` or the network.
+:func:`github_file_diff` (the on-demand expand-context reader) runs ``git show``
+against a real temp repo. The PR-backed :func:`github_changed_files` /
+:func:`github_pr_diff` shell out to ``gh``, stubbed here via :func:`_stub_gh`.
+:func:`github_info`'s availability fallbacks and its check-summary reducer need
+neither ``gh`` nor the network.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -23,6 +25,25 @@ from omnigent.runner.github_resource import (
     github_info,
     github_pr_diff,
 )
+
+
+def _stub_gh(
+    monkeypatch: pytest.MonkeyPatch,
+    responses: dict[tuple[str, ...], tuple[int, str, str]],
+) -> None:
+    """Stub ``github_resource._gh`` to answer by the argv's leading tokens.
+
+    :param responses: Maps a leading-argv prefix (e.g. ``("pr", "view")``) to
+        the ``(returncode, stdout, stderr)`` it should return.
+    """
+
+    def fake_gh(argv: Sequence[str], *, cwd: str) -> tuple[int, str, str]:
+        for prefix, value in responses.items():
+            if tuple(argv[: len(prefix)]) == prefix:
+                return value
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
 
 
 def _git_env() -> dict[str, str]:
@@ -64,13 +85,11 @@ def repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def test_github_info_gh_not_installed_still_serves_git(
-    repo: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Without ``gh``, a git repo still reports branch + base so the diff renders.
+def test_github_info_gh_not_installed(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without ``gh`` there's no PR knowable, so base/pr/repo are null.
 
-    This is what lets the host fallback serve the branch-vs-base diff when the
-    runner is offline and its machine has no ``gh``.
+    ``available`` still reflects "is a git repo" and reports the branch; the tab
+    is a pure PR view, so ``base_ref`` is null until a PR resolves it.
     """
     monkeypatch.setattr(github_resource.shutil, "which", lambda _name: None)
     info = github_info(str(repo))
@@ -78,7 +97,7 @@ def test_github_info_gh_not_installed_still_serves_git(
     assert info["gh_available"] is False
     assert info["authenticated"] is False
     assert info["branch"] == "feature"
-    assert info["base_ref"] == "main"
+    assert info["base_ref"] is None
     assert info["pr"] is None
     assert info["repo"] is None
 
@@ -91,17 +110,36 @@ def test_github_info_not_a_git_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert info["reason"] == "not_a_git_repo"
 
 
-def test_github_changed_files_statuses(repo: Path) -> None:
-    """Changed-files list reports add/modify/delete against the base branch."""
-    result = github_changed_files(str(repo), "main")
+def test_github_changed_files_maps_pr_file_statuses(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The list comes from ``gh api pulls/<n>/files``, mapping GitHub statuses."""
+    files = [
+        {"filename": "newfile.py", "status": "added", "additions": 1, "deletions": 0},
+        {"filename": "src/fileA.py", "status": "modified", "additions": 2, "deletions": 1},
+        {"filename": "fileB.py", "status": "removed", "additions": 0, "deletions": 3},
+        {
+            "filename": "new/name.py",
+            "status": "renamed",
+            "additions": 0,
+            "deletions": 0,
+            "previous_filename": "old/name.py",
+        },
+    ]
+    _stub_gh(
+        monkeypatch,
+        {
+            ("pr", "view"): (0, json.dumps({"number": 7}), ""),
+            ("api",): (0, json.dumps(files), ""),
+        },
+    )
+    result = github_changed_files("/root")
     by_path = {entry["path"]: entry for entry in result["data"]}
     assert by_path["newfile.py"]["status"] == "created"
-    assert by_path["fileA.py"]["status"] == "modified"
+    assert by_path["src/fileA.py"]["status"] == "modified"
     assert by_path["fileB.py"]["status"] == "deleted"
-    assert "fileC.py" not in by_path
-    # Line counts come from numstat: the added file gains a line.
+    assert by_path["new/name.py"]["status"] == "renamed"
+    # Line counts and the display name come straight from the PR file entry.
     assert by_path["newfile.py"]["lines_added"] == 1
-    assert by_path["newfile.py"]["name"] == "newfile.py"
+    assert by_path["src/fileA.py"]["name"] == "fileA.py"
 
 
 def test_github_file_diff_added(repo: Path) -> None:
@@ -125,30 +163,23 @@ def test_github_file_diff_deleted(repo: Path) -> None:
     assert diff["after"] is None
 
 
-def test_github_changed_files_unresolvable_base(repo: Path) -> None:
-    """An unknown base ref yields an empty list rather than an error."""
-    result = github_changed_files(str(repo), "does-not-exist")
-    assert result == {"object": "list", "data": [], "has_more": False}
+def test_github_changed_files_no_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no PR for the branch, the list is empty (no local git fallback)."""
+    _stub_gh(monkeypatch, {("pr", "view"): (1, "", "no pull requests found")})
+    assert github_changed_files("/root") == {"object": "list", "data": [], "has_more": False}
 
 
-def test_github_pr_diff_covers_all_files(repo: Path) -> None:
-    """The whole-PR patch is one unified diff spanning every changed file."""
-    result = github_pr_diff(str(repo), "main")
-    patch = result["patch"]
-    # One diff header per changed file, plus the actual change content.
-    assert "diff --git a/fileA.py b/fileA.py" in patch
-    assert "diff --git a/newfile.py b/newfile.py" in patch
-    assert "diff --git a/fileB.py b/fileB.py" in patch
-    assert "+A changed" in patch
-    assert "fileC.py" not in patch  # unchanged file absent
+def test_github_pr_diff_returns_gh_patch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The whole-PR patch is ``gh pr diff`` verbatim (GitHub-computed)."""
+    patch = "diff --git a/fileA.py b/fileA.py\n@@ -1 +1 @@\n-A base\n+A changed\n"
+    _stub_gh(monkeypatch, {("pr", "diff"): (0, patch, "")})
+    assert github_pr_diff("/root") == {"object": "session.github.pr_diff", "patch": patch}
 
 
-def test_github_pr_diff_unresolvable_base(repo: Path) -> None:
-    """An unknown base ref yields an empty patch rather than an error."""
-    assert github_pr_diff(str(repo), "does-not-exist") == {
-        "object": "session.github.pr_diff",
-        "patch": "",
-    }
+def test_github_pr_diff_no_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no PR for the branch, the patch is empty rather than an error."""
+    _stub_gh(monkeypatch, {("pr", "diff"): (1, "", "no pull requests found")})
+    assert github_pr_diff("/root") == {"object": "session.github.pr_diff", "patch": ""}
 
 
 def test_summarize_checks_mixed() -> None:

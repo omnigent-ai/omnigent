@@ -1,9 +1,10 @@
 """GitHub integration for the session workspace, backed by the ``gh`` CLI.
 
-Powers the web UI's read-only "GitHub" rail tab. Everything here shells out to
-``gh`` (for PR metadata) and ``git`` (for the branch-vs-base diff) inside the
-session's workspace, mirroring the ``git`` subprocess pattern the changed-files
-/ diff endpoints already use (see :mod:`omnigent.runtime.filesystem_registry`).
+Powers the web UI's read-only "GitHub" rail tab, which is purely a PR view: the
+changed-files list and the whole-PR patch come straight from GitHub via ``gh``
+(``gh api .../pulls/<n>/files`` and ``gh pr diff``), so they match the PR's
+"Files changed" exactly. With no PR for the branch the tab shows its "no PR"
+empty state and fetches nothing.
 
 Design notes:
 
@@ -11,10 +12,11 @@ Design notes:
   sandboxed OS-env shell helper. The helper strips secrets from the environment,
   which would break ``gh`` auth; a plain subprocess inherits the runner process
   environment (the developer's ``gh`` auth in local dev).
-- The diff is computed locally with ``git`` against the PR's merge-base (the
-  three-dot / "Files changed" semantics GitHub shows), so it yields full
-  before/after file content the Monaco diff viewer can render — a unified-diff
-  blob cannot.
+- The list and patch are GitHub-computed, never a local ``git diff``, so a stale
+  local ``origin/<base>`` can't inflate them with files outside the PR.
+- Only the on-demand per-file expand-context reader (:func:`github_file_diff`)
+  still uses ``git show`` for full before/after content — a unified-diff blob
+  can't drive the viewer's context expansion.
 - ``available: false`` payloads let the tab render a message ("gh not installed",
   "not a git repo") instead of surfacing an error.
 """
@@ -162,43 +164,19 @@ def _summarize_checks(rollup: Any) -> dict[str, Any]:
     }
 
 
-def _git_default_base(root: str) -> str | None:
-    """Detect the repo's default branch name from git alone (no ``gh``).
-
-    Lets the branch-vs-base diff resolve a base even when ``gh`` is missing or
-    unauthenticated (e.g. served over the host fallback). Prefers the remote's
-    published HEAD, then a conventional ``main``/``master``.
-
-    :param root: Absolute workspace path.
-    :returns: A branch name, e.g. ``"main"``, or ``None``.
-    """
-    rc, out, _ = _git(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], cwd=root)
-    if rc == 0 and out.strip():
-        # "refs/remotes/origin/main" → "main"
-        return out.strip().rsplit("/", 1)[-1]
-    # No published remote HEAD: fall back to a conventional default, preferring
-    # the remote-tracking ref, then a local branch (a local-only workspace).
-    for candidate in ("origin/main", "origin/master", "main", "master"):
-        rc, _, _ = _git(["rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"], cwd=root)
-        if rc == 0:
-            return candidate.rsplit("/", 1)[-1]
-    return None
-
-
 def github_info(root: str) -> dict[str, Any]:
     """Resolve GitHub context for the workspace: repo, branch, base, and PR.
 
-    Git-first: a git checkout is the fundamental requirement (the branch-vs-base
-    diff is viewable from git alone), and ``gh`` layers PR/repo metadata on top.
-    So ``available`` reflects "is a git repo", and ``base_ref`` is populated from
-    git even when ``gh`` is absent — this is what lets the host fallback serve
-    the diff when the runner is offline and its machine has no ``gh``.
+    Git-first: a git checkout is the fundamental requirement, so ``available``
+    reflects "is a git repo". ``gh`` layers the repo / PR metadata on top;
+    ``base_ref`` is the PR's base branch (``None`` when there's no PR, since the
+    tab is a pure PR view).
 
     :param root: Absolute path to the session workspace.
     :returns: A ``session.github.info`` object. ``available`` is false only when
         this isn't a git repo (``reason: not_a_git_repo``). ``gh_available`` /
         ``authenticated`` report whether the ``gh`` CLI is present and signed in;
-        ``repo`` / ``pr`` are null without it, and the diff still renders.
+        ``repo`` / ``pr`` / ``base_ref`` are null without it.
     """
     payload: dict[str, Any] = {"object": "session.github.info"}
 
@@ -207,11 +185,10 @@ def github_info(root: str) -> dict[str, Any]:
         payload.update(available=False, reason="not_a_git_repo")
         return payload
     branch = out.strip()
-    git_base = _git_default_base(root)
     payload.update(
         available=True,
         branch=branch,
-        base_ref=git_base,
+        base_ref=None,
         repo=None,
         pr=None,
     )
@@ -229,15 +206,11 @@ def github_info(root: str) -> dict[str, Any]:
     if not authenticated:
         return payload
 
-    default_branch: str | None = None
-    rc, out, _ = _gh(["repo", "view", "--json", "nameWithOwner,defaultBranchRef"], cwd=root)
+    rc, out, _ = _gh(["repo", "view", "--json", "nameWithOwner"], cwd=root)
     if rc == 0:
         try:
             data = json.loads(out)
             payload["repo"] = {"name_with_owner": data.get("nameWithOwner")}
-            ref = data.get("defaultBranchRef")
-            if isinstance(ref, dict):
-                default_branch = ref.get("name")
         except (ValueError, AttributeError):
             pass
 
@@ -262,9 +235,8 @@ def github_info(root: str) -> dict[str, Any]:
             pr = None
     payload["pr"] = pr
 
-    # Diff base precedence: the PR's base, else gh's default branch, else the
-    # git-derived default already set above.
-    payload["base_ref"] = (pr.get("base_ref") if pr else None) or default_branch or git_base
+    # A pure PR view: the base is the PR's base branch, else null (no PR).
+    payload["base_ref"] = pr.get("base_ref") if pr else None
     return payload
 
 
@@ -309,67 +281,84 @@ def _resolve_diff_base(root: str, base: str) -> str | None:
     return resolved
 
 
-# git diff status letters → the status vocabulary the web changed-files list uses.
-_STATUS_MAP = {
-    "A": "created",
-    "M": "modified",
-    "D": "deleted",
-    "R": "renamed",
-    "C": "created",
-    "T": "modified",
+# GitHub pulls/files ``status`` → the status vocabulary the web list uses.
+_GH_STATUS_MAP = {
+    "added": "created",
+    "removed": "deleted",
+    "modified": "modified",
+    "renamed": "renamed",
+    "copied": "created",
+    "changed": "modified",
+    "unchanged": "modified",
 }
 
 
-def github_changed_files(root: str, base: str) -> dict[str, Any]:
-    """List files changed on HEAD relative to the base branch's merge-base.
+def _pr_number(root: str) -> int | None:
+    """Return the PR number for the workspace's branch, or ``None``.
 
     :param root: Absolute workspace path.
-    :param base: Base branch name, e.g. ``"main"``.
+    :returns: The associated PR's number, or ``None`` when ``gh`` finds no PR
+        (none for the branch, ``gh`` missing, or not authenticated).
+    """
+    rc, out, _ = _gh(["pr", "view", "--json", "number"], cwd=root)
+    if rc != 0:
+        return None
+    try:
+        number = json.loads(out).get("number")
+    except (ValueError, AttributeError):
+        return None
+    return number if isinstance(number, int) else None
+
+
+def github_changed_files(root: str) -> dict[str, Any]:
+    """List the PR's changed files, straight from GitHub.
+
+    Sourced from ``gh api .../pulls/<n>/files`` so the set (and each file's
+    status / line counts) matches the PR's "Files changed" exactly — never a
+    local ``git diff``. Empty when the branch has no PR.
+
+    :param root: Absolute workspace path.
     :returns: A ``list`` object whose ``data`` entries carry ``path`` / ``name``
         / ``status`` / ``lines_added`` / ``lines_removed``.
     """
-    diff_base = _resolve_diff_base(root, base)
-    if diff_base is None:
-        return {"object": "list", "data": [], "has_more": False}
-
-    # numstat first (adds/dels + final path), keyed by path for the status merge.
-    # ``-M`` detects renames so a moved file shows once (matching the whole-PR
-    # patch the diff view parses), not as a delete + add pair.
-    counts: dict[str, tuple[int | None, int | None]] = {}
-    rc, out, _ = _git(["diff", "-M", "--numstat", diff_base, "HEAD"], cwd=root)
-    if rc == 0:
-        for line in out.splitlines():
-            parts = line.split("\t")
-            if len(parts) < 3:
-                continue
-            added, removed, path = parts[0], parts[1], parts[-1]
-            counts[path] = (
-                None if added == "-" else int(added),
-                None if removed == "-" else int(removed),
-            )
+    empty: dict[str, Any] = {"object": "list", "data": [], "has_more": False}
+    number = _pr_number(root)
+    if number is None:
+        return empty
+    # ``{owner}`` / ``{repo}`` are filled by ``gh`` from the repo; ``--paginate``
+    # concatenates the pages of the (array) response into one JSON array.
+    rc, out, _ = _gh(
+        ["api", "--paginate", f"repos/{{owner}}/{{repo}}/pulls/{number}/files?per_page=100"],
+        cwd=root,
+    )
+    if rc != 0:
+        return empty
+    try:
+        entries = json.loads(out)
+    except ValueError:
+        return empty
+    if not isinstance(entries, list):
+        return empty
 
     data: list[dict[str, Any]] = []
-    rc, out, _ = _git(["diff", "-M", "--name-status", diff_base, "HEAD"], cwd=root)
-    if rc == 0:
-        for line in out.splitlines():
-            parts = line.split("\t")
-            if len(parts) < 2:
-                continue
-            code = parts[0][:1]
-            # For renames/copies (``R100\told\tnew``) the last field is the
-            # current path — the one the diff endpoint reads at HEAD.
-            path = parts[-1]
-            added, removed = counts.get(path, (None, None))
-            data.append(
-                {
-                    "object": "session.github.changed_file",
-                    "path": path,
-                    "name": path.split("/")[-1],
-                    "status": _STATUS_MAP.get(code, "modified"),
-                    "lines_added": added,
-                    "lines_removed": removed,
-                }
-            )
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        # ``filename`` is the current path (the new name for a rename) — the one
+        # the diff endpoint reads at HEAD, matching the whole-PR patch.
+        path = entry.get("filename")
+        if not path:
+            continue
+        data.append(
+            {
+                "object": "session.github.changed_file",
+                "path": path,
+                "name": str(path).split("/")[-1],
+                "status": _GH_STATUS_MAP.get(str(entry.get("status")), "modified"),
+                "lines_added": entry.get("additions"),
+                "lines_removed": entry.get("deletions"),
+            }
+        )
     return {"object": "list", "data": data, "has_more": False}
 
 
@@ -405,21 +394,16 @@ def github_file_diff(root: str, base: str, path: str) -> dict[str, Any]:
     }
 
 
-def github_pr_diff(root: str, base: str) -> dict[str, Any]:
-    """Return the whole PR as one unified diff patch (HEAD vs the base merge-base).
+def github_pr_diff(root: str) -> dict[str, Any]:
+    """Return the whole PR as one unified diff patch, straight from GitHub.
 
-    One ``git diff`` for every changed file, so the web view can render the
-    entire PR from a single call (parsed client-side into per-file diffs).
-    ``-M`` detects renames so a move renders as one file rather than a
-    delete + add.
+    ``gh pr diff`` yields the PR's "Files changed" patch (server-computed against
+    the base's merge-base), which the web view parses client-side into per-file
+    diffs. Empty when the branch has no PR.
 
     :param root: Absolute workspace path.
-    :param base: Base branch name, e.g. ``"main"``.
     :returns: A ``session.github.pr_diff`` object with the ``patch`` text
-        (empty when the base can't be resolved / there are no changes).
+        (empty when there's no PR / no changes).
     """
-    diff_base = _resolve_diff_base(root, base)
-    if diff_base is None:
-        return {"object": "session.github.pr_diff", "patch": ""}
-    rc, out, _ = _git(["diff", "-M", diff_base, "HEAD"], cwd=root)
+    rc, out, _ = _gh(["pr", "diff"], cwd=root)
     return {"object": "session.github.pr_diff", "patch": out if rc == 0 else ""}

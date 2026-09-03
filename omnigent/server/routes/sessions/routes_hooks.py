@@ -771,6 +771,10 @@ def register_hooks_routes(
             policy_store=get_policy_store(),
             phase=phase,
             tool_name=data.get("name") if isinstance(data, dict) else None,
+            # A sub-agent conversation's own guardrails live on the CHILD
+            # spec inside this bundle; without the row the check would
+            # fast-path skip a bundle whose only policies are child-declared.
+            conversation=conv,
         ):
             return Response(
                 content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),

@@ -21,9 +21,15 @@ from omnigent.extensions import (
 
 
 class _Distribution:
-    def __init__(self, name: str, version: str | None = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        version: str | None = None,
+        files: tuple[str, ...] | None = None,
+    ) -> None:
         self.name = name
         self.version = version
+        self.files = files
 
 
 class _EntryPoint:
@@ -34,10 +40,14 @@ class _EntryPoint:
         *,
         distribution: str | None = None,
         version: str | None = None,
+        module: str | None = None,
+        files: tuple[str, ...] | None = None,
     ) -> None:
         self.name = name
         self._loader = loader
-        self.dist = _Distribution(distribution, version) if distribution else None
+        self.module = module
+        self.value = f"{module}:get_manifest" if module else ""
+        self.dist = _Distribution(distribution, version, files) if distribution else None
 
     def load(self) -> Callable[[], ExtensionManifest] | object:
         return self._loader
@@ -183,6 +193,54 @@ def test_accepts_manifest_object_without_factory(monkeypatch: pytest.MonkeyPatch
     _install_entry_points(monkeypatch, _EntryPoint("review", _manifest()))
 
     assert registry.extension_manifests() == (_manifest(),)
+
+
+def test_records_verified_asset_package(monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest = _manifest()
+    _install_entry_points(
+        monkeypatch,
+        _EntryPoint(
+            "review",
+            manifest,
+            distribution=manifest.distribution,
+            version=manifest.version,
+            module="acme_review.plugin",
+            files=("acme_review/__init__.py", "acme_review/dist/extension.js"),
+        ),
+    )
+
+    state = registry.plugin_state()
+
+    assert state.asset_package(manifest.id) == "acme_review"
+
+
+def test_does_not_record_unverified_or_core_asset_package(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unverified = _manifest("acme.unverified")
+    core = _manifest("acme.core")
+    _install_entry_points(
+        monkeypatch,
+        _EntryPoint(
+            "unverified",
+            unverified,
+            distribution=unverified.distribution,
+            module="not_owned.plugin",
+            files=("different_package/__init__.py",),
+        ),
+        _EntryPoint(
+            "core",
+            core,
+            distribution=core.distribution,
+            module="omnigent.extensions",
+            files=("omnigent/__init__.py",),
+        ),
+    )
+
+    state = registry.plugin_state()
+
+    assert state.asset_package(unverified.id) is None
+    assert state.asset_package(core.id) is None
 
 
 def test_records_bad_return_type_without_breaking_healthy_extension(
@@ -377,9 +435,18 @@ def test_requires_javascript_suffix_for_browser_entrypoint(
     _install_entry_points(monkeypatch, _EntryPoint("review", manifest))
 
     assert (
-        "browser entrypoint must use one of: .js, .mjs"
-        in registry.plugin_state().load_errors["review"]
+        "browser entrypoint must use one of: .js" in registry.plugin_state().load_errors["review"]
     )
+
+
+def test_requires_fixed_browser_bundle_location(monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest = replace(
+        _manifest(),
+        entrypoints=ExtensionEntrypoints(browser="other/extension.js"),
+    )
+    _install_entry_points(monkeypatch, _EntryPoint("review", manifest))
+
+    assert "must be dist/extension.js" in registry.plugin_state().load_errors["review"]
 
 
 def test_requires_css_suffix_for_browser_styles(monkeypatch: pytest.MonkeyPatch) -> None:

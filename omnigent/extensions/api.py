@@ -82,7 +82,12 @@ class ExtensionPluginState:
 
     manifests: tuple[ExtensionManifest, ...]
     load_errors: dict[str, str] = field(default_factory=dict)
+    asset_packages: dict[str, str] = field(default_factory=dict)
 
     def get(self, extension_id: str) -> ExtensionManifest | None:
         """Return one accepted manifest by ID."""
         return next((item for item in self.manifests if item.id == extension_id), None)
+
+    def asset_package(self, extension_id: str) -> str | None:
+        """Return the verified package holding an extension's browser assets."""
+        return self.asset_packages.get(extension_id)

@@ -2155,18 +2155,16 @@ def register_resources_routes(
     async def read_github_pr_diff(
         request: Request,
         session_id: str,
-        base: str | None = Query(default=None),
     ) -> Any:
         """
         Return the whole PR as one unified diff patch.
 
-        One ``git diff`` covering every changed file, gzipped on the way out
+        ``gh pr diff`` covering every changed file, gzipped on the way out
         (patches are large). The web view parses it client-side into per-file
         diffs. Falls back to the host tunnel when the runner is offline.
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session/conversation identifier.
-        :param base: Base branch name; the default is derived when omitted.
         :returns: JSON with the ``patch`` text.
         """
         conv = await _validate_session(session_id, request, LEVEL_READ)
@@ -2174,9 +2172,8 @@ def register_resources_routes(
             session_id,
             conv,
             op="github_pr_diff",
-            host_params={"base": base},
+            host_params={},
             runner_path=f"/v1/sessions/{session_id}/resources/github/diff",
-            runner_params={"base": base} if base else None,
         )
 
     @file_read_router.get(
@@ -2493,15 +2490,12 @@ def register_resources_routes(
     async def list_session_github_changes(
         request: Request,
         session_id: str,
-        base: str | None = Query(default=None),
     ) -> dict[str, Any]:
         """
-        List files changed on the branch relative to its base (PR diff).
+        List the PR's changed files (empty when the branch has no PR).
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session/conversation identifier.
-        :param base: Base branch name; the runner derives the default when
-            omitted.
         :returns: Flat list of changed files with ``status`` and line counts.
         """
         conv = await _validate_session(session_id, request, LEVEL_READ)
@@ -2509,9 +2503,8 @@ def register_resources_routes(
             session_id,
             conv,
             op="github_changes",
-            host_params={"base": base},
+            host_params={},
             runner_path=f"/v1/sessions/{session_id}/resources/github/changes",
-            runner_params={"base": base} if base else None,
         )
 
     # Generic single-resource lookup — registered AFTER typed

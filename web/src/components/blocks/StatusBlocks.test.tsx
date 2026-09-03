@@ -169,6 +169,11 @@ describe("ErrorBanner", () => {
     expect(screen.queryByTestId("error-headline")).toBeNull();
     expect(reconnecting).toHaveClass("justify-center", "min-h-14");
     expect(status).toHaveTextContent(/^Reconnecting$/);
+    // The badge pairs the label with an animated spinner so the in-flight
+    // attempt reads as active work; the text stays the accessible label.
+    const spinner = reconnecting.querySelector(".animate-spin");
+    expect(spinner).not.toBeNull();
+    expect(spinner).toHaveAttribute("aria-hidden", "true");
     expect(status).toHaveAttribute("aria-live", "polite");
     expect(status).toHaveAttribute("aria-atomic", "true");
     expect(status).toHaveClass("rounded-xl", "border-border", "bg-background");

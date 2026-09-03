@@ -5024,6 +5024,64 @@ def test_forwarder_sends_codex_command_approval_response_to_app_server(
     assert fake_client.responses == [(14, {"decision": "accept"})]
 
 
+def test_forwarder_declines_codex_command_when_approval_hook_rejects_request(
+    tmp_path: Path,
+) -> None:
+    """A rejected Omnigent hook must not leave Codex waiting forever."""
+    fake_client = _FakeCodexAppServerClient()
+    codex_event = {
+        "id": 14,
+        "method": "item/commandExecution/requestApproval",
+        "params": {
+            "threadId": "thread_123",
+            "turnId": "turn_123",
+            "itemId": "item_cmd",
+            "command": "date",
+            "availableDecisions": [
+                {
+                    "acceptWithExecpolicyAmendment": {
+                        "execpolicy_amendment": [],
+                    }
+                }
+            ],
+        },
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/conv_123/hooks/codex-elicitation-request"
+        assert json.loads(request.content) == codex_event
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "code": "invalid_input",
+                    "message": ("Codex execpolicy amendment must be a non-empty list of strings."),
+                }
+            },
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            elicitation_tracker = _elicitation_tracker()
+            await codex_native_forwarder._handle_event(
+                client,
+                session_id="conv_123",
+                bridge_dir=tmp_path,
+                usage_coalescer=_usage_coalescer(client),
+                elicitation_tracker=elicitation_tracker,
+                event=codex_event,
+                codex_client=fake_client,  # type: ignore[arg-type]
+            )
+            await elicitation_tracker.drain()
+
+    asyncio.run(run())
+
+    assert fake_client.responses == [(14, {"decision": "decline"})]
+
+
 def test_forwarder_routes_unregistered_child_command_approval_to_parent(
     tmp_path: Path,
 ) -> None:

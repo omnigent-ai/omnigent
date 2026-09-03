@@ -530,8 +530,10 @@ def seed_isolated_agy_home(
 ) -> dict[str, str]:
     """Seed the per-session isolated agy Gemini dir and return env overrides.
 
-    Copies known file-based agy OAuth markers + onboarding/migration state (NEVER
-    moving or modifying the real files) into ``<bridge_dir>/agy-home/.gemini``.
+    Copies known file-based agy OAuth markers, the user's ``settings.json``
+    (backend config such as the GCP project/location block), and
+    onboarding/migration state (NEVER moving or modifying the real files) into
+    ``<bridge_dir>/agy-home/.gemini``.
     The runner keeps agy's real ``HOME`` intact and passes this directory through
     ``--gemini_dir``; on macOS that is required because agy uses keyring-backed
     auth that is not portable to a relocated ``HOME``. The relay's
@@ -565,22 +567,8 @@ def seed_isolated_agy_home(
             dst.write_bytes(src.read_bytes())
             os.chmod(dst, 0o600)
 
-    # Seed the onboarding-complete marker so the first-run wizard never blocks a
-    # headless launch (same state ``ensure_agy_onboarding_complete`` writes).
-    onboarding = iso_gemini / "antigravity-cli" / "cache" / "onboarding.json"
-    with contextlib.suppress(OSError):
-        onboarding.write_text(
-            json.dumps(
-                {
-                    "consumerOnboardingComplete": True,
-                    "enterpriseOnboardingComplete": False,
-                    "onboardingComplete": True,
-                },
-                sort_keys=True,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
+    _seed_isolated_agy_settings(real_home, iso_gemini)
+    _seed_isolated_agy_onboarding_marker(real_home, iso_gemini)
 
     # Seed the migration marker so agy does not churn a from-scratch migration on
     # first launch under the fresh Gemini dir (cosmetic; agy creates it itself otherwise).
@@ -594,6 +582,66 @@ def seed_isolated_agy_home(
         _seed_isolated_agy_workspace_trust(iso_gemini, Path(trusted_workspace))
 
     return {}
+
+
+def _seed_isolated_agy_settings(real_home: Path, iso_gemini: Path) -> None:
+    """Seed the user's real ``settings.json`` as the base of the isolated one.
+
+    The real settings carry backend config agy needs at turn time — notably the
+    ``gcp`` block (project + location) for GCP/enterprise logins, without which
+    every turn fails server-side with ``invalid location: ""``. Copied only when
+    the isolated file is absent so a re-seed never clobbers per-session edits
+    (the trust / survey seeders then merge their keys on top). Best-effort: a
+    failed copy only means agy runs without the user's settings.
+
+    :param real_home: The user's real home directory.
+    :param iso_gemini: The bridge-owned ``--gemini_dir`` being seeded.
+    """
+    real_settings = real_home / ".gemini" / "antigravity-cli" / "settings.json"
+    iso_settings = iso_gemini / "antigravity-cli" / "settings.json"
+    if real_settings.is_file() and not iso_settings.exists():
+        with contextlib.suppress(OSError):
+            iso_settings.write_bytes(real_settings.read_bytes())
+            os.chmod(iso_settings, 0o600)
+
+
+def _seed_isolated_agy_onboarding_marker(real_home: Path, iso_gemini: Path) -> None:
+    """Seed the onboarding-complete marker so the first-run wizard never blocks.
+
+    The user's real marker is preferred: it carries auth-flow state the
+    synthetic default lacks (``enterpriseOnboardingComplete``,
+    ``previousAuthMethod``), without which an enterprise/GCP login re-enters
+    the first-run wizard and blocks TUI injection. The marker is intentionally
+    re-written on every seed (unlike the guarded settings copy): it is a
+    regenerable, non-secret wizard gate that agy does not meaningfully edit
+    per-session, so the freshest real-home state always wins.
+
+    The synthetic fallback (no real marker, e.g. a cleared agy cache) marks
+    BOTH onboarding flows complete: the marker's only job here is suppressing
+    an unhookable wizard on a headless launch, and ``enterpriseOnboardingComplete:
+    false`` verifiably re-triggers the wizard for enterprise/GCP accounts.
+
+    :param real_home: The user's real home directory.
+    :param iso_gemini: The bridge-owned ``--gemini_dir`` being seeded.
+    """
+    onboarding = iso_gemini / "antigravity-cli" / "cache" / "onboarding.json"
+    real_onboarding = real_home / ".gemini" / "antigravity-cli" / "cache" / "onboarding.json"
+    with contextlib.suppress(OSError):
+        if real_onboarding.is_file():
+            onboarding.write_bytes(real_onboarding.read_bytes())
+        else:
+            onboarding.write_text(
+                json.dumps(
+                    {
+                        "consumerOnboardingComplete": True,
+                        "enterpriseOnboardingComplete": True,
+                        "onboardingComplete": True,
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
 
 
 def _seed_isolated_agy_plugins(real_home: Path, iso_gemini: Path) -> None:

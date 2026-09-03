@@ -3571,6 +3571,34 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     expect(tooltip.textContent).not.toContain("—");
   });
 
+  it("shows the selected host's model provider in the gear tooltip", async () => {
+    useHostModelOptionsMock.mockImplementation(
+      (_hostId, harness) =>
+        (harness === "claude-native"
+          ? {
+              ...CLAUDE_MODEL_OPTIONS_RESULT,
+              data: CLAUDE_MODEL_OPTIONS_RESULT.data.map((model) => ({
+                ...model,
+                source: { kind: "subscription", label: "Subscription", name: "claude" },
+              })),
+            }
+          : CODEX_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
+    );
+    renderLanding();
+
+    fireEvent.focus(screen.getByTestId("new-chat-landing-config-gear"));
+    await waitFor(() =>
+      expect(screen.getAllByTestId("new-chat-landing-config-gear-tooltip").length).toBeGreaterThan(
+        0,
+      ),
+    );
+    const tooltip = screen.getAllByTestId("new-chat-landing-config-gear-tooltip")[0];
+    expect(tooltip).toHaveTextContent("Connection: Claude subscription");
+    expect(tooltip.textContent?.indexOf("Connection:")).toBeGreaterThan(
+      tooltip.textContent?.indexOf("Permissions:") ?? -1,
+    );
+  });
+
   it("reflects an armed Codex bypass as the Approval value in the gear tooltip", async () => {
     renderLanding();
     // Arm bypass on Codex (a2) via the Approval dropdown, Save.

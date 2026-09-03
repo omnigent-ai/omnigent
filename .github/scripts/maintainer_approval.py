@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate maintainer approval, preserving it across trusted bot commits."""
+"""Evaluate maintainer approval, including trusted bot authors and commits."""
 
 from __future__ import annotations
 
@@ -42,16 +42,20 @@ def approval_decision(
     head_repository: str,
     head_sha: str,
     maintainers: set[str],
+    trusted_authors: set[str],
     trusted_successors: set[str],
     reviews: list[dict[str, Any]],
     commits: list[dict[str, Any]],
     timeline: list[dict[str, Any]] | None = None,
 ) -> ApprovalDecision:
-    """Accept current approval or trusted successor commits."""
+    """Accept trusted authors, current approval, or trusted successor commits."""
     maintainers = {login.casefold() for login in maintainers}
+    trusted_authors = {login.casefold() for login in trusted_authors}
     trusted_successors = {login.casefold() for login in trusted_successors}
     if author.casefold() in maintainers:
         return ApprovalDecision(True, f"Author @{author} is a maintainer.")
+    if author.casefold() in trusted_authors:
+        return ApprovalDecision(True, f"Author @{author} is trusted automation.")
 
     commit_positions = {
         str(commit.get("sha") or ""): index for index, commit in enumerate(commits)
@@ -172,6 +176,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repository", required=True)
     parser.add_argument("--pr-number", type=int, required=True)
+    parser.add_argument("--trusted-author", action="append", default=[])
     parser.add_argument("--trusted-successor", action="append", default=[])
     args = parser.parse_args()
 
@@ -185,6 +190,7 @@ def main() -> int:
         head_repository=str(((pull.get("head") or {}).get("repo") or {}).get("full_name") or ""),
         head_sha=str((pull.get("head") or {}).get("sha") or ""),
         maintainers=maintainers(args.repository),
+        trusted_authors=set(args.trusted_author),
         trusted_successors=set(args.trusted_successor),
         reviews=reviews,
         commits=commits,

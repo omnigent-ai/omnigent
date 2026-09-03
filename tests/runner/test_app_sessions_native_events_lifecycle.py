@@ -625,7 +625,18 @@ async def test_cursor_native_model_options_use_cli_catalog(
         )
 
     assert response.status_code == 200
-    assert response.json() == {"models": expected}
+    assert response.json() == {
+        "models": [
+            {
+                **expected[0],
+                "source": {
+                    "kind": "subscription",
+                    "label": "Subscription",
+                    "name": "cursor-agent",
+                },
+            }
+        ]
+    }
     assert event_response.status_code == 204
     assert injected == [("provider-latest", "Provider Latest")]
 

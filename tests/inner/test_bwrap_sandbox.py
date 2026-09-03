@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1286,6 +1288,124 @@ def test_read_write_overlap_scanned_once(tmp_path: Path) -> None:
         if argv[i] == "--bind-try" and argv[i + 1] == "/dev/null" and argv[i + 2] == target
     )
     assert count == 1, f"Expected a single .env mask across overlapping grants, got {count}."
+
+
+def test_write_root_missing_on_host_is_created(tmp_path: Path) -> None:
+    """
+    Regression: a ``write_paths`` root that doesn't exist on the
+    host yet must be created before the ``--bind-try`` is emitted.
+
+    ``--bind-try`` silently skips a missing source, so without this the
+    grant would bind to nothing and the agent's first write would fail
+    with a bare "Read-only file system" error, well after the policy
+    layer already approved the write.
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    missing_root = cwd / "docs" / "specs"
+    assert not missing_root.exists()
+
+    backend = _make_backend()
+    policy = _make_policy(cwd, write_roots=[missing_root])
+    backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, cwd)
+
+    assert missing_root.is_dir(), "write_paths root must be created so bind-try has a real source"
+
+
+def test_write_root_missing_on_host_logs_loudly(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    Regression: creating a missing write_paths root must be
+    logged at a visible level, and the log must state the path and the
+    permissions it ended up with, not create it silently.
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    missing_root = cwd / "docs" / "specs"
+
+    backend = _make_backend()
+    policy = _make_policy(cwd, write_roots=[missing_root])
+    with caplog.at_level(logging.WARNING):
+        backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, cwd)
+
+    matching = [r for r in caplog.records if str(missing_root) in r.getMessage()]
+    all_messages = [r.getMessage() for r in caplog.records]
+    assert matching, f"Expected a warning naming {missing_root}, got: {all_messages}"
+    message = matching[0].getMessage()
+    assert "did not exist" in message
+    assert re.search(r"permissions\s+0o[0-7]+", message), (
+        f"Expected the log to state the created directory's permissions, got: {message!r}"
+    )
+
+
+def test_write_root_already_present_is_not_touched(tmp_path: Path) -> None:
+    """
+    A write_paths root that already exists on the host must not be
+    recreated or logged about — the fallback only applies to the
+    genuinely-missing case.
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    existing_root = tmp_path / "shared"
+    existing_root.mkdir()
+    before_mtime = existing_root.stat().st_mtime_ns
+
+    backend = _make_backend()
+    policy = _make_policy(cwd, write_roots=[existing_root])
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, cwd)
+
+    assert existing_root.stat().st_mtime_ns == before_mtime
+    assert "--bind-try" in argv
+    assert str(existing_root) in argv
+
+
+def test_write_root_uncreatable_warns_instead_of_failing(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A missing write_paths root whose creation fails (e.g. an unwritable
+    parent) must not abort the whole sandbox wrap: merged-in optional
+    write roots (harness-internal dirs under an unwritable ``/home``)
+    would otherwise degrade the helper to running unwrapped. The wrap
+    keeps the old skip-the-bind behavior for that root and warns loudly.
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    uncreatable_root = tmp_path / "locked" / "child" / "grandchild"
+
+    real_mkdir = Path.mkdir
+
+    def _mkdir(self: Path, *args: object, **kwargs: object) -> None:
+        # Simulate an unwritable parent regardless of runner privileges
+        # (mode-based enforcement doesn't hold when tests run as root).
+        if self == uncreatable_root:
+            raise PermissionError(13, "Permission denied", str(self))
+        real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", _mkdir)
+
+    backend = _make_backend()
+    policy = _make_policy(cwd, write_roots=[uncreatable_root])
+    with caplog.at_level(logging.WARNING):
+        argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, cwd)
+
+    assert not uncreatable_root.exists()
+    matching = [r for r in caplog.records if str(uncreatable_root) in r.getMessage()]
+    assert matching, "Expected a warning about the uncreatable write root"
+    assert "could not be created" in matching[0].getMessage()
+    # The full bind triple is still emitted; bwrap's --bind-try skips
+    # the missing source safely instead of failing the spawn.
+    triples = [
+        (argv[i], argv[i + 1], argv[i + 2])
+        for i, a in enumerate(argv)
+        if a == "--bind-try" and i + 2 < len(argv)
+    ]
+    assert ("--bind-try", str(uncreatable_root), str(uncreatable_root)) in triples, (
+        f"expected a --bind-try triple for {uncreatable_root}, got {triples}"
+    )
 
 
 def test_nested_grant_masked_in_non_recursive_default(tmp_path: Path) -> None:

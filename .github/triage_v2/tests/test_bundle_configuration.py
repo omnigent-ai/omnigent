@@ -50,6 +50,24 @@ def test_v2_still_runs_when_legacy_intake_fails() -> None:
     assert "needs.triage.result == 'success'" not in prioritize
 
 
+def test_v2_owns_intake_when_enabled_and_manual_dispatch_is_dry_by_default() -> None:
+    intake = (WORKFLOWS / "issue-triage.yml").read_text()
+    reusable = (WORKFLOWS / "issue-prioritization-v2.yml").read_text()
+    legacy = intake.split("  triage:", 1)[1].split("  prioritize-v2:", 1)[0]
+    prioritize = intake.split("  prioritize-v2:", 1)[1]
+
+    assert "vars.ISSUE_PRIORITIZATION_V2_ENABLED != 'true'" in legacy
+    assert "remove in 0.12.0" in legacy
+    assert "cancel-in-progress: false" in intake
+    assert "github.event.action == 'opened'" in prioritize
+    apply_expression = (
+        "apply: ${{ github.event_name != 'workflow_dispatch' || inputs.apply_labels }}"
+    )
+    assert apply_expression in prioritize
+    assert "--intake --maintainers .github/MAINTAINER" in reusable
+    assert "mode=dry_run" in reusable
+
+
 def test_needs_info_expiry_is_gated_and_previewable() -> None:
     workflow = (WORKFLOWS / "needs-info-expiry.yml").read_text()
 

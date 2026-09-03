@@ -205,6 +205,7 @@ import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSw
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
 import type { NativeModelOption } from "@/lib/types";
+import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
   useConversations,
   useProjectConfig,
@@ -2293,6 +2294,7 @@ export function NewChatLandingScreen() {
             // Keep the catalog's default marker: the Default row names the
             // model a bare launch truly runs, for claude exactly as codex.
             isDefault: option.isDefault,
+            source: option.source,
           })),
     [hostClaudeModelOptions, sandboxSelected],
   );
@@ -2307,6 +2309,7 @@ export function NewChatLandingScreen() {
         : (hostPiModelOptions ?? []).map((option) => ({
             id: option.id,
             displayName: option.displayName ?? option.id,
+            source: option.source,
           })),
     [hostPiModelOptions, sandboxSelected],
   );
@@ -2943,6 +2946,13 @@ export function NewChatLandingScreen() {
       selectedAgent?.harness != null &&
       selectedAgent.harness in brainHarnessLabelsAll);
   const configSummary = useMemo((): { label: string; value: string }[] => {
+    const sourceRows = (options: readonly NativeModelOption[]) => {
+      if (routingOn) return [];
+      const source =
+        options.find((option) => option.id === pickedModel)?.source ??
+        options.find((option) => option.source)?.source;
+      return modelConfigurationSourceRows(source);
+    };
     if (smartRoutingHarnessSelected) {
       // Top-level Smart Routing's modal is the locked Permissions row alone, so
       // mirror it. Report the constant — never a mode left over in state from a
@@ -2952,7 +2962,7 @@ export function NewChatLandingScreen() {
     if (supportsModelPicker && !supportsPermissionMode) {
       const modelValue =
         piModelOptions.find((model) => model.id === pickedModel)?.displayName ?? "Default";
-      return [{ label: "Model", value: modelValue }];
+      return [{ label: "Model", value: modelValue }, ...sourceRows(piModelOptions)];
     }
     if (supportsPermissionMode) {
       const modelValue = routingOn
@@ -2973,6 +2983,7 @@ export function NewChatLandingScreen() {
         { label: "Model", value: modelValue },
         { label: "Effort", value: effortValue },
         { label: "Permissions", value: permissionValue },
+        ...sourceRows(claudeModelOptions),
       ];
     }
     // Codex folds routing into its Model row, so report it the same way Claude
@@ -3003,7 +3014,11 @@ export function NewChatLandingScreen() {
                   : defaultModelLabel(codexModelOptions),
               },
             ];
-      return [...modelRows, { label: "Approval", value: approvalValue }];
+      return [
+        ...modelRows,
+        { label: "Approval", value: approvalValue },
+        ...(isCodex ? sourceRows(codexModelOptions) : []),
+      ];
     }
     if (supportsCursorMode) {
       const modeValue =
@@ -4874,11 +4889,14 @@ export function NewChatLandingScreen() {
                           </TooltipTrigger>
                           <TooltipContent
                             side="top"
-                            className="flex-col items-start gap-0.5 px-3 py-2"
+                            className="max-w-80 flex-col items-start gap-0.5 px-3 py-2"
                             data-testid="new-chat-landing-config-gear-tooltip"
                           >
                             {configSummary.map((row) => (
-                              <span key={row.label} className="text-muted-foreground">
+                              <span
+                                key={row.label}
+                                className="max-w-72 truncate text-muted-foreground"
+                              >
                                 {row.label}:{" "}
                                 <span className="text-background dark:text-popover-foreground">
                                   {row.value}

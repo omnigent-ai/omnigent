@@ -1564,6 +1564,149 @@ def test_seed_isolated_agy_home_trusts_workspace_in_isolated_settings(
     }
 
 
+def test_seed_isolated_agy_home_copies_real_settings_as_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh seed copies the user's real settings.json into the isolated dir.
+
+    The real settings carry backend config agy needs at turn time — notably the
+    ``gcp`` project/location block for GCP/enterprise logins, without which every
+    turn fails server-side with ``invalid location: ""`` while the session still
+    looks logged in.
+    """
+    fake_home = tmp_path / "real-home"
+    real_settings = fake_home / ".gemini" / "antigravity-cli" / "settings.json"
+    real_settings.parent.mkdir(parents=True)
+    real_settings.write_text(
+        json.dumps(
+            {
+                "gcp": {"project": "acme-prod", "location": "global"},
+                "theme": "dark",
+                "trustedWorkspaces": ["/real/repo"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    seed_isolated_agy_home(bridge_dir, trusted_workspace=workspace)
+
+    iso_settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    isolated = json.loads(iso_settings.read_text(encoding="utf-8"))
+    # Backend config survives the copy; the trust seeder merged on top of it.
+    assert isolated["gcp"] == {"project": "acme-prod", "location": "global"}
+    assert isolated["theme"] == "dark"
+    assert isolated["trustedWorkspaces"] == ["/real/repo", str(workspace.resolve())]
+    # The real settings file is never modified.
+    assert json.loads(real_settings.read_text(encoding="utf-8"))["trustedWorkspaces"] == [
+        "/real/repo"
+    ]
+
+
+def test_seed_isolated_agy_home_never_clobbers_existing_isolated_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A re-seed keeps the isolated settings file — per-session edits survive."""
+    fake_home = tmp_path / "real-home"
+    real_settings = fake_home / ".gemini" / "antigravity-cli" / "settings.json"
+    real_settings.parent.mkdir(parents=True)
+    real_settings.write_text(json.dumps({"theme": "dark"}), encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    iso_settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    iso_settings.parent.mkdir(parents=True)
+    iso_settings.write_text(json.dumps({"model": "session-pick"}), encoding="utf-8")
+
+    seed_isolated_agy_home(bridge_dir)
+
+    assert json.loads(iso_settings.read_text(encoding="utf-8")) == {"model": "session-pick"}
+
+
+def test_seed_isolated_agy_home_prefers_real_onboarding_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The user's real onboarding marker is copied over the synthetic default.
+
+    The real marker carries auth-flow state the synthetic one lacks
+    (``enterpriseOnboardingComplete``, ``previousAuthMethod``); without it an
+    enterprise/GCP login re-enters the first-run wizard, which blocks TUI
+    injection.
+    """
+    fake_home = tmp_path / "real-home"
+    real_marker = fake_home / ".gemini" / "antigravity-cli" / "cache" / "onboarding.json"
+    real_marker.parent.mkdir(parents=True)
+    real_state = {
+        "consumerOnboardingComplete": True,
+        "enterpriseOnboardingComplete": True,
+        "onboardingComplete": True,
+        "previousAuthMethod": "gcp",
+    }
+    real_marker.write_text(json.dumps(real_state), encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_marker = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "cache" / "onboarding.json"
+    assert json.loads(iso_marker.read_text(encoding="utf-8")) == real_state
+
+
+def test_seed_isolated_agy_home_tolerates_absent_real_settings_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user with no settings.json seeds cleanly — no spurious gcp block appears.
+
+    Non-GCP (consumer subscription) users have no settings.json; seeding must
+    not fail or inject a gcp key the user never configured.
+    """
+    fake_home = tmp_path / "real-home"
+    (fake_home / ".gemini" / "antigravity-cli").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    # Absent, or created by the trust/survey seeders without a gcp key.
+    if iso_settings.exists():
+        assert "gcp" not in json.loads(iso_settings.read_text(encoding="utf-8"))
+
+
+def test_seed_isolated_agy_home_synthetic_onboarding_does_not_downgrade_enterprise_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The synthetic onboarding marker never hard-wires enterpriseOnboardingComplete=false.
+
+    When the real onboarding.json is absent (e.g. a cleared agy cache on a
+    GCP-authenticated host), a synthetic marker with
+    ``enterpriseOnboardingComplete: false`` re-triggers the first-run wizard
+    for enterprise accounts, which blocks TUI injection. If the seeder writes
+    the key at all, it must be True.
+    """
+    fake_home = tmp_path / "real-home"
+    (fake_home / ".gemini" / "antigravity-cli").mkdir(parents=True)
+    # No real onboarding.json.
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+
+    onboarding_path = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "cache" / "onboarding.json"
+    onboarding = json.loads(onboarding_path.read_text(encoding="utf-8"))
+    assert onboarding.get("onboardingComplete") is True
+    if "enterpriseOnboardingComplete" in onboarding:
+        assert onboarding["enterpriseOnboardingComplete"] is True
+
+
 def test_seed_isolated_agy_home_tolerates_missing_credential(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
