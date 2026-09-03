@@ -4281,6 +4281,28 @@ async def test_dns_errno_failure_is_not_a_recycle(
     )
 
 
+@pytest.mark.parametrize("port", [502, 1001, 1012])
+async def test_endpoint_port_is_not_a_recycle(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    port: int,
+) -> None:
+    """Standalone numbers in transport errors are not protocol status codes."""
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    failure = OSError(f"Connect call failed ('203.0.113.1', {port})")
+    spy = _ConnectSpy([failure, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        await _host().run()
+
+    reconnects = [
+        record.message for record in caplog.records if "Reconnecting in" in record.message
+    ]
+    assert len(reconnects) == 1
+    assert "(recycle" not in reconnects[0]
+
+
 async def test_sustained_recycle_failures_fall_back_to_backoff(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -4295,9 +4317,8 @@ async def test_sustained_recycle_failures_fall_back_to_backoff(
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_CAP_S", 0.0)
     monkeypatch.setattr("omnigent.host.connect._RECYCLE_PROMPT_MAX_STREAK", 3)
-    # Raised AT CONNECT TIME (never accepted): "server rejected WebSocket
-    # connection: HTTP 502" — an ingress-recycle-classified sustained outage.
-    rejected = RuntimeError("server rejected WebSocket connection: HTTP 502")
+    # Raised AT CONNECT TIME (never accepted): an ingress-classified outage.
+    rejected = _invalid_status(502)
     spy = _ConnectSpy([rejected] * 6 + [asyncio.CancelledError()])
     _patch_connect(monkeypatch, spy)
     host = _host()

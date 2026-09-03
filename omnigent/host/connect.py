@@ -144,6 +144,8 @@ from omnigent.runner.transports.ws_tunnel.limits import (
 from omnigent.runtime.websocket_metrics import (
     record_websocket_connected,
     record_websocket_disconnected,
+    websocket_close_code,
+    websocket_close_reason,
 )
 from omnigent.suspend_watch import watch_for_resume
 from omnigent.tls import client_ssl_context
@@ -388,17 +390,9 @@ except ValueError:
 # full default timeout on each reconnect after an established tunnel drops.
 _INITIAL_CONNECT_OPEN_TIMEOUT_S = 10.0
 _RECONNECT_OPEN_TIMEOUT_S = 3.0
-# Recycle close-code matching is anchored on word boundaries: bare substring
-# matching misread Windows errno 11001 ("getaddrinfo failed") as WebSocket
-# close code 1001 "going away", classifying a sustained DNS outage as an
-# ingress recycle and reconnecting at the 0.5s prompt cadence indefinitely.
-_RECYCLE_EXPLICIT_RE = re.compile(r"\b(?:1012|1001)\b|service restart|going away")
-_RECYCLE_INGRESS_RE = re.compile(r"\b(?:no close frame|502)\b")
-# Consecutive never-connected recycle-classified failures before the prompt
-# cadence gives way to the normal backoff ladder. An ingress cycle is brief
-# and self-healing (well under 10 attempts); a sustained 502/DNS outage is
-# not, and hammering a dead endpoint twice a second forever is its own
-# incident.
+# Consecutive handshake recycle failures before the prompt cadence gives way
+# to normal backoff. An ingress cycle is brief; sustained 502 responses are an
+# outage and shouldn't hammer the endpoint twice a second.
 _RECYCLE_PROMPT_MAX_STREAK = 10
 # Fresh hosts get a short auth-retry window for Databricks OAuth refreshes.
 # Established hosts retry auth failures indefinitely to preserve sessions.
@@ -3256,9 +3250,14 @@ class HostProcess:
                     # so the overlap window closes and the tunnel settles (and a
                     # genuinely persistent failure surfaces instead of a silent
                     # tight loop).
-                    reason = str(exc).lower()
-                    explicit_recycle = _RECYCLE_EXPLICIT_RE.search(reason) is not None
-                    ingress_recycle = _RECYCLE_INGRESS_RE.search(reason) is not None
+                    close_code = websocket_close_code(exc)
+                    close_reason = (websocket_close_reason(exc) or "").lower()
+                    explicit_recycle = close_code in {1001, 1012} or any(
+                        token in close_reason for token in ("service restart", "going away")
+                    )
+                    ingress_recycle = (
+                        isinstance(exc, InvalidStatus) and exc.response.status_code == 502
+                    ) or (isinstance(exc, ConnectionClosed) and close_code is None)
                     # A silent-connect streak overrides the recycle fast path:
                     # prompt reconnects are for endpoints that answer.
                     silent_churn = self._silent_connect_streak >= _SILENT_CONNECT_ESCALATE_ATTEMPTS
