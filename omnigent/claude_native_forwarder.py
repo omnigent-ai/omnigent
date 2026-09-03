@@ -17,6 +17,8 @@ from pathlib import Path
 import httpx
 
 from omnigent._native_post_delivery import (
+    _DEAD_LETTER_BACKUP_FILE,
+    _DEAD_LETTER_FILE,
     append_dead_letter,
     post_external_session_status,
     post_may_have_been_delivered,
@@ -46,7 +48,7 @@ from omnigent.claude_native_bridge import (
     write_active_session_id,
 )
 from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
-from omnigent.claude_native_status import sync_raw_status_context
+from omnigent.claude_native_status import CONTEXT_RAW_FILE, sync_raw_status_context
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
 
@@ -94,6 +96,30 @@ _PERMISSION_MODE_POLL_INTERVAL_S = 2.0
 # the loop resumes. Generous vs the 0.25s poll so a legitimately slow batch
 # (large backlog, slow posts) never trips it.
 _FORWARD_LOOP_STALL_DEADLINE_S = 300.0
+
+# Idle gating for the poll loop. The interval above is deliberately NOT backed
+# off — it is what makes streamed assistant text feel live — so instead a tick
+# whose inputs are all byte-identical to the previous tick skips the scan work
+# and costs one directory scan plus a handful of stats.
+#
+# Seconds of unchanged inputs before gating kicks in. Must comfortably exceed
+# every transition inside the loop body that fires on a timer rather than on a
+# file change: sub-agent idle quiescence (:data:`_SUBAGENT_IDLE_QUIESCENCE_S`,
+# 5s) and the cost retry backoff. Retries are checked explicitly, so they do not
+# otherwise constrain this.
+_IDLE_SETTLE_SECONDS = 8.0
+
+# Longest a gated loop goes without running the full body regardless of the
+# fingerprint. Purely a safety net: it bounds the damage of any change the
+# fingerprint cannot see.
+_IDLE_RESYNC_SECONDS = 10.0
+
+# Set to a falsy value to run the full body on every tick, restoring the
+# pre-gating behaviour without a rollback.
+_IDLE_GATE_ENV_VAR = "OMNIGENT_CLAUDE_FORWARDER_IDLE_GATE"
+
+# One ``(st_mtime_ns, st_size, st_ino)`` triple per watched path.
+_BridgeFingerprint = dict[str, tuple[int, int, int]]
 _POST_TIMEOUT_S = 10.0
 _MAX_SEEN_SOURCE_IDS = 2000
 _CURSOR_FINGERPRINT_BYTES = 256
@@ -703,6 +729,21 @@ class _PostRetryTracker:
             return None
         return remaining
 
+    def has_due_retry(self, now: float) -> bool:
+        """
+        Report whether any key's retry is due to be attempted now.
+
+        The poll loop consults this before skipping an unchanged tick: a
+        scheduled retry fires on a timer, not on a file change, so a gate
+        that only watched the transcript would strand it. Keys whose backoff
+        has not elapsed deliberately do *not* count — during a sustained
+        outage those would otherwise pin the loop at full rate forever.
+
+        :param now: Current monotonic time, e.g. ``time.monotonic()``.
+        :returns: ``True`` when at least one key is ready for another attempt.
+        """
+        return any(entry.next_attempt_at <= now for entry in self._entries.values())
+
     def clear(self, key: str) -> None:
         """
         Remove retry state for a successfully handled event.
@@ -756,6 +797,316 @@ class _PostRetryTracker:
             exhausted=False,
             permanent=permanent,
         )
+
+
+def _idle_gate_enabled() -> bool:
+    """
+    Report whether the poll loop may skip ticks whose inputs are unchanged.
+
+    :returns: ``True`` unless :envvar:`OMNIGENT_CLAUDE_FORWARDER_IDLE_GATE` is
+        set to a falsy value (``"0"``, ``"false"``, ``"no"``, ``"off"``).
+    """
+    raw = os.environ.get(_IDLE_GATE_ENV_VAR)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+# Bridge-owned files the poll loop reads. Stat'ed by name rather than found
+# with a directory scan: ``os.scandir`` plus a ``DirEntry.stat`` per entry
+# measures ~4.3us an entry against ~1.3us for a plain ``os.stat``, and the scan
+# also picked up the forwarder's own cursor files below — so writing one
+# churned the fingerprint and bought an extra full tick for no new input.
+#
+# Conservative on purpose: a couple of these are launch-time files the loop
+# never re-reads. Watching them costs one stat and cannot cause a miss, whereas
+# pruning the list to "what the loop reads today" would.
+_WATCHED_BRIDGE_FILES = (
+    "bridge.json",
+    "server.json",
+    "state.json",
+    "hooks.jsonl",
+    "tool_relay.json",
+    "tmux.json",
+    "permission_hook.json",
+    "context.json",
+    # The statusLine shim's raw capture; the loop normalizes it into
+    # context.json via sync_raw_status_context, so a write must wake the gate.
+    CONTEXT_RAW_FILE,
+    "claude-settings.json",
+    MESSAGE_DELTAS_FILE,
+)
+
+# Bridge files this module writes and the steady-state poll loop never reads.
+# The cursors are read once at startup to resume, but nothing re-reads them
+# per tick — so within the loop they change only because it just did work, and
+# watching them would re-open the gate on the forwarder's own output.
+_FORWARDER_OWNED_BRIDGE_FILES = (
+    _FORWARDER_STATE_FILE,
+    _HOOK_STATE_FILE,
+    _SUBAGENT_STATE_FILE,
+    _DELTA_STATE_FILE,
+    # Compaction-boundary cursor. Only this module reads or writes it, and
+    # every access sits inside the poll-loop body, so its changes are always
+    # our own output. A pending boundary whose POST failed is retried off
+    # ``status_retries`` / ``item_retries``, which the gate already consults —
+    # so nothing here needs the fingerprint to notice the write.
+    _COMPACTION_STATE_FILE,
+    # Sink for permanently-undeliverable payloads, shared by every native
+    # forwarder. Written for operators to inspect, not consumed by the loop.
+    _DEAD_LETTER_FILE,
+    _DEAD_LETTER_BACKUP_FILE,
+)
+
+# Bridge files written by adjacent routing components and never consumed by
+# this poll loop. They are classified separately from our own outputs so a new
+# producer file still requires an explicit watched/unwatched decision.
+_OTHER_PRODUCER_BRIDGE_FILES = (
+    "turn_router.json",
+    "turn_routing_done",
+    "turn_replay_pending.json",
+    "turn_routing.log",
+    "subagent_router.json",
+    # Relay coordinates written at relay startup for the in-terminal shim to
+    # source; the poll loop reads tool_relay.json (watched above), never this.
+    "tool_relay.env",
+)
+
+# Sub-agent transcripts grow; their sibling ``agent-*.meta.json`` is read once
+# at discovery and never again. Membership changes (either file appearing) move
+# the directory's own mtime, which is in the fingerprint, so only the
+# transcripts need stat'ing for content.
+_APPENDING_SUBAGENT_SUFFIX = ".jsonl"
+
+# How recent a directory mtime has to be before it stops being trustworthy as
+# a change signal.
+#
+# ``st_mtime_ns`` reports nanoseconds but filesystems do not store them: Linux
+# stamps directory mtimes from the jiffy clock (4ms at the common CONFIG_HZ=250),
+# and older filesystems round to 1-2s. An entry created within one tick of the
+# previous stat therefore leaves the recorded mtime *unchanged* — and because
+# nothing moves it afterwards either, comparing mtimes alone would leave that
+# sub-agent unwatched until the resync. Measured on a CONFIG_HZ=250 box: adding
+# an entry left the directory mtime unchanged 194 times out of 200.
+#
+# So a directory whose mtime sits inside this window of now is re-listed
+# regardless of whether the mtime moved. The window is wide enough for the 1-2s
+# filesystems; it costs extra listings only just after a change, and nothing at
+# all once the directory has been quiet — which is the steady state this whole
+# gate exists to make cheap.
+_DIR_MTIME_RACY_WINDOW_NS = 2_000_000_000
+
+
+def _fingerprint_now_ns() -> int:
+    """
+    Wall-clock reading used to age filesystem timestamps.
+
+    Exists as a private indirection so tests can drive the racy-window boundary
+    deterministically instead of sleeping past a real one — a sleep-based test
+    fails whenever the scheduler pauses it during setup, which looks like the
+    bug it is meant to catch. Kept out of :func:`time.time_ns` monkeypatching
+    for the same module-singleton reason as :func:`_supervisor_monotonic`.
+
+    :returns: Nanoseconds since the epoch.
+    """
+    return time.time_ns()
+
+
+def _mtime_is_racy(mtime_ns: int) -> bool:
+    """
+    Report whether a timestamp is too recent to trust as a change signal.
+
+    A change landing in the same filesystem timestamp tick as the previous
+    stat is invisible to a later mtime comparison, so anything stamped within
+    :data:`_DIR_MTIME_RACY_WINDOW_NS` of now has to be re-examined rather than
+    compared.
+
+    The check is one-sided — an *age*, not a distance. A timestamp from the
+    future is never trustworthy no matter how far ahead it is, and a
+    two-sided comparison would call a stamp 5 s ahead "settled" simply because
+    it is far from now, which is the opposite of the intent.
+
+    :param mtime_ns: A stat's ``st_mtime_ns``.
+    :returns: ``True`` when the caller must not rely on mtime equality.
+    """
+    return _fingerprint_now_ns() - mtime_ns < _DIR_MTIME_RACY_WINDOW_NS
+
+
+class _BridgeInputPaths:
+    """
+    Pre-resolved stat targets for one session's poll loop.
+
+    The fingerprint runs four times a second forever, so everything that does
+    not change between ticks is resolved once here: the bridge dir's watched
+    files, the transcript, and the sub-agent transcripts. Paths are kept as
+    plain strings — building ``bridge_dir / name`` per tick costs more than
+    the ``os.stat`` it feeds, which is what made an earlier by-name version
+    slower than the directory scan it replaced.
+
+    Sub-agent membership is refreshed when the directory's own mtime moves, or
+    while that mtime is too recent to trust. Every sub-agent a session ever
+    spawned stays on disk, so re-listing at 4 Hz is the dominant fingerprint
+    cost under fan-out — but mtime inequality alone is not a sound dirtiness
+    signal, see :data:`_DIR_MTIME_RACY_WINDOW_NS`.
+    """
+
+    def __init__(self, bridge_dir: Path) -> None:
+        """
+        Resolve the fixed stat targets for *bridge_dir*.
+
+        :param bridge_dir: Native Claude bridge directory.
+        """
+        root = str(bridge_dir)
+        self._bridge_targets: tuple[tuple[str, str], ...] = tuple(
+            ("bridge/" + name, os.path.join(root, name)) for name in _WATCHED_BRIDGE_FILES
+        )
+        self._transcript: str | None = None
+        self._subagents_dir: str | None = None
+        self._subagent_dir_key: tuple[int, int] | None = None
+        self._subagent_targets: tuple[tuple[str, str], ...] = ()
+        # Whether the cached listing was taken while the directory's mtime was
+        # still racy, and so may already be stale. Latched until a listing is
+        # taken with the mtime settled — see :meth:`fingerprint`.
+        self._subagent_listing_provisional = False
+
+    def set_transcript(self, transcript_path: Path | None) -> None:
+        """
+        Point the fingerprint at a new transcript, dropping stale sub-agents.
+
+        Called when hooks first report a transcript and again after a /clear
+        or /fork rotation, which resolves a different ``subagents/`` directory
+        — so the cached membership belongs to the previous session and must go.
+
+        :param transcript_path: Transcript JSONL, or ``None`` when hooks have
+            not reported one yet.
+        :returns: None.
+        """
+        if transcript_path is None:
+            self._transcript = None
+            self._subagents_dir = None
+        else:
+            self._transcript = str(transcript_path)
+            self._subagents_dir = str(_subagents_dir_for_transcript(transcript_path))
+        self._subagent_dir_key = None
+        self._subagent_targets = ()
+        self._subagent_listing_provisional = False
+
+    def _refresh_subagents(self, dir_key: tuple[int, int], *, provisional: bool) -> None:
+        """
+        Re-list the sub-agent transcripts.
+
+        :param dir_key: The directory stat identity this listing belongs to.
+        :param provisional: Whether the directory's mtime was still racy when
+            this listing was taken, meaning an entry could have landed after
+            the scan without moving the mtime. Latched so a later tick knows
+            to take one more listing once the mtime settles.
+        :returns: None.
+        """
+        assert self._subagents_dir is not None
+        targets: list[tuple[str, str]] = []
+        try:
+            with os.scandir(self._subagents_dir) as entries:
+                for entry in entries:
+                    name = entry.name
+                    if name.startswith(".") or not name.endswith(_APPENDING_SUBAGENT_SUFFIX):
+                        continue
+                    targets.append(("subagent/" + name, entry.path))
+        except OSError:
+            return
+        targets.sort()
+        self._subagent_dir_key = dir_key
+        self._subagent_targets = tuple(targets)
+        self._subagent_listing_provisional = provisional
+
+    def fingerprint(self) -> _BridgeFingerprint:
+        """
+        Snapshot the watched inputs: :data:`_WATCHED_BRIDGE_FILES`, the
+        transcript, and the sub-agent directory with its transcripts.
+
+        Inode is part of the triple because the bridge writes its JSON state
+        via a temp file plus ``os.replace``, so every write lands a new inode
+        even when the size and timestamp would look unchanged. Append-only
+        files (hook events, message deltas, transcripts) always grow their
+        size. Between them, no writer can mutate a *watched* input invisibly;
+        an input missing from the watch list is a different failure, guarded
+        against by the classification tests and bounded by the resync.
+
+        :returns: Fingerprint of the watched inputs.
+        """
+        fingerprint: _BridgeFingerprint = {}
+        stat = os.stat
+        for key, path in self._bridge_targets:
+            try:
+                info = stat(path)
+            except OSError:
+                continue
+            fingerprint[key] = (info.st_mtime_ns, info.st_size, info.st_ino)
+        if self._transcript is not None:
+            try:
+                info = stat(self._transcript)
+            except OSError:
+                pass
+            else:
+                fingerprint["transcript"] = (info.st_mtime_ns, info.st_size, info.st_ino)
+        if self._subagents_dir is not None:
+            try:
+                info = stat(self._subagents_dir)
+            except OSError:
+                # No sub-agent has been spawned yet; drop any stale listing.
+                self._subagent_dir_key = None
+                self._subagent_targets = ()
+                self._subagent_listing_provisional = False
+            else:
+                fingerprint["subagents/"] = (info.st_mtime_ns, info.st_size, info.st_ino)
+                dir_key = (info.st_mtime_ns, info.st_ino)
+                racy = _mtime_is_racy(info.st_mtime_ns)
+                # The provisional latch is what makes the window sound. A
+                # coarse mtime records the START of its bucket, so a change
+                # late in the bucket can already look older than the window by
+                # the time the next tick runs — and with the key unchanged,
+                # nothing would ever re-list. Carrying the uncertainty forward
+                # forces exactly one more listing once the mtime settles.
+                if dir_key != self._subagent_dir_key or racy or self._subagent_listing_provisional:
+                    self._refresh_subagents(dir_key, provisional=racy)
+                for key, path in self._subagent_targets:
+                    try:
+                        info = stat(path)
+                    except OSError:
+                        continue
+                    fingerprint[key] = (info.st_mtime_ns, info.st_size, info.st_ino)
+        return fingerprint
+
+
+def _forwarder_tick_is_needed(
+    *,
+    now: float,
+    last_change_at: float,
+    last_full_poll_at: float,
+    retry_trackers: tuple[_PostRetryTracker, ...],
+    dedupe: _ForwardDedupeState,
+) -> bool:
+    """
+    Decide whether this tick must run the full forwarding body.
+
+    Called only after the inputs were found byte-identical to the previous
+    tick, so the question is purely "is there time-based work outstanding?".
+
+    :param now: Current monotonic time.
+    :param last_change_at: Monotonic time an input last changed.
+    :param last_full_poll_at: Monotonic time the body last ran.
+    :param retry_trackers: Every retry tracker the loop owns.
+    :param dedupe: Dedupe state carrying the cost-post retry gate.
+    :returns: ``True`` when the body must run.
+    """
+    if now - last_change_at < _IDLE_SETTLE_SECONDS:
+        return True
+    if now - last_full_poll_at >= _IDLE_RESYNC_SECONDS:
+        return True
+    # Due, not merely scheduled: a cost endpoint that keeps rejecting would
+    # otherwise hold the gate open permanently.
+    if 0.0 < dedupe.cost_retry_not_before <= now:
+        return True
+    return any(tracker.has_due_retry(now) for tracker in retry_trackers)
 
 
 async def forward_claude_transcript_to_session(
@@ -843,12 +1194,67 @@ async def forward_claude_transcript_to_session(
     task_subjects: dict[str, str] = {}
     task_statuses: dict[str, str] = {}
     task_order: list[str] = []
+    # Idle gating: a tick whose watched inputs are byte-identical to the
+    # previous tick has nothing to forward, so it skips the ~20 file reads and
+    # ~10 scans the body would otherwise redo. The poll interval is untouched,
+    # so a change to a watched input is still picked up on the very next tick.
+    gate_enabled = _idle_gate_enabled()
+    fingerprint: _BridgeFingerprint | None = None
+    known_transcript_path: Path | None = None
+    bridge_inputs = _BridgeInputPaths(bridge_dir)
+    last_input_change_at = time.monotonic()
+    last_full_poll_at = 0.0
+    # Whether the last tick skipped its body. Tracked only so the two
+    # transitions are logged once each instead of on every tick — a field
+    # regression shows up as "gate never engages" (no CPU win) or "gate
+    # engaged while a turn was live" (a bug), both visible without a rebuild.
+    gate_engaged = False
+    # Correlates the two gate-transition log lines with a session without
+    # logging the bridge path (its name encodes the session identity, which
+    # code scanning treats as sensitive). Operators can recompute the digest
+    # from a known bridge dir to match log lines to a session.
+    bridge_label = hashlib.sha256(str(bridge_dir).encode("utf-8")).hexdigest()[:12]
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     from omnigent.cli_auth import open_server_client
 
     async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:
             try:
+                if gate_enabled:
+                    now = time.monotonic()
+                    current = bridge_inputs.fingerprint()
+                    if fingerprint is None or current != fingerprint:
+                        fingerprint = current
+                        last_input_change_at = now
+                    elif not _forwarder_tick_is_needed(
+                        now=now,
+                        last_change_at=last_input_change_at,
+                        last_full_poll_at=last_full_poll_at,
+                        retry_trackers=(
+                            item_retries,
+                            status_retries,
+                            subagent_start_retries,
+                            subagent_item_retries,
+                            subagent_status_retries,
+                        ),
+                        dedupe=dedupe,
+                    ):
+                        if not gate_engaged:
+                            gate_engaged = True
+                            _logger.debug(
+                                "Claude transcript forwarder idle; skipping unchanged "
+                                "polls; bridge=%s",
+                                bridge_label,
+                            )
+                        await asyncio.sleep(poll_interval_s)
+                        continue
+                    if gate_engaged:
+                        gate_engaged = False
+                        _logger.debug(
+                            "Claude transcript forwarder resumed; bridge=%s",
+                            bridge_label,
+                        )
+                    last_full_poll_at = now
                 async with asyncio.timeout(_FORWARD_LOOP_STALL_DEADLINE_S):
                     current_session_id = read_active_session_id(bridge_dir) or session_id
                     if hook_state is None:
@@ -955,6 +1361,11 @@ async def forward_claude_transcript_to_session(
                     # context.json (one stat when nothing changed).
                     status_raw_sig = sync_raw_status_context(bridge_dir, status_raw_sig)
                     transcript_path = read_transcript_path(bridge_dir)
+                    # The next tick must stat the active transcript and its
+                    # sub-agent directory, including after /clear or /fork.
+                    if transcript_path != known_transcript_path:
+                        known_transcript_path = transcript_path
+                        bridge_inputs.set_transcript(transcript_path)
                     if transcript_path is not None:
                         state = await _ensure_state_for_transcript(
                             bridge_dir=bridge_dir,
@@ -1078,6 +1489,7 @@ async def forward_claude_transcript_to_session(
                 # The deadline cancelled a stalled await mid-iteration; the
                 # traceback names it. Cursor state advances only after
                 # successful posts, so resuming retries the interrupted step.
+                fingerprint = None
                 _logger.warning(
                     "Claude transcript forwarder iteration exceeded %.0fs; "
                     "cancelled the stalled await and resuming; session=%s "
@@ -1089,6 +1501,7 @@ async def forward_claude_transcript_to_session(
                     extra={"session_id": session_id},
                 )
             except Exception:
+                fingerprint = None
                 _logger.exception(
                     "Claude transcript forwarder loop failed; session=%s bridge_dir=%s",
                     session_id,
