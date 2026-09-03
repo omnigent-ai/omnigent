@@ -10080,7 +10080,9 @@ def create_runner_app(
                 while remaining > 0:
                     chunk = await asyncio.to_thread(fobj.read, min(64 * 1024, remaining))
                     if not chunk:
-                        break
+                        # Ending short of Content-Length would hand the client
+                        # a silently incomplete file; abort the transfer instead.
+                        raise RuntimeError(f"{resolved.name} shrank during download")
                     remaining -= len(chunk)
                     yield chunk
             finally:

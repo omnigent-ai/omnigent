@@ -3136,6 +3136,43 @@ async def test_filesystem_download_forwards_runner_errors(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["read", "download", "write"])
+async def test_filesystem_forwards_a_literal_percent_still_encoded(
+    client: httpx.AsyncClient,
+    operation: str,
+) -> None:
+    """A name the server decoded to a literal ``%2F`` reaches the runner as that name.
+
+    Forwarded verbatim it would decode once more into an absolute path,
+    past the owner-only gate the server applied at workspace level.
+    """
+    runner = FastAPI()
+    seen: list[str] = []
+
+    @runner.get(_FS_ROUTE)
+    @runner.put(_FS_ROUTE)
+    async def _serve(session_id: str, environment_id: str, relative_path: str) -> JSONResponse:
+        del session_id, environment_id
+        seen.append(relative_path)
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"code": "path_not_found", "message": "nope"}},
+        )
+
+    url = (
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+        "/filesystem/%252Fetc/passwd"
+    )
+    async with _runner_app_client(runner):
+        if operation == "write":
+            await client.put(url, json={"content": "x", "encoding": "utf-8"})
+        else:
+            await client.get(url, params={"download": "true"} if operation == "download" else None)
+
+    assert seen == ["%2Fetc/passwd"]
+
+
+@pytest.mark.asyncio
 async def test_filesystem_write_proxies_to_runner(
     client: httpx.AsyncClient,
 ) -> None:

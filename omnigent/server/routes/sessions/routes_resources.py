@@ -334,8 +334,10 @@ def register_resources_routes(
                 if name in resp.headers
             }
             return _RunnerStreamResponse(resp, headers=forwarded)
-        await resp.aread()
-        await resp.aclose()
+        try:
+            await resp.aread()
+        finally:
+            await resp.aclose()
         if resp.status_code == 200:
             # A runner that predates ``download=true`` ignores it and answers
             # the capped JSON envelope; serving that would truncate silently.
@@ -517,6 +519,21 @@ def register_resources_routes(
             conversation.workspace,
         )
 
+    def _runner_path_segment(relative_path: str, *, absolute: bool) -> str:
+        """Encode a browse path for the runner's ``{relative_path:path}`` segment.
+
+        Only the leading slash is encoded, since a literal "//" is what proxies
+        collapse; interior slashes travel fine and keep logs readable. Every
+        other character is quoted, so a literal "%" in a name is not decoded a
+        second time by the runner into a path the gate here never saw.
+
+        :param relative_path: Decoded path, with a leading slash iff *absolute*.
+        :param absolute: Whether the path is host-absolute.
+        :returns: The encoded segment.
+        """
+        quoted = urllib.parse.quote(relative_path.lstrip("/"))
+        return "%2F" + quoted if absolute else quoted
+
     def _mutating_runner_path(
         session_id: str,
         environment_id: str,
@@ -535,12 +552,7 @@ def register_resources_routes(
         :param relative_path: Client-supplied path.
         :returns: The runner-relative URL.
         """
-        absolute = relative_path.startswith("/")
-        # Encode only the leading slash: a literal "//" is what proxies
-        # collapse, while interior slashes travel fine.
-        encoded = (
-            "%2F" + urllib.parse.quote(relative_path.lstrip("/")) if absolute else relative_path
-        )
+        encoded = _runner_path_segment(relative_path, absolute=relative_path.startswith("/"))
         return (
             f"/v1/sessions/{session_id}/resources/environments"
             f"/{environment_id}/filesystem/{encoded}"
@@ -2256,11 +2268,7 @@ def register_resources_routes(
         )
 
         qs = urllib.parse.urlencode(params)
-        # Encode only the leading slash: a literal "//" is what proxies
-        # collapse, while interior slashes travel fine and keep logs readable.
-        runner_rel = (
-            "%2F" + urllib.parse.quote(relative_path.lstrip("/")) if absolute else relative_path
-        )
+        runner_rel = _runner_path_segment(relative_path, absolute=absolute)
         if download:
             return await _stream_download_from_runner(
                 request,
