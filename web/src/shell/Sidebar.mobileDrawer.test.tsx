@@ -26,18 +26,40 @@ vi.mock("@/lib/serverOrigin", () => ({
 import { useConversations } from "@/hooks/useConversations";
 
 const useConvMock = vi.mocked(useConversations);
+const originalMatchMedia = window.matchMedia;
+
+function stubViewportWidth(width: number): void {
+  window.matchMedia = ((query: string) => ({
+    matches: (() => {
+      const min = query.match(/^\(min-width: ([\d.]+)px\)$/);
+      if (min) return width >= parseFloat(min[1]);
+      const max = query.match(/^\(max-width: ([\d.]+)px\)$/);
+      if (max) return width <= parseFloat(max[1]);
+      return false;
+    })(),
+    media: query,
+    onchange: null,
+    addListener: () => {},
+    removeListener: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    dispatchEvent: () => false,
+  })) as typeof window.matchMedia;
+}
 
 function mockConversations(conversations: Conversation[]) {
   useConvMock.mockImplementation(() => conversationPage(conversations));
 }
 
 beforeEach(() => {
+  stubViewportWidth(375);
   mockConversations([conv("conv_a")]);
 });
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  window.matchMedia = originalMatchMedia;
 });
 
 describe("mobile sidebar drawer", () => {
