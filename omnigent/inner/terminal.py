@@ -121,7 +121,7 @@ def _tmux_managed_option_commands(
     if keep_alive_after_exit:
         commands.extend(_tmux_session_persistence_commands())
     if allow_passthrough:
-        commands.append(["set-option", "-g", "allow-passthrough", "on"])
+        commands.append(["set-option", "-gq", "allow-passthrough", "on"])
     return commands
 
 
@@ -200,8 +200,9 @@ def _tmux_lockdown_commands() -> list[list[str]]:
     Managed terminals must stay inside Omnigent' terminal registry.
     Disabling the prefix table and right-click context menus prevents an
     attached user from creating extra panes, windows, or sessions through
-    tmux UI controls. The root-table unbinds are quiet so missing default
-    mouse bindings on a tmux version do not fail terminal launch.
+    tmux UI controls. The private server uses ``-f /dev/null``, so these
+    default root-table bindings are stable. Avoid ``unbind-key -q`` because
+    tmux 3.0 lacks it.
 
     :returns: Tmux commands that disable prefix and creation menus.
     """
@@ -209,12 +210,12 @@ def _tmux_lockdown_commands() -> list[list[str]]:
         ["set-option", "-g", "prefix", "None"],
         ["set-option", "-g", "prefix2", "None"],
         ["unbind-key", "-a", "-T", "prefix"],
-        ["unbind-key", "-q", "-T", "root", "MouseDown3Pane"],
-        ["unbind-key", "-q", "-T", "root", "M-MouseDown3Pane"],
-        ["unbind-key", "-q", "-T", "root", "MouseDown3Status"],
-        ["unbind-key", "-q", "-T", "root", "M-MouseDown3Status"],
-        ["unbind-key", "-q", "-T", "root", "MouseDown3StatusLeft"],
-        ["unbind-key", "-q", "-T", "root", "M-MouseDown3StatusLeft"],
+        ["unbind-key", "-T", "root", "MouseDown3Pane"],
+        ["unbind-key", "-T", "root", "M-MouseDown3Pane"],
+        ["unbind-key", "-T", "root", "MouseDown3Status"],
+        ["unbind-key", "-T", "root", "M-MouseDown3Status"],
+        ["unbind-key", "-T", "root", "MouseDown3StatusLeft"],
+        ["unbind-key", "-T", "root", "M-MouseDown3StatusLeft"],
     ]
 
 
@@ -1078,12 +1079,18 @@ class TerminalInstance:
                     f"wait-for -S {_TMUX_START_ON_ATTACH_CHANNEL}",
                 ]
             )
-        # ``pane-died`` is a window-scope hook that fires when remain-on-exit
-        # keeps the pane alive after the inner process exits. We need to set
-        # it AFTER new-session (not before) because window scope requires an
-        # existing window, and global scope (-g) does not fire for pane-died.
+        # Each managed terminal has an isolated tmux server and one session.
+        # Session scope keeps this compatible with tmux 3.0 and later.
         pane_died_hook: list[list[str]] = (
-            [["set-hook", "-w", "pane-died", "detach-client -a"]]
+            [
+                [
+                    "set-hook",
+                    "-t",
+                    self.tmux_target,
+                    "pane-died",
+                    "detach-client -a",
+                ]
+            ]
             if self.keep_alive_after_exit
             else []
         )

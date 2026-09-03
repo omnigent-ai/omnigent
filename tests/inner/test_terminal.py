@@ -62,6 +62,16 @@ def contains_subsequence(values: list[str], expected: list[str]) -> bool:
     )
 
 
+def test_allow_passthrough_option_is_quiet_for_older_tmux() -> None:
+    """An unsupported allow-passthrough option must not abort terminal launch."""
+    commands = terminal_mod._tmux_managed_option_commands(
+        10_000,
+        allow_passthrough=True,
+    )
+
+    assert ["set-option", "-gq", "allow-passthrough", "on"] in commands
+
+
 def test_threaded_idle_watcher_reports_terminal_exit(tmp_path: Path) -> None:
     """
     The threaded watcher reports tmux disappearance instead of exiting silently.
@@ -602,6 +612,11 @@ async def test_launch_keeps_server_alive_when_opted_in(
     cmd = await _capture_launch_argv(tmp_path, monkeypatch, keep_alive_after_exit=True)
     assert contains_subsequence(cmd, ["set-option", "-gq", "remain-on-exit", "on"])
     assert contains_subsequence(cmd, ["set-option", "-sq", "exit-empty", "off"])
+    assert contains_subsequence(
+        cmd,
+        ["set-hook", "-t", "main", "pane-died", "detach-client -a"],
+    )
+    assert not contains_subsequence(cmd, ["set-hook", "-w", "pane-died"])
 
 
 @pytest.mark.asyncio
@@ -834,18 +849,21 @@ async def test_launch_disables_tmux_pane_and_window_creation_controls(
     assert contains_subsequence(cmd, ["set-option", "-g", "prefix", "None"])
     assert contains_subsequence(cmd, ["set-option", "-g", "prefix2", "None"])
     assert contains_subsequence(cmd, ["unbind-key", "-a", "-T", "prefix"])
-    assert contains_subsequence(cmd, ["unbind-key", "-q", "-T", "root", "MouseDown3Pane"])
-    assert contains_subsequence(cmd, ["unbind-key", "-q", "-T", "root", "M-MouseDown3Pane"])
-    assert contains_subsequence(cmd, ["unbind-key", "-q", "-T", "root", "MouseDown3Status"])
-    assert contains_subsequence(cmd, ["unbind-key", "-q", "-T", "root", "M-MouseDown3Status"])
+    # tmux 3.0a has all six default bindings but no ``unbind-key -q`` flag.
+    # Keep the lockdown usable on supported older Linux distributions.
+    assert contains_subsequence(cmd, ["unbind-key", "-T", "root", "MouseDown3Pane"])
+    assert contains_subsequence(cmd, ["unbind-key", "-T", "root", "M-MouseDown3Pane"])
+    assert contains_subsequence(cmd, ["unbind-key", "-T", "root", "MouseDown3Status"])
+    assert contains_subsequence(cmd, ["unbind-key", "-T", "root", "M-MouseDown3Status"])
     assert contains_subsequence(
         cmd,
-        ["unbind-key", "-q", "-T", "root", "MouseDown3StatusLeft"],
+        ["unbind-key", "-T", "root", "MouseDown3StatusLeft"],
     )
     assert contains_subsequence(
         cmd,
-        ["unbind-key", "-q", "-T", "root", "M-MouseDown3StatusLeft"],
+        ["unbind-key", "-T", "root", "M-MouseDown3StatusLeft"],
     )
+    assert not contains_subsequence(cmd, ["unbind-key", "-q"])
 
 
 @pytest.mark.asyncio
