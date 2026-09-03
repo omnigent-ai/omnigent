@@ -902,13 +902,18 @@ describe("Sidebar session list", () => {
     // as desktop; only desktop hover widens it for the revealed controls.
     expect(row).toHaveClass("pr-2");
     expect(row.className).not.toMatch(/(?:^|\s)pr-28(?:\s|$)/);
-    expect(row.className).toContain("md:group-hover:pr-20");
+    expect(row.className).toContain(
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover:pr-20",
+    );
     // Keyed on `:focus-visible`, matching when the trailing controls appear and
     // the state marker fades. `focus-within` would also fire for a plain click,
     // narrowing the reserve on the selected row while the marker stayed put.
-    expect(row.className).toContain("md:group-has-[:focus-visible]:pr-20");
+    expect(row.className).toContain(
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[:focus-visible]:pr-20",
+    );
     expect(row.className).not.toContain("md:group-focus-within:pr-20");
     expect(row.className).not.toMatch(/(?:^|\s)md:pr-20(?:\s|$)/);
+    expect(row.className).not.toContain("[@media((hover:hover)_and_(pointer:fine))]:md:pr-20");
   });
 
   it("narrows the awaiting row's reserve on the same trigger that fades its tag", () => {
@@ -966,6 +971,20 @@ describe("Sidebar session list", () => {
     expect(slot).toHaveClass("[@media(not_((hover:hover)_and_(pointer:fine)))]:md:right-20");
     const row = screen.getByRole("link", { name: /Running row/ });
     expect(row.className).toContain("[@media(not_((hover:hover)_and_(pointer:fine)))]:md:pr-27");
+    // The fades and the hover reserve are gated the same way as the reveals,
+    // so a tap's sticky :hover or a keyboard focus on the persistent controls
+    // neither hides the badge nor collapses the reserve under it.
+    expect(slot).toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[:focus-visible]:opacity-0",
+    );
+    expect(slot).not.toHaveClass(
+      "md:group-hover:opacity-0",
+      "md:group-has-[:focus-visible]:opacity-0",
+    );
+    expect(row.className).not.toMatch(
+      /(?:^|\s)md:group-(?:hover|has-\[:focus-visible\]):pr-20(?:\s|$)/,
+    );
   });
 
   it("does not constrain a row's awaiting pill to the dot slot", () => {
