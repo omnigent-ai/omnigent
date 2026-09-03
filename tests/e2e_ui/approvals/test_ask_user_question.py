@@ -18,6 +18,11 @@ Claude's own question tool. It is the sibling of ``test_exit_plan_mode.py``:
 both cover a Claude built-in tool that surfaces a structured card rather than
 the binary policy ASK.
 
+``test_typed_answer_submits_on_the_default_send_key`` and
+``test_typed_answer_submits_on_mod_enter_when_the_setting_is_on`` cover the
+keyboard route to the same verdict: the card submits on whichever chord the
+composer's General setting names, so the two never disagree.
+
 ``test_answered_question_stays_outside_the_worked_fold`` covers the second
 half of the story: where the ANSWERED card lands in the transcript once the
 turn moves on. ``test_answered_question_survives_a_reload`` covers the third:
@@ -41,8 +46,12 @@ _log = logging.getLogger(__name__)
 _APPROVAL_CARD = '[data-testid="approval-card"]'
 _FORM = '[data-testid="ask-user-question-form"]'
 _SUBMIT = '[data-testid="ask-user-question-submit"]'
+_CUSTOM_INPUT = '[data-testid="ask-user-question-custom-input"]'
 _WORKED_FOLD = '[data-testid="turn-worked-fold"]'
 _COMPOSER = "Send a message…"
+
+# The composer's send-chord preference, which the question card reads too.
+_SUBMIT_SHORTCUT_STORAGE_KEY = "omnigent:composer-submit-with-mod-enter"
 
 _MOCK_ELICITATION_TIMEOUT_MS = 15_000
 # A mock-LLM turn is fast, but this one is paused mid-flight on the gate
@@ -52,6 +61,11 @@ _TURN_TIMEOUT_MS = 60_000
 # The exact option labels used in the hook payload and form assertions.
 _OPTION_ONE = "Alpha"
 _OPTION_TWO = "Bravo"
+
+# The question text is also the answer map's key — the payload carries no id.
+_QUESTION = "Which option do you prefer?"
+# Matches neither option, so this value can only have come from the typed row.
+_TYPED_ANSWER = "Charlie"
 
 
 def _pending_elicitations(base_url: str, session_id: str) -> list[dict]:
@@ -92,7 +106,7 @@ def _post_ask_user_question(base_url: str, session_id: str, holder: dict) -> thr
                     "tool_input": {
                         "questions": [
                             {
-                                "question": "Which option do you prefer?",
+                                "question": _QUESTION,
                                 "options": [_OPTION_ONE, _OPTION_TWO],
                             }
                         ]
@@ -150,6 +164,126 @@ def test_ask_user_question_form_renders_and_submits(
         raise AssertionError(f"hook thread failed: {result_holder['error']}") from result_holder[
             "error"
         ]
+
+    _wait_for(lambda: not _pending_elicitations(base_url, session_id))
+
+
+def _open_question_card(page: Page, base_url: str, session_id: str, holder: dict):
+    """Park a question prompt, open the session, and return the live widgets.
+
+    :param page: Playwright page, already carrying any init scripts.
+    :param base_url: Server base URL.
+    :param session_id: Session to raise the prompt on.
+    :param holder: Dict the hook thread writes ``response`` / ``error`` into.
+    :returns: ``(hook_thread, custom_input)`` — join the thread after answering.
+    """
+    hook_thread = _post_ask_user_question(base_url, session_id, holder)
+
+    # Let the server park the elicitation before the SPA tries to render it.
+    page.wait_for_timeout(500)
+    page.goto(f"{base_url}/c/{session_id}")
+
+    card = (
+        page.locator(f'{_APPROVAL_CARD}[data-state="pending"]')
+        .filter(has=page.locator(_FORM))
+        .first
+    )
+    expect(card).to_be_visible(timeout=_MOCK_ELICITATION_TIMEOUT_MS)
+    form = card.locator(_FORM)
+    return hook_thread, form.locator(_CUSTOM_INPUT)
+
+
+def _assert_typed_answer_reached_claude(holder: dict) -> None:
+    """Assert the parked hook drained with the typed value, not an empty accept."""
+    if "error" in holder:
+        raise AssertionError(f"hook thread failed: {holder['error']}") from holder["error"]
+    decision = holder["response"]["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow", decision
+    assert decision["updatedInput"]["answers"] == {_QUESTION: _TYPED_ANSWER}, decision
+
+
+@pytest.mark.timeout(90)
+def test_typed_answer_submits_on_the_default_send_key(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Typed custom answer + plain Enter → prompt drains with that answer.
+
+    The global accept hotkey (``useApproveHotkey``) skips AskUserQuestion, so
+    the card carries its own binding, driven by the composer's send-chord
+    setting. That setting defaults to plain Enter, which leaves Shift+Enter as
+    the newline for the custom row's textarea.
+    """
+    base_url, session_id = seeded_session
+
+    result_holder: dict = {}
+    hook_thread, custom_input = _open_question_card(page, base_url, session_id, result_holder)
+
+    # Typing auto-checks the custom row's radio, so the question is answered.
+    custom_input.fill(_TYPED_ANSWER)
+
+    # Shift+Enter types a newline instead of submitting.
+    custom_input.press("Shift+Enter")
+    expect(custom_input).to_have_value(f"{_TYPED_ANSWER}\n")
+    expect(page.locator(f'{_APPROVAL_CARD}[data-state="responded"]')).to_have_count(
+        0, timeout=2_000
+    )
+    assert _pending_elicitations(base_url, session_id), "Shift+Enter resolved the prompt"
+
+    # Drop the newline so the answer that lands is exactly the typed value.
+    custom_input.fill(_TYPED_ANSWER)
+    custom_input.press("Enter")
+
+    responded = page.locator(f'{_APPROVAL_CARD}[data-state="responded"]').first
+    expect(responded).to_be_visible(timeout=_MOCK_ELICITATION_TIMEOUT_MS)
+    expect(responded).to_contain_text(_TYPED_ANSWER)
+
+    hook_thread.join(timeout=30)
+    _assert_typed_answer_reached_claude(result_holder)
+
+    _wait_for(lambda: not _pending_elicitations(base_url, session_id))
+
+
+@pytest.mark.timeout(90)
+def test_typed_answer_submits_on_mod_enter_when_the_setting_is_on(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """With the opt-in send setting, bare Enter types and Ctrl+Enter submits.
+
+    Seeded before navigation because the card reads the preference once at
+    mount — a later write would not reach the already-rendered form.
+    """
+    base_url, session_id = seeded_session
+
+    page.add_init_script(
+        f"window.localStorage.setItem('{_SUBMIT_SHORTCUT_STORAGE_KEY}', 'true')",
+    )
+
+    result_holder: dict = {}
+    hook_thread, custom_input = _open_question_card(page, base_url, session_id, result_holder)
+
+    custom_input.fill(_TYPED_ANSWER)
+
+    # Bare Enter is the newline key in this mode.
+    custom_input.press("Enter")
+    expect(custom_input).to_have_value(f"{_TYPED_ANSWER}\n")
+    expect(page.locator(f'{_APPROVAL_CARD}[data-state="responded"]')).to_have_count(
+        0, timeout=2_000
+    )
+    assert _pending_elicitations(base_url, session_id), "bare Enter resolved the prompt"
+
+    custom_input.fill(_TYPED_ANSWER)
+    # Ctrl+Enter is the Win/Linux chord (CI runs Linux chromium); the handler
+    # also takes Cmd+Enter via metaKey on macOS.
+    custom_input.press("Control+Enter")
+
+    responded = page.locator(f'{_APPROVAL_CARD}[data-state="responded"]').first
+    expect(responded).to_be_visible(timeout=_MOCK_ELICITATION_TIMEOUT_MS)
+    expect(responded).to_contain_text(_TYPED_ANSWER)
+
+    hook_thread.join(timeout=30)
+    _assert_typed_answer_reached_claude(result_holder)
 
     _wait_for(lambda: not _pending_elicitations(base_url, session_id))
 
