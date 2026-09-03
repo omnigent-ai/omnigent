@@ -2784,6 +2784,12 @@ async def _send_to_existing_session(
     ``running`` handle immediately — the completion lands in the parent's
     ``sys_read_inbox`` queue, matching named-mode send.
 
+    The child's ``(agent, title)`` identity, carried by the handle, the
+    launching tool result, and the completion wake notice, comes from
+    the ``"<agent>:<title>"`` title when it has one, and otherwise from
+    the snapshot's ``sub_agent_name`` / ``agent_name`` with the verbatim
+    title, so a ``sys_session_create`` child is named like a named one.
+
     :param target_session_id: The existing child session id, e.g.
         ``"conv_abc123"``.
     :param message: The user message text to post.
@@ -2824,8 +2830,18 @@ async def _send_to_existing_session(
                 "message": "target sub-agent session is closed; create a new session to continue.",
             }
         )
-    parsed = _parse_session_title(snap_data.get("title"))
-    agent_label = parsed.agent or "agent"
+    display_title = title_without_closed_marker(_optional_string(snap_data.get("title")))
+    parsed = _parse_session_title(display_title)
+    # A sys_session_create child keeps its verbatim title and has no
+    # sub_agent_name, so when the title does not parse as "<agent>:<title>"
+    # the identity comes from the snapshot's agent fields instead.
+    agent_label = (
+        parsed.agent
+        or _optional_string(snap_data.get("sub_agent_name"))
+        or _optional_string(snap_data.get("agent_name"))
+        or "agent"
+    )
+    instance_title = parsed.title if parsed.title is not None else (display_title or "")
     existing_work = _runner_app.get_subagent_work(target_session_id)
     if existing_work is not None and existing_work.status in ("launching", "running", "waiting"):
         return (
@@ -2846,15 +2862,15 @@ async def _send_to_existing_session(
     _runner_app.register_child_session(
         target_session_id,
         parent_session_id=conversation_id,
-        title=snap_data.get("title") or "",
+        title=display_title or "",
         tool=agent_label,
-        session_name=parsed.title or "",
+        session_name=instance_title,
     )
     _runner_app.register_subagent_work(
         parent_session_id=conversation_id,
         child_session_id=target_session_id,
         agent=agent_label,
-        title=parsed.title or "",
+        title=instance_title,
         wrapper_label=_session_wrapper_label(snap_data),
         created_by=created_by,
         work_id=work_id,
@@ -2862,9 +2878,9 @@ async def _send_to_existing_session(
     _publish_child_launching_update(
         parent_session_id=conversation_id,
         child_session_id=target_session_id,
-        title=snap_data.get("title") or "",
+        title=display_title or "",
         tool=agent_label,
-        session_name=parsed.title or "",
+        session_name=instance_title,
         publish_event=publish_event,
     )
 
@@ -2891,9 +2907,9 @@ async def _send_to_existing_session(
             "conversation_id": target_session_id,
             "kind": "sub_agent",
             "agent": agent_label,
-            "title": parsed.title,
+            "title": instance_title,
             "status": "launching",
-            "message": _subagent_launching_message(agent_label, parsed.title, target_session_id),
+            "message": _subagent_launching_message(agent_label, instance_title, target_session_id),
         }
     )
 
