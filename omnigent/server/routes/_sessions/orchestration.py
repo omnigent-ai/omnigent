@@ -90,6 +90,7 @@ from omnigent.runtime.policies.builder import (
     ancestor_ids_from_tree,
     load_session_tree,
     load_session_usage,
+    load_verified_session_tree,
 )
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
@@ -895,6 +896,8 @@ def _publish_subtree_cost_to_ancestors(
     conv_store: ConversationStore,
     session_id: str,
     conv: Conversation | None = None,
+    *,
+    tree: list[Conversation] | None = None,
 ) -> None:
     """
     Re-publish each ancestor's subtree-summed cost after a child usage update.
@@ -927,13 +930,21 @@ def _publish_subtree_cost_to_ancestors(
         The parameter belongs to this function, not to whichever caller first
         needed it, so that no caller can be removed and leave a signature
         behind that its remaining callers already depend on.
+    :param tree: A spawn tree already loaded for this session — the rows of a
+        :func:`load_verified_session_tree` result, so membership of
+        *session_id* is already established. Callers that just summed the same
+        tree for this session's own badge pass it so the turn-end roll-up loads
+        the tree once instead of twice; the ancestor sums then come from the
+        same rows as the session's own, rather than a second read a few
+        milliseconds later. ``None`` loads the tree here.
     :returns: None.
     """
-    tree = load_session_tree(
-        session_id,
-        conv_store,
-        conv.root_conversation_id if conv is not None else None,
-    )
+    if tree is None:
+        tree = load_session_tree(
+            session_id,
+            conv_store,
+            conv.root_conversation_id if conv is not None else None,
+        )
     for ancestor_id in ancestor_ids_from_tree(tree, session_id):
         ancestor_usage = _sum_subtree_usage(tree, ancestor_id)
         subtree_cost = _priced_cost_for_display(ancestor_usage)
@@ -977,6 +988,7 @@ def _build_session_response(
     viewer_id: str | None = None,
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
+    agent: Agent | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -1047,6 +1059,9 @@ def _build_session_response(
         ``None`` is treated as ``[]``.
     :param agent_store: Optional store used to resolve the session harness.
     :param agent_cache: Optional cache used to load the session harness spec.
+    :param agent: The bound agent row when the caller already read it, so
+        the harness resolve reuses it instead of reading the same row again.
+        ``None`` reads it through *agent_store* as before.
     :returns: The :class:`SessionResponse` for the API.
     :raises OmnigentError: If ``conv.agent_id`` is ``None``.
     """
@@ -1099,6 +1114,7 @@ def _build_session_response(
             conv,
             agent_store=agent_store,
             agent_cache=agent_cache,
+            agent=agent,
         ),
         model_override=conv.model_override,
         cost_control_mode_override=conv.cost_control_mode_override,
@@ -1681,7 +1697,14 @@ async def _persist_external_session_usage(
     # hide in-flight sub-agent spend until the next child flush (the badge would
     # oscillate own ⇄ subtree). For a childless session the subtree is just
     # itself, so this equals own cost — one indexed tree query per flush.
-    subtree_usage = await asyncio.to_thread(load_session_usage, session_id, conversation_store)
+    #
+    # That one load also serves the ancestor roll-up below: the ancestors are in
+    # this same tree, so summing both from one read keeps a parent's badge
+    # consistent with its child's instead of straddling two reads.
+    subtree_tree = await asyncio.to_thread(
+        load_verified_session_tree, session_id, conversation_store
+    )
+    subtree_usage = _sum_subtree_usage(subtree_tree.rows, session_id)
     subtree_cost = _priced_cost_for_display(subtree_usage)
     usage_by_model = _usage_by_model_for_display(subtree_usage)
     # Only include fields that were sent; the client treats absent
@@ -1706,12 +1729,13 @@ async def _persist_external_session_usage(
     # This session's usage also moves its ANCESTORS' subtree cost (its spend
     # rolls up into every ancestor), so re-publish each ancestor's subtree cost
     # too — otherwise a grandparent's badge wouldn't reflect a deep descendant.
-    # No-op for a top-level session (no ancestors). Threaded: it pages the
-    # conversation tree per ancestor.
+    # No-op for a top-level session (no ancestors). Threaded: SSE fan-out over
+    # the tree already loaded above.
     await asyncio.to_thread(
         _publish_subtree_cost_to_ancestors,
         conversation_store,
         session_id,
+        tree=subtree_tree.rows,
     )
     return raw_tokens
 
@@ -6491,11 +6515,14 @@ async def _relay_runner_stream_once(
                             # surfaces tokens). context_tokens/window already ride
                             # on the response.completed event. Threaded: store
                             # reads + SSE fan-out.
-                            _subtree_usage = await asyncio.to_thread(
-                                load_session_usage,
+                            # One tree load for this session's own badge and
+                            # the ancestor roll-up below — same tree, one read.
+                            _subtree_tree = await asyncio.to_thread(
+                                load_verified_session_tree,
                                 session_id,
                                 conversation_store,
                             )
+                            _subtree_usage = _sum_subtree_usage(_subtree_tree.rows, session_id)
                             _subtree_cost = _priced_cost_for_display(_subtree_usage)
                             _usage_by_model = _usage_by_model_for_display(_subtree_usage)
                             if _subtree_cost is not None or _usage_by_model is not None:
@@ -6517,6 +6544,7 @@ async def _relay_runner_stream_once(
                                     _publish_subtree_cost_to_ancestors,
                                     conversation_store,
                                     session_id,
+                                    tree=_subtree_tree.rows,
                                 )
 
                     # Reset the turn-scoped response_id on any
@@ -9621,6 +9649,9 @@ async def _get_session_snapshot(
     llm_model: str | None = None
     context_window: int | None = None
     agent_name: str | None = None
+    # Kept in scope past the block so the harness resolve below reuses this
+    # row instead of reading the same agent (plus its session lookup) again.
+    agent: Agent | None = None
     if agent_store is not None and agent_cache is not None and conv.agent_id is not None:
         try:
             agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
@@ -9714,7 +9745,16 @@ async def _get_session_snapshot(
     # is persisted on its own child conversation, not the parent's, so the
     # parent's own session_usage would under-report. Off the event loop
     # because it pages the conversation tree from the store.
-    subtree_usage = await asyncio.to_thread(load_session_usage, conv.id, conv_store)
+    # The tree root comes from the row this request already holds, so the
+    # subtree load skips its own ``get_conversation``. It stays a hint:
+    # ``load_session_usage`` verifies the tree it names contains this session
+    # and resolves the root itself when the row was stale.
+    subtree_usage = await asyncio.to_thread(
+        load_session_usage,
+        conv.id,
+        conv_store,
+        root_conversation_id=conv.root_conversation_id,
+    )
     # Static signal telling the open view a host-bound, host-down session is a
     # resumable managed host it can wake by sending a message, vs a terminal
     # host_offline dead-end. Computed independently of liveness_lookup (the web
@@ -9752,6 +9792,7 @@ async def _get_session_snapshot(
         viewer_id=viewer_id,
         agent_store=agent_store,
         agent_cache=agent_cache,
+        agent=agent,
     )
 
 

@@ -1724,6 +1724,7 @@ def _resolve_harness_impl(
     *,
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
+    agent: Agent | None = None,
 ) -> str | None:
     """
     Resolve the canonical harness for a conversation's bound agent.
@@ -1740,6 +1741,10 @@ def _resolve_harness_impl(
     :param conv: The conversation entity, or ``None``.
     :param agent_store: Optional store for resolving the bound agent.
     :param agent_cache: Optional cache for loading the bound agent spec.
+    :param agent: The already-read row for ``conv.agent_id``, when the caller
+        holds it. Reused verbatim so the snapshot build does not read the same
+        agent (and its spawn-tree session lookup) twice; a row for a different
+        agent is ignored. ``None`` reads it through *agent_store*.
     :returns: The canonical harness (e.g. ``"openai-agents"`` or
         ``"claude-sdk"``), or ``None`` when unavailable.
     """
@@ -1764,7 +1769,8 @@ def _resolve_harness_impl(
             return None
         if agent_cache is None:
             agent_cache = get_agent_cache()
-        agent = agent_store.get(conv.agent_id)
+        if agent is None or agent.id != conv.agent_id:
+            agent = agent_store.get(conv.agent_id)
         if agent is None:
             return None
         loaded = agent_cache.load(

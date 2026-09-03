@@ -131,9 +131,15 @@ class _ConversationStore:
     ) -> None:
         self.items = items
         self.list_items_calls: list[dict[str, object]] = []
+        # Read counters for the snapshot's read-budget tests: the snapshot
+        # threads the row it already holds forward, so a second
+        # ``get_conversation`` for the same id means a layer re-read it.
+        self.get_conversation_calls: list[str] = []
+        self.list_conversations_calls: list[str | None] = []
         self._conversations = conversations
 
     def get_conversation(self, conversation_id: str) -> Conversation | None:
+        self.get_conversation_calls.append(conversation_id)
         if self._conversations is not None:
             return self._conversations.get(conversation_id)
         return Conversation(
@@ -161,6 +167,7 @@ class _ConversationStore:
         conversation sharing the root; otherwise synthesize the single
         childless conversation the legacy tests expect.
         """
+        self.list_conversations_calls.append(root_conversation_id)
         if self._conversations is not None:
             convs = [
                 c
@@ -2351,6 +2358,90 @@ def test_publish_subtree_cost_to_ancestors_publishes_each_ancestor_subtree(
     )
     # The payload is a session.usage broadcast the web client renders as the badge.
     assert by_conv["b460374fc8e697b296708f52dc9d8179"]["type"] == "session.usage"
+
+
+def test_publish_subtree_cost_to_ancestors_reuses_a_supplied_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller's already-loaded tree is reused, not re-read.
+
+    A turn end sums this session's own subtree for its badge and then walks
+    the ancestors — the same tree, twice. The caller hands its rows over so
+    the walk costs no store read, and every ancestor's number comes from the
+    same read as the session's own instead of a second one milliseconds later.
+    """
+    g = _graph_conv(
+        "8463f762110b86b1ba33ddf7a8fc1172",
+        root="8463f762110b86b1ba33ddf7a8fc1172",
+        parent=None,
+        cost=1.0,
+    )
+    c = _graph_conv(
+        "405bfe154d5c0e795a2b87021bc897bf",
+        root="8463f762110b86b1ba33ddf7a8fc1172",
+        parent="8463f762110b86b1ba33ddf7a8fc1172",
+        cost=4.0,
+    )
+    conv_store = _ConversationStore(
+        [],
+        conversations={
+            "8463f762110b86b1ba33ddf7a8fc1172": g,
+            "405bfe154d5c0e795a2b87021bc897bf": c,
+        },
+    )
+    recorder = _UsageStreamRecorder()
+    monkeypatch.setattr(_sessions_mod, "session_stream", recorder)
+
+    _publish_subtree_cost_to_ancestors(
+        conv_store,  # type: ignore[arg-type]
+        "405bfe154d5c0e795a2b87021bc897bf",
+        tree=[g, c],
+    )
+
+    # Zero store reads: the whole walk ran off the caller's rows. Without the
+    # hand-off this is one ``get_conversation`` plus one tree page — the second
+    # load of a tree the caller had just summed.
+    assert conv_store.get_conversation_calls == []
+    assert conv_store.list_conversations_calls == []
+    # Same answer as the self-loading path: the root's subtree is $1 + $4.
+    by_conv = {pub.conversation_id: pub.event for pub in recorder.published}
+    assert set(by_conv) == {"8463f762110b86b1ba33ddf7a8fc1172"}
+    assert by_conv["8463f762110b86b1ba33ddf7a8fc1172"]["total_cost_usd"] == 5.0
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_reads_the_conversation_row_once() -> None:
+    """The snapshot's subtree-usage load reuses the row the request holds.
+
+    The tree root is on the conversation the caller already fetched, so the
+    usage load takes it as a hint instead of re-reading the row. A second
+    ``get_conversation`` here is that read coming back — invisible to every
+    behavioural assertion, because the body is identical either way.
+    """
+    solo = _graph_conv(
+        "6d996c055256e5975b8e5683c4d77d47",
+        root="6d996c055256e5975b8e5683c4d77d47",
+        parent=None,
+        cost=0.42,
+    )
+    conv_store = _ConversationStore(
+        [],
+        conversations={"6d996c055256e5975b8e5683c4d77d47": solo},
+    )
+
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "6d996c055256e5975b8e5683c4d77d47",
+        conversation=solo,
+    )
+
+    # The caller supplied the row, so the snapshot must read it zero times:
+    # authorization already paid for it on the route.
+    assert conv_store.get_conversation_calls == []
+    # The tree page still runs — it observes this session's DESCENDANTS, which
+    # the single row cannot answer — and it is rooted at the in-hand row's root.
+    assert conv_store.list_conversations_calls == ["6d996c055256e5975b8e5683c4d77d47"]
+    assert snapshot.total_cost_usd == 0.42
 
 
 # ── _truncate_label ──────────────────────────────────────────────────────────
