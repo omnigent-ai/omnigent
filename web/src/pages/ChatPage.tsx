@@ -2231,10 +2231,10 @@ function MainAgentSurface({
                     when not already showing Working… so the two never stack. */}
                     {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
                     {/* MCP-server startup band (codex-native): renders while the
-                    harness boots its MCP servers and, after startup settles,
-                    when servers failed or were cancelled. Independent of the
-                    Working… shimmer — it is strictly more specific about why
-                    the turn hasn't produced output yet. */}
+                    harness boots its MCP servers; clears once the round
+                    settles (failures stay in host logs, not the chat).
+                    Independent of the Working… shimmer — it is strictly more
+                    specific about why the turn hasn't produced output yet. */}
                     <McpStartupIndicator />
                   </>
                 )}

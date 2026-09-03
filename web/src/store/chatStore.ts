@@ -555,10 +555,11 @@ export interface ConversationState {
   /**
    * Per-MCP-server startup map for the bound session (codex-native).
    * Updated by `session.mcp_startup` SSE events while the harness boots
-   * its MCP servers; cleared back to `null` once every server settles
-   * `ready`. Failed/cancelled servers are retained so the page can say
-   * which servers never came up. Always `null` for sessions whose
-   * harness reports no MCP startup.
+   * its MCP servers; cleared back to `null` once no server is still
+   * `starting`. Settled failures/cancellations are setup diagnostics
+   * (host logs), never conversation content, so they are dropped rather
+   * than retained. Always `null` for sessions whose harness reports no
+   * MCP startup.
    */
   mcpStartup: Record<string, McpServerStartup> | null;
 
@@ -2938,6 +2939,23 @@ async function reconcilePendingElicitations(id: string): Promise<void> {
 }
 
 /**
+ * An MCP startup map reduced to what the chat surface may show: the map
+ * while any server is still `starting`, else `null`. A settled round —
+ * all ready, or ended with failures/cancellations — renders nothing:
+ * failure notices are setup diagnostics that belong in host logs, not
+ * items in the conversation viewport. Applied at both intake points
+ * (SSE event and session snapshot) so a reload can't resurrect a notice
+ * the live handler would have dropped.
+ */
+function activeMcpStartup(
+  servers: Record<string, McpServerStartup> | null | undefined,
+): Record<string, McpServerStartup> | null {
+  if (!servers) return null;
+  const anyStarting = Object.values(servers).some((r) => r.status === "starting");
+  return anyStarting ? servers : null;
+}
+
+/**
  * Store fields derived from the session's agent binding, computed from a
  * session snapshot.
  *
@@ -3006,7 +3024,7 @@ function sessionBindingPatch(
     codexModelOptions: session.codexModelOptions ?? [],
     terminalPending: session.terminalPending ?? false,
     sandboxStatus: session.sandboxStatus ?? null,
-    mcpStartup: session.mcpStartup ?? null,
+    mcpStartup: activeMcpStartup(session.mcpStartup),
   };
 }
 
@@ -5234,13 +5252,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       });
       return;
     case "session_mcp_startup": {
-      // Mirror the harness's per-MCP-server startup map. Cleared once
-      // every server settles `ready` (the band disappears); failures and
-      // cancellations are retained so the page can say which servers
-      // never came up.
-      const records = Object.values(event.servers);
-      const allReady = records.length === 0 || records.every((r) => r.status === "ready");
-      applyToConversation({ mcpStartup: allReady ? null : event.servers });
+      // Mirror the harness's per-MCP-server startup map while the round
+      // is in flight; cleared once no server is still `starting`.
+      // Failures/cancellations are setup diagnostics (host logs), not
+      // conversation content — retaining them rendered an inline notice
+      // in the chat viewport and pinned the message-flow branch open.
+      applyToConversation({ mcpStartup: activeMcpStartup(event.servers) });
       return;
     }
     case "session_usage": {

@@ -1,4 +1,4 @@
-import { AlertTriangleIcon, Loader2Icon, WifiOffIcon } from "lucide-react";
+import { Loader2Icon, WifiOffIcon } from "lucide-react";
 import { ConversationEmptyState } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ErrorBanner } from "@/components/blocks/StatusBlocks";
@@ -220,10 +220,6 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
 // before collapsing the rest into "…" — mirrors the Codex TUI's own
 // startup header, and keeps a 20-server config to one line.
 const MCP_STARTING_NAMES_SHOWN = 3;
-// Cap for the settled warning's failed/cancelled name lists. Longer
-// than the starting cap because these name servers the user may need
-// to fix; beyond this the count carries the signal.
-const MCP_SETTLED_NAMES_SHOWN = 8;
 
 /**
  * The startup band's in-flight line, mirroring the Codex TUI's header.
@@ -242,60 +238,26 @@ export function mcpStartingLine(starting: string[], total: number): string {
 }
 
 /**
- * A settled warning's name list, capped so the band stays scannable.
- *
- * @param names Failed or cancelled server names, sorted.
- * @returns e.g. `"a, b, c, d, e, f, g, h, +12 more"`.
- */
-export function mcpSettledNames(names: string[]): string {
-  if (names.length <= MCP_SETTLED_NAMES_SHOWN) return names.join(", ");
-  const shown = names.slice(0, MCP_SETTLED_NAMES_SHOWN);
-  return `${shown.join(", ")}, +${names.length - MCP_SETTLED_NAMES_SHOWN} more`;
-}
-
-/**
  * Per-MCP-server startup band for native harness sessions (codex-native).
  * Codex defers a mid-startup turn's execution until its MCP servers
  * settle, and the session previously showed nothing during that window.
- * Renders a spinner naming the still-starting servers; once startup
- * settles with failures/cancellations, a one-line notice says which
- * servers never came up. Self-gates to null when the store carries no
- * startup state (an all-ready map is cleared by the store handler).
+ * Renders a spinner naming the still-starting servers; once the round
+ * settles the band disappears entirely. Failures and cancellations are
+ * setup diagnostics, not conversation content — they stay in host logs
+ * rather than adding an item to the chat viewport.
  */
 export function McpStartupIndicator() {
   const mcpStartup = useChatStore((s) => s.mcpStartup);
   if (mcpStartup === null) return null;
   const names = Object.keys(mcpStartup).sort();
   const starting = names.filter((name) => mcpStartup[name].status === "starting");
-  if (starting.length > 0) {
-    return (
-      <Message
-        from="assistant"
-        data-testid="mcp-startup-indicator"
-        role="status"
-        aria-live="polite"
-      >
-        <MessageContent>
-          <span className="flex items-center gap-2 text-muted-foreground text-ui">
-            <Loader2Icon className="size-4 shrink-0 animate-spin" aria-hidden />
-            {mcpStartingLine(starting, names.length)}
-          </span>
-        </MessageContent>
-      </Message>
-    );
-  }
-  const failed = names.filter((name) => mcpStartup[name].status === "failed");
-  const cancelled = names.filter((name) => mcpStartup[name].status === "cancelled");
-  if (failed.length === 0 && cancelled.length === 0) return null;
-  const parts: string[] = [];
-  if (failed.length > 0) parts.push(`failed: ${mcpSettledNames(failed)}`);
-  if (cancelled.length > 0) parts.push(`cancelled: ${mcpSettledNames(cancelled)}`);
+  if (starting.length === 0) return null;
   return (
-    <Message from="assistant" data-testid="mcp-startup-indicator" role="status">
+    <Message from="assistant" data-testid="mcp-startup-indicator" role="status" aria-live="polite">
       <MessageContent>
         <span className="flex items-center gap-2 text-muted-foreground text-ui">
-          <AlertTriangleIcon className="size-4 shrink-0" aria-hidden />
-          {`MCP startup incomplete (${parts.join("; ")})`}
+          <Loader2Icon className="size-4 shrink-0 animate-spin" aria-hidden />
+          {mcpStartingLine(starting, names.length)}
         </span>
       </MessageContent>
     </Message>
