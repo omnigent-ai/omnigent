@@ -2162,6 +2162,40 @@ def _enforce_wrapper_guard() -> None:
         raise SystemExit(2)
 
 
+def _ensure_stdio_survives_unencodable_output() -> None:
+    """Keep stdio writes from aborting when the stream encoding is legacy.
+
+    A shell on a legacy non-UTF-8 encoding (Windows ANSI codepage like
+    cp1252, a C/latin-1 locale, or an explicit ``PYTHONIOENCODING``) hands
+    Python stdio streams that can't encode the CLI's decorative glyphs
+    (emoji, ``✓``, ``←``, …), so a plain ``print`` raises
+    ``UnicodeEncodeError`` mid-command. Reconfigure such streams so the
+    unencodable character degrades to a stand-in instead of killing the
+    command: on Windows switch to UTF-8 outright (modern terminals render
+    it, and it preserves the glyphs); elsewhere keep the stream's own
+    encoding and only relax the error handler, so output stays in the
+    encoding the consumer asked for. ``PYTHONUTF8`` can't help here since
+    PEP 540 reads it only at interpreter startup.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        encoding = (getattr(stream, "encoding", "") or "").lower().replace("_", "-")
+        if encoding in {"utf-8", "utf8"}:
+            continue
+        # Trade-off: errors="replace" is process-wide, so any genuinely
+        # unencodable output (not just decorative glyphs) degrades to "?"
+        # instead of raising — acceptable for a CLI's human-facing stdio.
+        # Detached/replaced streams (or a test's capture object) can't be
+        # reconfigured; the glyph fallback still guards the actual writes.
+        with contextlib.suppress(ValueError, OSError):
+            if sys.platform == "win32":
+                reconfigure(encoding="utf-8", errors="replace")
+            else:
+                reconfigure(errors="replace")
+
+
 def main() -> None:
     """
     Console-script entry point for ``omnigent``.
@@ -2201,6 +2235,11 @@ def main() -> None:
     cwd = os.getcwd()
     if cwd not in sys.path:
         sys.path.insert(0, cwd)
+
+    # Legacy-codepage stdio (Windows ANSI, C locale, PYTHONIOENCODING)
+    # can't encode the CLI's glyphs; harden the streams before any command
+    # renders so the write degrades instead of aborting.
+    _ensure_stdio_survives_unencodable_output()
 
     # Relocate pre-rename ~/.omniagents state before anything reads ~/.omnigent
     # (update-check cache, diagnostics logs, config). No-op once migrated.
