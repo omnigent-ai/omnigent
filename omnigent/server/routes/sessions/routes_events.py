@@ -272,7 +272,7 @@ async def _recover_retry_session(
         raise _session_not_found()
 
     original_runner_id = conv.runner_id
-    runner_client = await _get_runner_client(session_id, runner_router)
+    runner_client = await _get_runner_client(session_id, runner_router, conversation=conv)
     runner_relaunched = False
     terminal_ready_from_init = False
     if runner_client is None:
@@ -791,7 +791,7 @@ def register_events_routes(
                 )
                 if _refreshed is not None:
                     wake_conv = _refreshed
-            _client = await _get_runner_client(session_id, runner_router)
+            _client = await _get_runner_client(session_id, runner_router, conversation=wake_conv)
             if _client is None and wake_conv.host_id is not None:
                 _host_reg = getattr(_app_state, "host_registry", None)
                 _tunnel_reg = getattr(_app_state, "tunnel_registry", None)
@@ -839,7 +839,9 @@ def register_events_routes(
                     )
                     if _refreshed is not None:
                         wake_conv = _refreshed
-                    _client = await _get_runner_client(session_id, runner_router)
+                    _client = await _get_runner_client(
+                        session_id, runner_router, conversation=wake_conv
+                    )
                 if _client is None:
                     _client = await _wait_for_runner_client(
                         session_id,
@@ -885,6 +887,7 @@ def register_events_routes(
             runner_client = await _get_runner_client(
                 session_id,
                 runner_router,
+                conversation=conv,
             )
             interrupt_delivered = False
             if runner_client is not None:
@@ -1505,7 +1508,7 @@ def register_events_routes(
             # call_ids no-op at the scaffold; the harness re-emits the
             # completed function_call + output on resume, so history is
             # written through the normal stream path (no separate persist).
-            runner_client = await _get_runner_client(session_id, runner_router)
+            runner_client = await _get_runner_client(session_id, runner_router, conversation=conv)
             if runner_client is None:
                 raise OmnigentError(
                     "No runner bound to this session; cannot deliver the tool result.",
@@ -1554,6 +1557,11 @@ def register_events_routes(
                 raise _session_not_found()
             conv = conv_after_wake
             _runner_needs_session_init = True
+        # Deliberately NOT passing conversation=conv: the request-phase policy
+        # gate above can park server-side for human approval (ASK), for up to
+        # DEFAULT_ASK_TIMEOUT, and a relaunch or heal in that window rebinds
+        # runner_id / host_id. Routing must read the row itself so the turn
+        # cannot be dispatched to a runner that no longer owns the session.
         runner_client = await _get_runner_client(session_id, runner_router)
         # Managed-launch rendezvous: a ``host_type="managed"`` create
         # returns before the sandbox exists, so the first message (the
@@ -1576,7 +1584,9 @@ def register_events_routes(
                 conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
                 if conv is None:
                     raise _session_not_found()
-                runner_client = await _get_runner_client(session_id, runner_router)
+                runner_client = await _get_runner_client(
+                    session_id, runner_router, conversation=conv
+                )
         # Check for wrong-replica routing miss before attempting healing or dispatch.
         # The runner tunnel is registered on the same replica as its host; when the
         # tunnel is absent here but the host is live elsewhere, the key routed to
@@ -1762,7 +1772,9 @@ def register_events_routes(
                         if conv_after_relaunch is None:
                             raise _session_not_found()
                         conv = conv_after_relaunch
-                        runner_client = await _get_runner_client(session_id, runner_router)
+                        runner_client = await _get_runner_client(
+                            session_id, runner_router, conversation=conv
+                        )
             else:
                 relaunched_runner_id = None
             if runner_client is None:

@@ -1209,15 +1209,21 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
     )
     resolve_calls = {"n": 0}
 
-    async def _staged_get_runner_client(sid: str, router: object) -> httpx.AsyncClient | None:
+    async def _staged_get_runner_client(
+        sid: str,
+        router: object,
+        *,
+        conversation: Conversation | None = None,
+    ) -> httpx.AsyncClient | None:
         """Simulate the pinned runner becoming routable during grace.
 
         :param sid: Session id being routed, e.g. ``"d1f9214d74c38b9f9a9db17ed8352dc4"``.
         :param router: Real app runner router (unused in this staged
             resolver).
+        :param conversation: Row the route reuses for routing (unused here).
         :returns: ``None`` first, then the fake runner client.
         """
-        del router
+        del router, conversation
         assert sid == session_id
         resolve_calls["n"] += 1
         return None if resolve_calls["n"] == 1 else fake_runner
@@ -1351,14 +1357,20 @@ async def test_relaunch_posts_session_init_before_forwarding_message(
         base_url="http://runner",
     )
 
-    async def _staged_get_runner_client(sid: str, router: object) -> httpx.AsyncClient | None:
+    async def _staged_get_runner_client(
+        sid: str,
+        router: object,
+        *,
+        conversation: Conversation | None = None,
+    ) -> httpx.AsyncClient | None:
         """Return ``None`` so the route enters the relaunch branch.
 
         :param sid: Session id being routed (unused; one session here).
         :param router: Real app runner router (unused — staged here).
+        :param conversation: Row the route reuses for routing (unused here).
         :returns: ``None``.
         """
-        del sid, router
+        del sid, router, conversation
         return None
 
     monkeypatch.setattr(sessions_module, "_get_runner_client", _staged_get_runner_client)

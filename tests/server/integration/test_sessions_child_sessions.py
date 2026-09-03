@@ -1580,6 +1580,7 @@ async def test_native_subagent_message_uses_native_terminal_forward(
     async def _fake_get_runner_client(
         session_id: str,
         runner_router: object,
+        **_kwargs: Any,
     ) -> httpx.AsyncClient:
         """
         Route the native child message to the fake runner.
@@ -1969,6 +1970,7 @@ async def test_subagent_message_heals_stale_runner_binding_via_parent(
     async def _runner_client_stub(
         _session_id: str,
         _runner_router: object,
+        **_kwargs: Any,
     ) -> httpx.AsyncClient | None:
         nonlocal call_count
         call_count += 1
