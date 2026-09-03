@@ -24,7 +24,11 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
+from omnigent.entities import (
+    USER_SESSION_TITLE_MAX_CHARS,
+    MessageData,
+    NewConversationItem,
+)
 from omnigent.llms.context_window import ModelPricing
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.background_session_titles import BackgroundTitleRequest
@@ -210,6 +214,148 @@ async def test_first_message_schedules_background_semantic_title(
     await coordinator.wait_for_idle()
     snapshot = await client.get(f"/v1/sessions/{session['id']}")
     assert snapshot.json()["title"] == "Debug authentication timeout"
+
+
+async def test_create_titled_session_keeps_title_after_first_message(
+    client: httpx.AsyncClient,
+    app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session named at creation is never auto-renamed.
+
+    The background title pipeline only runs on untitled conversations, so
+    the first user turn must leave a create-time title untouched and must
+    not invoke the generator at all.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], title="canvas-layout")
+    assert session["title"] == "canvas-layout"
+
+    generator_calls: list[BackgroundTitleRequest] = []
+
+    async def generator(request: BackgroundTitleRequest) -> str:
+        generator_calls.append(request)
+        return "Generated title that must not land"
+
+    coordinator = app.state.background_title_coordinator
+    coordinator._generator = generator
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={"queued": True})),
+        base_url="http://runner",
+    )
+
+    async def get_runner_client(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client",
+        get_runner_client,
+    )
+
+    try:
+        response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "please investigate the authentication timeout",
+                        }
+                    ],
+                },
+            },
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert response.status_code == 202, response.text
+    # Scheduling happens inline in the events handler, so after the response
+    # and a drained coordinator nothing more can arrive.
+    await coordinator.wait_for_idle()
+    assert generator_calls == []
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["title"] == "canvas-layout"
+
+
+async def test_sidebar_rename_wins_in_flight_background_title(
+    client: httpx.AsyncClient,
+    app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sidebar rename while the background title is in flight is never clobbered.
+
+    End-to-end version of the coordinator-level race test: the first message
+    seeds a title and schedules generation, the user renames from the sidebar
+    (PATCH) before generation finishes, and the generated title must not land.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    generator_started = asyncio.Event()
+    release_generator = asyncio.Event()
+
+    async def generator(_request: BackgroundTitleRequest) -> str:
+        generator_started.set()
+        await release_generator.wait()
+        return "Generated title that must not land"
+
+    coordinator = app.state.background_title_coordinator
+    coordinator._generator = generator
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={"queued": True})),
+        base_url="http://runner",
+    )
+
+    async def get_runner_client(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client",
+        get_runner_client,
+    )
+
+    try:
+        response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "please investigate the authentication timeout",
+                        }
+                    ],
+                },
+            },
+        )
+        assert response.status_code == 202, response.text
+        # The background attempt is mid-generation when the user renames.
+        await asyncio.wait_for(generator_started.wait(), timeout=5)
+        renamed = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"title": "My sidebar name"},
+        )
+        assert renamed.status_code == 200, renamed.text
+        release_generator.set()
+        await coordinator.wait_for_idle()
+    finally:
+        release_generator.set()
+        await fake_runner.aclose()
+
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["title"] == "My sidebar name"
 
 
 async def test_background_title_failure_does_not_break_subsequent_user_turn(
@@ -1497,6 +1643,9 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
             "agent_id": agent["id"],
             "model": "skill-agent",
             "has_mcp_servers": False,
+            # No renderer subscribes to the session stream in this test,
+            # so the turn is stamped headless (browser tools stripped).
+            "browser_renderer_available": False,
             # The forwarded message is the meta item; its store id lets the
             # runner dedup it on a cold-cache history reload.
             "persisted_item_id": meta["id"],
@@ -3135,6 +3284,85 @@ async def test_list_session_items_404_for_nonexistent(
     """Items endpoint returns 404 for a session that doesn't exist."""
     resp = await client.get("/v1/sessions/ad563e906854634c49e1a6fd2fbb31d4/items")
     assert resp.status_code == 404
+
+
+async def test_list_session_items_big_page_survives_bounded_read_backend(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    ``limit=1000`` on a large conversation must not 500 when the backend can
+    only serve bounded reads.
+
+    A deployed managed-Postgres backend failed single big-page reads of a
+    large conversation (500 at ``limit>=500``, 200 at ``limit<=400``), which
+    turned every valid ``limit=1000`` request into ``internal_error`` — most
+    visibly breaking claude-native cold resume. The route must assemble the
+    page from bounded per-statement reads, so the same request returns 200
+    with the complete, ordered page. The choke is injected at the engine
+    boundary to mirror that deployed failure signature.
+    """
+    from sqlalchemy import event as _sa_event
+
+    # The deployed signature: reads of <=400 rows serve fine, bigger ones fail.
+    deployed_safe_read_rows = 400
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    appended = store.append(
+        session["id"],
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_big",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": f"item-{i}"}],
+                ),
+            )
+            for i in range(600)
+        ],
+    )
+
+    def _choke_on_oversized_reads(conn, clauseelement, multiparams, params, execution_options):
+        limit_clause = getattr(clauseelement, "_limit_clause", None)
+        value = getattr(limit_clause, "value", None)
+        if (
+            isinstance(value, int)
+            and value > deployed_safe_read_rows
+            and "conversation_items" in str(clauseelement)
+        ):
+            raise RuntimeError(f"simulated backend failure on oversized read (limit={value})")
+
+    _sa_event.listen(store._conv_engine, "before_execute", _choke_on_oversized_reads)
+    try:
+        resp = await client.get(
+            f"/v1/sessions/{session['id']}/items",
+            params={"limit": 1000},
+        )
+        assert resp.status_code == 200, resp.text
+        page = resp.json()
+        assert [i["id"] for i in page["data"]] == [i.id for i in appended]
+        assert page["has_more"] is False
+        assert page["first_id"] == appended[0].id
+        assert page["last_id"] == appended[-1].id
+
+        # Cursor pagination stays correct across the same bounded backend.
+        first = await client.get(
+            f"/v1/sessions/{session['id']}/items",
+            params={"limit": 500},
+        )
+        assert first.status_code == 200, first.text
+        assert first.json()["has_more"] is True
+        rest = await client.get(
+            f"/v1/sessions/{session['id']}/items",
+            params={"limit": 500, "after": first.json()["last_id"]},
+        )
+        assert rest.status_code == 200, rest.text
+        assert [i["id"] for i in rest.json()["data"]] == [i.id for i in appended[500:]]
+    finally:
+        _sa_event.remove(store._conv_engine, "before_execute", _choke_on_oversized_reads)
 
 
 # ── GET /v1/sessions/{id} snapshot fields ────────────────
@@ -10044,4 +10272,68 @@ async def test_create_child_session_duplicate_title_returns_409(
     )
     assert resp2.status_code == 409, (
         f"expected 409 on duplicate child title, got {resp2.status_code}: {resp2.text}"
+    )
+
+
+async def test_create_session_notifies_runner_with_init_envelope(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The create route notifies the runner with the session-init envelope.
+
+    Cross-component regression: the create route must send the full
+    ``session_init`` envelope — carrying the persisted ``/model`` override —
+    not the legacy id-only body. Otherwise the runner falls back to a
+    best-effort reverse GET and, on any failure, silently spawns the default
+    model and respawns on the first turn. Asserts the captured runner-init POST
+    is the envelope and that it carries the override.
+    """
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PAYLOAD_KEY,
+        parse_runner_session_init_envelope,
+    )
+    from omnigent.server.routes import sessions as sessions_module
+
+    agent = await create_test_agent(client)
+
+    captured_inits: list[dict[str, Any]] = []
+
+    def forward_to_runner(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            captured_inits.append(json.loads(request.content))
+        return httpx.Response(201, json={"status": "initialized"})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(forward_to_runner),
+        base_url="http://runner",
+    )
+
+    async def _fake_get_runner_client(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    try:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"agent_id": agent["id"], "model_override": "model-x"},
+        )
+        assert resp.status_code == 201, f"create failed: {resp.status_code} {resp.text}"
+    finally:
+        await fake_runner.aclose()
+
+    assert captured_inits, "create route did not notify the runner of the new session"
+    body = captured_inits[-1]
+    assert SESSION_INIT_PAYLOAD_KEY in body, (
+        "create route sent the legacy id-only body, not the init envelope; the "
+        f"runner would fall back to a reverse GET. Body keys: {sorted(body)}"
+    )
+    envelope = parse_runner_session_init_envelope(body)
+    assert envelope is not None
+    assert envelope.snapshot.model_override == "model-x", (
+        "the init envelope must carry the persisted /model override so the "
+        "runner seeds it into the first spawn; got "
+        f"{envelope.snapshot.model_override!r}"
     )

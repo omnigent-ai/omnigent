@@ -545,9 +545,9 @@ def test_managed_mint_factory_installs_for_retry_on_transient_boot_failure(
     """A transient probe failure still installs the factory (armed to retry).
 
     If the mint endpoint has a blip at the instant the runner boots (network
-    error, 5xx), the factory must still install so a later callback re-mints
-    — otherwise the runner is left permanently unauthenticated until process
-    restart.
+    error, timeout), the factory must still install so a later callback
+    re-mints — otherwise the runner is left permanently unauthenticated until
+    process restart.
 
     :param monkeypatch: Pytest environment patch fixture.
     :returns: None.
@@ -642,6 +642,342 @@ def test_managed_mint_factory_declines_at_request_time_and_auth_sends_bare(
     sent2 = next(auth.auth_flow(request2))
     assert "Authorization" not in sent2.headers
     assert len(calls) == 2  # probe blip + the single definitive 400
+
+
+@pytest.mark.parametrize("status_code", [500, 502, 503, 504])
+def test_managed_mint_factory_latches_declined_on_5xx_with_no_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+) -> None:
+    """A 5xx before any successful mint latches ``declined`` → bare requests.
+
+    An intermediary (e.g. a Databricks Apps relay answering 502 Bad Gateway)
+    can respond for the mint endpoint so the request never reaches the
+    server. With no cached token, treating that as transient means the
+    factory returns ``None`` forever and ``auth_flow`` raises on every
+    callback — bricking the session at spec resolve. The 5xx must latch
+    ``declined`` so callbacks fall back to bare requests.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :param status_code: The 5xx status the intermediary answers with.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _bad_gateway(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Answer every mint the way an intermediary's 5xx page does."""
+        calls.append(1)
+        request = httpx.Request("POST", mint_url)
+        raise httpx.HTTPStatusError(
+            "bad gateway",
+            request=request,
+            response=httpx.Response(status_code, request=request),
+        )
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _bad_gateway)
+
+    factory = _ManagedMintTokenFactory(
+        "https://s.example.com/v1/runners/r/token",
+        "https://s.example.com",
+        "btok",
+    )
+    assert factory() is None
+    assert factory.declined is True
+    assert factory.proxy_auth_failed is False
+
+    auth = _RunnerDatabricksAuth(factory)
+    request = httpx.Request("GET", "http://server/v1/sessions/conv_1/agent/contents")
+    sent = next(auth.auth_flow(request))  # must NOT raise (fail closed)
+    assert "Authorization" not in sent.headers
+
+    # The latch short-circuits: later calls never re-hit the endpoint.
+    assert factory() is None
+    assert len(calls) == 1
+
+
+def test_declined_latch_recovers_when_bare_request_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected bare request clears the 5xx decline and re-mints.
+
+    The decline latched by an intermediary 5xx is a guess that the server
+    doesn't need auth. When a bare callback then gets a re-auth signal
+    (401/403/OIDC redirect), the guess was wrong — the server was merely
+    down. The auth flow must clear the latch, mint a fresh token from the
+    recovered server, and retry the request authenticated, so the runner
+    heals without a process restart.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _5xx_then_mint(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Answer 502 for the first mint (server down), then mint fine."""
+        calls.append(1)
+        if len(calls) == 1:
+            request = httpx.Request("POST", mint_url)
+            raise httpx.HTTPStatusError(
+                "bad gateway",
+                request=request,
+                response=httpx.Response(502, request=request),
+            )
+        return ("jwt-recovered", time.time() + 1800)
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _5xx_then_mint)
+
+    factory = _ManagedMintTokenFactory(
+        "https://s.example.com/v1/runners/r/token",
+        "https://s.example.com",
+        "btok",
+    )
+    assert factory() is None
+    assert factory.declined is True
+
+    auth = _RunnerDatabricksAuth(factory)
+    request = httpx.Request("GET", "http://server/v1/sessions/conv_1/agent/contents")
+    gen = auth.auth_flow(request)
+    bare = next(gen)
+    assert "Authorization" not in bare.headers
+
+    # The authenticated server rejects the bare request → the flow clears
+    # the latch, re-mints, and retries with the fresh bearer.
+    retried = gen.send(httpx.Response(401))
+    assert retried.headers.get("Authorization") == "Bearer jwt-recovered"
+    assert factory.declined is False
+    with pytest.raises(StopIteration):
+        gen.send(httpx.Response(200))
+
+
+def test_declined_latch_stays_bare_when_bare_request_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful bare request keeps the decline latched (no-auth server).
+
+    On a genuine no-auth/header-mode server, bare requests succeed; the
+    auth flow must not clear the latch or re-hit the mint endpoint on
+    every callback.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _bad_gateway(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Answer every mint with 502."""
+        calls.append(1)
+        request = httpx.Request("POST", mint_url)
+        raise httpx.HTTPStatusError(
+            "bad gateway",
+            request=request,
+            response=httpx.Response(502, request=request),
+        )
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _bad_gateway)
+
+    factory = _ManagedMintTokenFactory(
+        "https://s.example.com/v1/runners/r/token",
+        "https://s.example.com",
+        "btok",
+    )
+    assert factory() is None
+    assert factory.declined is True
+
+    auth = _RunnerDatabricksAuth(factory)
+    request = httpx.Request("GET", "http://server/v1/sessions/conv_1/agent/contents")
+    gen = auth.auth_flow(request)
+    bare = next(gen)
+    assert "Authorization" not in bare.headers
+
+    with pytest.raises(StopIteration):
+        gen.send(httpx.Response(200))
+    assert factory.declined is True
+    assert len(calls) == 1  # the latch kept later calls off the endpoint
+
+
+def test_managed_mint_factory_5xx_after_prior_mint_keeps_cached_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 5xx after a successful mint is transient — serve the cache, no latch.
+
+    Once the server has proven it mints for this runner, a mid-session 5xx
+    (server restart, brief gateway hiccup) must not permanently flip the
+    factory to bare requests: the still-valid cached token is served and
+    the next refresh retries the mint.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _mint_then_5xx(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Mint a near-expiry token once, then answer 502 to refreshes."""
+        calls.append(1)
+        if len(calls) == 1:
+            # Within the refresh skew → the next call attempts a re-mint.
+            return ("jwt-1", time.time() + 250)
+        request = httpx.Request("POST", mint_url)
+        raise httpx.HTTPStatusError(
+            "bad gateway",
+            request=request,
+            response=httpx.Response(502, request=request),
+        )
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _mint_then_5xx)
+
+    factory = _make_managed_mint_factory("https://s.example.com", "btok")
+    assert factory is not None
+    assert isinstance(factory, _ManagedMintTokenFactory)
+
+    # Refresh attempt gets the 502; the still-valid cached token is served.
+    assert factory() == "jwt-1"
+    assert factory.declined is False
+    assert factory.proxy_auth_failed is False
+    assert len(calls) == 2
+
+
+def test_managed_mint_factory_probe_5xx_installs_declined_factory_that_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A construction-probe 5xx installs the factory with declined latched.
+
+    Callbacks then go out bare (non-blocking), and once the intermediary
+    stops answering for the server a rejected bare request can clear the
+    latch and re-mint — dropping the factory at boot would lose that
+    recovery path permanently.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _5xx_then_mint(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Answer the probe with 502, then mint successfully."""
+        calls.append(1)
+        request = httpx.Request("POST", mint_url)
+        if len(calls) == 1:
+            raise httpx.HTTPStatusError(
+                "bad gateway",
+                request=request,
+                response=httpx.Response(502, request=request),
+            )
+        return "jwt-recovered", time.time() + 3600
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _5xx_then_mint)
+
+    factory = _make_managed_mint_factory("https://s.example.com", "btok")
+    assert isinstance(factory, _ManagedMintTokenFactory)
+    assert factory.declined is True
+    assert factory.declined_by_server_error is True
+    # Declined: calls return None without touching the network.
+    assert factory() is None
+    assert len(calls) == 1
+    # A rejected bare request clears the latch; the next call re-mints.
+    factory.reset_decline()
+    assert factory() == "jwt-recovered"
+    assert factory.declined is False
+
+
+def test_managed_mint_factory_snapshot_pairs_token_with_declined(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """call_with_declined returns a consistent (token, declined) pair.
+
+    auth_flow decides raise-vs-bare from this snapshot; taking both values
+    under one lock acquisition means a concurrent decline-reset+mint can
+    never make a callback observe no-token alongside a stale declined=False
+    and raise spuriously.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _5xx_then_mint(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Answer the first mint with 502, then mint successfully."""
+        calls.append(1)
+        request = httpx.Request("POST", mint_url)
+        if len(calls) == 1:
+            raise httpx.HTTPStatusError(
+                "bad gateway",
+                request=request,
+                response=httpx.Response(502, request=request),
+            )
+        return "jwt-snap", time.time() + 3600
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _5xx_then_mint)
+
+    factory = _ManagedMintTokenFactory(
+        "https://s.example.com/v1/runners/r/token",
+        "https://s.example.com",
+        "btok",
+    )
+    # 5xx latches declined; the snapshot reports both halves consistently.
+    assert factory.call_with_declined() == (None, True)
+    factory.reset_decline()
+    assert factory.call_with_declined() == ("jwt-snap", False)
+
+
+def test_declined_latch_from_definitive_refusal_is_not_reset_on_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuine 400/404 decline stays latched when a bare request is rejected.
+
+    Only a 5xx-latched decline (``declined_by_server_error``) is a guess
+    worth retracting. A no-auth/header-mode server that answered 400/404
+    definitively refused to mint; a later rejected bare request (e.g. an
+    unrelated 403) must not make ``auth_flow`` re-probe the mint endpoint
+    on every callback.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _refuse(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Answer every mint with the definitive 400 of a no-auth server."""
+        calls.append(1)
+        request = httpx.Request("POST", mint_url)
+        raise httpx.HTTPStatusError(
+            "no auth provider", request=request, response=httpx.Response(400, request=request)
+        )
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _refuse)
+
+    factory = _ManagedMintTokenFactory(
+        "https://s.example.com/v1/runners/r/token",
+        "https://s.example.com",
+        "btok",
+    )
+    assert factory() is None
+    assert factory.declined is True
+    assert factory.declined_by_server_error is False
+
+    auth = _RunnerDatabricksAuth(factory)
+    request = httpx.Request("GET", "http://server/v1/sessions/conv_1/agent/contents")
+    gen = auth.auth_flow(request)
+    bare = next(gen)
+    assert "Authorization" not in bare.headers
+
+    # A rejected bare request must NOT clear the definitive latch or re-mint.
+    with pytest.raises(StopIteration):
+        gen.send(httpx.Response(401))
+    assert factory.declined is True
+    assert len(calls) == 1
 
 
 def test_managed_mint_factory_proxy_auth_failure_falls_through_to_sdk(

@@ -25,7 +25,8 @@ Default view inside the sandbox:
   ``write_paths: ["."]`` flips it to read-write. Top-level
   dotfiles / dotdirs in cwd are tmpfs-masked unless their name is
   in :data:`_DEFAULT_CWD_ALLOW_HIDDEN` (``.venv`` by default) or
-  :attr:`OSEnvSandboxSpec.cwd_allow_hidden`.
+  :attr:`OSEnvSandboxSpec.cwd_allow_hidden`; the explicit ``"*"``
+  entry allows every dotpath in trusted roots.
 - The per-helper scratch tmpdir created by
   :func:`omnigent.inner.sandbox.create_private_tmpdir` is
   bind-mounted read-write and surfaced via ``$TMPDIR``.
@@ -469,6 +470,19 @@ class BwrapSandboxBackend(SandboxBackend):
         if target is not None:
             bwrap_args += _ensure_executable_visible([target], cwd_resolved)
 
+        # Extra read roots beyond the default toolchain bind set. These
+        # mounts precede write grants because bwrap resolves overlaps by
+        # letting the last mount win.
+        if policy.read_roots is not None:
+            for root in policy.read_roots:
+                # Read roots only expand visibility; they never restrict an
+                # overlapping cwd or explicit write grant.
+                if _is_same_path(root, cwd_resolved) or any(
+                    _is_same_path(root, write_root) for write_root in policy.write_roots
+                ):
+                    continue
+                bwrap_args += ["--ro-bind-try", str(root), str(root)]
+
         # cwd bind: writable iff a write_root resolves to cwd.
         cwd_writable = any(_is_same_path(root, cwd_resolved) for root in policy.write_roots)
         bwrap_args += [
@@ -490,11 +504,6 @@ class BwrapSandboxBackend(SandboxBackend):
         # caller also added the parent to read_paths or write_paths).
         for fpath in policy.write_files:
             bwrap_args += ["--bind-try", str(fpath), str(fpath)]
-
-        # Extra read roots beyond the default toolchain bind set.
-        if policy.read_roots is not None:
-            for root in policy.read_roots:
-                bwrap_args += ["--ro-bind-try", str(root), str(root)]
 
         # Mask dotfiles anywhere under cwd OR under any ``read_paths`` /
         # ``write_paths`` root that aren't on the allowlist, plus any

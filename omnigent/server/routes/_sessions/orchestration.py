@@ -318,8 +318,8 @@ from omnigent.server.schemas import (
     ElicitationResult,
     ErrorDetail,
     NativeModelOption,
+    SessionCreateInput,
     SessionCreateMetadata,
-    SessionCreateRequest,
     SessionEventInput,
     SessionListItem,
     SessionModelEvent,
@@ -348,6 +348,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.project_store import ProjectStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.events import NativeSessionUsageEvent as _TelNativeSessionUsageEvent
 from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedEvent
@@ -1358,6 +1359,37 @@ def _accumulate_session_usage(
     # Per-user daily rollup (policy-gated; this is the per-turn delta).
     _record_daily_cost(conv, cost_delta, conversation_store)
     return _priced_cost_for_display(new_current)
+
+
+async def _persist_relay_reported_model(
+    resp_obj: dict[str, Any],
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> None:
+    """Persist the concrete model reported by an SDK harness response."""
+    usage_obj = resp_obj.get("usage")
+    if not isinstance(usage_obj, dict):
+        return
+    raw_model = usage_obj.get("model")
+    if not isinstance(raw_model, str) or not raw_model.strip():
+        return
+    model = raw_model.strip()
+    conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    if conv is None or conv.reported_model == model:
+        return
+    await asyncio.to_thread(
+        conversation_store.update_conversation,
+        session_id,
+        reported_model=model,
+    )
+    session_stream.publish(
+        session_id,
+        SessionModelEvent(
+            type="session.model",
+            conversation_id=session_id,
+            model=model,
+        ).model_dump(exclude_none=True),
+    )
 
 
 def _persist_native_cumulative_usage(
@@ -2866,6 +2898,7 @@ async def _run_managed_launch(
         host_store=host_store,
         host_registry=host_registry,
         tunnel_registry=tunnel_registry,
+        relaunch_host=relaunch_host,
     )
 
 
@@ -2879,6 +2912,7 @@ async def _bind_and_launch_managed_runner(
     host_store: HostStore,
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
+    relaunch_host: Host | None = None,
 ) -> None:
     """
     Bind a provisioned managed host to its session and launch a runner.
@@ -2888,6 +2922,14 @@ async def _bind_and_launch_managed_runner(
     ``ConversationNotFoundError``, and the fresh sandbox is torn down
     (the delete route could not see the host binding yet). Settles
     the tracker on every path.
+
+    A launch failure after the host is online also tears the sandbox
+    down — UNLESS *relaunch_host* is set: that means ``managed.host_id``
+    is an existing, persistent host identity getting a new sandbox
+    generation, not a fresh one minted for this launch, so a failed
+    generation is left alone (same reasoning as a failed wake: the
+    identity is the user's, not this attempt's to destroy) rather than
+    torn down.
 
     :param session_id: Session/conversation identifier.
     :param managed: The provision result (host id + workspace).
@@ -2900,6 +2942,9 @@ async def _bind_and_launch_managed_runner(
     :param tunnel_registry: Runner-tunnel registry used to await the
         launched runner's connection. ``None`` in minimal test
         wirings (the rendezvous then settles at frame-send).
+    :param relaunch_host: Existing managed host row being relaunched, or
+        ``None`` for a first launch (a fresh host identity was just
+        minted for ``managed.host_id``).
     """
     from omnigent.server.managed_hosts import terminate_managed_host
 
@@ -2948,7 +2993,15 @@ async def _bind_and_launch_managed_runner(
                 # host refuses, fail the launch loudly (mirroring the
                 # delete-during-provisioning path) rather than waiting out
                 # the connect timeout for a runner that will never appear.
+                # A first launch's fresh Job that will never serve this
+                # session shouldn't outlive the launch that provisioned it;
+                # a relaunch generation on an existing host leaves the
+                # identity alone, same as a failed wake.
                 reason = launch_attempt.error or "harness not configured on the sandbox host"
+                if relaunch_host is None:
+                    host = await asyncio.to_thread(host_store.get_host, managed.host_id)
+                    if host is not None:
+                        await terminate_managed_host(host, host_store, sandbox_config)
                 tracker.fail(session_id, reason)
                 _publish_sandbox_status(session_id, "failed", reason)
                 return
@@ -2961,6 +3014,13 @@ async def _bind_and_launch_managed_runner(
             tracker,
         )
         if not connected:
+            # The runner never connected its tunnel; _wait_for_managed_runner_tunnel
+            # already settled the tracker and published the failure. Same
+            # first-launch-vs-relaunch reasoning as the branch above.
+            if relaunch_host is None:
+                host = await asyncio.to_thread(host_store.get_host, managed.host_id)
+                if host is not None:
+                    await terminate_managed_host(host, host_store, sandbox_config)
             return
     tracker.finish(session_id)
     _publish_sandbox_status(session_id, "ready")
@@ -4873,6 +4933,15 @@ async def _forward_event_to_runner(
         # servers — False/absent saves the runner from a no-op spec
         # load on every turn for agents without MCP servers.
         "has_mcp_servers": has_mcp_servers,
+        # Whether a live renderer (e.g. the desktop app's embedded
+        # browser) is subscribed to this session's stream right now.
+        # The runner drops the ``browser_*`` tool schemas for the turn
+        # when this is False — a headless session must not advertise
+        # tools that can never be served. Presence heuristic: any stream
+        # subscriber counts (the protocol has no renderer-capability
+        # registration), so a non-renderer viewer keeps tools advertised
+        # — no worse than the pre-hint behavior.
+        "browser_renderer_available": session_stream.has_subscribers(session_id),
         # Id of the item just persisted for this turn. On a cold runner
         # cache the runner reloads history (which includes this item in
         # PRE-resolution form) and drops it by id, appending its own
@@ -6359,6 +6428,14 @@ async def _relay_runner_stream_once(
                     # Accumulate LLM token usage from the harness
                     # response so policy callables can read
                     # event["context"]["usage"]["total_cost_usd"].
+                    if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES:
+                        _terminal_response = event.get("response")
+                        if isinstance(_terminal_response, dict):
+                            await _persist_relay_reported_model(
+                                _terminal_response,
+                                session_id,
+                                conversation_store,
+                            )
                     if evt_type == "response.completed":
                         # Persist the turn's usage (cost + token buckets) so
                         # policy callables can read
@@ -6375,10 +6452,9 @@ async def _relay_runner_stream_once(
                         if _turn_start_s is not None:
                             _latency_ms = (time.monotonic() - _turn_start_s) * 1000
                         _turn_start_s = None
+                        _response = event.get("response")
                         _resp_usage = (
-                            event.get("response", {}).get("usage") or {}
-                            if evt_type == "response.completed"
-                            else {}
+                            _response.get("usage") or {} if isinstance(_response, dict) else {}
                         )
                         _turn_in = _resp_usage.get("input_tokens")
                         _turn_out = _resp_usage.get("output_tokens")
@@ -7396,7 +7472,7 @@ def _ungatewayed_model_routing_error(harness: str) -> str:
 
 
 async def _reject_ungatewayed_model_routing(
-    body: SessionCreateRequest,
+    body: SessionCreateInput,
     request: Request,
     user_id: str | None,
     agent: Agent,
@@ -7532,7 +7608,7 @@ async def _pre_session_model_catalog(
 
 
 async def _routing_host_for_create(
-    body: SessionCreateRequest,
+    body: SessionCreateInput,
     request: Request,
     user_id: str | None,
 ) -> Host | None:
@@ -7596,7 +7672,7 @@ def _create_resolved_harness(
 
 
 def _fixed_native_routing_harness(
-    body: SessionCreateRequest,
+    body: SessionCreateInput,
     agent: Agent,
     agent_cache: AgentCache | None,
 ) -> str | None:
@@ -7635,7 +7711,7 @@ def _fixed_native_routing_harness(
 
 
 def _spec_routes_its_own_harness(
-    body: SessionCreateRequest,
+    body: SessionCreateInput,
     agent: Agent,
     agent_cache: AgentCache | None,
 ) -> bool:
@@ -7682,7 +7758,7 @@ def _spec_routes_its_own_harness(
 
 
 def _spawn_pins_its_harness(
-    body: SessionCreateRequest,
+    body: SessionCreateInput,
     agent: Agent,
     agent_cache: AgentCache | None,
 ) -> bool:
@@ -7716,7 +7792,7 @@ def _spawn_pins_its_harness(
 
 
 async def _resolve_fixed_native_model_routing(
-    body: SessionCreateRequest,
+    body: SessionCreateInput,
     request: Request,
     user_id: str | None,
     harness: str,
@@ -7769,7 +7845,7 @@ async def _resolve_fixed_native_model_routing(
 
 
 async def _resolve_native_smart_routing(
-    body: SessionCreateRequest,
+    body: SessionCreateInput,
     request: Request,
     user_id: str | None,
 ) -> tuple[str | None, str | None, dict[str, Any] | None, str | None]:
@@ -7885,7 +7961,7 @@ async def _create_session_from_existing_agent(
     conversation_store: ConversationStore,
     agent_store: AgentStore,
     runner_router: RunnerRouter | None,
-    body: SessionCreateRequest,
+    body: SessionCreateInput,
     request: Request,
     agent_cache: AgentCache | None = None,
     user_id: str | None = None,
@@ -7894,7 +7970,8 @@ async def _create_session_from_existing_agent(
     file_store: FileStore | None = None,
     artifact_store: ArtifactStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
-) -> SessionResponse:
+    project_store: ProjectStore | None = None,
+) -> tuple[SessionResponse, tuple[dict[str, str], ...]]:
     """
     Create a session bound to an already-registered agent.
 
@@ -7928,6 +8005,18 @@ async def _create_session_from_existing_agent(
         403/404 if ``parent_session_id`` or session-scoped ``agent_id``
         fails authorization.
     """
+    from omnigent.server.routes._session_create_validation import (
+        resolve_project_session_create,
+    )
+
+    project_resolution = await resolve_project_session_create(
+        body=body,
+        user_id=user_id,
+        project_store=project_store,
+    )
+    body = project_resolution.body
+    assert body.agent_id is not None
+
     _reject_reserved_cost_control_label_seed(body.labels)
     _reject_server_reserved_label_seed(body.labels)
 
@@ -8325,6 +8414,7 @@ async def _create_session_from_existing_agent(
             workspace=canonical_workspace,
             git_branch=git_branch,
             terminal_launch_args=validated_launch_args,
+            project_id=project_resolution.project_id,
         )
     except NameAlreadyExistsError as exc:
         if (
@@ -8336,7 +8426,10 @@ async def _create_session_from_existing_agent(
                 host_id=body.host_id,
                 worktree_path=created_worktree_path,
                 branch=git_branch,
-                delete_branch=True,
+                # A recreated worktree checked out a pre-existing branch —
+                # remove the directory but keep the user's branch (and its
+                # unpushed commits).
+                delete_branch=body.git is None or not body.git.existing_branch,
                 request=request,
                 reason="create-rollback",
             )
@@ -8358,7 +8451,9 @@ async def _create_session_from_existing_agent(
                 host_id=body.host_id,
                 worktree_path=created_worktree_path,
                 branch=git_branch,
-                delete_branch=True,
+                # Same branch-preservation rule as the NameAlreadyExists
+                # rollback above: never -D a pre-existing branch.
+                delete_branch=body.git is None or not body.git.existing_branch,
                 request=request,
                 reason="create-rollback",
             )
@@ -8630,12 +8725,15 @@ async def _create_session_from_existing_agent(
     # Re-read rather than reusing the local ``conv``: the label-only branch
     # above and ``_forward_event_to_runner`` can mutate the row after it was
     # built, so a fresh read is what keeps the create response current.
-    return await _get_session_snapshot(
-        conversation_store,
-        conv.id,
-        agent_store=agent_store,
-        agent_cache=agent_cache,
-        liveness_lookup=liveness_lookup,
+    return (
+        await _get_session_snapshot(
+            conversation_store,
+            conv.id,
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+            liveness_lookup=liveness_lookup,
+        ),
+        project_resolution.warnings,
     )
 
 
@@ -8693,6 +8791,16 @@ def _create_session_from_bundle(
             reasoning_effort=spec.executor.reasoning_effort,
         )
         metadata = metadata.model_copy(update={"reasoning_effort": seeded_effort})
+
+    if metadata.parent_session_id is not None:
+        try:
+            terminal_launch_args = _derive_terminal_launch_args_from_spec(spec)
+        except ValueError as exc:
+            raise OmnigentError(
+                f"invalid terminal_launch_args in bundled child spec: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        metadata = metadata.model_copy(update={"terminal_launch_args": terminal_launch_args})
 
     agent_id = generate_agent_id()
     agent_bundle_location = bundle_location(agent_id, bundle_bytes)

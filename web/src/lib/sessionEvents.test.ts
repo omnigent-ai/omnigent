@@ -875,6 +875,29 @@ describe("response.elicitation_request (FLAT envelope)", () => {
     const ev = out[0] as ElicitationRequest;
     expect(ev.rememberScope).toBeNull();
   });
+
+  it("lifts Codex MCP persistence modes from approval metadata", () => {
+    const out = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_codex_mcp",
+      params: {
+        mode: "form",
+        message: 'Allow the omnigent MCP server to run tool "sys_read_inbox"?',
+        phase: "codex_mcp_elicitation",
+        policy_name: "codex_native_mcp_elicitation",
+        content_preview: "{}",
+        requestedSchema: {},
+        _meta: {
+          codex_approval_kind: "mcp_tool_call",
+          persist: ["session", "always", "unsupported", "session"],
+        },
+      },
+    });
+
+    expect(out).toHaveLength(1);
+    const ev = out[0] as ElicitationRequest;
+    expect(ev.codexPersistModes).toEqual(["session", "always"]);
+  });
 });
 
 describe("response.elicitation_resolved (FLAT envelope)", () => {

@@ -2,6 +2,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReactNode } from "react";
+import type * as HostModule from "@/lib/host";
+import type * as NativeBridgeModule from "@/lib/nativeBridge";
 
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(),
@@ -10,8 +12,19 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 vi.mock("@/store/chatStore", () => ({
   useChatStore: vi.fn(),
 }));
+vi.mock("@/lib/host", async (importOriginal) => ({
+  ...(await importOriginal<typeof HostModule>()),
+  isDatabricksWorkspace: vi.fn(() => false),
+}));
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof NativeBridgeModule>()),
+  isAndroidShell: vi.fn(() => false),
+  isIOSShell: vi.fn(() => false),
+}));
 
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { isDatabricksWorkspace } from "@/lib/host";
+import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { useChatStore } from "@/store/chatStore";
 import {
   downloadWorkspaceFile,
@@ -200,77 +213,94 @@ describe("triggerBrowserDownload", () => {
 // downloadWorkspaceFile
 // ---------------------------------------------------------------------------
 
+function blobResponse(blob: Blob): Response {
+  return {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    blob: async () => blob,
+  } as unknown as Response;
+}
+
+/** Capture every synthetic download link the code clicks, as `[href, download]`. */
+function captureDownloadClicks(): [string, string][] {
+  const clicked: [string, string][] = [];
+  const origCreateElement = document.createElement.bind(document);
+  vi.spyOn(document, "createElement").mockImplementation((tag: string) => {
+    const el = origCreateElement(tag);
+    if (tag === "a")
+      vi.spyOn(el as HTMLAnchorElement, "click").mockImplementation(() => {
+        const a = el as HTMLAnchorElement;
+        clicked.push([a.getAttribute("href") ?? "", a.download]);
+      });
+    return el;
+  });
+  return clicked;
+}
+
+const DOWNLOAD_URL =
+  "/v1/sessions/sess_123/resources/environments/default/filesystem/src/main.py?download=true";
+
 describe("downloadWorkspaceFile", () => {
-  it("fetches the correct URL and triggers a download with the filename from the path", async () => {
-    fetchMock.mockResolvedValueOnce(
-      jsonResponse({
-        object: "session.environment.filesystem.file_content",
-        path: "src/main.py",
-        content_type: "text/x-python",
-        encoding: "utf-8",
-        content: "print('hi')",
-        bytes: 11,
-      }),
-    );
-    const clickedLinks: string[] = [];
-    const origCreateElement = document.createElement.bind(document);
-    vi.spyOn(document, "createElement").mockImplementation((tag: string) => {
-      const el = origCreateElement(tag);
-      if (tag === "a")
-        vi.spyOn(el as HTMLAnchorElement, "click").mockImplementation(() => {
-          clickedLinks.push((el as HTMLAnchorElement).download);
-        });
-      return el;
-    });
-    vi.stubGlobal("URL", { createObjectURL: vi.fn(() => "blob:x"), revokeObjectURL: vi.fn() });
+  it("clicks a link to the raw download URL so the browser streams it to disk", async () => {
+    // A same-origin navigation shows in the browser's download UI at once and
+    // never buffers the file in the page, unlike a fetch-then-Blob.
+    const clicked = captureDownloadClicks();
 
     await downloadWorkspaceFile("sess_123", "src/main.py");
 
-    // fetchFileContent goes through authenticatedFetch, which adds auth headers
-    // and `cache: "no-store"` (see lib/identity.ts) — assert the URL plus that
-    // cache-bypass init rather than a bare single-arg call.
+    expect(clicked).toEqual([[DOWNLOAD_URL, "main.py"]]);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    ["the managed embed", isDatabricksWorkspace],
+    ["the iOS shell", isIOSShell],
+    ["the Android shell", isAndroidShell],
+  ])("fetches the bytes through the app's transport in %s", async (_label, predicate) => {
+    // The embed host supplies auth headers and replica routing that a bare
+    // navigation lacks, and the mobile shells save http(s) downloads outside
+    // the WebView's session, so the bytes come through authenticatedFetch.
+    vi.mocked(predicate).mockReturnValueOnce(true);
+    const file = new Blob(["print('hi')"], { type: "text/x-python" });
+    fetchMock.mockResolvedValueOnce(blobResponse(file));
+    const clicked = captureDownloadClicks();
+    const createObjectURL = vi.fn(() => "blob:x");
+    vi.stubGlobal("URL", { createObjectURL, revokeObjectURL: vi.fn() });
+
+    await downloadWorkspaceFile("sess_123", "src/main.py");
+
+    // authenticatedFetch adds auth headers and `cache: "no-store"` (see
+    // lib/identity.ts) — assert the URL plus that cache-bypass init.
     expect(fetchMock).toHaveBeenCalledWith(
-      "/v1/sessions/sess_123/resources/environments/default/filesystem/src/main.py",
+      DOWNLOAD_URL,
       expect.objectContaining({ cache: "no-store" }),
     );
-    // The download filename is derived from the last path segment.
-    expect(clickedLinks).toEqual(["main.py"]);
+    expect(createObjectURL).toHaveBeenCalledWith(file);
+    expect(clicked).toEqual([["blob:x", "main.py"]]);
 
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
 
-  it("logs a console warning when the server returns truncated: true", async () => {
-    fetchMock.mockResolvedValueOnce(
-      jsonResponse({
-        object: "session.environment.filesystem.file_content",
-        path: "big.txt",
-        content_type: "text/plain",
-        encoding: "utf-8",
-        content: "partial content",
-        bytes: 15,
-        truncated: true,
-      }),
-    );
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const origCreateElement = document.createElement.bind(document);
-    vi.spyOn(document, "createElement").mockImplementation((tag: string) => {
-      const el = origCreateElement(tag);
-      if (tag === "a") vi.spyOn(el as HTMLAnchorElement, "click").mockImplementation(() => {});
-      return el;
-    });
-    vi.stubGlobal("URL", { createObjectURL: vi.fn(() => "blob:x"), revokeObjectURL: vi.fn() });
+  it("names the host base for an absolute path alongside download=true", async () => {
+    const clicked = captureDownloadClicks();
 
-    await downloadWorkspaceFile("sess_abc", "big.txt");
+    await downloadWorkspaceFile("sess_abc", "/Users/me/reports/q3.pdf");
 
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("big.txt"));
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("truncated"));
+    expect(clicked).toEqual([
+      [
+        "/v1/sessions/sess_abc/resources/environments/default/filesystem/Users/me/reports/q3.pdf?download=true&base=host",
+        "q3.pdf",
+      ],
+    ]);
 
     vi.restoreAllMocks();
-    vi.unstubAllGlobals();
   });
-
   it("propagates fetch errors to the caller", async () => {
+    vi.mocked(isDatabricksWorkspace).mockReturnValueOnce(true);
     fetchMock.mockResolvedValueOnce({
       ok: false,
       status: 404,

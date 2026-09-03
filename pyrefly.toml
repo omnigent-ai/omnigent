@@ -36,6 +36,8 @@ ignore-missing-imports = [
     "e2b.*",
     "google.auth",
     "google.auth.*",
+    "hvac",
+    "hvac.*",
     "islo",
     "islo.*",
     "kubernetes",

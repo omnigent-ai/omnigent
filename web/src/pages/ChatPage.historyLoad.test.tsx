@@ -620,6 +620,109 @@ describe("HistoryAutoLoader", () => {
 
     expect(loadMoreHistory).not.toHaveBeenCalled();
   });
+
+  it("bounds the prepend-fed chain from a single touch drag", () => {
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({ hasMoreHistory: true, oldestItemId: "item_50", loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    // Folded tool-heavy transcript: one short screen, no scroll range, parked
+    // under the load threshold. Height-neutral prepends keep it that way.
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 800 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader />);
+    expect(loadMoreHistory).not.toHaveBeenCalled();
+
+    // One small downward finger drag — "peek at what's above".
+    fireEvent.touchStart(scrollRoot, { touches: [{ clientY: 300 }] });
+    fireEvent.touchMove(scrollRoot, { touches: [{ clientY: 360 }] });
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+
+    // Each settled page moves the cursor without adding height. The chain may
+    // follow for a bounded number of pages, then must wait for a new gesture
+    // instead of paging in the entire transcript.
+    let settled = 49;
+    while (loadMoreHistory.mock.calls.length < 8 && settled > 0) {
+      const before = loadMoreHistory.mock.calls.length;
+      act(() => {
+        useChatStore.setState({ loadingMoreHistory: false, oldestItemId: `item_${settled}` });
+      });
+      settled -= 1;
+      if (loadMoreHistory.mock.calls.length === before) break;
+    }
+
+    expect(loadMoreHistory.mock.calls.length).toBeLessThanOrEqual(3);
+  });
+
+  it("holds the bound when pages settle mid-drag between touchmoves", () => {
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({ hasMoreHistory: true, oldestItemId: "item_50", loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 800 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader />);
+    fireEvent.touchStart(scrollRoot, { touches: [{ clientY: 300 }] });
+
+    // A sustained drag on a fast connection: pages settle while the finger is
+    // still moving, so every settle is followed by another touchmove from the
+    // SAME gesture. Those mid-drag touchmoves must not refill the budget.
+    let settled = 49;
+    let fingerY = 320;
+    let stalled = 0;
+    while (stalled < 2 && settled > 0) {
+      const before = loadMoreHistory.mock.calls.length;
+      fireEvent.touchMove(scrollRoot, { touches: [{ clientY: fingerY }] });
+      fingerY += 10;
+      act(() => {
+        useChatStore.setState({ loadingMoreHistory: false, oldestItemId: `item_${settled}` });
+      });
+      settled -= 1;
+      if (loadMoreHistory.mock.calls.length === before) stalled += 1;
+      else stalled = 0;
+    }
+
+    expect(loadMoreHistory.mock.calls.length).toBeGreaterThanOrEqual(1);
+    expect(loadMoreHistory.mock.calls.length).toBeLessThanOrEqual(3);
+  });
+
+  it("re-grants the chain budget on the reader's next gesture", () => {
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({ hasMoreHistory: true, oldestItemId: "item_50", loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 800 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader />);
+    fireEvent.touchStart(scrollRoot, { touches: [{ clientY: 300 }] });
+    fireEvent.touchMove(scrollRoot, { touches: [{ clientY: 360 }] });
+
+    // Exhaust the first gesture's budget with height-neutral prepends.
+    let settled = 49;
+    let stalled = 0;
+    while (stalled < 1 && settled > 0) {
+      const before = loadMoreHistory.mock.calls.length;
+      act(() => {
+        useChatStore.setState({ loadingMoreHistory: false, oldestItemId: `item_${settled}` });
+      });
+      settled -= 1;
+      if (loadMoreHistory.mock.calls.length === before) stalled += 1;
+    }
+    const afterFirstGesture = loadMoreHistory.mock.calls.length;
+
+    // The chain stopped, but older history is not stranded: the next drag
+    // asks again and pages resume.
+    fireEvent.touchStart(scrollRoot, { touches: [{ clientY: 300 }] });
+    fireEvent.touchMove(scrollRoot, { touches: [{ clientY: 360 }] });
+
+    expect(loadMoreHistory.mock.calls.length).toBe(afterFirstGesture + 1);
+  });
 });
 
 describe("LatestTurnSpacer", () => {

@@ -26,6 +26,7 @@ const openFile = vi.fn();
 let changedPaths: string[] = [];
 const FILE_VIEWER = {
   openFile,
+  openGithubTab: () => {},
   isChangedPath: (p: string) => changedPaths.includes(p),
   conversationId: undefined,
   workspaceRoot: WORKSPACE,

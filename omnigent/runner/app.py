@@ -198,6 +198,14 @@ _CLAUDE_MODEL_CONFIRM_POLL_S = 0.25
 _CLAUDE_MODEL_LATE_DIALOG_BUDGET_S = 1200.0
 _CLAUDE_MODEL_LATE_DIALOG_POLL_S = 2.0
 
+# After a stale-pane recreate the TUI reboots with ``--resume``. Poll until
+# the input box is usable before typing into it. Only a recreate waits: a live
+# pane is left to ``inject_slash_command``'s own composer reclaim. Same pacing
+# as the other pane polls above (one tmux capture each). Module-level so tests
+# can tighten the budget.
+_CLAUDE_PANE_READY_TIMEOUT_S = 30.0
+_CLAUDE_PANE_READY_POLL_S = 0.25
+
 
 def _warn_unresolved_sub_agent(session_id: str | None, sub_agent_name: str) -> None:
     """
@@ -396,6 +404,12 @@ _SUBAGENT_DELIVERY_ALREADY_DELIVERED = "already_delivered"
 _SUBAGENT_DELIVERY_UNTRACKED = "untracked"
 _SUBAGENT_DELIVERY_MISSING_WORK_ENTRY = "missing_work_entry"
 _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX = "missing_parent_inbox"
+# Runner-owned labels on a child session that make sub-agent result delivery
+# durable across a runner restart. The dispatch id is stamped when a turn is
+# sent to the child; the delivered id is the receipt the parent's
+# ``sys_read_inbox`` drain writes once it has consumed that turn's result.
+SUBAGENT_DISPATCH_ID_LABEL_KEY = "omnigent.subagent.dispatch_id"
+SUBAGENT_DELIVERED_ID_LABEL_KEY = "omnigent.subagent.delivered_id"
 # Read budget for runner→server POSTs that can PARK behind a human-approval
 # ASK gate: policy evaluation (``_evaluate_policy_via_omnigent``) and sub-agent
 # wake-notice delivery (``_deliver_subagent_wake_post``). Both are gated at the
@@ -1252,7 +1266,10 @@ def _is_context_overflow_error(event: _JsonObject) -> tuple[int, int] | None:
     return 128000, 128001
 
 
-def _response_failed_event(error: Mapping[str, object]) -> bytes:
+def _response_failed_event(
+    error: Mapping[str, object],
+    source: str = "execution",
+) -> bytes:
     """
     Encode one ``response.failed`` SSE frame.
 
@@ -1261,10 +1278,17 @@ def _response_failed_event(error: Mapping[str, object]) -> bytes:
 
     :param error: Error payload to place under ``response.error``,
         e.g. ``{"code": "connection_error", "message": "dropped"}``.
+    :param source: Where the fault originated -- ``"llm"`` for
+        inference/context errors, ``"harness"`` for Claude Code/harness
+        process failures, ``"execution"`` for runner configuration
+        or infrastructure failures.  Forwarded as-is to the AP server
+        so it can persist the right ``ErrorData.source``.
     :returns: UTF-8 encoded SSE frame bytes.
     """
     response = {"status": "failed", "error": error}
-    payload = json.dumps({"type": "response.failed", "response": response, "error": error})
+    payload = json.dumps(
+        {"type": "response.failed", "source": source, "response": response, "error": error}
+    )
     return f"event: response.failed\ndata: {payload}\n\n".encode()
 
 
@@ -1494,6 +1518,11 @@ class _SubagentDeliveryAck:
 _subagent_work_by_child: dict[str, _SubagentWorkEntry] = {}
 _subagent_work_by_parent: dict[str, set[str]] = {}
 _drained_delivered_subagent_children: set[str] = set()
+# Parents whose restart-recovery scan completed in this process, plus a
+# per-parent lock so an init racing a sys_read_inbox drain cannot run two
+# scans that both pass the registry check and queue one result twice.
+_subagent_recovery_done: set[str] = set()
+_subagent_recovery_locks: dict[str, asyncio.Lock] = {}
 
 # Per-(parent, agent_type) monotonic ordinal counter for structured
 # sub-agent names (e.g. "researcher-1", "researcher-2").
@@ -1530,6 +1559,15 @@ def recover_subagent_ordinals(
     _subagent_ordinal_counters[key] = max_ordinal
 
 
+def new_subagent_work_id() -> str:
+    """
+    Mint the id of one sub-agent dispatch, e.g. ``"subagent_a1b2c3d4e5f6"``.
+
+    :returns: A fresh dispatch id.
+    """
+    return f"subagent_{uuid.uuid4().hex[:12]}"
+
+
 def register_subagent_work(
     *,
     parent_session_id: str,
@@ -1538,6 +1576,7 @@ def register_subagent_work(
     title: str,
     wrapper_label: str | None = None,
     created_by: str | None = None,
+    work_id: str | None = None,
 ) -> _SubagentWorkEntry:
     """
     Register one running sub-agent dispatch.
@@ -1555,6 +1594,8 @@ def register_subagent_work(
         label, e.g. ``"claude-code-native-ui"``.
     :param created_by: Human actor that dispatched this child turn, if
         known from the parent turn context.
+    :param work_id: Dispatch id already stamped on the child session,
+        e.g. ``"subagent_a1b2c3d4e5f6"``; ``None`` mints a new one.
     :returns: The registered work entry.
     """
     prior = _subagent_work_by_child.get(child_session_id)
@@ -1568,7 +1609,7 @@ def register_subagent_work(
     entry = _SubagentWorkEntry(
         parent_session_id=parent_session_id,
         child_session_id=child_session_id,
-        work_id=f"subagent_{uuid.uuid4().hex[:12]}",
+        work_id=work_id or new_subagent_work_id(),
         agent=agent,
         title=title,
         wrapper_label=wrapper_label,
@@ -1681,6 +1722,155 @@ def list_subagent_work(parent_session_id: str) -> list[_SubagentWorkEntry]:
         if (entry := _subagent_work_by_child.get(child_id)) is not None
     ]
     return sorted(entries, key=lambda entry: entry.created_at)
+
+
+def undelivered_subagent_dispatch_id(labels: Mapping[str, object]) -> str | None:
+    """
+    Return the dispatch id of a child turn whose result the parent never drained.
+
+    :param labels: Child session labels, e.g.
+        ``{"omnigent.subagent.dispatch_id": "subagent_a1b2c3d4e5f6"}``.
+    :returns: The dispatch id when the delivered-id receipt is missing or
+        names an earlier turn; ``None`` for a drained turn, or for a child
+        created before dispatch ids were stamped.
+    """
+    dispatch_id = labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
+    if not isinstance(dispatch_id, str) or not dispatch_id:
+        return None
+    if labels.get(SUBAGENT_DELIVERED_ID_LABEL_KEY) == dispatch_id:
+        return None
+    return dispatch_id
+
+
+class _SubagentRecoveryReadError(Exception):
+    """A sessions API read needed by restart recovery returned a non-200."""
+
+
+async def _get_recovery_page(
+    server_client: httpx.AsyncClient, path: str, params: dict[str, str]
+) -> Any:
+    """
+    Read one page of a sessions API listing for restart recovery.
+
+    :param server_client: HTTP client connected to the Omnigent server.
+    :param path: Sessions API path, e.g. ``"/v1/sessions/conv_p/child_sessions"``.
+    :param params: Query parameters, e.g. ``{"limit": "1000"}``.
+    :returns: The decoded JSON page.
+    :raises _SubagentRecoveryReadError: When the server returns a non-200.
+    """
+    response = await server_client.get(path, params=params, timeout=10.0)
+    if response.status_code != 200:
+        raise _SubagentRecoveryReadError(f"{path} returned {response.status_code}")
+    return response.json()
+
+
+async def _list_child_sessions(
+    server_client: httpx.AsyncClient, parent_id: str
+) -> list[_JsonObject]:
+    """
+    Return every child-session summary of a parent, following pagination.
+
+    :param server_client: HTTP client connected to the Omnigent server.
+    :param parent_id: Parent session id, e.g. ``"conv_parent123"``.
+    :returns: Child summaries as returned by the sessions API.
+    :raises _SubagentRecoveryReadError: When a page read fails.
+    """
+    children: list[_JsonObject] = []
+    params: dict[str, str] = {"limit": "1000"}
+    while True:
+        page = await _get_recovery_page(
+            server_client, f"/v1/sessions/{parent_id}/child_sessions", params
+        )
+        children.extend(page.get("data", []))
+        if not page.get("has_more") or not page.get("last_id"):
+            return children
+        params["after"] = page["last_id"]
+
+
+async def _fetch_latest_assistant_text(
+    server_client: httpx.AsyncClient, session_id: str
+) -> str | None:
+    """
+    Return the newest assistant message text of a session, reading newest first.
+
+    :param server_client: HTTP client connected to the Omnigent server.
+    :param session_id: Session to read, e.g. ``"conv_child456"``.
+    :returns: Joined text blocks of the newest assistant message (empty when
+        that message carries no text, matching live delivery), or ``None``
+        when the transcript holds no assistant message.
+    :raises _SubagentRecoveryReadError: When a page read fails.
+    """
+    params: dict[str, str] = {"limit": "100", "order": "desc"}
+    while True:
+        page = await _get_recovery_page(server_client, f"/v1/sessions/{session_id}/items", params)
+        for item in page.get("data", []):
+            if item.get("type") != "message" or item.get("role") != "assistant":
+                continue
+            return "\n".join(
+                block["text"]
+                for block in item.get("content", [])
+                if block.get("type") in {"output_text", "text"} and block.get("text")
+            )
+        if not page.get("has_more") or not page.get("last_id"):
+            return None
+        params["after"] = page["last_id"]
+
+
+async def _recover_subagent_results_from_server(
+    *,
+    server_client: httpx.AsyncClient,
+    parent_id: str,
+    schedule_wake: Callable[[_SubagentWorkEntry], None],
+) -> None:
+    """
+    Re-queue terminal child results whose delivery receipt is missing.
+
+    A child turn is stamped with a dispatch id when it is sent, and the
+    parent's ``sys_read_inbox`` drain writes that id back as the delivered
+    id. A terminal child whose two ids differ was never drained, so its
+    result is rebuilt from the child transcript and queued again under the
+    same dispatch id, letting the eventual drain close the loop.
+
+    :param server_client: HTTP client connected to the Omnigent server.
+    :param parent_id: Parent session whose inbox was recreated, e.g.
+        ``"conv_parent123"``.
+    :param schedule_wake: Callback that posts the parent wake notice.
+    :raises _SubagentRecoveryReadError: When a server read returns a
+        non-200; the caller retries on the next drain.
+    """
+    for child in await _list_child_sessions(server_client, parent_id):
+        child_id = child.get("id")
+        status = child.get("current_task_status")
+        if not isinstance(child_id, str) or not isinstance(status, str):
+            continue
+        if status not in _SUBAGENT_TERMINAL_STATUSES:
+            continue
+        if (
+            get_subagent_work(child_id) is not None
+            or child_id in _drained_delivered_subagent_children
+        ):
+            continue
+        labels = child.get("labels")
+        dispatch_id = undelivered_subagent_dispatch_id(labels if isinstance(labels, dict) else {})
+        if dispatch_id is None:
+            continue
+        output: str | None = None
+        if status == "failed":
+            error = child.get("last_task_error")
+            message = error.get("message") if isinstance(error, dict) else None
+            output = message if isinstance(message, str) else None
+        else:
+            output = await _fetch_latest_assistant_text(server_client, child_id)
+        entry = register_subagent_work(
+            parent_session_id=parent_id,
+            child_session_id=child_id,
+            agent=str(child.get("tool") or child.get("agent_name") or "sub-agent"),
+            title=str(child.get("session_name") or ""),
+            work_id=dispatch_id,
+        )
+        ack = mark_subagent_work_terminal(child_id, status=status, output=output)
+        if ack.delivered_now:
+            schedule_wake(entry)
 
 
 def mark_subagent_work_terminal(
@@ -2934,6 +3124,38 @@ def create_runner_app(
                 _session_workspace_cache[session_id] = snapshot.workspace
         return _session_workspace_cache.get(session_id)
 
+    async def _fetch_session_model_override(session_id: str) -> str | None:
+        """One-shot uncached read of the persisted ``/model`` override.
+
+        Legacy (no-envelope) init only — current servers ship the override in
+        the init envelope. Deliberately NOT cached in ``_SessionSnapshot``:
+        ``model_override`` is mutable (a ``/model`` switch changes it), so a
+        value stored in the long-lived identity cache would go stale and reseed
+        the old model on a later re-init, forcing a needless respawn. Each init
+        re-reads it fresh.
+        """
+        try:
+            resp = await server_client.get(f"/v1/sessions/{session_id}")
+            if resp.status_code == 200:
+                raw = resp.json().get("model_override")
+                if isinstance(raw, str) and raw:
+                    return raw
+            else:
+                _logger.warning(
+                    "legacy model_override fallback for %s: session GET returned "
+                    "HTTP %s; a model-pinned first turn may respawn",
+                    session_id,
+                    resp.status_code,
+                )
+        except Exception:  # noqa: BLE001 — best-effort, but surface it
+            _logger.warning(
+                "legacy model_override fallback for %s failed; a model-pinned "
+                "first turn may respawn",
+                session_id,
+                exc_info=True,
+            )
+        return None
+
     async def _session_runtime_cwd(session_id: str) -> Path | None:
         workspace = await _session_workspace_value(session_id)
         if workspace and workspace.strip():
@@ -3305,12 +3527,25 @@ def create_runner_app(
                 server_client=server_client,
                 routing_class=_routing_class,
             )
+            # Seed the initial spawn with the persisted /model override so a
+            # model-pinned session's first turn doesn't force a wasteful
+            # model-switch respawn. Current servers ship the override in the
+            # init envelope (read fresh each init); legacy (no-envelope) servers
+            # fall back to a one-shot uncached GET. Both sources are read fresh
+            # so a later /model switch can't reseed a stale model. Native
+            # harnesses no-op (_build_spawn_env_from_spec guards on env=None).
+            _model_override = (
+                init_context.envelope.snapshot.model_override
+                if init_context.envelope is not None
+                else await _fetch_session_model_override(session_id)
+            )
             spawn_env = _build_spawn_env_from_spec(
                 spec,
                 harness_name,
                 workdir=_resolved_spec_workdir(spec_entry),
                 cwd=await _session_runtime_cwd(session_id),
                 session_id=session_id,
+                model_override=_model_override,
             )
             if spawn_env is None:
                 spawn_env = await _resolve_native_spawn_env(
@@ -3360,6 +3595,9 @@ def create_runner_app(
             _session_event_queues[session_id] = asyncio.Queue()
         if session_id not in _session_inboxes:
             _session_inboxes[session_id] = asyncio.Queue()
+        # A fresh queue can mean a fresh runner process rather than a fresh
+        # session: re-queue results the previous process never drained.
+        await _recover_undrained_subagent_results(session_id)
         if session_id not in _session_async_tasks:
             _session_async_tasks[session_id] = {}
         raw_sub_agent_name = body.get("sub_agent_name")
@@ -3700,6 +3938,8 @@ def create_runner_app(
                 msg_body = {
                     "agent_id": agent_id,
                     "model": body.get("model", agent_id),
+                    # Recovery has no live server dispatch carrying renderer state.
+                    "browser_renderer_available": False,
                 }
                 _turn_task = asyncio.create_task(
                     _run_turn_bg(msg_body, session_id),
@@ -3957,6 +4197,8 @@ def create_runner_app(
         _last_server_item_id.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
         _session_inboxes.pop(session_id, None)
+        _subagent_recovery_done.discard(session_id)
+        _subagent_recovery_locks.pop(session_id, None)
         _subagent_wake_pending.discard(session_id)
         _stranded_wake_parents.discard(session_id)
         _last_rewake_notice.pop(session_id, None)
@@ -4428,6 +4670,47 @@ def create_runner_app(
             title=snapshot.sub_agent_name or "",
         )
 
+    async def _recover_undrained_subagent_results(parent_id: str) -> None:
+        """
+        Re-queue terminal child results lost with a runner process restart.
+
+        The parent inbox is a process-local queue, so a result queued before
+        a restart but not yet drained would otherwise vanish. Runs once per
+        parent per process; a scan that fails on a server read is retried
+        before the next ``sys_read_inbox`` drain. The inbox is created here
+        when missing: after a reconnect the server can dispatch a pending
+        message before it re-initializes the session, and that turn's drain
+        must still see the recovered results.
+
+        :param parent_id: Parent session whose inbox was recreated, e.g.
+            ``"conv_parent123"``.
+        :returns: None.
+        """
+        if parent_id in _subagent_recovery_done:
+            return
+        _session_inboxes.setdefault(parent_id, asyncio.Queue())
+        lock = _subagent_recovery_locks.setdefault(parent_id, asyncio.Lock())
+        async with lock:
+            if parent_id in _subagent_recovery_done:
+                return
+            try:
+                await _recover_subagent_results_from_server(
+                    server_client=server_client,
+                    parent_id=parent_id,
+                    schedule_wake=_schedule_subagent_wake,
+                )
+            except (httpx.HTTPError, _SubagentRecoveryReadError, ValueError):
+                _logger.warning(
+                    "Failed to recover undrained sub-agent results for %s",
+                    parent_id,
+                    exc_info=True,
+                    extra={"session_id": parent_id},
+                )
+                return
+            _subagent_recovery_done.add(parent_id)
+
+    app.state.recover_undrained_subagent_results = _recover_undrained_subagent_results
+
     def _note_session_harness_override(conv_id: str, harness_override: str | None) -> None:
         """Record the harness a session was forwarded, so reads match the run.
 
@@ -4893,6 +5176,7 @@ def create_runner_app(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
         try:
             settled = await asyncio.to_thread(
                 set_permission_mode,
@@ -4912,6 +5196,68 @@ def create_runner_app(
             )
         return JSONResponse(status_code=200, content={"permission_mode": settled})
 
+    async def _prepare_claude_native_pane_for_injection(
+        conv_id: str,
+        bridge_dir: Path,
+    ) -> None:
+        """Heal a dead-but-registered Claude pane before typing into it.
+
+        Registry membership is not liveness: a pane whose tmux server died
+        without ``close()`` stays registered advertising a socket that is
+        gone, so anything typed into it fails: tmux cannot connect, or the pane
+        never renders. ``_ensure_native_terminal_for_turn`` already probes and
+        recreates such an entry, so it is reused rather than growing a second
+        recovery path.
+
+        Only a recreate waits for :func:`claude_pane_ready`, because only a
+        recreate reboots the TUI (via ``--resume``) with no input box yet.
+        That is what the ``is_alive()`` probe distinguishes. On a LIVE pane the
+        one thing that reports "not ready" is a surface occupying the composer
+        (shell mode, the ctrl+r search, a hand-opened picker), which this poll
+        has no way to clear: ``inject_slash_command`` reclaims the composer
+        itself in ``_restore_occupied_input``. Waiting here would stall the
+        case inject already handles for the whole budget, then inject anyway.
+
+        No terminal registry means there is nothing to heal, and a recreate that
+        produced no pane is not waited on either (inject keeps its own short
+        advertisement timeout in both cases).
+        """
+        from omnigent.claude_native_bridge import claude_pane_ready
+
+        terminal_registry = resource_registry.terminal_registry if resource_registry else None
+        if terminal_registry is None:
+            return
+        terminal_name = native_terminal_name("claude-native")
+        if terminal_name is None:
+            return
+        # This probe duplicates the ensure path's own detection on purpose: its
+        # only job is to decide whether the readiness poll below runs at all.
+        instance = terminal_registry.get(conv_id, terminal_name, "main")
+        if instance is not None and await instance.is_alive():
+            return
+        await _ensure_native_terminal_for_turn(conv_id, "claude-native")
+        if terminal_registry.get(conv_id, terminal_name, "main") is None:
+            # The ensure swallows its own failures, so an unregistered pane here
+            # means nothing was created and nothing is booting. Waiting cannot
+            # help; let the injection fail fast as it did before.
+            return
+        deadline = time.monotonic() + _CLAUDE_PANE_READY_TIMEOUT_S
+        while True:
+            if await asyncio.to_thread(claude_pane_ready, bridge_dir):
+                return
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(_CLAUDE_PANE_READY_POLL_S)
+        # Let the injection report its own failure, as it did before this heal
+        # existed. Logged, else a pane that recreates but never boots is
+        # indistinguishable from a plain slow request.
+        _logger.warning(
+            "claude-native pane not ready %ss after re-create for session=%s; injecting anyway",
+            _CLAUDE_PANE_READY_TIMEOUT_S,
+            conv_id,
+            extra={"session_id": conv_id},
+        )
+
     async def _handle_claude_native_effort_change(
         conv_id: str,
         effort: str | None,
@@ -4930,6 +5276,7 @@ def create_runner_app(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
         command = f"/effort {effort}"
         try:
             # An effort switch invalidates the prompt cache on a session with
@@ -5025,6 +5372,7 @@ def create_runner_app(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
         selected_model = model.strip()
         claude_config = await _resolve_session_claude_launch_config(conv_id)
         resolved_model = (
@@ -5227,6 +5575,7 @@ def create_runner_app(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
         try:
             await asyncio.to_thread(
                 inject_slash_command,
@@ -6844,6 +7193,16 @@ def create_runner_app(
                     )
 
         _spec_tools = _session_tool_schemas.get(conv) or []
+        # Request-driven harnesses should not advertise browser tools when no
+        # renderer is subscribed. Native harnesses ignore this per-turn list
+        # and keep their session-scoped relay surface; their calls still use
+        # the prompt no-renderer failure below. An absent hint from an older
+        # server preserves the previous advertised surface. Only the spec
+        # surface is filtered; request-supplied tools remain caller-owned.
+        if msg_body.get("browser_renderer_available") is False:
+            from omnigent.runner.tool_dispatch import strip_browser_tool_schemas
+
+            _spec_tools = strip_browser_tool_schemas(_spec_tools)
         _client_tools = cast(list[_JsonObject], msg_body.get("tools") or [])
         merged_tools = _merge_request_client_tools(_spec_tools, _client_tools)
         if merged_tools:
@@ -7299,6 +7658,7 @@ def create_runner_app(
                         )
                         _fail_status = {
                             "type": "response.failed",
+                            "source": "harness",
                             "error": {
                                 "status": harness_resp.status_code,
                             },
@@ -7311,7 +7671,9 @@ def create_runner_app(
                             conv_id,
                             error={"status": harness_resp.status_code},
                         )
-                        yield _response_failed_event({"status": harness_resp.status_code})
+                        yield _response_failed_event(
+                            {"status": harness_resp.status_code}, source="harness"
+                        )
                         return
 
                     _omnigent_task_id = cast(str | None, body.get("task_id"))
@@ -7683,12 +8045,13 @@ def create_runner_app(
                 }
                 _overflow_fail = {
                     "type": "response.failed",
+                    "source": "llm",
                     "response": {"status": "failed", "error": _error},
                     "error": _error,
                 }
                 _publish_event(conv_id, _overflow_fail)
                 _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
-                yield _response_failed_event(_error)
+                yield _response_failed_event(_error, source="llm")
 
             except (httpx.HTTPError, RuntimeError) as exc:
                 _logger.exception(
@@ -7704,12 +8067,13 @@ def create_runner_app(
                 }
                 _http_fail = {
                     "type": "response.failed",
+                    "source": "harness",
                     "response": {"status": "failed", "error": _error},
                     "error": _error,
                 }
                 _publish_event(conv_id, _http_fail)
                 _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
-                yield _response_failed_event(_error)
+                yield _response_failed_event(_error, source="harness")
 
         return StreamingResponse(
             proxy_stream(),
@@ -9237,6 +9601,91 @@ def create_runner_app(
             },
         )
 
+    # ── GitHub integration (read-only): PR metadata + branch-vs-base diff ──
+    # Backed by the ``gh`` CLI and ``git``; see omnigent.runner.github_resource.
+    # Each shells out synchronously, so it is offloaded to a thread like the
+    # changed-files / diff routes above (a blocked loop 503s the session).
+
+    async def _github_workspace_root(session_id: str) -> str:
+        """Resolve the workspace root for GitHub routes, or 404 when headless."""
+        agent_spec = await _require_os_env(session_id)
+        root = resource_registry.compute_default_env_root(session_id, agent_spec)
+        if root is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Session has no filesystem; GitHub API unavailable.",
+            )
+        return root
+
+    @app.get("/v1/sessions/{session_id}/resources/github")
+    async def read_github_info(session_id: str) -> JSONResponse:
+        import asyncio as _asyncio
+
+        from omnigent.runner.github_resource import github_info
+
+        root = await _github_workspace_root(session_id)
+        info = await _asyncio.to_thread(github_info, root)
+        return JSONResponse(status_code=200, content=info)
+
+    @app.get("/v1/sessions/{session_id}/resources/github/changes")
+    async def read_github_changes(
+        session_id: str,
+        base: str | None = Query(default=None),
+    ) -> JSONResponse:
+        import asyncio as _asyncio
+
+        from omnigent.runner.github_resource import github_changed_files, resolve_base_ref
+
+        root = await _github_workspace_root(session_id)
+        resolved_base = await _asyncio.to_thread(resolve_base_ref, root, base)
+        if not resolved_base:
+            return JSONResponse(
+                status_code=200,
+                content={"object": "list", "data": [], "has_more": False},
+            )
+        result = await _asyncio.to_thread(github_changed_files, root, resolved_base)
+        return JSONResponse(status_code=200, content=result)
+
+    @app.get("/v1/sessions/{session_id}/resources/github/diff")
+    async def read_github_pr_diff(
+        session_id: str,
+        base: str | None = Query(default=None),
+    ) -> JSONResponse:
+        import asyncio as _asyncio
+
+        from omnigent.runner.github_resource import github_pr_diff, resolve_base_ref
+
+        root = await _github_workspace_root(session_id)
+        resolved_base = await _asyncio.to_thread(resolve_base_ref, root, base)
+        result = await _asyncio.to_thread(github_pr_diff, root, resolved_base or "")
+        return JSONResponse(status_code=200, content=result)
+
+    @app.get("/v1/sessions/{session_id}/resources/github/diff/{relative_path:path}")
+    async def read_github_file_diff(
+        session_id: str,
+        relative_path: str,
+        base: str | None = Query(default=None),
+    ) -> JSONResponse:
+        import asyncio as _asyncio
+
+        from omnigent.runner.github_resource import github_file_diff, resolve_base_ref
+
+        # Repo-root-relative paths only; reject traversal even though ``git show``
+        # reads from the object store (not disk) and rejects out-of-tree paths.
+        if relative_path.startswith("/") or any(
+            seg in ("", "..") for seg in relative_path.split("/")
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"code": "invalid_path", "message": "Invalid path"}},
+            )
+        root = await _github_workspace_root(session_id)
+        resolved_base = await _asyncio.to_thread(resolve_base_ref, root, base)
+        result = await _asyncio.to_thread(
+            github_file_diff, root, resolved_base or "", relative_path
+        )
+        return JSONResponse(status_code=200, content=result)
+
     @app.get(
         "/v1/sessions/{session_id}/resources/environments"
         "/{environment_id}/filesystem/{relative_path:path}"
@@ -9249,8 +9698,11 @@ def create_runner_app(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
-    ) -> JSONResponse:
+        download: bool = False,
+    ) -> Response:
         await _require_os_env(session_id)
+        if download:
+            return await _fs_download(session_id, environment_id, relative_path)
         return await _fs_list_or_read(
             session_id,
             environment_id,
@@ -9826,6 +10278,68 @@ def create_runner_app(
             content={"meta_text": format_skill_meta_text(skill, arguments)},
         )
 
+    async def _fs_download(
+        session_id: str,
+        environment_id: str,
+        path: str,
+    ) -> StreamingResponse:
+        """Serve a file's complete bytes as an attachment.
+
+        The read path inlines content in a JSON envelope, so it caps at
+        ``_MAX_READ_BYTES``. A download streams from a descriptor and needs
+        no cap; ``open_download`` binds that descriptor to what the sandbox
+        can read before a byte is served.
+
+        :param session_id: Session identifier.
+        :param environment_id: Environment resource id.
+        :param path: Path within the environment, or an absolute path.
+        :returns: The file streamed with ``Content-Disposition: attachment``.
+        :raises InvalidPath: If the path names a directory.
+        :raises FilesystemPathNotFound: If nothing the caller may see exists
+            at the path.
+        """
+        from omnigent.runner.environment_filesystem import CallerProcessFilesystem
+
+        await _ensure_session_registered(session_id)
+        agent_spec = await _resolve_session_agent_spec(session_id)
+        env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
+        fobj, resolved, size = await CallerProcessFilesystem(env).open_download(path)
+
+        async def _chunks() -> AsyncIterator[bytes]:
+            # Stop at the size announced in Content-Length so a file growing
+            # underneath the download cannot overrun the response.
+            remaining = size
+            try:
+                while remaining > 0:
+                    chunk = await asyncio.to_thread(fobj.read, min(64 * 1024, remaining))
+                    if not chunk:
+                        # Ending short of Content-Length would hand the client
+                        # a silently incomplete file; abort the transfer instead.
+                        raise RuntimeError(f"{resolved.name} shrank during download")
+                    remaining -= len(chunk)
+                    yield chunk
+            finally:
+                fobj.close()
+
+        # Same header Starlette's FileResponse builds: a plain quoted filename
+        # when it is URL-safe, else the RFC 5987 encoded form.
+        quoted = urllib.parse.quote(resolved.name)
+        disposition = (
+            f'attachment; filename="{resolved.name}"'
+            if quoted == resolved.name
+            else f"attachment; filename*=utf-8''{quoted}"
+        )
+        return StreamingResponse(
+            _chunks(),
+            media_type=mimetypes.guess_type(resolved.name)[0] or "application/octet-stream",
+            headers={
+                "Content-Length": str(size),
+                "Content-Disposition": disposition,
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
     async def _fs_list_or_read(
         session_id: str,
         environment_id: str,
@@ -10166,6 +10680,11 @@ def create_runner_app(
                     status_code=200,
                     content={"error": {"code": -32000, "message": "Missing tool name"}},
                 )
+
+            if tool_name == "sys_read_inbox":
+                # A scan that failed at initialization must not leave the
+                # drain reporting an empty inbox; this is a no-op once done.
+                await _recover_undrained_subagent_results(session_id)
 
             if "__" in tool_name:
                 if mcp_manager is None:
@@ -10591,6 +11110,8 @@ def create_runner_app(
                     msg_body: _JsonObject = {
                         "agent_id": agent_id,
                         "model": agent_id or "",
+                        # Catch-up has no live server dispatch carrying renderer state.
+                        "browser_renderer_available": False,
                     }
                     _turn_task = asyncio.create_task(
                         _run_turn_bg(msg_body, session_id),
