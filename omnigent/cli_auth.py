@@ -266,6 +266,13 @@ def load_token(server_url: str, *, min_remaining_seconds: float = 0.0) -> str | 
     if entry is None:
         return None
 
+    # A tokenless record — a Databricks pointer, which deliberately stores no
+    # bearer — is not a session that can lapse. Declining it is the normal
+    # path, so return before the expiry check rather than reporting it as
+    # expired at epoch 0 and telling the user to re-run `omnigent login`.
+    if not isinstance(entry.get("token"), str):
+        return None
+
     expires_at = entry.get("expires_at", 0)
     if isinstance(expires_at, (int, float)) and expires_at < time.time():
         _warn_expired_once(server_url, expires_at, has_refresh="refresh_token" in entry)

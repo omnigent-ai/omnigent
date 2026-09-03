@@ -456,6 +456,37 @@ def test_load_token_returns_none_for_databricks_record(token_dir) -> None:
     assert load_token("https://myapp-123.aws.databricksapps.com") is None
 
 
+def test_databricks_record_is_not_reported_as_an_expired_session(
+    token_dir,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Declining a tokenless pointer record must not warn about expiry.
+
+    The record holds no ``expires_at``, so an epoch-0 default made every
+    command claim the session "expired on 1970-01-01" and tell the user to
+    re-run ``omnigent login`` — pointing at auth while the real fault lay
+    elsewhere. Databricks auth is minted from the CLI OAuth cache instead,
+    so there is nothing to re-authenticate.
+    """
+    import logging
+
+    from omnigent import cli_auth
+    from omnigent.cli_auth import load_token, store_databricks_auth
+
+    store_databricks_auth(
+        server_url="https://myapp-123.aws.databricksapps.com",
+        workspace_host="https://example.databricks.com",
+    )
+    # The warning fires at most once per process per server.
+    cli_auth._warned_expired_servers.clear()
+
+    with caplog.at_level(logging.DEBUG, logger="omnigent.cli_auth"):
+        assert load_token("https://myapp-123.aws.databricksapps.com") is None
+
+    assert "expired" not in caplog.text.lower()
+    assert "1970" not in caplog.text
+
+
 def test_load_databricks_host_returns_none_for_jwt_record(token_dir) -> None:
     """A session-JWT record is not a Databricks pointer record.
 
