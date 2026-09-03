@@ -276,9 +276,9 @@ Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
 its coding agents or drive a live OpenClaw Gateway session over ACP.
 
 <details>
-<summary>Grok Build and Devin</summary>
+<summary>Grok Build, Devin, and MiniMax Code</summary>
 
-Two more coding agents are built in but have no `omnigent <name>` launcher of
+Three more coding agents are built in but have no `omnigent <name>` launcher of
 their own, because each ships a CLI that holds its own login. Install the vendor
 CLI, log in with it, then name the harness:
 
@@ -292,20 +292,27 @@ omnigent run --harness grok           # 'grok-build' also works
 curl -fsSL https://cli.devin.ai/install.sh | bash
 devin auth login
 omnigent run --harness devin
+
+# MiniMax Code
+curl -fsSL https://filecdn.minimax.chat/public/install.sh | bash
+mcode login
+omnigent run --harness minimax        # 'mcode' and 'minimax-code' also work
 ```
 
-Both speak the [Agent Client Protocol](https://agentclientprotocol.com) over
-stdio, and Omnigent stores no credential for either — each CLI reads back the
-login it wrote to disk. That also means `--model` is refused rather than
-silently dropped: both run their account-default model. To pin one, configure an
-`acp:` agent whose command passes the vendor's own model flag.
+All three speak the [Agent Client Protocol](https://agentclientprotocol.com) over
+stdio, and Omnigent stores no credential for any of them — each CLI reads its own
+saved configuration. That also means `--model` is refused rather than silently
+dropped: model selection stays with the vendor CLI. To pass a vendor model flag,
+configure an `acp:` agent whose command includes it.
 
-Use the vendor login rather than an API key. A builtin ACP row has no
+Use the vendor's own credential command rather than expecting an ambient API
+key. A builtin ACP row has no
 `env_passthrough` of its own, and `XAI_API_KEY` is not in the host-to-runner
 credential allowlist, so exporting it in your shell does not reach the agent.
 If you need the key route, pass it explicitly with
 `OMNIGENT_RUNNER_ENV_PASSTHROUGH=XAI_API_KEY`, or configure an `acp:` agent that
-declares the passthrough.
+declares the passthrough. For a MiniMax custom provider or API key, run
+`mcode provider`; MiniMax Code reads that saved configuration itself.
 
 </details>
 
