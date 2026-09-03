@@ -194,6 +194,7 @@ class SdkInprocDriver:
     """Drive turns through a harness wrap subprocess."""
 
     transport = "sdk-inproc"
+    applied_model_override = True
 
     def __init__(self, profile: BenchProfile, *, databricks_profile: str | None) -> None:
         self._profile = profile

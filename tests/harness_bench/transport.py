@@ -19,11 +19,13 @@ class Driver(Protocol):
     Not ``@runtime_checkable`` on purpose: drivers are selected by class from
     :func:`driver_registry`, never by ``isinstance`` — and a runtime protocol
     check would not cover the data/static members (``transport``,
-    ``unavailable``) anyway. The docstring-only method bodies below are the
-    Protocol stub form; the concrete drivers supply the behavior.
+    ``unavailable``, ``applied_model_override``) anyway. The docstring-only
+    method bodies below are the Protocol stub form; the concrete drivers
+    supply the behavior.
     """
 
     transport: str
+    applied_model_override: bool
 
     async def __aenter__(self) -> Driver:
         """Provision the transport and bind a session."""
@@ -79,6 +81,16 @@ class Driver(Protocol):
     @staticmethod
     def unavailable(profile: BenchProfile, *, databricks_profile: str | None) -> str | None:
         """Return a skip reason if this driver cannot run *profile*, else None."""
+
+
+def driver_applied_model_override(driver: object) -> bool:
+    """Return whether *driver* applied ``profile.model`` as an override.
+
+    Conservative default: a driver that does not expose the flag is treated
+    as unused. The model_override probe must never claim ``SUPPORTED`` from
+    turn completion alone.
+    """
+    return bool(getattr(driver, "applied_model_override", False))
 
 
 def driver_registry() -> dict[str, type]:
@@ -142,4 +154,10 @@ def resolve_driver_class(
     return registry[name]
 
 
-__all__ = ["Driver", "driver_registry", "resolve_driver_class", "resolve_transport_name"]
+__all__ = [
+    "Driver",
+    "driver_applied_model_override",
+    "driver_registry",
+    "resolve_driver_class",
+    "resolve_transport_name",
+]
