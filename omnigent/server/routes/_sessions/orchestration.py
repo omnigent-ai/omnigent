@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import math
 import secrets
@@ -8873,6 +8874,32 @@ async def _child_session_summaries_from_conversations(
     ]
 
 
+def _mcp_arguments_hash(arguments: dict[str, Any]) -> str:
+    """Hash MCP arguments using a stable JSON representation."""
+    canonical = json.dumps(
+        arguments,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _mcp_approval_matches(
+    pending: _PendingPolicyAskWrites,
+    session_id: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> bool:
+    """Return whether a pending approval authorizes this invocation."""
+    return (
+        pending.from_mcp
+        and pending.session_id == session_id
+        and pending.tool_name == tool_name
+        and pending.arguments_hash == _mcp_arguments_hash(arguments)
+    )
+
+
 async def _handle_mcp_tools_call(
     rpc_id: int | str | None,
     session_id: str,
@@ -9015,7 +9042,8 @@ async def _handle_mcp_tools_call(
             # was genuinely issued by the server (present in the
             # server-side pending map) and that the user approved it.
             elicitation_id_from_state: str = state.get("elicitation_id", "")
-            if elicitation_id_from_state not in _pending_policy_ask_writes:
+            pending = _pending_policy_ask_writes.get(elicitation_id_from_state)
+            if pending is None or not pending.from_mcp:
                 # The elicitation_id is not in the server-side map.
                 # Either it was forged, already consumed, or expired.
                 # Check inputResponses: if the caller claims approval
@@ -9030,29 +9058,40 @@ async def _handle_mcp_tools_call(
                         "Elicitation not found or already resolved",
                     )
                 return _mcp_error_response(rpc_id, -32000, "Tool call denied by user")
+            if not _mcp_approval_matches(pending, session_id, namespaced_name, arguments):
+                return _mcp_error_response(
+                    rpc_id,
+                    -32000,
+                    "Approval does not match this tool call",
+                )
+            # Compare and consume without yielding so concurrent retries cannot
+            # both spend the same approval. Mismatches leave it intact.
+            _pending_policy_ask_writes.pop(elicitation_id_from_state, None)
             approval = input_responses.get(elicitation_id_from_state) or {}
             if approval.get("action") != "accept":
                 return _mcp_error_response(rpc_id, -32000, "Tool call denied by user")
-            # Recover any policy-transformed args that were serialised into
-            # requestState on the initial ASK — the client re-sends the
-            # original arguments which we must not use when a transform was set.
-            if state.get("transformed_arguments") is not None:
-                arguments = state["transformed_arguments"]
+            if pending.transformed_arguments is not None:
+                arguments = pending.transformed_arguments
             # Apply the deciding policy's deferred writes now that the
             # user approved (POLICIES.md §7.2: only on accept).
-            _pending = _pending_policy_ask_writes.pop(elicitation_id_from_state, None)
-            if _pending is not None:
-                if _pending.set_labels:
-                    await asyncio.to_thread(engine.apply_label_writes, _pending.set_labels)
-                if _pending.state_updates:
-                    with contextlib.suppress(ConversationNotFoundError):
-                        await asyncio.to_thread(engine.apply_state_updates, _pending.state_updates)
+            if pending.set_labels:
+                await asyncio.to_thread(engine.apply_label_writes, pending.set_labels)
+            if pending.state_updates:
+                with contextlib.suppress(ConversationNotFoundError):
+                    await asyncio.to_thread(engine.apply_state_updates, pending.state_updates)
         else:
             # ALLOW — policy no longer requires approval (e.g. label
             # state changed between the original ASK and this retry).
-            # Recover transformed args if present, then fall through.
-            if state.get("transformed_arguments") is not None:
-                arguments = state["transformed_arguments"]
+            # Consume a matching stale approval even though it is no longer
+            # required, so it cannot authorize a later ASK retry.
+            elicitation_id_from_state = state.get("elicitation_id", "")
+            pending = _pending_policy_ask_writes.get(elicitation_id_from_state)
+            if pending is not None and _mcp_approval_matches(
+                pending, session_id, namespaced_name, arguments
+            ):
+                _pending_policy_ask_writes.pop(elicitation_id_from_state, None)
+                if pending.transformed_arguments is not None:
+                    arguments = pending.transformed_arguments
         # Fall through to execution.
     else:
         # ── First call: evaluate TOOL_CALL policy ────────────────────
@@ -9107,17 +9146,15 @@ async def _handle_mcp_tools_call(
                 state_updates=call_result.state_updates,
                 set_labels=call_result.set_labels,
                 from_mcp=True,
+                session_id=session_id,
+                tool_name=namespaced_name,
+                arguments_hash=_mcp_arguments_hash(arguments),
+                transformed_arguments=cast("dict[str, Any] | None", call_result.data),
             )
             request_state_payload: dict[str, Any] = {
                 "elicitation_id": elicitation_id,
                 "session_id": session_id,
             }
-            # If the policy returned transformed args alongside ASK (e.g.
-            # PII-redacted arguments), persist them so the retry path can
-            # apply them after the user approves — the client re-sends the
-            # original arguments, which would silently bypass the transform.
-            if call_result.data is not None:
-                request_state_payload["transformed_arguments"] = call_result.data
             request_state = json.dumps(request_state_payload)
             return _mcp_input_required_response(
                 rpc_id,
