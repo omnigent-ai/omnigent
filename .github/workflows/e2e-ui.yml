@@ -235,19 +235,17 @@ jobs:
       # native render-parity tests boot a real Claude Code / Codex CLI. The
       # rest of the e2e-ui suite (openai-agents) ignores them.
       - name: Install Claude Code CLI
-        # claude-code 2.1.170, NOT the 2.1.124 in .github/ci-deps: 2.1.124
-        # doesn't recognise the hook events the native bridge configures and
-        # shows a blocking startup modal that swallows the first message.
-        # Runs the package's install script so the platform-specific binary is
-        # linked into the temporary CLI directory and put on PATH.
-        # (The install.cjs script was removed in the same version the upstream
-        # npm package no longer ships it, so lifecycle scripts are required.)
+        # Same claude-code pin as .github/ci-deps. The native bridge needs a
+        # release that recognises its hook events (older ones show a blocking
+        # startup modal that swallows the first message). Runs the package's
+        # install script so the platform-specific binary is linked into the
+        # temporary CLI directory and put on PATH.
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
           CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
           mkdir -p "$CC_CLI_DIR" && cd "$CC_CLI_DIR"
-          npm install --no-audit --no-fund @anthropic-ai/claude-code@2.1.212
+          npm install --no-audit --no-fund @anthropic-ai/claude-code@2.1.236
           echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Install Codex CLI
