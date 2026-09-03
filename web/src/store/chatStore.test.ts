@@ -54,6 +54,7 @@ import type {
 import type { TerminalInfo } from "@/hooks/useTerminals";
 import { terminalsQueryKey } from "@/hooks/useTerminals";
 import { type ChildSessionInfo, childSessionsQueryKey } from "@/hooks/useChildSessions";
+import type { GithubInfo } from "@/hooks/useGithub";
 import {
   consumePendingInitialPrompt,
   handleSessionEvent,
@@ -4368,6 +4369,28 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       });
       spy.mockRestore();
     });
+
+    it("marks the GitHub info stale without refetching (its tab follows the same workspace)", async () => {
+      seedSession("conv_sw", []);
+      await useChatStore.getState().switchTo("conv_sw");
+      const spy = vi.spyOn(client, "invalidateQueries");
+
+      handleSessionEvent({
+        type: "session_agent_changed",
+        conversationId: "conv_sw",
+        agentId: "ag_clone",
+        agentName: "Claude Code (switch ag_clone)",
+      });
+
+      // Same reasoning as the environment above: the new agent's workspace
+      // may or may not be a git checkout, but a refetch now would re-serve
+      // the OLD agent's answer, so only stale-mark it (refetchType "none").
+      expect(spy).toHaveBeenCalledWith({
+        queryKey: ["github-info", "conv_sw"],
+        refetchType: "none",
+      });
+      spy.mockRestore();
+    });
   });
 
   describe("session.terminal_pending", () => {
@@ -6157,6 +6180,87 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       // ONE debounced flush (the two events above coalesced). 10 would mean
       // the debounce broke and each event flushed separately.
       expect(spy).toHaveBeenCalledTimes(5);
+      spy.mockRestore();
+    });
+
+    it("re-probes an unavailable GitHub answer so a hidden GitHub tab can come back", async () => {
+      // A workspace that isn't a git repo hides the GitHub rail tab, and with
+      // it the panel's own Refresh — so a git init / clone by the agent must
+      // re-run the probe from here.
+      vi.useFakeTimers();
+      client.setQueryData<GithubInfo>(["github-info", "conv_abc"], {
+        object: "session.github.info",
+        available: false,
+        reason: "not_a_git_repo",
+      });
+      const spy = vi.spyOn(client, "invalidateQueries");
+      handleSessionEvent({
+        type: "session_changed_files_invalidated",
+        sessionId: "conv_abc",
+        environmentId: "default",
+      });
+
+      await vi.advanceTimersByTimeAsync(750);
+
+      expect(spy).toHaveBeenCalledWith({ queryKey: ["github-info", "conv_abc"] });
+      spy.mockRestore();
+    });
+
+    it("leaves an available GitHub answer to the panel's own Refresh", async () => {
+      // A git workspace's probe runs gh round-trips; charging that per edit
+      // burst isn't worth it when the visible tab's panel can refresh itself.
+      vi.useFakeTimers();
+      client.setQueryData<GithubInfo>(["github-info", "conv_abc"], {
+        object: "session.github.info",
+        available: true,
+        branch: "main",
+      });
+      const spy = vi.spyOn(client, "invalidateQueries");
+      handleSessionEvent({
+        type: "session_changed_files_invalidated",
+        sessionId: "conv_abc",
+        environmentId: "default",
+      });
+
+      await vi.advanceTimersByTimeAsync(750);
+
+      expect(spy).not.toHaveBeenCalledWith(
+        expect.objectContaining({ queryKey: ["github-info", "conv_abc"] }),
+      );
+      expect(spy).toHaveBeenCalledTimes(5);
+      spy.mockRestore();
+    });
+
+    it("re-probes a GitHub answer an agent switch marked stale", async () => {
+      // The switch handler only stale-marks the info (the runner reset hasn't
+      // run yet); the reset's changed-files event is the refetch, in both
+      // directions across a git-repo boundary.
+      seedSession("conv_sw", []);
+      await useChatStore.getState().switchTo("conv_sw");
+      client.setQueryData<GithubInfo>(["github-info", "conv_sw"], {
+        object: "session.github.info",
+        available: true,
+        branch: "main",
+      });
+      handleSessionEvent({
+        type: "session_agent_changed",
+        conversationId: "conv_sw",
+        agentId: "ag_clone",
+        agentName: "Claude Code (switch ag_clone)",
+      });
+      expect(client.getQueryState(["github-info", "conv_sw"])?.isInvalidated).toBe(true);
+
+      vi.useFakeTimers();
+      const spy = vi.spyOn(client, "invalidateQueries");
+      handleSessionEvent({
+        type: "session_changed_files_invalidated",
+        sessionId: "conv_sw",
+        environmentId: "default",
+      });
+
+      await vi.advanceTimersByTimeAsync(750);
+
+      expect(spy).toHaveBeenCalledWith({ queryKey: ["github-info", "conv_sw"] });
       spy.mockRestore();
     });
   });

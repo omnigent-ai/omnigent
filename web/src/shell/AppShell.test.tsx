@@ -56,6 +56,13 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   useWorkspaceChangedFiles: vi.fn(() => ({ data: undefined, isLoading: true })),
 }));
 
+vi.mock("@/hooks/useGithub", () => ({
+  // The shell reads the git info only to gate the GitHub rail tab. The panel
+  // (the module's other consumer under the shell) is stubbed below, so the
+  // remaining data hooks are never reached.
+  useGithubInfo: vi.fn(() => ({ data: undefined, isLoading: true })),
+}));
+
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module (childSessionsQueryKey, MAX_TREE_DEPTH,
   // cachedTreeContains) — only the hook is replaced.
@@ -178,6 +185,13 @@ vi.mock("./SubagentsPanel", () => ({
     <div data-testid="subagents-panel" data-conversation-id={conversationId} />
   ),
 }));
+vi.mock("./GithubPanel", () => ({
+  // Marker only — the panel's own states are covered by GithubPanel.test.tsx;
+  // here it just proves which tab the rail mounted.
+  GithubPanel: ({ conversationId }: { conversationId: string }) => (
+    <div data-testid="github-panel" data-conversation-id={conversationId} />
+  ),
+}));
 // The real WorkspacePanel mounts a rail xterm for an open shell tab; stub the
 // low-level view to a marker echoing the attached terminal id.
 vi.mock("@/components/blocks/TerminalView", () => ({
@@ -229,6 +243,10 @@ import {
 
 const useEnvironmentMock = vi.mocked(useWorkspaceEnvironment);
 const useChangedFilesMock = vi.mocked(useWorkspaceChangedFiles);
+
+import { useGithubInfo } from "@/hooks/useGithub";
+
+const useGithubInfoMock = vi.mocked(useGithubInfo);
 
 import { useChildSessions } from "@/hooks/useChildSessions";
 
@@ -534,6 +552,12 @@ beforeEach(() => {
   useChangedFilesMock.mockReset();
   useChangedFilesMock.mockReturnValue({ data: undefined, isLoading: true } as unknown as ReturnType<
     typeof useWorkspaceChangedFiles
+  >);
+  // Default: git info still loading (data undefined) → the GitHub tab stays
+  // visible, mirroring the environment default above.
+  useGithubInfoMock.mockReset();
+  useGithubInfoMock.mockReturnValue({ data: undefined, isLoading: true } as unknown as ReturnType<
+    typeof useGithubInfo
   >);
   // The Chat/TUI toggle persists its position to sessionStorage so leaving
   // and re-entering a conversation restores the last view. Clear
@@ -2491,6 +2515,115 @@ describe("FilesPanel visibility", () => {
   });
 });
 
+describe("GitHub tab visibility", () => {
+  // The GitHub rail tab needs a git checkout on disk. The runner reports that
+  // through the same info query the panel reads; the shell drops the tab only
+  // on a definitive "not a git repo" answer, never on an unknown one.
+  function mockWorkspaceWithFiles() {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_git", permission_level: null }]);
+  }
+
+  it("hides the GitHub tab, but keeps Files, when the workspace isn't a git repo", () => {
+    mockWorkspaceWithFiles();
+    useGithubInfoMock.mockReturnValue({
+      data: { object: "session.github.info", available: false, reason: "not_a_git_repo" },
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useGithubInfo>);
+
+    renderShell("/c/conv_git");
+
+    expect(screen.queryByRole("tab", { name: "GitHub" })).toBeNull();
+    expect(screen.getByRole("tab", { name: "Files" })).toBeInTheDocument();
+  });
+
+  it("keeps the GitHub tab while the git info is still loading", () => {
+    // Unknown is not "not a repo": a cold-booting runner must not make the
+    // tab flash away before it has answered.
+    mockWorkspaceWithFiles();
+    useGithubInfoMock.mockReturnValue({
+      data: undefined,
+      isLoading: true,
+      error: null,
+    } as unknown as ReturnType<typeof useGithubInfo>);
+
+    renderShell("/c/conv_git");
+
+    expect(screen.getByRole("tab", { name: "GitHub" })).toBeInTheDocument();
+  });
+
+  it("keeps the GitHub tab when the git info query fails", () => {
+    mockWorkspaceWithFiles();
+    useGithubInfoMock.mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      error: new Error("runner unavailable"),
+    } as unknown as ReturnType<typeof useGithubInfo>);
+
+    renderShell("/c/conv_git");
+
+    expect(screen.getByRole("tab", { name: "GitHub" })).toBeInTheDocument();
+  });
+
+  it("shows the GitHub tab for a git workspace", () => {
+    mockWorkspaceWithFiles();
+    useGithubInfoMock.mockReturnValue({
+      data: { object: "session.github.info", available: true, branch: "main" },
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useGithubInfo>);
+
+    renderShell("/c/conv_git");
+
+    expect(screen.getByRole("tab", { name: "GitHub" })).toBeInTheDocument();
+    // Keyed by the route's own conversation, so the shell shares the panel's
+    // and composer's cache entry instead of issuing a second request.
+    expect(useGithubInfoMock).toHaveBeenCalledWith("conv_git");
+  });
+
+  it("falls back to Files when the selected GitHub tab turns out to be unavailable", () => {
+    // The user opens GitHub while the info is still loading, then the runner
+    // answers "not a git repo": the tab goes away and the selection must land
+    // on Files rather than strand the rail on a hidden tab.
+    mockWorkspaceWithFiles();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const makeTree = () => (
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_git"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route path="c/:conversationId" element={<div>chat</div>} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(makeTree());
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "GitHub" }));
+    expect(screen.getByRole("tab", { name: "GitHub" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("github-panel")).toHaveAttribute("data-conversation-id", "conv_git");
+
+    useGithubInfoMock.mockReturnValue({
+      data: { object: "session.github.info", available: false, reason: "not_a_git_repo" },
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useGithubInfo>);
+    rerender(makeTree());
+
+    expect(screen.queryByRole("tab", { name: "GitHub" })).toBeNull();
+    expect(screen.queryByTestId("github-panel")).toBeNull();
+    expect(screen.getByRole("tab", { name: "Files" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("files-panel")).toBeInTheDocument();
+  });
+});
+
 describe("Right workspace card visibility", () => {
   it("reserves the visible pane width plus its two desktop margins from the header", () => {
     useEnvironmentMock.mockReturnValue({
@@ -2515,7 +2648,7 @@ describe("Right workspace card visibility", () => {
     // A no-os_env agent (available: false) with no shells
     // still has the unconditional Agents tab (the panel lists at least
     // the main agent), so the card mounts, the Agents tab is selected
-    // by the fallback, and Files/Shells are absent. An unmounted
+    // by the fallback, and Files/GitHub/Shells are absent. An unmounted
     // card here means the always-visible Agents rule regressed.
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null, home: null },
@@ -2527,6 +2660,7 @@ describe("Right workspace card visibility", () => {
 
     expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
     expect(screen.queryByRole("tab", { name: /Files/i })).toBeNull();
+    expect(screen.queryByRole("tab", { name: "GitHub" })).toBeNull();
     expect(screen.queryByRole("tab", { name: /Shells/i })).toBeNull();
     // The tab-fallback effect lands on Agents (the only available tab).
     expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");

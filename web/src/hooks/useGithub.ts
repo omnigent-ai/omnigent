@@ -62,8 +62,8 @@ export interface GithubInfo {
   object: "session.github.info";
   /** False only when this isn't a git repo (see reason); the diff needs one. */
   available: boolean;
-  /** Why unavailable: "not_a_git_repo" | "no_os_env". */
-  reason?: string;
+  /** Why unavailable: no git checkout on disk, or no os_env at all. */
+  reason?: "not_a_git_repo" | "no_os_env";
   /** Whether the `gh` CLI is present. When false, PR/repo are null but the
    *  branch-vs-base diff still renders from git. */
   gh_available?: boolean;
@@ -128,7 +128,9 @@ async function fetchGithubInfo(conversationId: string): Promise<GithubInfo> {
  *
  * Disabled when the runner is known offline. Retries the runner-offline case
  * with capped backoff so a cold-booting runner resolves before any error UI.
- * No polling — the panel refetches on a manual Refresh.
+ * No polling — the panel refetches on a manual Refresh, and the chat store
+ * re-probes an unavailable answer when the workspace changes, so a hidden
+ * GitHub tab can come back (see ``scheduleWorkspaceFilesystemInvalidation``).
  */
 export function useGithubInfo(conversationId: string | undefined) {
   const serveable = useWorkspaceServeable(conversationId);

@@ -93,6 +93,7 @@ import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
+import type { GithubInfo } from "@/hooks/useGithub";
 import { overlayTitleIntoCaches, type ConversationsInfiniteData } from "@/lib/sessionListCache";
 import { useTerminalActivityStore } from "./terminalActivity";
 import { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
@@ -1219,6 +1220,13 @@ function scheduleWorkspaceFilesystemInvalidation(sessionId: string): void {
     queryClient?.invalidateQueries({
       queryKey: ["workspace-environment", sessionId],
     });
+    // Re-probe the GitHub info when its cached answer is unavailable (a hidden
+    // GitHub tab has no Refresh of its own) or already marked stale, e.g. by an
+    // agent switch. A git workspace's probe costs gh round-trips, so edits skip it.
+    const github = queryClient?.getQueryState<GithubInfo>(["github-info", sessionId]);
+    if (github?.data?.available === false || github?.isInvalidated) {
+      queryClient?.invalidateQueries({ queryKey: ["github-info", sessionId] });
+    }
   }, WORKSPACE_INVALIDATION_DEBOUNCE_MS);
   workspaceInvalidationTimers.set(sessionId, timer);
 }
@@ -5373,6 +5381,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // lost reset — the next focus/remount refetch corrects the tab.
       queryClient?.invalidateQueries({
         queryKey: ["workspace-environment", event.conversationId],
+        refetchType: "none",
+      });
+      // The GitHub tab's git-repo probe reads the same workspace, so it gets
+      // the same stale-mark; the reset's changed-files event then refetches it.
+      queryClient?.invalidateQueries({
+        queryKey: ["github-info", event.conversationId],
         refetchType: "none",
       });
       // The switch closes the old agent's terminals on the runner

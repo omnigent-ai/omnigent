@@ -563,7 +563,7 @@ interface WorkspacePanelProps {
   onRightRailTabChange: (next: RightRailTab) => void;
   /** Whether the Files/Changes tabs are available (agent spec exposes an os_env). */
   showFilesPanel: boolean;
-  /** Whether the GitHub tab is available (same on-disk-workspace gate as Files). */
+  /** Whether the GitHub tab is available (the Files gate plus a git checkout on disk). */
   showGithubTab: boolean;
   /** Whether the Browser tab is available — Electron shell only (hidden in a
    *  plain web build, which has no embedded WebContentsView). */

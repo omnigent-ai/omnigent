@@ -55,6 +55,14 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
     isLoading: false,
   })),
 }));
+vi.mock("@/hooks/useGithub", () => ({
+  // A git workspace, so the rail's GitHub tab stays put alongside Files.
+  useGithubInfo: vi.fn(() => ({
+    data: { object: "session.github.info", available: true },
+    isLoading: false,
+    error: null,
+  })),
+}));
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module — childSessionsQueryKey, MAX_TREE_DEPTH, and
   // cachedTreeContains (which reads the query cache seeded below) stay

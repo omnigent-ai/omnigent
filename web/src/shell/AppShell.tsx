@@ -67,6 +67,7 @@ import {
   useDeleteTerminal,
   useTerminals,
 } from "@/hooks/useTerminals";
+import { useGithubInfo } from "@/hooks/useGithub";
 import {
   useWorkspaceChangedFiles,
   useWorkspaceEnvironment,
@@ -729,6 +730,10 @@ export function AppShell() {
   // it is enough to prove availability without paying for directory contents.
   const environmentQuery = useWorkspaceEnvironment(conversationId);
   const showFilesPanel = environmentQuery.data?.available !== false;
+  // The GitHub tab also needs a git checkout on disk. This shares the GitHub
+  // panel's info query, so it costs no extra request.
+  const githubInfoQuery = useGithubInfo(conversationId);
+  const workspaceNotGitRepo = githubInfoQuery.data?.reason === "not_a_git_repo";
   // Per-tab availability for the right workspace rail — the single source
   // of truth shared by the tab-fallback effect below, the rail's mount
   // gate, and the header's collapse toggle, so they can never disagree.
@@ -739,11 +744,10 @@ export function AppShell() {
         // Changes tab shares the Files gate — same on-disk workspace, just the
         // changed-files scope.
         changes: showFilesPanel,
-        // GitHub tab shares the Files gate too — it needs a git checkout on
-        // disk. The panel itself renders the "gh not installed" / "not a git
-        // repo" / "no PR" states, so the tab is present whenever there's a
-        // workspace.
-        github: showFilesPanel,
+        // GitHub tab: hidden once the runner reports the workspace isn't a
+        // git repo. An unknown answer (loading, errored, runner offline) keeps
+        // the tab, so a cold-booting runner never makes it flash away.
+        github: showFilesPanel && !workspaceNotGitRepo,
         // Browser tab: shown only when the desktop shell hosts the embedded
         // WebContentsView. A plain web build has no embedded browser, and an
         // older desktop build predates the `browser*` bridge — both hide the
@@ -757,18 +761,16 @@ export function AppShell() {
         // rail's tab strip (see WorkspacePanel's TerminalTabsStrip / "+"
         // menu). Mobile keeps a shells drawer (see ``showShellsTab`` below).
       }) as const,
-    [showFilesPanel],
+    [showFilesPanel, workspaceNotGitRepo],
   );
   // Whether the rail has anything at all to show. When false the workspace
   // card doesn't mount and the header hides its collapse toggle — a
   // no-filesystem agent with no terminals/sub-agents would otherwise
   // render an empty white card with no way to dismiss it.
   const hasRailContent = Object.values(railTabsAvailable).some(Boolean);
-  // Keep the selected tab valid. When the current tab disappears — e.g. the
-  // files panel turns off — fall back to the first still-visible tab in
-  // display order (Files · Changes · Agents · Browser). Picking
-  // the first available (rather than ping-ponging between two effects) keeps
-  // this convergent even when several tabs vanish at once.
+  // Keep the selected tab valid: when the current tab disappears (files panel
+  // off, runner reports no git repo), fall back to the first still-visible tab
+  // in display order. First-available keeps this convergent when several vanish.
   useEffect(() => {
     if (railTabsAvailable[rightRailTab]) return;
     const next = (["files", "changes", "github", "subagents", "browser"] as const).find(

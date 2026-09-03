@@ -7,14 +7,16 @@ with ``page.route`` and answered with canned JSON, so the test exercises the
 *frontend* — the PR header, the CI-check pills, and the folder-tree sidebar —
 without a real ``gh``/``git`` (which a CI workspace has no PR for anyway).
 
-Two behaviours are pinned:
+Three behaviours are pinned:
 
 1. Opening the GitHub rail tab renders the associated PR (title + number), its
    CI checks as labeled pills, and the branch-vs-base file tree — with a
    single-child directory chain (``src`` → ``app``) compacted into one row.
 2. The composer status line's ``#<pr>`` link opens that tab.
+3. A workspace with no git checkout gets no GitHub tab at all (the rail keeps
+   Files), rather than a panel that can only say "not a git repo".
 
-Neither sends a message, so both stay fast and LLM-free.
+None sends a message, so all three stay fast and LLM-free.
 """
 
 from __future__ import annotations
@@ -58,6 +60,15 @@ _INFO = {
             ],
         },
     },
+}
+
+# GET /resources/github for a workspace with no git checkout. The rail hides
+# its GitHub tab on this answer instead of mounting a panel that can only say
+# "not a git repo".
+_INFO_NOT_A_GIT_REPO = {
+    "object": "session.github.info",
+    "available": False,
+    "reason": "not_a_git_repo",
 }
 
 # GET /resources/github/changes — files changed vs the base. ``src`` → ``app``
@@ -172,3 +183,26 @@ def test_composer_pr_link_opens_github_tab(
     pr_link.click()
     rail = page.get_by_role("complementary", name="Workspace")
     expect(rail.get_by_text("Add the GitHub tab")).to_be_visible(timeout=30_000)
+
+
+def test_github_tab_hidden_for_non_git_workspace(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A workspace that isn't a git repo gets no GitHub tab; Files stays."""
+    base_url, session_id = seeded_session
+    # Only the info endpoint is reachable here: with the tab gone, nothing
+    # requests the changes or the diff.
+    page.route(
+        re.compile(r"/resources/github(?:\?|$)"),
+        lambda r: r.fulfill(json=_INFO_NOT_A_GIT_REPO),
+    )
+    page.goto(f"{base_url}/c/{session_id}")
+
+    open_right_rail(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+    # Files and Agents prove the tab strip has rendered, so the GitHub check
+    # below can't pass vacuously on an empty rail.
+    expect(rail.get_by_role("tab", name="Files")).to_be_visible(timeout=30_000)
+    expect(rail.get_by_role("tab", name="Agents")).to_be_visible()
+    expect(rail.get_by_role("tab", name="GitHub")).to_have_count(0)
