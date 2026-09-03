@@ -80,7 +80,7 @@ _RESTART_AFTER_S = 4.0
 # $FAKE_CLAUDE_DELIVERED — the analog of a UserPromptSubmit hook event.
 # Enter may arrive as "\r" or "\n" (cbreak leaves ICRNL on); either
 # submits outside a paste and is a plain line break inside one.
-_FAKE_CLAUDE_TUI = r'''
+_FAKE_CLAUDE_TUI = r"""
 import os
 import sys
 import termios
@@ -159,7 +159,7 @@ while True:
         elif ord(ch) >= 0x20:
             draft += ch
     draw(draft)
-'''
+"""
 
 
 def _tmux(socket: Path, *args: str) -> None:
