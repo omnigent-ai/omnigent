@@ -642,7 +642,7 @@ async def test_events_compact_on_native_session_returns_503_when_bridge_not_read
 
 
 @pytest.mark.asyncio
-async def test_events_compact_on_codex_native_injects_slash_command(
+async def test_events_compact_on_codex_native_types_settles_then_submits(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -656,17 +656,38 @@ async def test_events_compact_on_codex_native_injects_slash_command(
     registry (not a ``tmux.json`` sidecar).  The 200 return is
     load-bearing: the Omnigent server reads it to skip its own
     AP-side compaction.
+
+    The settle between typing and Enter is load-bearing too: typing
+    ``/compact`` opens Codex's slash-command popup, which draws
+    asynchronously, and an Enter sent back-to-back is swallowed by the
+    still-opening popup — the command is left un-submitted in the TUI
+    composer and the user sees no compaction feedback at all.
     """
+    import time as real_time
+    from typing import Any as _Any
+
+    from omnigent.runner import app as runner_app
     from omnigent.runner.app import _session_event_queues_ref
     from tests.runner.helpers import make_test_terminal_instance
 
-    captured: list[tuple[str, list[str]]] = []
+    events: list[tuple[str, object]] = []
 
     def _fake_run_tmux(socket_path: str, *args: str) -> None:
         """Record tmux send-keys calls without touching tmux."""
-        captured.append((socket_path, list(args)))
+        events.append(("tmux", (socket_path, list(args))))
+
+    class _RecordingTime:
+        """Delegate to the real ``time`` module but record ``sleep`` calls."""
+
+        def __getattr__(self, name: str) -> _Any:
+            return getattr(real_time, name)
+
+        @staticmethod
+        def sleep(seconds: float) -> None:
+            events.append(("sleep", seconds))
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
+    monkeypatch.setattr(runner_app, "time", _RecordingTime())
 
     codex_native_spec = AgentSpec(
         spec_version=1,
@@ -722,21 +743,27 @@ async def test_events_compact_on_codex_native_injects_slash_command(
     )
 
     # Exactly 3 tmux send-keys calls: C-u, -l /compact, Enter.
-    assert len(captured) == 3, (
-        f"Expected 3 tmux send-keys calls (C-u, /compact, Enter), got {len(captured)}."
-    )
     socket = str(instance.socket_path)
-    # 1. Clear draft: C-u
-    assert captured[0] == (socket, ["send-keys", "-t", "main", "C-u"]), (
-        f"First call must clear draft with C-u; got {captured[0]!r}."
-    )
-    # 2. Type /compact literally
-    assert captured[1] == (socket, ["send-keys", "-l", "-t", "main", "/compact"]), (
-        f"Second call must type /compact literally; got {captured[1]!r}."
-    )
-    # 3. Submit with Enter
-    assert captured[2] == (socket, ["send-keys", "-t", "main", "Enter"]), (
-        f"Third call must submit with Enter; got {captured[2]!r}."
+    tmux_calls = [payload for kind, payload in events if kind == "tmux"]
+    assert tmux_calls == [
+        (socket, ["send-keys", "-t", "main", "C-u"]),
+        (socket, ["send-keys", "-l", "-t", "main", "/compact"]),
+        (socket, ["send-keys", "-t", "main", "Enter"]),
+    ], f"Expected C-u, literal /compact, Enter; got {tmux_calls!r}."
+
+    # A settle pause must separate typing the command from the submit Enter,
+    # or the asynchronously-rendered slash-command popup swallows the Enter
+    # and the command never submits.
+    typed = ("tmux", (socket, ["send-keys", "-l", "-t", "main", "/compact"]))
+    entered = ("tmux", (socket, ["send-keys", "-t", "main", "Enter"]))
+    settles = [
+        payload
+        for kind, payload in events[events.index(typed) + 1 : events.index(entered)]
+        if kind == "sleep"
+    ]
+    assert settles and all(isinstance(s, float | int) and s > 0 for s in settles), (
+        "Typing /compact and pressing Enter must be separated by a settle "
+        f"pause for the slash-command popup to render; got events={events!r}."
     )
     # /compact is a control signal, not a state change.
     assert queued_events == [], f"compact must not publish session events; got {queued_events!r}."
