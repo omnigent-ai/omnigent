@@ -3707,6 +3707,28 @@ async def test_non_auth_permanent_4xx_omits_login_hint(
     assert "omnigent login" not in message
 
 
+async def test_409_rejection_names_the_self_service_reset_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 409 refusal points at `omnigent host reset-id`, not just an admin.
+
+    The 409 means the machine's host id is owned by another identity (e.g.
+    an M2M service principal that won credential resolution earlier). The
+    user must get a copy-pasteable self-service recovery command instead of
+    being told only to find an administrator.
+    """
+    spy = _ConnectSpy([_invalid_status(409)])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    with pytest.raises(HostConnectError) as excinfo:
+        await host.run()
+
+    message = str(excinfo.value)
+    assert "HTTP 409" in message
+    assert "host reset-id" in message
+
+
 @pytest.mark.parametrize("status", [408, 429, 500, 503])
 async def test_run_reconnects_on_transient_upgrade_failure(
     monkeypatch: pytest.MonkeyPatch, status: int

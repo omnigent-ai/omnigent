@@ -586,7 +586,12 @@ describe("Sidebar session list", () => {
     // show. A regression to false would leave that filter perpetually empty.
     expect(useConvMock.mock.calls.length).toBeGreaterThanOrEqual(1);
     for (const call of useConvMock.mock.calls) {
-      expect(call).toEqual(["", true, { reconcileWhileConnected: true }]);
+      // searchQuery empty + includeArchived hard-wired true is the contract this
+      // guards; the options arg (reconcile poll, notifyOnChangeProps coalescing)
+      // is an implementation detail, so assert the first two args only.
+      expect(call[0]).toBe("");
+      expect(call[1]).toBe(true);
+      expect(call[2]).toMatchObject({ reconcileWhileConnected: true });
     }
   });
 
