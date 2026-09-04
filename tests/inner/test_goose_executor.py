@@ -1009,6 +1009,9 @@ def _stdout_proc(*lines: str) -> MagicMock:
     )
     proc = MagicMock()
     proc.stdout = mock_stdout
+    # pid=None routes the tree-aware teardown helpers down their no-pid
+    # branch, which signals this handle directly and makes no OS calls.
+    proc.pid = None
     return proc
 
 
