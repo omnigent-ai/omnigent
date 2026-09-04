@@ -283,10 +283,11 @@ def _main_permission_request(argv: list[str]) -> int:
     )
     deadline = time.monotonic() + _PERMISSION_RETRY_WINDOW_S
     verdict = _request_web_approval(url, headers, body, bridge_dir=bridge_dir, deadline=deadline)
-    if verdict is None:
-        # No web verdict: leave kimi's own TUI prompt for manual approval.
+    if verdict is None or verdict == "decline":
+        # No web verdict leaves kimi's prompt for manual approval. On decline,
+        # the server's forwarded Escape rejects it; another key would race it.
         return 0
-    key = APPROVE_KEY if verdict == "allow" else DENY_KEY
+    key = APPROVE_KEY if verdict == "accept" else DENY_KEY
     for attempt in range(2):
         try:
             inject_approval_keystroke(bridge_dir, key=key, timeout_s=_SURFACE_TIMEOUT_S)
@@ -301,9 +302,9 @@ def _main_permission_request(argv: list[str]) -> int:
                 verdict = _request_web_approval(
                     url, headers, body, bridge_dir=bridge_dir, deadline=deadline
                 )
-                if verdict is None:
+                if verdict is None or verdict == "decline":
                     return 0
-                key = APPROVE_KEY if verdict == "allow" else DENY_KEY
+                key = APPROVE_KEY if verdict == "accept" else DENY_KEY
                 continue
             print(
                 f"omnigent kimi permission-request hook: keystroke inject failed: {exc}",
@@ -329,8 +330,9 @@ def _request_web_approval(
 ) -> str | None:
     """POST the approval card and long-poll for the web verdict.
 
-    :returns: ``"allow"`` / ``"deny"``, or ``None`` after the bounded re-park
-        window, a transport failure, or an unparseable verdict.
+    :returns: the verdict action (``"accept"`` / ``"decline"`` / ``"cancel"``),
+        or ``None`` after the bounded re-park window, a transport failure, or
+        an unparseable verdict.
     """
     if deadline is None:
         deadline = time.monotonic() + _PERMISSION_RETRY_WINDOW_S
@@ -390,19 +392,19 @@ def _request_web_approval(
 
 
 def _verdict_from_response(data: object) -> str | None:
-    """Extract ``"allow"`` / ``"deny"`` from the native-permission response.
+    """Extract the web verdict action from the native-permission response.
 
     The vendor-agnostic endpoint returns an ``ElicitationResult``
-    (``{"action": "accept"|"decline"|"cancel"}``): ``accept`` maps to allow,
-    ``decline`` / ``cancel`` to deny. Anything else is no verdict.
+    (``{"action": "accept"|"decline"|"cancel"}``); the action is returned
+    verbatim so the caller can act on ``decline`` (which the server answers
+    with a forwarded Escape) differently from ``cancel``. Anything else is no
+    verdict.
     """
     if not isinstance(data, dict):
         return None
     action = data.get("action")
-    if action == "accept":
-        return "allow"
-    if action in ("decline", "cancel"):
-        return "deny"
+    if action in ("accept", "decline", "cancel"):
+        return action
     return None
 
 
