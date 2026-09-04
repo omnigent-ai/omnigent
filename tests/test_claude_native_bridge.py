@@ -6959,18 +6959,18 @@ def test_claude_prompt_rendered_sees_prompt_under_labelled_rule() -> None:
 
 
 @pytest.mark.parametrize(
-    "line",
+    ("line", "allow_label"),
     [
-        "─" * 40,  # plain rule
-        "───",  # shortest plain rule
-        "╭" + "─" * 10 + "╮",  # cornered rule
-        "─" * 40 + " 01007290 ─",  # labelled with a session title
-        "─" * 40 + " design doc work ─",  # label carrying spaces
+        ("─" * 40, False),
+        ("───", False),
+        ("╭" + "─" * 10 + "╮", False),
+        ("─" * 40 + " 01007290 ─", True),
+        ("─" * 40 + " design doc work ─", True),
     ],
 )
-def test_is_box_rule_accepts_rules(line: str) -> None:
-    """Plain, cornered and labelled rules all frame the input box."""
-    assert _is_box_rule(line) is True
+def test_is_box_rule_accepts_rules(line: str, allow_label: bool) -> None:
+    """Labels are allowed only when identifying an opening rule."""
+    assert _is_box_rule(line, allow_label=allow_label) is True
 
 
 @pytest.mark.parametrize(
@@ -6982,11 +6982,100 @@ def test_is_box_rule_accepts_rules(line: str) -> None:
         "output line 1",
         "─ x ─",  # leading run below _MIN_TITLED_RULE_RUN
         "──",  # shorter than the minimum rule
+        "│   │",
+        "─ ─",
+        "─── note ─",
     ],
 )
 def test_is_box_rule_rejects_non_rules(line: str) -> None:
     """Ordinary rows must not pass as a rule now that labels are allowed."""
     assert _is_box_rule(line) is False
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["│   │", "─ ─", "─ x ─", "── x ─", "───x ─", "─── x─", "─── x", "───   ─"],
+)
+def test_is_box_rule_rejects_malformed_labels(line: str) -> None:
+    """Opening labels still require a leading run and spaced delimiters."""
+    assert _is_box_rule(line, allow_label=True) is False
+
+
+@pytest.mark.parametrize("labelled", [False, True])
+@pytest.mark.parametrize("draft_line", ["  │   │", "  ─── note ─"])
+@pytest.mark.parametrize("closing_rule_visible", [False, True])
+def test_multiline_diagram_draft_keeps_composer_ready(
+    labelled: bool,
+    draft_line: str,
+    closing_rule_visible: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Draft content does not displace the frame at the readiness gate."""
+    rule = "─" * 40
+    opening = f"{rule} my session ─" if labelled else rule
+    lines = [opening, "❯ explain this diagram", draft_line, "  end"]
+    if closing_rule_visible:
+        lines.extend([rule, "  ! for shell mode", "  ? for shortcuts"])
+    pane = "\n".join(lines)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_args: pane)
+
+    assert _occupying_surface(pane) is None
+    claude_native_bridge._wait_for_claude_prompt_ready("unused", "unused", timeout_s=0)
+
+
+@pytest.mark.parametrize("labelled", [False, True])
+@pytest.mark.parametrize("draft_line", ["  │   │", "  ─── note ─"])
+def test_inject_user_message_replaces_multiline_diagram_draft(
+    labelled: bool,
+    draft_line: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An existing diagram draft is cleared and replaced without an Escape."""
+    rule = "─" * 40
+    opening = f"{rule} my session ─" if labelled else rule
+    tui = {"pane": f"{opening}\n❯ explain this diagram\n{draft_line}\n  end\n{rule}"}
+    commands: list[list[str]] = []
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+
+    def fake_run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        if "capture-pane" in command:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        commands.append(command)
+        if command[-1] == "C-k":
+            tui["pane"] = _composer_pane()
+        elif "paste-buffer" in command:
+            tui["pane"] = _composer_pane("new message")
+        elif command[-1] == "Enter":
+            tui["pane"] = _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    inject_user_message(bridge_dir, content="new message", timeout_s=1)
+
+    keys = [command[-1] for command in commands if "send-keys" in command]
+    assert keys == ["C-a", "C-k", "Enter"]
+    assert sum("paste-buffer" in command for command in commands) == 1
+    assert tui["pane"] == _composer_pane()
+
+
+def test_labelled_scrollback_composer_does_not_hide_overlay() -> None:
+    """A prior labelled frame cannot make a current overlay look injectable."""
+    rule = "─" * 40
+    pane = "\n".join(
+        [
+            f"{rule} old session ─",
+            "❯ earlier prompt",
+            rule,
+            rule,
+            "  Rewind",
+            "  ❯ (current)",
+            "  Enter to continue · Esc to cancel",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is False
+    assert _occupying_surface(pane) == "an overlay"
 
 
 def _write_deltas_lines(bridge_dir: Path, lines: list[str]) -> None:
@@ -8543,7 +8632,10 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
         "inline-reverse-search-wrapped",
     ],
 )
-def test_an_occupied_pane_never_reads_as_a_mounted_input_box(occupied_pane: str) -> None:
+@pytest.mark.parametrize("labelled", [False, True])
+def test_an_occupied_pane_never_reads_as_a_mounted_input_box(
+    occupied_pane: str, labelled: bool
+) -> None:
     """
     An occupied pane is not a mounted chat input, ``❯`` in it or not.
 
@@ -8555,6 +8647,9 @@ def test_an_occupied_pane_never_reads_as_a_mounted_input_box(occupied_pane: str)
     restore, and to a history replay; only a framed composer row with no
     search footer counts.
     """
+    if labelled:
+        rule = "─" * 30
+        occupied_pane = occupied_pane.replace(rule, f"{rule} my session ─", 1)
     assert _claude_prompt_rendered(occupied_pane) is False
 
 

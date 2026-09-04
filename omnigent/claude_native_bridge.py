@@ -4064,12 +4064,26 @@ def _composer_row(pane: str) -> str | None:
     terminal), the lowest rule is the opening one and the row under it is
     the composer.
 
+    Labelled rules are opening candidates only when followed by a
+    composer row. Otherwise a divider in a multiline draft would
+    displace the real opening rule from the last two frame boundaries.
+
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: The row's text, e.g. ``"❯ fix the bug"`` or ``"!"`` in shell
         mode, or ``None`` when no input box is on screen.
     """
     non_empty = [line for line in pane.splitlines() if line.strip()]
-    rules = [idx for idx, line in enumerate(non_empty) if _is_box_rule(line)]
+    rules = [
+        idx
+        for idx, line in enumerate(non_empty)
+        if _is_box_rule(
+            line,
+            allow_label=(
+                idx + 1 < len(non_empty)
+                and non_empty[idx + 1].strip()[:1] in _COMPOSER_MODE_GLYPHS
+            ),
+        )
+    ]
     if not rules:
         return None
     candidates = [rules[-2] + 1] if len(rules) >= 2 else []
@@ -4140,7 +4154,7 @@ def _history_search_footer_shown(pane: str) -> bool:
     return " ".join(fragments).lower().startswith(_HISTORY_SEARCH_FOOTER_PREFIXES)
 
 
-def _is_box_rule(line: str) -> bool:
+def _is_box_rule(line: str, *, allow_label: bool = False) -> bool:
     """
     Return whether a line is a TUI box-drawing horizontal rule.
 
@@ -4150,25 +4164,22 @@ def _is_box_rule(line: str) -> bool:
     the rule directly above the composer, so it is the position that
     identifies the box, not the corners.
 
-    A rule may also carry a **label**: Claude Code breaks the box's
-    opening rule with the session's title (``"──── my session ─"``). The
-    frame still marks the box, so a labelled rule counts as one. Demanding
-    every glyph be a rule glyph instead anchors :func:`_composer_row` on
-    the *closing* rule, which reports "no input box" with ``❯`` plainly on
-    screen and times the turn out with the message undelivered. A label is
-    accepted only between a leading run of at least
-    :data:`_MIN_TITLED_RULE_RUN` glyphs and a trailing run, spaced off from
-    both, so ordinary output cannot pass as a rule.
+    A labelled opening rule counts only when the caller has verified
+    that a composer row follows it. Closing rules and footer boundaries
+    stay strict so draft dividers and box-drawn content cannot move them.
 
     :param line: A single pane line, e.g. ``"──────────"`` or
         ``"──────── my session ─"``.
+    :param allow_label: Whether this line is an opening-rule candidate.
     :returns: ``True`` when the line is a box-drawing rule.
     """
     stripped = line.strip()
     if len(stripped) < 3:
         return False
-    if all(ch in _BOX_RULE_CHARS or ch == " " for ch in stripped):
+    if all(ch in _BOX_RULE_CHARS for ch in stripped):
         return True
+    if not allow_label:
+        return False
     lead = len(stripped) - len(stripped.lstrip(_BOX_RULE_GLYPHS))
     trail = len(stripped) - len(stripped.rstrip(_BOX_RULE_GLYPHS))
     if lead < _MIN_TITLED_RULE_RUN or trail < 1:
