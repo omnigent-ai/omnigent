@@ -189,6 +189,7 @@ def store_databricks_auth(
     workspace_host: str,
     user_id: str | None = None,
     org_id: str | None = None,
+    profile: str | None = None,
 ) -> None:
     """Persist a Databricks Apps auth pointer record for a server.
 
@@ -208,6 +209,12 @@ def store_databricks_auth(
         ``x-databricks-org-id`` response header), e.g.
         ``"2850744067564480"``. Used to build workspace web-UI links
         (the ``?o=`` query param).
+    :param profile: The ``~/.databrickscfg`` profile the user chose for
+        this server, e.g. ``"my-user"``. Recorded so later commands
+        resolve credentials by profile (an explicit identity) rather
+        than guessing among the profiles that match ``workspace_host``
+        — the fix for a machine that also holds a service-principal
+        profile for the same workspace.
     """
     entry: dict[str, str | float] = {
         "auth_type": "databricks",
@@ -217,6 +224,8 @@ def store_databricks_auth(
         entry["user_id"] = user_id
     if org_id:
         entry["org_id"] = org_id
+    if profile:
+        entry["profile"] = profile
     _store_entry(server_url, entry)
 
 
@@ -514,6 +523,23 @@ def load_databricks_workspace_host(server_url: str) -> str | None:
         return None
     host = entry.get("workspace_host")
     return host if isinstance(host, str) and host else None
+
+
+def load_databricks_profile(server_url: str) -> str | None:
+    """Load the chosen ``~/.databrickscfg`` profile from a pointer record.
+
+    :param server_url: The server URL, e.g.
+        ``"https://myapp-123.aws.databricksapps.com"``.
+    :returns: The profile name the user selected at login time, e.g.
+        ``"my-user"``, or ``None`` when the stored record (if any) is
+        not a Databricks pointer record or carries no profile (older
+        records, or a login that did not name one).
+    """
+    entry = _load_entry(server_url)
+    if entry is None or entry.get("auth_type") != "databricks":
+        return None
+    profile = entry.get("profile")
+    return profile if isinstance(profile, str) and profile else None
 
 
 def load_databricks_org_id(server_url: str) -> str | None:

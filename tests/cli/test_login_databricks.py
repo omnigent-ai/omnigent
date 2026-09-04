@@ -207,6 +207,85 @@ def test_login_apps_redirect_stores_pointer_record(
     assert "alice@example.com" in result.output
 
 
+def test_login_profile_resolves_by_profile_and_persists_it(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path
+) -> None:
+    """`login --profile` authenticates as the named profile and persists it.
+
+    The fix for a machine holding both a user login and a service
+    principal for one workspace: naming the profile pins the identity so
+    later commands resolve it directly instead of guessing among the
+    host-matching profiles. The browser flow must NOT run.
+    """
+    from omnigent.cli_auth import load_databricks_profile, load_databricks_workspace_host
+
+    fake = _FakeHttpx(
+        responses=[
+            _response(302, headers={"location": _APPS_REDIRECT}),
+            _response(200, body={"user_id": "alice@example.com"}),
+        ]
+    )
+    login_calls = _patch_login_env(monkeypatch, fake_httpx=fake)
+
+    # The host-keyed resolver must NOT be consulted when a profile is named.
+    def _host_auth_info_boom(workspace_host: str) -> object:
+        raise AssertionError("host-keyed resolution must not run with --profile")
+
+    monkeypatch.setattr(cli_mod, "_databricks_workspace_auth_info", _host_auth_info_boom)
+
+    def _profile_auth_info(profile: str) -> cli_mod._DatabricksWorkspaceAuthInfo | None:
+        assert profile == "my-user"
+        return cli_mod._DatabricksWorkspaceAuthInfo(token="tok-profile", profile_name=profile)
+
+    monkeypatch.setattr(cli_mod, "_databricks_profile_auth_info", _profile_auth_info)
+
+    result = CliRunner().invoke(cli_group, ["login", _APPS_URL, "--profile", "my-user"])
+
+    assert result.exit_code == 0, result.output
+    # The profile is persisted so later commands replay the same identity.
+    assert load_databricks_profile(_APPS_URL) == "my-user"
+    assert load_databricks_workspace_host(_APPS_URL) == _WORKSPACE
+    # The profile's token — not a browser-minted one — reached the app.
+    assert fake.requests[-1]["authorization"] == "Bearer tok-profile"
+    # No `databricks auth login` browser flow ran.
+    assert login_calls == []
+
+
+def test_login_profile_fails_loud_when_profile_does_not_resolve(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path
+) -> None:
+    """A named profile that yields no credential fails loud, no browser fallback.
+
+    An explicit ``--profile`` states one identity; silently falling back
+    to the browser login would register a different one — the exact bug
+    this fix removes.
+    """
+    fake = _FakeHttpx(responses=[_response(302, headers={"location": _APPS_REDIRECT})])
+    login_calls = _patch_login_env(monkeypatch, fake_httpx=fake)
+    monkeypatch.setattr(cli_mod, "_databricks_profile_auth_info", lambda profile: None)
+
+    result = CliRunner().invoke(cli_group, ["login", _APPS_URL, "--profile", "missing"])
+
+    assert result.exit_code != 0
+    assert "missing" in result.output
+    assert login_calls == []
+
+
+def test_login_profile_rejected_for_non_databricks_server(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path
+) -> None:
+    """`--profile` is only meaningful for Databricks-fronted servers."""
+    fake = _FakeHttpx(responses=[_response(200, body={})])
+    _patch_login_env(monkeypatch, fake_httpx=fake)
+
+    result = CliRunner().invoke(
+        cli_group, ["login", "http://localhost:6767", "--profile", "my-user"]
+    )
+
+    assert result.exit_code != 0
+    assert "--profile" in result.output
+
+
 def test_login_workspace_hosted_401_uses_url_host(
     monkeypatch: pytest.MonkeyPatch, token_dir: Path
 ) -> None:

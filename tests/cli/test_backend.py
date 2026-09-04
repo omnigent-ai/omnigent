@@ -1893,7 +1893,12 @@ def _patch_auth_preflight(
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: tty)
     login_calls: list[str] = []
 
-    def _capture_login(server: str, workspace_host: str, org_id: str | None = None) -> None:
+    def _capture_login(
+        server: str,
+        workspace_host: str,
+        org_id: str | None = None,
+        profile: str | None = None,
+    ) -> None:
         login_calls.append(f"{server} {workspace_host}")
 
     monkeypatch.setattr(cli, "_databricks_login", _capture_login)
@@ -1949,6 +1954,79 @@ def test_ensure_backend_databricks_preflight_skips_when_authenticated(
     assert result == "https://myapp-1234.aws.databricksapps.com"
 
 
+def test_host_preflight_explicit_profile_resolves_and_persists_even_on_200(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`host --profile` is honored even when current creds already answer 200.
+
+    A co-resident service principal's token can make `/v1/me` return 200 —
+    exactly the "already registered as the SP" state the flag exists to
+    escape. If the preflight bailed on that 200, the explicit profile would
+    be silently dropped: never resolved, never verified, never persisted.
+    The named profile must be resolved and stored regardless.
+    """
+    import httpx
+
+    requests: list[dict[str, object]] = []
+    stored: list[dict[str, str | None]] = []
+    monkeypatch.setattr(
+        "omnigent.chat._remote_headers",
+        lambda server_url=None, *, host_id=None: {"Authorization": "Bearer sp-token"},
+    )
+
+    def _get(url: str, **kwargs: object) -> object:
+        requests.append(kwargs)
+        # The initial probe AND the profile-token verify both answer 200.
+        return _databricks_probe_response(200)
+
+    monkeypatch.setattr(httpx, "get", _get)
+    # No redirect target on a 200 — the workspace comes from the stored record.
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_workspace_host",
+        lambda server: "https://example.databricks.com",
+    )
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_profile", lambda server: None)
+
+    def _profile_auth_info(profile: str) -> cli._DatabricksWorkspaceAuthInfo:
+        assert profile == "my-user"
+        return cli._DatabricksWorkspaceAuthInfo(token="user-token", profile_name="my-user")
+
+    # The host-keyed guess must NOT be used when a profile is named.
+    monkeypatch.setattr(
+        cli,
+        "_databricks_workspace_auth_info",
+        lambda workspace: pytest.fail("host-keyed resolution must not run with --profile"),
+    )
+    monkeypatch.setattr(cli, "_databricks_profile_auth_info", _profile_auth_info)
+    monkeypatch.setattr(cli, "_databricks_login", lambda *args, **kwargs: pytest.fail("login"))
+
+    def _store(
+        server: str,
+        workspace: str,
+        user_id: str | None = None,
+        org_id: str | None = None,
+        profile: str | None = None,
+    ) -> None:
+        stored.append({"server": server, "workspace": workspace, "profile": profile})
+
+    monkeypatch.setattr("omnigent.cli_auth.store_databricks_auth", _store)
+
+    cli._ensure_databricks_server_auth(
+        _HOST_DATABRICKS_SERVER, non_interactive=True, profile="my-user"
+    )
+
+    # The profile's token — not the SP's — verified, and the profile was persisted.
+    assert requests[-1]["headers"] == {"Authorization": "Bearer user-token"}
+    assert stored == [
+        {
+            "server": _HOST_DATABRICKS_SERVER,
+            "workspace": "https://example.databricks.com",
+            "profile": "my-user",
+        }
+    ]
+
+
 def test_databricks_preflight_silent_sdk_refresh_skips_login(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1981,6 +2059,7 @@ def test_databricks_preflight_silent_sdk_refresh_skips_login(
         workspace: str,
         user_id: str | None = None,
         org_id: str | None = None,
+        profile: str | None = None,
     ) -> None:
         stored.append((server, workspace, org_id))
 
@@ -2049,6 +2128,7 @@ def test_databricks_preflight_uses_cli_workspace_id_for_workspace_mount(
         workspace: str,
         user_id: str | None = None,
         org_id: str | None = None,
+        profile: str | None = None,
     ) -> None:
         stored.append((server, workspace, org_id))
 
@@ -2133,6 +2213,7 @@ def test_databricks_preflight_refresh_handles_duplicate_workspace_profiles(
         workspace: str,
         user_id: str | None = None,
         org_id: str | None = None,
+        profile: str | None = None,
     ) -> None:
         stored.append((server, workspace, org_id))
 
@@ -2381,7 +2462,9 @@ def test_databricks_preflight_rejected_credential_recovers_via_sdk_refresh(
     )
     monkeypatch.setattr(
         "omnigent.cli_auth.store_databricks_auth",
-        lambda server, workspace, user_id=None, org_id=None: stored.append((server, workspace)),
+        lambda server, workspace, user_id=None, org_id=None, profile=None: stored.append(
+            (server, workspace)
+        ),
     )
 
     cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
@@ -2428,7 +2511,9 @@ def _capture_preflight(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, bool]
     """
     calls: list[tuple[str, bool]] = []
 
-    def _capture(server: str, *, non_interactive: bool = False) -> None:
+    def _capture(
+        server: str, *, non_interactive: bool = False, profile: str | None = None
+    ) -> None:
         calls.append((server, non_interactive))
 
     monkeypatch.setattr(cli, "_ensure_databricks_server_auth", _capture)

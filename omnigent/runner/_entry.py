@@ -665,15 +665,20 @@ def _make_auth_token_factory(
             # ``omnigent login <apps-url>``) names the exact workspace
             # the Apps edge accepts tokens from, so it beats ambient
             # profile resolution.
-            from omnigent.cli_auth import load_databricks_workspace_host
+            from omnigent.cli_auth import load_databricks_profile, load_databricks_workspace_host
 
             workspace_host = (
                 load_databricks_workspace_host(resolved_server_url)
                 if resolved_server_url
                 else None
             )
+            profile = load_databricks_profile(resolved_server_url) if resolved_server_url else None
             try:
-                if workspace_host is not None:
+                # A stored profile names the exact identity chosen at login;
+                # prefer it over host-keyed profile guessing.
+                if profile is not None:
+                    sdk_auth, _host = _resolve_databricks_auth(profile=profile)
+                elif workspace_host is not None:
                     sdk_auth, _host = _resolve_databricks_auth(host=workspace_host)
                 else:
                     sdk_auth, _host = _resolve_databricks_auth()

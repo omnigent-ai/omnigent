@@ -778,7 +778,7 @@ def _stored_databricks_record_token(server_url: str) -> str | None:
     :returns: A bearer token, or ``None`` when no pointer record is
         stored or the workspace credentials don't resolve.
     """
-    from omnigent.cli_auth import load_databricks_workspace_host
+    from omnigent.cli_auth import load_databricks_profile, load_databricks_workspace_host
     from omnigent.inner.databricks_executor import (
         DatabricksAuthError,
         _resolve_databricks_auth,
@@ -787,10 +787,17 @@ def _stored_databricks_record_token(server_url: str) -> str | None:
     workspace_host = load_databricks_workspace_host(server_url)
     if workspace_host is None:
         return None
+    profile = load_databricks_profile(server_url)
     try:
         auth = _databricks_auth_cache.get(server_url)
         if auth is None:
-            auth, _host = _resolve_databricks_auth(host=workspace_host)
+            # A stored profile names the exact identity the user chose at
+            # login; resolving by profile beats guessing among the profiles
+            # that match the workspace host.
+            if profile is not None:
+                auth, _host = _resolve_databricks_auth(profile=profile)
+            else:
+                auth, _host = _resolve_databricks_auth(host=workspace_host)
             _databricks_auth_cache[server_url] = auth
         return auth.current_token()  # type: ignore[union-attr]
     except (DatabricksAuthError, ImportError, ValueError):
@@ -862,7 +869,7 @@ class _DatabricksTokenAuth(httpx.Auth):
         :returns: Bearer token string, or ``None`` when no Databricks
             credentials resolve.
         """
-        from omnigent.cli_auth import load_databricks_workspace_host
+        from omnigent.cli_auth import load_databricks_profile, load_databricks_workspace_host
         from omnigent.inner.databricks_executor import (
             DatabricksAuthError,
             _resolve_databricks_auth,
@@ -872,11 +879,16 @@ class _DatabricksTokenAuth(httpx.Auth):
             workspace_host = (
                 load_databricks_workspace_host(self._server_url) if self._server_url else None
             )
+            profile = load_databricks_profile(self._server_url) if self._server_url else None
             try:
-                if workspace_host is not None:
-                    self._sdk_auth, _host = _resolve_databricks_auth(host=workspace_host)
+                # A stored profile names the exact identity chosen at login;
+                # prefer it over host-keyed profile guessing.
+                if profile is not None:
+                    self._sdk_auth, _ = _resolve_databricks_auth(profile=profile)
+                elif workspace_host is not None:
+                    self._sdk_auth, _ = _resolve_databricks_auth(host=workspace_host)
                 else:
-                    self._sdk_auth, _host = _resolve_databricks_auth()
+                    self._sdk_auth, _ = _resolve_databricks_auth()
             except (DatabricksAuthError, ImportError, ValueError):
                 self._sdk_auth = None
             self._sdk_auth_resolved = True

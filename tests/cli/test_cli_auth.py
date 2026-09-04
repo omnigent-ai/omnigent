@@ -231,6 +231,53 @@ def test_store_and_load_databricks_record(token_dir) -> None:
     )
 
 
+def test_store_and_load_databricks_profile(token_dir) -> None:
+    """A profile chosen at login round-trips through the pointer record.
+
+    The ``--profile`` fix persists the identity the user named so later
+    commands resolve by profile instead of guessing among the profiles
+    that match the workspace host.
+    """
+    from omnigent.cli_auth import (
+        load_databricks_profile,
+        load_databricks_workspace_host,
+        store_databricks_auth,
+    )
+
+    store_databricks_auth(
+        server_url="https://myapp-123.aws.databricksapps.com",
+        workspace_host="https://example.databricks.com",
+        user_id="alice@example.com",
+        profile="my-user",
+    )
+
+    assert load_databricks_profile("https://myapp-123.aws.databricksapps.com") == "my-user", (
+        "The stored profile must round-trip so the identity is pinned."
+    )
+    # Workspace host still resolves alongside the profile.
+    assert (
+        load_databricks_workspace_host("https://myapp-123.aws.databricksapps.com")
+        == "https://example.databricks.com"
+    )
+
+
+def test_load_databricks_profile_none_when_not_stored(token_dir) -> None:
+    """A record stored without a profile (older login) resolves to None.
+
+    ``None`` is the signal for callers to fall back to host-keyed
+    resolution, so backward compatibility with pre-``--profile`` records
+    must not surface an empty string or crash.
+    """
+    from omnigent.cli_auth import load_databricks_profile, store_databricks_auth
+
+    store_databricks_auth(
+        server_url="https://myapp-123.aws.databricksapps.com",
+        workspace_host="https://example.databricks.com",
+    )
+
+    assert load_databricks_profile("https://myapp-123.aws.databricksapps.com") is None
+
+
 def test_databricks_request_headers_org_only(token_dir) -> None:
     """A recorded ?o= selector surfaces as the workspace-routing header.
 
