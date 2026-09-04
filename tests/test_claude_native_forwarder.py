@@ -8670,3 +8670,45 @@ async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
     assert stall_warnings, "the deadline trip must be loudly logged, never silent"
     # The warning's traceback names the stalled await for next-time forensics.
     assert stall_warnings[0].exc_info is not None
+
+
+@pytest.mark.asyncio
+async def test_oversized_item_post_stays_under_transport_quota() -> None:
+    """A >1 MiB transcript item is POSTed bounded under the ~1 MiB transport quota.
+
+    The managed-deployment proxy drops any event POST larger than ~1 MiB
+    without answering, so an unbounded body times out as an ambiguous
+    delivery and the item silently vanishes from the web transcript. The
+    forwarder must bound the transfer itself: the request body stays under
+    the quota while the response's leading text still reaches the server.
+    """
+    head = "LARGE-RESPONSE-HEAD "
+    item = ClaudeTranscriptItem(
+        source_id="assistant-large:0:message",
+        item_type="message",
+        data={
+            "role": "assistant",
+            "agent": "claude-native-ui",
+            "content": [{"type": "text", "text": head + "x" * (2 * 1024 * 1024)}],
+        },
+        response_id="resp_large",
+    )
+    bodies: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(request.content)
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        await forwarder._post_external_conversation_item(client, session_id="conv_x", item=item)
+
+    assert len(bodies) == 1
+    assert len(bodies[0]) <= 1024 * 1024, "item POST must stay under the transport quota"
+    decoded = json.loads(bodies[0])
+    assert decoded["type"] == "external_conversation_item"
+    assert decoded["data"]["item_type"] == "message"
+    assert decoded["data"]["response_id"] == "resp_large"
+    delivered_text = decoded["data"]["item_data"]["content"][0]["text"]
+    assert delivered_text.startswith(head)
+    assert "[truncated by omnigent:" in delivered_text
