@@ -1460,7 +1460,7 @@ def _fetch_devin_cli_listing(provider: ResolvedModelProvider) -> ModelListing:
 
 def _fetch_kimi_cli_listing(provider: ResolvedModelProvider) -> ModelListing:
     """Build a live listing from Kimi's CLI-owned provider catalog."""
-    from omnigent.kimi_native import resolve_kimi_executable
+    from omnigent.harnesses.kimi_native.main import resolve_kimi_executable
 
     completed = subprocess.run(
         [resolve_kimi_executable(), "provider", "list", "--json"],

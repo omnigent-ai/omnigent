@@ -2116,7 +2116,7 @@ def test_kimi_listing_uses_cli_owned_model_catalog(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A Kimi worker lists aliases from the CLI that owns its provider config."""
-    from omnigent import kimi_native
+    from omnigent.harnesses.kimi_native import main as kimi_native
 
     _isolate_config(monkeypatch, tmp_path, "")
     commands: list[list[str]] = []
@@ -2168,7 +2168,7 @@ def test_kimi_listing_failures_degrade_without_caching(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str
 ) -> None:
     """Kimi catalog failures stay usable and retry on the next listing."""
-    from omnigent import kimi_native
+    from omnigent.harnesses.kimi_native import main as kimi_native
 
     _isolate_config(monkeypatch, tmp_path, "")
     attempts = 0
