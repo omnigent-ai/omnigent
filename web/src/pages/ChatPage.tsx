@@ -967,11 +967,13 @@ export function ChatPage() {
   const modelPickerKind = modelPickerKindForConv(capabilitySource);
   // Effort ladders key on the model the session is actually on — the
   // reported `llmModel` — falling back to the sticky preference only
-  // before the first report lands.
-  const effortLevels = effortLevelsForConv(
-    capabilitySource,
-    codexModelOptions,
-    llmModel ?? selectedModel,
+  // before the first report lands. Memoized because codex-native resolves
+  // via codexEffortLevelsForModel, which returns a fresh array each call;
+  // a new identity here would defeat the memo() on MainAgentSurface/Composer
+  // on every unrelated store tick (mirrors the codexModelOptions rationale).
+  const effortLevels = useMemo(
+    () => effortLevelsForConv(capabilitySource, codexModelOptions, llmModel ?? selectedModel),
+    [capabilitySource, codexModelOptions, llmModel, selectedModel],
   );
   const showEffort = shouldShowEffortPicker(capabilitySource) && effortLevels.length > 0;
 
