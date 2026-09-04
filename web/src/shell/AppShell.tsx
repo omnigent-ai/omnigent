@@ -218,7 +218,10 @@ export function AppShell() {
 
   // Read early: the conversationId scopes the per-session workspace state
   // (rail open/width/tab/open files) used throughout this component.
-  const { conversationId } = useParams<{ conversationId: string }>();
+  const { conversationId, extensionId } = useParams<{
+    conversationId: string;
+    extensionId: string;
+  }>();
   const [fileViewerCommentsOpen, setFileViewerCommentsOpen] = useState(false);
   const [rightRailTab, setRightRailTab] = useState<RightRailTab>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).rightRailTab ?? "files") : "files",
@@ -236,6 +239,10 @@ export function AppShell() {
       : undefined;
   const [searchParams, setSearchParams] = useSearchParams();
   const [sidebarOpen, setSidebarOpen] = useState(initialSidebarOpen);
+  // Extension pages own their top chrome. The shell header only carries the
+  // collapsed-sidebar toggle there, so skip it while the sidebar is open and
+  // let the page use the full height (ExtensionViewHost drops its inset).
+  const extensionOwnsHeader = extensionId !== undefined && sidebarOpen;
   const [sidebarPeek, setSidebarPeek] = useState(false);
 
   // The settings nav lives INSIDE the sidebar, and its "Back" row is the only
@@ -1930,73 +1937,78 @@ export function AppShell() {
                   } as CSSProperties
                 }
               >
-                <ChatHeader
-                  // Real docked state — deliberately NOT `|| sidebarPeek`. Peek
-                  // is a transient card floating over the collapsed layout (the
-                  // docked sidebar stays w-0), so the header must keep its
-                  // collapsed left slot. Treating peek as open relaid it out —
-                  // the toggle unmounted and the breadcrumb slid left into its
-                  // spot — shifting the title sideways the instant the peek card
-                  // appeared. Left collapsed, the breadcrumb stays put beneath
-                  // the floating card (and in the title-bar strip on mac).
-                  sidebarOpen={sidebarOpen}
-                  onOpenSidebar={(peek?: boolean) => {
-                    if (peek) {
-                      setSidebarPeek(true);
-                      setSidebarOpen(false);
-                    } else {
-                      setSidebarOpen(true);
-                      setSidebarPeek(false);
-                    }
-                  }}
-                  isChildSession={isChildSession}
-                  subAgentName={activeSession?.subAgentName ?? null}
-                  conversationId={conversationId}
-                  actionConversation={actionConversation}
-                  conversationTitle={headerConversationTitle}
-                  projectName={headerProjectName}
-                  titleLinkTo={headerTitleLinkTo}
-                  boundAgent={boundAgent}
-                  wrapperLabel={wrapperLabel}
-                  canShare={canShare}
-                  shareDisabled={shareDisabled}
-                  shareDisabledReason={shareDisabledReason}
-                  onShare={() => setShareOpen(true)}
-                  hasAgentInfo={hasAgentInfo}
-                  onAgentInfo={() => setAgentInfoOpen(true)}
-                  hasHeaderMenu={hasHeaderMenu}
-                  showFilesPanel={showFilesPanel}
-                  hasRailContent={hasRailContent}
-                  rightPanelOpen={rightPanelOpen}
-                  onToggleRightPanel={toggleRightPanel}
-                  mobileMenu={{
-                    fileViewerOpen,
-                    panelOpen,
-                    terminalFirst,
-                    executionLogsOpen,
-                    filesPanelOpen,
-                    subagentsPanelOpen,
-                    shellsPanelOpen,
-                    hideTerminalsTab,
-                    // Mobile: reachable when a shell exists OR the agent
-                    // declares shell access (so the drawer's "+ New shell" row
-                    // can create the first one). Desktop rail tab stays gated
-                    // on an existing shell (railTabsAvailable.terminals).
-                    showShellsTab:
-                      !hideTerminalsTab && (railTerminals.length > 0 || agentSupportsShells),
-                    terminalsLength: railTerminals.length,
-                    debugMode,
-                    changedCount,
-                    subagentsWorking,
-                    agentCount,
-                    onOpenFiles: openFilesPanel,
-                    onOpenChanges: openChangesPanel,
-                    onOpenShells: openShellsPanel,
-                    onOpenSubagents: openSubagentsPanel,
-                    onOpenMainExecutionLog: openMainExecutionLog,
-                  }}
-                />
-                <main className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+                {!extensionOwnsHeader && (
+                  <ChatHeader
+                    // Real docked state — deliberately NOT `|| sidebarPeek`. Peek
+                    // is a transient card floating over the collapsed layout (the
+                    // docked sidebar stays w-0), so the header must keep its
+                    // collapsed left slot. Treating peek as open relaid it out —
+                    // the toggle unmounted and the breadcrumb slid left into its
+                    // spot — shifting the title sideways the instant the peek card
+                    // appeared. Left collapsed, the breadcrumb stays put beneath
+                    // the floating card (and in the title-bar strip on mac).
+                    sidebarOpen={sidebarOpen}
+                    onOpenSidebar={(peek?: boolean) => {
+                      if (peek) {
+                        setSidebarPeek(true);
+                        setSidebarOpen(false);
+                      } else {
+                        setSidebarOpen(true);
+                        setSidebarPeek(false);
+                      }
+                    }}
+                    isChildSession={isChildSession}
+                    subAgentName={activeSession?.subAgentName ?? null}
+                    conversationId={conversationId}
+                    actionConversation={actionConversation}
+                    conversationTitle={headerConversationTitle}
+                    projectName={headerProjectName}
+                    titleLinkTo={headerTitleLinkTo}
+                    boundAgent={boundAgent}
+                    wrapperLabel={wrapperLabel}
+                    canShare={canShare}
+                    shareDisabled={shareDisabled}
+                    shareDisabledReason={shareDisabledReason}
+                    onShare={() => setShareOpen(true)}
+                    hasAgentInfo={hasAgentInfo}
+                    onAgentInfo={() => setAgentInfoOpen(true)}
+                    hasHeaderMenu={hasHeaderMenu}
+                    showFilesPanel={showFilesPanel}
+                    hasRailContent={hasRailContent}
+                    rightPanelOpen={rightPanelOpen}
+                    onToggleRightPanel={toggleRightPanel}
+                    mobileMenu={{
+                      fileViewerOpen,
+                      panelOpen,
+                      terminalFirst,
+                      executionLogsOpen,
+                      filesPanelOpen,
+                      subagentsPanelOpen,
+                      shellsPanelOpen,
+                      hideTerminalsTab,
+                      // Mobile: reachable when a shell exists OR the agent
+                      // declares shell access (so the drawer's "+ New shell" row
+                      // can create the first one). Desktop rail tab stays gated
+                      // on an existing shell (railTabsAvailable.terminals).
+                      showShellsTab:
+                        !hideTerminalsTab && (railTerminals.length > 0 || agentSupportsShells),
+                      terminalsLength: railTerminals.length,
+                      debugMode,
+                      changedCount,
+                      subagentsWorking,
+                      agentCount,
+                      onOpenFiles: openFilesPanel,
+                      onOpenChanges: openChangesPanel,
+                      onOpenShells: openShellsPanel,
+                      onOpenSubagents: openSubagentsPanel,
+                      onOpenMainExecutionLog: openMainExecutionLog,
+                    }}
+                  />
+                )}
+                <main
+                  className="relative flex min-h-0 min-w-0 flex-1 flex-col"
+                  data-shell-header={extensionOwnsHeader ? "hidden" : "visible"}
+                >
                   <Outlet />
                 </main>
 

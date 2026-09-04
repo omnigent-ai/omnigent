@@ -37,6 +37,8 @@ def test_canvas_package_is_conformant_and_self_contained() -> None:
     assert manifest.permissions == frozenset(
         {
             ExtensionPermission.NAVIGATION,
+            ExtensionPermission.PROJECTS_READ,
+            ExtensionPermission.PROJECTS_WRITE,
             ExtensionPermission.SESSIONS_READ,
             ExtensionPermission.STORAGE_USER,
         }

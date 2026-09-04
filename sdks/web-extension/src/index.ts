@@ -27,6 +27,19 @@ export interface ThemeInfo {
   theme: "light" | "dark";
 }
 
+export interface ExtensionPullRequest {
+  number: number;
+  title: string;
+  state: string;
+  url: string;
+}
+
+export interface ExtensionProjectSummary {
+  id: string;
+  name: string;
+  icon: string | null;
+}
+
 export class ExtensionApiError extends Error {
   constructor(
     readonly code: string,
@@ -49,7 +62,10 @@ export interface ExtensionContext {
       params?: Record<string, string | number | boolean>,
     ): Promise<void>;
     openSession(sessionId: string): Promise<void>;
-    openNewSession(): Promise<void>;
+    /** Opens the composer; with `projectId`, the new session is filed under that project. */
+    openNewSession(options?: { projectId?: string }): Promise<void>;
+    /** Opens an https URL the host handed out (e.g. a pull request) in a new tab. */
+    openExternal(url: string): Promise<void>;
   };
   theme: {
     getCurrent(): Promise<ThemeInfo>;
@@ -70,6 +86,12 @@ export interface ExtensionContext {
     listAll(options?: {
       pageLimit?: number;
     }): Promise<ExtensionSessionSummary[]>;
+    /** The pull request filed from a session's branch, if any. */
+    pullRequest(sessionId: string): Promise<ExtensionPullRequest | null>;
+  };
+  projects: {
+    list(): Promise<ExtensionProjectSummary[]>;
+    create(options: { name: string }): Promise<ExtensionProjectSummary>;
   };
 }
 
@@ -189,8 +211,14 @@ export function defineExtension(lifecycle: ExtensionLifecycle): void {
       async openSession(sessionId) {
         await request("navigation.openSession", { sessionId });
       },
-      async openNewSession() {
-        await request("navigation.openNewSession", {});
+      async openNewSession(options) {
+        await request(
+          "navigation.openNewSession",
+          options?.projectId ? { projectId: options.projectId } : {},
+        );
+      },
+      async openExternal(url) {
+        await request("navigation.openExternal", { url });
       },
     },
     theme: {
@@ -244,6 +272,17 @@ export function defineExtension(lifecycle: ExtensionLifecycle): void {
           (code, message) => new ExtensionApiError(code, message),
         );
       },
+      pullRequest: (sessionId) =>
+        request<ExtensionPullRequest | null>("sessions.pullRequest", {
+          sessionId,
+        }),
+    },
+    projects: {
+      list: () => request<ExtensionProjectSummary[]>("projects.list", {}),
+      create: (options) =>
+        request<ExtensionProjectSummary>("projects.create", {
+          name: options.name,
+        }),
     },
   });
 

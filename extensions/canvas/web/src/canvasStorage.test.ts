@@ -8,7 +8,9 @@ import {
   positionBucket,
   positionBucketKey,
   readCanvasLayout,
+  readCanvasViewport,
   resetCanvasLayout,
+  viewportKey,
   upsertPosition,
   writeAllPositionBuckets,
   writeCanvasViewport,
@@ -50,15 +52,44 @@ describe("canvas storage", () => {
     });
   });
 
-  it("falls back for unknown versions and deletes every layout key", async () => {
+  it("falls back for unknown layout versions", async () => {
     const storage = fakeStorage();
     await storage.set(LAYOUT_META_KEY, { version: 999 });
     await expect(readCanvasLayout(storage)).resolves.toEqual({
       positions: {},
       viewport: null,
     });
-    await resetCanvasLayout(storage);
-    expect(storage.values.size).toBe(0);
+    await expect(readCanvasViewport(storage, "proj_a")).resolves.toBeNull();
+  });
+
+  it("keeps a viewport per canvas and resets only the active canvas", async () => {
+    const storage = fakeStorage();
+    const positions = { one: { x: 1, y: 2 }, two: { x: 3, y: 4 } };
+    await writeAllPositionBuckets(storage, positions);
+    await writeCanvasViewport(storage, { x: 1, y: 1, zoom: 1 });
+    await writeCanvasViewport(
+      storage,
+      { x: 2, y: 2, zoom: 2, width: 1200.4, height: 700.6 },
+      "proj_a",
+    );
+    expect(viewportKey("proj_a")).toBe(`${LAYOUT_VIEWPORT_KEY}.proj_a`);
+    await expect(readCanvasViewport(storage, "proj_a")).resolves.toEqual({
+      x: 2,
+      y: 2,
+      zoom: 2,
+      width: 1200,
+      height: 701,
+    });
+
+    await expect(
+      resetCanvasLayout(storage, "proj_a", positions, ["two"]),
+    ).resolves.toEqual({ one: { x: 1, y: 2 } });
+
+    await expect(readCanvasViewport(storage, "proj_a")).resolves.toBeNull();
+    await expect(readCanvasLayout(storage)).resolves.toEqual({
+      positions: { one: { x: 1, y: 2 } },
+      viewport: { x: 1, y: 1, zoom: 1 },
+    });
   });
 
   it("keeps thousands of moved-card positions within storage budgets", async () => {

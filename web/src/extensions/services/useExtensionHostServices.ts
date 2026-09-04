@@ -1,11 +1,14 @@
-import { useMemo } from "react";
+import { useMemo, useRef } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useTheme } from "next-themes";
 import { resolveIdentity } from "@/lib/identity";
 import { getOmnigentServerIdentity } from "@/lib/host";
+import { fetchGithubInfo } from "@/hooks/useGithub";
 import { useNavigate } from "@/lib/routing";
-import type { ExtensionCatalogItem } from "../types";
+import type { ExtensionCatalogItem, ExtensionPullRequest } from "../types";
 import { ExtensionHostServiceError } from "./errors";
 import { grantedHostMethods } from "./registry";
+import { createProjectSummary, listProjectSummaries, parseCreateProjectParams } from "./projects";
 import { listSessionPage, SessionReadLimiter } from "./sessions";
 import {
   ExtensionStorageError,
@@ -67,9 +70,12 @@ function pageSearch(value: unknown): string {
 export function useExtensionHostServices(extension: ExtensionCatalogItem) {
   const navigate = useNavigate();
   const { resolvedTheme } = useTheme();
+  const queryClient = useQueryClient();
   const theme = resolvedTheme === "dark" ? "dark" : "light";
   const writeLimiter = useMemo(() => new ExtensionStorageWriteLimiter(), []);
   const sessionReadLimiter = useMemo(() => new SessionReadLimiter(), []);
+  // External URLs the host has handed to this extension; the only ones it may open.
+  const externalUrlsRef = useRef(new Set<string>());
 
   const methods = useMemo(() => {
     const implementations = {
@@ -99,9 +105,33 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
         navigate(`/c/${encodeURIComponent(sessionId)}`);
         return null;
       },
-      "navigation.openNewSession": (_params: unknown, signal: AbortSignal) => {
+      "navigation.openExternal": async (params: unknown, signal: AbortSignal) => {
         throwIfAborted(signal);
-        navigate("/");
+        const url = objectParams(params).url;
+        if (typeof url !== "string" || !externalUrlsRef.current.has(url)) {
+          throw new ExtensionHostServiceError(
+            "PermissionDenied",
+            "URL was not provided by the host",
+          );
+        }
+        window.open(url, "_blank", "noopener,noreferrer");
+        return null;
+      },
+      "navigation.openNewSession": async (params: unknown, signal: AbortSignal) => {
+        throwIfAborted(signal);
+        const projectId = params === undefined ? undefined : objectParams(params).projectId;
+        if (projectId === undefined || projectId === null) {
+          navigate("/");
+          return null;
+        }
+        if (typeof projectId !== "string" || !projectId || projectId.length > 256) {
+          throw new ExtensionHostServiceError("InvalidParams", "projectId is invalid");
+        }
+        // The composer takes the project by name (`?project=`), so resolve it here.
+        const project = (await listProjectSummaries()).find((item) => item.id === projectId);
+        throwIfAborted(signal);
+        if (!project) throw new ExtensionHostServiceError("InvalidParams", "Project not found");
+        navigate({ pathname: "/", search: `?project=${encodeURIComponent(project.name)}` });
         return null;
       },
       "theme.getCurrent": (_params: unknown, signal: AbortSignal) => {
@@ -132,9 +162,38 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
         }),
       "sessions.listPage": (params: unknown, signal: AbortSignal) =>
         sessionReadLimiter.run(signal, () => listSessionPage(params, signal)),
+      "sessions.pullRequest": (params: unknown, signal: AbortSignal) =>
+        sessionReadLimiter.run(signal, async (): Promise<ExtensionPullRequest | null> => {
+          const sessionId = objectParams(params).sessionId;
+          if (typeof sessionId !== "string" || !sessionId || sessionId.length > 256) {
+            throw new ExtensionHostServiceError("InvalidParams", "sessionId is invalid");
+          }
+          // Shares the GitHub panel's cache so the runner is asked at most every 30s per session.
+          const info = await queryClient.fetchQuery({
+            queryKey: ["github-info", sessionId],
+            queryFn: () => fetchGithubInfo(sessionId),
+            staleTime: 30_000,
+          });
+          const pr = info.available ? info.pr : null;
+          if (!pr || !/^https:\/\//.test(pr.url)) return null;
+          externalUrlsRef.current.add(pr.url);
+          return { number: pr.number, title: pr.title.slice(0, 256), state: pr.state, url: pr.url };
+        }),
+      "projects.list": (_params: unknown, signal: AbortSignal) => {
+        throwIfAborted(signal);
+        return listProjectSummaries();
+      },
+      "projects.create": async (params: unknown, signal: AbortSignal) => {
+        const name = parseCreateProjectParams(params);
+        throwIfAborted(signal);
+        const project = await createProjectSummary(name);
+        // The sidebar caches its project list; refresh it so the new project shows there too.
+        void queryClient.invalidateQueries({ queryKey: ["projects"] });
+        return project;
+      },
     };
     return grantedHostMethods(extension, implementations);
-  }, [extension, navigate, sessionReadLimiter, theme, writeLimiter]);
+  }, [extension, navigate, queryClient, sessionReadLimiter, theme, writeLimiter]);
   const events = useMemo(() => ({ "theme.changed": { theme } }), [theme]);
   return { methods, events };
 }

@@ -10,7 +10,15 @@ import {
   sessionListQuery,
 } from "./sessions";
 
+import { markConversationUnread, resetReadStateForTests } from "@/hooks/useUnseenConversations";
+import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
+
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+
+afterEach(() => {
+  resetReadStateForTests();
+  clearOptimisticTitles();
+});
 
 const wireRow = {
   id: "conv_1",
@@ -101,15 +109,38 @@ describe("projectSessionPage", () => {
 
     expect(Object.keys(result.sessions[0]).sort()).toEqual([
       "createdAt",
+      "gitBranch",
       "id",
+      "projectId",
       "status",
       "title",
+      "titleProvisional",
+      "unread",
       "updatedAt",
       "workspace",
     ]);
     expect(result.sessions[0].title).toHaveLength(256);
+    expect(result.sessions[0].projectId).toBe("project-secret");
     expect(result.sessions[0].workspace).toHaveLength(512);
     expect(result.nextCursor).toBeNull();
+  });
+
+  it("flags a finished session unread with the sidebar's read-state rule", () => {
+    markConversationUnread("conv_1", wireRow.updated_at);
+    const page = { data: [{ ...wireRow, status: "idle" }], has_more: false, last_id: null };
+    expect(projectSessionPage(page, 25).sessions[0].unread).toBe(true);
+    expect(projectSessionPage({ ...page, data: [wireRow] }, 25).sessions[0].unread).toBe(false);
+  });
+
+  it("falls back to the sidebar's provisional first-message title", () => {
+    recordOptimisticTitle("conv_1", "Bob, please look at the flaky test");
+    const untitled = { data: [{ ...wireRow, title: null }], has_more: false, last_id: null };
+    expect(projectSessionPage(untitled, 25).sessions[0]).toMatchObject({
+      title: "Bob, please look at the flaky test",
+      titleProvisional: true,
+    });
+    const titled = projectSessionPage({ ...untitled, data: [wireRow] }, 25).sessions[0];
+    expect(titled).toMatchObject({ title: "Session one", titleProvisional: false });
   });
 
   it("keeps a worst-case page within the RPC response budget", () => {

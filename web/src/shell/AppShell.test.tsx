@@ -441,6 +441,7 @@ function renderShell(path: string, info?: ServerInfo) {
                   </>
                 }
               />
+              <Route path="extensions/:extensionId/*" element={<div>extension page</div>} />
             </Route>
           </Routes>
         </MemoryRouter>
@@ -2497,6 +2498,31 @@ describe("FilesPanel visibility", () => {
     // dotfiles would disappear the moment the user moves between sessions.
     fireEvent.click(screen.getByTestId("nav-session"));
     expect(screen.getByTestId("files-panel")).toHaveAttribute("data-show-hidden", "true");
+  });
+});
+
+describe("Extension pages own the header", () => {
+  it("shows the header only while the sidebar is collapsed", () => {
+    mockConversations([]);
+    renderShell("/extensions/acme.tool/home");
+
+    expect(screen.getByText("extension page")).toBeInTheDocument();
+    expect(document.querySelector("header.chat-header")).not.toBeNull();
+    expect(screen.getByRole("main")).toHaveAttribute("data-shell-header", "visible");
+
+    fireEvent.click(screen.getByRole("button", { name: "Open sidebar" }));
+
+    expect(document.querySelector("header.chat-header")).toBeNull();
+    expect(screen.getByRole("main")).toHaveAttribute("data-shell-header", "hidden");
+  });
+
+  it("keeps the header on other routes even with the sidebar open", () => {
+    mockConversations([]);
+    renderShell("/");
+    fireEvent.click(screen.getByRole("button", { name: "Open sidebar" }));
+
+    expect(document.querySelector("header.chat-header")).not.toBeNull();
+    expect(screen.getByRole("main")).toHaveAttribute("data-shell-header", "visible");
   });
 });
 

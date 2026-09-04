@@ -1,5 +1,9 @@
 import type { ExtensionContext } from "@omnigent/extension-sdk";
-import type { CanvasPosition, CanvasPositions } from "./canvasLayout";
+import {
+  MAIN_CANVAS_ID,
+  type CanvasPosition,
+  type CanvasPositions,
+} from "./canvasLayout";
 
 export const LAYOUT_VERSION = 1;
 export const POSITION_BUCKET_COUNT = 16;
@@ -12,6 +16,9 @@ export interface CanvasViewport {
   x: number;
   y: number;
   zoom: number;
+  /** Canvas container size when saved; a viewport only fits the size it was made for. */
+  width?: number;
+  height?: number;
 }
 
 export interface CanvasLayout {
@@ -35,6 +42,14 @@ export function positionBucketKey(bucket: number): string {
   return `canvas.layout.positions.v1.${bucket}`;
 }
 
+// The Main canvas keeps the original key so layouts saved before canvases
+// existed still restore.
+export function viewportKey(canvasId: string): string {
+  return canvasId === MAIN_CANVAS_ID
+    ? LAYOUT_VIEWPORT_KEY
+    : `${LAYOUT_VIEWPORT_KEY}.${canvasId}`;
+}
+
 function boundedCoordinate(value: number): number {
   return Math.max(
     -MAX_ABS_COORDINATE,
@@ -45,14 +60,16 @@ function boundedCoordinate(value: number): number {
 function validViewport(value: unknown): value is CanvasViewport {
   if (!value || typeof value !== "object") return false;
   const viewport = value as Partial<CanvasViewport>;
+  const finite = (n: unknown): n is number =>
+    typeof n === "number" && Number.isFinite(n);
+  const sizeOk = (n: unknown) => n === undefined || (finite(n) && n >= 0);
   return (
-    typeof viewport.x === "number" &&
-    Number.isFinite(viewport.x) &&
-    typeof viewport.y === "number" &&
-    Number.isFinite(viewport.y) &&
-    typeof viewport.zoom === "number" &&
-    Number.isFinite(viewport.zoom) &&
-    viewport.zoom > 0
+    finite(viewport.x) &&
+    finite(viewport.y) &&
+    finite(viewport.zoom) &&
+    viewport.zoom > 0 &&
+    sizeOk(viewport.width) &&
+    sizeOk(viewport.height)
   );
 }
 
@@ -84,7 +101,7 @@ export async function readCanvasLayout(
     return { positions: {}, viewport: null };
   }
   const [viewport, ...buckets] = await Promise.all([
-    storage.get<unknown>(LAYOUT_VIEWPORT_KEY),
+    storage.get<unknown>(viewportKey(MAIN_CANVAS_ID)),
     ...Array.from({ length: POSITION_BUCKET_COUNT }, (_, bucket) =>
       storage.get<unknown>(positionBucketKey(bucket)),
     ),
@@ -101,15 +118,32 @@ export async function readCanvasLayout(
   };
 }
 
+export async function readCanvasViewport(
+  storage: StorageApi,
+  canvasId: string,
+): Promise<CanvasViewport | null> {
+  const meta = await storage.get<{ version?: number }>(LAYOUT_META_KEY);
+  if (!meta || meta.version !== LAYOUT_VERSION) return null;
+  const viewport = await storage.get<unknown>(viewportKey(canvasId));
+  return validViewport(viewport) ? viewport : null;
+}
+
 export async function writeCanvasViewport(
   storage: StorageApi,
   viewport: CanvasViewport,
+  canvasId: string = MAIN_CANVAS_ID,
 ): Promise<void> {
   await writeVersion(storage);
-  await storage.set(LAYOUT_VIEWPORT_KEY, {
+  await storage.set(viewportKey(canvasId), {
     x: Math.round(viewport.x),
     y: Math.round(viewport.y),
     zoom: Math.round(viewport.zoom * 1000) / 1000,
+    ...(viewport.width !== undefined && viewport.height !== undefined
+      ? {
+          width: Math.round(viewport.width),
+          height: Math.round(viewport.height),
+        }
+      : {}),
   });
 }
 
@@ -172,12 +206,24 @@ export async function writeAllPositionBuckets(
   );
 }
 
-export async function resetCanvasLayout(storage: StorageApi): Promise<void> {
+// Forgets the saved spots of the given canvas's cards and its viewport only;
+// other canvases keep their layouts. Returns the remaining persisted positions.
+export async function resetCanvasLayout(
+  storage: StorageApi,
+  canvasId: string,
+  positions: CanvasPositions,
+  sessionIds: Iterable<string>,
+): Promise<CanvasPositions> {
+  const removed = new Set(sessionIds);
+  const remaining = Object.fromEntries(
+    Object.entries(positions).filter(([id]) => !removed.has(id)),
+  ) as CanvasPositions;
+  const buckets = new Set([...removed].map(positionBucket));
   await Promise.all([
-    storage.delete(LAYOUT_META_KEY),
-    storage.delete(LAYOUT_VIEWPORT_KEY),
-    ...Array.from({ length: POSITION_BUCKET_COUNT }, (_, bucket) =>
-      storage.delete(positionBucketKey(bucket)),
+    storage.delete(viewportKey(canvasId)),
+    ...[...buckets].map((bucket) =>
+      writePositionBucket(storage, remaining, bucket),
     ),
   ]);
+  return remaining;
 }

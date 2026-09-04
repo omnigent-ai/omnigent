@@ -49,20 +49,32 @@ defineExtension({
 
 Available V1 methods:
 
-- `navigation.openPage`, `openSession`, and `openNewSession` with the
-  `navigation` permission;
+- `navigation.openPage`, `openSession`, `openNewSession` (optionally filed
+  under a `projectId`), and `openExternal` (only for URLs the host returned,
+  such as a pull request) with the `navigation` permission;
 - `theme.getCurrent` and `theme.subscribe`;
 - `storage.user.get`, `set`, and `delete` with the `storage.user` permission;
-- `sessions.listPage` and the SDK's `sessions.listAll` helper with the
-  `sessions.read` permission.
+- `sessions.listPage`, the SDK's `sessions.listAll` helper, and
+  `sessions.pullRequest` (the PR filed from a session's branch, via the same
+  GitHub lookup as the shell's GitHub tab) with the `sessions.read` permission;
+- `projects.list` with the `projects.read` permission and `projects.create`
+  with the `projects.write` permission.
 
 The sessions API exposes only top-level, non-archived sessions the current user
 can already read. Because operator-installed extension bundles are trusted code,
 requesting `sessions.read` grants access to session titles and absolute working
-directory paths visible to that user. Summaries contain ID, title, status, working directory, and
-created/updated timestamps. Pages are capped at 25 rows and the
+directory paths visible to that user. Summaries contain ID, title, status, an `unread` flag (a finished turn the
+current user has not viewed yet, using the sidebar's unread rule), a
+`titleProvisional` flag (the title is the shell's first-message placeholder
+until the server names the session), working
+directory, worktree branch, project ID, and created/updated timestamps. Pages are capped at 25 rows and the
 SDK drains at most 200 pages or 5,000 sessions. Extensions receive neither raw
 authenticated fetch nor the internal session WebSocket.
+
+The projects API returns the current user's projects as ID, name, and icon.
+`projects.create` makes an empty project from a trimmed name of at most 100
+characters — the same operation as the sidebar's **New project** button — and
+the host refreshes the shell's project list afterwards.
 
 Storage uses parent-owned IndexedDB, not `localStorage`: 32 KB per value,
 256 KB and 128 keys per extension namespace. Writes are paced and quota errors

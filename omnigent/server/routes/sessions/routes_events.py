@@ -185,6 +185,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _evaluate_tool_call_policy,
     _heal_subagent_runner_binding_via_parent,
     _is_native_terminal_session,
+    _mark_dispatch_in_flight,
     _maybe_relaunch_managed_sandbox,
     _maybe_wake_stale_resumable_managed_sandbox,
     _persist_external_antigravity_subagent_start,
@@ -402,6 +403,23 @@ def register_events_routes(
         response_model=None,
     )
     async def post_event(
+        request: Request,
+        session_id: str,
+        body: SessionEventInput,
+    ) -> dict[str, bool | str]:
+        """
+        Route entry for :func:`_post_event_impl`.
+
+        A message counts as in flight for the whole request — including any
+        runner launch it triggers — so the session list reports a booting
+        session as running instead of idle.
+        """
+        if body.type != "message":
+            return await _post_event_impl(request, session_id, body)
+        with _mark_dispatch_in_flight(session_id):
+            return await _post_event_impl(request, session_id, body)
+
+    async def _post_event_impl(
         request: Request,
         session_id: str,
         body: SessionEventInput,

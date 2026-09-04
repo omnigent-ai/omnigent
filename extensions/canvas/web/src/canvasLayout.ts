@@ -3,6 +3,8 @@ import type { ExtensionSessionSummary } from "@omnigent/extension-sdk";
 export const CARD_WIDTH = 280;
 export const CARD_HEIGHT = 132;
 export const CARD_GAP = 32;
+// Sessions outside any project (or whose project is gone) live on this canvas.
+export const MAIN_CANVAS_ID = "main";
 const CELL_WIDTH = CARD_WIDTH + CARD_GAP;
 const CELL_HEIGHT = CARD_HEIGHT + CARD_GAP;
 
@@ -67,4 +69,42 @@ export function prunePositions(
   return Object.fromEntries(
     Object.entries(positions).filter(([id]) => live.has(id)),
   );
+}
+
+export function canvasIdFor(
+  session: ExtensionSessionSummary,
+  projectIds: ReadonlySet<string>,
+): string {
+  return session.projectId !== null && projectIds.has(session.projectId)
+    ? session.projectId
+    : MAIN_CANVAS_ID;
+}
+
+export function sessionsOnCanvas(
+  sessions: ExtensionSessionSummary[],
+  canvasId: string,
+  projectIds: ReadonlySet<string>,
+): ExtensionSessionSummary[] {
+  return sessions.filter(
+    (session) => canvasIdFor(session, projectIds) === canvasId,
+  );
+}
+
+// Each canvas lays out its unsaved cards in its own grid, so a project's cards
+// never start in slots taken by cards on another canvas.
+export function mergeCanvasPositions(
+  sessions: ExtensionSessionSummary[],
+  projectIds: ReadonlySet<string>,
+  saved: CanvasPositions,
+): CanvasPositions {
+  const groups = new Map<string, ExtensionSessionSummary[]>();
+  for (const session of sessions) {
+    const canvasId = canvasIdFor(session, projectIds);
+    groups.set(canvasId, [...(groups.get(canvasId) ?? []), session]);
+  }
+  let positions: CanvasPositions = {};
+  for (const group of groups.values()) {
+    positions = { ...positions, ...mergeSessionPositions(group, saved) };
+  }
+  return positions;
 }

@@ -1,4 +1,6 @@
 import { authenticatedFetch } from "@/lib/identity";
+import { isConversationUnseen } from "@/hooks/useUnseenConversations";
+import { getOptimisticTitle } from "@/lib/optimisticTitles";
 import type { ExtensionSessionPage, ExtensionSessionSummary } from "../types";
 import { ExtensionHostServiceError } from "./errors";
 
@@ -118,11 +120,18 @@ function projectSession(value: unknown): ExtensionSessionSummary {
   if (typeof updatedAt !== "number" || !Number.isFinite(updatedAt)) {
     throw new ExtensionHostServiceError("HostError", "Session updated_at is malformed");
   }
+  const title = optionalBoundedString(row.title, "title", SESSION_TITLE_MAX_LENGTH);
+  // Same provisional label the sidebar shows before the server seeds a title.
+  const optimisticTitle = title === null ? getOptimisticTitle(id) : undefined;
   return {
     id,
-    title: optionalBoundedString(row.title, "title", SESSION_TITLE_MAX_LENGTH),
+    title: title ?? optimisticTitle?.slice(0, SESSION_TITLE_MAX_LENGTH) ?? null,
+    titleProvisional: title === null && optimisticTitle !== undefined,
     status: status as ExtensionSessionSummary["status"],
+    unread: isConversationUnseen(id, updatedAt, status),
     workspace: optionalBoundedString(row.workspace, "workspace", SESSION_WORKSPACE_MAX_LENGTH),
+    gitBranch: optionalBoundedString(row.git_branch, "git_branch", SESSION_TITLE_MAX_LENGTH),
+    projectId: optionalBoundedString(row.project_id, "project_id", SESSION_ID_MAX_LENGTH),
     createdAt,
     updatedAt,
   };

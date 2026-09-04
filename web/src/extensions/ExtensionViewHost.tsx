@@ -287,7 +287,7 @@ export function ExtensionViewHost({
   }
 
   return (
-    <div className="relative flex h-full min-h-0 w-full flex-col overflow-hidden pt-14 md:pt-12">
+    <div className="extension-view-host relative flex h-full min-h-0 w-full flex-col overflow-hidden pt-14 md:pt-12">
       {frameDocument && (
         <iframe
           key={frameDocument.identity.nonce}
@@ -303,7 +303,7 @@ export function ExtensionViewHost({
       {status !== "ready" && (
         <div
           role="status"
-          className="absolute inset-x-0 bottom-0 top-14 flex items-center justify-center bg-background text-sm text-muted-foreground md:top-12"
+          className="extension-view-status absolute inset-x-0 bottom-0 top-14 flex items-center justify-center bg-background text-sm text-muted-foreground md:top-12"
         >
           {status === "loading" ? "Loading extension…" : "Starting extension…"}
         </div>

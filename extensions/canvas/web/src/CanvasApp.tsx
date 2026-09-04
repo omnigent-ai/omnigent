@@ -1,11 +1,21 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from "react";
 import type {
   ExtensionContext,
+  ExtensionProjectSummary,
+  ExtensionPullRequest,
   ExtensionSessionSummary,
 } from "@omnigent/extension-sdk";
 import {
   applyNodeChanges,
   Background,
+  ControlButton,
   Controls,
   ReactFlow,
   ReactFlowProvider,
@@ -14,54 +24,84 @@ import {
   type NodeChange,
 } from "@xyflow/react";
 import {
+  MAIN_CANVAS_ID,
+  mergeCanvasPositions,
   mergeSessionPositions,
   prunePositions,
+  sessionsOnCanvas,
   type CanvasPositions,
 } from "./canvasLayout";
 import {
   positionBucket,
   readCanvasLayout,
+  readCanvasViewport,
   resetCanvasLayout,
   upsertPosition,
   writeCanvasViewport,
   writePositionBucket,
   type CanvasViewport,
 } from "./canvasStorage";
-import { loadSessions } from "./sessionData";
+import {
+  canCreateProjects,
+  canReadProjects,
+  loadProjects,
+  loadSessions,
+} from "./sessionData";
 import { SessionCardNode, type SessionCardData } from "./SessionCardNode";
 
 const nodeTypes = { session: SessionCardNode };
 const proOptions = { hideAttribution: true };
-const defaultViewport: CanvasViewport = { x: 0, y: 0, zoom: 1 };
+const FIT_VIEW = { padding: 0.2, maxZoom: 1 };
+const RESIZE_REFIT_DELAY_MS = 100;
+export const SESSION_POLL_INTERVAL_MS = 5_000;
+export const PULL_REQUEST_REFRESH_MS = 300_000;
+const PROJECT_NAME_MAX_LENGTH = 100;
 type SessionNode = Node<SessionCardData, "session">;
 
-function isMobileViewport(): boolean {
-  return (
-    typeof window !== "undefined" &&
-    typeof window.matchMedia === "function" &&
-    !window.matchMedia("(min-width: 768px)").matches
-  );
+function sessionCountLabel(count: number): string {
+  return count === 1 ? "1 session" : `${count} sessions`;
 }
 
 function CanvasSurface({ context }: { context: ExtensionContext }) {
   const flow = useReactFlow();
   const [nodes, setNodes] = useState<SessionNode[]>([]);
   const [sessions, setSessions] = useState<ExtensionSessionSummary[]>([]);
+  const [projects, setProjects] = useState<ExtensionProjectSummary[]>([]);
+  const [pullRequests, setPullRequests] = useState<
+    Record<string, ExtensionPullRequest | null>
+  >({});
+  const pullRequestCheckedAtRef = useRef<Record<string, number>>({});
+  const [activeCanvas, setActiveCanvas] = useState(MAIN_CANVAS_ID);
   const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [storageWarning, setStorageWarning] = useState<string | null>(null);
-  const [savedViewport, setSavedViewport] = useState<CanvasViewport | null>(
-    null,
-  );
-  const [mobile, setMobile] = useState(isMobileViewport);
-  const [arrangeMode, setArrangeMode] = useState(() => !isMobileViewport());
+  const flowContainerRef = useRef<HTMLDivElement>(null);
+  const tabsRef = useRef<HTMLElement>(null);
+  const [tabsScrollable, setTabsScrollable] = useState(false);
+  // True once the user pans or zooms by hand; auto-fits then stop overriding them.
+  const viewportDirtyRef = useRef(false);
+  // null while the new-project form is closed.
+  const [newProjectName, setNewProjectName] = useState<string | null>(null);
+  const [savingProject, setSavingProject] = useState(false);
+  const [projectError, setProjectError] = useState<string | null>(null);
   const positionsRef = useRef<CanvasPositions>({});
   const persistedPositionsRef = useRef<CanvasPositions>({});
+  const activeCanvasRef = useRef(MAIN_CANVAS_ID);
   const openingRef = useRef(false);
   const initializedRef = useRef(false);
   const viewportTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const aliveRef = useRef(true);
+
+  const projectIds = useMemo(
+    () => new Set(projects.map((project) => project.id)),
+    [projects],
+  );
+  const visibleSessions = useMemo(
+    () => sessionsOnCanvas(sessions, activeCanvas, projectIds),
+    [activeCanvas, projectIds, sessions],
+  );
+  const activeProject =
+    projects.find((project) => project.id === activeCanvas) ?? null;
 
   useEffect(() => {
     return () => {
@@ -69,17 +109,49 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
     };
   }, []);
 
-  useEffect(() => {
-    if (typeof window.matchMedia !== "function") return;
-    const media = window.matchMedia("(min-width: 768px)");
-    const update = () => {
-      const nextMobile = !media.matches;
-      setMobile(nextMobile);
-      setArrangeMode(!nextMobile);
+  const fitToView = useCallback(
+    (duration = 0) => {
+      viewportDirtyRef.current = false;
+      void flow.fitView({ ...FIT_VIEW, duration });
+    },
+    [flow],
+  );
+
+  const containerSize = useCallback(() => {
+    const rect = flowContainerRef.current?.getBoundingClientRect();
+    return {
+      width: Math.round(rect?.width ?? 0),
+      height: Math.round(rect?.height ?? 0),
     };
-    media.addEventListener("change", update);
-    return () => media.removeEventListener("change", update);
   }, []);
+
+  // A saved viewport only makes sense for the container it was saved in (and
+  // within the zoom cap); anything else fits the cards to the current view.
+  const applyViewport = useCallback(
+    (saved: CanvasViewport | null) => {
+      requestAnimationFrame(() => {
+        if (!aliveRef.current) return;
+        const size = containerSize();
+        const usable =
+          saved !== null &&
+          saved.zoom <= FIT_VIEW.maxZoom &&
+          saved.width !== undefined &&
+          saved.height !== undefined &&
+          Math.abs(saved.width - size.width) <= 2 &&
+          Math.abs(saved.height - size.height) <= 2;
+        if (usable) {
+          viewportDirtyRef.current = false;
+          void flow.setViewport(
+            { x: saved.x, y: saved.y, zoom: saved.zoom },
+            { duration: 0 },
+          );
+        } else {
+          fitToView();
+        }
+      });
+    },
+    [containerSize, fitToView, flow],
+  );
 
   const openSession = useCallback(
     (sessionId: string) => {
@@ -103,6 +175,13 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
     [context],
   );
 
+  const openExternal = useCallback(
+    (url: string) => {
+      void context.navigation.openExternal(url).catch(() => undefined);
+    },
+    [context],
+  );
+
   const nodesFor = useCallback(
     (
       items: ExtensionSessionSummary[],
@@ -112,25 +191,78 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
         id: session.id,
         type: "session",
         position: positions[session.id],
-        data: { session, onOpen: openSession },
+        data: {
+          session,
+          pullRequest: pullRequests[session.id] ?? null,
+          onOpen: openSession,
+          onOpenExternal: openExternal,
+        },
         selectable: true,
         focusable: false,
       })),
-    [openSession],
+    [openExternal, openSession, pullRequests],
   );
 
-  const applySessions = useCallback(
-    async (items: ExtensionSessionSummary[], persistPruned: boolean) => {
+  // Ask the host (it shells out to gh on the session's host) for each card's
+  // PR when the card appears and at most every few minutes after that.
+  useEffect(() => {
+    if (!context.capabilities.includes("sessions.pullRequest")) return;
+    const now = Date.now();
+    const due = sessions.filter(
+      (session) =>
+        now - (pullRequestCheckedAtRef.current[session.id] ?? 0) >=
+        PULL_REQUEST_REFRESH_MS,
+    );
+    for (const session of due)
+      pullRequestCheckedAtRef.current[session.id] = now;
+    for (const session of due) {
+      void context.sessions
+        .pullRequest(session.id)
+        .then((pullRequest) => {
+          if (!aliveRef.current) return;
+          setPullRequests((current) =>
+            current[session.id] === pullRequest
+              ? current
+              : { ...current, [session.id]: pullRequest },
+          );
+        })
+        .catch(() => undefined);
+    }
+  }, [context, sessions]);
+
+  // Cards follow the active canvas; drags update the node state directly and
+  // land in positionsRef on drop, so rebuilding here never loses a move.
+  useEffect(() => {
+    setNodes(nodesFor(visibleSessions, positionsRef.current));
+  }, [nodesFor, visibleSessions]);
+
+  const applyData = useCallback(
+    async (
+      items: ExtensionSessionSummary[],
+      projectList: ExtensionProjectSummary[],
+      persistPruned: boolean,
+    ) => {
       const previousPersisted = persistedPositionsRef.current;
       const persisted = prunePositions(
         previousPersisted,
         items.map((session) => session.id),
       );
-      const positions = mergeSessionPositions(items, positionsRef.current);
+      const ids = new Set(projectList.map((project) => project.id));
       persistedPositionsRef.current = persisted;
-      positionsRef.current = positions;
+      positionsRef.current = mergeCanvasPositions(
+        items,
+        ids,
+        positionsRef.current,
+      );
+      if (
+        activeCanvasRef.current !== MAIN_CANVAS_ID &&
+        !ids.has(activeCanvasRef.current)
+      ) {
+        activeCanvasRef.current = MAIN_CANVAS_ID;
+        setActiveCanvas(MAIN_CANVAS_ID);
+      }
+      setProjects(projectList);
       setSessions(items);
-      setNodes(nodesFor(items, positions));
       if (persistPruned) {
         const dirtyBuckets = new Set(
           Object.keys(previousPersisted)
@@ -152,24 +284,24 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
         }
       }
     },
-    [context.storage.user, nodesFor],
+    [context.storage.user],
+  );
+
+  const loadData = useCallback(
+    () => Promise.all([loadSessions(context), loadProjects(context)]),
+    [context],
   );
 
   const refresh = useCallback(
     async (initial = false) => {
-      setRefreshing(!initial);
       if (initial) setLoading(true);
       try {
-        const items = await loadSessions(context);
+        const [items, projectList] = await loadData();
         if (!aliveRef.current) return;
-        await applySessions(items, !initial);
+        await applyData(items, projectList, !initial);
         if (!aliveRef.current) return;
         setError(null);
-        if (initial && !savedViewport) {
-          requestAnimationFrame(() =>
-            flow.fitView({ padding: 0.2, duration: 0 }),
-          );
-        }
+        if (initial) fitToView();
       } catch (reason) {
         if (aliveRef.current) {
           setError(
@@ -181,11 +313,10 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
       } finally {
         if (aliveRef.current) {
           setLoading(false);
-          setRefreshing(false);
         }
       }
     },
-    [applySessions, context, flow, savedViewport],
+    [applyData, fitToView, loadData],
   );
 
   useEffect(() => {
@@ -196,22 +327,17 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
         positions: {},
         viewport: null,
       })),
-      loadSessions(context),
+      loadData(),
     ]).then(
-      async ([layout, items]) => {
+      async ([layout, [items, projectList]]) => {
         if (cancelled) return;
         persistedPositionsRef.current = layout.positions;
         positionsRef.current = layout.positions;
-        setSavedViewport(layout.viewport);
-        await applySessions(items, true);
+        await applyData(items, projectList, true);
         if (cancelled || !aliveRef.current) return;
         initializedRef.current = true;
         setLoading(false);
-        if (!layout.viewport) {
-          requestAnimationFrame(() =>
-            flow.fitView({ padding: 0.2, duration: 0 }),
-          );
-        }
+        applyViewport(layout.viewport);
       },
       (reason: unknown) => {
         if (cancelled) return;
@@ -225,7 +351,73 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
       cancelled = true;
       if (viewportTimerRef.current) clearTimeout(viewportTimerRef.current);
     };
-  }, [applySessions, context, flow]);
+  }, [applyData, applyViewport, context.storage.user, loadData]);
+
+  const selectCanvas = useCallback(
+    async (canvasId: string) => {
+      if (activeCanvasRef.current === canvasId) return;
+      activeCanvasRef.current = canvasId;
+      setActiveCanvas(canvasId);
+      const viewport = await readCanvasViewport(
+        context.storage.user,
+        canvasId,
+      ).catch(() => null);
+      if (!aliveRef.current || activeCanvasRef.current !== canvasId) return;
+      applyViewport(viewport);
+    },
+    [applyViewport, context.storage.user],
+  );
+
+  // Follow the window: while the view is an auto-fit, keep it fitted as the
+  // container resizes. A hand-panned view is left alone.
+  useEffect(() => {
+    const container = flowContainerRef.current;
+    if (!container || typeof ResizeObserver === "undefined") return;
+    let first = true;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const observer = new ResizeObserver(() => {
+      if (first) {
+        first = false;
+        return;
+      }
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        if (initializedRef.current && !viewportDirtyRef.current) fitToView();
+      }, RESIZE_REFIT_DELAY_MS);
+    });
+    observer.observe(container);
+    return () => {
+      if (timer) clearTimeout(timer);
+      observer.disconnect();
+    };
+  }, [fitToView, loading]);
+
+  // The tab strip only advertises a scrollbar when it actually overflows.
+  useEffect(() => {
+    const strip = tabsRef.current;
+    if (!strip) return;
+    const measure = () =>
+      setTabsScrollable(strip.scrollWidth > strip.clientWidth + 1);
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(strip);
+    return () => observer.disconnect();
+  }, [loading, projects, newProjectName]);
+
+  // No live feed yet: poll like the sidebar does so status, titles, and new
+  // sessions keep up while the canvas is open, and catch up on window focus.
+  useEffect(() => {
+    const refreshIfReady = () => {
+      if (initializedRef.current && !document.hidden) void refresh();
+    };
+    const timer = setInterval(refreshIfReady, SESSION_POLL_INTERVAL_MS);
+    window.addEventListener("focus", refreshIfReady);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener("focus", refreshIfReady);
+    };
+  }, [refresh]);
 
   const onNodesChange = useCallback((changes: NodeChange<SessionNode>[]) => {
     setNodes((current) => applyNodeChanges(changes, current));
@@ -252,7 +444,11 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
           persistedPositionsRef.current,
           positionBucket(node.id),
         ),
-        writeCanvasViewport(context.storage.user, flow.getViewport()),
+        writeCanvasViewport(
+          context.storage.user,
+          { ...flow.getViewport(), ...containerSize() },
+          activeCanvasRef.current,
+        ),
       ]).catch(() => {
         if (aliveRef.current) {
           setStorageWarning(
@@ -261,15 +457,21 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
         }
       });
     },
-    [context.storage.user, flow],
+    [containerSize, context.storage.user, flow],
   );
 
   const onMoveEnd = useCallback(
-    (_event: MouseEvent | TouchEvent | null, viewport: CanvasViewport) => {
+    (event: MouseEvent | TouchEvent | null, viewport: CanvasViewport) => {
       if (!initializedRef.current) return;
+      if (event !== null) viewportDirtyRef.current = true;
       if (viewportTimerRef.current) clearTimeout(viewportTimerRef.current);
+      const canvasId = activeCanvasRef.current;
       viewportTimerRef.current = setTimeout(() => {
-        void writeCanvasViewport(context.storage.user, viewport).catch(() => {
+        void writeCanvasViewport(
+          context.storage.user,
+          { ...viewport, ...containerSize() },
+          canvasId,
+        ).catch(() => {
           if (aliveRef.current) {
             setStorageWarning(
               "Canvas viewport could not be saved in this browser.",
@@ -278,26 +480,80 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
         });
       }, 250);
     },
-    [context.storage.user],
+    [containerSize, context.storage.user],
   );
 
   const resetLayout = useCallback(async () => {
-    const positions = mergeSessionPositions(sessions, {});
-    positionsRef.current = positions;
-    persistedPositionsRef.current = {};
-    setNodes(nodesFor(sessions, positions));
-    setSavedViewport(null);
+    const ids = visibleSessions.map((session) => session.id);
+    const removed = new Set(ids);
+    const kept = Object.fromEntries(
+      Object.entries(positionsRef.current).filter(([id]) => !removed.has(id)),
+    ) as CanvasPositions;
+    positionsRef.current = {
+      ...kept,
+      ...mergeSessionPositions(visibleSessions, {}),
+    };
+    setNodes(nodesFor(visibleSessions, positionsRef.current));
     try {
-      await resetCanvasLayout(context.storage.user);
+      persistedPositionsRef.current = await resetCanvasLayout(
+        context.storage.user,
+        activeCanvas,
+        persistedPositionsRef.current,
+        ids,
+      );
     } catch {
       if (aliveRef.current) {
         setStorageWarning("Stored canvas layout could not be reset.");
       }
     }
-    if (aliveRef.current) {
-      requestAnimationFrame(() => flow.fitView({ padding: 0.2, duration: 0 }));
+    if (aliveRef.current) requestAnimationFrame(() => fitToView());
+  }, [
+    activeCanvas,
+    context.storage.user,
+    fitToView,
+    nodesFor,
+    visibleSessions,
+  ]);
+
+  const submitProject = useCallback(async () => {
+    const name = (newProjectName ?? "").trim();
+    if (!name || savingProject) return;
+    setSavingProject(true);
+    setProjectError(null);
+    try {
+      const project = await context.projects.create({ name });
+      if (!aliveRef.current) return;
+      setProjects((current) => [
+        ...current.filter((item) => item.id !== project.id),
+        project,
+      ]);
+      setNewProjectName(null);
+      await selectCanvas(project.id);
+    } catch (reason) {
+      if (aliveRef.current) {
+        setProjectError(
+          reason instanceof Error ? reason.message : "Could not create project",
+        );
+      }
+    } finally {
+      if (aliveRef.current) setSavingProject(false);
     }
-  }, [context.storage.user, flow, nodesFor, sessions]);
+  }, [context.projects, newProjectName, savingProject, selectCanvas]);
+
+  const closeProjectForm = () => {
+    setNewProjectName(null);
+    setProjectError(null);
+  };
+
+  // Plain controls instead of a <form>: the sandboxed frame has no
+  // `allow-forms`, so the browser would block a form submission outright.
+  const onProjectNameKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "Escape") closeProjectForm();
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void submitProject();
+    }
+  };
 
   if (loading) {
     return (
@@ -317,20 +573,96 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
       </div>
     );
   }
-  if (sessions.length === 0) {
-    return (
-      <div className="canvas-state">
-        <strong>No non-archived sessions</strong>
-        <span>Start a session and it will appear here.</span>
+
+  const canvasTabs = canReadProjects(context) && (
+    <nav
+      ref={tabsRef}
+      className="canvas-tabs"
+      aria-label="Canvases"
+      data-scrollable={tabsScrollable}
+    >
+      <div role="tablist" className="canvas-tablist">
         <button
           type="button"
-          onClick={() => void context.navigation.openNewSession()}
+          role="tab"
+          className="canvas-tab"
+          aria-selected={activeCanvas === MAIN_CANVAS_ID}
+          onClick={() => void selectCanvas(MAIN_CANVAS_ID)}
         >
-          New session
+          Main
         </button>
+        {projects.map((project) => (
+          <button
+            key={project.id}
+            type="button"
+            role="tab"
+            className="canvas-tab"
+            aria-selected={activeCanvas === project.id}
+            title={project.name}
+            onClick={() => void selectCanvas(project.id)}
+          >
+            {project.icon && <span aria-hidden>{project.icon}</span>}
+            <span className="canvas-tab-label">{project.name}</span>
+          </button>
+        ))}
       </div>
-    );
-  }
+      {canCreateProjects(context) &&
+        (newProjectName === null ? (
+          <button
+            type="button"
+            className="canvas-tab canvas-tab-add"
+            aria-label="New project"
+            title="New project"
+            onClick={() => {
+              setProjectError(null);
+              setNewProjectName("");
+            }}
+          >
+            +
+          </button>
+        ) : (
+          <div className="canvas-new-project">
+            <input
+              aria-label="Project name"
+              placeholder="Project name"
+              autoFocus
+              maxLength={PROJECT_NAME_MAX_LENGTH}
+              value={newProjectName}
+              onChange={(event) => setNewProjectName(event.target.value)}
+              onKeyDown={onProjectNameKeyDown}
+            />
+            <button
+              type="button"
+              disabled={savingProject || newProjectName.trim() === ""}
+              onClick={() => void submitProject()}
+            >
+              {savingProject ? "Creating…" : "Create"}
+            </button>
+            <button type="button" onClick={closeProjectForm}>
+              Cancel
+            </button>
+          </div>
+        ))}
+    </nav>
+  );
+
+  const emptyState = visibleSessions.length === 0 && (
+    <div className="canvas-state canvas-empty">
+      {activeProject ? (
+        <>
+          <strong>No sessions in {activeProject.name}</strong>
+        </>
+      ) : projects.length > 0 ? (
+        <>
+          <strong>No sessions outside projects</strong>
+        </>
+      ) : (
+        <>
+          <strong>No sessions</strong>
+        </>
+      )}
+    </div>
+  );
 
   return (
     <div
@@ -340,39 +672,18 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
       <header className="canvas-toolbar">
         <div>
           <h1>Canvas</h1>
-          <span>{sessions.length} sessions</span>
-        </div>
-        <div className="canvas-toolbar-actions">
-          {mobile && (
-            <button
-              type="button"
-              aria-pressed={arrangeMode}
-              onClick={() => setArrangeMode((value) => !value)}
-            >
-              Arrange
-            </button>
-          )}
-          <button
-            type="button"
-            disabled={refreshing}
-            onClick={() => void refresh()}
-          >
-            {refreshing ? "Refreshing…" : "Refresh"}
-          </button>
-          <button
-            type="button"
-            onClick={() => flow.fitView({ padding: 0.2, duration: 150 })}
-          >
-            Fit view
-          </button>
-          <button type="button" onClick={() => void resetLayout()}>
-            Reset layout
-          </button>
+          <span>{sessionCountLabel(visibleSessions.length)}</span>
         </div>
       </header>
+      {canvasTabs}
       {error && (
         <div className="canvas-banner" role="alert">
           Refresh failed: {error}
+        </div>
+      )}
+      {projectError && (
+        <div className="canvas-banner" role="alert">
+          Project could not be created: {projectError}
         </div>
       )}
       {storageWarning && (
@@ -380,7 +691,11 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
           {storageWarning}
         </div>
       )}
-      <div className="canvas-flow" style={{ flex: 1, minHeight: 0 }}>
+      <div
+        ref={flowContainerRef}
+        className="canvas-flow"
+        style={{ flex: 1, minHeight: 0 }}
+      >
         <ReactFlow<SessionNode>
           nodes={nodes}
           nodeTypes={nodeTypes}
@@ -388,8 +703,7 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
           onNodeDragStop={onNodeDragStop}
           onNodeDoubleClick={(_event, node) => openSession(node.id)}
           onMoveEnd={onMoveEnd}
-          defaultViewport={savedViewport ?? defaultViewport}
-          nodesDraggable={arrangeMode}
+          nodesDraggable
           nodesConnectable={false}
           elementsSelectable
           nodesFocusable={false}
@@ -401,9 +715,54 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
           maxZoom={2.5}
           proOptions={proOptions}
         >
-          <Background />
-          <Controls showInteractive={false} />
+          {visibleSessions.length > 0 && <Background />}
+          <Controls showInteractive={false}>
+            <ControlButton
+              onClick={() => void resetLayout()}
+              title="Reset layout"
+              aria-label="Reset layout"
+            >
+              {/* Inline fill: xyflow's controls CSS fills button SVGs. */}
+              <svg
+                viewBox="0 0 24 24"
+                style={{ fill: "none" }}
+                stroke="currentColor"
+                strokeWidth="2.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden
+              >
+                <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+                <path d="M3 3v5h5" />
+              </svg>
+            </ControlButton>
+          </Controls>
         </ReactFlow>
+        {emptyState}
+        <button
+          type="button"
+          className="canvas-fab"
+          aria-label="New session"
+          title="New session"
+          onClick={() =>
+            void context.navigation.openNewSession(
+              activeProject ? { projectId: activeProject.id } : undefined,
+            )
+          }
+        >
+          <svg
+            viewBox="0 0 24 24"
+            width="22"
+            height="22"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.25"
+            strokeLinecap="round"
+            aria-hidden
+          >
+            <path d="M5 12h14M12 5v14" />
+          </svg>
+        </button>
       </div>
     </div>
   );

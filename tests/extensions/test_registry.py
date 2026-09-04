@@ -146,6 +146,8 @@ def test_modern_entry_point_discovery_selects_extension_group(
 def test_extension_permission_values_include_read_only_sessions() -> None:
     assert {permission.value for permission in ExtensionPermission} == {
         "navigation",
+        "projects.read",
+        "projects.write",
         "sessions.read",
         "storage.user",
     }

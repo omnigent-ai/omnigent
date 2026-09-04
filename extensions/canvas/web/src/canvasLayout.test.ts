@@ -4,8 +4,11 @@ import {
   CARD_GAP,
   CARD_HEIGHT,
   CARD_WIDTH,
+  MAIN_CANVAS_ID,
+  mergeCanvasPositions,
   mergeSessionPositions,
   prunePositions,
+  sessionsOnCanvas,
 } from "./canvasLayout";
 
 function session(id: string, updatedAt: number): ExtensionSessionSummary {
@@ -13,6 +16,10 @@ function session(id: string, updatedAt: number): ExtensionSessionSummary {
     id,
     title: id,
     status: "idle",
+    unread: false,
+    titleProvisional: false,
+    gitBranch: null,
+    projectId: null,
     workspace: null,
     createdAt: 1,
     updatedAt,
@@ -58,5 +65,34 @@ describe("prunePositions", () => {
     expect(
       prunePositions({ one: { x: 1, y: 2 }, two: { x: 3, y: 4 } }, ["two"]),
     ).toEqual({ two: { x: 3, y: 4 } });
+  });
+});
+
+describe("canvases", () => {
+  const projectIds = new Set(["proj_a"]);
+  const inProject = { ...session("in_project", 3), projectId: "proj_a" };
+  const orphan = { ...session("orphan", 2), projectId: "proj_gone" };
+  const loose = session("loose", 1);
+
+  it("places sessions on their project's canvas and the rest on Main", () => {
+    expect(
+      sessionsOnCanvas([inProject, orphan, loose], MAIN_CANVAS_ID, projectIds),
+    ).toEqual([orphan, loose]);
+    expect(
+      sessionsOnCanvas([inProject, orphan, loose], "proj_a", projectIds),
+    ).toEqual([inProject]);
+  });
+
+  it("starts every canvas at its own grid origin while keeping saved spots", () => {
+    const positions = mergeCanvasPositions(
+      [inProject, orphan, loose],
+      projectIds,
+      {
+        loose: { x: 640, y: 0 },
+      },
+    );
+    expect(positions.in_project).toEqual({ x: 0, y: 0 });
+    expect(positions.orphan).toEqual({ x: 0, y: 0 });
+    expect(positions.loose).toEqual({ x: 640, y: 0 });
   });
 });

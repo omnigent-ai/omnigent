@@ -4,12 +4,16 @@ export const HOST_METHOD_PERMISSIONS = {
   "navigation.openPage": "navigation",
   "navigation.openSession": "navigation",
   "navigation.openNewSession": "navigation",
+  "navigation.openExternal": "navigation",
   "theme.getCurrent": null,
   "theme.subscribe": null,
   "storage.user.get": "storage.user",
   "storage.user.set": "storage.user",
   "storage.user.delete": "storage.user",
   "sessions.listPage": "sessions.read",
+  "sessions.pullRequest": "sessions.read",
+  "projects.list": "projects.read",
+  "projects.create": "projects.write",
 } as const satisfies Record<string, string | null>;
 
 export function grantedHostMethods<T extends Record<string, unknown>>(

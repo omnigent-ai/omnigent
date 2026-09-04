@@ -29,6 +29,8 @@ def get_manifest() -> ExtensionManifest:
         permissions=frozenset(
             {
                 ExtensionPermission.NAVIGATION,
+                ExtensionPermission.PROJECTS_READ,
+                ExtensionPermission.PROJECTS_WRITE,
                 ExtensionPermission.SESSIONS_READ,
                 ExtensionPermission.STORAGE_USER,
             }

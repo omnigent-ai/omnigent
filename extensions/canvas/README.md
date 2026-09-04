@@ -30,4 +30,4 @@ The committed build artifacts live in `src/omnigent_canvas/dist/` so the Python 
 
 ## Storage and privacy
 
-The extension requests only `navigation`, `sessions.read`, and `storage.user`. The host filters the session list to the current user's accessible, top-level, non-archived sessions. Manually arranged card positions and the viewport are stored locally in extension-scoped browser storage; transcript content is never read by this extension.
+The extension requests `navigation`, `sessions.read`, `projects.read`, `projects.write`, and `storage.user`. Sessions are grouped into one canvas per project plus a **Main** canvas for sessions outside any project; the **+** tab creates a new project. The host filters the session list to the current user's accessible, top-level, non-archived sessions. Manually arranged card positions and the viewport are stored locally in extension-scoped browser storage; transcript content is never read by this extension.

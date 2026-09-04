@@ -11,7 +11,11 @@ function session(id: string): ExtensionSessionSummary {
     id,
     title: id,
     status: "idle",
+    titleProvisional: false,
+    unread: false,
     workspace: null,
+    gitBranch: null,
+    projectId: null,
     createdAt: 1,
     updatedAt: 1,
   };

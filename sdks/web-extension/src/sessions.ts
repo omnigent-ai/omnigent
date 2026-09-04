@@ -2,7 +2,15 @@ export interface ExtensionSessionSummary {
   id: string;
   title: string | null;
   status: "idle" | "running" | "waiting" | "failed";
+  /** A finished turn the current user has not viewed yet (the sidebar's unread rule). */
+  unread: boolean;
+  /** True when `title` is the shell's provisional first-message title (no server title yet). */
+  titleProvisional: boolean;
   workspace: string | null;
+  /** Worktree branch the session runs on, or null when it works in the workspace itself. */
+  gitBranch: string | null;
+  /** Owning project, or null for sessions outside any project. */
+  projectId: string | null;
   createdAt: number;
   updatedAt: number;
 }
