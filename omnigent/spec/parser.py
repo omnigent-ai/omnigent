@@ -2459,7 +2459,9 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
         ``strict=False``) can catch them uniformly.
     """
     try:
-        text = skill_md.read_text()
+        # SKILL.md is a portable, UTF-8 canonical artifact. Relying on the
+        # host default codec makes valid skills fail on Windows cp1252.
+        text = skill_md.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         # UnicodeDecodeError (a non-UTF-8 SKILL.md) is a ValueError, not an
         # OSError — funnel it through OmnigentError too so the lenient

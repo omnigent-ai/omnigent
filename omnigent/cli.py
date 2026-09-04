@@ -3982,6 +3982,12 @@ def server(
         # `omnigent server --background` is the canonical spelling for the
         # detached server; the deprecated ``server start`` alias routes to the
         # same helper so both spellings can never drift.
+        # The detached launcher owns the child argv. Preserve template paths
+        # so it can append them when it creates the background server.
+        if agent_dirs:
+            os.environ["OMNIGENT_LOCAL_AGENT_DIRS"] = os.pathsep.join(agent_dirs)
+        else:
+            os.environ.pop("OMNIGENT_LOCAL_AGENT_DIRS", None)
         _run_background_server()
         return
 

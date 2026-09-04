@@ -651,6 +651,13 @@ def _spawn_local_server(port: int) -> _SpawnedLocalServer:
     # "browser auto-opens signed in + TUI auto-signed in" once
     # the spawned server's bootstrap fires.
     child_env = {**os.environ, PROCESS_LOG_FILE_ENV_VAR: str(log_path)}
+    # ``server --background --agent <path>`` reaches this detached launcher,
+    # so carry only its explicit operator templates into the child command.
+    agent_dirs = tuple(
+        item
+        for item in child_env.get("OMNIGENT_LOCAL_AGENT_DIRS", "").split(os.pathsep)
+        if item
+    )
     # Mirror create_auth_provider's resolution via the shared helper so the
     # daemon-owned server agrees with the server's own auth wiring: header is
     # the env-unset default; OMNIGENT_AUTH_ENABLED=1 opts into accounts (or
@@ -694,6 +701,7 @@ def _spawn_local_server(port: int) -> _SpawnedLocalServer:
                     "--artifact-location",
                     str(artifact_path),
                     *(["--config", str(p)] if (p := global_config_path()).exists() else []),
+                    *(item for agent_dir in agent_dirs for item in ("--agent", agent_dir)),
                 ],
                 env=child_env,
                 stdout=log_fh,
