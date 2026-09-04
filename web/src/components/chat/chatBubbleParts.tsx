@@ -1349,13 +1349,17 @@ export function JumpToTopButton({
     const onScroll = () => {
       const top = scrollEl.scrollTop;
       const next = top <= 1;
+      const atBottom = top >= scrollEl.scrollHeight - scrollEl.clientHeight - 1;
       setAtTop((prev) => (prev === next ? prev : next));
       // Upward scroll (and not already pinned to the top): show the pill and
       // (re)arm the idle timer that fades it out once scrolling settles.
-      if (top < lastTop - 1 && top > 1) {
+      if (top < lastTop - 1 && top > 1 && !atBottom) {
         setScrolledUp(true);
         clearTimeout(hideTimer);
         hideTimer = setTimeout(() => setScrolledUp(false), SCROLL_REVEAL_MS);
+      } else if (top > lastTop + 1 || atBottom) {
+        clearTimeout(hideTimer);
+        setScrolledUp(false);
       }
       lastTop = top;
     };
