@@ -13,10 +13,17 @@ server rather than local guesses. When no server is reachable, ``auth_source``
 falls back to what this machine's environment *would* boot a server in, marked
 by ``auth_source_origin`` so the two are never confused.
 
-Invariant: **no secrets.** Only versions, OS, and the coarse auth mode
-(accounts | single_user | oidc | header) are reported — never keys, tokens, or
-config bodies. ``auth_source`` doubles as the OSS-vs-managed signal (there is no
-explicit install marker).
+The ``health`` section comes from :mod:`omnigent.diagnostics_health`: a few
+counts read from ``~/.databrickscfg`` and the newest host/runner logs that
+distinguish the local auth failure modes from a server-side refusal. It lives in
+its own module because it probes the filesystem rather than versions, and
+degrades to ``null`` sections instead of raising.
+
+Invariant: **no secrets.** Only versions, OS, the coarse auth mode
+(accounts | single_user | oidc | header), and the health section's counts and
+fixed classification strings are reported — never keys, tokens, profile names,
+log lines, or config bodies. ``auth_source`` doubles as the OSS-vs-managed
+signal (there is no explicit install marker).
 """
 
 from __future__ import annotations
@@ -147,11 +154,14 @@ def collect_snapshot(*, server_url: str | None = None, timeout: float = 5.0) -> 
               "auth_source": "accounts" | "single_user" | "oidc" | "header" | "unknown",
               "auth_source_origin": "server" | "local-env",
               "os": "macOS-...",
-              "python": "3.12.13"
+              "python": "3.12.13",
+              "health": {...}   # see omnigent.diagnostics_health
             }
 
         Contains no secrets.
     """
+    from omnigent.diagnostics_health import collect_health
+
     server_version: str | None = None
     auth_source = _local_auth_source()
     auth_source_origin = "local-env"
@@ -172,6 +182,7 @@ def collect_snapshot(*, server_url: str | None = None, timeout: float = 5.0) -> 
         "auth_source_origin": auth_source_origin,
         "os": platform.platform(),
         "python": platform.python_version(),
+        "health": collect_health(server_url=server_url),
     }
 
 

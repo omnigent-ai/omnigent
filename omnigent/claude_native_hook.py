@@ -1046,6 +1046,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         are expressed via the JSON output, not exit codes.
     """
     from omnigent.native_policy_hook import (
+        evaluate_failure_detail,
         evaluation_response_to_hook_output,
         fail_closed_hook_output,
         hook_payload_to_evaluation_request,
@@ -1127,7 +1128,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         reauth=reauth,
     )
     if resp is None:
-        return _fail_closed(api_error or (reauth.failure_reason if reauth else None))
+        return _fail_closed(evaluate_failure_detail(api_error, reauth))
     if not resp.content:
         print("omnigent evaluate-policy hook: empty Omnigent response", file=sys.stderr)
         return _fail_closed()
