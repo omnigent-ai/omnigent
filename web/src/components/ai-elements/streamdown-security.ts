@@ -3,6 +3,7 @@ import { createMathPlugin } from "@streamdown/math";
 import { mermaid } from "@streamdown/mermaid";
 import { defaultRehypePlugins, type LinkSafetyConfig, type StreamdownProps } from "streamdown";
 import { lazyCodePlugin } from "./lazyCodePlugin";
+import { ChatMermaidBlock } from "./mermaid-block";
 
 type StreamdownRehypePlugins = NonNullable<StreamdownProps["rehypePlugins"]>;
 type StreamdownRehypePlugin = StreamdownRehypePlugins[number];
@@ -29,6 +30,14 @@ export const STREAMDOWN_PLUGINS = {
   // rewritten to `$$…$$` by `normalizeExplicitMathDelimiters`.
   math: createMathPlugin({ singleDollarTextMath: false }),
   mermaid,
+  // Chat renders mermaid fences with an app-owned renderer (custom
+  // renderers take precedence over the built-in mermaid block). The
+  // built-in defers rendering until the diagram scrolls into view and
+  // re-renders on every mount, which re-introduced the expand jolt on
+  // the settled-turn fold: its kept trace is hidden while folded, so a
+  // diagram inside it never intersects and only rendered after the
+  // expand. See mermaid-block.tsx.
+  renderers: [{ component: ChatMermaidBlock, language: "mermaid" }],
 };
 export const SECURE_STREAMDOWN_REHYPE_PLUGINS = createStreamdownRehypePlugins(false);
 export const FILE_LINK_STREAMDOWN_REHYPE_PLUGINS = createStreamdownRehypePlugins(true);
