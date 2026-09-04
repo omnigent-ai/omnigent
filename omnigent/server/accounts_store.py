@@ -43,7 +43,11 @@ from omnigent.db.db_models import (
     current_workspace_id,
 )
 from omnigent.db.enum_codecs import decode_account_token_kind, encode_account_token_kind
-from omnigent.db.utils import get_or_create_engine, make_named_managed_session_maker
+from omnigent.db.utils import (
+    get_or_create_engine,
+    make_named_managed_session_maker,
+    run_write_transaction,
+)
 from omnigent.entities import Account, AccountToken
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 
@@ -139,7 +143,8 @@ class SqlAlchemyAccountStore:
         :raises ValueError: If a user with this id already exists.
         """
         now = int(time.time())
-        with self._session("create_user_with_password") as session:
+
+        def write(session: Session) -> Account:
             existing = session.get(SqlUser, (current_workspace_id(), user_id))
             if existing is not None:
                 raise ValueError(f"user {user_id!r} already exists")
@@ -159,6 +164,8 @@ class SqlAlchemyAccountStore:
                 # callers handle uniqueness violation in one place.
                 raise ValueError(f"user {user_id!r} already exists") from exc
             return _to_account(row)
+
+        return run_write_transaction(self._session_immediate, "create_user_with_password", write)
 
     def get_user(self, user_id: str) -> Account | None:
         """Look up a user by id. Returns ``None`` if missing."""
@@ -193,7 +200,8 @@ class SqlAlchemyAccountStore:
         :param user_id: The username to update, e.g. ``"alice"``.
         :param is_admin: The flag value to set.
         """
-        with self._session("set_user_admin_status") as session:
+
+        def write(session: Session) -> None:
             session.execute(
                 update(SqlUser)
                 .where(
@@ -202,6 +210,8 @@ class SqlAlchemyAccountStore:
                 )
                 .values(is_admin=is_admin)
             )
+
+        run_write_transaction(self._session_immediate, "set_user_admin_status", write)
 
     def list_users(self) -> list[Account]:
         """Return all users for the admin members page.
@@ -276,8 +286,8 @@ class SqlAlchemyAccountStore:
             ``user_id`` is the last remaining admin, ``None`` if no such
             user exists.
         """
-        session_maker = self._session if self._supports_for_update else self._session_immediate
-        with session_maker("delete_user") as session:
+
+        def write(session: Session) -> bool | None:
             target = session.get(SqlUser, (current_workspace_id(), user_id))
             if target is None:
                 return None
@@ -293,6 +303,8 @@ class SqlAlchemyAccountStore:
             )
             session.delete(target)
             return True
+
+        return run_write_transaction(self._session_immediate, "delete_user", write)
 
     def get_password_hash(self, user_id: str) -> str | None:
         """Fetch a user's password hash for verification.
@@ -313,7 +325,8 @@ class SqlAlchemyAccountStore:
         admin-initiated reset. No-op silently if the user does
         not exist (the route should 404 first).
         """
-        with self._session("update_password") as session:
+
+        def write(session: Session) -> None:
             session.execute(
                 update(SqlUser)
                 .where(
@@ -323,13 +336,16 @@ class SqlAlchemyAccountStore:
                 .values(password_hash=password_hash)
             )
 
+        run_write_transaction(self._session_immediate, "update_password", write)
+
     def mark_logged_in(self, user_id: str, when_epoch_seconds: int) -> None:
         """Bump ``last_login_at`` on every successful login.
 
         :param when_epoch_seconds: Login timestamp. Tests pass a
             fixed value for determinism.
         """
-        with self._session("mark_user_logged_in") as session:
+
+        def write(session: Session) -> None:
             session.execute(
                 update(SqlUser)
                 .where(
@@ -338,6 +354,8 @@ class SqlAlchemyAccountStore:
                 )
                 .values(last_login_at=when_epoch_seconds)
             )
+
+        run_write_transaction(self._session_immediate, "mark_user_logged_in", write)
 
     # ── Account tokens (invite + magic-link) ──────────────────────
 
@@ -370,7 +388,8 @@ class SqlAlchemyAccountStore:
         """
         if kind not in ("invite", "magic"):
             raise ValueError(f"unknown token kind {kind!r}")
-        with self._session("create_account_token") as session:
+
+        def write(session: Session) -> AccountToken:
             row = SqlAccountToken(
                 id=token_id,
                 kind=encode_account_token_kind(kind),
@@ -383,6 +402,8 @@ class SqlAlchemyAccountStore:
             session.add(row)
             session.flush()
             return _to_account_token(row)
+
+        return run_write_transaction(self._session_immediate, "create_account_token", write)
 
     def redeem_token(
         self, token_id: str, *, kind: str, now_epoch_seconds: int
@@ -400,7 +421,8 @@ class SqlAlchemyAccountStore:
         / expired tokens. Caller can't distinguish (intentional —
         opaque-to-bruteforce-guessing).
         """
-        with self._session("redeem_account_token") as session:
+
+        def write(session: Session) -> AccountToken | None:
             result = cast(
                 CursorResult[tuple[object]],
                 session.execute(
@@ -422,6 +444,8 @@ class SqlAlchemyAccountStore:
             row = session.get(SqlAccountToken, (current_workspace_id(), token_id))
             return _to_account_token(row) if row is not None else None
 
+        return run_write_transaction(self._session_immediate, "redeem_account_token", write)
+
     def purge_expired_tokens(self, now_epoch_seconds: int) -> int:
         """Delete tokens whose ``expires_at`` is in the past.
 
@@ -432,7 +456,8 @@ class SqlAlchemyAccountStore:
 
         :returns: The number of rows deleted.
         """
-        with self._session("purge_expired_account_tokens") as session:
+
+        def write(session: Session) -> int:
             result = cast(
                 CursorResult[tuple[object]],
                 session.execute(
@@ -443,6 +468,12 @@ class SqlAlchemyAccountStore:
                 ),
             )
             return result.rowcount
+
+        return run_write_transaction(
+            self._session_immediate,
+            "purge_expired_account_tokens",
+            write,
+        )
 
     # ── OIDC invited emails (opt-in pre-authorization) ────────────
     #
@@ -471,7 +502,8 @@ class SqlAlchemyAccountStore:
         :returns: ``True`` if this call redeemed the token, ``False`` if
             it was missing / wrong-kind / already-redeemed / expired.
         """
-        with self._session("redeem_oidc_invite") as session:
+
+        def write(session: Session) -> bool:
             result = cast(
                 CursorResult[tuple[object]],
                 session.execute(
@@ -489,6 +521,8 @@ class SqlAlchemyAccountStore:
                 ),
             )
             return result.rowcount == 1
+
+        return run_write_transaction(self._session_immediate, "redeem_oidc_invite", write)
 
     def is_email_invited(self, email: str) -> bool:
         """Whether ``email`` redeemed an OIDC invite (durable pre-auth).

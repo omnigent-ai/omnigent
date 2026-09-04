@@ -21,6 +21,10 @@ Omnigent is an open-source **meta-harness** that gives you a common orchestratio
 
 ---
 
+CockroachDB deployments can use the optional `omnigent[cockroachdb]` extra.
+See [CockroachDB setup](docs/COCKROACHDB.md) for supported versions, connection
+URLs, schema initialization, and the persistent local test matrix.
+
 ## Why Omnigent?
 
 Omnigent lets you:

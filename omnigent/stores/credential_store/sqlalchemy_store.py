@@ -19,9 +19,15 @@ from typing import Any, cast
 from sqlalchemy import delete, select
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlConnection, current_workspace_id
-from omnigent.db.utils import get_or_create_engine, make_named_managed_session_maker, now_epoch
+from omnigent.db.utils import (
+    get_or_create_engine,
+    make_named_managed_session_maker,
+    now_epoch,
+    run_write_transaction,
+)
 from omnigent.entities import ProviderConnection
 from omnigent.stores.credential_store.secret_cipher import SecretCipher
 
@@ -73,6 +79,11 @@ class CredentialStore:
         self._engine = get_or_create_engine(storage_location)
         self._session = make_named_managed_session_maker(
             self._engine, query_name_prefix="omnigent.credential_store"
+        )
+        self._session_immediate = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.credential_store",
+            immediate=True,
         )
         self._cipher = secret_cipher
 
@@ -129,7 +140,7 @@ class CredentialStore:
         secret_enc = self._cipher.encrypt(json.dumps(secret), context=context)
         metadata_json = json.dumps(metadata)
 
-        def _apply(session: Any, row: SqlConnection | None) -> SqlConnection:
+        def _apply(session: Session, row: SqlConnection | None) -> SqlConnection:
             if row is None:
                 row = SqlConnection(
                     user_id=user_id,
@@ -147,22 +158,24 @@ class CredentialStore:
                 row.updated_at = now
             return row
 
-        with self._session("upsert") as session:
-            row = _apply(session, session.get(SqlConnection, pk))
-            try:
-                session.flush()
-            except IntegrityError:
-                # A concurrent reconnect inserted the same PK between our get
-                # and flush. Roll back and retry as an update below.
-                session.rollback()
-            else:
-                # Return the entity from the secret we just wrote — no wasted
-                # decrypt of the ciphertext we produced a few lines up.
-                return self._build_entity(row, secret)
-        with self._session("upsert_retry") as session:
+        def initial_write(session: Session) -> ProviderConnection:
             row = _apply(session, session.get(SqlConnection, pk))
             session.flush()
             return self._build_entity(row, secret)
+
+        try:
+            return run_write_transaction(self._session_immediate, "upsert", initial_write)
+        except IntegrityError:
+            # A concurrent reconnect inserted the same PK between our get and
+            # flush. Retry as an update in a fresh managed transaction.
+            pass
+
+        def conflict_write(session: Session) -> ProviderConnection:
+            row = _apply(session, session.get(SqlConnection, pk))
+            session.flush()
+            return self._build_entity(row, secret)
+
+        return run_write_transaction(self._session_immediate, "upsert_retry", conflict_write)
 
     def update_secret(
         self,
@@ -182,21 +195,29 @@ class CredentialStore:
         user until they reconnect — worth surfacing, not swallowing.
         """
         workspace_id = current_workspace_id()
-        with self._session("update_secret") as session:
+        context = _enc_context(workspace_id, user_id, provider, account_id)
+        secret_enc = self._cipher.encrypt(json.dumps(secret), context=context)
+        metadata_json = json.dumps(metadata) if metadata is not None else None
+        updated_at = now_epoch()
+
+        def write(session: Session) -> bool:
             row = session.get(SqlConnection, (workspace_id, user_id, provider, account_id))
             if row is None:
-                _logger.warning(
-                    "credential_store: update_secret found no %s connection for the user "
-                    "(removed mid-refresh); the refreshed secret was discarded",
-                    provider,
-                )
                 return False
-            context = _enc_context(workspace_id, user_id, provider, account_id)
-            row.secret_enc = self._cipher.encrypt(json.dumps(secret), context=context)
-            if metadata is not None:
-                row.metadata_json = json.dumps(metadata)
-            row.updated_at = now_epoch()
+            row.secret_enc = secret_enc
+            if metadata_json is not None:
+                row.metadata_json = metadata_json
+            row.updated_at = updated_at
             return True
+
+        updated = run_write_transaction(self._session_immediate, "update_secret", write)
+        if not updated:
+            _logger.warning(
+                "credential_store: update_secret found no %s connection for the user "
+                "(removed mid-refresh); the refreshed secret was discarded",
+                provider,
+            )
+        return updated
 
     def get(
         self,
@@ -225,7 +246,8 @@ class CredentialStore:
 
     def delete(self, user_id: str, provider: str, *, account_id: str = "") -> bool:
         """Remove a user's connection for *provider*. Returns ``True`` if a row went."""
-        with self._session("delete") as session:
+
+        def write(session: Session) -> bool:
             result = cast(
                 CursorResult[tuple[object]],
                 session.execute(
@@ -238,6 +260,8 @@ class CredentialStore:
                 ),
             )
             return result.rowcount > 0
+
+        return run_write_transaction(self._session_immediate, "delete", write)
 
     def list_for_user(self, user_id: str) -> list[ProviderConnection]:
         """All of a user's connections (metadata only), across providers."""

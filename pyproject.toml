@@ -138,6 +138,10 @@ dependencies = [
 # working; the underlying packages are now default deps above.
 claude-sdk = []
 openai-agents = []
+cockroachdb = [
+    "psycopg[binary]>=3.1,<4",
+    "sqlalchemy-cockroachdb>=2.0,<3",
+]
 # `all` carries dependencies moved out of the default install that internal
 # CI / dev workflows still exercise.
 all = [
