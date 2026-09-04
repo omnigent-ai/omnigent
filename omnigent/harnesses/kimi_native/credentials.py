@@ -6,13 +6,15 @@ relative to the same home — there is no project-level merge for the ``hooks``
 array. To gate a session's tools without mutating the user's global config, the
 runner points the launched ``kimi`` process at a session-scoped home that:
 
-- symlinks the user's global home entries (oauth, credentials, …) so login /
-  providers keep working — EXCEPT the ``sessions/`` store and its index, which
-  stay session-private so the transcript forwarder's wire-log discovery can
-  never adopt a parallel session's log — and
+- symlinks the user's global state (oauth, credentials, …) so login and
+  providers keep working, while the sessions store, its index, and workspace
+  trust stay session-private, and
 - carries a ``config.toml`` that is the user's config text with two Omnigent
   ``[[hooks]]`` appended — a ``PreToolUse`` deny-gate and a ``PermissionRequest``
-  read-only surface, both dispatched to :mod:`omnigent.harnesses.kimi_native.hook`.
+  read-only surface, both dispatched to
+  :mod:`omnigent.harnesses.kimi_native.hook`, and
+- pre-seeds Kimi's trust record for the launch workspace so its unhookable
+  first-run modal cannot park the session or suppress project MCP servers.
 
 Outside opted-in CI, appending hooks keeps the user's config byte-for-byte.
 CI adds provider-scoped request headers to the private config copy first.
@@ -21,10 +23,15 @@ CI adds provider-scoped request headers to the private config copy first.
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import json
 import logging
 import os
+import re
 import shlex
+import shutil
 import sys
+import time
 import tomllib
 from pathlib import Path
 
@@ -38,9 +45,12 @@ from omnigent.databricks_ai_gateway import (
 KIMI_CODE_HOME_ENV_VAR = "KIMI_CODE_HOME"
 _CONFIG_FILE = "config.toml"
 #: Global-home entries kept session-private instead of symlinked: config.toml
-#: is rebuilt with the Omnigent hooks, and the sessions store + its index stay
-#: per-session so parallel kimi sessions cannot adopt each other's wire logs.
-_PRIVATE_ENTRIES = frozenset({_CONFIG_FILE, "sessions", "session_index.jsonl"})
+#: is rebuilt with the Omnigent hooks, while sessions and trust stay private.
+_WORKSPACE_TRUST_DIR = "workspace-trust"
+_PRIVATE_ENTRIES = frozenset(
+    {_CONFIG_FILE, "sessions", "session_index.jsonl", _WORKSPACE_TRUST_DIR}
+)
+_WORKSPACE_SLUG_MAX_LENGTH = 40
 
 
 def with_kimi_ci_request_tags(config_text: str) -> str:
@@ -167,24 +177,70 @@ def render_kimi_hooks_toml(*, bridge_dir: Path, python_executable: str | None = 
     )
 
 
+def _workspace_trust_record(workspace: Path) -> tuple[str, str]:
+    """Return Kimi 0.41's canonical root and workspace-trust filename."""
+    root = os.path.abspath(os.fspath(workspace)).replace("\\", "/")
+    canonical_root = root.rstrip("/") or root
+    basename = canonical_root.rsplit("/", maxsplit=1)[-1]
+    slug = re.sub(r"[^a-z0-9._-]+", "-", basename.lower()).strip("-")
+    slug = slug[:_WORKSPACE_SLUG_MAX_LENGTH].strip("-")
+    if slug in {"", ".", ".."}:
+        slug = "workspace"
+    digest = hashlib.sha256(canonical_root.encode("utf-8")).hexdigest()[:12]
+    return canonical_root, f"wd_{slug}_{digest}"
+
+
+def _materialize_workspace_trust_dir(session_home: Path, user_home: Path) -> Path:
+    """Create a real session trust directory and copy existing user records."""
+    trust_dir = session_home / _WORKSPACE_TRUST_DIR
+    if trust_dir.is_symlink():
+        trust_dir.unlink()
+    trust_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(trust_dir, 0o700)
+
+    user_trust_dir = user_home / _WORKSPACE_TRUST_DIR
+    if user_trust_dir.is_dir():
+        with contextlib.suppress(OSError):
+            for source in user_trust_dir.iterdir():
+                destination = trust_dir / source.name
+                if not source.is_file() or destination.exists() or destination.is_symlink():
+                    continue
+                with contextlib.suppress(OSError):
+                    shutil.copyfile(source, destination)
+    return trust_dir
+
+
+def _seed_workspace_trust(trust_dir: Path, workspace: Path) -> None:
+    """Write Kimi's session-scoped trust record for *workspace* atomically."""
+    root, record_name = _workspace_trust_record(workspace)
+    record_path = trust_dir / record_name
+    tmp = record_path.with_name(record_path.name + ".tmp")
+    payload = {"root": root, "trustedAt": time.time_ns() // 1_000_000}
+    tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    with contextlib.suppress(OSError):
+        os.chmod(tmp, 0o600)
+    os.replace(tmp, record_path)
+
+
 def build_kimi_session_home(
     session_home: Path,
     *,
     bridge_dir: Path,
+    workspace: Path,
     python_executable: str | None = None,
 ) -> dict[str, str]:
     """Materialize a session-scoped ``KIMI_CODE_HOME`` with Omnigent hooks.
 
-    Symlinks every entry of the user's global kimi home into *session_home*
-    except ``config.toml`` (rebuilt below with the Omnigent hooks) and the
-    ``sessions`` store + ``session_index.jsonl`` (kept session-private so
-    parallel kimi sessions cannot adopt each other's wire logs), then writes a
-    ``config.toml`` that is the user's config plus the Omnigent hooks.
-    Best-effort and idempotent: re-running rewrites ``config.toml`` and leaves
-    existing symlinks in place.
+    Symlinks shareable entries of the user's global kimi home into
+    *session_home*, keeps session history private, materializes a private
+    ``workspace-trust`` directory, seeds the launch workspace there, then
+    writes a ``config.toml`` containing the user's config plus the Omnigent
+    hooks. Re-running is idempotent.
 
     :param session_home: Directory to use as the session's ``KIMI_CODE_HOME``.
     :param bridge_dir: The kimi-native bridge dir the hook commands read.
+    :param workspace: Workspace Kimi launches in, used for the trust record.
     :param python_executable: Interpreter for the hook commands (see
         :func:`render_kimi_hooks_toml`).
     :returns: ``{"KIMI_CODE_HOME": str(session_home)}`` to merge into the
@@ -217,6 +273,9 @@ def build_kimi_session_home(
                 link.unlink()
     with contextlib.suppress(OSError):
         (session_home / "sessions").mkdir(exist_ok=True)
+
+    trust_dir = _materialize_workspace_trust_dir(session_home, user_home)
+    _seed_workspace_trust(trust_dir, workspace)
 
     hooks = render_kimi_hooks_toml(bridge_dir=bridge_dir, python_executable=python_executable)
     # Ensure a clean separation if the user's config has no trailing newline.
