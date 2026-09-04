@@ -5522,7 +5522,8 @@ async def _record_create_route_prompt(
 
 # Sessions with a message dispatch still awaiting its runner (cold boot). The
 # session list reports them as running so a booting session spins instead of
-# reading idle until the runner accepts the message.
+# reading idle until the runner accepts the message. Process-local and
+# best-effort: with several replicas only the one handling the POST knows.
 _dispatch_in_flight: dict[str, int] = {}
 
 

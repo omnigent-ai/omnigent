@@ -402,7 +402,7 @@ def _wheel_name_version(wheel: Path) -> tuple[str, str]:
     :returns: ``("omnigent-canvas", "0.1.0")``.
     """
     name, version = wheel.name.split("-")[:2]
-    return name.replace("_", "-"), version
+    return name.lower().replace("_", "-"), version
 
 
 def _uv_source_lines(
@@ -431,8 +431,19 @@ def _uv_source_lines(
         wheel = next(wheel for name, wheel in wheels.items() if name.startswith(wheel_prefix))
         source = _wheel_source_path(wheel)
         source_lines.append(f"{package_name} = {{ path = {_toml_string(source)} }}")
+    core_names = {"omnigent", "omnigent-client", "omnigent-ui-sdk"}
+    seen: set[str] = set()
     for wheel in extension_wheels:
         package_name, _ = _wheel_name_version(wheel)
+        if package_name in core_names:
+            raise SystemExit(
+                f"--extension-wheel {wheel.name} would shadow the core package {package_name}"
+            )
+        if package_name in seen:
+            raise SystemExit(
+                f"--extension-wheel {wheel.name} repeats the extension {package_name}"
+            )
+        seen.add(package_name)
         source = _wheel_source_path(wheel)
         source_lines.append(f"{package_name} = {{ path = {_toml_string(source)} }}")
     return source_lines
