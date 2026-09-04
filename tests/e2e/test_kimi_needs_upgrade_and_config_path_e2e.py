@@ -16,14 +16,14 @@ Three user-observable failure modes are guarded here:
    ``omnigent/runtime/workflow.py`` still points users at ``~/.kimi/``.
 
 Failure modes 1–2 were fixed by "fix(onboarding): correct the kimi and hermes
-CLI version floors" (the floor is now 0.7.0); the tests here guard that fix so
-a future edit can't silently re-import kimi-cli's 1.x series. Failure mode 3 is
+CLI version floors"; Kimi's floor is now 0.41.0 because the native bridge uses
+that release's trust format. The tests here guard both constraints. Failure mode 3 is
 guarded by ``test_kimi_auth_rejection_names_the_real_kimi_code_config_path``,
 which fails while any user-visible guidance names the legacy path.
 
 All three tests drive real user surfaces: the ``omni setup`` TUI under a
 pseudo-TTY and the ``omnigent run`` launcher as a subprocess, with a stub
-``kimi`` binary reporting the exact version from the report (0.32.0) placed
+``kimi`` binary reporting the minimum supported version (0.41.0) placed
 first on ``PATH``.
 
 Usage::
@@ -48,16 +48,15 @@ pexpect = pytest.importorskip("pexpect")
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# The Kimi Code CLI version from the bug report — a current, shipping 0.x
-# build that the (buggy) 1.47.0 floor rejected.
-_REPORTED_KIMI_VERSION = "0.32.0"
+# The oldest Kimi Code CLI with the workspace-trust format the bridge seeds.
+_SUPPORTED_KIMI_VERSION = "0.41.0"
 
 # Strip ANSI escape sequences (CSI, OSC, and keypad-mode toggles) so TUI
 # rows can be matched as plain text.
 _ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]")
 
 
-def _write_stub_kimi(bin_dir: Path, version: str = _REPORTED_KIMI_VERSION) -> Path:
+def _write_stub_kimi(bin_dir: Path, version: str = _SUPPORTED_KIMI_VERSION) -> Path:
     """Create a stub ``kimi`` binary whose ``--version`` prints *version*.
 
     The version-floor check (``_harness_cli_version_satisfies``) only runs
@@ -122,8 +121,7 @@ def test_kimi_version_floor_targets_kimi_code_0x_series() -> None:
     The bug was the floor being re-derived from the wrong upstream project
     (``kimi-cli``, a 1.x series). Kimi Code ships 0.x releases, so any floor
     at or above 1.0.0 is unsatisfiable by every build of the binary the spec
-    itself installs. Also asserts the report's shipping build (0.32.0)
-    satisfies the declared floor.
+    itself installs. Also pins the workspace-trust-compatible floor exactly.
     """
     from omnigent.onboarding import harness_install as hi
 
@@ -135,17 +133,14 @@ def test_kimi_version_floor_targets_kimi_code_0x_series() -> None:
         "series — this re-imports the separate kimi-cli project's numbering "
         "and rejects every shipping Kimi Code build"
     )
-    assert Version(_REPORTED_KIMI_VERSION) >= Version(spec.min_version), (
-        f"a current Kimi Code build ({_REPORTED_KIMI_VERSION}) no longer "
-        f"satisfies the declared floor {spec.min_version!r}"
-    )
+    assert spec.min_version == _SUPPORTED_KIMI_VERSION
 
 
 def test_setup_kimi_row_does_not_read_needs_upgrade(tmp_path: Path) -> None:
     """``omni setup`` with a current Kimi Code CLI never shows "Needs upgrade".
 
     Reconstructs the reported journey: a fully up-to-date Kimi Code CLI
-    (0.32.0) on PATH, fresh config, run ``omni setup``. On the buggy build the
+    (0.41.0) on PATH, fresh config, run ``omni setup``. On the buggy build the
     Kimi Code row read ``✗ Needs upgrade``; on a fixed build it reads
     ``Not configured`` (installed, no credential yet) or ``Signed in``.
     """
@@ -193,7 +188,7 @@ def test_setup_kimi_row_does_not_read_needs_upgrade(tmp_path: Path) -> None:
         joined = "\n".join(kimi_lines)
         assert "Needs upgrade" not in joined, (
             "a current Kimi Code CLI "
-            f"({_REPORTED_KIMI_VERSION}) is marked 'Needs upgrade' — the "
+            f"({_SUPPORTED_KIMI_VERSION}) is marked 'Needs upgrade' — the "
             f"version floor rejects every shipping 0.x build:\n{joined}"
         )
         assert "Not installed" not in joined, (
