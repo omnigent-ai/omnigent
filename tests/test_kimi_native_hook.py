@@ -189,9 +189,13 @@ def test_permission_request_injects_keystroke_for_verdict(
     exit_code = kimi_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)])
 
     assert exit_code == 0
-    # Routed to the shared elicitation endpoint with the gated tool.
-    assert posted[0]["url"].endswith("/v1/sessions/conv_abc/hooks/permission-request")
-    assert posted[0]["body"]["tool_name"] == "Bash"
+    # Routed to the vendor-agnostic native-permission endpoint, labelled Kimi.
+    assert posted[0]["url"].endswith("/v1/sessions/conv_abc/hooks/native-permission-request")
+    body = posted[0]["body"]
+    assert body["agent"] == "Kimi"
+    assert body["policy_name"] == "kimi_native_permission"
+    assert body["message"] == "Kimi wants to call **Bash**"
+    assert body["operation_type"] == "Bash"
     assert keys == [expected_key]
 
 
@@ -301,15 +305,14 @@ def test_permission_request_ungoverned_no_request(
 @pytest.mark.parametrize(
     ("response", "expected"),
     [
-        ({"hookSpecificOutput": {"decision": {"behavior": "allow"}}}, "allow"),
-        ({"hookSpecificOutput": {"decision": {"behavior": "deny"}}}, "deny"),
-        ({"hookSpecificOutput": {"permissionDecision": "allow"}}, "allow"),
-        ({"hookSpecificOutput": {"permissionDecision": "deny"}}, "deny"),
-        ({"hookSpecificOutput": {"decision": {"behavior": "allow_always"}}}, "allow"),
-        ({"hookSpecificOutput": {"decision": {"behavior": "reject"}}}, "deny"),
+        ({"action": "accept"}, "allow"),
+        ({"action": "decline"}, "deny"),
+        ({"action": "cancel"}, "deny"),
         ({}, None),
-        ({"hookSpecificOutput": {}}, None),
-        ({"hookSpecificOutput": {"decision": {"behavior": "huh"}}}, None),
+        ({"action": "huh"}, None),
+        ({"action": None}, None),
+        # The old Claude PermissionRequest shape must NOT resolve to a verdict.
+        ({"hookSpecificOutput": {"decision": {"behavior": "allow"}}}, None),
         ("not a dict", None),
     ],
 )
