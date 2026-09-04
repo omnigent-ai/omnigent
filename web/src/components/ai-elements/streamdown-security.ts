@@ -1,3 +1,7 @@
+// Keep streamdown's lazily-imported mermaid facade in the static bundle so a
+// mid-session chunk fetch can never degrade a diagram (see the module header).
+import "./eagerMermaidFacade";
+
 import { cjk } from "@streamdown/cjk";
 import { createMathPlugin } from "@streamdown/math";
 import { mermaid } from "@streamdown/mermaid";
