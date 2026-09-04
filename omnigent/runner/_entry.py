@@ -696,36 +696,18 @@ def _make_auth_token_factory(
         :returns: Bearer token string, or ``None`` if no credentials
             are configured.
         """
-        # Check stored OIDC token first.
+        # Check stored OIDC token first: prefer one with enough remaining
+        # life to survive the handshake, renew a lapsed/near-lapse one from
+        # the login-issued refresh grant, and only then fall back to a
+        # near-expiry token that has not actually lapsed. This is what keeps
+        # an unattended host alive past session-JWT expiry — the tunnel
+        # rebuilds headers through this factory on every reconnect.
         if resolved_server_url:
-            from omnigent.cli_auth import (
-                REFRESH_MIN_REMAINING_SECONDS,
-                load_token,
-                refresh_stored_token,
-            )
+            from omnigent.cli_auth import load_or_refresh_token
 
-            # Require enough remaining life that the token cannot lapse
-            # mid-handshake; a token inside that window falls through to
-            # the renewal path below rather than being used and rejected.
-            oidc_token = load_token(
-                resolved_server_url,
-                min_remaining_seconds=REFRESH_MIN_REMAINING_SECONDS,
-            )
+            oidc_token = load_or_refresh_token(resolved_server_url)
             if oidc_token:
                 return oidc_token
-            # Expired or near-lapse: renew from the login-issued refresh
-            # grant when one exists. This is what keeps an unattended host
-            # alive past session-JWT expiry — the tunnel rebuilds headers
-            # through this factory on every reconnect.
-            refreshed = refresh_stored_token(resolved_server_url)
-            if refreshed:
-                return refreshed
-            # Nothing to renew with: a near-expiry token that has NOT
-            # actually lapsed still authenticates, so prefer it over
-            # falling through to no credential at all.
-            still_valid = load_token(resolved_server_url)
-            if still_valid:
-                return still_valid
         return _sdk_token()
 
     # Probe once to check if a user credential is available.

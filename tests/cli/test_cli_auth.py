@@ -785,3 +785,76 @@ def test_refresh_rejects_unusable_response_fields(token_dir, monkeypatch) -> Non
     assert refresh_stored_token("http://localhost:6767") == "fresh"
     entry = json.loads((token_dir / "auth_tokens.json").read_text())["http://localhost:6767"]
     assert entry["expires_at"] < time.time() + 4000
+
+
+def test_load_or_refresh_prefers_fresh_token(token_dir, monkeypatch) -> None:
+    """A token with plenty of remaining life is used as-is — no network."""
+    from omnigent import cli_auth
+
+    cli_auth.store_token(
+        "http://localhost:6767",
+        token="fresh",
+        user_id="a@x",
+        expires_at=time.time() + 3600,
+        refresh_token="refresh-1",
+    )
+
+    def _no_refresh(*_a, **_kw):
+        raise AssertionError("refresh must not run while the stored token is fresh")
+
+    monkeypatch.setattr(cli_auth, "refresh_stored_token", _no_refresh)
+    assert cli_auth.load_or_refresh_token("http://localhost:6767") == "fresh"
+
+
+def test_load_or_refresh_renews_idle_expired_token(token_dir, monkeypatch) -> None:
+    """An idle-expired entry with refresh material renews and persists."""
+    import httpx
+
+    from omnigent import cli_auth
+
+    cli_auth.store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda url, **_kw: httpx.Response(
+            200,
+            json={"access_token": "fresh", "refresh_token": "refresh-2", "expires_in": 3600},
+            request=httpx.Request("POST", url),
+        ),
+    )
+
+    assert cli_auth.load_or_refresh_token("http://localhost:6767") == "fresh"
+    # The renewed pair is persisted, not just returned.
+    assert cli_auth.load_token("http://localhost:6767") == "fresh"
+
+
+def test_load_or_refresh_falls_back_to_near_expiry_token(token_dir) -> None:
+    """Near-lapse with nothing to renew: the still-valid token still wins."""
+    from omnigent import cli_auth
+
+    cli_auth.store_token(
+        "http://localhost:6767",
+        token="almost-lapsed",
+        user_id="a@x",
+        expires_at=time.time() + 30,  # inside REFRESH_MIN_REMAINING_SECONDS
+    )
+    assert cli_auth.load_or_refresh_token("http://localhost:6767") == "almost-lapsed"
+
+
+def test_load_or_refresh_expired_without_material_is_none(token_dir) -> None:
+    """Expired with no refresh grant: nothing usable, so None."""
+    from omnigent import cli_auth
+
+    cli_auth.store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+    )
+    assert cli_auth.load_or_refresh_token("http://localhost:6767") is None

@@ -406,6 +406,28 @@ def refresh_stored_token(server_url: str, *, timeout: float = 10.0) -> str | Non
         return None
 
 
+def load_or_refresh_token(server_url: str) -> str | None:
+    """Load a stored token, renewing it from the refresh grant when needed.
+
+    The one resolution every login-credential consumer should use: prefer a
+    stored token with enough remaining life that it cannot lapse mid-request;
+    otherwise renew from the login-issued refresh grant; and only then fall
+    back to a near-expiry token that has not actually lapsed (it still
+    authenticates, so it beats no credential at all).
+
+    :param server_url: The server URL, e.g. ``"http://localhost:6767"``.
+    :returns: A usable access token, or ``None`` when nothing is stored and
+        nothing could be renewed.
+    """
+    token = load_token(server_url, min_remaining_seconds=REFRESH_MIN_REMAINING_SECONDS)
+    if token:
+        return token
+    refreshed = refresh_stored_token(server_url)
+    if refreshed:
+        return refreshed
+    return load_token(server_url)
+
+
 def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | None:
     """Perform the refresh exchange; caller holds the token-file lock."""
     entry = _load_entry(server_url)
