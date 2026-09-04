@@ -17,10 +17,11 @@ Design notes:
 - Only the on-demand per-file expand-context reader (:func:`github_file_diff`)
   still uses ``git show`` for full before/after content — a unified-diff blob
   can't drive the viewer's context expansion.
-- The branch→PR lookup tries a bare ``gh pr view`` first, then retries with the
-  head named explicitly as ``<owner>:<head-ref>`` when that finds nothing — the
-  fallback catches a PR whose head is a fork branch under a renamed ref, which a
-  bare ``gh pr view`` misses because it guesses the head repo owner.
+- The branch→PR lookup resolves in one ``gh`` call: when the branch has an
+  upstream, ``gh pr list --head <pushed-ref>`` matches on the head ref name
+  alone, so it finds the PR whether the head is in the base repo or a fork —
+  unlike a bare ``gh pr view``, whose head-repo-owner guess misses fork heads.
+  A bare ``gh pr view`` is used only when there's no upstream to name the head.
 - ``available: false`` payloads let the tab render a message ("gh not installed",
   "not a git repo") instead of surfacing an error.
 """
@@ -30,7 +31,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import shutil
 import subprocess
 import time
@@ -177,70 +177,59 @@ def _current_branch(root: str) -> str | None:
     return out.strip() or None
 
 
-def _remote_owner(url: str) -> str | None:
-    """Parse ``<owner>`` from a GitHub remote URL (ssh scp-like, ``ssh://``, https)."""
-    # Strip the transport + host prefix, leaving ``<owner>/<repo>[.git]``.
-    path = re.sub(r"^(?:git@[^:]+:|ssh://[^/]+/|https?://[^/]+/)", "", url)
-    return path.split("/", 1)[0] or None
+def _pushed_head_ref(root: str) -> str | None:
+    """Return the current branch's pushed head ref name, or ``None``.
 
-
-def _pushed_pr_selector(root: str, branch: str) -> str | None:
-    """Build an ``<owner>:<head-ref>`` selector naming the branch's PR head.
-
-    A bare ``gh pr view`` guesses the head repo owner and so misses a PR whose
-    head is a fork branch under a renamed ref (the triangular push flow). Naming
-    the head explicitly bypasses the guess: the head ref is the configured
-    upstream (``branch.<name>.merge``) and the owner is the push remote's repo
-    owner — both exactly what was pushed. ``None`` if either can't be derived.
+    Reads the configured upstream (``branch.<name>.merge``), whose value is the
+    ref that was actually pushed — which may carry a ``<user>/`` prefix under a
+    fork / triangular push flow and so differ from the local branch name.
+    ``None`` when detached or with no upstream configured.
     """
-    rc, merge, _ = _git(["config", f"branch.{branch}.merge"], cwd=root)
-    if rc != 0 or not merge.strip():
+    branch = _current_branch(root)
+    if branch is None:
         return None
-    head_ref = merge.strip().removeprefix("refs/heads/")
-
-    rc, remote, _ = _git(["config", f"branch.{branch}.remote"], cwd=root)
-    if rc != 0 or not remote.strip():
+    rc, out, _ = _git(["config", f"branch.{branch}.merge"], cwd=root)
+    if rc != 0 or not out.strip():
         return None
-    rc, url, _ = _git(["remote", "get-url", remote.strip()], cwd=root)
-    if rc != 0 or not url.strip():
-        return None
-    owner = _remote_owner(url.strip())
-    return f"{owner}:{head_ref}" if owner else None
-
-
-def _loads_pr_object(out: str) -> dict[str, Any] | None:
-    """Parse ``gh pr view --json`` stdout into a PR object, or ``None``."""
-    try:
-        data = json.loads(out)
-    except ValueError:
-        return None
-    return data if isinstance(data, dict) else None
+    return out.strip().removeprefix("refs/heads/") or None
 
 
 def _pr_view_json(root: str, fields: str) -> dict[str, Any] | None:
     """Return the branch's PR as a ``gh``-JSON object for ``fields``, or ``None``.
 
-    Tries a bare ``gh pr view`` first (its own branch→PR resolution). Only when
-    that finds nothing does it touch git and retry with the head named as
-    ``<owner>:<head-ref>`` (see :func:`_pushed_pr_selector`) — the bare form
-    guesses the head repo owner and so misses a PR whose head is a fork branch
-    under a renamed ref (the triangular push flow). Both forms return one PR
-    object, so the result parses identically.
+    Resolves the PR in a single ``gh`` call. When the branch has an upstream,
+    ``gh pr list --head <pushed-ref>`` matches on the head ref name alone, so it
+    finds the PR whether the head is in the base repo or a fork — unlike a bare
+    ``gh pr view``, whose head-repo-owner guess misses fork heads. ``--state
+    all`` keeps merged/closed PRs visible, as a bare ``gh pr view`` would.
+    ``gh pr list --json`` accepts the same fields and its rows share the shape of
+    a ``gh pr view`` object, so the first row parses identically. Only with no
+    upstream to name the head does it fall back to a bare ``gh pr view``.
     """
-    rc, out, _ = _gh(["pr", "view", "--json", fields], cwd=root)
-    if rc == 0:
-        data = _loads_pr_object(out)
-        if data is not None:
-            return data
+    head_ref = _pushed_head_ref(root)
+    if head_ref is not None:
+        rc, out, _ = _gh(
+            ["pr", "list", "--head", head_ref, "--state", "all", "--limit", "1", "--json", fields],
+            cwd=root,
+        )
+        if rc != 0:
+            return None
+        try:
+            rows = json.loads(out)
+        except ValueError:
+            return None
+        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+            return rows[0]
+        return None
 
-    branch = _current_branch(root)
-    if branch is None:
+    rc, out, _ = _gh(["pr", "view", "--json", fields], cwd=root)
+    if rc != 0:
         return None
-    selector = _pushed_pr_selector(root, branch)
-    if selector is None:
+    try:
+        data = json.loads(out)
+    except ValueError:
         return None
-    rc, out, _ = _gh(["pr", "view", selector, "--json", fields], cwd=root)
-    return _loads_pr_object(out) if rc == 0 else None
+    return data if isinstance(data, dict) else None
 
 
 def github_info(root: str) -> dict[str, Any]:

@@ -61,14 +61,12 @@ def _run(argv: list[str], cwd: Path) -> None:
     subprocess.run(argv, cwd=cwd, check=True, capture_output=True, env=_git_env())
 
 
-def _set_fork_push(repo: Path, *, owner: str, head_ref: str, remote: str = "origin") -> None:
-    """Mark the ``feature`` branch as pushed to ``owner``'s fork under ``head_ref``.
+def _set_pushed_ref(repo: Path, head_ref: str) -> None:
+    """Give the ``feature`` branch an upstream whose pushed ref is ``head_ref``.
 
-    Mirrors a triangular / fork push: an upstream (``branch.feature.merge``) whose
-    ref differs from the local name, tracking a remote whose URL owner is ``owner``.
+    Mirrors a fork / triangular push, where the pushed ref (``branch.feature.merge``)
+    differs from the local branch name.
     """
-    _run(["git", "remote", "add", remote, f"git@github.com:{owner}/repo.git"], repo)
-    _run(["git", "config", "branch.feature.remote", remote], repo)
     _run(["git", "config", "branch.feature.merge", f"refs/heads/{head_ref}"], repo)
 
 
@@ -121,21 +119,14 @@ def test_github_info_not_a_git_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert info["reason"] == "not_a_git_repo"
 
 
-def _is_bare_pr_view(argv: Sequence[str]) -> bool:
-    """True for ``gh pr view --json …`` (no selector), False for ``… <selector> --json``."""
-    return tuple(argv[:2]) == ("pr", "view") and (len(argv) <= 2 or argv[2] == "--json")
+def test_github_info_pr_via_pr_list_head(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The PR resolves in one ``gh pr list --head`` call keyed by the pushed ref.
 
-
-def test_github_info_pr_fallback_via_owner_head_selector(
-    repo: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A PR a bare ``gh pr view`` can't resolve is recovered via ``<owner>:<head-ref>``.
-
-    In a fork / triangular flow the head is ``acme:alice/feature`` — owner from
-    the push remote's URL, head ref from ``branch.<n>.merge`` — both differing
-    from the checkout's ``feature``, so the retry must name the head from those.
+    In a fork / triangular flow the pushed ref (``alice/feature``, from
+    ``branch.<n>.merge``) differs from the checkout's ``feature``; ``--head``
+    matches on the ref name alone, finding a PR a bare ``gh pr view`` would miss.
     """
-    _set_fork_push(repo, owner="acme", head_ref="alice/feature")
+    _set_pushed_ref(repo, "alice/feature")
     pr = {
         "number": 42,
         "title": "Add thing",
@@ -156,9 +147,8 @@ def test_github_info_pr_fallback_via_owner_head_selector(
             return (0, "", "")
         if head == ("repo", "view"):
             return (0, json.dumps({"nameWithOwner": "acme/repo"}), "")
-        if head == ("pr", "view"):
-            # The bare form finds nothing; the explicit selector resolves the PR.
-            return (1, "", "not found") if _is_bare_pr_view(argv) else (0, json.dumps(pr), "")
+        if head == ("pr", "list"):
+            return (0, json.dumps([pr]), "")
         return (1, "", "no stub")
 
     monkeypatch.setattr(github_resource, "_gh", fake_gh)
@@ -169,15 +159,20 @@ def test_github_info_pr_fallback_via_owner_head_selector(
     assert info["pr"]["head_ref"] == "alice/feature"
     assert info["pr"]["is_draft"] is True
     assert info["base_ref"] == "main"
-    # The retry named the head as <push-remote-owner>:<upstream-ref>.
-    selectors = [c[2] for c in calls if not _is_bare_pr_view(c) and c[:2] == ("pr", "view")]
-    assert selectors == ["acme:alice/feature"]
+    # One resolve call: gh pr list --head <pushed ref> --state all, no gh pr view.
+    list_calls = [c for c in calls if c[:2] == ("pr", "list")]
+    assert len(list_calls) == 1
+    args = list_calls[0]
+    assert args[args.index("--head") + 1] == "alice/feature"
+    assert args[args.index("--state") + 1] == "all"
+    assert not any(c[:2] == ("pr", "view") for c in calls)
 
 
-def test_github_info_pr_view_hit_skips_fallback(
+def test_github_info_pr_no_upstream_uses_pr_view(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When the bare ``gh pr view`` resolves the PR, no ``<owner>:<head-ref>`` retry runs."""
+    """With no upstream to name the head, fall back to a bare ``gh pr view``."""
+    # The fixture's `feature` branch has no configured upstream.
     view = {
         "number": 5,
         "title": "t",
@@ -207,29 +202,25 @@ def test_github_info_pr_view_hit_skips_fallback(
 
     info = github_info(str(repo))
     assert info["pr"]["number"] == 5
-    # Only the bare form ran; no explicit-selector retry.
-    assert all(_is_bare_pr_view(c) for c in calls if c[:2] == ("pr", "view"))
+    # No upstream → bare gh pr view, never gh pr list.
+    assert any(c[:2] == ("pr", "view") for c in calls)
+    assert not any(c[:2] == ("pr", "list") for c in calls)
 
 
-def test_github_changed_files_fallback_via_owner_head_selector(
+def test_github_changed_files_via_pr_list_head(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The changed-files list resolves a PR the bare ``gh pr view`` misses.
+    """The changed-files list resolves the PR number via ``gh pr list --head`` too.
 
-    Exercises the second call site (:func:`_pr_number`): the bare view finds
-    nothing, the ``<owner>:<head-ref>`` retry supplies the number, and the files
-    fetch runs.
+    Exercises the second call site (:func:`_pr_number`): ``gh pr list --head``
+    supplies the number, then the files fetch runs.
     """
-    _set_fork_push(repo, owner="acme", head_ref="alice/feature")
+    _set_pushed_ref(repo, "alice/feature")
     files = [{"filename": "a.py", "status": "added", "additions": 1, "deletions": 0}]
 
     def fake_gh(argv: Sequence[str], *, cwd: str) -> tuple[int, str, str]:
-        if tuple(argv[:2]) == ("pr", "view"):
-            return (
-                (1, "", "not found")
-                if _is_bare_pr_view(argv)
-                else (0, json.dumps({"number": 9}), "")
-            )
+        if tuple(argv[:2]) == ("pr", "list"):
+            return (0, json.dumps([{"number": 9}]), "")
         if argv and argv[0] == "api":
             return (0, json.dumps(files), "")
         return (1, "", "no stub")
