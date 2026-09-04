@@ -1347,6 +1347,18 @@ export function AppShell() {
   // embedded build we claim the chord ahead of any host-page ⌘K listener.
   // Bound here where the palette's open-state lives.
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  // Stable handlers so the memoized Sidebar doesn't re-render on AppShell's
+  // frequent re-renders (chatStore status churn during a bind). Inline
+  // callbacks would give it fresh props each time and defeat the memo.
+  const handleSidebarClose = useCallback(() => {
+    setSidebarOpen(false);
+    setSidebarPeek(false);
+  }, []);
+  const handleSidebarOpen = useCallback(() => {
+    setSidebarOpen(true);
+    setSidebarPeek(false);
+  }, []);
+  const handleOpenSearch = useCallback(() => setCommandPaletteOpen(true), []);
   const isEmbedded = useIsEmbedded();
   useCommandPaletteHotkey(() => setCommandPaletteOpen((prev) => !prev));
   useNewSessionHotkey(!isEmbedded);
@@ -1882,17 +1894,11 @@ export function AppShell() {
           cluster on a narrow window. The strip stays pure drag surface. */}
             <Sidebar
               open={sidebarOpen}
-              onOpen={() => {
-                setSidebarOpen(true);
-                setSidebarPeek(false);
-              }}
+              onOpen={handleSidebarOpen}
               peek={sidebarPeek}
               dragProgress={sidebarDragProgress}
-              onClose={() => {
-                setSidebarOpen(false);
-                setSidebarPeek(false);
-              }}
-              onOpenSearch={() => setCommandPaletteOpen(true)}
+              onClose={handleSidebarClose}
+              onOpenSearch={handleOpenSearch}
             />
 
             {/* Content region (everything right of the sidebar): a relative
