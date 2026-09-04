@@ -7,6 +7,7 @@ import type { ComponentProps, ReactNode } from "react";
 import { createContext, memo, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { Streamdown } from "streamdown";
 
+import { CodeBlockGuardedPre } from "./code-block-boundary";
 import { normalizeExplicitMathDelimiters } from "./mathMarkdown";
 import { Shimmer } from "./shimmer";
 import { MarkdownErrorBoundary } from "./MarkdownErrorBoundary";
@@ -31,6 +32,9 @@ interface ReasoningContextValue {
 }
 
 const ReasoningContext = createContext<ReasoningContextValue | null>(null);
+
+// Module-level so the components map keeps a stable identity across renders.
+const REASONING_COMPONENTS = { pre: CodeBlockGuardedPre };
 
 export const useReasoning = () => {
   const context = useContext(ReasoningContext);
@@ -198,6 +202,9 @@ export const ReasoningContent = memo(({ className, children, ...props }: Reasoni
     >
       <MarkdownErrorBoundary source={normalizedChildren}>
         <Streamdown
+          // Contain a code-block render fault (e.g. a failed lazy chunk) to
+          // that block instead of degrading the whole reasoning section.
+          components={REASONING_COMPONENTS}
           plugins={STREAMDOWN_PLUGINS}
           // Let links open on a plain click (and cmd/ctrl-click in a new tab)
           // instead of Streamdown's default "Open external link?" modal.

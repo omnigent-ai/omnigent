@@ -7,11 +7,9 @@ import { copyText } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
 import type { UIMessage } from "ai";
 import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, CopyIcon, WrapTextIcon } from "lucide-react";
-import type { ComponentProps, HTMLAttributes, ReactElement, ReactNode } from "react";
+import type { ComponentProps, HTMLAttributes, ReactElement } from "react";
 import {
-  cloneElement,
   createContext,
-  isValidElement,
   memo,
   useCallback,
   useContext,
@@ -22,6 +20,7 @@ import {
 } from "react";
 import { Streamdown, type StreamdownProps } from "streamdown";
 
+import { CodeBlockBoundary, extractCodeText, tagCodeBlock } from "./code-block-boundary";
 import { MarkdownErrorBoundary } from "./MarkdownErrorBoundary";
 
 import {
@@ -322,26 +321,6 @@ function getChatCodeControls(controls: StreamdownProps["controls"]): StreamdownP
   return { code: { copy: false, download: true } };
 }
 
-function extractCodeText(children: ReactNode): string {
-  if (typeof children === "string" || typeof children === "number") {
-    return String(children);
-  }
-
-  if (Array.isArray(children)) {
-    return children.map(extractCodeText).join("");
-  }
-
-  if (isValidElement(children)) {
-    const props = children.props as { children?: ReactNode; code?: unknown };
-    if (typeof props.code === "string") {
-      return props.code;
-    }
-    return extractCodeText(props.children);
-  }
-
-  return "";
-}
-
 // Shared visual style for the buttons overlaid on a chat code block (copy,
 // wrap toggle). The frosted/ghost look matches the rest of the chat surface;
 // positioning lives on the container in ChatCodeBlockPre, not here, so the
@@ -422,13 +401,12 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
   // horizontal-scroll view for when column alignment matters.
   const [wrap, setWrap] = useState(true);
   const toggleWrap = useCallback(() => setWrap((w) => !w), []);
-  const block = isValidElement(children)
-    ? cloneElement(children, { "data-block": "true" } as Record<string, unknown>)
-    : children;
 
   return (
     <div className={cn("relative", wrap && "chat-code-wrap")}>
-      {block}
+      {/* Contained so a chunk-load fault degrades this block to plain source
+          instead of tripping the whole-message boundary below. */}
+      <CodeBlockBoundary>{tagCodeBlock(children)}</CodeBlockBoundary>
       {/* Overlay actions, anchored left of Streamdown's own download button
           (which sits at the header's right edge). A flex row lets the buttons
           self-arrange, so neither needs a hardcoded horizontal offset. */}
