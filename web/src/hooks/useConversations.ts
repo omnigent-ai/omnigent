@@ -343,15 +343,16 @@ function withRecentlyCreated(
   project: string | undefined,
   includeArchived: boolean,
   queryClient: QueryClient,
-  visibility?: "mine" | "shared",
+  visibility?: "mine" | "shared" | "archived",
 ): ConversationsPage {
-  // Recently-created sessions are always owned by the viewer, so skip injection
-  // for the "shared" visibility filter where they would not belong.
+  // Recently-created sessions are always owned (active, not archived), so skip
+  // injection for "shared" and "archived" filters where they would not belong.
   if (
     after !== undefined ||
     searchQuery ||
     project ||
     visibility === "shared" ||
+    visibility === "archived" ||
     recentlyCreatedSessions.size === 0
   ) {
     return page;
