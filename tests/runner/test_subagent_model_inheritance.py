@@ -253,6 +253,26 @@ async def test_family_mismatch_blocks_inheritance_quietly(
 
 
 @pytest.mark.asyncio
+async def test_kimi_cli_default_blocks_parent_model_inheritance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An omitted Kimi model stays on the CLI default instead of parent Opus."""
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("kimi-native"),
+        conv_id="conv_parent_kimi_cli_default",
+        parent_snapshot={
+            "id": "conv_parent_kimi_cli_default",
+            "agent_id": "ag_parent",
+            "model_override": "claude-opus-4-8",
+            "llm_model": None,
+        },
+    )
+
+    assert "model_override" not in bodies[0]
+
+
+@pytest.mark.asyncio
 async def test_unplumbed_harness_blocks_inheritance_quietly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
