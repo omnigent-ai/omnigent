@@ -211,6 +211,7 @@ writing nothing to disk — use HTTPS repository URLs. Details by provider match
 | `env` | Optional list of SERVER env-var names to inject as literal Pod env (prefer `secret_name` for credentials). |
 | `node_selector` | Optional extra node labels, merged with a default `kubernetes.io/arch: amd64` — set that key to `arm64` to schedule runners on arm64 nodes. |
 | `resources` | Optional `requests` / `limits` (`cpu` / `memory`) override. |
+| `pod_ready_timeout_s` | Optional override for how long to wait for a runner Pod to reach `Running` (schedule + image pull + init container) before failing the launch — default 90s. Raise it for deployments whose host image regularly takes longer to pull. Also settable via env: `OMNIGENT_K8S_POD_READY_TIMEOUT_S` (this key takes precedence when both are set). |
 | `in_cluster` | Optional cluster-config source: `true` (in-cluster SA only), `false` (kubeconfig only), omit (try in-cluster, then kubeconfig). |
 | `kubeconfig` | Optional kubeconfig path for the out-of-cluster fallback (env: `OMNIGENT_KUBERNETES_KUBECONFIG`). |
 | `pvc_mounts` | Optional pre-created PersistentVolumeClaims mounted into every runner Pod — see [Persistent storage mounts](#persistent-storage-mounts-pvc_mounts). |

@@ -152,11 +152,12 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("MainTerminalView — terminal-first SDK sessions", () => {
-  it("renders the REPL chrome-free: shells and the + stay out of the pill view", () => {
+  it("renders the REPL chrome-free: shells and the + stay out of the pill view", async () => {
     renderView({ terminals: [REPL_TERMINAL, BASH_SHELL] });
 
-    // The agent's terminal fills the pane.
-    expect(screen.getByTestId("terminal-view")).toHaveAttribute(
+    // The agent's terminal fills the pane. findByTestId waits for the lazy
+    // TerminalView chunk to resolve through its Suspense boundary.
+    expect(await screen.findByTestId("terminal-view")).toHaveAttribute(
       "data-terminal-id",
       "terminal_tui_main",
     );

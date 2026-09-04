@@ -10,7 +10,7 @@ empty because nothing mirrors the transcript back into the session.
 This module is that missing mirror — the qwen analog of
 :mod:`omnigent.goose_native_forwarder`. Where goose has to scrape a SQLite store,
 qwen emits a structured **stream-json event stream** (verified Anthropic-shaped
-against ``qwen`` v0.18.1): we tail the ``--json-file`` NDJSON by byte offset and
+against ``qwen`` v0.18.1 and v0.21.14): we tail the ``--json-file`` NDJSON by byte offset and
 POST each new ``user`` / ``assistant`` message as an ``external_conversation_item``
 event (which also seeds the session title).
 
@@ -26,9 +26,14 @@ Event shapes consumed (others are ignored defensively):
   these as web elicitation cards. This forwarder ignores them (they carry no
   transcript prose to mirror).
 
-Status (``running``/``idle``) is intentionally NOT posted here: the runner's
-PTY-activity watcher owns those edges for qwen-native (see
-:mod:`omnigent.runner.app`), exactly as for goose-/cursor-native.
+Qwen v0.18 emits a terminating top-level ``result`` record. Qwen v0.21.14 no
+longer emits that record; it ends each model invocation with a nested
+``stream_event.message_stop``. For v0.21, a ``message_stop`` is terminal only
+when the preceding assistant message is not a ``tool_use`` stop — tool-use
+cycles continue with tool-result events and another model invocation. The
+forwarder posts ``external_session_status`` from either real turn boundary with
+the last assistant text, while the runner's PTY watcher remains a read-only UI
+signal.
 
 This module also hosts the **compaction mirror** (:func:`supervise_qwen_compaction_mirror`).
 qwen compaction (its *compression*) is invisible on the ``--json-file`` stream
@@ -51,7 +56,7 @@ import logging
 import os
 import re
 import time
-from collections.abc import Container, Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -108,6 +113,10 @@ class _ForwardState:
 
     offset: int = 0
     seen_uuids: list[str] | None = None
+    last_assistant_text: str = ""
+    # ``None`` means no assistant message is awaiting its ``message_stop``;
+    # ``""`` represents qwen's JSON null/missing terminal stop reason.
+    last_assistant_stop_reason: str | None = None
 
 
 def _read_state(bridge_dir: Path) -> _ForwardState:
@@ -122,6 +131,16 @@ def _read_state(bridge_dir: Path) -> _ForwardState:
     return _ForwardState(
         offset=offset if isinstance(offset, int) and offset >= 0 else 0,
         seen_uuids=[u for u in seen if isinstance(u, str)] if isinstance(seen, list) else [],
+        last_assistant_text=(
+            data.get("last_assistant_text")
+            if isinstance(data.get("last_assistant_text"), str)
+            else ""
+        ),
+        last_assistant_stop_reason=(
+            data.get("last_assistant_stop_reason")
+            if isinstance(data.get("last_assistant_stop_reason"), str)
+            else None
+        ),
     )
 
 
@@ -135,7 +154,14 @@ def _write_state(bridge_dir: Path, state: _ForwardState) -> bool:
         # _DEDUP_WINDOW uuids — the ones a relaunch re-read is most likely to hit.
         seen = (state.seen_uuids or [])[-_DEDUP_WINDOW:]
         tmp.write_text(
-            json.dumps({"offset": state.offset, "seen_uuids": seen}),
+            json.dumps(
+                {
+                    "offset": state.offset,
+                    "seen_uuids": seen,
+                    "last_assistant_text": state.last_assistant_text,
+                    "last_assistant_stop_reason": state.last_assistant_stop_reason,
+                }
+            ),
             encoding="utf-8",
         )
         os.replace(tmp, bridge_dir / _STATE_FILE)
@@ -158,6 +184,16 @@ class _MirrorItem:
     uuid: str
     item_type: str
     item_data: dict[str, object]
+    response_id: str
+
+
+@dataclass
+class _TerminalStatus:
+    """One authoritative qwen turn-completion record."""
+
+    uuid: str
+    status: str
+    output: str | None
     response_id: str
 
 
@@ -221,36 +257,94 @@ def _event_to_item(event: dict[str, object], agent_name: str) -> _MirrorItem | N
     )
 
 
-def _read_new_events(
-    events_file: Path, offset: int, seen: Container[str], agent_name: str
-) -> tuple[list[_MirrorItem], int]:
-    """Read NDJSON lines past *offset*, returning new mirror items + the new offset.
+def _assistant_stop_reason(event: dict[str, object]) -> str | None:
+    """Return the stop reason from a top-level assistant event.
 
-    Detects a truncated/recreated event file (``size < offset``) and rewinds to 0.
-    Only fully terminated lines (ending in ``\\n``) are consumed; a trailing
-    partial line is left for the next poll by not advancing past it.
+    ``None`` means *not an assistant event*. Qwen serializes a successful final
+    answer with a JSON null (and older fixtures omit the key), represented here
+    as ``""`` so it remains distinguishable from no assistant context.
     """
+    if event.get("type") != "assistant":
+        return None
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return None
+    stop_reason = message.get("stop_reason")
+    return stop_reason if isinstance(stop_reason, str) else ""
+
+
+def _event_to_terminal(
+    event: dict[str, object],
+    last_assistant_text: str,
+    last_assistant_stop_reason: str | None = None,
+) -> _TerminalStatus | None:
+    """Convert qwen's version-specific terminating record to session status."""
+    event_type = event.get("type")
+    if event_type == "result":
+        # Qwen's result builder permits caller-defined success subtypes;
+        # is_error is the protocol's authoritative discriminator.
+        failed = event.get("is_error") is True
+        result = event.get("result")
+        result_text = result.strip() if isinstance(result, str) else ""
+        output = result_text or last_assistant_text or None
+    elif event_type == "stream_event":
+        stream_event = event.get("event")
+        if (
+            not isinstance(stream_event, dict)
+            or stream_event.get("type") != "message_stop"
+            or last_assistant_stop_reason is None
+            or last_assistant_stop_reason == "tool_use"
+        ):
+            return None
+        # message_stop carries no error channel: a v0.21 turn that dies is
+        # surfaced by the runner's terminal-exit watcher, not this edge.
+        failed = False
+        output = last_assistant_text or None
+    else:
+        return None
+    uuid = event.get("uuid")
+    if not isinstance(uuid, str) or not uuid:
+        return None
+    return _TerminalStatus(
+        uuid=uuid,
+        status="failed" if failed else "idle",
+        output=output,
+        response_id=f"qwen:{uuid}",
+    )
+
+
+def _read_new_forward_events(
+    events_file: Path,
+    offset: int,
+    seen: Collection[str],
+    agent_name: str,
+    last_assistant_text: str,
+    last_assistant_stop_reason: str | None = None,
+) -> tuple[list[_MirrorItem | _TerminalStatus], int, str, str | None]:
+    """Read mirror items and terminal records in wire order past *offset*."""
     try:
         size = events_file.stat().st_size
     except OSError:
-        return [], offset
+        return [], offset, last_assistant_text, last_assistant_stop_reason
     if size < offset:
-        offset = 0  # file truncated by a relaunched terminal
+        offset = 0
+        last_assistant_text = ""
+        last_assistant_stop_reason = None
     if size == offset:
-        return [], offset
+        return [], offset, last_assistant_text, last_assistant_stop_reason
     try:
         with open(events_file, "rb") as fh:
             fh.seek(offset)
             data = fh.read(size - offset)
     except OSError:
-        return [], offset
-    # Only consume up to the last newline; keep any trailing partial line.
+        return [], offset, last_assistant_text, last_assistant_stop_reason
     last_nl = data.rfind(b"\n")
     if last_nl == -1:
-        return [], offset  # no complete line yet
+        return [], offset, last_assistant_text, last_assistant_stop_reason
     consumed = data[: last_nl + 1]
     new_offset = offset + len(consumed)
-    items: list[_MirrorItem] = []
+    actions: list[_MirrorItem | _TerminalStatus] = []
+    encountered = set(seen)
     for raw in consumed.split(b"\n"):
         raw = raw.strip()
         if not raw:
@@ -258,13 +352,43 @@ def _read_new_events(
         try:
             event = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
-            continue  # tolerate a malformed line rather than stalling the tail
+            continue
         if not isinstance(event, dict):
             continue
+        if event.get("type") == "user":
+            last_assistant_stop_reason = None
+        assistant_stop_reason = _assistant_stop_reason(event)
+        if assistant_stop_reason is not None:
+            last_assistant_stop_reason = assistant_stop_reason
         item = _event_to_item(event, agent_name)
-        if item is not None and item.uuid not in seen:
-            items.append(item)
-    return items, new_offset
+        if item is not None and item.uuid not in encountered:
+            actions.append(item)
+            encountered.add(item.uuid)
+            last_assistant_text = _assistant_text_after_action(last_assistant_text, item)
+            continue
+        terminal = _event_to_terminal(event, last_assistant_text, last_assistant_stop_reason)
+        if terminal is not None and terminal.uuid not in encountered:
+            actions.append(terminal)
+            encountered.add(terminal.uuid)
+            last_assistant_text = ""
+            last_assistant_stop_reason = None
+    return actions, new_offset, last_assistant_text, last_assistant_stop_reason
+
+
+def _assistant_text_after_action(current: str, action: _MirrorItem | _TerminalStatus) -> str:
+    """Return the assistant buffer after one successfully delivered action."""
+    if isinstance(action, _TerminalStatus):
+        return ""
+    role = action.item_data.get("role")
+    if role == "user":
+        return ""
+    if role != "assistant":
+        return current
+    content = action.item_data.get("content")
+    if not isinstance(content, list) or not content or not isinstance(content[0], dict):
+        return current
+    text = content[0].get("text")
+    return text if isinstance(text, str) else current
 
 
 async def _post_conversation_item(
@@ -283,6 +407,47 @@ async def _post_conversation_item(
         },
     )
     resp.raise_for_status()
+
+
+async def _post_external_session_status(
+    client: httpx.AsyncClient, *, session_id: str, terminal: _TerminalStatus
+) -> None:
+    """POST one authoritative qwen terminal edge."""
+    data: dict[str, object] = {
+        "status": terminal.status,
+        "response_id": terminal.response_id,
+    }
+    if terminal.output is not None:
+        data["output"] = terminal.output
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_session_status", "data": data},
+    )
+    resp.raise_for_status()
+
+
+async def _deliver_forward_actions(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    state: _ForwardState,
+    actions: list[_MirrorItem | _TerminalStatus],
+) -> None:
+    """Deliver actions in order and durably commit each successful POST."""
+    seen = _new_seen(state.seen_uuids)
+    for action in actions:
+        if isinstance(action, _MirrorItem):
+            await _post_conversation_item(client, session_id=session_id, item=action)
+        else:
+            await _post_external_session_status(client, session_id=session_id, terminal=action)
+        seen[action.uuid] = None
+        state.seen_uuids = list(seen)
+        state.last_assistant_text = _assistant_text_after_action(state.last_assistant_text, action)
+        # Keep the prior offset until every action from this read is delivered.
+        # On a later POST failure, retry re-reads the batch but skips each
+        # already-delivered uuid while retaining the assistant output.
+        _write_state(bridge_dir, state)
 
 
 async def forward_qwen_events_to_session(
@@ -314,27 +479,39 @@ async def forward_qwen_events_to_session(
     :returns: Never normally returns; cancel the task to stop it.
     """
     target = events_file or events_file_path(bridge_dir)
-    persisted = _read_state(bridge_dir)
-    offset = persisted.offset
-    seen = _new_seen(persisted.seen_uuids)
+    state = _read_state(bridge_dir)
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     from omnigent.cli_auth import open_server_client
 
     async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:
             try:
-                items, new_offset = await asyncio.to_thread(
-                    _read_new_events, target, offset, seen, agent_name
+                (
+                    actions,
+                    new_offset,
+                    next_assistant_text,
+                    next_assistant_stop_reason,
+                ) = await asyncio.to_thread(
+                    _read_new_forward_events,
+                    target,
+                    state.offset,
+                    _new_seen(state.seen_uuids),
+                    agent_name,
+                    state.last_assistant_text,
+                    state.last_assistant_stop_reason,
                 )
-                for item in items:
-                    await _post_conversation_item(client, session_id=session_id, item=item)
-                    seen[item.uuid] = None
-                if new_offset != offset or items:
-                    offset = new_offset
-                    _write_state(
-                        bridge_dir,
-                        _ForwardState(offset=offset, seen_uuids=list(seen)),
-                    )
+                await _deliver_forward_actions(
+                    client,
+                    session_id=session_id,
+                    bridge_dir=bridge_dir,
+                    state=state,
+                    actions=actions,
+                )
+                if new_offset != state.offset or actions:
+                    state.offset = new_offset
+                    state.last_assistant_text = next_assistant_text
+                    state.last_assistant_stop_reason = next_assistant_stop_reason
+                    _write_state(bridge_dir, state)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -438,7 +615,7 @@ def _compaction_status_from_record(record: dict[str, object]) -> str | None:
 def _read_new_compaction_statuses(recording: Path, offset: int) -> tuple[list[str], int]:
     """Read NDJSON lines past *offset*, returning new compaction statuses + offset.
 
-    Same tail discipline as :func:`_read_new_events` (truncation rewind, only
+    Same tail discipline as :func:`_read_new_forward_events` (truncation rewind, only
     newline-terminated lines consumed), but scoped to ``chat_compression`` records.
     """
     try:

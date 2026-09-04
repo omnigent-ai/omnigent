@@ -318,6 +318,7 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
           cost_control_mode_override?: "on" | "off" | null;
           subagent_routing_override?: "on" | "off" | null;
           collaboration_mode?: string;
+          approval_mode?: string;
         })
       : {};
     const labels = { ...(sessionLabels.get(sessionId) ?? {}) };
@@ -339,6 +340,10 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
     }
     if ("collaboration_mode" in body && typeof body.collaboration_mode === "string") {
       labels["omnigent.codex_native.collaboration_mode"] = body.collaboration_mode;
+      sessionLabels.set(sessionId, labels);
+    }
+    if ("approval_mode" in body && typeof body.approval_mode === "string") {
+      labels["omnigent.codex_native.approval_mode"] = body.approval_mode;
       sessionLabels.set(sessionId, labels);
     }
     return mockResponse({
@@ -3310,6 +3315,54 @@ describe("chatStore — send (file attachments)", () => {
     ]);
   });
 
+  it("gives same-named attachments distinct optimistic ids", async () => {
+    // Pasted screenshots all arrive named "image.png". The optimistic
+    // "pending:" placeholder must key on File identity, not the name, or the
+    // two blocks collide on one id — React dedupes on the shared render key
+    // and strands a ghost chip until a refresh swaps in the server ids.
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+
+    // Hold the upload open so we can inspect the optimistic bubble before
+    // real ids land.
+    let releaseUpload: () => void = () => {};
+    const uploadGate = new Promise<void>((resolve) => {
+      releaseUpload = resolve;
+    });
+    let uploadSeq = 0;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/resources/files")) {
+        await uploadGate;
+        uploadSeq += 1;
+        return mockResponse({
+          id: `file_real_${uploadSeq}`,
+          name: "image.png",
+          metadata: { filename: "image.png", bytes: 10, created_at: 0 },
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const a = new File(["a"], "image.png", { type: "image/png" });
+    const b = new File(["b"], "image.png", { type: "image/png" });
+    const sendPromise = useChatStore.getState().send("two shots", "agent_xyz", [a, b]);
+
+    // Optimistic bubble, before the upload resolves: two image blocks with
+    // distinct placeholder ids so both chips render.
+    const optimistic = useChatStore.getState().pendingUserMessages[0]!.content;
+    const imageIds = optimistic
+      .filter((c) => c.type === "input_image")
+      .map((c) => (c as { file_id: string }).file_id);
+    expect(imageIds).toHaveLength(2);
+    expect(new Set(imageIds).size).toBe(2);
+
+    releaseUpload();
+    await sendPromise;
+  });
+
   it("preserves the real file_id through a text-only consumed event", async () => {
     // End-to-end claude-native: upload → text-only consumed event →
     // promoted bubble must carry the real id so UserBubble takes the
@@ -4421,10 +4474,13 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(useChatStore.getState().mcpStartup).toBeNull();
     });
 
-    it("retains failed and cancelled servers after startup settles", () => {
-      // The settled-with-failures map is what lets the page say which
-      // servers never came up (mirrors the Codex TUI's startup warnings).
-      useChatStore.setState({ mcpStartup: null });
+    it("drops a settled map with failures and cancellations — diagnostics stay out of the chat", () => {
+      // A settled round must clear the band even when servers never came
+      // up: startup failures are setup diagnostics for host logs, and
+      // retaining them rendered an inline notice in the chat viewport.
+      useChatStore.setState({
+        mcpStartup: { safe: { status: "starting", error: null } },
+      });
       handleSessionEvent({
         type: "session_mcp_startup",
         conversationId: "conv_abc",
@@ -4433,9 +4489,84 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
           "storage-console": { status: "cancelled", error: null },
         },
       });
+      expect(useChatStore.getState().mcpStartup).toBeNull();
+    });
+
+    it("keeps an in-flight map that already carries a failure — the spinner names the rest", () => {
+      // While any server is still starting the round is live: the map is
+      // retained so the band keeps naming the still-pending servers.
+      useChatStore.setState({ mcpStartup: null });
+      handleSessionEvent({
+        type: "session_mcp_startup",
+        conversationId: "conv_abc",
+        servers: {
+          safe: { status: "failed", error: "handshake failed" },
+          "storage-console": { status: "starting", error: null },
+        },
+      });
       expect(useChatStore.getState().mcpStartup).toEqual({
         safe: { status: "failed", error: "handshake failed" },
-        "storage-console": { status: "cancelled", error: null },
+        "storage-console": { status: "starting", error: null },
+      });
+    });
+
+    it("drops a settled-with-failures map arriving via the session snapshot", async () => {
+      // A client reloading after a failed startup round reads the map
+      // from the snapshot, not the live stream. The snapshot intake must
+      // apply the same live-round-only rule, or a reload resurrects the
+      // inline failure notice the live handler drops.
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (
+          url.split("?")[0] === "/v1/sessions/conv_mcp_snapshot" &&
+          (init?.method ?? "GET") === "GET"
+        ) {
+          return mockResponse({
+            id: "conv_mcp_snapshot",
+            agent_id: "agent_xyz",
+            status: "idle",
+            created_at: 0,
+            items: [],
+            mcp_startup: {
+              safe: { status: "failed", error: "handshake failed" },
+            },
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      await useChatStore.getState().switchTo("conv_mcp_snapshot");
+
+      expect(useChatStore.getState().mcpStartup).toBeNull();
+    });
+
+    it("seeds an in-flight map arriving via the session snapshot", async () => {
+      // The mid-boot reload is the case the band's snapshot seeding
+      // exists for — the live-round-only rule must not drop it.
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (
+          url.split("?")[0] === "/v1/sessions/conv_mcp_booting" &&
+          (init?.method ?? "GET") === "GET"
+        ) {
+          return mockResponse({
+            id: "conv_mcp_booting",
+            agent_id: "agent_xyz",
+            status: "idle",
+            created_at: 0,
+            items: [],
+            mcp_startup: {
+              safe: { status: "starting", error: null },
+            },
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      await useChatStore.getState().switchTo("conv_mcp_booting");
+
+      expect(useChatStore.getState().mcpStartup).toEqual({
+        safe: { status: "starting", error: null },
       });
     });
   });
@@ -4868,6 +4999,31 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         permissionMode: "plan",
       });
       expect(useChatStore.getState().claudePermissionMode).toBe("default");
+    });
+  });
+
+  describe("session.codex_approval_mode", () => {
+    it("moves the picker to an approval mode switched inside the TUI", () => {
+      // A /permissions change in the Codex TUI emits no event of its own; the
+      // forwarder observes thread/settings/updated and the server republishes
+      // it here, which is the only way the web picker learns about it.
+      useChatStore.setState({ conversationId: "conv_abc", codexApprovalMode: "" });
+      handleSessionEvent({
+        type: "session_codex_approval_mode",
+        conversationId: "conv_abc",
+        approvalMode: "approve-for-me",
+      });
+      expect(useChatStore.getState().codexApprovalMode).toBe("approve-for-me");
+    });
+
+    it("ignores an approval-mode event from a different session", () => {
+      useChatStore.setState({ conversationId: "conv_open", codexApprovalMode: "ask-for-approval" });
+      handleSessionEvent({
+        type: "session_codex_approval_mode",
+        conversationId: "conv_other",
+        approvalMode: "full-access",
+      });
+      expect(useChatStore.getState().codexApprovalMode).toBe("ask-for-approval");
     });
   });
 
@@ -5453,6 +5609,68 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       useChatStore.setState({ activeResponse: null });
       handleSessionEvent({ type: "session_interrupted", requestedAt: 0 });
       expect(useChatStore.getState().activeResponse).toBeNull();
+    });
+  });
+
+  describe("response.completed / response.failed (context ring)", () => {
+    it("applies usage from a completed turn to tokensUsed", () => {
+      useChatStore.setState({ tokensUsed: 2_000 });
+      handleSessionEvent({
+        type: "response_completed",
+        response: {
+          id: "resp_ok",
+          status: "completed",
+          model: "m",
+          usage: {
+            inputTokens: 100_000,
+            outputTokens: 5,
+            totalTokens: 100_005,
+            contextTokens: 100_000,
+          },
+        },
+      });
+      expect(useChatStore.getState().tokensUsed).toBe(100_000);
+    });
+
+    it("applies usage from a FAILED turn to tokensUsed (meter must not freeze)", () => {
+      // A turn that dies after the model call started still observed its
+      // prompt size; the failed terminal event carries it. Pre-fix only
+      // response_completed updated the ring, so a failed turn left it
+      // frozen at the previous successful turn's value.
+      useChatStore.setState({ tokensUsed: 2_000 });
+      handleSessionEvent({
+        type: "response_failed",
+        response: {
+          id: "resp_fail",
+          status: "failed",
+          model: "m",
+          usage: {
+            inputTokens: 100_000,
+            outputTokens: 0,
+            totalTokens: 100_000,
+            contextTokens: 100_000,
+          },
+          error: { code: "RuntimeError", message: "inner executor error: auth failed" },
+        },
+      });
+      expect(useChatStore.getState().tokensUsed).toBe(100_000);
+    });
+
+    it("leaves tokensUsed alone when a failed turn carries no usage", () => {
+      // Executors that observed nothing before failing report usage: null —
+      // the ring keeps the previous turn's value rather than zeroing.
+      useChatStore.setState({ tokensUsed: 2_000 });
+      handleSessionEvent({
+        type: "response_failed",
+        response: {
+          id: "resp_fail2",
+          status: "failed",
+          model: "m",
+          usage: null,
+          error: { code: "RuntimeError", message: "boom" },
+        },
+      });
+      expect(useChatStore.getState().tokensUsed).toBe(2_000);
     });
   });
 
@@ -7384,6 +7602,89 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     expect(useChatStore.getState().codexPlanMode).toBe(false);
     expect(sessionLabels.get("conv_plan_failure")).not.toHaveProperty(
       "omnigent.codex_native.collaboration_mode",
+    );
+  });
+
+  it("hydrates Codex approval mode from the label on switch", async () => {
+    seedSession("conv_approval_hydrate", []);
+    withSnapshot("conv_approval_hydrate", {
+      labels: {
+        "omnigent.wrapper": "codex-native-ui",
+        "omnigent.codex_native.approval_mode": "approve-for-me",
+      },
+    });
+
+    await useChatStore.getState().switchTo("conv_approval_hydrate");
+
+    expect(useChatStore.getState().codexApprovalMode).toBe("approve-for-me");
+  });
+
+  it("leaves Codex approval mode empty when the label is absent", async () => {
+    // Label-only reader: no label means unset (the picker shows a
+    // placeholder), never a guessed default.
+    seedSession("conv_approval_unset", []);
+    withSnapshot("conv_approval_unset", { labels: { "omnigent.wrapper": "codex-native-ui" } });
+
+    await useChatStore.getState().switchTo("conv_approval_unset");
+
+    expect(useChatStore.getState().codexApprovalMode).toBe("");
+  });
+
+  it("leaves Codex approval mode empty on a non-Codex session", async () => {
+    seedSession("conv_approval_non_codex", []);
+    withSnapshot("conv_approval_non_codex", {
+      labels: { "omnigent.codex_native.approval_mode": "approve-for-me" },
+    });
+
+    await useChatStore.getState().switchTo("conv_approval_non_codex");
+
+    expect(useChatStore.getState().codexApprovalMode).toBe("");
+  });
+
+  it("PATCHes Codex approval mode and settles from the returned label", async () => {
+    seedSession("conv_approval_toggle", []);
+    withSnapshot("conv_approval_toggle", { labels: { "omnigent.wrapper": "codex-native-ui" } });
+    await useChatStore.getState().switchTo("conv_approval_toggle");
+    fetchMock.mockClear();
+
+    await useChatStore.getState().setCodexApprovalMode("approve-for-me");
+
+    expect(patchCallsFor("conv_approval_toggle")).toEqual([{ approval_mode: "approve-for-me" }]);
+    expect(useChatStore.getState().codexApprovalMode).toBe("approve-for-me");
+  });
+
+  it("rolls back Codex approval mode when the PATCH is rejected", async () => {
+    seedSession("conv_approval_failure", []);
+    withSnapshot("conv_approval_failure", { labels: { "omnigent.wrapper": "codex-native-ui" } });
+    await useChatStore.getState().switchTo("conv_approval_failure");
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.split("?")[0]!;
+      if (path === "/v1/sessions/conv_approval_failure" && init?.method === "PATCH") {
+        return mockResponse(
+          {
+            error: {
+              code: "runner_unavailable",
+              message: "Could not switch to approve-for-me approval mode: no live Codex runner.",
+            },
+          },
+          { ok: false, status: 503 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+    fetchMock.mockClear();
+
+    await expect(useChatStore.getState().setCodexApprovalMode("approve-for-me")).rejects.toThrow(
+      "Could not switch to approve-for-me approval mode",
+    );
+
+    expect(patchCallsFor("conv_approval_failure")).toEqual([{ approval_mode: "approve-for-me" }]);
+    // Rolls back to the pre-switch value; with no label yet, that's the unset
+    // empty string — never the optimistic value.
+    expect(useChatStore.getState().codexApprovalMode).toBe("");
+    expect(sessionLabels.get("conv_approval_failure")).not.toHaveProperty(
+      "omnigent.codex_native.approval_mode",
     );
   });
 

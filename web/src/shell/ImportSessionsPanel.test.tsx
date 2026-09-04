@@ -70,22 +70,29 @@ describe("ImportSessionsPanel", () => {
     useHostsMock.mockReturnValue({
       data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],
     } as unknown as ReturnType<typeof useHosts>);
-    importLocalSessionsMock.mockResolvedValue({
-      imported: 2,
-      alreadyImported: 1,
-      failed: 0,
-      sessions: [
-        { id: "c1", title: "First session" },
-        { id: "c2", title: null },
-      ],
+    // Deliver each session through the streaming callback, then resolve with
+    // the final tally — mirrors the NDJSON stream the panel consumes live.
+    importLocalSessionsMock.mockImplementation(async (_host, _source, _limit, onSession) => {
+      onSession?.({ id: "c1", title: "First session" });
+      onSession?.({ id: "c2", title: null });
+      return {
+        imported: 2,
+        alreadyImported: 1,
+        failed: 0,
+        sessions: [
+          { id: "c1", title: "First session" },
+          { id: "c2", title: null },
+        ],
+      };
     });
 
     renderPanel();
     fireEvent.click(screen.getByTestId("import-submit"));
 
     await waitFor(() => expect(screen.getByTestId("import-result")).toBeInTheDocument());
-    // Defaults to the online host + "all" harnesses + 25 recent.
-    expect(importLocalSessionsMock).toHaveBeenCalledWith("host_1", "all", 25);
+    // Defaults to the online host + "all" harnesses + 25 recent, plus the
+    // per-session streaming callback.
+    expect(importLocalSessionsMock).toHaveBeenCalledWith("host_1", "all", 25, expect.any(Function));
     expect(screen.getByTestId("import-result").textContent).toContain("Imported 2");
     expect(screen.getByTestId("import-result").textContent).toContain("1 already imported");
     const link1 = screen.getByTestId("import-result-link-c1");

@@ -1032,11 +1032,9 @@ def _parse_cwd_allow_hidden(raw: object) -> list[str] | None:
     ``os_env.sandbox``.
 
     Each entry must be a single path component (no ``/``, ``\\``,
-    or ``.`` / ``..`` traversal) so a misconfigured spec can't punch
-    a hole through arbitrary subdirectories of cwd. The bwrap backend
-    looks each entry up in ``cwd.iterdir()`` directly; sanitising
-    here keeps the resolver simple and the failure mode loud at
-    parse time rather than at runtime.
+    or ``.`` / ``..`` traversal). The special entry ``"*"`` explicitly
+    disables dotpath masking for trusted roots while preserving escaping-
+    symlink masking.
 
     :param raw: Raw value from the YAML, e.g. ``[".venv", ".git"]``,
         or ``None`` when the field is absent.
@@ -2379,6 +2377,71 @@ def _falsey_flag(raw: object) -> bool:
     return isinstance(raw, str) and raw.strip().lower() in _FALSEY_STRINGS
 
 
+# The only line recovery rewrites: a top-level ``description:`` whose value
+# starts on the same line. Every other key keeps strict YAML semantics, so a
+# setting like ``user-invocable: false: internal only`` still fails loudly
+# instead of being read as a truthy string.
+_FRONTMATTER_DESCRIPTION_RE = re.compile(r"\Adescription:[ \t]+(?P<value>\S.*)\Z")
+
+# An indented ``key: value`` line is a mis-indented setting, not prose. Folding
+# it into the description would drop the setting it declares.
+_KEY_SHAPED_LINE_RE = re.compile(r"\A[ \t]+[A-Za-z0-9_.-]+:([ \t].*)?\Z")
+
+# Value openers that mean YAML structure (flow collection, block scalar, anchor,
+# alias, tag) or an already-quoted scalar. Quoting these would change what the
+# frontmatter says, so they are left for the strict parse to accept or reject.
+_YAML_VALUE_INDICATORS = ("'", '"', "[", "{", "|", ">", "&", "*", "!", "?", "%", "@", "`")
+
+
+def _quote_description_with_colon(frontmatter_str: str) -> str:
+    """
+    Quote a plain ``description:`` scalar whose value carries a ``": "``.
+
+    Skill authors write prose in ``description:`` and prose contains colons,
+    which YAML reads as a nested mapping and rejects. Claude Code accepts those
+    files, so rejecting them drops a skill the user has installed. Rewriting
+    only that one line and re-parsing keeps every other malformed frontmatter
+    loud: no other key is touched, a value opening a flow collection, block
+    scalar, or quote is left alone, and so is one carrying a `` #`` comment,
+    since quoting any of those would change what the frontmatter says rather
+    than recover it.
+
+    :param frontmatter_str: Raw frontmatter block, e.g.
+        ``"name: x\ndescription: does y: and z\n"``.
+    :returns: The block with a colon-bearing description double-quoted.
+    """
+    lines = frontmatter_str.split("\n")
+    out: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        index += 1
+        match = _FRONTMATTER_DESCRIPTION_RE.match(line)
+        value = match.group("value").rstrip() if match else ""
+        if (
+            match is None
+            or value.startswith(_YAML_VALUE_INDICATORS)
+            or " #" in value
+            or (": " not in value and not value.endswith(":"))
+        ):
+            out.append(line)
+            continue
+        # A plain scalar folds its indented continuation lines into one value
+        # with single spaces, so absorb a wrapped description. A key-shaped
+        # line ends the run: it is left in place for the re-parse to reject.
+        while (
+            index < len(lines)
+            and lines[index][:1] in (" ", "\t")
+            and lines[index].strip()
+            and not _KEY_SHAPED_LINE_RE.match(lines[index])
+        ):
+            value = f"{value} {lines[index].strip()}"
+            index += 1
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        out.append(f'description: "{escaped}"')
+    return "\n".join(out)
+
+
 def _parse_skill(skill_md: Path) -> SkillSpec:
     """
     Parse a single ``SKILL.md`` file into a :class:`SkillSpec`.
@@ -2416,10 +2479,16 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
     try:
         frontmatter = yaml.safe_load(frontmatter_str)
     except yaml.YAMLError as exc:
-        raise OmnigentError(
-            f"SKILL.md has invalid YAML frontmatter: {skill_md}: {exc}",
-            code=ErrorCode.INVALID_INPUT,
-        ) from exc
+        # Retry with colon-bearing prose quoted before giving up, and report
+        # the ORIGINAL error if that still fails so the message names the real
+        # complaint rather than the rewrite's.
+        try:
+            frontmatter = yaml.safe_load(_quote_description_with_colon(frontmatter_str))
+        except yaml.YAMLError:
+            raise OmnigentError(
+                f"SKILL.md has invalid YAML frontmatter: {skill_md}: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
     if not isinstance(frontmatter, dict):
         raise OmnigentError(
             f"SKILL.md frontmatter must be a YAML mapping: {skill_md}",

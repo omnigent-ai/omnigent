@@ -1,13 +1,14 @@
 """E2E: importing recent local sessions from Settings and the empty landing.
 
-Two new user-facing surfaces drive ``POST /v1/imports/local`` (the chosen host
-reads + normalizes its own transcripts over the tunnel; the server persists
-each as its frame arrives):
+Two user-facing surfaces drive the host-mediated import (the chosen host reads
++ normalizes its own transcripts over the tunnel; the server persists each as
+its frame arrives):
 
 * Settings › "Import sessions" (``ImportSessionsPanel``) — pick a machine,
-  harness, and count, then import; the result links each new session.
-* The empty landing (``NewChatLandingScreen``) — a one-click "Import your N
-  most recent sessions" plus a "Choose what to import" link into Settings.
+  harness, and count, then import via ``POST /v1/imports/local/stream``; the
+  result lists each new session as its NDJSON frame lands.
+* The empty landing (``NewChatLandingScreen``) — a single "Import your recent
+  sessions" button that opens Settings › Import.
 
 The transcripts live on the caller's machine and the host round-trip needs a
 live tunnel, so — like the visual and ``start_session`` suites — these stub the
@@ -39,6 +40,12 @@ def _fulfill_json(route: Route, body: dict[str, object]) -> None:
     route.fulfill(status=200, content_type="application/json", body=json.dumps(body))
 
 
+def _fulfill_ndjson(route: Route, events: list[dict[str, object]]) -> None:
+    """Fulfill the import POST with the endpoint's NDJSON stream shape."""
+    body = "".join(json.dumps(e) + "\n" for e in events)
+    route.fulfill(status=200, content_type="application/x-ndjson", body=body)
+
+
 def test_settings_import_panel_imports_and_links_sessions(
     page: Page,
     live_server: str,
@@ -52,22 +59,18 @@ def test_settings_import_panel_imports_and_links_sessions(
 
     def _handle_import(route: Route) -> None:
         captured["post"] = route.request.post_data_json
-        _fulfill_json(
+        _fulfill_ndjson(
             route,
-            {
-                "imported": 2,
-                "already_imported": 0,
-                "failed": 0,
-                "sessions": [
-                    {"session_id": "conv_imp_1", "title": "First imported"},
-                    # A session with no synthesizable title still links.
-                    {"session_id": "conv_imp_2", "title": None},
-                ],
-            },
+            [
+                {"event": "session", "session_id": "conv_imp_1", "title": "First imported"},
+                # A session with no synthesizable title still links.
+                {"event": "session", "session_id": "conv_imp_2", "title": None},
+                {"event": "done", "imported": 2, "already_imported": 0, "failed": 0},
+            ],
         )
 
     page.route("**/v1/hosts", lambda r: _fulfill_json(r, _HOSTS_BODY))
-    page.route("**/v1/imports/local", _handle_import)
+    page.route("**/v1/imports/local/stream", _handle_import)
 
     page.goto(f"{live_server}/settings/import")
 
@@ -90,56 +93,24 @@ def test_settings_import_panel_imports_and_links_sessions(
     assert captured["post"] == {"host_id": _HOST_ID, "source": "all", "limit": 25}
 
 
-def test_empty_landing_choose_what_to_import_opens_settings(
+def test_empty_landing_import_button_opens_settings(
     page: Page,
     live_server: str,
 ) -> None:
-    """Empty landing: "Choose what to import" navigates into Settings › Import."""
+    """Empty landing: the single import button navigates into Settings › Import."""
     page.route(_SESSIONS_RE, lambda r: _fulfill_json(r, _EMPTY_LIST_BODY))
     page.route("**/v1/hosts", lambda r: _fulfill_json(r, {"hosts": []}))
 
     page.goto(f"{live_server}/")
 
     expect(page.get_by_test_id("new-chat-landing")).to_be_visible(timeout=30_000)
-    # No sessions yet, so the landing offers the import affordances.
-    expect(page.get_by_test_id("landing-quick-import")).to_be_visible(timeout=30_000)
-    page.get_by_test_id("landing-import-sessions").click()
+    # No sessions yet, so the landing offers the single import affordance.
+    import_button = page.get_by_test_id("landing-import-sessions")
+    expect(import_button).to_be_visible(timeout=30_000)
+    expect(import_button).to_contain_text("Import your recent sessions")
+    import_button.click()
 
     page.wait_for_url("**/settings/import", timeout=30_000)
     # With no online host the panel shows the connect-a-machine notice, proving
     # the section mounted (rather than the full picker) — either is fine here.
     expect(page.get_by_test_id("import-no-hosts")).to_be_visible(timeout=30_000)
-
-
-def test_empty_landing_quick_import_imports_recent_sessions(
-    page: Page,
-    live_server: str,
-) -> None:
-    """Empty landing: the one-click button imports from the online host and reports the count."""
-
-    def _handle_import(route: Route) -> None:
-        _fulfill_json(
-            route,
-            {
-                "imported": 3,
-                "already_imported": 0,
-                "failed": 0,
-                "sessions": [
-                    {"session_id": f"conv_q_{i}", "title": f"Session {i}"} for i in range(3)
-                ],
-            },
-        )
-
-    page.route(_SESSIONS_RE, lambda r: _fulfill_json(r, _EMPTY_LIST_BODY))
-    page.route("**/v1/hosts", lambda r: _fulfill_json(r, _HOSTS_BODY))
-    page.route("**/v1/imports/local", _handle_import)
-
-    page.goto(f"{live_server}/")
-
-    quick_import = page.get_by_test_id("landing-quick-import")
-    expect(quick_import).to_be_visible(timeout=30_000)
-    quick_import.click()
-
-    expect(page.get_by_test_id("landing-quick-import-result")).to_contain_text(
-        "Imported 3 sessions", timeout=30_000
-    )

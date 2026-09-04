@@ -324,6 +324,10 @@ def test_cursor_native_worker_row_not_source_none(
     expect(
         page.locator(_ASSISTANT, has_text=f"Catalog reported. Marker: {chat.routing_token}").first
     ).to_be_visible(timeout=_TURN_TIMEOUT_MS)
+    # The final text item can render just before the terminal response settles
+    # the turn and folds its tool calls. Wait for the authoritative session
+    # status UI to go idle so the trigger cannot be replaced mid-click.
+    expect(page.get_by_test_id("working-indicator")).to_be_hidden(timeout=30_000)
 
     # Put the catalog on screen the way a user reads it (and the video shows it).
     _expand_list_models_tool_call(page)

@@ -26,7 +26,7 @@ from collections.abc import Awaitable, Callable
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
-from omnigent.debug_logging import set_current_user_id
+from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.host.frames import (
     HostConnectionErrorFrame,
     HostCreateDirResultFrame,
@@ -303,6 +303,12 @@ def create_host_tunnel_router(
                 frame.version,
                 frame.name,
                 frame.runners,
+                extra=debug_event(
+                    "host_tunnel",
+                    phase="connected",
+                    host_id=host_id,
+                    version=frame.version,
+                ),
             )
 
             sender_task = asyncio.create_task(
@@ -376,7 +382,11 @@ def create_host_tunnel_router(
                         )
 
         except WebSocketDisconnect:
-            _logger.warning("Host %s disconnected", host_id)
+            _logger.warning(
+                "Host %s disconnected",
+                host_id,
+                extra=debug_event("host_tunnel", phase="disconnected", host_id=host_id),
+            )
             # Only run disconnect cleanup if we actually registered this
             # host on THIS connection. A connect that failed before
             # register — e.g. the upsert IntegrityError when a peer
@@ -394,7 +404,11 @@ def create_host_tunnel_router(
                             host_id,
                         )
         except Exception as exc:
-            _logger.exception("Host tunnel error for %s", host_id)
+            _logger.exception(
+                "Host tunnel error for %s",
+                host_id,
+                extra=debug_event("host_tunnel", phase="error", host_id=host_id, stage=stage),
+            )
             retryable = stage in {"registration", "registry", "connected"}
             await _send_connection_error(
                 ws,

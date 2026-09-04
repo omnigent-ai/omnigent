@@ -16,14 +16,15 @@ from omnigent.entities import (
 )
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
 
-# Label set on a fork of a session that had a working directory. Its
-# value is the source session id. Presence marks the (unbound) clone as
-# needing a host + working directory before it can run, so the
-# online-dot reports it offline until bound and the UI opens the
-# directory picker instead of silently dropping the first message.
-# Forks of chat-only sources (no workspace) get no label and resume
-# in-process like a brand-new chat session. Canonical home is the store
-# layer; the server route and the SQLAlchemy store both import it.
+# Label set on a fork of a session that had a working directory, or a
+# runner-bound native session whose working-directory metadata was lost.
+# Its value is the source session id. Presence marks the (unbound) clone
+# as needing a host + working directory before it can run, so the
+# online-dot reports it offline until bound and the UI opens the directory
+# picker instead of silently dropping the first message. Forks of
+# chat-only sources get no label and resume in-process like a brand-new
+# chat session. Canonical home is the store layer; the server route and
+# the SQLAlchemy store both import it.
 FORK_SOURCE_LABEL_KEY = "omnigent.fork.source_id"
 
 # One-shot fork directive: the SOURCE session's runtime-native session id
@@ -1318,6 +1319,10 @@ class ConversationStore(ABC):
         method; internal sub-agent code also uses it to keep child
         conversations on the parent's current runner.
 
+        Runner/host binding is live state, not conversation activity, so
+        this must NOT bump ``updated_at`` (it drives sidebar ordering
+        and the unread dot).
+
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
         :param runner_id: Runner identifier to bind to,
@@ -1337,6 +1342,10 @@ class ConversationStore(ABC):
         Counterpart to :meth:`replace_runner_id` for the 1:1
         session↔runner invariant — /clear and /switch unbind the old
         session before binding the runner to the new one.
+
+        Runner/host binding is live state, not conversation activity, so
+        this must NOT bump ``updated_at`` (it drives sidebar ordering
+        and the unread dot).
 
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -1365,6 +1374,10 @@ class ConversationStore(ABC):
         ``workspace`` together never violates
         ``ck_conversations_workspace_required_for_host`` (workspace
         is only required while ``host_id`` is set).
+
+        Runner/host binding is live state, not conversation activity, so
+        this must NOT bump ``updated_at`` (it drives sidebar ordering
+        and the unread dot).
 
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -1411,6 +1424,10 @@ class ConversationStore(ABC):
         Used when the server asks a host to spawn a runner for
         an existing session. Last-write-wins semantics (like
         :meth:`replace_runner_id`).
+
+        Runner/host binding is live state, not conversation activity, so
+        this must NOT bump ``updated_at`` (it drives sidebar ordering
+        and the unread dot).
 
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -1485,6 +1502,7 @@ class ConversationStore(ABC):
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
         project_id: str | None = None,
+        host_id: str | None = None,
     ) -> CreatedSession:
         """
         Atomically create a session and its session-scoped agent.
@@ -1523,6 +1541,9 @@ class ConversationStore(ABC):
         :param runner_id: Optional runner binding to persist at
             creation time, e.g. ``"runner_abc123"``. Child sessions
             inherit the parent's binding through this field.
+        :param host_id: Optional external host the session binds to,
+            e.g. ``"host_a1b2c3d4..."``. Requires a non-``None``
+            ``workspace``. ``None`` leaves the session unbound.
         :returns: The committed conversation and agent entities.
         :raises ConversationNotFoundError: If
             ``parent_conversation_id`` is set but no such

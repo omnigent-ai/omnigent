@@ -296,9 +296,8 @@ export function insertNewRowsIntoPages(
   candidates: Map<string, SessionListWireItem>,
   filters: ConversationListFilters,
   skip?: (id: string) => boolean,
-): { data: ConversationsInfiniteData | undefined; inserted: Set<string> } {
-  const inserted = new Set<string>();
-  if (!data || candidates.size === 0 || filters.searchQuery) return { data, inserted };
+): { data: ConversationsInfiniteData | undefined; inserted: Conversation[] } {
+  if (!data || candidates.size === 0 || filters.searchQuery) return { data, inserted: [] };
   const present = new Set<string>();
   for (const page of data.pages) for (const c of page.data) present.add(c.id);
   const rows: Conversation[] = [];
@@ -316,12 +315,11 @@ export function insertNewRowsIntoPages(
     };
     if (conv.parent_session_id != null || violatesKnownMembership(conv, filters)) continue;
     rows.push(conv);
-    inserted.add(id);
   }
-  if (rows.length === 0) return { data, inserted };
+  if (rows.length === 0) return { data, inserted: [] };
   const [first, ...rest] = data.pages;
   const nextFirst = { ...first, data: [...rows, ...first.data], first_id: rows[0].id };
-  return { data: { ...data, pages: [nextFirst, ...rest] }, inserted };
+  return { data: { ...data, pages: [nextFirst, ...rest] }, inserted: rows };
 }
 
 /**

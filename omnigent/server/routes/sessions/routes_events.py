@@ -15,6 +15,7 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 
+from omnigent.debug_logging import add_audit_attrs, mark_request_audit_suppressed
 from omnigent.entities import (
     ErrorData,
     NewConversationItem,
@@ -224,6 +225,18 @@ _retry_recovery_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
 _retry_recovery_tasks: dict[str, asyncio.Task[dict[str, bool | str]]] = {}
+
+# POST /events types that arrive per streamed chunk — the harness echoing its
+# own live output back. Their per-call audit row is pure noise (the content is
+# already on the SSE-event logger), so the envelope is suppressed for them.
+_TRANSIENT_AUDIT_EVENT_TYPES = frozenset(
+    {
+        _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
+        _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
+        _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
+        _EXTERNAL_SESSION_USAGE_TYPE,
+    }
+)
 
 
 def _retry_recovery_lock(session_id: str) -> asyncio.Lock:
@@ -516,6 +529,13 @@ def register_events_routes(
                 f"Allowed types: {sorted(_ALLOWED_EVENT_TYPES)}",
                 code=ErrorCode.INVALID_INPUT,
             )
+        # Tag the audit envelope end-event with the event kind so a message,
+        # interrupt, approval, stop, … are distinguishable in the audit table.
+        # Transient per-chunk echoes suppress the row entirely (they are the
+        # firehose; the content is already on the SSE-event logger).
+        add_audit_attrs(event_type=body.type)
+        if body.type in _TRANSIENT_AUDIT_EVENT_TYPES:
+            mark_request_audit_suppressed()
         # For item types, validate the data payload shape against
         # the item-type's discriminator class. The control types
         # (interrupt, approval) bypass the item-persist path and have
@@ -635,6 +655,13 @@ def register_events_routes(
                 # deny sentinel on the session stream so the
                 # client/REPL sees feedback.
                 reason = _input_verdict.get("reason", "Denied by policy")
+                # Surface the input-policy block on this post_event's audit row
+                # so a "my message was blocked" case is queryable with its reason.
+                add_audit_attrs(
+                    policy_verdict=_input_verdict.get("verdict", "deny"),
+                    policy_phase="input",
+                    policy_reason=reason,
+                )
                 _publish_policy_deny(session_id, reason)
                 await _persist_policy_deny_sentinel(
                     session_id,
@@ -2169,13 +2196,19 @@ def register_events_routes(
             has a server-created worktree (``git_branch`` set), the
             host removes the worktree directory and deletes its branch
             (``git worktree remove --force`` then ``git branch -D``).
-            Ignored for sessions with no worktree. Best-effort: a
-            cleanup failure does not block the delete. Defaults to
-            ``False`` (worktree and branch left untouched). See
+            Ignored for sessions with no worktree. If the host
+            tunnel is down (typically ``runner_online: false``), the
+            delete is rejected with 409 so the caller can retry
+            without cleanup rather than receiving a misleading 404.
+            A host-reported git failure is still logged and does not
+            block the delete. Defaults to ``False`` (worktree and
+            branch left untouched). See
             designs/SESSION_GIT_WORKTREE.md.
         :returns: A :class:`ConversationDeleted` confirmation.
         :raises OmnigentError: 404 if no session or no access,
-            403 if insufficient permissions.
+            403 if insufficient permissions, 409 if
+            ``delete_branch=true`` and the host is offline so
+            worktree cleanup cannot run.
         """
         user_id = _require_user(request, auth_provider)
         if permission_store is not None and user_id is not None:
@@ -2228,16 +2261,12 @@ def register_events_routes(
 
             with contextlib.suppress(RuntimeError):
                 await get_terminal_registry().cleanup_conversation(session_id)
-        # Session file cleanup.
-        if file_store is not None and artifact_store is not None:
-            deleted_file_ids = await asyncio.to_thread(
-                file_store.delete_all_for_session, session_id
-            )
-            for fid in deleted_file_ids:
-                await asyncio.to_thread(artifact_store.delete, fid)
         # Opt-in git worktree cleanup: only when delete_branch=true and
         # the session has a server-created worktree. Runs after runner
-        # teardown; best-effort (designs/SESSION_GIT_WORKTREE.md).
+        # teardown but before the irreversible file cleanup below: an
+        # unreachable host fails the delete (409) with the session
+        # retained, so nothing irrecoverable may be destroyed first.
+        # Git errors on a reachable host stay best-effort.
         if (
             delete_branch
             and conv.git_branch is not None
@@ -2253,7 +2282,15 @@ def register_events_routes(
                 reason="session-delete",
                 conversation_store=conversation_store,
                 exclude_conversation_id=conv.id,
+                fail_if_unavailable=True,
             )
+        # Session file cleanup.
+        if file_store is not None and artifact_store is not None:
+            deleted_file_ids = await asyncio.to_thread(
+                file_store.delete_all_for_session, session_id
+            )
+            for fid in deleted_file_ids:
+                await asyncio.to_thread(artifact_store.delete, fid)
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.discard(session_id)
         deleted = await conversation_store.delete_conversation(session_id)

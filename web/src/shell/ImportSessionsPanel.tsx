@@ -13,6 +13,7 @@ import {
 } from "@/components/ui/select";
 import {
   importLocalSessions,
+  type ImportedSessionRef,
   type ImportSourceSelector,
   type LocalImportResult,
 } from "@/lib/sessionsApi";
@@ -47,6 +48,9 @@ export function ImportSessionsPanel() {
   const [source, setSource] = useState<ImportSourceSelector>("all");
   const [limit, setLimit] = useState(25);
   const [submitting, setSubmitting] = useState(false);
+  // Sessions appended as their frames stream in, so the list fills live rather
+  // than appearing all at once when the import finishes.
+  const [streamed, setStreamed] = useState<ImportedSessionRef[]>([]);
   const [result, setResult] = useState<LocalImportResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -74,8 +78,11 @@ export function ImportSessionsPanel() {
     setSubmitting(true);
     setError(null);
     setResult(null);
+    setStreamed([]);
     try {
-      const res = await importLocalSessions(hostId, source, limit);
+      const res = await importLocalSessions(hostId, source, limit, (s) => {
+        setStreamed((prev) => [...prev, s]);
+      });
       setResult(res);
       // Newly imported sessions land in the sidebar list.
       await queryClient.invalidateQueries({ queryKey: ["conversations"] });
@@ -163,19 +170,25 @@ export function ImportSessionsPanel() {
         </Button>
       </div>
 
-      {result !== null && (
+      {(result !== null || streamed.length > 0 || submitting) && (
         <div className="flex flex-col gap-2">
-          <p className="text-sm text-muted-foreground" data-testid="import-result">
-            Imported {result.imported}
-            {result.alreadyImported > 0 && `, ${result.alreadyImported} already imported`}
-            {result.failed > 0 && `, ${result.failed} failed`}.
-          </p>
-          {result.sessions.length > 0 && (
+          {result !== null ? (
+            <p className="text-sm text-muted-foreground" data-testid="import-result">
+              Imported {result.imported}
+              {result.alreadyImported > 0 && `, ${result.alreadyImported} already imported`}
+              {result.failed > 0 && `, ${result.failed} failed`}.
+            </p>
+          ) : submitting ? (
+            <p className="text-sm text-muted-foreground" data-testid="import-progress">
+              Importing{streamed.length > 0 ? ` ${streamed.length} so far` : ""}…
+            </p>
+          ) : null}
+          {streamed.length > 0 && (
             <ul
               className="flex max-h-64 flex-col gap-1 overflow-y-auto"
               data-testid="import-result-sessions"
             >
-              {result.sessions.map((s) => (
+              {streamed.map((s) => (
                 <li key={s.id}>
                   <Link
                     to={`/c/${s.id}`}

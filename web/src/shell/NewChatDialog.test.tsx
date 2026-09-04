@@ -32,6 +32,7 @@ import type { ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
 import {
   useHostModelOptions,
+  fetchHosts,
   useHosts,
   useInstallHarness,
   useInstallingHarnesses,
@@ -46,7 +47,9 @@ import type { Conversation } from "@/hooks/useConversations";
 import { setOmnigentHostConfig } from "@/lib/host";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import {
+  connectArcaHost,
   controlHost,
+  getDesktopFeatures,
   getHostIdentity,
   isElectronShell,
   onHostStatusChanged,
@@ -70,10 +73,13 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   getHostIdentity: vi.fn(async () => null),
   onHostStatusChanged: vi.fn(() => () => {}),
   controlHost: vi.fn(async () => ({ ok: false })),
+  getDesktopFeatures: vi.fn(async () => null),
+  connectArcaHost: vi.fn(async () => ({ ok: false })),
 }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(),
+  fetchHosts: vi.fn(async () => []),
   // The setup dialog mounts these; default to inert so tests that don't
   // exercise install / credential-write don't need to wire them up.
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
@@ -773,6 +779,7 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
     databricks_features: false,
     managed_sandboxes_enabled: false,
     sandbox_provider: null,
+    enabled_connections: [],
     sharing_mode: "on",
     public_sharing_enabled: true,
     server_version: null,
@@ -959,6 +966,148 @@ describe("Run on this machine (desktop host enrollment)", () => {
     vi.mocked(controlHost).mockClear();
     fireEvent.click(screen.getByTestId("new-chat-landing-connect-error-retry"));
     await waitFor(() => expect(vi.mocked(controlHost)).toHaveBeenCalledWith("start"));
+  });
+});
+
+describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
+  beforeEach(() => {
+    setupLandingMocks();
+    mockHosts([]);
+    vi.mocked(isElectronShell).mockReturnValue(true);
+    vi.mocked(getHostIdentity).mockResolvedValue({ cliInstalled: false, hostId: null });
+    vi.mocked(onHostStatusChanged).mockReturnValue(() => {});
+    vi.mocked(getDesktopFeatures).mockResolvedValue({ databricksInternalFeatures: true });
+    vi.mocked(connectArcaHost).mockClear();
+    vi.mocked(fetchHosts).mockClear();
+  });
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    // Restore the browser defaults so these overrides don't leak into the
+    // other describe blocks (which assume no desktop shell / no MDM flag).
+    vi.mocked(isElectronShell).mockReturnValue(false);
+    vi.mocked(getDesktopFeatures).mockResolvedValue(null);
+  });
+
+  async function openHostMenu() {
+    const chip = await screen.findByTestId("new-chat-landing-host-chip");
+    fireEvent.pointerDown(chip, { button: 0 });
+    fireEvent.click(chip);
+  }
+
+  it("offers the Arca option only when the desktop shell reports the MDM flag", async () => {
+    renderLanding();
+    await openHostMenu();
+    expect(await screen.findByTestId("new-chat-landing-run-on-arca")).toBeTruthy();
+  });
+
+  it("hides the Arca option when the flag is off or unknown (old shell)", async () => {
+    vi.mocked(getDesktopFeatures).mockResolvedValue(null);
+    renderLanding();
+    await openHostMenu();
+    // The menu is open (the escape hatch renders), but no Arca entry.
+    await screen.findByTestId("new-chat-landing-connect-host");
+    expect(screen.queryByTestId("new-chat-landing-run-on-arca")).toBeNull();
+  });
+
+  it("state 3: hides the Arca option entirely and tags the connected row", async () => {
+    // The row is recognized by the host id remembered at connect time — a
+    // host's name (machine hostname) is deliberately not matched against
+    // anything from `arca status`.
+    localStorage.setItem("omnigent:arca-host-id", "arca-1");
+    mockHosts([{ host_id: "arca-1", name: "ip-10-0-0-7", owner: "me", status: "online" }]);
+    renderLanding();
+    await openHostMenu();
+
+    const row = await screen.findByTestId("new-chat-landing-host-arca-1");
+    expect(row.textContent).toContain("Arca instance");
+    expect(screen.queryByTestId("new-chat-landing-run-on-arca")).toBeNull();
+  });
+
+  it("shows a plain Run on Arca item (no status line) while not connected", async () => {
+    renderLanding();
+    await openHostMenu();
+
+    const item = await screen.findByTestId("new-chat-landing-run-on-arca");
+    expect(item.textContent).toContain("Run on Arca");
+    expect(screen.queryByTestId("new-chat-landing-arca-subtitle")).toBeNull();
+  });
+
+  // Silent-outcome cases: a deliberate dismissal, and a failure the connect
+  // console already displayed — neither may echo into the composer strip.
+  async function expectNoArcaError(result: Awaited<ReturnType<typeof connectArcaHost>>) {
+    vi.mocked(connectArcaHost).mockResolvedValue(result);
+    renderLanding();
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-run-on-arca"));
+    await waitFor(() => expect(vi.mocked(connectArcaHost)).toHaveBeenCalled());
+    expect(screen.queryByTestId("new-chat-landing-arca-error")).toBeNull();
+  }
+
+  it("stays silent when the user dismissed the console", async () => {
+    await expectNoArcaError({
+      ok: false,
+      canceled: true,
+      error: "Connecting Arca wasn't approved.",
+    });
+  });
+
+  it("stays silent for a failure the console already displayed", async () => {
+    await expectNoArcaError({
+      ok: false,
+      shownInConsole: true,
+      error: "Couldn't reach the Arca instance.",
+    });
+  });
+
+  it("surfaces a gate failure (no console shown) with a retry", async () => {
+    vi.mocked(connectArcaHost).mockResolvedValue({
+      ok: false,
+      error: "Couldn't reach the Arca instance.",
+    });
+    renderLanding();
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-run-on-arca"));
+
+    const err = await screen.findByTestId("new-chat-landing-arca-error");
+    expect(err.textContent).toContain("Couldn't reach the Arca instance.");
+    expect(vi.mocked(connectArcaHost)).toHaveBeenCalledTimes(1);
+
+    // Retry re-invokes the connect.
+    vi.mocked(connectArcaHost).mockClear();
+    fireEvent.click(screen.getByTestId("new-chat-landing-arca-error-retry"));
+    await waitFor(() => expect(vi.mocked(connectArcaHost)).toHaveBeenCalledTimes(1));
+  });
+
+  it("skips the new-host wait when the daemon was already connected", async () => {
+    vi.mocked(connectArcaHost).mockResolvedValue({ ok: true, alreadyRunning: true });
+    renderLanding();
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-run-on-arca"));
+
+    // No 30s poll, no error — an explanatory toast instead.
+    await waitFor(() =>
+      expect(showToastMock).toHaveBeenCalledWith(
+        "Arca is already connected to this server — pick its host from the list.",
+      ),
+    );
+    expect(vi.mocked(fetchHosts)).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("new-chat-landing-arca-error")).toBeNull();
+  });
+
+  it("selects the host that newly came online after a successful connect", async () => {
+    vi.mocked(connectArcaHost).mockResolvedValue({ ok: true });
+    // First post-connect poll already sees the freshly-registered Arca host.
+    vi.mocked(fetchHosts).mockResolvedValue([
+      { host_id: "arca-1", name: "arca-box", owner: "me", status: "online" },
+    ]);
+    renderLanding();
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-run-on-arca"));
+
+    // selectHost persists the pick — the observable effect of auto-selection.
+    await waitFor(() => expect(localStorage.getItem("omnigent:last-host-choice")).toBe("arca-1"));
+    expect(vi.mocked(connectArcaHost)).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -1583,6 +1732,45 @@ describe("NewChatLandingScreen", () => {
     openSelect("new-chat-landing-config-permission");
     expect(screen.getByText("Plan")).toBeTruthy();
     expect(screen.getByText("Bypass permissions")).toBeTruthy();
+  });
+
+  it("falls back to Default when the host catalog stops listing the picked model", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    openAgentConfig("a1");
+    pickSelectOption("new-chat-landing-config-model", "Haiku 4.5");
+    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain("Haiku 4.5");
+
+    // The host's provider changes under the open modal: its next poll of the
+    // catalog no longer lists the pick.
+    const shrunk = {
+      data: CLAUDE_MODEL_OPTIONS_RESULT.data.filter((model) => model.id !== "haiku"),
+      isLoading: false,
+      isError: false,
+    };
+    useHostModelOptionsMock.mockImplementation(
+      (_hostId, harness) =>
+        (harness === "codex-native" ? CODEX_MODEL_OPTIONS_RESULT : shrunk) as unknown as ReturnType<
+          typeof useHostModelOptions
+        >,
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "run the build" },
+    });
+    const trigger = screen.getByTestId("new-chat-landing-config-model");
+    expect(trigger.textContent).toContain("Default");
+    expect(trigger.textContent).not.toContain("Haiku 4.5");
+
+    // Saving the fallback sends no override, so the launch uses the provider's default.
+    saveConfig();
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.model_override).toBeUndefined();
   });
 
   it("shows the Codex approval-mode knob in the gear modal", () => {
@@ -3019,6 +3207,12 @@ describe("NewChatLandingScreen skill pills", () => {
   });
 });
 
+// A dataTransfer for an OS file drag. ``types`` is what the handler reads
+// mid-drag — files are only exposed on drop.
+function fileDrag(files: File[] = []) {
+  return { types: ["Files"], files };
+}
+
 // Attachments on the landing composer — same paperclip affordance as the
 // in-session composer; files ride the pending-prompt handoff (covered in
 // the flow tests), this suite covers the local chip UI.
@@ -3046,24 +3240,54 @@ describe("NewChatLandingScreen attachments", () => {
     renderLanding();
     const composer = screen.getByTestId("new-chat-landing-composer");
     // Dragging over the composer lifts the drop-target overlay.
-    fireEvent.dragOver(composer, { dataTransfer: { files: [] } });
+    fireEvent.dragOver(composer, { dataTransfer: fileDrag() });
     expect(screen.getByText("Drop files here")).toBeTruthy();
     // Dropping a file attaches it (chip proves it reached state) and clears
     // the overlay.
     const file = new File(["hello"], "dropped.txt", { type: "text/plain" });
-    fireEvent.drop(composer, { dataTransfer: { files: [file] } });
+    fireEvent.drop(composer, { dataTransfer: fileDrag([file]) });
     expect(screen.getByText("dropped.txt")).toBeTruthy();
     expect(screen.queryByText("Drop files here")).toBeNull();
   });
 
-  it("clears the drop overlay when the drag leaves the composer", () => {
+  // The whole landing surface is the drop target, not just the composer box.
+  it("attaches files dropped anywhere on the landing surface, not just on the composer", () => {
+    renderLanding();
+    const surface = screen.getByTestId("new-chat-landing");
+    fireEvent.dragEnter(surface, { dataTransfer: fileDrag() });
+    expect(screen.getByText("Drop files here")).toBeTruthy();
+    const file = new File(["hello"], "shot.png", { type: "image/png" });
+    fireEvent.drop(surface, { dataTransfer: fileDrag([file]) });
+    expect(screen.getByText("shot.png")).toBeTruthy();
+    expect(screen.queryByText("Drop files here")).toBeNull();
+  });
+
+  // Outside it — the sidebar and the rest of the shell — nothing is claimed.
+  it("ignores files dropped outside the landing surface", () => {
+    renderLanding();
+    fireEvent.dragEnter(document.body, { dataTransfer: fileDrag() });
+    expect(screen.queryByText("Drop files here")).toBeNull();
+    const file = new File(["hello"], "elsewhere.txt", { type: "text/plain" });
+    fireEvent.drop(document.body, { dataTransfer: fileDrag([file]) });
+    expect(screen.queryByText("elsewhere.txt")).toBeNull();
+  });
+
+  it("clears the drop overlay when the drag leaves the landing surface", () => {
     renderLanding();
     const composer = screen.getByTestId("new-chat-landing-composer");
-    fireEvent.dragEnter(composer, { dataTransfer: { files: [] } });
+    fireEvent.dragEnter(composer, { dataTransfer: fileDrag() });
     expect(screen.getByText("Drop files here")).toBeTruthy();
-    // relatedTarget defaults to null (outside the composer), so the active
-    // state clears rather than sticking when moving between child elements.
-    fireEvent.dragLeave(composer, { dataTransfer: { files: [] } });
+    fireEvent.dragLeave(composer, { dataTransfer: fileDrag() });
+    expect(screen.queryByText("Drop files here")).toBeNull();
+  });
+
+  // Dragging selected text (no "Files" type) must stay native so it can be
+  // dropped into the textarea — the page-wide handler ignores it.
+  it("ignores a drag that carries no files", () => {
+    renderLanding();
+    fireEvent.dragOver(screen.getByTestId("new-chat-landing-composer"), {
+      dataTransfer: { types: ["text/plain"], files: [] },
+    });
     expect(screen.queryByText("Drop files here")).toBeNull();
   });
 
@@ -3088,7 +3312,7 @@ describe("NewChatLandingScreen attachments", () => {
     const composer = screen.getByTestId("new-chat-landing-composer");
     const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
     const zip = new File([new Uint8Array(10)], "photos.zip", { type: "application/zip" });
-    fireEvent.drop(composer, { dataTransfer: { files: [ok, zip] } });
+    fireEvent.drop(composer, { dataTransfer: fileDrag([ok, zip]) });
     expect(screen.getByText("notes.txt")).toBeTruthy();
     expect(screen.queryByText("photos.zip")).toBeNull();
     expect(screen.getByTestId("new-chat-landing-attachment-error").textContent).toContain(
@@ -3384,6 +3608,34 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     // Unset effort reads "Default" (mirrors the modal), never the "—" sentinel.
     expect(tooltip.textContent).toContain("Effort: Default");
     expect(tooltip.textContent).not.toContain("—");
+  });
+
+  it("shows the selected host's model provider in the gear tooltip", async () => {
+    useHostModelOptionsMock.mockImplementation(
+      (_hostId, harness) =>
+        (harness === "claude-native"
+          ? {
+              ...CLAUDE_MODEL_OPTIONS_RESULT,
+              data: CLAUDE_MODEL_OPTIONS_RESULT.data.map((model) => ({
+                ...model,
+                source: { kind: "subscription", label: "Subscription", name: "claude" },
+              })),
+            }
+          : CODEX_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
+    );
+    renderLanding();
+
+    fireEvent.focus(screen.getByTestId("new-chat-landing-config-gear"));
+    await waitFor(() =>
+      expect(screen.getAllByTestId("new-chat-landing-config-gear-tooltip").length).toBeGreaterThan(
+        0,
+      ),
+    );
+    const tooltip = screen.getAllByTestId("new-chat-landing-config-gear-tooltip")[0];
+    expect(tooltip).toHaveTextContent("Connection: Claude subscription");
+    expect(tooltip.textContent?.indexOf("Connection:")).toBeGreaterThan(
+      tooltip.textContent?.indexOf("Permissions:") ?? -1,
+    );
   });
 
   it("reflects an armed Codex bypass as the Approval value in the gear tooltip", async () => {

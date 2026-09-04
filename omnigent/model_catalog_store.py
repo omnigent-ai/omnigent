@@ -255,6 +255,36 @@ def _refresh_in_background(
     _inflight[key] = asyncio.create_task(_run(), name=f"model-catalog-refresh-{harness}")
 
 
+async def reprobe_catalog(
+    harness: str,
+    fingerprint: str,
+    resolve: Callable[[], Awaitable[list[dict[str, Any]] | None]],
+) -> list[dict[str, Any]] | None:
+    """
+    Re-probe now and return the fresh rows, joining a probe already in flight.
+
+    For a decision that must not rest on a stale entry (resetting a model pick
+    the stored rows do not serve), the refresh :func:`ensure_catalog` only
+    kicks in the background is awaited here. A failed probe returns ``None``
+    and leaves the stored rows in place.
+
+    :param harness: Canonical harness name.
+    :param fingerprint: The launch-config fingerprint.
+    :param resolve: Probe coroutine factory producing verbatim rows.
+    :returns: The fresh rows, or ``None`` when the probe failed.
+    """
+    key = (harness, fingerprint)
+    task = _inflight.get(key)
+    if task is None or task.done():
+        _refresh_in_background(harness, fingerprint, resolve)
+        task = _inflight[key]
+    try:
+        return await asyncio.shield(task)
+    except Exception:  # noqa: BLE001 — a joined miss probe may raise; stored rows keep serving
+        _logger.warning("%s catalog refresh failed", harness, exc_info=True)
+        return None
+
+
 def default_row(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     """Return the catalog's single ``isDefault`` row, if any.
 
@@ -285,5 +315,6 @@ __all__ = [
     "ensure_catalog",
     "fingerprint_of",
     "read_catalog",
+    "reprobe_catalog",
     "write_catalog",
 ]

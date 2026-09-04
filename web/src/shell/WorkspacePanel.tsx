@@ -1,6 +1,5 @@
 import {
   BotIcon,
-  CheckIcon,
   FileIcon,
   FolderTreeIcon,
   FileDiffIcon,
@@ -15,6 +14,8 @@ import {
 import {
   type CSSProperties,
   type ReactElement,
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useRef,
@@ -34,19 +35,25 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { TerminalView } from "@/components/blocks/TerminalView";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { terminalTabKey, useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
+import GithubMono from "@lobehub/icons/es/Github/components/Mono";
+import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
 import { FilesPanel } from "./FilesPanel";
 import { FileViewer } from "./FileViewer";
+import { GithubPanel } from "./GithubPanel";
 import type { ChangedSort } from "./FlatFileList";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useTerminalStatuses } from "./useTerminalStatuses";
 import { type RightRailTab, TAB_BADGE_BASE } from "./railTabs";
 import { Button } from "../components/ui/button";
+
+const TerminalView = lazy(() =>
+  import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
+);
 
 function WorkspaceTabTooltip({
   label,
@@ -67,27 +74,15 @@ function WorkspaceTabTooltip({
   );
 }
 
-// localStorage key for the last shell type launched from the "+" menu, so the
-// choice is remembered across the menu's remounts (it renders in two spots) and
-// reloads. App-global (not per-session): the user's preferred shell rarely
-// varies by conversation.
-const PREFERRED_SHELL_KEY = "omnigent:preferred-shell";
-
-function readPreferredShell(): string | null {
-  try {
-    return window.localStorage.getItem(PREFERRED_SHELL_KEY);
-  } catch {
-    return null;
-  }
-}
-
 // ---------------------------------------------------------------------------
 // NewTabMenu — the "+" affordance in the tab strip. Opens a small dropdown
-// ("Open new") to spin up a Shell as a rail tab. When the agent declares a
-// single terminal, "Shell" launches it directly; when several are declared,
-// "Shell" nests a submenu so the user picks which type to launch — the last
-// pick is remembered (check-marked, and launched on a plain "Shell" click).
-// Gated on the agent's spec declaring terminal access — renders nothing else.
+// ("Open new") to spin up a Shell as a rail tab. A single "Shell" item both
+// launches and picks the type: clicking its label launches the remembered
+// default (the last-picked type, else the first declared name), and the item
+// names that default inline — "Shell (zsh)". When several types are declared,
+// the same row carries a flyout (chevron) listing the OTHER types; picking one
+// launches it and remembers it as the new default. Gated on the agent's spec
+// declaring terminal access — renders nothing otherwise.
 //
 // The "Shell" item also reflects the session's liveness so opening a shell on
 // a disconnected session isn't a silent 502:
@@ -150,10 +145,7 @@ function NewTabMenu({
   // Remembered shell type, persisted across remounts/reloads. Seeded from
   // localStorage so the "+" in either strip spot agrees on the current pick.
   const [preferred, setPreferred] = useState<string | null>(() => readPreferredShell());
-  // Controlled so a launch can force the menu closed. The submenu "Shell"
-  // trigger preventDefaults its click (to launch the default without toggling
-  // the submenu), which also suppresses Radix's auto-close — leaving the menu
-  // stuck open until a second click. Closing here fixes that.
+  // Controlled so a launch can force the menu closed on select.
   const [menuOpen, setMenuOpen] = useState(false);
   // Shell access mirrors NewTerminalButton's gate: the agent's spec must
   // declare a non-empty ``terminals:`` block.
@@ -163,10 +155,10 @@ function NewTabMenu({
   // per conversation, reached via its own pinned tab, so it's not offered here.)
   if (!canOpenShell) return null;
 
-  // The default launched on a plain "Shell" click: the remembered pick when it
-  // is still a declared type, else the first declared name.
-  const defaultShell =
-    preferred !== null && declaredTerminals.includes(preferred) ? preferred : declaredTerminals[0];
+  // The default launched by the primary segment: the remembered pick when it
+  // is still a declared type, else the first declared name. Non-null here since
+  // the empty case returned above.
+  const defaultShell = resolveDefaultShell(declaredTerminals, preferred) as string;
 
   const launchShell = (name: string) => {
     setMenuOpen(false);
@@ -184,25 +176,25 @@ function NewTabMenu({
   // Launch a type and remember it as the new default for next time.
   const pickShell = (name: string) => {
     setPreferred(name);
-    try {
-      window.localStorage.setItem(PREFERRED_SHELL_KEY, name);
-    } catch {
-      /* storage unavailable — the in-memory pick still holds for this mount */
-    }
+    writePreferredShell(name);
     launchShell(name);
   };
 
-  // One declared shell → a direct "Shell" action. Several → a nested submenu
-  // so the user picks which type to launch (mirrors NewTerminalButton's picker).
+  // One declared shell → a plain "Shell" item. Several → the same row carries a
+  // flyout to the other types.
   const multipleShells = declaredTerminals.length > 1;
+  // The other declared types, shown in the row's flyout (the current default is
+  // already named in the row itself).
+  const otherShells = declaredTerminals.filter((name) => name !== defaultShell);
 
   // Liveness-derived affordance for the "Shell" item. A create in flight on a
   // wakeable session reads "Reconnecting…" (the server is waking the runner);
   // an offline session disables the item since the browser can't reconnect it.
   const isReconnecting = create.isPending && connectState === "wakeable";
   const shellDisabled = create.isPending || connectState === "offline";
-  // Icon + label + trailing hint, shared by the single-item and submenu-trigger
-  // renders so both reflect the same connect state.
+  // Icon + label + trailing hint for the "Shell" item. The label names the
+  // current default inline — "Shell (zsh)" — so the type is visible without
+  // opening the flyout.
   const shellItemContent = (
     <>
       {isReconnecting ? (
@@ -210,7 +202,9 @@ function NewTabMenu({
       ) : (
         <TerminalIcon className="size-4" />
       )}
-      <span className="whitespace-nowrap">{isReconnecting ? "Reconnecting…" : "Shell"}</span>
+      <span className="whitespace-nowrap">
+        {isReconnecting ? "Reconnecting…" : `Shell (${defaultShell})`}
+      </span>
       {connectState === "offline" && (
         <span className="ml-auto pl-4 text-sm text-muted-foreground">Offline</span>
       )}
@@ -247,40 +241,45 @@ function NewTabMenu({
         <SuppressBrowserView />
         <DropdownMenuLabel>Open new</DropdownMenuLabel>
         {multipleShells ? (
+          // Several types → a single "Shell (default)" row that launches the
+          // default on click and reveals a flyout of the OTHER types on hover.
+          // The sub-trigger's built-in chevron is hidden ([&>svg:last-child]) to
+          // keep the row clean. The click handler guards on ``shellDisabled``
+          // itself because Radix runs a sub-trigger's onClick before its own
+          // disabled check — without the guard an offline session would still
+          // fire a create.
           <DropdownMenuSub>
-            {/* Clicking "Shell" launches the remembered default immediately —
-                the type selection is optional. Hover/right-arrow still opens the
-                submenu to pick a specific type. onClick fires the default and
-                lets the menu close on its own; preventDefault stops the click
-                from only toggling the submenu open. */}
             <DropdownMenuSubTrigger
               disabled={shellDisabled}
-              onClick={(e) => {
-                e.preventDefault();
-                launchShell(defaultShell);
+              onClick={() => {
+                if (!shellDisabled) launchShell(defaultShell);
               }}
+              className="cursor-pointer [&>svg:last-child]:hidden"
             >
               {shellItemContent}
             </DropdownMenuSubTrigger>
-            <DropdownMenuSubContent>
-              {declaredTerminals.map((name) => (
+            {/* min-w-0 drops the default 96px floor so the box hugs the shell
+                name (e.g. "bash") instead of padding it out. */}
+            <DropdownMenuSubContent className="min-w-0">
+              <DropdownMenuLabel>Other shells</DropdownMenuLabel>
+              {otherShells.map((name) => (
                 <DropdownMenuItem
                   key={name}
                   onSelect={() => pickShell(name)}
                   disabled={shellDisabled}
+                  className="cursor-pointer"
                 >
-                  <CheckIcon
-                    className={cn("size-4", name === defaultShell ? "opacity-100" : "opacity-0")}
-                  />
                   {name}
                 </DropdownMenuItem>
               ))}
             </DropdownMenuSubContent>
           </DropdownMenuSub>
         ) : (
+          // Single type → a plain launch item.
           <DropdownMenuItem
-            onSelect={() => launchShell(declaredTerminals[0])}
+            onSelect={() => launchShell(defaultShell)}
             disabled={shellDisabled}
+            className="cursor-pointer"
           >
             {shellItemContent}
           </DropdownMenuItem>
@@ -510,10 +509,15 @@ function RailTerminalView({
   conversationId,
   terminalKey,
   readOnly,
+  autoFocus,
 }: {
   conversationId: string;
   terminalKey: string;
   readOnly: boolean;
+  /** Grab keyboard focus when the WS connects. Only for a shell the user just
+   *  opened by hand — a shell restored on a session switch leaves focus in the
+   *  chat composer. */
+  autoFocus: boolean;
 }) {
   const { terminals } = useTerminals(conversationId);
   const { setTerminalConnectionState, markTerminalActive } = useTerminalStatuses(terminals);
@@ -527,14 +531,17 @@ function RailTerminalView({
   }
   return (
     <div key={terminal.id} className="flex h-full min-h-0 flex-col">
-      <TerminalView
-        sessionId={conversationId}
-        terminalId={terminal.id}
-        readOnly={readOnly}
-        directAttachUrl={terminal.directAttachUrl}
-        onStateChange={(state) => setTerminalConnectionState(terminal.id, state)}
-        onActivity={() => markTerminalActive(terminal.id)}
-      />
+      <Suspense fallback={null}>
+        <TerminalView
+          sessionId={conversationId}
+          terminalId={terminal.id}
+          readOnly={readOnly}
+          focusOnConnect={autoFocus}
+          directAttachUrl={terminal.directAttachUrl}
+          onStateChange={(state) => setTerminalConnectionState(terminal.id, state)}
+          onActivity={() => markTerminalActive(terminal.id)}
+        />
+      </Suspense>
     </div>
   );
 }
@@ -565,6 +572,8 @@ interface WorkspacePanelProps {
   onRightRailTabChange: (next: RightRailTab) => void;
   /** Whether the Files/Changes tabs are available (agent spec exposes an os_env). */
   showFilesPanel: boolean;
+  /** Whether the GitHub tab is available (same on-disk-workspace gate as Files). */
+  showGithubTab: boolean;
   /** Whether the Browser tab is available — Electron shell only (hidden in a
    *  plain web build, which has no embedded WebContentsView). */
   showBrowserTab: boolean;
@@ -604,6 +613,11 @@ interface WorkspacePanelProps {
   openTerminals: string[];
   /** Active shell tab key, or null when no shell tab is selected. */
   selectedTerminalKey: string | null;
+  /** Whether the selected shell was just opened by an explicit user gesture
+   *  (clicking a tab / "+"→Shell) and so may grab keyboard focus on connect.
+   *  False when the shell is merely restored on a session switch — then focus
+   *  stays in the chat composer. */
+  autoFocusSelectedTerminal?: boolean;
   /** Tab key whose close (terminal kill) is in flight — rendered greyed and
    *  non-interactive until it disappears. Null when no close is pending. */
   closingTerminalKey?: string | null;
@@ -658,6 +672,7 @@ export function WorkspacePanel({
   rightRailTab,
   onRightRailTabChange,
   showFilesPanel,
+  showGithubTab,
   showBrowserTab,
   changedCount,
   subagentsWorking,
@@ -672,6 +687,7 @@ export function WorkspacePanel({
   openTerminalTab,
   openTerminals,
   selectedTerminalKey,
+  autoFocusSelectedTerminal = false,
   closingTerminalKey,
   onCloseTerminal,
   maximized,
@@ -806,6 +822,18 @@ export function WorkspacePanel({
                 </TabsTrigger>
               </WorkspaceTabTooltip>
             )}
+            {showGithubTab && (
+              <WorkspaceTabTooltip label="GitHub">
+                <TabsTrigger
+                  value="github"
+                  aria-label="GitHub"
+                  className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
+                >
+                  <GithubMono size={16} />
+                  <span className="sr-only">GitHub</span>
+                </TabsTrigger>
+              </WorkspaceTabTooltip>
+            )}
             <WorkspaceTabTooltip label="Agents">
               <TabsTrigger
                 value="subagents"
@@ -934,6 +962,7 @@ export function WorkspacePanel({
             conversationId={conversationId}
             terminalKey={selectedTerminalKey}
             readOnly={!isOwnerLevel(permissionLevel)}
+            autoFocus={autoFocusSelectedTerminal}
           />
         ) : selectedFilePath !== null ? (
           <FileViewer
@@ -952,6 +981,8 @@ export function WorkspacePanel({
           // Embedded browser (Electron only) — BrowserPane self-gates and
           // measures this rail slot to position the native view over it.
           <BrowserPane conversationId={conversationId} className="min-h-0 flex-1" />
+        ) : rightRailTab === "github" && showGithubTab ? (
+          <GithubPanel conversationId={conversationId} />
         ) : rightRailTab === "subagents" && rootSessionId ? (
           <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
         ) : (

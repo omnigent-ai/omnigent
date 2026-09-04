@@ -7,7 +7,7 @@ import functools
 import mimetypes
 import ntpath
 import urllib.parse
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Annotated, Any, cast
 
@@ -21,7 +21,8 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.types import Receive, Scope, Send
 
 from omnigent.entities import (
     Conversation,
@@ -94,6 +95,29 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
+
+
+class _RunnerStreamResponse(StreamingResponse):
+    """Stream a runner response body and close it however the send ends.
+
+    A generator ``finally`` only runs once the body is first pulled, so a
+    send that fails before that, or a client that disconnects (where
+    Starlette skips background tasks), would leak the tunnel request.
+    Closing in ``__call__`` covers every exit.
+
+    :param upstream: The runner's streamed response.
+    :param headers: Response headers to forward.
+    """
+
+    def __init__(self, upstream: httpx.Response, *, headers: Mapping[str, str]) -> None:
+        super().__init__(upstream.aiter_raw(), headers=headers)
+        self._upstream = upstream
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._upstream.aclose()
 
 
 def register_resources_routes(
@@ -246,6 +270,89 @@ def register_resources_routes(
             raise _session_not_found()
         return conv
 
+    # Per-chunk read budget for a direct HTTP runner client; no total timeout,
+    # since a large file legitimately outlives any. The WebSocket tunnel
+    # transport ignores httpx timeouts: there, a runner that drops aborts the
+    # body iterator once the tunnel closes.
+    _download_timeout = httpx.Timeout(connect=5.0, read=45.0, write=None, pool=None)
+
+    async def _stream_download_from_runner(
+        request: Request,
+        session_id: str,
+        conversation: Conversation,
+        runner_path: str,
+    ) -> Response:
+        """Stream a file download from the runner without buffering it.
+
+        The runner serves the bytes straight from disk; forwarding them
+        chunk by chunk keeps the server's memory flat however large the
+        file is. There is no host fallback: the host tunnel's filesystem
+        op answers in a single message, so it cannot stream a file.
+
+        :param request: The incoming request, for the gzip opt-out.
+        :param session_id: Session/conversation identifier.
+        :param conversation: Conversation loaded during authorization.
+        :param runner_path: Runner-relative URL carrying ``download=true``.
+        :returns: The attachment, streamed as the runner sends it, or the
+            runner's own error body and status for a missing file, a
+            directory, or an out-of-grant path.
+        :raises OmnigentError: ``runner_unavailable`` when the runner
+            predates downloads.
+        :raises HTTPException: 502 when no runner can be reached.
+        """
+        runner_client = await _get_runner_client_for_resource_access(
+            session_id,
+            conversation=conversation,
+        )
+        if runner_client is None:
+            raise HTTPException(
+                status_code=502,
+                detail="no runner available for resource access",
+            )
+        try:
+            resp = await runner_client.send(
+                runner_client.build_request("GET", runner_path, timeout=_download_timeout),
+                stream=True,
+            )
+        except (httpx.HTTPError, ConnectionError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="runner download endpoint unavailable",
+            ) from exc
+        if resp.status_code == 200 and "content-disposition" in resp.headers:
+            skip_gzip(request)
+            forwarded = {
+                name: resp.headers[name]
+                for name in (
+                    "content-type",
+                    "content-length",
+                    "content-encoding",
+                    "content-disposition",
+                    "cache-control",
+                    "x-content-type-options",
+                )
+                if name in resp.headers
+            }
+            return _RunnerStreamResponse(resp, headers=forwarded)
+        try:
+            await resp.aread()
+        finally:
+            await resp.aclose()
+        if resp.status_code == 200:
+            # A runner that predates ``download=true`` ignores it and answers
+            # the capped JSON envelope; serving that would truncate silently.
+            raise OmnigentError(
+                "Session runner does not support file downloads; restart the session",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = None
+        if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
+            raise HTTPException(status_code=502, detail="runner download failed")
+        return JSONResponse(status_code=resp.status_code, content=payload)
+
     async def _proxy_get_to_runner(
         session_id: str,
         path: str,
@@ -330,7 +437,8 @@ def register_resources_routes(
         :param session_id: Session/conversation identifier.
         :param conversation: Conversation loaded during authorization.
         :param op: Host-side op name — ``"list_or_read"`` / ``"changes"``
-            / ``"diff"`` / ``"search"``.
+            / ``"diff"`` / ``"search"`` / ``"github_info"`` /
+            ``"github_changes"`` / ``"github_diff"`` / ``"github_pr_diff"``.
         :param host_params: Op-specific args for the host reader.
         :param runner_path: Runner-relative URL for the live path.
         :param runner_params: Optional query params for the runner path.
@@ -411,6 +519,21 @@ def register_resources_routes(
             conversation.workspace,
         )
 
+    def _runner_path_segment(relative_path: str, *, absolute: bool) -> str:
+        """Encode a browse path for the runner's ``{relative_path:path}`` segment.
+
+        Only the leading slash is encoded, since a literal "//" is what proxies
+        collapse; interior slashes travel fine and keep logs readable. Every
+        other character is quoted, so a literal "%" in a name is not decoded a
+        second time by the runner into a path the gate here never saw.
+
+        :param relative_path: Decoded path, with a leading slash iff *absolute*.
+        :param absolute: Whether the path is host-absolute.
+        :returns: The encoded segment.
+        """
+        quoted = urllib.parse.quote(relative_path.lstrip("/"))
+        return "%2F" + quoted if absolute else quoted
+
     def _mutating_runner_path(
         session_id: str,
         environment_id: str,
@@ -429,12 +552,7 @@ def register_resources_routes(
         :param relative_path: Client-supplied path.
         :returns: The runner-relative URL.
         """
-        absolute = relative_path.startswith("/")
-        # Encode only the leading slash: a literal "//" is what proxies
-        # collapse, while interior slashes travel fine.
-        encoded = (
-            "%2F" + urllib.parse.quote(relative_path.lstrip("/")) if absolute else relative_path
-        )
+        encoded = _runner_path_segment(relative_path, absolute=relative_path.startswith("/"))
         return (
             f"/v1/sessions/{session_id}/resources/environments"
             f"/{environment_id}/filesystem/{encoded}"
@@ -1087,7 +1205,9 @@ def register_resources_routes(
 
         Used by native Claude ``/clear`` rotation: ownership changes
         from the previous conversation to the fresh one while the tmux
-        pane keeps running.
+        pane keeps running. A successful transfer also carries the
+        source host, workspace, and git branch to the target because the
+        live terminal remains on that same placement.
 
         :param request: The incoming FastAPI request (for auth) with
             JSON body ``{"target_session_id": "conv_new"}``.
@@ -1132,6 +1252,15 @@ def register_resources_routes(
             raise OmnigentError(
                 error.get("message", "Terminal transfer failed"),
                 code=error.get("code", ErrorCode.INTERNAL_ERROR),
+            )
+
+        if conv.host_id is not None:
+            await asyncio.to_thread(
+                conversation_store.set_host_id,
+                target_session_id,
+                conv.host_id,
+                conv.workspace,
+                conv.git_branch,
             )
 
         _publish_and_persist_resource_event(
@@ -2018,9 +2147,87 @@ def register_resources_routes(
         )
 
     @file_read_router.get(
+        "/sessions/{session_id}/resources/github/diff",
+        # Internal (UI GitHub diff view) — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def read_github_pr_diff(
+        request: Request,
+        session_id: str,
+    ) -> Any:
+        """
+        Return the whole PR as one unified diff patch.
+
+        ``gh pr diff`` covering every changed file, gzipped on the way out
+        (patches are large). The web view parses it client-side into per-file
+        diffs. Falls back to the host tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :returns: JSON with the ``patch`` text.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_READ)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_pr_diff",
+            host_params={},
+            runner_path=f"/v1/sessions/{session_id}/resources/github/diff",
+        )
+
+    @file_read_router.get(
+        "/sessions/{session_id}/resources/github/diff/{relative_path:path}",
+        # Internal (UI GitHub diff view) — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def read_github_file_diff(
+        request: Request,
+        session_id: str,
+        relative_path: str,
+        base: str | None = Query(default=None),
+    ) -> Any:
+        """
+        Return before/after content for a file in the branch-vs-base diff.
+
+        Reads the file at HEAD and at the base branch's merge-base via
+        ``git show``. Falls back to the host tunnel when the runner is offline,
+        so the diff stays viewable from the workspace on disk.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param relative_path: Repo-root-relative path from the changes list.
+        :param base: Base branch name; the default is derived when omitted.
+        :returns: JSON with ``before`` and ``after`` content strings.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_READ)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_diff",
+            host_params={"base": base, "path": relative_path},
+            runner_path=f"/v1/sessions/{session_id}/resources/github/diff/{relative_path}",
+            runner_params={"base": base} if base else None,
+        )
+
+    @file_read_router.get(
         "/sessions/{session_id}/resources/environments"
         "/{environment_id}/filesystem/{relative_path:path}",
         response_model=None,
+        responses={
+            200: {
+                "description": (
+                    "File content or directory listing as JSON; the raw file "
+                    "as an attachment when `download=true`."
+                ),
+                "content": {
+                    "application/octet-stream": {
+                        "schema": {"type": "string", "format": "binary"},
+                    },
+                },
+            },
+        },
     )
     async def read_or_list_environment_path(
         request: Request,
@@ -2031,6 +2238,9 @@ def register_resources_routes(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
+        # A plain default, not ``Query(...)``: the root listing calls this
+        # function directly, and a ``Query`` object is truthy.
+        download: bool = False,
     ) -> Any:
         """
         Read a file or list a directory in an environment.
@@ -2044,7 +2254,10 @@ def register_resources_routes(
         :param after: Cursor entry id for forward pagination.
         :param before: Cursor entry id for backward pagination.
         :param order: Sort order, ``"asc"`` or ``"desc"``.
-        :returns: File content or directory listing.
+        :param download: When ``True``, stream the complete file as an
+            attachment with no size cap instead of the capped JSON
+            envelope. A directory rejects it with 400.
+        :returns: File content or directory listing, or the raw file.
         """
         params: dict[str, str] = {"limit": str(limit), "order": order}
         if after is not None:
@@ -2063,11 +2276,15 @@ def register_resources_routes(
         )
 
         qs = urllib.parse.urlencode(params)
-        # Encode only the leading slash: a literal "//" is what proxies
-        # collapse, while interior slashes travel fine and keep logs readable.
-        runner_rel = (
-            "%2F" + urllib.parse.quote(relative_path.lstrip("/")) if absolute else relative_path
-        )
+        runner_rel = _runner_path_segment(relative_path, absolute=absolute)
+        if download:
+            return await _stream_download_from_runner(
+                request,
+                session_id,
+                conv,
+                f"/v1/sessions/{session_id}/resources/environments"
+                f"/{environment_id}/filesystem/{runner_rel}?download=true",
+            )
         path = (
             f"/v1/sessions/{session_id}/resources/environments"
             f"/{environment_id}/filesystem/{runner_rel}?{qs}"
@@ -2231,6 +2448,63 @@ def register_resources_routes(
             request=request,
             environment_id=environment_id,
             publish_invalidation=False,
+        )
+
+    # ── GitHub integration (read-only) ───────────────────────────
+    # Registered BEFORE the generic ``/{resource_id}`` lookup so
+    # ``/resources/github`` is not captured as a resource id. The diff route
+    # lives on ``file_read_router`` (gzip) above.
+
+    @router.get(
+        "/sessions/{session_id}/resources/github",
+        response_model=None,
+    )
+    async def get_session_github(
+        request: Request,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """
+        Return GitHub context (repo, branch, base ref, PR) for a session.
+
+        Proxies to the runner, which shells out to ``gh``/``git`` in the
+        workspace. Returns an ``available: false`` payload (200) when ``gh`` is
+        missing or the workspace is not a git repo.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :returns: The ``session.github.info`` object.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_READ)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_info",
+            host_params={},
+            runner_path=f"/v1/sessions/{session_id}/resources/github",
+        )
+
+    @router.get(
+        "/sessions/{session_id}/resources/github/changes",
+        response_model=None,
+    )
+    async def list_session_github_changes(
+        request: Request,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """
+        List the PR's changed files (empty when the branch has no PR).
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :returns: Flat list of changed files with ``status`` and line counts.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_READ)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_changes",
+            host_params={},
+            runner_path=f"/v1/sessions/{session_id}/resources/github/changes",
         )
 
     # Generic single-resource lookup — registered AFTER typed

@@ -1055,6 +1055,106 @@ def test_read_transcript_items_since_flags_compact_summary(tmp_path: Path) -> No
 
 
 @pytest.mark.parametrize(
+    "stdout",
+    [
+        "Not enough messages to compact.",
+        "not enough messages to compact",
+        "Nothing to compact.",
+    ],
+)
+def test_read_transcript_items_since_flags_compact_noop(tmp_path: Path, stdout: str) -> None:
+    """
+    A ``/compact`` refusal stdout record is surfaced with its text.
+
+    When Claude declines ``/compact`` (context too small), it writes the
+    refusal to a standalone ``local_command`` stdout record — separate from
+    the ``/compact`` command echo. The bridge must surface it as a
+    ``slash_command`` item flagged ``is_compact_noop=True`` (so the forwarder
+    dismisses the stranded "Compacting…" spinner) carrying the refusal text as
+    ``output`` (so the web shows the same message Claude did).
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "compact-cmd",
+                        "message": {
+                            "role": "user",
+                            "content": (
+                                "<command-name>/compact</command-name>\n"
+                                "            <command-message>compact</command-message>\n"
+                                "            <command-args></command-args>"
+                            ),
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "system",
+                        "subtype": "local_command",
+                        "uuid": "compact-stdout",
+                        "isMeta": False,
+                        "content": f"<local-command-stdout>{stdout}</local-command-stdout>",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    # Exactly one bubble: the bare ``/compact`` echo is deduped away so the
+    # web shows a single "Command compact" row (like the terminal), and it
+    # carries the refusal text as ``output``.
+    compact_items = [item for item in items if item.data.get("name") == "compact"]
+    assert len(compact_items) == 1, f"expected one /compact bubble, got {items!r}"
+    noop = compact_items[0]
+    assert noop.is_compact_noop is True
+    assert noop.item_type == "slash_command"
+    assert noop.data["kind"] == "command"
+    assert noop.data["output"] == stdout.strip()
+
+
+def test_read_transcript_items_since_keeps_real_bash_local_command(tmp_path: Path) -> None:
+    """
+    A non-refusal ``local_command`` stdout is not mistaken for a compact noop.
+
+    A shell ``!cmd`` record still surfaces as a terminal command, never a
+    flagged compact-noop item.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "system",
+                "subtype": "local_command",
+                "uuid": "bash-1",
+                "content": ("<bash-input>echo hi</bash-input>\n<bash-stdout>hi</bash-stdout>"),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert all(not item.is_compact_noop for item in items), items
+
+
+@pytest.mark.parametrize(
     "raw_text",
     [
         "Prompt is too long",
@@ -7608,6 +7708,43 @@ _REVERSE_SEARCH_PANE = """\
   ↑/↓ to nav · Enter to use · Esc to cancel · ctrl+s to scope
 """
 
+# The same ctrl+r search as Claude Code 2.1.212 renders it: the search rides
+# the framed composer as its filter field, so the frame and ❯ glyph read
+# exactly like a free input box — only the lowercase footer under the
+# closing rule tells it apart. Typing filters history; Enter replays an
+# old prompt.
+_INLINE_REVERSE_SEARCH_PANE = """\
+❯ hello history entry
+  ⎿  Not logged in · Please run /login
+──────────────────────────────
+❯ 
+──────────────────────────────
+  search prompts:   ⏸ manual mode on · ← for agents
+"""
+
+# The same inline search in a narrow pane: the footer's left cell wraps
+# ("search" / "prompts:") with the right column's text interleaved, so no
+# single row carries the whole marker.
+_INLINE_REVERSE_SEARCH_WRAPPED_PANE = """\
+❯ hello history entry
+──────────────────────────────
+❯ 
+──────────────────────────────
+  search        ⏸ manual mode on · gh auth login fo
+  prompts:
+  ✘ Auto-update failed · Try claude doctor or npm …
+"""
+
+# The same inline search with a filter that matches nothing — the footer
+# switches to "no matching prompt: <filter>", the only visible difference.
+_INLINE_REVERSE_SEARCH_NO_MATCH_PANE = """\
+❯ hello history entry
+──────────────────────────────
+❯ 
+──────────────────────────────
+  no matching prompt: usr-2-injected  ⏸ manual mode on
+"""
+
 # Shell mode, as Claude Code 2.1.240 renders it: typing ``!`` at an empty
 # composer swaps the ``❯`` glyph for ``!`` and everything typed there runs
 # as a bash command. Note the ``❯`` echoes left in the transcript above —
@@ -8250,12 +8387,20 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
     "occupied_pane",
     [
         _REVERSE_SEARCH_PANE,
+        _INLINE_REVERSE_SEARCH_PANE,
         _MODEL_PICKER_PANE,
         _SHELL_MODE_PANE,
         _REWIND_PANE,
         _SETTINGS_PANEL_PANE,
     ],
-    ids=["reverse-search", "model-picker", "shell-mode", "rewind", "settings-panel"],
+    ids=[
+        "reverse-search",
+        "inline-reverse-search",
+        "model-picker",
+        "shell-mode",
+        "rewind",
+        "settings-panel",
+    ],
 )
 def test_inject_user_message_restores_an_occupied_input_box_first(
     occupied_pane: str,
@@ -8323,20 +8468,76 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
 
 @pytest.mark.parametrize(
     "occupied_pane",
-    [_SHELL_MODE_PANE, _REWIND_PANE],
-    ids=["shell-mode", "rewind"],
+    [
+        _SHELL_MODE_PANE,
+        _REWIND_PANE,
+        _INLINE_REVERSE_SEARCH_PANE,
+        _INLINE_REVERSE_SEARCH_NO_MATCH_PANE,
+        _INLINE_REVERSE_SEARCH_WRAPPED_PANE,
+    ],
+    ids=[
+        "shell-mode",
+        "rewind",
+        "inline-reverse-search",
+        "inline-reverse-search-no-match",
+        "inline-reverse-search-wrapped",
+    ],
 )
 def test_an_occupied_pane_never_reads_as_a_mounted_input_box(occupied_pane: str) -> None:
     """
     An occupied pane is not a mounted chat input, ``❯`` in it or not.
 
-    Both panes carry the glyph — shell mode leaves earlier prompt echoes
-    in the transcript above the ``!`` composer, the rewind dialog marks
-    its selected row with it — and both have an input-box rule somewhere
-    below it. Reading that as "ready" is what handed a chat message to
-    bash and to a checkpoint restore; only the framed composer row counts.
+    All these panes carry the glyph — shell mode leaves earlier prompt
+    echoes in the transcript above the ``!`` composer, the rewind dialog
+    marks its selected row with it, and the inline ctrl+r search rides
+    the framed composer itself as its filter field. Reading them as
+    "ready" is what handed a chat message to bash, to a checkpoint
+    restore, and to a history replay; only a framed composer row with no
+    search footer counts.
     """
     assert _claude_prompt_rendered(occupied_pane) is False
+
+
+@pytest.mark.parametrize(
+    "occupied_pane",
+    [
+        _INLINE_REVERSE_SEARCH_PANE,
+        _INLINE_REVERSE_SEARCH_NO_MATCH_PANE,
+        _INLINE_REVERSE_SEARCH_WRAPPED_PANE,
+    ],
+    ids=["idle-filter", "no-match-filter", "wrapped-footer"],
+)
+def test_the_inline_history_search_reads_as_occupying(occupied_pane: str) -> None:
+    """
+    The composer-riding ctrl+r search is named as the occupying surface.
+
+    Its frame and ``❯`` glyph are indistinguishable from a free composer,
+    so without the footer read the reclaim would skip the Escape and the
+    injected message would filter history instead of being delivered.
+    """
+    assert _occupying_surface(occupied_pane) == "the prompt-history search"
+
+
+def test_search_chrome_in_the_transcript_does_not_read_as_occupying() -> None:
+    """
+    Search-footer text echoed into scrollback is not a live search.
+
+    The footer read is anchored below the input box's closing rule, so a
+    conversation ABOUT the history search — its chrome quoted in the
+    transcript above the box — must not draw an Escape at a free composer.
+    """
+    pane = "\n".join(
+        [
+            "❯ what does 'search prompts:' mean?",
+            "  ⎿  It is the ctrl+r history search footer.",
+            "──────────────────────────────",
+            "❯ ",
+            "──────────────────────────────",
+            "  ? for shortcuts",
+        ]
+    )
+    assert _occupying_surface(pane) is None
+    assert _claude_prompt_rendered(pane) is True
 
 
 def test_a_multiline_draft_in_a_sliver_pane_still_reads_as_ready() -> None:
@@ -8861,3 +9062,204 @@ async def test_curl_evaluate_policy_command_round_trips(
     output = json.loads(result.stdout)
     assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert output["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+# ---------------------------------------------------------------------------
+# OMNI-3699 regression: a continuation paste whose draft is never confirmed
+# by ``_draft_in_input_box`` must raise RuntimeError, not silently drop.
+#
+# Background: ``inject_user_message`` polls up to ``_PASTE_COMMIT_TIMEOUT_S``
+# for the paste to become visible as a draft in the input box.  When that
+# window expires before the TUI shows the ``[Pasted text]`` placeholder
+# (e.g. a large paste on a loaded machine), the old code sent a single blind
+# Enter and returned silently.  That Enter was absorbed into the still-
+# processing paste burst as a newline, so the message sat unsent, the harness
+# returned success, and the session latched at ``status: "running"``
+# indefinitely.
+#
+# The fix raises ``RuntimeError`` in that path so the caller cannot silently
+# lose the message.  The "draft unidentifiable" fall-through (empty-needle
+# whitespace-only content) is preserved as a best-effort path that emits a
+# warning rather than hard-failing.
+# ---------------------------------------------------------------------------
+
+
+def _post_turn_pane(draft: str = "") -> str:
+    """Return a pane that looks like a completed-turn composer with *draft* in the box.
+
+    Simulates what Claude Code shows after a turn finishes: scrollback with
+    a ``[Pasted text]`` entry from the previous paste plus a fresh empty
+    composer waiting for the next message.
+
+    :param draft: Text currently sitting in the input box row.
+    :returns: The pane text string.
+    """
+    return (
+        "❯ [Pasted text #1 +22 lines]\n"
+        "  ✓  Explored the codebase\n"
+        "  ✓  Read 12 files\n"
+        "The implementation looks correct.\n"
+        "──────────────────────────────────────────────────────────────\n"
+        f"❯ {draft}\n"
+        "──────────────────────────────────────────────────────────────\n"
+        "  ? for shortcuts\n"
+    )
+
+
+def test_inject_user_message_continuation_paste_draft_timeout_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """inject_user_message raises when the paste-commit timeout expires and draft is unseen.
+
+    The pane after a completed turn has a ``❯ [Pasted text]`` line in scrollback
+    that looks like it could contain a paste placeholder, but the *live* input box
+    (the last ``❯`` row) is empty.  ``_draft_in_input_box`` correctly matches only
+    the last glyph line, so it never returns True, and the poll window expires
+    with ``draft_seen=False``.
+
+    Before the fix: the function sent a single blind Enter and returned without
+    error, silently dropping the message.
+
+    After the fix: the function raises ``RuntimeError`` describing that the draft
+    was never confirmed, preventing the caller from losing the message silently.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_COMMIT_TIMEOUT_S", 0.1)
+    monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_SETTLE_S", 0.0)
+
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    # Build a large multi-line prompt that exceeds the paste-placeholder threshold:
+    # > 1 937 chars, >= 14 newlines (the range where Claude Code's TUI renders the
+    # paste as ``[Pasted text #N +M lines]`` instead of verbatim text, and which
+    # all observed OMNI-3699 failures shared).
+    continuation_prompt = "\n".join(
+        [
+            "Please implement the following feature:",
+            "",
+            "The system needs to handle continuation messages sent to an existing",
+            "claude-native sub-agent session.  These are second or later calls to",
+            "sys_session_send for a session that has already completed at least one turn.",
+            "",
+        ]
+        + [
+            f"Step {i}: perform the necessary action for this item in the sequence."
+            for i in range(1, 30)
+        ]
+    )
+    assert len(continuation_prompt) > 1_500
+    assert continuation_prompt.count("\n") >= 14
+
+    # Simulate the pane state after a completed turn: the live input box is empty,
+    # but there is a ``❯ [Pasted text]`` entry in scrollback from the prior turn.
+    # ``_draft_in_input_box`` only inspects the *last* ``❯`` row, so the
+    # scrollback placeholder does not satisfy the poll, and ``draft_seen`` stays
+    # False until the timeout fires.
+    tui: dict[str, str] = {"pane": _post_turn_pane()}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    # The fix: must raise RuntimeError when the draft was never confirmed.
+    # (Before the fix this returned silently — the regression the test guards.)
+    with pytest.raises(RuntimeError, match="draft"):
+        inject_user_message(bridge_dir, content=continuation_prompt)
+
+
+def test_inject_user_message_whitespace_only_content_submits_blind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Whitespace-only content (empty needle) uses the blind-submit fallback, not the error path.
+
+    When ``_submit_needle`` returns an empty string (the content has no usable
+    first line), the draft cannot be identified in the pane, so the poll is skipped
+    and a single Enter is sent without verification — same as the legacy blind-submit
+    behavior.  This must not raise: the best-effort path is retained for content
+    whose draft position cannot be determined.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_COMMIT_TIMEOUT_S", 0.1)
+    monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_SETTLE_S", 0.0)
+
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=_composer_pane(), stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    # Whitespace-only content has no identifiable needle — must not raise.
+    inject_user_message(bridge_dir, content="   \n  \n  ")
+
+
+# ── owner-pid marker + orphan prune (bridge-dir reaping) ────────────────────
+
+
+def test_prepare_bridge_dir_writes_owner_pid_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prepare_bridge_dir records the creating pid so the periodic sweep can
+    prune the dir only when its owner is provably dead."""
+    from omnigent.claude_native_bridge import prepare_bridge_dir
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "claude-native")
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+
+    bridge_dir = prepare_bridge_dir("conv_owner", workspace=tmp_path)
+
+    assert (bridge_dir / "owner.pid").read_text(encoding="utf-8").strip() == str(os.getpid())
+
+
+def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prune removes only provably-dead-owner dirs; live and unmarked survive."""
+    from omnigent.claude_native_bridge import prune_orphaned_bridge_dirs
+
+    root = tmp_path / "claude-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", root)
+
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    dead_dir = root / "deadowner"
+    dead_dir.mkdir()
+    (dead_dir / "owner.pid").write_text(str(dead.pid), encoding="utf-8")
+
+    live_dir = root / "liveowner"
+    live_dir.mkdir()
+    (live_dir / "owner.pid").write_text(str(os.getpid()), encoding="utf-8")
+
+    unmarked_dir = root / "unmarked"
+    unmarked_dir.mkdir()
+
+    pruned = prune_orphaned_bridge_dirs()
+
+    assert pruned == 1
+    assert not dead_dir.exists()
+    assert live_dir.exists()
+    assert unmarked_dir.exists()

@@ -56,6 +56,14 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   useWorkspaceChangedFiles: vi.fn(() => ({ data: undefined, isLoading: true })),
 }));
 
+// AppShell reads the GitHub info to gate the rail's GitHub tab; keep it
+// loading here (tab visible, matching the Files gate's no-flash default) so
+// no network-backed query fires. Tab visibility itself is covered in
+// AppShell.githubTabVisibility.test.tsx.
+vi.mock("@/hooks/useGithub", () => ({
+  useGithubInfo: vi.fn(() => ({ data: undefined, isLoading: true })),
+}));
+
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module (childSessionsQueryKey, MAX_TREE_DEPTH,
   // cachedTreeContains) — only the hook is replaced.
@@ -373,6 +381,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     databricks_features: false,
     managed_sandboxes_enabled: false,
     sandbox_provider: null,
+    enabled_connections: [],
     sharing_mode: "on",
     public_sharing_enabled: true,
     server_version: null,
@@ -1073,7 +1082,7 @@ describe("TerminalFirstContext", () => {
     expect(regularProbe).toHaveAttribute("data-is-claude-native", "false");
   });
 
-  it("targets the agent terminal while a user shell remains open in the workspace rail", () => {
+  it("targets the agent terminal while a user shell remains open in the workspace rail", async () => {
     writeSessionWorkspaceState("conv_native", {
       open: true,
       selectedTerminalKey: "terminal:terminal_bash_s1",
@@ -1103,7 +1112,8 @@ describe("TerminalFirstContext", () => {
 
     renderShell("/c/conv_native");
 
-    expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_bash_s1");
+    // findByTestId waits for the lazy TerminalView chunk to resolve through its Suspense boundary.
+    expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("terminal_bash_s1");
     fireEvent.click(screen.getByTestId("view-mode-terminal"));
     expect(screen.getByTestId("view-probe")).toHaveAttribute(
       "data-terminal-view-key",

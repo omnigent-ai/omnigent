@@ -7,6 +7,7 @@ import contextlib
 import errno
 import logging
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -2168,6 +2169,48 @@ def test_build_runner_env_passthrough_extends_forwarded_set() -> None:
     assert "UNLISTED_SECRET" not in env
 
 
+def test_dispatch_trace_context_reaches_runner_but_not_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The dispatch-blessed caller trace context must reach runner (and thus
+    harness) subprocesses via the OMNIGENT_OTEL_ allowlist prefix, but a
+    long-lived host daemon must NOT inherit it: the daemon outlives the
+    dispatch and is reused, so a stale caller context stuck to it would
+    funnel every later run into the first caller's dead trace.
+    """
+    from omnigent.cli import _build_host_daemon_env
+    from omnigent.runtime.telemetry import (
+        DISPATCH_TRACEPARENT_ENV_VAR,
+        DISPATCH_TRACESTATE_ENV_VAR,
+    )
+
+    traceparent = "00-9fb2e1cf8fbe9c5ecb7742f04c351500-662a3348b2576ccf-01"
+
+    runner_env = _build_runner_env(
+        {
+            "PATH": "/usr/bin:/bin",
+            DISPATCH_TRACEPARENT_ENV_VAR: traceparent,
+            DISPATCH_TRACESTATE_ENV_VAR: "vendor=abc",
+        },
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+    assert runner_env[DISPATCH_TRACEPARENT_ENV_VAR] == traceparent
+    assert runner_env[DISPATCH_TRACESTATE_ENV_VAR] == "vendor=abc"
+
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv(DISPATCH_TRACEPARENT_ENV_VAR, traceparent)
+    monkeypatch.setenv(DISPATCH_TRACESTATE_ENV_VAR, "vendor=abc")
+    for server_url in (None, "https://example.databricksapps.com"):
+        daemon_env = _build_host_daemon_env(server_url=server_url)
+        assert DISPATCH_TRACEPARENT_ENV_VAR not in daemon_env
+        assert DISPATCH_TRACESTATE_ENV_VAR not in daemon_env
+
+
 def test_build_runner_env_passthrough_survives_remote_daemon_hop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3706,6 +3749,34 @@ async def test_reconnect_uses_shorter_handshake_timeout(
     assert [call["open_timeout"] for call in spy.calls] == [10.0, 3.0]
 
 
+async def test_host_records_accepted_connection_and_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The host reports lifecycle metrics only after an accepted upgrade."""
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
+    spy = _ConnectSpy([None, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    connected: list[tuple[str, bool]] = []
+    disconnected: list[tuple[str, BaseException | None]] = []
+    monkeypatch.setattr(
+        "omnigent.host.connect.record_websocket_connected",
+        lambda kind, *, reconnect: connected.append((kind, reconnect)),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.record_websocket_disconnected",
+        lambda kind, error, **_kwargs: disconnected.append((kind, error)),
+    )
+
+    await _host().run()
+
+    assert connected == [("host", False)]
+    assert len(disconnected) == 1
+    assert disconnected[0][0] == "host"
+    assert isinstance(disconnected[0][1], ConnectionClosedError)
+
+
 def _refused_exc() -> ConnectionRefusedError:
     """A single-stack connection-refused, as asyncio raises it.
 
@@ -3880,6 +3951,26 @@ async def test_run_host_process_invalid_host_id_exits_actionably(
     assert "not-a-uuid" in err
 
 
+def test_run_host_process_mirrors_structured_logs_on_foreground_tty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Foreground ``omnigent host`` mirrors logs like ``omnigent server``."""
+    monkeypatch.delenv("OMNIGENT_LOG_TO_STDERR", raising=False)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
+
+    with patch(
+        "omnigent.host.connect.configure_process_logging",
+        return_value=tmp_path / "host.log",
+    ) as configure_logging:
+        run_host_process(
+            server_url="https://app.example.databricks.com",
+            config_path=tmp_path / "config.yaml",
+        )
+
+    configure_logging.assert_called_once_with("host", log_to_stderr=True)
+
+
 def test_run_host_process_announces_session_log_dir_on_start(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3906,6 +3997,56 @@ def test_run_host_process_announces_session_log_dir_on_start(
     out = capsys.readouterr().out
     assert "Session logs: ~/.omnigent/logs/runner/" in out
     assert "This host's log: ~/.omnigent/logs/host/host-" in out
+
+
+async def test_run_sweeps_orphaned_native_bridge_dirs_on_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host startup reclaims native bridge dirs orphaned by a crashed runner.
+
+    A runner that dies uncleanly (SIGKILL / crash / host restart mid-run)
+    never runs its explicit-delete cleanup, and if no new runner ever
+    launches on the machine the runner-side startup sweep never fires
+    either — so ``~/.omnigent`` grows without bound. The host daemon's own
+    (re)start is the reliable moment to reap: ``run()`` must invoke the
+    cross-harness bridge-dir sweep before entering the connect loop.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
+    sweeps: list[int] = []
+    monkeypatch.setattr(
+        "omnigent.native_bridge_common.reap_orphaned_native_bridge_dirs",
+        lambda: sweeps.append(1) or 3,
+    )
+    host = _host()
+
+    await host.run()
+
+    assert sweeps == [1]
+
+
+async def test_run_survives_a_failing_native_bridge_dir_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raising bridge-dir sweep must not abort host startup.
+
+    The sweep is best-effort housekeeping; a broken bridge module or an
+    unreadable bridge root must never prevent the host from registering.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
+
+    def _boom() -> int:
+        raise OSError("bridge root unreadable")
+
+    monkeypatch.setattr(
+        "omnigent.native_bridge_common.reap_orphaned_native_bridge_dirs",
+        _boom,
+    )
+    host = _host()
+
+    # Startup completes (run returns via the clean cancel) despite the raise.
+    await host.run()
 
 
 async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
@@ -4157,6 +4298,93 @@ async def test_model_options_frame_replies_off_the_receive_loop(
     assert reply.status == "ok"
     assert reply.models == [{"id": "gpt-5.6-sol", "displayName": "GPT-5.6-Sol"}]
     _cleanup_host(host)
+
+
+async def test_dns_errno_failure_is_not_a_recycle(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Windows errno 11001 (getaddrinfo failed) is not close code 1001.
+
+    The old substring classifier matched "1001" inside "11001", so a
+    sustained DNS outage (VPN down) classified every failure as an explicit
+    recycle and reconnected at the 0.5s prompt cadence indefinitely — 2
+    attempts/second, 122k attempts overnight in the field report.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_CAP_S", 0.0)
+    dns_failure = OSError(11001, "getaddrinfo failed")
+    spy = _ConnectSpy([dns_failure, dns_failure, dns_failure, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        await host.run()
+
+    assert spy.call_count == 4
+    reconnects = [
+        record.message for record in caplog.records if "Reconnecting in" in record.message
+    ]
+    assert len(reconnects) == 3
+    assert not any("(recycle" in r for r in reconnects), (
+        "a DNS resolution failure must take the backoff ladder, not the prompt recycle cadence"
+    )
+
+
+@pytest.mark.parametrize("port", [502, 1001, 1012])
+async def test_endpoint_port_is_not_a_recycle(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    port: int,
+) -> None:
+    """Standalone numbers in transport errors are not protocol status codes."""
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    failure = OSError(f"Connect call failed ('203.0.113.1', {port})")
+    spy = _ConnectSpy([failure, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        await _host().run()
+
+    reconnects = [
+        record.message for record in caplog.records if "Reconnecting in" in record.message
+    ]
+    assert len(reconnects) == 1
+    assert "(recycle" not in reconnects[0]
+
+
+async def test_sustained_recycle_failures_fall_back_to_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A sustained run of recycle-classified failures is an outage, not a cycle.
+
+    The prompt cadence exists for a brief ingress recycle; when the same
+    classification fires attempt after attempt without a connection ever
+    establishing (proxy 502 while the server is down), the daemon must back
+    off instead of hammering the endpoint twice a second forever.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_CAP_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._RECYCLE_PROMPT_MAX_STREAK", 3)
+    # Raised AT CONNECT TIME (never accepted): an ingress-classified outage.
+    rejected = _invalid_status(502)
+    spy = _ConnectSpy([rejected] * 6 + [asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        await host.run()
+
+    assert spy.call_count == 7
+    reconnects = [
+        record.message for record in caplog.records if "Reconnecting in" in record.message
+    ]
+    assert len(reconnects) == 6
+    prompt = [i for i, r in enumerate(reconnects) if "(recycle" in r]
+    # The first _RECYCLE_PROMPT_MAX_STREAK attempts are prompt; every attempt
+    # after that takes the backoff ladder.
+    assert prompt == [0, 1, 2], f"prompt cadence must stop after the streak cap: {prompt}"
 
 
 async def test_silent_connect_streak_escalates_and_slows_reconnects(
@@ -4824,6 +5052,43 @@ def test_post_connect_auth_rejection_escalates_without_going_fatal(
     assert "omnigent login http://localhost:8000" in escalated
     assert "no longer a transient network blip" in escalated
     assert host._auth_retry_streak == _AUTH_REJECT_ESCALATE_ATTEMPTS
+
+
+async def test_launch_harness_probe_runs_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The readiness probe must not run inline on the daemon's event loop.
+
+    It shells out to ``<cli> --version``, so inline a hung CLI would stall the
+    keepalive pong the server counts as liveness.
+    """
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    loop_thread_id = threading.get_ident()
+    probe_thread_ids: list[int] = []
+
+    def _record_thread(harness: str) -> bool:
+        probe_thread_ids.append(threading.get_ident())
+        return False
+
+    monkeypatch.setattr("omnigent.host.connect.harness_is_configured", _record_thread)
+
+    result = await host._handle_launch(
+        HostLaunchRunnerFrame(
+            request_id="req_probe_thread",
+            binding_token="token_abc",
+            workspace=str(workspace),
+            harness="codex",
+        )
+    )
+
+    assert result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
+    assert probe_thread_ids, "the harness probe should still run"
+    assert loop_thread_id not in probe_thread_ids, (
+        "harness readiness probe ran on the event loop thread"
+    )
 
 
 async def test_fatal_upgrade_error_surfaces_server_refusal_body() -> None:

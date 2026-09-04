@@ -1707,6 +1707,22 @@
             "title": "Code",
             "type": "string"
           },
+          "level": {
+            "anyOf": [
+              {
+                "enum": [
+                  "error",
+                  "info"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Rendering level. `\"info\"` renders the banner as a neutral notice (e.g. codex started a fresh thread) rather than a failure; `None` / `\"error\"` is the destructive default and is omitted from the wire so existing error items are unchanged.",
+            "title": "Level"
+          },
           "message": {
             "description": "Human-readable error message, e.g. `\"Native Codex requires the 'codex' CLI on PATH.\"`.",
             "title": "Message",
@@ -1717,7 +1733,8 @@
             "enum": [
               "llm",
               "execution",
-              "tool"
+              "tool",
+              "harness"
             ],
             "title": "Source",
             "type": "string"
@@ -1812,11 +1829,12 @@
             "title": "Sequence Number"
           },
           "source": {
-            "description": "Origin of the error \u2014 `\"llm\"` for LLM-call failures, `\"execution\"` for timeouts, `\"tool\"` for tool failures (currently emitted by retry exhaustion paths).",
+            "description": "Origin of the error -- `\"llm\"` for LLM-call failures, `\"execution\"` for timeouts, `\"tool\"` for tool failures, `\"harness\"` for harness process failures.",
             "enum": [
               "llm",
               "execution",
-              "tool"
+              "tool",
+              "harness"
             ],
             "title": "Source",
             "type": "string"
@@ -1849,6 +1867,331 @@
         "title": "ErrorEvent",
         "type": "object"
       },
+      "ExtensionAssetErrorResponse": {
+        "description": "Concise diagnostic for one unresolved browser bundle.",
+        "properties": {
+          "error": {
+            "title": "Error",
+            "type": "string"
+          },
+          "extension_id": {
+            "title": "Extension Id",
+            "type": "string"
+          },
+          "status": {
+            "const": "unresolved",
+            "default": "unresolved",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "extension_id",
+          "error"
+        ],
+        "title": "ExtensionAssetErrorResponse",
+        "type": "object"
+      },
+      "ExtensionBrowserBundleResponse": {
+        "description": "Opaque browser-bundle availability and content-addressed asset URLs.",
+        "properties": {
+          "declared": {
+            "title": "Declared",
+            "type": "boolean"
+          },
+          "digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Digest"
+          },
+          "has_styles": {
+            "title": "Has Styles",
+            "type": "boolean"
+          },
+          "script_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Script Url"
+          },
+          "style_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Style Url"
+          }
+        },
+        "required": [
+          "declared",
+          "has_styles"
+        ],
+        "title": "ExtensionBrowserBundleResponse",
+        "type": "object"
+      },
+      "ExtensionDiagnosticsResponse": {
+        "description": "Administrator view of accepted and rejected extensions.",
+        "properties": {
+          "asset_errors": {
+            "items": {
+              "$ref": "#/components/schemas/ExtensionAssetErrorResponse"
+            },
+            "title": "Asset Errors",
+            "type": "array"
+          },
+          "extensions": {
+            "items": {
+              "$ref": "#/components/schemas/ExtensionResponse"
+            },
+            "title": "Extensions",
+            "type": "array"
+          },
+          "load_errors": {
+            "items": {
+              "$ref": "#/components/schemas/ExtensionLoadErrorResponse"
+            },
+            "title": "Load Errors",
+            "type": "array"
+          },
+          "object": {
+            "const": "extension_diagnostics",
+            "default": "extension_diagnostics",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "required": [
+          "extensions",
+          "load_errors",
+          "asset_errors"
+        ],
+        "title": "ExtensionDiagnosticsResponse",
+        "type": "object"
+      },
+      "ExtensionListResponse": {
+        "description": "Public catalog of accepted extensions.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ExtensionResponse"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "ExtensionListResponse",
+        "type": "object"
+      },
+      "ExtensionLoadErrorResponse": {
+        "description": "Concise diagnostic for one rejected entry point.",
+        "properties": {
+          "entry_point": {
+            "title": "Entry Point",
+            "type": "string"
+          },
+          "error": {
+            "title": "Error",
+            "type": "string"
+          },
+          "status": {
+            "const": "rejected",
+            "default": "rejected",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "entry_point",
+          "error"
+        ],
+        "title": "ExtensionLoadErrorResponse",
+        "type": "object"
+      },
+      "ExtensionPageResponse": {
+        "description": "One namespaced page contribution.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "route": {
+            "title": "Route",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "view": {
+            "title": "View",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "route",
+          "view"
+        ],
+        "title": "ExtensionPageResponse",
+        "type": "object"
+      },
+      "ExtensionPrimaryNavigationResponse": {
+        "description": "One primary-sidebar navigation contribution.",
+        "properties": {
+          "icon": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Icon"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "order": {
+            "format": "int64",
+            "title": "Order",
+            "type": "integer"
+          },
+          "page": {
+            "title": "Page",
+            "type": "string"
+          },
+          "when": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "When"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "page",
+          "icon",
+          "order",
+          "when"
+        ],
+        "title": "ExtensionPrimaryNavigationResponse",
+        "type": "object"
+      },
+      "ExtensionResponse": {
+        "description": "Public metadata for one accepted extension.",
+        "properties": {
+          "browser": {
+            "$ref": "#/components/schemas/ExtensionBrowserBundleResponse"
+          },
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          },
+          "distribution": {
+            "title": "Distribution",
+            "type": "string"
+          },
+          "extension_api": {
+            "format": "int64",
+            "title": "Extension Api",
+            "type": "integer"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "object": {
+            "const": "extension",
+            "default": "extension",
+            "title": "Object",
+            "type": "string"
+          },
+          "pages": {
+            "items": {
+              "$ref": "#/components/schemas/ExtensionPageResponse"
+            },
+            "title": "Pages",
+            "type": "array"
+          },
+          "permissions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Permissions",
+            "type": "array"
+          },
+          "primary_navigation": {
+            "items": {
+              "$ref": "#/components/schemas/ExtensionPrimaryNavigationResponse"
+            },
+            "title": "Primary Navigation",
+            "type": "array"
+          },
+          "status": {
+            "enum": [
+              "enabled",
+              "unavailable"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "display_name",
+          "distribution",
+          "version",
+          "extension_api",
+          "status",
+          "permissions",
+          "pages",
+          "primary_navigation",
+          "browser"
+        ],
+        "title": "ExtensionResponse",
+        "type": "object"
+      },
       "FailedEvent": {
         "description": "Terminal event for a turn that ended with an error.\n\nCarries a `omnigent.server.schemas.FailedResponseObject`\nwhose `error` field describes the failure. Response metadata may\nbe absent when the failure occurs before response allocation.",
         "properties": {
@@ -1876,6 +2219,18 @@
             ],
             "default": null,
             "title": "Sequence Number"
+          },
+          "source": {
+            "default": "execution",
+            "description": "Where the fault originated -- `\"llm\"` for inference/context errors, `\"harness\"` for Claude Code/harness process failures, `\"execution\"` for runner configuration or infrastructure failures.",
+            "enum": [
+              "llm",
+              "execution",
+              "tool",
+              "harness"
+            ],
+            "title": "Source",
+            "type": "string"
           },
           "type": {
             "const": "response.failed",
@@ -2357,7 +2712,7 @@
         "type": "object"
       },
       "ImportedSessionRef": {
-        "description": "One freshly imported session: its new id plus display title.\n\n`title` is `None` when the session has no native title and no first user\nmessage to synthesize from; the UI falls back to a placeholder.",
+        "description": "One freshly imported session: its new id plus display title.\n\n`title` is `None` when the session has no native title and no first user\nmessage to synthesize from; the UI falls back to a placeholder. Also the\nshape of each `{\"event\": \"session\", ...}` line the\n`/imports/local/stream` endpoint emits.",
         "properties": {
           "session_id": {
             "title": "Session Id",
@@ -2541,7 +2896,7 @@
         "type": "object"
       },
       "LocalImportResponse": {
-        "description": "Batch result for `POST /v1/imports/local`.",
+        "description": "Buffered batch result for `POST /v1/imports/local`.\n\nThe streaming `/imports/local/stream` endpoint carries the same tally on\nits terminal `{\"event\": \"done\", ...}` line instead.",
         "properties": {
           "already_imported": {
             "format": "int64",
@@ -4013,6 +4368,13 @@
             "title": "Dictation Available",
             "type": "boolean"
           },
+          "enabled_connections": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Enabled Connections",
+            "type": "array"
+          },
           "features": {
             "additionalProperties": {
               "type": "boolean"
@@ -4107,6 +4469,7 @@
           "managed_sandboxes_enabled",
           "sandbox_provider",
           "sandbox_providers",
+          "enabled_connections",
           "sharing_mode",
           "public_sharing_enabled",
           "server_version",
@@ -4152,6 +4515,7 @@
             "session.agent_changed": "#/components/schemas/SessionAgentChangedEvent",
             "session.changed_files.invalidated": "#/components/schemas/SessionChangedFilesInvalidatedEvent",
             "session.child_session.updated": "#/components/schemas/SessionChildSessionUpdatedEvent",
+            "session.codex_approval_mode": "#/components/schemas/SessionCodexApprovalModeEvent",
             "session.collaboration_mode": "#/components/schemas/SessionCollaborationModeEvent",
             "session.created": "#/components/schemas/SessionCreatedEvent",
             "session.heartbeat": "#/components/schemas/SessionHeartbeatEvent",
@@ -4202,6 +4566,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionPermissionModeEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionCodexApprovalModeEvent"
           },
           {
             "$ref": "#/components/schemas/SessionAgentChangedEvent"
@@ -4480,6 +4847,47 @@
           "child"
         ],
         "title": "SessionChildSessionUpdatedEvent",
+        "type": "object"
+      },
+      "SessionCodexApprovalModeEvent": {
+        "description": "Active approval/sandbox-mode update from a codex-native session.\n\nEmitted after the web UI switches the mode, and after the Codex forwarder\nobserves a `thread/settings/updated` notification \u2014 an approval change the\nuser made inside Codex's `/permissions` popup, which Omnigent has no other\nway to see. Lets the composer's approval picker track the thread without a\nreload.",
+        "properties": {
+          "approval_mode": {
+            "description": "The active mode, one of `\"ask-for-approval\"`, `\"approve-for-me\"`, `\"full-access\"`, `\"read-only\"`. Category: **transient** (SSE-only). The server also writes `omnigent.codex_native.approval_mode` on the conversation labels (and `terminal_launch_args`), so reconnecting clients restore the same state from the session snapshot.",
+            "title": "Approval Mode",
+            "type": "string"
+          },
+          "conversation_id": {
+            "description": "Session identifier, e.g. `\"conv_abc123\"`.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.codex_approval_mode",
+            "description": "Always `\"session.codex_approval_mode\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "approval_mode"
+        ],
+        "title": "SessionCodexApprovalModeEvent",
         "type": "object"
       },
       "SessionCollaborationModeEvent": {
@@ -5313,7 +5721,7 @@
         "type": "object"
       },
       "SessionModelEvent": {
-        "description": "Active-model report from a terminal-backed integration.\n\nEmitted after an `external_model_change` POST from a native\nforwarder \u2014 the launch's own model report, or a switch made inside\nthe pane (a `/model` command or the in-TUI picker). Every surface\nre-renders its model display from this.",
+        "description": "Active-model report from a harness integration.\n\nEmitted after an `external_model_change` POST from a native\nforwarder or when an SDK relay reports its concrete model in terminal\nresponse usage. Every surface re-renders its model display from this.",
         "properties": {
           "conversation_id": {
             "description": "Session identifier, e.g. `\"conv_abc123\"`.",
@@ -7577,6 +7985,18 @@
         "additionalProperties": false,
         "description": "Request body for `PATCH /v1/sessions/{id}`.\n\nThe Alpha runner-state pivot makes this endpoint the mutable\nsession affinity primitive when `runner_id` is provided. The\nserver validates that the runner is online, then replaces\n`conversations.runner_id`. Existing session metadata updates\nremain supported for clients that update title, labels, or\nreasoning effort through the sessions API.",
         "properties": {
+          "approval_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Codex-native approval mode to switch a running session to, one of `\"ask-for-approval\"`, `\"approve-for-me\"`, `\"full-access\"`, `\"read-only\"` \u2014 Codex's own `/permissions` presets (the set is codex-version-dependent, so an older build may not offer every one). Only valid for sessions stamped with the codex-native wrapper label. The runner applies it by driving Codex's `/permissions` popup and confirms the switch echoed before returning, so a failure to reach the mode surfaces as an error. The confirmed mode is stored on the read-back label only (Codex owns the durable approval state), so it is not written to `terminal_launch_args`. Omitted leaves unchanged.",
+            "title": "Approval Mode"
+          },
           "archived": {
             "anyOf": [
               {
@@ -8331,6 +8751,167 @@
         "summary": "Branding Logo"
       }
     },
+    "/v1/extensions": {
+      "get": {
+        "description": "List extensions installed and enabled when the server started.\n\nV1 treats operator installation as enablement. Installing, removing, or\nupgrading a package requires a server restart to refresh this snapshot.",
+        "operationId": "list_extensions_v1_extensions_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtensionListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Extensions",
+        "tags": [
+          "extensions"
+        ]
+      }
+    },
+    "/v1/extensions/diagnostics": {
+      "get": {
+        "description": "Show accepted extensions and concise discovery failures to administrators.",
+        "operationId": "extension_diagnostics_v1_extensions_diagnostics_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtensionDiagnosticsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Extension Diagnostics",
+        "tags": [
+          "extensions"
+        ]
+      }
+    },
+    "/v1/extensions/{extension_id}": {
+      "get": {
+        "description": "Return one installed extension's public contribution metadata.",
+        "operationId": "get_extension_v1_extensions__extension_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "extension_id",
+            "required": true,
+            "schema": {
+              "title": "Extension Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtensionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Extension",
+        "tags": [
+          "extensions"
+        ]
+      }
+    },
+    "/v1/extensions/{extension_id}/assets/{digest}/{asset_name}": {
+      "get": {
+        "description": "Return a declared asset only when its bundle digest still matches.",
+        "operationId": "get_extension_asset_v1_extensions__extension_id__assets__digest___asset_name__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "extension_id",
+            "required": true,
+            "schema": {
+              "title": "Extension Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "digest",
+            "required": true,
+            "schema": {
+              "title": "Digest",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "asset_name",
+            "required": true,
+            "schema": {
+              "title": "Asset Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              },
+              "text/css": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "text/javascript": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Extension JavaScript or CSS asset"
+          },
+          "404": {
+            "description": "Extension asset not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Extension Asset",
+        "tags": [
+          "extensions"
+        ]
+      }
+    },
     "/v1/harnesses": {
       "get": {
         "operationId": "list_harnesses_v1_harnesses_get",
@@ -8471,6 +9052,76 @@
           }
         },
         "summary": "Detect Host Credentials",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/credentials/{provider}": {
+      "get": {
+        "description": "Return the session owner's *provider* credential for *host_id*.\n\nAuthenticated by the launch token (constant-time, expiry-aware, and\nbound to *host_id*), exactly like the host tunnel. `401` when the\ntoken doesn't resolve; `404` for a provider with no broker resolver or\nnot configured on this server; `{\"connected\": false}` when the owner\nhasn't linked it, so a caller can fall back cleanly.",
+        "operationId": "host_credential_v1_hosts__host_id__credentials__provider__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "provider",
+            "required": true,
+            "schema": {
+              "title": "Provider",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-omnigent-host-token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Omnigent-Host-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Host Credential V1 Hosts  Host Id  Credentials  Provider  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Host Credential",
         "tags": [
           "hosts"
         ]
@@ -9063,7 +9714,7 @@
     },
     "/v1/imports/local": {
       "post": {
-        "description": "Import the caller's recent local transcripts from a chosen host.\n\nThe transcripts live on the caller's machine, so the read happens on\nthe connected host over its tunnel \u2014 the server can't see them. The\nhost enumerates + normalizes the most recent sessions; the server\nimports those not already imported. Drives the web \"Import sessions\"\nbutton.\n\nNot atomic: each session is persisted as its frame arrives. If the host\ndrops mid-stream this raises after the sessions read so far are already\ncommitted; a retry is idempotent (they come back as already-imported).",
+        "description": "Import the caller's recent local transcripts from a chosen host.\n\nThe transcripts live on the caller's machine, so the read happens on\nthe connected host over its tunnel \u2014 the server can't see them. The\nhost enumerates + normalizes the most recent sessions; the server\nimports those not already imported.\n\nBuffered form: returns the whole batch's tally in one JSON body. For a\nlive per-session list use `POST /v1/imports/local/stream`. Not atomic:\neach session is persisted as its frame arrives, so if the host drops\nmid-stream this raises after the sessions read so far are already\ncommitted; a retry is idempotent (they come back as already-imported).",
         "operationId": "import_local_sessions_v1_imports_local_post",
         "requestBody": {
           "content": {
@@ -9098,6 +9749,47 @@
           }
         },
         "summary": "Import Local Sessions",
+        "tags": [
+          "imports"
+        ]
+      }
+    },
+    "/v1/imports/local/stream": {
+      "post": {
+        "description": "Stream the caller's recent local transcripts from a chosen host.\n\nSame import as the buffered `POST /v1/imports/local`, but responds with\nNDJSON: one `{\"event\": \"session\", ...}` line per newly imported session\nas its frame lands, so the caller lists sessions as they arrive rather\nthan waiting out the whole batch; a terminal `{\"event\": \"done\", ...}`\ncarries the tally. A mid-stream host failure emits `{\"event\": \"error\", ...}` before `done` \u2014 the sessions read so far are already committed\nand a retry is idempotent. Request validation still fails ahead of the\nstream with the usual HTTP error.",
+        "operationId": "import_local_sessions_stream_v1_imports_local_stream_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LocalImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              },
+              "application/x-ndjson": {}
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Local Sessions Stream",
         "tags": [
           "imports"
         ]
@@ -9981,7 +10673,7 @@
     },
     "/v1/sessions/{session_id}": {
       "delete": {
-        "description": "Delete a session and all associated resources.\n\nRequires owner-level access. Tears down tasks, runner-side\nresources (environments, terminals), session files, and the\nconversation row.\n\n**Returns:** A `ConversationDeleted` confirmation.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access, 403 if insufficient permissions.",
+        "description": "Delete a session and all associated resources.\n\nRequires owner-level access. Tears down tasks, runner-side\nresources (environments, terminals), session files, and the\nconversation row.\n\n**Returns:** A `ConversationDeleted` confirmation.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access, 403 if insufficient permissions, 409 if `delete_branch=true` and the host is offline so worktree cleanup cannot run.",
         "operationId": "delete_session_v1_sessions__session_id__delete",
         "parameters": [
           {
@@ -9995,7 +10687,7 @@
             }
           },
           {
-            "description": "Opt-in git cleanup, as a query param (`?delete_branch=true`). When `True` and the session has a server-created worktree (`git_branch` set), the host removes the worktree directory and deletes its branch (`git worktree remove --force` then `git branch -D`). Ignored for sessions with no worktree. Best-effort: a cleanup failure does not block the delete. Defaults to `False` (worktree and branch left untouched). See designs/SESSION_GIT_WORKTREE.md.",
+            "description": "Opt-in git cleanup, as a query param (`?delete_branch=true`). When `True` and the session has a server-created worktree (`git_branch` set), the host removes the worktree directory and deletes its branch (`git worktree remove --force` then `git branch -D`). Ignored for sessions with no worktree. If the host tunnel is down (typically `runner_online: false`), the delete is rejected with 409 so the caller can retry without cleanup rather than receiving a misleading 404. A host-reported git failure is still logged and does not block the delete. Defaults to `False` (worktree and branch left untouched). See designs/SESSION_GIT_WORKTREE.md.",
             "in": "query",
             "name": "delete_branch",
             "required": false,
@@ -12283,7 +12975,7 @@
         ]
       },
       "get": {
-        "description": "Read a file or list a directory in an environment.\n\n**Returns:** File content or directory listing.",
+        "description": "Read a file or list a directory in an environment.\n\n**Returns:** File content or directory listing, or the raw file.",
         "operationId": "read_or_list_environment_path_v1_sessions__session_id__resources_environments__environment_id__filesystem__relative_path__get",
         "parameters": [
           {
@@ -12374,6 +13066,17 @@
               "title": "Order",
               "type": "string"
             }
+          },
+          {
+            "description": "When `True`, stream the complete file as an attachment with no size cap instead of the capped JSON envelope. A directory rejects it with 400.",
+            "in": "query",
+            "name": "download",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Download",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -12381,9 +13084,15 @@
             "content": {
               "application/json": {
                 "schema": {}
+              },
+              "application/octet-stream": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "File content or directory listing as JSON; the raw file as an attachment when `download=true`."
           },
           "422": {
             "content": {
@@ -13163,6 +13872,90 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/resources/github": {
+      "get": {
+        "description": "Return GitHub context (repo, branch, base ref, PR) for a session.\n\nProxies to the runner, which shells out to `gh`/`git` in the\nworkspace. Returns an `available: false` payload (200) when `gh` is\nmissing or the workspace is not a git repo.\n\n**Returns:** The `session.github.info` object.",
+        "operationId": "get_session_github_v1_sessions__session_id__resources_github_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Github",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/changes": {
+      "get": {
+        "description": "List the PR's changed files (empty when the branch has no PR).\n\n**Returns:** Flat list of changed files with `status` and line counts.",
+        "operationId": "list_session_github_changes_v1_sessions__session_id__resources_github_changes_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Github Changes",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/resources/terminals": {
       "get": {
         "description": "Return only terminal resources for a session.\n\nThe runner endpoint's pagination params (`limit` / `after` /\n`before` / `order`) are forwarded from the incoming query\nstring \u2014 without this, a client-requested `order=asc` (the web\nterminal tabs rely on creation order to keep the session's own\nterminal first) would be silently dropped and the runner's\n`desc` default would apply.\n\n**Returns:** `PaginatedList` of terminal resources.",
@@ -13680,6 +14473,11 @@
       "description": "Discover the built-in agents available to bind to a session.",
       "name": "agents",
       "x-displayName": "Agents"
+    },
+    {
+      "description": "Inspect installed extension pages and navigation contributions.",
+      "name": "extensions",
+      "x-displayName": "Extensions"
     },
     {
       "description": "Hosts that can launch runners. Browse the host filesystem and create directories.",

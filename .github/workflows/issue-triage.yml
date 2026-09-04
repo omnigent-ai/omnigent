@@ -13,8 +13,8 @@ name: Issue Triage
 # exfiltrate secrets. All GitHub mutations happen in steps the LLM
 # cannot influence.
 #
-# Runs legacy intake on issue open. V2 handles issue edits and author follow-up
-# through the reusable issue-prioritization-v2 workflow.
+# V2 owns new-issue intake and issue edits while its rollout switch is enabled.
+# The legacy job remains unchanged behind the disabled switch for rollback.
 #
 # What the bot does:
 #   1. Removes `needs-triage`, adds `triaged`
@@ -40,6 +40,7 @@ on:
       issue_number:
         description: Issue to triage
         required: true
+        type: number
       apply_labels:
         description: >-
           Apply labels, assignment, and duplicate closure (otherwise log only)
@@ -58,7 +59,7 @@ permissions:
 # (e.g. a re-label right after open won't race with the initial run).
 concurrency:
   group: issue-triage-${{ github.event.issue.number || inputs.issue_number }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   OMNIGENT_SKIP_WEB_UI: "true"
@@ -72,16 +73,20 @@ env:
 
 jobs:
   triage:
+    name: Legacy intake fallback
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Legacy intake runs once for new non-bot issues. Edited issues proceed only
-    # to the V2 job below.
+    # Deprecated: remove in 0.12.0 after the seven-day V2 intake canary.
+    # This fallback runs only while V2 is disabled.
     if: >-
-      github.event_name == 'workflow_dispatch' ||
+      vars.ISSUE_PRIORITIZATION_V2_ENABLED != 'true' &&
       (
-        github.event_name == 'issues' &&
-        github.event.action == 'opened' &&
-        !endsWith(github.event.issue.user.login, '[bot]')
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event_name == 'issues' &&
+          github.event.action == 'opened' &&
+          !endsWith(github.event.issue.user.login, '[bot]')
+        )
       )
     steps:
       - name: Check LLM credentials available
@@ -102,6 +107,12 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
+
+      - name: Set up Python
+        if: steps.creds.outputs.available == 'true'
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version-file: ".python-version"
 
       # ── Trusted context-gathering steps ──────────────────────────────
       # These run before the LLM and use the GitHub token directly.
@@ -163,12 +174,12 @@ jobs:
             --json number,title,body,state,stateReason,url,createdAt,updatedAt,labels \
             > /tmp/corpus.json
 
-          PYTHONPATH=.github/scripts python3 <<'PYEOF'
+          PYTHONPATH=.github/triage_v2/src python3 <<'PYEOF'
           import json
           import os
           import pathlib
 
-          from issue_duplicates import extract_issue_references, rank_candidates
+          from issue_prioritization.duplicates import extract_issue_references, rank_candidates
 
           issue = json.loads(pathlib.Path("/tmp/issue.json").read_text())
           corpus = json.loads(pathlib.Path("/tmp/corpus.json").read_text())
@@ -191,12 +202,6 @@ jobs:
           PYEOF
 
       # ── LLM classification (no tools, no shell, no GH_TOKEN) ────────
-
-      - name: Set up Python
-        if: steps.creds.outputs.available == 'true'
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
-        with:
-          python-version-file: ".python-version"
 
       - name: Set up uv
         if: steps.creds.outputs.available == 'true'
@@ -233,7 +238,7 @@ jobs:
           # this dir's node_modules empty.
           CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
           mkdir -p "$CC_CLI_DIR" && cd "$CC_CLI_DIR"
-          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.212
+          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.236
           node node_modules/@anthropic-ai/claude-code/install.cjs
           echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
 
@@ -297,8 +302,8 @@ jobs:
           python3 <<'PYEOF'
           import json, pathlib, sys
 
-          sys.path.insert(0, ".github/scripts")
-          from issue_duplicates import format_candidates_for_prompt
+          sys.path.insert(0, ".github/triage_v2/src")
+          from issue_prioritization.duplicates import format_candidates_for_prompt
 
           issue = json.loads(pathlib.Path("/tmp/issue.json").read_text())
           dupes = json.loads(pathlib.Path("/tmp/duplicates.json").read_text())
@@ -429,10 +434,10 @@ jobs:
           # allowlists, and write gh commands to a script file.
           # All GitHub mutations are built in Python with proper escaping
           # — no eval, no shell interpolation of model output.
-          PYTHONPATH=.github/scripts python3 <<'PYEOF'
+          PYTHONPATH=.github/triage_v2/src python3 <<'PYEOF'
           import json, os, pathlib, sys, shlex
 
-          from issue_duplicates import (
+          from issue_prioritization.duplicates import (
               build_duplicate_comment,
               parse_triage_output,
               validate_duplicate_decision,
@@ -775,14 +780,21 @@ jobs:
       always() &&
       vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true' &&
       (
-        github.event_name == 'issues' &&
-        !endsWith(github.event.issue.user.login, '[bot]') &&
+        github.event_name == 'workflow_dispatch' ||
         (
-          github.event.action == 'opened' ||
-          github.event.action == 'edited'
+          github.event_name == 'issues' &&
+          !endsWith(github.event.issue.user.login, '[bot]') &&
+          (
+            github.event.action == 'opened' ||
+            github.event.action == 'edited'
+          )
         )
       )
     uses: ./.github/workflows/issue-prioritization-v2.yml
     with:
-      issue_number: ${{ github.event.issue.number }}
+      issue_number: ${{ github.event.issue.number || inputs.issue_number }}
+      intake: ${{ github.event_name == 'workflow_dispatch' || github.event.action == 'opened' }}
+      apply: ${{ github.event_name != 'workflow_dispatch' || inputs.apply_labels }}
+      manual_dispatch: ${{ github.event_name == 'workflow_dispatch' }}
+      post_duplicate_comments: ${{ inputs.post_comment }}
     secrets: inherit

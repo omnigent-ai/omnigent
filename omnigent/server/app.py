@@ -22,13 +22,24 @@ from sqlalchemy.exc import StatementError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.responses import Response
-from starlette.routing import Mount, Route
+from starlette.routing import Match, Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from omnigent._platform import resolve_repo_symlink
 from omnigent.db.db_models import InvalidUuidError
-from omnigent.debug_logging import set_current_user_id
+from omnigent.debug_logging import (
+    audit_event_logger,
+    current_request_audit_attrs,
+    debug_event,
+    debug_sink_enabled,
+    reset_request_audit_attrs,
+    set_current_session_id,
+    set_current_user_id,
+)
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.extensions import ExtensionPluginState
+from omnigent.extensions.assets import ResolvedBundle, build_asset_index
+from omnigent.extensions.registry import plugin_state as load_extension_plugin_state
 from omnigent.harness_plugins import (
     NativeHarnessProvider,
     native_provider_for_key,
@@ -66,6 +77,8 @@ from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
 from omnigent.server.routes.dictation import create_dictation_router
+from omnigent.server.routes.extension_assets import create_extension_assets_router
+from omnigent.server.routes.extensions import create_extensions_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
@@ -131,6 +144,7 @@ class ServerInfoResponse(BaseModel):
     managed_sandboxes_enabled: bool
     sandbox_provider: str | None
     sandbox_providers: list[str]
+    enabled_connections: list[str]
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
     public_sharing_enabled: bool
     server_version: str
@@ -141,6 +155,33 @@ class ServerInfoResponse(BaseModel):
     installable_harnesses: list[str]
     dictation_available: bool
     branding: BrandingInfo
+
+
+def _resolve_extension_state(
+    provided: ExtensionPluginState | None,
+) -> ExtensionPluginState:
+    """Resolve extensions without allowing catalog discovery to stop the server."""
+    if provided is not None:
+        return provided
+    try:
+        return load_extension_plugin_state()
+    # Distribution metadata is an external installation boundary. Preserve the
+    # rest of the server if global discovery itself fails before per-plugin
+    # failure isolation can apply.
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("could not discover installed extensions (%s)", exc, exc_info=True)
+        return ExtensionPluginState(manifests=(), load_errors={"registry": str(exc)})
+
+
+def _resolve_extension_assets(
+    state: ExtensionPluginState,
+) -> tuple[dict[str, ResolvedBundle], dict[str, str]]:
+    """Resolve bundle snapshots without allowing asset failures to stop the server."""
+    try:
+        return build_asset_index(state)
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("could not build extension asset index (%s)", exc, exc_info=True)
+        return {}, {"registry": str(exc)}
 
 
 def _server_version() -> str:
@@ -215,14 +256,39 @@ _SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
 def _session_id_from_request(request: Request) -> str | None:
     """Best-effort session id parsed from a ``/v1/sessions/<id>/…`` request path.
 
-    Threaded into exception-handler logs (``extra={"session_id": …}``) so a 500
-    on a session route carries its conversation id in the debug-logs table. Read
-    from the request explicitly per-invocation — no ambient/request-scoped
-    session ContextVar exists on the server, deliberately, to avoid
-    cross-request mis-attribution.
+    Threaded into exception-handler logs so a 500 on a session route carries its
+    conversation id in the debug-logs table. Parsed from the path here (rather
+    than the matched route param) because a handler may raise before the id is
+    otherwise in scope; the ambient request-scoped session ContextVar bound by
+    the middleware (:func:`omnigent.debug_logging.set_current_session_id`) covers
+    the non-exception records.
     """
     match = _SESSION_PATH_RE.search(request.url.path)
     return match.group(1) if match else None
+
+
+def _error_audit_extra(
+    request: Request,
+    *,
+    phase: str = "error",
+    **attributes: str,
+) -> dict[str, object]:
+    """Build the ``extra=`` for an exception-handler log: operation + session id.
+
+    Routing has already happened by the time an exception handler runs, so the
+    matched route's name (the handler function, e.g. ``get_session``) is the
+    operation. The record keeps its message and stack trace (via ``exc_info``)
+    while gaining a queryable ``event_name`` + ``session_id``, correlating it to
+    the middleware's ``error`` envelope row.
+    """
+    route = request.scope.get("route")
+    operation = getattr(route, "name", None) or "unmatched"
+    return debug_event(
+        operation,
+        session_id=_session_id_from_request(request),
+        phase=phase,
+        **attributes,
+    )
 
 
 # polly's and debby's multi-file bundles are packaged under
@@ -318,6 +384,57 @@ def request_route_template_for_metrics(request: Request) -> str:
     if isinstance(route, Route | Mount):
         return route.path
     return _UNMATCHED_ROUTE_TEMPLATE
+
+
+def _resolve_audit_route(request: Request) -> tuple[str, str, str | None]:
+    """Resolve ``(operation, route_template, session_id)`` before routing.
+
+    ``request.scope["route"]`` is only populated *after* routing (inside
+    ``call_next``), so to name the pre-call ``start`` audit event and bind the
+    ambient session id we match the request against the app's routes here. The
+    operation is the matched route's name (its handler function name, e.g.
+    ``create_session``); the session id comes from the matched route's
+    ``{session_id}`` path param — never the loose path regex — so a non-session
+    route (or ``/v1/sessions`` list) resolves to a null session id. Returns
+    ``("unmatched", "<unmatched>", None)`` when nothing matches.
+    """
+    for route in request.app.router.routes:
+        try:
+            match, child_scope = route.matches(request.scope)
+        except Exception:  # noqa: BLE001 — route matching must never fail a request
+            continue
+        if match is Match.FULL:
+            name = getattr(route, "name", None) or "unmatched"
+            template = getattr(route, "path", _UNMATCHED_ROUTE_TEMPLATE)
+            session_id = child_scope.get("path_params", {}).get("session_id")
+            return name, template, session_id
+    return "unmatched", _UNMATCHED_ROUTE_TEMPLATE, None
+
+
+def _emit_audit_event(
+    operation: str,
+    phase: str,
+    *,
+    session_id: str | None,
+    **attributes: str,
+) -> None:
+    """Emit one server audit row (table-only, gated on the debug sink).
+
+    A no-op when the debug-log sink is off, so it costs nothing for OSS / users
+    who never enabled it. ``event_name`` is the operation (handler name) and
+    ``phase`` / ``route`` / ``status`` / ``duration_ms`` ride as attributes so a
+    reader groups by operation and filters by phase.
+    """
+    if not debug_sink_enabled():
+        return
+    # Audit logging must never fail a request.
+    with suppress(Exception):
+        audit_event_logger().info(
+            "%s %s",
+            operation,
+            phase,
+            extra=debug_event(operation, session_id=session_id, phase=phase, **attributes),
+        )
 
 
 def _request_status_code_for_metrics(
@@ -744,16 +861,23 @@ def _ensure_default_acp_agents(
     agent_cache: Any,
 ) -> None:
     """
-    Seed a picker agent for each ACP harness set up on THIS server's host.
+    Seed a picker agent per builtin ACP CLI row and per configured ``acp:`` agent.
 
     Native harnesses seed a fixed ``<harness>-ui`` agent each
-    (:func:`_ensure_default_native_agents`). ACP agents are host config rather
-    than a fixed catalog, so seed one agent per user-configured ``acp:<slug>``
-    agent (``harness_is_configured("acp:...")`` treats "in config" as set up) and
-    per builtin ACP CLI harness whose binary is on PATH (its readiness gate). On a
-    host with no ACP setup — the common remote-server case, where the server holds
-    no ``acp:`` config — this seeds nothing. When both sources name the same
-    harness, the configured agent wins (see :func:`shadowed_builtin_acp_rows`).
+    (:func:`_ensure_default_native_agents`) unconditionally; the picker hides a row
+    the selected host cannot launch, reading that host's ``configured_harnesses``
+    readiness map. Builtin ACP CLI harnesses follow the same model, because the
+    vendor CLI runs on the *executing* host (the attached runner) rather than on the
+    server: gating the row on the server's own PATH left Devin and Grok missing from
+    the picker on every remote server, even when the runner had them installed.
+
+    User-configured ``acp:<slug>`` agents stay config-gated. Their launch command is
+    resolved from the *host's* own ``acp:`` block at spawn time, so a row naming a
+    slug the executing host does not define could never launch; surfacing those on a
+    remote server first needs the host to advertise its configured slugs.
+
+    When both sources name the same harness, the configured agent wins (see
+    :func:`shadowed_builtin_acp_rows`).
 
     Purely additive: it only adds picker rows and never touches native seeding.
     A malformed ``acp:`` block is logged and skipped, never fatal to startup
@@ -767,7 +891,6 @@ def _ensure_default_acp_agents(
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
     """
-    from omnigent._platform import resolve_cli_binary
     from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 
     # (1) User-configured acp:<slug> agents — "set up" == present in config.
@@ -793,12 +916,12 @@ def _ensure_default_acp_agents(
             bundle_bytes=_build_acp_bundle(harness=f"acp:{agent.slug}", name=agent.slug),
         )
 
-    # (2) Builtin ACP CLI harnesses (e.g. grok) — "set up" == binary on PATH. Keyed
-    # by the catalog id (already a valid slug), not the display label. A row a
-    # configured agent already claims is skipped: both seed the same
-    # ``builtin_agent_id``, so the row would overwrite the user's chosen command.
-    for key, row in ACP_CLI_HARNESSES.items():
-        if key in shadowed or resolve_cli_binary(row.binary) is None:
+    # (2) Builtin ACP CLI harnesses — one row each, seeded like the natives because
+    # the vendor CLI runs on the executing host, not here. Keyed by the catalog id
+    # (already a valid slug), not the display label. A row a configured agent already
+    # claims is skipped: both seed the same ``builtin_agent_id``.
+    for key in ACP_CLI_HARNESSES:
+        if key in shadowed:
             continue
         _ensure_builtin_agent(
             agent_store,
@@ -945,10 +1068,13 @@ def create_app(
     admins: list[str] | None = None,
     allowed_domains: list[str] | None = None,
     sandbox_config: ManagedSandboxDeployment | None = None,
+    github_config: Any | None = None,  # GitHubAppConfig — GitHub App integration
+    github_store: Any | None = None,  # GithubConnectionStore — GitHub App integration
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
+    extension_state: ExtensionPluginState | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1023,6 +1149,15 @@ def create_app(
         ``host_type="managed"`` create fails with a clear error).
         Managed-host credentials live on the ``hosts`` table, so no
         extra store is wired.
+    :param github_config: Parsed GitHub App configuration
+        (:class:`omnigent.server.github_app.GitHubAppConfig`) enabling
+        the per-user "Connect GitHub" flow. ``None`` disables the
+        integration (the connect UI is hidden and the routes stay
+        unmounted).
+    :param github_store: Persistence for per-user GitHub connections
+        (:class:`omnigent.connections.github.GithubConnectionStore`).
+        Required alongside ``github_config`` to enable the integration;
+        wired together by ``create_app``'s caller.
     :param sharing_mode: Server policy for creating new session
         permission grants (see :class:`SharingMode`): ``ON`` allows
         grants at any level plus public/workspace read, ``READ_ONLY``
@@ -1042,6 +1177,9 @@ def create_app(
     :param feature_flags: Optional immutable release-feature snapshot.
         When omitted, resolves the comma-separated ``OMNIGENT_FEATURES``
         enabled set once at application construction.
+    :param extension_state: Optional pre-resolved installed-extension registry.
+        When omitted, entry points are discovered once at application
+        construction and the process-cached state is reused thereafter.
     :param public_sharing: Whether public (anyone-with-the-link) read
         access may be granted — i.e. whether the ``__public__`` grant is
         allowed. Orthogonal to ``sharing_mode``: a server can keep normal
@@ -1074,6 +1212,8 @@ def create_app(
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
+    resolved_extension_state = _resolve_extension_state(extension_state)
+    extension_bundles, extension_asset_errors = _resolve_extension_assets(resolved_extension_state)
 
     # First-boot admin bootstrap for the accounts auth provider.
     # Runs before any route is mounted so the login page is never
@@ -1392,6 +1532,27 @@ def create_app(
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
+    # GitHub App integration: enabled only when both the config and the
+    # connection store are wired. The client is stateless (holds config),
+    # built once and reused for the connect flow.
+    # Per-user connection providers (GitHub, ...). One registry entry per
+    # provider (connections_registry) drives uniform wiring: each gets
+    # ``app.state.<name>_{config,store,client}``, populated only when both its
+    # config and its store are present, else None. The info endpoint's
+    # enabled_connections list and the router mounting below both read these.
+    from omnigent.server.connections_registry import connection_providers
+
+    _connection_inputs = {"github": (github_config, github_store)}
+    for _provider in connection_providers():
+        _cfg, _store = _connection_inputs.get(_provider.name, (None, None))
+        _on = _cfg is not None and _store is not None
+        setattr(app.state, f"{_provider.name}_config", _cfg if _on else None)
+        setattr(app.state, f"{_provider.name}_store", _store if _on else None)
+        setattr(
+            app.state,
+            f"{_provider.name}_client",
+            _provider.client_factory(_cfg) if _on else None,
+        )
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
     # admin-gated auth routes AND ``/v1/me``'s is_admin computation consult the
@@ -1533,6 +1694,28 @@ def create_app(
         except Exception:  # noqa: BLE001 — attribution is best-effort
             set_current_user_id(None)
 
+        # Resolve the operation + session id from the matched route up front so
+        # the audit ``start`` event is named and records emitted while handling a
+        # session-scoped request inherit the session id (ambient, from the route
+        # ``{session_id}`` param — set to None for non-session routes so no stale
+        # value leaks and no non-session route is mis-attributed).
+        operation, audit_route, audit_session_id = _resolve_audit_route(request)
+        set_current_session_id(audit_session_id)
+        reset_request_audit_attrs()
+        # ``post_event`` is hit per streamed chunk (the harness echoes its own
+        # output back), so a per-call ``start`` row is pure noise — emit only the
+        # end row for it (and the handler suppresses even that for transient
+        # types). Every other operation keeps its real-time ``start``.
+        if operation != "post_event":
+            _emit_audit_event(
+                operation,
+                "start",
+                session_id=audit_session_id,
+                route=audit_route,
+                method=request.method,
+                request_id=request_id,
+            )
+
         failed = False
         status_code: int | None = None
         started_at = server_metrics.request_started()
@@ -1552,6 +1735,47 @@ def create_app(
             )
             set_request_duration_for_access_log(duration_seconds)
             route = request_route_template_for_metrics(request)
+            # Handler-attached attributes ride the end event. A handler that
+            # learns the session id mid-request (create_session, launch_runner —
+            # routes with no {session_id} path param) puts it in the bag; the
+            # BaseHTTPMiddleware runs the handler in a child context, so a
+            # ContextVar it sets there would not be visible here, but the bag is a
+            # shared dict, so it is. The bag's session_id becomes the row's column
+            # (not an attribute). Other reserved keys are dropped so a handler can
+            # never shadow an envelope field or collide with an _emit_audit_event
+            # argument (session_id / phase would raise TypeError).
+            _bag = current_request_audit_attrs()
+            # A handler can suppress the whole envelope for this request (e.g. a
+            # transient POST /events echo). An error still logs — a failure is
+            # never noise, and the exception handler carries the detail.
+            if _bag.get("_suppress") and not request_failed:
+                pass
+            else:
+                end_session_id = _bag.get("session_id") or audit_session_id
+                _reserved = {
+                    "_suppress",
+                    "session_id",
+                    "phase",
+                    "route",
+                    "method",
+                    "request_id",
+                    "status",
+                    "duration_ms",
+                }
+                end_attributes = {k: v for k, v in _bag.items() if k not in _reserved}
+                end_attributes.update(
+                    route=audit_route,
+                    method=request.method,
+                    request_id=request_id,
+                    status=str(status_code) if status_code is not None else "none",
+                    duration_ms=str(round(duration_seconds * 1000)),
+                )
+                _emit_audit_event(
+                    operation,
+                    "error" if request_failed else "ok",
+                    session_id=end_session_id,
+                    **end_attributes,
+                )
             # Per-route tally (low-cardinality template key) for offline
             # request-breakdown analysis, e.g. the benchmark harness's
             # per-journey network appendix. Cheap; independent of the OTel path.
@@ -1581,19 +1805,36 @@ def create_app(
         :param exc: The application error.
         :returns: A JSON response with the error code and message.
         """
-        if exc.http_status >= 500:
+        if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
+            # A session state, not a fault: the user's machine is asleep or
+            # the host disconnected, and clients render it as a reconnect
+            # affordance. Through the 5xx arm every poll of an offline
+            # session added an "Internal error" plus a stack, which is what
+            # buried the real 500s.
+            _logger.warning(
+                "Runner unavailable: %s",
+                exc.message,
+                extra=_error_audit_extra(
+                    request, phase="unavailable", code=str(exc.code), http_status="503"
+                ),
+            )
+        elif exc.http_status >= 500:
             _logger.error(
                 "Internal error: %s",
                 exc.message,
                 exc_info=exc,
-                extra={"session_id": _session_id_from_request(request)},
+                extra=_error_audit_extra(
+                    request, code=str(exc.code), http_status=str(exc.http_status)
+                ),
             )
         elif exc.http_status == 400 and request.url.path.endswith("/policies/evaluate"):
             _logger.warning(
                 "Policy evaluate rejected 400 on %s: %s",
                 request.url.path,
                 exc.message,
-                extra={"session_id": _session_id_from_request(request)},
+                extra=_error_audit_extra(
+                    request, phase="rejected", code=str(exc.code), http_status="400"
+                ),
             )
         return JSONResponse(
             status_code=exc.http_status,
@@ -1633,7 +1874,9 @@ def create_app(
             "Database error: %s",
             exc,
             exc_info=exc,
-            extra={"session_id": _session_id_from_request(request)},
+            extra=_error_audit_extra(
+                request, code=str(ErrorCode.INTERNAL_ERROR), http_status="500"
+            ),
         )
         return JSONResponse(
             status_code=500,
@@ -1664,7 +1907,9 @@ def create_app(
             "Unhandled exception: %s",
             exc,
             exc_info=exc,
-            extra={"session_id": _session_id_from_request(request)},
+            extra=_error_audit_extra(
+                request, code=str(ErrorCode.INTERNAL_ERROR), http_status="500"
+            ),
         )
         return JSONResponse(
             status_code=500,
@@ -2097,6 +2342,17 @@ def create_app(
             managed_sandboxes_enabled = True
             sandbox_provider = sandbox_config.default.provider
             sandbox_providers = list(sandbox_config.launchable_providers())
+        # enabled_connections lists the connection providers this deploy has
+        # wired (config + store present), in a stable order. The web UI shows
+        # the Sandbox Integrations nav when the list is non-empty and renders
+        # one panel per provider. A provider appears only when both its config
+        # and its connection store are present.
+        enabled_connections = [
+            provider
+            for provider in ("github",)
+            if getattr(app.state, f"{provider}_config", None) is not None
+            and getattr(app.state, f"{provider}_store", None) is not None
+        ]
         # sharing_mode is the server's session-sharing policy
         # (on/read_only/off), surfaced so the web app can hide the Share
         # control (off) or restrict it to read-only (read_only) in lockstep
@@ -2160,6 +2416,7 @@ def create_app(
                 "managed_sandboxes_enabled": managed_sandboxes_enabled,
                 "sandbox_provider": sandbox_provider,
                 "sandbox_providers": sandbox_providers,
+                "enabled_connections": enabled_connections,
                 "sharing_mode": sharing_mode.value,
                 "public_sharing_enabled": public_sharing_enabled,
                 "server_version": _server_version(),
@@ -2325,6 +2582,25 @@ def create_app(
         create_harnesses_router(auth_provider=auth_provider),
         prefix="/v1",
         tags=["harnesses"],
+    )
+    app.include_router(
+        create_extensions_router(
+            resolved_extension_state,
+            bundles=extension_bundles,
+            asset_errors=extension_asset_errors,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["extensions"],
+    )
+    app.include_router(
+        create_extension_assets_router(
+            extension_bundles,
+            auth_provider=auth_provider,
+        ),
+        prefix="/v1",
+        tags=["extensions"],
     )
     # Server-side speech-to-text behind the composer mic button
     # (designs/server-dictation.md). Availability is probed lazily, so
@@ -2799,6 +3075,44 @@ def create_app(
             prefix="/v1",
             tags=["hosts"],
         )
+        # Host-facing credential vending: a sandbox fetches its owner's
+        # per-provider credential over the launch-token-authenticated channel
+        # instead of having it injected. One generic route serves every provider
+        # that registered a credential_resolver (app.state set by the
+        # connection-provider wiring above); it 404s for a provider not
+        # configured on this server, so mounting it unconditionally is safe.
+        #
+        # Registered AFTER create_hosts_router on purpose: its ``{provider}`` path
+        # param would otherwise shadow that router's literal
+        # ``/hosts/{host_id}/credentials/detected`` (Starlette matches in
+        # registration order with no literal-over-parameter priority).
+        from omnigent.server.routes.host_credentials import create_host_credentials_router
+
+        app.include_router(
+            create_host_credentials_router(host_store),
+            prefix="/v1",
+            tags=["hosts"],
+        )
+
+    # Per-user connection routes (/v1/connections/{provider}/*): connect /
+    # callback / status / disconnect. One registry entry per provider; each is
+    # mounted only when configured (config + store present), so an unconfigured
+    # provider's surface stays absent exactly like a build without the feature.
+    for _provider in connection_providers():
+        _cfg = getattr(app.state, f"{_provider.name}_config", None)
+        _store = getattr(app.state, f"{_provider.name}_store", None)
+        if _cfg is None or _store is None:
+            continue
+        app.include_router(
+            _provider.router_factory(
+                _cfg,
+                _store,
+                auth_provider=auth_provider,
+                client=getattr(app.state, f"{_provider.name}_client", None),
+            ),
+            prefix="/v1",
+            tags=["integrations"],
+        )
 
     # Mount the auth router that matches the active provider. OIDC and
     # accounts share the /auth prefix but expose different endpoints
@@ -2888,16 +3202,23 @@ def create_app(
             )
 
         # Device Authorization Grant (RFC 8628): opt-in, default-off via
-        # OMNIGENT_DEVICE_GRANT_ENABLED, and accounts-mode only (the
-        # in-browser consent flow needs the accounts login page). Wires
-        # the full /oauth/* surface including the token endpoint. See
+        # OMNIGENT_DEVICE_GRANT_ENABLED. Supported in accounts and oidc
+        # modes (both own a server-minted session cookie). Header mode has
+        # no server-mintable identity and is excluded. See
         # designs/DEVICE_AUTH.md.
         from omnigent.server.auth import env_var_is_truthy
 
+        _is_github_oidc = (
+            isinstance(auth_provider, UnifiedAuthProvider)
+            and auth_provider._source == "oidc"
+            and auth_provider._oidc_config is not None
+            and getattr(auth_provider._oidc_config, "provider_type", None) == "github"
+        )
         if (
             env_var_is_truthy("OMNIGENT_DEVICE_GRANT_ENABLED", default=False)
             and isinstance(auth_provider, UnifiedAuthProvider)
-            and auth_provider._source == "accounts"
+            and auth_provider._source in ("accounts", "oidc")
+            and not _is_github_oidc
             and device_grant_store is not None
         ):
             from omnigent.server.routes.device_auth import create_device_auth_router
@@ -2926,6 +3247,15 @@ def create_app(
             # No device flow, but login-issued refresh grants still need
             # their token/revoke endpoints — in OIDC mode and in accounts
             # mode without the flag alike.
+            if _is_github_oidc and env_var_is_truthy(
+                "OMNIGENT_DEVICE_GRANT_ENABLED", default=False
+            ):
+                _logger.warning(
+                    "device-grant: GitHub OAuth does not support prompt=login / "
+                    "max_age=0, so the anti-phishing re-auth gate cannot be enforced. "
+                    "Device-grant flow skipped for this deployment; only "
+                    "/oauth/token + /oauth/revoke are mounted."
+                )
             from omnigent.server.routes.device_auth import create_oauth_token_router
 
             app.include_router(

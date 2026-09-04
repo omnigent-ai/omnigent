@@ -311,6 +311,8 @@ export interface ErrorBlock {
   type: "error";
   ctx: BlockContext;
   message: string;
+  /** `"info"` renders as a neutral notice pill instead of a destructive error. */
+  level?: "error" | "info";
   /** Where the error originated, e.g. "llm". */
   source: string;
   /** Machine-readable error code, e.g. "llm_auth_failed". Empty when omitted. */

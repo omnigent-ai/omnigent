@@ -798,6 +798,194 @@ class TestConstructor(unittest.TestCase):
 
         _run(_t())
 
+    def test_gateway_pins_family_aliases_to_served_ids(self):
+        """A gateway turn pins every family alias to an id the gateway serves.
+
+        Claude Code's refusal-fallback resolves the ``opus`` alias through
+        ``ANTHROPIC_DEFAULT_OPUS_MODEL``; unpinned it lands on a canonical
+        vendor id a gateway serving its own ids rejects (``model_not_found``).
+        The executor lists the gateway's models and pins each alias to a
+        served id. See ``_apply_gateway_model_vocabulary``.
+        """
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+        from omnigent.model_catalog import ModelEntry, ModelListing
+
+        async def _t():
+            executor = ClaudeSDKExecutor(
+                gateway=True,
+                gateway_host="https://gateway.example.com",
+                base_url_override="https://gateway.example.com/anthropic",
+                gateway_auth_command="printf token",
+                model="gw-claude-fable-5",
+            )
+
+            captured: dict[str, dict[str, str]] = {}
+
+            async def fake_get_or_create_client(sdk, *, session_key, options, model):
+                captured["env"] = dict(options.env or {})
+                captured["settings"] = json.loads(options.settings or "{}")
+                raise RuntimeError("stop after env assembly")
+
+            listing = ModelListing(
+                source="openai-compatible",
+                verified=True,
+                models=(
+                    ModelEntry(id="gw-claude-fable-5", family="claude"),
+                    ModelEntry(id="gw-claude-opus-4-7", family="claude"),
+                    ModelEntry(id="gw-claude-opus-4-8", family="claude"),
+                    # A newer Opus alongside 4.8 — the shape that broke the
+                    # refusal-fallback: the alias must track the newest while
+                    # the rewrites still cover the older generation the CLI's
+                    # own route table can name.
+                    ModelEntry(id="gw-claude-opus-5", family="claude"),
+                    ModelEntry(id="gw-claude-sonnet-5", family="claude"),
+                    ModelEntry(id="gw-claude-haiku-4-5", family="claude"),
+                    ModelEntry(id="gw-gpt-5-6", family="openai"),
+                ),
+                note="",
+            )
+            with (
+                patch("omnigent.model_catalog.listing_for_provider", return_value=listing),
+                patch.object(
+                    executor,
+                    "_get_or_create_client",
+                    side_effect=fake_get_or_create_client,
+                ),
+            ):
+                with self.assertRaises(RuntimeError):
+                    async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                        pass
+
+            env = captured["env"]
+            # Newest served generation per family; the non-Claude id is ignored.
+            self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "gw-claude-opus-5")
+            self.assertEqual(env["ANTHROPIC_DEFAULT_FABLE_MODEL"], "gw-claude-fable-5")
+            self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "gw-claude-sonnet-5")
+            self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "gw-claude-haiku-4-5")
+            # Every served Claude generation is reachable by its canonical
+            # spelling, so whichever id the CLI's route table names resolves —
+            # including the 4.8 the newest-Opus alias no longer points at.
+            self.assertEqual(
+                captured["settings"]["modelOverrides"],
+                {
+                    "claude-fable-5": "gw-claude-fable-5",
+                    "claude-opus-4-7": "gw-claude-opus-4-7",
+                    "claude-opus-4-8": "gw-claude-opus-4-8",
+                    "claude-opus-5": "gw-claude-opus-5",
+                    "claude-sonnet-5": "gw-claude-sonnet-5",
+                    "claude-haiku-4-5": "gw-claude-haiku-4-5",
+                },
+            )
+
+        _run(_t())
+
+    def test_gateway_listing_without_claude_models_pins_nothing(self):
+        """A gateway that lists no Claude models leaves the aliases unpinned.
+
+        The served ids are unknown, so the executor must not invent pins;
+        an unpinned alias is today's behavior, not a regression.
+        """
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+        from omnigent.model_catalog import ModelEntry, ModelListing
+
+        async def _t():
+            executor = ClaudeSDKExecutor(
+                gateway=True,
+                gateway_host="https://gateway.example.com",
+                base_url_override="https://gateway.example.com/v1",
+                gateway_auth_command="printf token",
+                model="gpt-5",
+            )
+
+            captured: dict[str, dict[str, str]] = {}
+
+            async def fake_get_or_create_client(sdk, *, session_key, options, model):
+                captured["env"] = dict(options.env or {})
+                raise RuntimeError("stop after env assembly")
+
+            listing = ModelListing(
+                source="openai-compatible",
+                verified=True,
+                models=(ModelEntry(id="gpt-5", family="openai"),),
+                note="",
+            )
+            with (
+                patch("omnigent.model_catalog.listing_for_provider", return_value=listing),
+                patch.object(
+                    executor,
+                    "_get_or_create_client",
+                    side_effect=fake_get_or_create_client,
+                ),
+            ):
+                with self.assertRaises(RuntimeError):
+                    async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                        pass
+
+            self.assertFalse({k for k in captured["env"] if k.startswith("ANTHROPIC_DEFAULT_")})
+
+        _run(_t())
+
+    def test_explicit_family_pins_are_not_overwritten(self):
+        """Pre-set ``ANTHROPIC_DEFAULT_*_MODEL`` pins win over the listing.
+
+        A launch config that already pins every alias must be respected
+        verbatim. The gateway is still listed, because pinning an alias says
+        nothing about how this gateway spells the canonical ids Claude Code
+        names on its own — those rewrites are needed either way.
+        """
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+        from omnigent.model_catalog import ModelEntry, ModelListing
+
+        async def _t():
+            executor = ClaudeSDKExecutor(
+                gateway=True,
+                gateway_host="https://gateway.example.com",
+                base_url_override="https://gateway.example.com/anthropic",
+                gateway_auth_command="printf token",
+                model="gw-claude-fable-5",
+            )
+            executor._extra_env["ANTHROPIC_DEFAULT_FABLE_MODEL"] = "pinned-fable"
+            executor._extra_env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = "pinned-opus"
+            executor._extra_env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = "pinned-sonnet"
+            executor._extra_env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = "pinned-haiku"
+
+            captured: dict[str, dict[str, str]] = {}
+
+            async def fake_get_or_create_client(sdk, *, session_key, options, model):
+                captured["env"] = dict(options.env or {})
+                captured["settings"] = json.loads(options.settings or "{}")
+                raise RuntimeError("stop after env assembly")
+
+            listing = ModelListing(
+                source="openai-compatible",
+                verified=True,
+                models=(ModelEntry(id="gw-claude-opus-4-8", family="claude"),),
+                note="",
+            )
+            with (
+                patch("omnigent.model_catalog.listing_for_provider", return_value=listing),
+                patch.object(
+                    executor,
+                    "_get_or_create_client",
+                    side_effect=fake_get_or_create_client,
+                ),
+            ):
+                with self.assertRaises(RuntimeError):
+                    async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                        pass
+
+            for alias in ("FABLE", "OPUS", "SONNET", "HAIKU"):
+                self.assertEqual(
+                    captured["env"][f"ANTHROPIC_DEFAULT_{alias}_MODEL"],
+                    f"pinned-{alias.lower()}",
+                )
+            self.assertEqual(
+                captured["settings"]["modelOverrides"],
+                {"claude-opus-4-8": "gw-claude-opus-4-8"},
+            )
+
+        _run(_t())
+
     def test_gateway_model_passes_through(self):
         """Explicit model on the gateway path passes through unchanged."""
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
@@ -1371,6 +1559,140 @@ class TestResolveGatewayEnv(unittest.TestCase):
                 host_override="https://example.databricks.com/",
                 base_url_override="https://example.databricks.com/ai-gateway/anthropic",
             )
+
+
+# ---------------------------------------------------------------------------
+# Tests: Gateway model vocabulary (alias pins + canonical rewrites)
+# ---------------------------------------------------------------------------
+
+
+class TestGatewayModelVocabulary(unittest.TestCase):
+    def test_pins_map_served_families_to_env_vars(self):
+        from omnigent.inner.claude_sdk_executor import _gateway_model_vocabulary
+        from omnigent.model_catalog import ModelEntry, ModelListing
+
+        listing = ModelListing(
+            source="openai-compatible",
+            verified=True,
+            models=(
+                ModelEntry(id="databricks-claude-opus-4-8", family="claude"),
+                ModelEntry(id="databricks-claude-fable-5", family="claude"),
+                ModelEntry(id="databricks-gpt-5-6", family="openai"),
+            ),
+            note="",
+        )
+        with patch("omnigent.model_catalog.listing_for_provider", return_value=listing) as lister:
+            vocabulary = _gateway_model_vocabulary(
+                "https://gw.example.com/anthropic", "printf tok"
+            )
+        self.assertEqual(
+            vocabulary.alias_pins,
+            {
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8",
+                "ANTHROPIC_DEFAULT_FABLE_MODEL": "databricks-claude-fable-5",
+            },
+        )
+        # Same listing, second half of the vocabulary: the canonical spelling
+        # Claude Code names itself, rewritten to what this gateway serves. The
+        # non-Claude id contributes to neither half.
+        self.assertEqual(
+            vocabulary.model_overrides,
+            {
+                "claude-opus-4-8": "databricks-claude-opus-4-8",
+                "claude-fable-5": "databricks-claude-fable-5",
+            },
+        )
+        # The listing is fetched as a gateway transport: the base URL and the
+        # auth command the CLI itself uses, not a Databricks profile.
+        provider = lister.call_args.args[0]
+        self.assertEqual(provider.base_url, "https://gw.example.com/anthropic")
+        self.assertEqual(provider.auth_command, "printf tok")
+        self.assertIsNone(provider.profile)
+
+    def test_nothing_when_the_listing_has_no_claude_models(self):
+        from omnigent.inner.claude_sdk_executor import (
+            _EMPTY_GATEWAY_VOCABULARY,
+            _gateway_model_vocabulary,
+        )
+        from omnigent.model_catalog import ModelListing
+
+        listing = ModelListing(source="openai-compatible", verified=True, models=(), note="")
+        with patch("omnigent.model_catalog.listing_for_provider", return_value=listing):
+            self.assertEqual(
+                _gateway_model_vocabulary("https://gw.example.com/anthropic", "printf tok"),
+                _EMPTY_GATEWAY_VOCABULARY,
+            )
+
+    def test_nothing_when_the_listing_fails(self):
+        """A failed listing is swallowed — today's behavior is the safe default."""
+        from omnigent.inner.claude_sdk_executor import (
+            _EMPTY_GATEWAY_VOCABULARY,
+            _gateway_model_vocabulary,
+        )
+
+        with patch(
+            "omnigent.model_catalog.listing_for_provider",
+            side_effect=RuntimeError("listing unavailable"),
+        ):
+            self.assertEqual(
+                _gateway_model_vocabulary("https://gw.example.com/anthropic", "printf tok"),
+                _EMPTY_GATEWAY_VOCABULARY,
+            )
+
+    def test_direct_endpoint_never_lists_or_pins(self):
+        """Off the gateway transport the CLI resolves canonical ids itself."""
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        executor = ClaudeSDKExecutor()
+        env = {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}
+        listing = Mock()
+        with patch("omnigent.model_catalog.listing_for_provider", listing):
+            overrides = _run(executor._apply_gateway_model_vocabulary(env, None))
+        self.assertEqual(env, {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"})
+        self.assertEqual(overrides, {})
+        listing.assert_not_called()
+
+    def test_preset_pins_are_respected_but_rewrites_still_apply(self):
+        """A launch config that pins aliases still needs the id rewrites.
+
+        Pinning ``opus`` tells Claude Code which model the *alias* means. It
+        says nothing about how this gateway spells the canonical ids the CLI
+        names on its own, so the rewrites must be derived either way.
+        """
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+        from omnigent.model_catalog import ModelEntry, ModelListing
+
+        listing = ModelListing(
+            source="openai-compatible",
+            verified=True,
+            models=(ModelEntry(id="gw-claude-opus-4-8", family="claude"),),
+            note="",
+        )
+        executor = ClaudeSDKExecutor.__new__(ClaudeSDKExecutor)
+        executor._gateway = True
+        executor._gateway_vocabulary = None
+        env = {
+            "ANTHROPIC_BASE_URL": "https://gw.example.com/anthropic",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "gw-claude-opus-5",
+        }
+        with patch("omnigent.model_catalog.listing_for_provider", return_value=listing):
+            overrides = _run(executor._apply_gateway_model_vocabulary(env, "printf tok"))
+        self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "gw-claude-opus-5")
+        self.assertEqual(overrides, {"claude-opus-4-8": "gw-claude-opus-4-8"})
+
+    def test_settings_payload_carries_helper_and_rewrites(self):
+        from omnigent.inner.claude_sdk_executor import _claude_settings_payload
+
+        self.assertIsNone(_claude_settings_payload(None, {}))
+        self.assertEqual(
+            json.loads(_claude_settings_payload("printf tok", {"claude-opus-4-8": "gw-opus"})),
+            {"apiKeyHelper": "printf tok", "modelOverrides": {"claude-opus-4-8": "gw-opus"}},
+        )
+        # No credential helper, but a gateway that still needs the rewrites.
+        self.assertEqual(
+            json.loads(_claude_settings_payload(None, {"claude-opus-4-8": "gw-opus"})),
+            {"modelOverrides": {"claude-opus-4-8": "gw-opus"}},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -4633,6 +4955,452 @@ def test_precompact_hook_emits_compaction_complete_with_session_messages() -> No
     _run(_t())
 
 
+def test_precompact_exception_persists_compaction_before_executor_error(tmp_path: Path) -> None:
+    """A stream failure after PreCompact still emits the durable boundary."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete, CompactionStarted
+
+    class _SystemMessage:
+        def __init__(self, subtype, data, hook_event_name=None, session_id=None):
+            self.subtype = subtype
+            self.data = data
+            self.hook_event_name = hook_event_name
+            self.session_id = session_id
+
+    class _FakeSessionMessage:
+        def __init__(self, type, message):
+            self.type = type
+            self.message = message
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = _SystemMessage
+        ResultMessage = type("ResultMessage", (), {})
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return
+
+            async def query(self, prompt, session_id="default"):
+                return
+
+            async def receive_response(self):
+                yield _SystemMessage(
+                    subtype="hook_started",
+                    data={
+                        "hook_event": "PreCompact",
+                        "session_id": "claude-uuid-error",
+                        "transcript_path": str(transcript_path),
+                    },
+                    hook_event_name="PreCompact",
+                    session_id="claude-uuid-error",
+                )
+                with transcript_path.open("a", encoding="utf-8") as transcript:
+                    transcript.write(
+                        json.dumps(
+                            {
+                                "type": "user",
+                                "uuid": "compact-summary-1",
+                                "isCompactSummary": True,
+                                "message": {
+                                    "role": "user",
+                                    "content": "compacted summary",
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+                raise RuntimeError("Autocompact is thrashing: the context refilled to the limit")
+
+            async def disconnect(self):
+                return None
+
+    fake_session_msgs = [
+        _FakeSessionMessage(
+            "assistant",
+            {"content": [{"type": "text", "text": "compacted summary"}]},
+        )
+    ]
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "precompact-1",
+                "message": {"role": "user", "content": "continue"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with (
+            patch(
+                "omnigent.inner.claude_sdk_executor._ensure_sdk",
+                return_value=_FakeSDK,
+            ),
+            patch(
+                "claude_agent_sdk.get_session_messages",
+                return_value=fake_session_msgs,
+            ) as mock_get_msgs,
+        ):
+            events = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "continue", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+        started = [event for event in events if isinstance(event, CompactionStarted)]
+        completed = [event for event in events if isinstance(event, CompactionComplete)]
+        errors = [event for event in events if isinstance(event, ExecutorError)]
+
+        assert len(started) == 1
+        assert len(completed) == 1
+        assert len(errors) == 1
+        assert not [event for event in events if isinstance(event, TurnComplete)]
+        assert events.index(started[0]) < events.index(completed[0])
+        assert events.index(completed[0]) < events.index(errors[0])
+        assert completed[0].compacted_messages == [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "compacted summary"}],
+            }
+        ]
+        mock_get_msgs.assert_called_once_with("claude-uuid-error", directory=None)
+
+    _run(_t())
+
+
+@pytest.mark.parametrize(
+    ("transcript_location", "expect_checkpoint"),
+    [("top_level", True), ("nested", False)],
+)
+def test_precompact_exception_sdk_wire_payload_contract(
+    tmp_path: Path,
+    transcript_location: str,
+    expect_checkpoint: bool,
+) -> None:
+    """The SDK-decoded hook payload exposes a safe transcript boundary."""
+    import claude_agent_sdk as real_sdk
+    from claude_agent_sdk._internal.message_parser import parse_message
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete
+
+    class _FakeSessionMessage:
+        def __init__(self, type, message):
+            self.type = type
+            self.message = message
+
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "precompact-wire-1",
+                "message": {"role": "user", "content": "continue"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    raw_hook_payload = {
+        "type": "system",
+        "subtype": "hook_started",
+        "hook_id": "hook-precompact-wire-1",
+        "hook_name": "PreCompact:auto",
+        "hook_event": "PreCompact",
+        "uuid": "hook-event-precompact-wire-1",
+        "session_id": "claude-uuid-wire",
+        "cwd": str(tmp_path),
+        "trigger": "auto",
+        "custom_instructions": None,
+    }
+    if transcript_location == "top_level":
+        raw_hook_payload["transcript_path"] = str(transcript_path)
+    else:
+        raw_hook_payload["input"] = {"transcript_path": str(transcript_path)}
+
+    hook_message = parse_message(raw_hook_payload)
+    assert isinstance(hook_message, real_sdk.HookEventMessage)
+
+    class _FakeSDK:
+        AssistantMessage = real_sdk.AssistantMessage
+        UserMessage = real_sdk.UserMessage
+        SystemMessage = real_sdk.SystemMessage
+        ResultMessage = real_sdk.ResultMessage
+        StreamEvent = real_sdk.StreamEvent
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return
+
+            async def query(self, prompt, session_id="default"):
+                return
+
+            async def receive_response(self):
+                yield hook_message
+                with transcript_path.open("a", encoding="utf-8") as transcript:
+                    transcript.write(
+                        json.dumps(
+                            {
+                                "type": "user",
+                                "uuid": "compact-summary-wire-1",
+                                "isCompactSummary": True,
+                                "message": {
+                                    "role": "user",
+                                    "content": "compacted summary",
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+                raise RuntimeError("Autocompact refilled the context")
+
+            async def disconnect(self):
+                return None
+
+    fake_session_msgs = [
+        _FakeSessionMessage(
+            "assistant",
+            {"content": [{"type": "text", "text": "compacted summary"}]},
+        )
+    ]
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with (
+            patch(
+                "omnigent.inner.claude_sdk_executor._ensure_sdk",
+                return_value=_FakeSDK,
+            ),
+            patch(
+                "claude_agent_sdk.get_session_messages",
+                return_value=fake_session_msgs,
+            ) as mock_get_messages,
+        ):
+            events = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "continue", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+        checkpoints = [event for event in events if isinstance(event, CompactionComplete)]
+        assert len(checkpoints) == int(expect_checkpoint)
+        if expect_checkpoint:
+            mock_get_messages.assert_called_once_with("claude-uuid-wire", directory=None)
+        else:
+            mock_get_messages.assert_not_called()
+
+    _run(_t())
+
+
+@pytest.mark.parametrize("session_read", [[], RuntimeError("transcript not flushed")])
+def test_precompact_exception_preserves_history_without_exportable_checkpoint(
+    tmp_path: Path,
+    session_read: list[object] | Exception,
+) -> None:
+    """An empty or failed export never replaces full history with a placeholder."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete
+
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+
+    class _SystemMessage:
+        def __init__(self, subtype, data, hook_event_name=None, session_id=None):
+            self.subtype = subtype
+            self.data = data
+            self.hook_event_name = hook_event_name
+            self.session_id = session_id
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = _SystemMessage
+        ResultMessage = type("ResultMessage", (), {})
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return
+
+            async def query(self, prompt, session_id="default"):
+                return
+
+            async def receive_response(self):
+                yield _SystemMessage(
+                    subtype="hook_started",
+                    data={
+                        "hook_event": "PreCompact",
+                        "session_id": "claude-uuid-error",
+                        "transcript_path": str(transcript_path),
+                    },
+                    hook_event_name="PreCompact",
+                    session_id="claude-uuid-error",
+                )
+                with transcript_path.open("a", encoding="utf-8") as transcript:
+                    transcript.write(
+                        json.dumps(
+                            {
+                                "type": "user",
+                                "uuid": "compact-summary-1",
+                                "isCompactSummary": True,
+                                "message": {
+                                    "role": "user",
+                                    "content": "compacted summary",
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+                raise RuntimeError("Autocompact is thrashing: the context refilled to the limit")
+
+            async def disconnect(self):
+                return None
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        get_messages = (
+            patch("claude_agent_sdk.get_session_messages", side_effect=session_read)
+            if isinstance(session_read, Exception)
+            else patch("claude_agent_sdk.get_session_messages", return_value=session_read)
+        )
+        with (
+            patch(
+                "omnigent.inner.claude_sdk_executor._ensure_sdk",
+                return_value=_FakeSDK,
+            ),
+            get_messages,
+        ):
+            events = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "continue", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+        assert not [event for event in events if isinstance(event, CompactionComplete)]
+        assert len([event for event in events if isinstance(event, ExecutorError)]) == 1
+
+    _run(_t())
+
+
+def test_precompact_exception_without_new_summary_preserves_history(tmp_path: Path) -> None:
+    """PreCompact alone is not evidence that Claude finished compaction."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete
+
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+
+    class _SystemMessage:
+        def __init__(self, subtype, data, hook_event_name=None, session_id=None):
+            self.subtype = subtype
+            self.data = data
+            self.hook_event_name = hook_event_name
+            self.session_id = session_id
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = _SystemMessage
+        ResultMessage = type("ResultMessage", (), {})
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return
+
+            async def query(self, prompt, session_id="default"):
+                return
+
+            async def receive_response(self):
+                yield _SystemMessage(
+                    subtype="hook_started",
+                    data={
+                        "hook_event": "PreCompact",
+                        "session_id": "claude-uuid-error",
+                        "transcript_path": str(transcript_path),
+                    },
+                    hook_event_name="PreCompact",
+                    session_id="claude-uuid-error",
+                )
+                raise RuntimeError("stream failed before compaction completed")
+
+            async def disconnect(self):
+                return None
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with (
+            patch(
+                "omnigent.inner.claude_sdk_executor._ensure_sdk",
+                return_value=_FakeSDK,
+            ),
+            patch("claude_agent_sdk.get_session_messages") as mock_get_messages,
+        ):
+            events = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "continue", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+        assert not [event for event in events if isinstance(event, CompactionComplete)]
+        assert len([event for event in events if isinstance(event, ExecutorError)]) == 1
+        mock_get_messages.assert_not_called()
+
+    _run(_t())
+
+
 def test_precompact_hook_emits_compaction_started_before_complete() -> None:
     """CompactionStarted is yielded when PreCompact fires, before CompactionComplete.
 
@@ -4660,6 +5428,11 @@ def test_precompact_hook_emits_compaction_started_before_complete() -> None:
             self.subtype = subtype
             self.data = data
             self.hook_event_name = hook_event_name
+
+    class _FakeSessionMessage:
+        def __init__(self, type, message):
+            self.type = type
+            self.message = message
 
     class _FakeSDK:
         AssistantMessage = type("AssistantMessage", (), {})
@@ -4707,7 +5480,12 @@ def test_precompact_hook_emits_compaction_started_before_complete() -> None:
             ),
             patch(
                 "claude_agent_sdk.get_session_messages",
-                return_value=[],
+                return_value=[
+                    _FakeSessionMessage(
+                        "user",
+                        {"content": [{"type": "text", "text": "compacted summary"}]},
+                    )
+                ],
             ),
         ):
             events = [
@@ -4856,3 +5634,110 @@ async def test_enqueue_session_message_returns_false_without_queuing() -> None:
 
     assert result is False
     assert not query_called, "query() must not be called during enqueue"
+
+
+@pytest.mark.asyncio
+async def test_terminal_error_carries_observed_usage() -> None:
+    """A terminal-error turn still reports the usage it observed mid-turn.
+
+    A turn can fail AFTER the model call started — the stream dies and the
+    CLI's retries are rejected (auth failure), or the ``ResultMessage``
+    arrives with ``is_error=True``. The prompt size was already observed
+    from ``message_start``, and discarding it froze the context-occupancy
+    meter at the previous successful turn's value exactly when the session
+    was in trouble.
+
+    Regression guard: pre-fix the ``terminal_error`` path yielded
+    ``ExecutorError`` with no usage, so nothing downstream could update
+    the meter on a failed turn.
+    """
+    from unittest.mock import patch
+
+    from claude_agent_sdk.types import (
+        ClaudeAgentOptions as SDKClaudeAgentOptions,
+    )
+    from claude_agent_sdk.types import ResultMessage as SDKResultMessage
+    from claude_agent_sdk.types import StreamEvent as SDKStreamEvent
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import ExecutorError
+
+    class _Sentinel:
+        pass
+
+    # The model call opens (message_start carries the prompt usage), then the
+    # harness reports a terminal failure via ResultMessage(is_error=True).
+    message_start = SDKStreamEvent(
+        uuid="u1",
+        session_id="s1",
+        event={
+            "type": "message_start",
+            "message": {
+                "usage": {
+                    "input_tokens": 400,
+                    "cache_read_input_tokens": 99_000,
+                    "cache_creation_input_tokens": 600,
+                }
+            },
+        },
+    )
+    sdk_result = SDKResultMessage(
+        subtype="success",
+        session_id="s1",
+        result="authentication failed",
+        total_cost_usd=0.0,
+        duration_ms=10,
+        duration_api_ms=8,
+        is_error=True,
+        num_turns=1,
+        usage=None,
+    )
+
+    class _FakeSDK:
+        AssistantMessage = _Sentinel
+        UserMessage = _Sentinel
+        SystemMessage = _Sentinel
+        StreamEvent = SDKStreamEvent
+        ResultMessage = SDKResultMessage
+        ClaudeAgentOptions = SDKClaudeAgentOptions
+        messages = [message_start, sdk_result]
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return None
+
+            async def query(self, prompt, session_id="default"):
+                return None
+
+            async def receive_response(self):
+                for message in _FakeSDK.messages:
+                    yield message
+
+            async def disconnect(self):
+                return None
+
+    executor = ClaudeSDKExecutor()
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+        events = [
+            e
+            async for e in executor.run_turn(
+                [{"role": "user", "content": "hi"}],
+                [],
+                "",
+            )
+        ]
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert errors, "Expected an ExecutorError for the terminal failure"
+    usage = errors[0].usage
+    assert usage is not None, (
+        "ExecutorError.usage is None — the observed message_start usage was "
+        "discarded on the terminal-error path, so the context meter freezes."
+    )
+    # Window fill = input + cache_creation + cache_read from the last call.
+    assert usage["context_tokens"] == 100_000
+    # output_tokens is unknown on an incomplete turn — reported as 0.
+    assert usage["output_tokens"] == 0
