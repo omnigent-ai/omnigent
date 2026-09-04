@@ -117,11 +117,6 @@ function App({ basename }: AppProps = {}) {
   // the original relative route table.
   const prefix = basename ?? "";
   const info = useServerInfo();
-  // While the probe is in flight, render nothing — first paint is
-  // ~30ms after boot anyway, and flashing the chrome we may
-  // immediately tear down once the probe returns is worse than a
-  // tiny blank moment.
-  if (info === "loading") return null;
 
   // First-run: accounts on but no admin claimed yet. Route EVERY path to
   // the Create-admin form so the first visitor lands on it no matter how
@@ -129,7 +124,7 @@ function App({ basename }: AppProps = {}) {
   // /auth/setup is server-gated to the zero-admin state, and needs_setup
   // flips false the instant it succeeds — so this whole branch disappears
   // after the first admin exists.
-  if (info.accounts_enabled && info.needs_setup) {
+  if (info !== "loading" && info.accounts_enabled && info.needs_setup) {
     return (
       <Suspense fallback={null}>
         <Routes>
@@ -142,7 +137,7 @@ function App({ basename }: AppProps = {}) {
   return (
     <Suspense fallback={null}>
       <Routes>
-        {info.accounts_enabled && (
+        {info !== "loading" && info.accounts_enabled && (
           <>
             <Route path={`${prefix}/login`} element={<LoginPage />} />
             <Route path={`${prefix}/register`} element={<RegisterPage />} />

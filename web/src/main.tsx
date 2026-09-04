@@ -107,8 +107,8 @@ const bootServerInfo = createBootServerInfo(resolveServerInfo());
 // exactly as it did before this gate existed.
 const bootIdentityGate = withBootTimeout<string | null>(bootIdentity, null);
 
-function RootApp({ initialInfo }: { initialInfo: ServerInfo }) {
-  const [info, setInfo] = useState(initialInfo);
+function RootApp({ initialInfo }: { initialInfo: ServerInfo | "loading" }) {
+  const [info, setInfo] = useState<ServerInfo | "loading">(initialInfo);
   useEffect(() => {
     let alive = true;
     void bootServerInfo.settled.then((resolved) => {
@@ -119,6 +119,7 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo }) {
     };
   }, []);
   useEffect(() => {
+    if (info === "loading") return;
     if (info.branding?.app_name) document.title = info.branding.app_name;
     const faviconUrl = info.branding?.logos.favicon;
     if (!faviconUrl) return;
@@ -154,16 +155,20 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo }) {
   );
 }
 
-void Promise.all([bootServerInfo.initial, bootIdentityGate]).then(([initialInfo]) => {
-  // `/v1/me` came back 401 with a login page and we're already on our way
-  // there. Mounting now would start a navigation race we lose either way:
-  // the shell's queries fire against a session we know is invalid, 401,
-  // and get torn down mid-flight when the login page commits. Header mode
-  // never lands here (no login page), so a proxy-less deploy still renders.
-  if (isLoginRedirectPending()) return;
-  createRoot(document.getElementById("root")!).render(
-    <StrictMode>
-      <RootApp initialInfo={initialInfo} />
-    </StrictMode>,
-  );
+// Mount immediately so the shell renders before the server probes settle.
+// The CapabilitiesProvider starts with "loading"; bootServerInfo.settled
+// updates it once /v1/info returns (see RootApp's useEffect above).
+const root = createRoot(document.getElementById("root")!);
+root.render(
+  <StrictMode>
+    <RootApp initialInfo="loading" />
+  </StrictMode>,
+);
+
+// `/v1/me` came back 401 with a login page and we're already on our way
+// there. Unmount to stop the shell's queries firing against an invalid
+// session mid-redirect. Header mode never lands here (no login page), so
+// a proxy-less deploy is unaffected.
+void bootIdentityGate.then(() => {
+  if (isLoginRedirectPending()) root.unmount();
 });
