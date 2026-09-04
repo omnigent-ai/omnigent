@@ -696,6 +696,18 @@ class _AgentsSessionState:
     rollback_to_item_count: int | None = None
 
 
+def _without_tool_history(messages: list[Message]) -> list[Message]:
+    """Return *messages* minus ``tool_call`` / ``tool_result`` history items.
+
+    The history cursor counts only conversational messages: a live SDK session
+    already holds its own tool items (Layer-1 state), so replaying them on a
+    delta turn would duplicate context and misalign the cursor. Tool history is
+    consumed only by the full-replay path for a fresh SDK session, which has no
+    Layer-1 state to reconstruct it from.
+    """
+    return [msg for msg in messages if msg.get("role") not in ("tool_call", "tool_result")]
+
+
 # ``_sanitize_replay_item`` walks replay values recursively. At the
 # boundary these are either SDK TypedDicts, pydantic models that have
 # already been ``model_dump``-ed to dicts, or primitive JSON values — so
@@ -1274,7 +1286,11 @@ class OpenAIAgentsSDKExecutor(Executor):
             await self._rewind_sdk_session(state, state.rollback_to_item_count)
             state.rollback_to_item_count = None
 
-        if state.started and len(split_transient_tail(messages).persisted) < state.history_cursor:
+        cursor_view = _without_tool_history(messages)
+        if (
+            state.started
+            and len(split_transient_tail(cursor_view).persisted) < state.history_cursor
+        ):
             await self._rewind_sdk_session(state, 0)
             state.started = False
             state.resume_state = None
@@ -1299,9 +1315,12 @@ class OpenAIAgentsSDKExecutor(Executor):
             state.resume_state = None
 
         if not state.started:
+            # Full replay into a fresh SDK session (fork, restart): include the
+            # tool_call / tool_result history — there is no Layer-1 state to
+            # reconstruct the recorded tool context from.
             return _normalize_responses_items_for_chat(_convert_messages_to_responses(messages))
 
-        split = split_transient_tail(messages)
+        split = split_transient_tail(_without_tool_history(messages))
         delta_persisted = split.persisted[state.history_cursor :]
         delta_messages = list(delta_persisted) + list(split.transient)
         if not delta_messages:
@@ -1721,7 +1740,9 @@ class OpenAIAgentsSDKExecutor(Executor):
                 if stepwise_internal_turns and saw_tool_activity and result is not None:
                     state.started = True
                     state.resume_state = result.to_state()
-                    state.history_cursor = len(split_transient_tail(messages).persisted)
+                    state.history_cursor = len(
+                        split_transient_tail(_without_tool_history(messages)).persisted
+                    )
                     yield TurnComplete(continue_turn=True)
                     return
                 logger.error("OpenAIAgentsSDKExecutor: max turns exceeded")
@@ -1829,7 +1850,9 @@ class OpenAIAgentsSDKExecutor(Executor):
 
         if not response_text and final_text:
             yield TextChunk(text=final_text)
-        state.history_cursor = len(split_transient_tail(messages).persisted) + 1
+        state.history_cursor = (
+            len(split_transient_tail(_without_tool_history(messages)).persisted) + 1
+        )
         # Aggregate usage across all raw responses for this turn. The SDK
         # accumulates per-request usage on RunResult.raw_responses.
         #
