@@ -3250,13 +3250,14 @@ def inject_user_message(
     The submit is **acknowledged, not fire-and-forget**: Claude Code
     coalesces rapid stdin bursts into a paste, so an Enter that lands
     while the TUI is still consuming the paste is folded in as a
-    newline and the draft sits unsent. This helper first polls
-    ``capture-pane`` until the draft is visible in the input box (the
-    paste was committed), sends Enter, then polls that the draft left
-    the box — re-sending Enter while it hasn't — and raises if the
-    message never submits. An empty composer is not sufficient evidence:
-    after it clears, this helper also waits for the matching
-    ``UserPromptSubmit`` hook from the active Claude session.
+    newline and the draft sits unsent. This helper polls ``capture-pane``
+    until the draft is visible in the input box (best-effort — a large
+    paste collapses to a ``[Pasted text]`` placeholder that may not match),
+    sends Enter, then polls that the draft left the box — re-sending Enter
+    while it hasn't — and raises if the message never submits. An empty
+    composer is not sufficient evidence: after it clears, this helper also
+    waits for the matching ``UserPromptSubmit`` hook from the active Claude
+    session, which is the authoritative delivery check.
 
     :param bridge_dir: Bridge directory path.
     :param content: User text from the Omnigent web UI. Must be non-empty.
@@ -3265,11 +3266,9 @@ def inject_user_message(
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in time,
         if Claude's input prompt never renders, if a ``tmux send-keys``
-        invocation fails, if the paste draft was never confirmed in the
-        input box after ``_PASTE_COMMIT_TIMEOUT_S`` (the TUI was still
-        consuming the paste — message not submitted), or if the draft
-        never leaves the input box after repeated submit Enters, or Claude
-        never acknowledges the submitted prompt.
+        invocation fails, if the draft never leaves the input box after
+        repeated submit Enters, or if Claude never acknowledges the
+        submitted prompt via ``UserPromptSubmit``.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     # A surface left occupying the composer swallows everything typed
@@ -3343,32 +3342,17 @@ def inject_user_message(
     # the paste becomes a newline inside the draft instead of a submit,
     # and the message sits unsent. A fixed sleep raced this (lost under
     # load / large payloads); polling is deterministic.
-    # When the draft never becomes visible (timeout expired) AND the
-    # content has an identifiable needle, raise rather than submit blind:
-    # a blind Enter races the still-consuming TUI and would silently drop
-    # the message (the caller gets no error but the turn never runs).
-    # When the needle is empty (whitespace-only content) the draft cannot
-    # be confirmed either way; fall through to best-effort blind submit.
-    draft_seen = False
+    # The draft-visibility poll is best-effort, not a gate: large or
+    # multi-line pastes render as a collapsed ``[Pasted text]`` placeholder
+    # whose glyph row may not match the needle within the window, so a
+    # timeout here does not mean the paste failed. Fall through to submit
+    # regardless — the ``UserPromptSubmit`` acknowledgement below is the
+    # authoritative delivery check and surfaces a genuine non-delivery.
     deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
     while time.monotonic() < deadline:
         if _draft_in_input_box(_capture_pane(info["socket_path"], info["tmux_target"]), needle):
-            draft_seen = True
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-    if not draft_seen:
-        if not needle:
-            # Content has no identifiable first line (e.g. whitespace-only).
-            # The draft position cannot be confirmed, so fall through to a
-            # best-effort blind submit rather than hard-failing.
-            time.sleep(_PASTE_SETTLE_S)
-            _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
-            return
-        raise RuntimeError(
-            f"The pasted draft was never visible in Claude Code's input box after "
-            f"{_PASTE_COMMIT_TIMEOUT_S}s (needle={needle!r}). The TUI may still be "
-            "consuming the paste — the message was not submitted. Retry the send."
-        )
     time.sleep(_PASTE_SETTLE_S)
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
     # Verify the submit took: a successful Enter clears the input box.
