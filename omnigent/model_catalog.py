@@ -39,6 +39,7 @@ import subprocess
 import threading
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal, TypeAlias, cast
+from urllib.parse import urlsplit
 
 import click
 import httpx
@@ -63,6 +64,7 @@ from omnigent.model_resolver import (
 )
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
+    BEDROCK_KIND,
     CLI_CONFIG_KIND,
     DATABRICKS_KIND,
     KEY_KIND,
@@ -248,6 +250,62 @@ class ResolvedModelProvider:
     auth_command: str | None = None
     cli: str | None = None
     detail: str = ""
+
+
+def _model_configuration_host(base_url: str) -> str | None:
+    """Extract a host without carrying URL userinfo into browser metadata."""
+    try:
+        parsed = urlsplit(base_url if "://" in base_url else f"//{base_url}")
+        if not parsed.hostname:
+            return None
+        hostname = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    return f"{hostname}:{port}" if port is not None else hostname
+
+
+def model_configuration_source(
+    provider: ResolvedModelProvider, *, harness: str | None = None
+) -> dict[str, str] | None:
+    """Return non-secret coordinates describing how a model is reached."""
+    if provider.kind == NONE_KIND:
+        return None
+
+    # Native Claude deliberately ignores legacy api_key auth and uses its own
+    # CLI login. Named key providers still route through the configured key.
+    if (
+        harness in {"claude-native", "native-claude"}
+        and provider.kind == KEY_KIND
+        and provider.detail == "api_key auth"
+    ):
+        return {"kind": SUBSCRIPTION_KIND, "label": "Subscription", "name": "claude"}
+
+    source: dict[str, str] = {"kind": provider.kind}
+    if provider.kind == SUBSCRIPTION_KIND:
+        source.update(label="Subscription", name=provider.cli or "CLI login")
+    elif provider.kind == DATABRICKS_KIND:
+        source.update(label="Workspace", name=provider.profile or "DEFAULT")
+    elif provider.kind in {"gateway", "local"}:
+        source["label"] = "AI Gateway" if provider.kind == "gateway" else "Local"
+        name = provider.detail.removeprefix("provider '").removesuffix("'")
+        if name:
+            source["name"] = name
+    elif provider.kind == CLI_CONFIG_KIND:
+        source.update(label="CLI config", name=provider.detail or provider.cli or "Codex")
+    elif provider.kind == BEDROCK_KIND:
+        source["label"] = "Bedrock"
+        name = provider.detail.removeprefix("provider '").removesuffix("'")
+        if name:
+            source["name"] = name
+    else:
+        source["label"] = "API key"
+        name = provider.family or provider.detail.removeprefix("provider '").removesuffix("'")
+        if name:
+            source["name"] = name
+    if provider.base_url and (host := _model_configuration_host(provider.base_url)):
+        source["host"] = host
+    return source
 
 
 def is_direct_openai_provider(provider: ResolvedModelProvider) -> bool:

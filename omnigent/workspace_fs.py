@@ -470,24 +470,20 @@ class WorkspaceReader:
         }
 
     # ── GitHub integration (read-only) ────────────────────────────
-    # Serve the same read-only PR-metadata + branch-vs-base diff the runner's
+    # Serve the same read-only PR metadata + the PR's files / diff the runner's
     # GitHub endpoints do, so the tab keeps working when the runner is offline
     # but the host still holds the workspace. Delegates to the shared
-    # ``github_resource`` helpers against this reader's confined root; the git
-    # ops are read-only and ``gh`` is the developer's own authenticated CLI.
+    # ``github_resource`` helpers against this reader's confined root; the list
+    # and patch come from ``gh`` (the developer's authenticated CLI) and only the
+    # per-file reader shells out to a read-only ``git show``.
 
     def github_info(self) -> _WorkspacePayload:
         """GitHub context (repo, branch, base ref, PR) for the workspace."""
         return cast("_WorkspacePayload", github_resource.github_info(str(self._root)))
 
-    def github_changes(self, base: str | None) -> _WorkspacePayload:
-        """Files changed on HEAD vs the base branch (``base`` derived if None)."""
-        resolved = github_resource.resolve_base_ref(str(self._root), base)
-        if not resolved:
-            return {"object": "list", "data": [], "has_more": False}
-        return cast(
-            "_WorkspacePayload", github_resource.github_changed_files(str(self._root), resolved)
-        )
+    def github_changes(self) -> _WorkspacePayload:
+        """The PR's changed files (empty when the branch has no PR)."""
+        return cast("_WorkspacePayload", github_resource.github_changed_files(str(self._root)))
 
     def github_file_diff(self, base: str | None, relative_path: str) -> _WorkspacePayload:
         """Before/after content for one file, HEAD vs the base merge-base."""
@@ -497,10 +493,6 @@ class WorkspaceReader:
             github_resource.github_file_diff(str(self._root), resolved or "", relative_path),
         )
 
-    def github_pr_diff(self, base: str | None) -> _WorkspacePayload:
-        """The whole PR as one unified diff patch (base derived if None)."""
-        resolved = github_resource.resolve_base_ref(str(self._root), base)
-        return cast(
-            "_WorkspacePayload",
-            github_resource.github_pr_diff(str(self._root), resolved or ""),
-        )
+    def github_pr_diff(self) -> _WorkspacePayload:
+        """The whole PR as one unified diff patch (empty when there's no PR)."""
+        return cast("_WorkspacePayload", github_resource.github_pr_diff(str(self._root)))

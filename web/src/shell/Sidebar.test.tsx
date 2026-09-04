@@ -582,13 +582,14 @@ describe("Sidebar session list", () => {
     renderSidebar();
 
     // The sidebar makes two useConversations calls: one all-sessions query
-    // (includeArchived: true, for inbox counts + WS reconciliation) and one
-    // tab-scoped filtered query (includeArchived: false, for display).
-    // Assert the all-sessions call is present — a regression to false would
-    // leave the inbox badge blind to archived-session approvals.
+    // (includeArchived: true, reconcileWhileConnected: true — for inbox counts
+    // and WS reconciliation) and one tab-scoped filtered query (includeArchived:
+    // false, for display). Assert the all-sessions call is present and correct.
     const calls = useConvMock.mock.calls;
     expect(calls.length).toBeGreaterThanOrEqual(1);
-    expect(calls.some((call) => call[0] === "" && call[1] === true)).toBe(true);
+    const allSessionsCall = calls.find((call) => call[0] === "" && call[1] === true);
+    expect(allSessionsCall).toBeDefined();
+    expect(allSessionsCall?.[2]).toMatchObject({ reconcileWhileConnected: true });
   });
 
   it("opens the command palette when the Search button is clicked", () => {

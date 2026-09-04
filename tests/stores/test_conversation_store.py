@@ -3159,6 +3159,58 @@ def test_create_session_with_agent_records_workspace(
     assert fetched.host_id is None
 
 
+def test_create_session_with_agent_records_host_id_with_workspace(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Verify create_session_with_agent persists host_id alongside workspace.
+
+    The multipart ``POST /v1/sessions`` form accepts ``metadata.host_id``
+    for launching the bundled session's runner on an external host; the
+    binding must land on the row at creation so the launch flow (and the
+    session snapshot) sees it. Before this parameter existed, the
+    bundled-create path silently dropped the caller's host binding.
+    """
+    created = conversation_store.create_session_with_agent(
+        agent_id="5b6cf1f0662a1eab8722ca44e9d0b111",
+        agent_name="host-bound-bundle-agent",
+        agent_bundle_location="5b6cf1f0662a1eab8722ca44e9d0b111/bundle1",
+        agent_description=None,
+        workspace="/Users/corey/projects/bundled",
+        host_id="3f866cafac81246fb60ae6ceb1a738da",
+    )
+
+    fetched = conversation_store.get_conversation(created.conversation.id)
+    assert fetched is not None
+    assert fetched.host_id == "3f866cafac81246fb60ae6ceb1a738da"
+    assert fetched.workspace == "/Users/corey/projects/bundled"
+
+
+def test_create_session_with_agent_host_id_requires_workspace(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Verify host_id without a workspace is rejected at insert.
+
+    The ``workspace_required_for_host`` check constraint guards the
+    pairing; a caller that validated ``host_id`` but forgot the
+    workspace must fail loudly instead of writing a row the launch
+    flow can't use.
+    """
+    # MySQL reports check-constraint violations (error 3819) as
+    # OperationalError rather than IntegrityError.
+    from sqlalchemy.exc import IntegrityError, OperationalError
+
+    with pytest.raises((IntegrityError, OperationalError)):
+        conversation_store.create_session_with_agent(
+            agent_id="9d1de2b7dd35c74faf05ff54c99ab222",
+            agent_name="host-no-ws-agent",
+            agent_bundle_location="9d1de2b7dd35c74faf05ff54c99ab222/bundle1",
+            agent_description=None,
+            host_id="3f866cafac81246fb60ae6ceb1a738da",
+        )
+
+
 def test_create_session_with_agent_workspace_defaults_to_none(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

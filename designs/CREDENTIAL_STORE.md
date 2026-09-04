@@ -185,15 +185,18 @@ sequencing it first. The migration chains off the current `upstream/main` head
 to a single Alembic head; a test guards that
 (`tests/db/test_migration_connections.py`).
 
-## Broker endpoint (future generalization)
+## Broker endpoint (provider-generic)
 
-The credential broker currently vends only GitHub:
-`GET /v1/hosts/{host_id}/github-credential`. When a second provider needs
-on-demand delivery to a sandbox, this becomes
-`GET /v1/hosts/{host_id}/credentials/{provider}` returning the provider's secret
-+ attribution metadata, with the git credential helper and the GitHub MCP proxy
-passing `provider=github`. Kept GitHub-specific for now to limit blast radius;
-the store change is the prerequisite that makes it a small follow-up.
+The credential broker is generic over providers:
+`GET /v1/hosts/{host_id}/credentials/{provider}` resolves the launch token to
+the session owner and returns that provider's secret + attribution metadata
+(the git credential helper and the GitHub MCP proxy pass `provider=github`).
+One route (`routes/host_credentials.py`) serves every provider that registers a
+`credential_resolver` on the `ConnectionProvider` registry; a provider with no
+resolver — connect-only, or on-demand delivery not built yet — returns `404`. A
+new provider is one registry entry, not another hand-copied route + client. The
+resolver is best-effort: a fault degrades to `{"connected": false}` rather than
+a 500, and the token is never persisted in the sandbox.
 
 ## Revocation & audit note
 

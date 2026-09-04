@@ -2,9 +2,9 @@
 //
 //   useGithubInfo        — GET /resources/github
 //                          repo / branch / base ref / associated PR + CI summary.
-//   useGithubChangedFiles — GET /resources/github/changes?base=<ref>
-//                          files changed on the branch vs its base (sidebar list).
-//   useGithubPrDiff      — GET /resources/github/diff?base=<ref>
+//   useGithubChangedFiles — GET /resources/github/changes
+//                          the PR's changed files (sidebar list).
+//   useGithubPrDiff      — GET /resources/github/diff
 //                          the whole PR as one unified-diff patch.
 //   fetchGithubFileContents — GET /resources/github/diff/{path}?base=<ref>
 //                          before/after full content for one file, fetched on
@@ -20,6 +20,8 @@ import {
   RunnerOfflineError,
   runnerOfflineRetryDelay,
   shouldRetryRunnerOffline,
+  useSessionActive,
+  useTrailingInvalidate,
   useWorkspaceServeable,
   type WorkspaceChangedFile,
 } from "@/hooks/useWorkspaceChangedFiles";
@@ -79,7 +81,7 @@ export interface GithubInfo {
   authenticated?: boolean;
   branch?: string;
   repo?: GithubRepo | null;
-  /** Branch the diff is computed against (PR base, gh default, else git default). */
+  /** The PR's base branch; null when there's no PR (the tab is a PR view). */
   base_ref?: string | null;
   pr?: GithubPr | null;
 }
@@ -163,15 +165,75 @@ async function fetchGithubInfo(conversationId: string): Promise<GithubInfo> {
   return (await res.json()) as GithubInfo;
 }
 
+/** Poll cadence while the panel is open and the GitHub state can still change.
+ *  Covers both the setup/availability states the user resolves outside the app
+ *  (install `gh`, `gh auth login`/`switch`, `cd` into a repo) — cheap local
+ *  git/gh checks — and the waiting-for-a-PR / CI-running states, which cost a
+ *  `gh` API call but only while the panel is actually focused. */
+const GITHUB_POLL_MS = 5_000;
+
+/**
+ * The panel's poll interval for the current GitHub info, or `false` to stop.
+ *
+ * While the panel is open we keep polling in every state that can still change
+ * from something the user does outside the app — the setup/availability states
+ * (no repo, `gh` missing, not authenticated, repo unresolved) as well as
+ * waiting for a PR and watching an open PR's checks. It rests (returns `false`)
+ * only at a stable end state: an open PR whose checks have all settled, or a
+ * merged/closed PR. A resting panel still refreshes on the turn-end invalidate
+ * (see {@link useGithubInfo}); resting only forgoes the interval poll. Kept pure
+ * and exported so each state is unit-testable.
+ *
+ * Note: an open PR on a repo with no CI stays at `total === 0` and so keeps
+ * polling while the panel is open+focused — we can't tell "no CI" from "checks
+ * haven't registered yet", and freshness wins for the cost of a focused poll.
+ */
+export function computeGithubPollInterval(info: GithubInfo | undefined): number | false {
+  // No usable info yet — an initial error, or a transient fetch failure with no
+  // cached data. Keep trying; runner-offline is gated off by `enabled`.
+  if (!info) return GITHUB_POLL_MS;
+  // Setup / availability states, all resolved outside the app.
+  if (
+    !info.available ||
+    info.gh_available === false ||
+    info.authenticated === false ||
+    !info.repo?.name_with_owner
+  ) {
+    return GITHUB_POLL_MS;
+  }
+  const pr = info.pr;
+  if (!pr) return GITHUB_POLL_MS; // set up, waiting for a PR to appear
+  if (pr.state !== "OPEN") return false; // merged/closed → nothing left to watch
+  // Open PR: poll while checks run or haven't registered; stop once settled.
+  return pr.checks.pending > 0 || pr.checks.total === 0 ? GITHUB_POLL_MS : false;
+}
+
 /**
  * Fetch GitHub context (repo, branch, base ref, PR + CI summary) for a session.
  *
  * Disabled when the runner is known offline. Retries the runner-offline case
  * with capped backoff so a cold-booting runner resolves before any error UI.
- * No polling — the panel refetches on a manual Refresh.
+ *
+ * Refetch is driven two ways, both harness-agnostic:
+ *   - Turn end: a trailing invalidate on the focused session's active→idle
+ *     transition, so a PR the agent opened during the turn shows up (in the
+ *     status-line indicator and the panel) without a manual refresh. This is
+ *     the always-on path — the status line uses it even with the tab closed.
+ *   - Panel poll: pass `{ poll: true }` (the GitHub panel does) to also poll
+ *     while the panel is open — see {@link computeGithubPollInterval} for which
+ *     states poll and which rest. It catches changes a turn boundary can't
+ *     (setup fixed outside the app, CI progressing after the turn). Backgrounded
+ *     tabs pause (`refetchIntervalInBackground: false`).
+ *
+ * Disabled when the runner is known offline. Retries the runner-offline case
+ * with capped backoff so a cold-booting runner resolves before any error UI.
  */
-export function useGithubInfo(conversationId: string | undefined) {
+export function useGithubInfo(conversationId: string | undefined, options?: { poll?: boolean }) {
   const serveable = useWorkspaceServeable(conversationId);
+  // Turn-end backstop: refetch when the focused session goes active→idle, so a
+  // just-opened PR appears without opening the tab. Keys off the turn lifecycle,
+  // so it works for every harness (no per-harness tool detection).
+  useTrailingInvalidate(conversationId, useSessionActive(conversationId), "github-info");
   return useQuery({
     queryKey: ["github-info", conversationId],
     queryFn: () => fetchGithubInfo(conversationId!),
@@ -179,16 +241,14 @@ export function useGithubInfo(conversationId: string | undefined) {
     retry: shouldRetryRunnerOffline,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
+    refetchInterval: options?.poll ? (query) => computeGithubPollInterval(query.state.data) : false,
+    refetchIntervalInBackground: false,
   });
 }
 
-async function fetchGithubChangedFiles(
-  conversationId: string,
-  base: string | undefined,
-): Promise<GithubChangedFilesResult> {
-  const params = base ? `?base=${encodeURIComponent(base)}` : "";
+async function fetchGithubChangedFiles(conversationId: string): Promise<GithubChangedFilesResult> {
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/changes${params}`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/changes`,
   );
   if (res.status === 404) return { available: false, data: [] };
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
@@ -200,22 +260,18 @@ async function fetchGithubChangedFiles(
 }
 
 /**
- * Fetch files changed on the branch relative to `base` (the PR "Files
- * changed"). Pass the `base_ref` from {@link useGithubInfo}; when omitted the
- * runner derives the default branch (an extra gh call).
+ * Fetch the PR's changed files (the "Files changed" list). Enabled only when a
+ * PR exists (pass `hasPr` from {@link useGithubInfo}); the runner returns an
+ * empty list otherwise.
  */
-export function useGithubChangedFiles(
-  conversationId: string | undefined,
-  base: string | undefined,
-) {
+export function useGithubChangedFiles(conversationId: string | undefined, hasPr: boolean) {
   const serveable = useWorkspaceServeable(conversationId);
   return useQuery({
-    queryKey: ["github-changed-files", conversationId, base ?? null],
-    queryFn: () => fetchGithubChangedFiles(conversationId!, base),
-    // Wait for a base ref (from useGithubInfo) — without one there's nothing to
-    // diff against, and it also skips the query when GitHub is
-    // unavailable/unauthenticated (no base ref is resolved in those states).
-    enabled: !!conversationId && !!base && serveable !== false,
+    queryKey: ["github-changed-files", conversationId],
+    queryFn: () => fetchGithubChangedFiles(conversationId!),
+    // Only a PR has files to show — skip the call in every no-PR / unavailable
+    // / unauthenticated state (the panel shows an empty state instead).
+    enabled: !!conversationId && hasPr && serveable !== false,
     retry: shouldRetryRunnerOffline,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
@@ -252,13 +308,9 @@ export interface GithubPrDiffResponse {
   patch: string;
 }
 
-async function fetchGithubPrDiff(
-  conversationId: string,
-  base: string | undefined,
-): Promise<GithubPrDiffResponse> {
-  const params = base ? `?base=${encodeURIComponent(base)}` : "";
+async function fetchGithubPrDiff(conversationId: string): Promise<GithubPrDiffResponse> {
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/diff${params}`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/diff`,
   );
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
     throw new RunnerOfflineError();
@@ -270,15 +322,15 @@ async function fetchGithubPrDiff(
 /**
  * Fetch the whole PR as one unified diff patch. The panel parses it
  * client-side into per-file diffs, so the entire PR renders from a single
- * call. Waits for a base ref (from {@link useGithubInfo}); disabled when the
- * runner is known offline.
+ * call. Enabled only when a PR exists (pass `hasPr` from {@link useGithubInfo});
+ * disabled when the runner is known offline.
  */
-export function useGithubPrDiff(conversationId: string | undefined, base: string | undefined) {
+export function useGithubPrDiff(conversationId: string | undefined, hasPr: boolean) {
   const serveable = useWorkspaceServeable(conversationId);
   return useQuery({
-    queryKey: ["github-pr-diff", conversationId, base ?? null],
-    queryFn: () => fetchGithubPrDiff(conversationId!, base),
-    enabled: !!conversationId && !!base && serveable !== false,
+    queryKey: ["github-pr-diff", conversationId],
+    queryFn: () => fetchGithubPrDiff(conversationId!),
+    enabled: !!conversationId && hasPr && serveable !== false,
     retry: shouldRetryRunnerOffline,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,

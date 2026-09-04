@@ -84,6 +84,7 @@ _logger = logging.getLogger("omnigent.runner.app")
 _OMNIGENT_PACKAGE_DIR = Path(__file__).resolve().parent.parent.parent
 
 _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
+
 _REPL_TERMINAL_NAME = "tui"
 _REPL_TERMINAL_SESSION_KEY = "main"
 _NO_BODY_STATUS_CODES = {204, 304}
@@ -6361,6 +6362,35 @@ async def _load_claude_launch_metadata(
     return metadata
 
 
+async def _clear_session_model_override(
+    session_id: str,
+    server_client: httpx.AsyncClient,
+) -> None:
+    """
+    Reset a session's persisted model pick to Default.
+
+    The server clears the pick only for its explicit ``"default"`` alias; a
+    JSON ``null`` leaves it unchanged. Best-effort: a failed reset keeps the
+    pick, and the next relaunch repeats the fallback.
+
+    :param session_id: Session/conversation identifier.
+    :param server_client: Runner Omnigent server client.
+    """
+    try:
+        resp = await server_client.patch(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+            json={"model_override": "default"},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "claude-native: could not reset the model pick for session %s",
+            session_id,
+            exc_info=True,
+        )
+
+
 async def _auto_create_claude_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -6793,12 +6823,22 @@ async def _auto_create_claude_terminal(
         from omnigent.server.smart_routing import task_v1_claude_arms
 
         claude_config = claude_config_with_routed_arms_pinned(claude_config, task_v1_claude_arms())
-    launch_model = resolve_claude_native_model_selection(
-        session_model_override
-        or _claude_native_model_from_spec(agent_spec)
+    # The launch model without the session's pick: the agent-spec pin, else
+    # the provider's own default. Also what a pick the provider cannot serve
+    # falls back to.
+    unpinned_launch_model = resolve_claude_native_model_selection(
+        _claude_native_model_from_spec(agent_spec)
         or (claude_config.model if claude_config is not None else None),
         claude_config,
     )
+    launch_model = (
+        resolve_claude_native_model_selection(session_model_override, claude_config)
+        if session_model_override
+        else unpinned_launch_model
+    )
+    # A pick the provider cannot serve is dropped only once the fallback
+    # terminal is actually up, so a failed launch never loses it.
+    reset_pick_after_launch = False
     # Explicit launches (model-flows design §4): consult the shared catalog
     # only when it can change the outcome — to validate an explicit request,
     # or to resolve a Default launch that would otherwise pass no ``--model``
@@ -6808,6 +6848,8 @@ async def _auto_create_claude_terminal(
             claude_catalog_serves_model,
             claude_launch_catalog,
             claude_launch_catalog_is_stale,
+            claude_launch_endpoint_label,
+            claude_reprobed_launch_catalog,
         )
         from omnigent.model_catalog_store import default_row
 
@@ -6827,21 +6869,55 @@ async def _auto_create_claude_terminal(
                 extra={"session_id": session_id},
             )
         if session_model_override and launch_catalog:
-            resolved_request = (
-                resolve_claude_native_model_selection(session_model_override, claude_config)
-                or session_model_override
-            )
-            # A pane's ``/model`` persists the exact id it runs; the catalog
-            # may spell that model only by its family alias.
-            if not (
-                claude_catalog_serves_model(launch_catalog, session_model_override, claude_config)
-                or claude_catalog_serves_model(launch_catalog, resolved_request, claude_config)
-            ):
-                raise click.ClickException(
-                    f"the requested model {session_model_override!r} is not in this "
-                    "host's current model list — it may have changed since the pick. "
-                    "Pick again from the model menu."
+            pick = session_model_override
+            resolved_request = resolve_claude_native_model_selection(pick, claude_config) or pick
+
+            def _serves_pick(rows: list[dict[str, object]]) -> bool:
+                """
+                Whether *rows* serve the pick by its persisted or resolved spelling.
+                """
+                # A pane's ``/model`` persists the exact id it runs; the catalog
+                # may spell that model only by its family alias.
+                return claude_catalog_serves_model(
+                    rows, pick, claude_config
+                ) or claude_catalog_serves_model(rows, resolved_request, claude_config)
+
+            # Only rows that are fresh may retire the pick: a stale entry may
+            # predate a provider change, so it is re-probed first, and a
+            # failed probe leaves no fresh rows at all.
+            fresh_rows: list[dict[str, object]] | None = launch_catalog
+            if launch_catalog_was_stale and not _serves_pick(launch_catalog):
+                fresh_rows = await claude_reprobed_launch_catalog(claude_config)
+                if fresh_rows:
+                    launch_catalog = fresh_rows
+                    launch_catalog_was_stale = False
+            if not _serves_pick(launch_catalog):
+                # The pick outlives the provider it was made under (a later
+                # ``omnigent setup`` can re-point the default). Launch on what
+                # this provider serves; reset the pick to Default only on fresh
+                # evidence, so the picker shows what the session now runs.
+                offered = ", ".join(
+                    str(row.get("id") or row.get("model") or "") for row in launch_catalog
                 )
+                if fresh_rows:
+                    reset_pick_after_launch = True
+                    outcome = "launching on the provider default and resetting the pick to Default"
+                else:
+                    outcome = (
+                        "the re-probe failed, so launching on the provider default and "
+                        "keeping the pick for the next relaunch"
+                    )
+                _logger.warning(
+                    "claude-native: model pick %r for session %s is not served by %s "
+                    "(it offers: %s); %s",
+                    pick,
+                    session_id,
+                    claude_launch_endpoint_label(claude_config),
+                    offered,
+                    outcome,
+                    extra={"session_id": session_id},
+                )
+                launch_model = unpinned_launch_model
         if launch_model is None and launch_catalog:
             # A stale entry's default is yesterday's answer: pinning it as
             # ``--model`` turns a provider-side retirement or entitlement
@@ -7060,6 +7136,8 @@ async def _auto_create_claude_terminal(
             extra={"session_id": session_id},
         )
         raise
+    if reset_pick_after_launch:
+        await _clear_session_model_override(session_id, server_client)
     # Surface the terminal on the live SSE stream so an already-connected
     # web UI enables the Terminal toggle immediately. The required-terminal
     # launch helper registers the resource and starts the activity watcher but

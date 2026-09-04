@@ -8741,6 +8741,7 @@ def _create_session_from_bundle(
     metadata: SessionCreateMetadata,
     bundle_bytes: bytes,
     runner_id: str | None = None,
+    spec: AgentSpec | None = None,
 ) -> CreatedSessionResponse:
     """
     Validate, store, and persist a bundled session request.
@@ -8765,6 +8766,11 @@ def _create_session_from_bundle(
         parent session (caller-resolved, ownership-checked),
         e.g. ``"runner_abc123"``. ``None`` leaves the session
         unbound.
+    :param spec: Optional pre-validated spec for *bundle_bytes*. The
+        multipart route validates the bundle once up front (it needs
+        ``os_env.cwd`` for workspace validation before any row
+        exists) and passes the result here so the tarball isn't
+        extracted twice. ``None`` validates in this function.
     :returns: Response with the new session id.
     :raises OmnigentError: If bundle validation or agent insert
         integrity checks fail, or the parent session vanished
@@ -8772,15 +8778,16 @@ def _create_session_from_bundle(
     :raises SQLAlchemyError: If the database transaction fails for
         any non-integrity reason.
     """
-    # Enforce the policy-handler allowlist only on a shared /
-    # multi-user server. On a trusted single-user/local server,
-    # ``omnigent run`` uploads the operator's own bundle through this same
-    # path, so custom handlers must keep working (the operator already has
-    # code execution — the restriction would add no security there).
-    spec = validate_agent_bundle(
-        bundle_bytes,
-        enforce_handler_allowlist=not local_single_user_enabled(),
-    )
+    if spec is None:
+        # Enforce the policy-handler allowlist only on a shared /
+        # multi-user server. On a trusted single-user/local server,
+        # ``omnigent run`` uploads the operator's own bundle through this same
+        # path, so custom handlers must keep working (the operator already has
+        # code execution — the restriction would add no security there).
+        spec = validate_agent_bundle(
+            bundle_bytes,
+            enforce_handler_allowlist=not local_single_user_enabled(),
+        )
     assert spec.name is not None
 
     if metadata.reasoning_effort is None and spec.executor.reasoning_effort is not None:

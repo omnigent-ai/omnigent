@@ -1,4 +1,8 @@
-from maintainer_approval import approval_decision, latest_decisive_reviews
+from maintainer_approval import (
+    approval_decision,
+    latest_decisive_reviews,
+    pull_request_target_pushers,
+)
 
 REPOSITORY = "omnigent-ai/omnigent"
 MAINTAINERS = {"maintainer"}
@@ -50,6 +54,7 @@ def decide(
     head="new",
     head_repository=REPOSITORY,
     author="contributor",
+    pushers=None,
 ):
     return approval_decision(
         repository=REPOSITORY,
@@ -61,6 +66,7 @@ def decide(
         trusted_successors=TRUSTED,
         reviews=reviews,
         commits=commits,
+        pushers=pushers or (lambda _sha: set(TRUSTED)),
         timeline=timeline or [],
     )
 
@@ -87,7 +93,7 @@ def test_approval_survives_trusted_same_repo_successor_commits():
         commits=[commit("old"), commit("new")],
     )
     assert decision.approved
-    assert "only trusted automation committed" in decision.reason
+    assert "only trusted automation pushed and committed" in decision.reason
 
 
 def test_auto_dismissed_approval_survives_the_trusted_push_that_dismissed_it():
@@ -97,28 +103,77 @@ def test_auto_dismissed_approval_survives_the_trusted_push_that_dismissed_it():
         timeline=[dismissal_event()],
     )
     assert decision.approved
-    assert "only trusted automation committed" in decision.reason
+    assert "only trusted automation pushed and committed" in decision.reason
 
 
-def test_trusted_fork_push_preserves_approval():
+def test_fork_head_requires_a_fresh_approval():
     decision = decide(
         reviews=[review("APPROVED", "old")],
         commits=[commit("old"), commit("new")],
         head_repository="contributor/omnigent",
     )
-    assert decision.approved
-    assert "only trusted automation committed" in decision.reason
+    assert not decision.approved
     assert "fork head" in decision.reason
 
 
-def test_auto_dismissed_fork_approval_accepts_human_push_token_actor():
+def test_successor_pushed_by_untrusted_actor_is_rejected_despite_bot_commit_identity():
+    decision = decide(
+        reviews=[review("APPROVED", "old")],
+        commits=[commit("old"), commit("new")],
+        pushers=lambda sha: {"contributor"} if sha == "new" else set(TRUSTED),
+    )
+    assert not decision.approved
+    assert "untrusted commit" in decision.reason
+
+
+def test_intermediate_untrusted_push_is_rejected_even_when_automation_pushed_last():
+    decision = decide(
+        reviews=[review("APPROVED", "old")],
+        commits=[commit("old"), commit("mid"), commit("new")],
+        pushers=lambda sha: {"contributor"} if sha == "mid" else set(TRUSTED),
+    )
+    assert not decision.approved
+    assert "mid" in decision.reason
+
+
+def test_head_without_a_trusted_push_record_is_rejected():
+    decision = decide(
+        reviews=[review("APPROVED", "old")],
+        commits=[commit("old"), commit("new")],
+        pushers=lambda _sha: set(),
+    )
+    assert not decision.approved
+    assert "no push recorded from trusted automation" in decision.reason
+
+
+def test_dismissal_by_untrusted_actor_is_rejected_despite_bot_commit_identity():
     decision = decide(
         reviews=[review("DISMISSED", "old")],
         commits=[commit("old"), commit("new")],
-        timeline=[dismissal_event(actor="fork-push-token-owner")],
-        head_repository="contributor/omnigent",
+        timeline=[dismissal_event(actor="contributor")],
     )
-    assert decision.approved
+    assert not decision.approved
+    assert "not auto-dismissed by trusted automation" in decision.reason
+
+
+def test_pushers_come_from_every_page_of_pull_request_target_run_actors():
+    calls = []
+    pages = {
+        1: [{"actor": {"login": "omni-resolve-agent[bot]"}}] * 99 + [{"actor": None}],
+        2: [{"actor": {"login": "contributor"}}],
+    }
+
+    def request(arguments):
+        calls.append(arguments[1])
+        return {"workflow_runs": pages[int(arguments[1].rsplit("page=", 1)[1])]}
+
+    pushers = pull_request_target_pushers(REPOSITORY, request)
+    assert pushers("abc") == {"omni-resolve-agent[bot]", "contributor"}
+    assert pushers("abc") == {"omni-resolve-agent[bot]", "contributor"}
+    endpoint = (
+        f"repos/{REPOSITORY}/actions/runs?head_sha=abc&event=pull_request_target&per_page=100"
+    )
+    assert calls == [f"{endpoint}&page=1", f"{endpoint}&page=2"]
 
 
 def test_dismissed_approval_requires_a_trusted_matching_dismissal_event():
@@ -150,7 +205,7 @@ def test_approval_does_not_survive_untrusted_updates():
         head_repository="contributor/omnigent",
     )
     assert not untrusted_fork.approved
-    assert "untrusted commit" in untrusted_fork.reason
+    assert "fork head" in untrusted_fork.reason
 
 
 def test_approval_does_not_survive_rewritten_history():
@@ -182,5 +237,6 @@ def test_maintainer_authored_pr_still_passes():
         trusted_successors=TRUSTED,
         reviews=[],
         commits=[commit("new", "maintainer")],
+        pushers=lambda _sha: set(),
     )
     assert decision.approved

@@ -4,7 +4,7 @@ import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
@@ -710,6 +710,68 @@ describe("Composer slash-command submit routing", () => {
     expect(screen.getByTestId("composer-config-model")).toBeTruthy();
   });
 
+  it("shows the model connection from both the model label and session gear", async () => {
+    useChatStore.setState({ llmModel: "sonnet" });
+    const options = CLAUDE_MODEL_OPTIONS.map((option) => ({
+      ...option,
+      source: {
+        kind: "databricks",
+        label: "Workspace",
+        name: "production-west",
+        host: "acme.cloud.databricks.com",
+      },
+    }));
+    render(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: options,
+        })}
+      />,
+    );
+
+    const source = screen.getByTestId("composer-model-source");
+    expect(source).toHaveTextContent("Sonnet 4.6");
+    expect(source).not.toHaveTextContent("Workspace");
+    fireEvent.focus(source);
+    const tooltip = await screen.findByTestId("composer-model-source-tooltip");
+    expect(tooltip).toHaveTextContent("Connection: Databricks · production-west");
+    expect(tooltip).not.toHaveTextContent("acme.cloud.databricks.com");
+    expect(tooltip).not.toHaveTextContent("Profile:");
+    expect(tooltip).not.toHaveTextContent("Host:");
+
+    fireEvent.blur(source);
+    fireEvent.focus(screen.getByTestId("composer-config-gear"));
+    const gearTooltip = await screen.findByTestId("composer-config-gear-tooltip");
+    expect(gearTooltip).toHaveTextContent("Connection: Databricks · production-west");
+    expect(gearTooltip.textContent?.indexOf("Connection:")).toBeGreaterThan(
+      gearTooltip.textContent?.indexOf("Effort:") ?? -1,
+    );
+  });
+
+  it("labels subscription provenance instead of showing an unexplained CLI name", async () => {
+    useChatStore.setState({ llmModel: "sonnet" });
+    const options = CLAUDE_MODEL_OPTIONS.map((option) => ({
+      ...option,
+      source: { kind: "subscription", label: "Subscription", name: "claude" },
+    }));
+    render(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: options,
+        })}
+      />,
+    );
+
+    fireEvent.focus(screen.getByTestId("composer-model-source"));
+    const tooltip = await screen.findByTestId("composer-model-source-tooltip");
+    expect(tooltip).toHaveTextContent("Connection: Claude subscription");
+    expect(tooltip).not.toHaveTextContent("Authentication");
+  });
+
   it("does not open an empty Claude config modal while the live catalog loads", () => {
     const onSend = vi.fn();
     render(
@@ -910,6 +972,10 @@ describe("Composer model/effort label", () => {
       selectedEffort: "high",
       costControlModeOverride: "on",
     });
+    const options = CLAUDE_MODEL_OPTIONS.map((option) => ({
+      ...option,
+      source: { kind: "subscription", label: "Subscription", name: "claude" },
+    }));
     renderWithTooltips(
       <Composer
         {...composerProps({
@@ -918,12 +984,14 @@ describe("Composer model/effort label", () => {
           modelPickerKind: "claude",
           showModels: true,
           costRoutingEligible: true,
+          codexModelOptions: options,
         })}
       />,
     );
     expect(label()).toHaveTextContent("Smart Routing");
     expect(label()).not.toHaveTextContent("Opus");
     expect(label()).not.toHaveTextContent("High");
+    expect(screen.queryByTestId("composer-model-source")).toBeNull();
   });
 
   it("renders the reported model, never the request or the sticky", () => {
@@ -1372,6 +1440,55 @@ describe("Composer claude-native permission mode", () => {
     );
 
     expect(screen.getByTestId("composer-config-gear")).toBeInTheDocument();
+  });
+});
+
+describe("Composer codex-native approval mode", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    useChatStore.setState({ codexApprovalMode: "" });
+  });
+
+  it("shows the Approvals row with the current mode inside the gear modal", async () => {
+    useChatStore.setState({ conversationId: "conv_test", codexApprovalMode: "approve-for-me" });
+
+    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
+    fireEvent.click(screen.getByTestId("composer-config-gear"));
+
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+    expect(screen.getByTestId("composer-config-approval-mode")).toHaveTextContent("Approve for me");
+  });
+
+  it("follows a live store change while the modal is open and untouched", async () => {
+    // Repro: the mode changes externally (a TUI /permissions switch arrives as
+    // a session.codex_approval_mode SSE) while the gear modal is open. The open
+    // picker must update, not stay on the value it snapshotted on open.
+    useChatStore.setState({ conversationId: "conv_test", codexApprovalMode: "approve-for-me" });
+
+    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
+    fireEvent.click(screen.getByTestId("composer-config-gear"));
+    await screen.findByTestId("composer-config-modal");
+    expect(screen.getByTestId("composer-config-approval-mode")).toHaveTextContent("Approve for me");
+
+    act(() => {
+      useChatStore.setState({ codexApprovalMode: "full-access" });
+    });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("composer-config-approval-mode")).toHaveTextContent("Full Access"),
+    );
+  });
+
+  it("shows the placeholder until a mode is known", async () => {
+    // Label-only reader: an unset mode reads as the placeholder, never a guess.
+    useChatStore.setState({ conversationId: "conv_test", codexApprovalMode: "" });
+
+    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
+    fireEvent.click(screen.getByTestId("composer-config-gear"));
+
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+    expect(screen.getByTestId("composer-config-approval-mode")).toHaveTextContent("Set in Codex");
   });
 });
 

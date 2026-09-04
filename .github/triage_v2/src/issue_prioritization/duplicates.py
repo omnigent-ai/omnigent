@@ -268,10 +268,11 @@ def reference_disposition(candidate: dict[str, Any]) -> str:
     build, and the new report has to stay open to capture that.
     `declined` — closed as not planned, so there is nothing to move a report into.
     """
-    if candidate.get("state") != "CLOSED":
+    if str(candidate.get("state") or "").upper() != "CLOSED":
         return "open"
     labels = {label.casefold() for label in _label_names(candidate.get("labels"))}
-    if candidate.get("stateReason") == "NOT_PLANNED" or "wontfix" in labels:
+    state_reason = candidate.get("stateReason", candidate.get("state_reason"))
+    if str(state_reason or "").upper() == "NOT_PLANNED" or "wontfix" in labels:
         return "declined"
     return "fixed"
 
@@ -571,7 +572,9 @@ def _normalize_candidate(issue_number: int, candidate: dict[str, Any]) -> dict[s
         "title": str(candidate.get("title") or "")[:500],
         "body": str(candidate.get("body") or "")[:2000],
         "state": state,
-        "stateReason": str(candidate.get("stateReason") or "").upper(),
+        "stateReason": str(
+            candidate.get("stateReason", candidate.get("state_reason")) or ""
+        ).upper(),
         "url": str(candidate.get("url") or ""),
         "createdAt": candidate.get("createdAt"),
         "updatedAt": candidate.get("updatedAt"),

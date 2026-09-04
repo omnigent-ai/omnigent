@@ -41,7 +41,7 @@ import {
 import { showToast } from "@/components/ui/toast";
 import { revokePermission } from "@/lib/permissionsApi";
 import { conversationDisplayLabel, setLegacyPinnedConversationId } from "@/shell/sidebarNav";
-import { stopSession } from "@/lib/sessionsApi";
+import { apiErrorFromResponse, stopSession } from "@/lib/sessionsApi";
 import { setSessionHost } from "@/lib/sessionHost";
 import {
   createProject as apiCreateProject,
@@ -102,6 +102,13 @@ export interface UseConversationsOptions {
   // When false, the query is disabled (no fetch fires). Lets callers mount
   // the hook unconditionally while suppressing the request until it's needed.
   enabled?: boolean;
+  /**
+   * Which result fields trigger a consumer re-render (passed to the infinite
+   * query). Lets a consumer that holds the whole query object avoid re-rendering
+   * on the live-updates merge's per-frame result-object churn. Omit to notify on
+   * any observed field.
+   */
+  notifyOnChangeProps?: readonly (keyof ReturnType<typeof useInfiniteQuery>)[];
 }
 
 export class BulkConversationMutationError extends Error {
@@ -584,6 +591,12 @@ export function useConversations(
     // until it's actually needed (e.g. the sidebar's tab-scoped query is
     // disabled when the user is not on the "mine" or "shared" tab).
     enabled: options.enabled ?? true,
+    // Coalesce the live-updates object churn for consumers that opt in (see
+    // UseConversationsOptions.notifyOnChangeProps). Mutable copy — the query
+    // options type wants a mutable array.
+    ...(options.notifyOnChangeProps
+      ? { notifyOnChangeProps: [...options.notifyOnChangeProps] }
+      : {}),
   });
 }
 
@@ -627,7 +640,10 @@ export async function deleteConversation(id: string, deleteBranch = false): Prom
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}${query}`, {
     method: "DELETE",
   });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  // Prefer the server's `error.message` (e.g. runner-offline worktree
+  // cleanup) over the bare status line so the delete-failed toast is
+  // actionable instead of "404 Not Found".
+  if (!res.ok) throw await apiErrorFromResponse(res);
   // Drop any client-side queued messages for the now-deleted session; bound to
   // a dead conversation, they could never flush.
   useChatStore.getState().clearQueuedMessages(id);
@@ -942,6 +958,22 @@ function finalizeDeletedConversations(queryClient: QueryClient, ids: readonly st
 }
 
 /**
+ * User-facing copy when an optimistic session delete is rolled back.
+ *
+ * Bare HTTP status lines (`"404 Not Found"`) are not appended — they
+ * are what made the runner-offline worktree failure look like a missing
+ * session. Structured server messages (409 conflict, etc.) are.
+ */
+function deleteFailedToast(label: string | null | undefined, err: unknown): string {
+  const restored = label
+    ? `Couldn't delete ${label} — it's back in the sidebar.`
+    : "Couldn't delete the session — it's back in the sidebar.";
+  const serverMessage = err instanceof Error ? err.message.trim() : "";
+  if (!serverMessage || /^\d{3}\b/.test(serverMessage)) return restored;
+  return `${restored} ${serverMessage}`;
+}
+
+/**
  * Delete a conversation: stop the running session, then
  * `DELETE /v1/sessions/{id}`.
  *
@@ -984,16 +1016,15 @@ export function useStopAndDeleteConversation() {
       const snapshot = await paintConversationsDeleted(queryClient, [id]);
       return { label: row ? conversationDisplayLabel(row) : null, snapshot };
     },
-    onError: (_err, { id }, context) => {
+    onError: (err, { id }, context) => {
       restoreDeletedConversations(queryClient, context?.snapshot, [id]);
       // The row is back in the sidebar but nothing else marks it as failed
       // (the row unmounted when it was spliced out, taking any in-row error
-      // state with it), so the toast is the only failure signal.
-      showToast(
-        context?.label
-          ? `Couldn't delete ${context.label} — it's back in the sidebar.`
-          : "Couldn't delete the session — it's back in the sidebar.",
-      );
+      // state with it), so the toast is the only failure signal. Keep it
+      // until dismiss: a default-duration toast is easy to miss, and the
+      // server message (runner offline / delete without branch) is the
+      // only hint for what to do next.
+      showToast(deleteFailedToast(context?.label, err), { duration: 0 });
     },
     onSuccess: (_data, { id }) => {
       finalizeDeletedConversations(queryClient, [id]);

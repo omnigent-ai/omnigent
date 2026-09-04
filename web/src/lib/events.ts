@@ -587,6 +587,18 @@ export interface SessionPermissionModeEvent {
 }
 
 /**
+ * `session.codex_approval_mode` — active codex-native approval/sandbox switch.
+ *
+ * Emitted when the web picker switches the mode, and when the Codex forwarder
+ * sees a `thread/settings/updated` (a `/permissions` change made in the TUI).
+ */
+export interface SessionCodexApprovalModeEvent {
+  type: "session_codex_approval_mode";
+  conversationId: string;
+  approvalMode: string;
+}
+
+/**
  * `session.agent_changed` — the session's bound agent was switched in
  * place (switch-agent route).
  *
@@ -948,6 +960,7 @@ export type StreamEvent =
   | SessionReasoningEffortEvent
   | SessionCollaborationModeEvent
   | SessionPermissionModeEvent
+  | SessionCodexApprovalModeEvent
   | SessionAgentChangedEvent
   | SessionTodosEvent
   | SessionTerminalPendingEvent

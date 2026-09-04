@@ -16,6 +16,10 @@ name: Maintainer Approval
 #
 # `pull_request_target` doesn't fire on reviews, so maintainer-approval-rerun.yml
 # + -rerun-run.yml re-run this workflow on an approving review to flip it green.
+#
+# An approval is carried across later commits only when every push since it was
+# made by trusted automation, judged by the authenticated actor of each head's
+# `pull_request_target` run (hence `actions: read`), never by the commit email.
 
 on:
   pull_request_target:
@@ -35,6 +39,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      actions: read
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:

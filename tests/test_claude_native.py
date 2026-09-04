@@ -15,6 +15,7 @@ import shlex
 import ssl
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -3441,7 +3442,7 @@ async def test_attach_with_reconnect_exits_immediately_on_user_request(
         attach=attach,
         attach_url="wss://example.com/attach",
         headers={"Authorization": "Bearer tok"},
-        recover=lambda: _noop_async(),
+        recover=_noop_async,
     )
 
     # Exactly one attach call — no retries after a clean user exit.
@@ -3581,6 +3582,28 @@ async def test_attach_with_reconnect_retries_after_websocket_exception(
         f"expected 3 attach calls (2 fail + 1 succeed), got {len(attach.calls)}; "
         "the reconnect loop is not retrying after a transient WS error"
     )
+
+
+@pytest.mark.asyncio
+async def test_attach_with_reconnect_uses_session_name_in_clean_close_message(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Shared reconnect messages identify the active native wrapper."""
+    monkeypatch.setattr(claude_native, "_sleep", _noop_sleep)
+    attach = _ScriptedAttach(script=[False, True])
+
+    await claude_native._attach_with_reconnect(
+        attach=attach,
+        attach_url="wss://example.com/attach",
+        headers={"Authorization": "Bearer tok"},
+        recover=lambda: _noop_async(),
+        session_name="Codex",
+    )
+
+    captured = capsys.readouterr()
+    assert "Codex session connection closed by server; reconnecting..." in captured.err
+    assert "Claude session" not in captured.err
 
 
 @pytest.mark.asyncio
@@ -8428,6 +8451,156 @@ def test_claude_transcript_records_handles_compaction_item() -> None:
     assert boundaries[0]["compactMetadata"]["postTokens"] == 4321
 
 
+def test_claude_transcript_records_handles_native_compaction_messages() -> None:
+    """Claude-native compacted messages survive cold-resume reconstruction."""
+    items: list[dict[str, Any]] = [
+        {
+            "id": "msg_before",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "discarded before compaction"}],
+        },
+        {
+            "id": "cmp_native",
+            "type": "compaction",
+            "token_count": 1234,
+            "compacted_messages": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "native compact summary",
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "native reply"},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_native",
+                            "name": "Read",
+                            "input": {"file_path": "README.md"},
+                        },
+                    ],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_native",
+                            "content": "native tool result",
+                        }
+                    ],
+                },
+            ],
+        },
+        {
+            "id": "msg_after",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "after compaction"}],
+        },
+    ]
+
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_native",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+        bridge_dir=Path("/tmp/test-bridge"),
+    )
+
+    assert [record.get("type") for record in records] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+        "user",
+    ]
+    assert records[1]["message"] == {"role": "user", "content": "native compact summary"}
+    assert records[2]["message"] == {
+        "role": "assistant",
+        "content": [
+            {"type": "text", "text": "native reply"},
+            {
+                "type": "tool_use",
+                "id": "toolu_native",
+                "name": "Read",
+                "input": {"file_path": "README.md"},
+            },
+        ],
+    }
+    assert records[3]["message"] == {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_native",
+                "content": "native tool result",
+            }
+        ],
+    }
+    assert records[4]["message"] == {"role": "user", "content": "after compaction"}
+    assert all(record["parentUuid"] == previous["uuid"] for previous, record in pairwise(records))
+    assert "discarded before compaction" not in json.dumps(records)
+
+
+def test_claude_transcript_records_downgrades_compaction_stripped_image() -> None:
+    """A compaction-stripped image block never resumes as an invalid image.
+
+    Compaction replaces an image block's base64 with the marker
+    ``[image/png content omitted from the compaction snapshot]``. Replayed
+    verbatim that marker reaches the provider as ``source.data`` and fails the
+    resume with ``invalid base64 image data: Invalid symbol 91, offset 0`` (the
+    leading ``[``). The rebuild must downgrade it to a text placeholder.
+    """
+    marker = "[image/png content omitted from the compaction snapshot]"
+    items: list[dict[str, Any]] = [
+        {
+            "id": "cmp",
+            "type": "compaction",
+            "token_count": 42,
+            "compacted_messages": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_img",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": marker,
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ],
+        },
+    ]
+
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_img",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+        bridge_dir=Path("/tmp/test-bridge"),
+    )
+
+    tool_result = records[1]["message"]["content"][0]
+    inner = tool_result["content"][0]
+    assert inner["type"] == "text", f"stripped image replayed as invalid image: {inner}"
+    assert marker not in json.dumps(records)
+
+
 def test_websocket_connect_passes_ssl_context_for_wss(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -10201,6 +10374,37 @@ def test_claude_catalog_serves_model(
     assert (
         claude_native.claude_catalog_serves_model(_subscription_catalog(), model, config) is served
     )
+
+
+@pytest.mark.parametrize(
+    ("config", "label"),
+    [
+        (None, "Claude Code's own login"),
+        (
+            claude_native.ClaudeNativeUcodeConfig(
+                env={
+                    "ANTHROPIC_BASE_URL": "https://user:secret@gateway.example:8443/anthropic?sig=1"
+                },
+                api_key_helper="printf sk-key",
+            ),
+            "the gateway at https://gateway.example:8443",
+        ),
+        (
+            claude_native.ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock.example/v1"},
+                api_key_helper=None,
+            ),
+            "the Bedrock endpoint at https://bedrock.example",
+        ),
+    ],
+)
+def test_claude_launch_endpoint_label_names_where_inference_goes(
+    config: claude_native.ClaudeNativeUcodeConfig | None, label: str
+) -> None:
+    """
+    The label names only the endpoint's origin: no path, userinfo, or query.
+    """
+    assert claude_native.claude_launch_endpoint_label(config) == label
 
 
 # ── Bare --resume picker: host scoping and concise errors ────────────

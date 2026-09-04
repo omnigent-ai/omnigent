@@ -1,26 +1,21 @@
 import {
   type FormEvent,
   type KeyboardEvent,
-  createContext,
-  memo,
   useCallback,
-  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  type ReactNode,
 } from "react";
 import {
   ArrowUpIcon,
   BotIcon,
-  CheckIcon,
   CornerUpLeftIcon,
-  CopyIcon,
   FileTextIcon,
   FolderIcon,
   GitBranchIcon,
-  GitForkIcon,
   ImageIcon,
   Loader2Icon,
   PaperclipIcon,
@@ -29,50 +24,17 @@ import {
   SquareTerminalIcon,
   XIcon,
 } from "lucide-react";
-import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   composerSendShortcutKeys,
   KeyboardShortcutTooltipContent,
 } from "@/components/KeyboardShortcut";
-import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
 import { useNavigate, useParams } from "@/lib/routing";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import {
-  Conversation,
-  ConversationContent,
-  ConversationEmptyState,
-  ConversationScrollButton,
-} from "@/components/ai-elements/conversation";
-import { useStickToBottomContext } from "use-stick-to-bottom";
-import {
-  Message,
-  MessageActions,
-  MessageAction,
-  MessageContent,
-} from "@/components/ai-elements/message";
-import { Shimmer } from "@/components/ai-elements/shimmer";
-import { ElicitationCard } from "@/components/blocks/ApprovalCard";
-import {
-  BlockRenderer,
-  FilePathAwareMessageResponse,
-  rendersOnlyWorkedFold,
-} from "@/components/blocks/BlockRenderer";
-import {
-  CompactionMarker,
-  ErrorBanner,
-  RoutingDecisionCard,
-} from "@/components/blocks/StatusBlocks";
-import { SystemMessageView } from "@/components/blocks/SystemMessage";
-import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
-import { BrandLogo } from "@/components/BrandLogo";
 import { useAppName } from "@/lib/branding";
-import { StreamBudgetBanner } from "@/components/StreamBudgetBanner";
 import { cn } from "@/lib/utils";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
-import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
-import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
 import {
   serverSwitcherHiddenForSurface,
@@ -92,30 +54,19 @@ import type { NativeModelOption, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
-import type { MessageContentBlock } from "@/lib/blocks";
-import { ELICITATION_RESPONSE_PREFIX } from "@/lib/blocks";
 import {
   derivePermissionLevel,
   isOwnerLevel,
   isSessionSharedWithOthers,
 } from "@/lib/permissionsApi";
-import {
-  type Bubble,
-  type RenderItem,
-  type BubbleCache,
-  buildBubbles,
-  bubblesEqual,
-  createBubbleCache,
-  liveCandidateAssistantIndex,
-} from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { retrySession } from "@/lib/sessionsApi";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
+import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
   composerAttachmentKey,
   consumePendingInitialPrompt,
   type PendingInitialPrompt,
-  type PendingUserMessage,
   type QueuedMessage,
   useChatStore,
 } from "@/store/chatStore";
@@ -144,6 +95,48 @@ import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 // after the pure helpers moved to the shared lib.
 export { detectMentionAt, mentionMarkerFor };
 export type { MentionItem, MentionState };
+// Bubble rendering, scroll helpers, and the working-indicator cluster moved to
+// chatBubbleParts to break the ChatPage ↔ Transcript cycle. Re-exported so
+// existing importers (tests + components) that reach them via "./ChatPage"
+// keep working. SessionSharedContext and computeIsWorking are also imported
+// back below for ChatPage's own use.
+export {
+  BubbleView,
+  ConversationScrollRefBridge,
+  HistoryAutoLoader,
+  HistoryLoadingIndicator,
+  JumpToTopButton,
+  KeepBottomOnViewportResize,
+  LatestTurnSpacer,
+  ScrollToBottomOnSend,
+  SessionSharedContext,
+  UserMessageNavConnected,
+  WORKING_MESSAGES,
+  WorkingIndicator,
+  bubbleKey,
+  buildPendingBubbles,
+  collectBubbleMarkdown,
+  collectPendingElicitations,
+  computeIsWorking,
+  containsDisplayMath,
+  containsMarkdownTable,
+  extractUserText,
+  isBackgroundTasksOnly,
+  isSystemBubble,
+  mergePendingBubbles,
+  reorderCommittedRequestElicitations,
+  shouldShowAuthorBadge,
+  shouldShowWorkingIndicator,
+  stripGatedSubagentRoutingChips,
+  stripPendingElicitations,
+  workingIndicatorLabel,
+} from "@/components/chat/chatBubbleParts";
+export type { ConversationScroller } from "@/components/chat/chatBubbleParts";
+import {
+  type ConversationScroller,
+  SessionSharedContext,
+  computeIsWorking,
+} from "@/components/chat/chatBubbleParts";
 import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { useSession } from "@/hooks/useSession";
 import { useGithubInfo } from "@/hooks/useGithub";
@@ -158,10 +151,7 @@ import {
   useSessionLiveness,
 } from "@/hooks/useSessionLiveness";
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
-import { useUserMessageNav } from "@/hooks/useUserMessageNav";
-import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
-import { UserMessageNav } from "@/components/UserMessageNav";
 import { HostBadge } from "@/components/HostBadge";
 import {
   BUILTIN_SLASH_COMMANDS,
@@ -184,7 +174,6 @@ import {
   smartRoutingSourceFor,
 } from "@/lib/smartRoutingAvailability";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
-import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
 import {
   Dialog,
   DialogContent,
@@ -213,39 +202,31 @@ import {
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { MainTerminalView } from "@/shell/MainTerminalView";
-import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
 import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
-import { useForkDialog } from "@/shell/ForkDialogContext";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import {
   CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
   claudePermissionModeLabel,
   isClaudeNativeSession,
 } from "@/lib/claudePermissionMode";
+import {
+  CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS,
+  codexApprovalModeLabel,
+} from "@/lib/codexApprovalMode";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
 import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
-import { SessionImage } from "@/components/SessionImage";
 import { GoalControl, GoalStatusPill, useGoalState, type Goal } from "@/components/goal";
-import { copyText } from "@/lib/clipboard";
-import { showToast } from "@/components/ui/toast";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import {
-  ConnectionIndicator,
-  McpStartupIndicator,
-  RunnerStartingIndicator,
-} from "./ChatIndicators";
+import { ConnectionIndicator } from "./ChatIndicators";
 import { CHAT_COLUMN_WIDTH } from "./chatLayout";
+import { Transcript } from "@/components/chat/Transcript";
 
-// Matches both wordings the native executors emit: "[Attached: <path>]"
-// (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
-// is the path. Global so all markers in a message are found / stripped.
-const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]\s*/g;
 /** Server-info as consumers see it: the probe's result, or "loading". */
 type ServerInfoValue = ServerInfo | "loading";
 
@@ -306,70 +287,6 @@ export function isSubagentRoutingEligible(
   return smartRoutingEnabled(serverInfo) && isSubagentRoutingSession(session);
 }
 
-function extractUserText(content: MessageContentBlock[]): string {
-  return content
-    .filter(
-      (c): c is Extract<MessageContentBlock, { type: "input_text" }> => c.type === "input_text",
-    )
-    .map((c) => c.text)
-    .join("")
-    .replace(ATTACHED_RE, "")
-    .trim();
-}
-
-/**
- * Pull the paths out of the "[Attached: …]" markers an "@"-mention adds to a
- * user message, so the bubble can show what was attached (the marker text
- * itself is stripped from the rendered text by {@link extractUserText}). A
- * trailing "/" marks a folder. Returns [] for ordinary messages.
- *
- * Explicitly *uploaded* files share this marker wording: the native executor
- * materializes the upload to disk and injects `[Attached: <abs-path>]` so the
- * vendor CLI can read it. Those uploads already ride in as an
- * `input_image`/`input_file` block (rendered as the image / a file chip), so
- * surfacing them again here would double-render — as the path of an internal
- * bridge temp dir, no less. "@"-mention paths are always workspace-relative
- * while upload markers are absolute, so skip absolute paths (see
- * {@link isAbsolutePath}).
- */
-// An absolute filesystem path in any form a native executor might materialize
-// an upload to: POSIX ("/…"), Windows drive ("C:\…" or "C:/…"), or UNC
-// ("\\host\share"). Workspace "@"-mention paths are always relative, so this
-// reliably tells a materialized upload apart from a tagged workspace file
-// regardless of the host OS the runner happens to be on.
-function isAbsolutePath(p: string): boolean {
-  return /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
-}
-
-function extractAttachedPaths(content: MessageContentBlock[]): MentionItem[] {
-  const text = content
-    .filter(
-      (c): c is Extract<MessageContentBlock, { type: "input_text" }> => c.type === "input_text",
-    )
-    .map((c) => c.text)
-    .join("");
-  const out: MentionItem[] = [];
-  for (const m of text.matchAll(ATTACHED_RE)) {
-    const raw = m[1].trim();
-    if (!raw) continue;
-    // Absolute path → a materialized upload, already shown via its file block.
-    if (isAbsolutePath(raw)) continue;
-    // Split a trailing ":start-end" line span back out so the chip can show
-    // it without truncation (it's the whole point of a partial-file attach).
-    const range = /^(.*):(\d+)-(\d+)$/.exec(raw);
-    if (range) {
-      out.push({
-        path: range[1],
-        isDir: false,
-        lineRange: { start: Number(range[2]), end: Number(range[3]) },
-      });
-    } else {
-      out.push({ path: raw.replace(/\/$/, ""), isDir: raw.endsWith("/") });
-    }
-  }
-  return out;
-}
-
 // Leading whitespace + the command token, so the composer overlay can tint
 // just the `/skill` and leave any args in the default color.
 const SLASH_COMMAND_SPLIT_RE = /^(\s*)(\/[A-Za-z0-9][\w:-]*)/;
@@ -387,260 +304,6 @@ export function splitSlashCommand(
   if (!m) return null;
   const [, before, token] = m;
   return { before, token, after: value.slice(before.length + token.length) };
-}
-
-/** Joins all `kind: "text"` items into a single markdown string for copying. */
-export function collectBubbleMarkdown(items: RenderItem[]): string {
-  return items
-    .filter((item): item is Extract<RenderItem, { kind: "text" }> => item.kind === "text")
-    .map((item) => item.text)
-    .join("\n\n")
-    .trim();
-}
-
-const TABLE_SEPARATOR_RE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/;
-const DISPLAY_MATH_RE = /(^|\n)\s*(\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\])/;
-
-function isMarkdownTableRow(line: string): boolean {
-  return line.trim().includes("|");
-}
-
-export function containsMarkdownTable(items: RenderItem[]): boolean {
-  return items.some((item) => {
-    if (item.kind !== "text") return false;
-    const lines = item.text.split("\n");
-    return lines.some(
-      (line, index) =>
-        TABLE_SEPARATOR_RE.test(line) &&
-        index > 0 &&
-        index < lines.length - 1 &&
-        isMarkdownTableRow(lines[index - 1] ?? "") &&
-        isMarkdownTableRow(lines[index + 1] ?? ""),
-    );
-  });
-}
-
-export function containsDisplayMath(items: RenderItem[]): boolean {
-  return items.some((item) => item.kind === "text" && DISPLAY_MATH_RE.test(item.text));
-}
-
-/**
- * Build optimistic user bubbles from the pending-send queue.
- *
- * Author priority per bubble: `p.author` (captured at send time for
- * fresh sends, or from the snapshot's `created_by` for replayed entries)
- * falls back to `selfAuthor` (the current viewer's identity).
- * This covers two cases:
- *   1. A fresh send: `selfAuthor` is the viewer; `p.author` is the same
- *      value stamped at `send()` time, so either works.
- *   2. A snapshot-replayed pending entry (reconnect): `p.author` carries
- *      the original sender's email from the server, so a collaborator
- *      reconnecting sees the correct attribution rather than their own
- *      email stamped on someone else's message.
- *
- * `selfAuthor` is null before identity resolves and in single-user
- * mode (no label shown).
- *
- * @param pending - the queued optimistic sends, in FIFO order.
- * @param selfAuthor - the viewer's attribution id, or null.
- */
-export function buildPendingBubbles(
-  pending: PendingUserMessage[],
-  selfAuthor: string | null,
-): Bubble[] {
-  return pending.map((p) => {
-    const author = p.author ?? selfAuthor;
-    return {
-      kind: "user",
-      // No server item id yet; tempId keeps React keys stable until promotion.
-      itemId: p.tempId,
-      content: p.content,
-      ...(author !== null ? { createdBy: author } : {}),
-      // Stamped once at send time; absent for snapshot-replayed entries,
-      // which show no timestamp rather than a re-stamped render time.
-      ...(p.createdAtS !== undefined ? { createdAtS: p.createdAtS } : {}),
-    };
-  });
-}
-
-// A committed bubble that exists ONLY to render one or more
-// REQUEST-phase policy elicitation cards. A REQUEST-phase ASK parks the
-// user message server-side (it is not persisted / consumed until the
-// human approves — POLICIES.md §7.2), so the message lingers as an
-// optimistic pending bubble (and later a consumed committed bubble) while
-// its elicitation card arrives as a standalone committed assistant
-// bubble. Used by `mergePendingBubbles` and
-// `reorderCommittedRequestElicitations` to keep the prompt above the card
-// that asks about it, both before and after approval.
-function isStandaloneElicitationBubble(bubble: Bubble): boolean {
-  // A committed assistant bubble that is ENTIRELY an elicitation card with no
-  // turn to anchor to, so it must sit BELOW the user message it gated:
-  //   • REQUEST-phase policy ASKs (gate the prompt before any turn), and
-  //   • terminal-driven harness gates such as cursor-native `pre_tool_use`,
-  //     which never emit `response_created`.
-  // The `elicit_*` response id blockStream stamps on exactly those cards IS the
-  // "no turn to anchor to" signal. A card carrying a real turn id belongs to
-  // that turn — an inline approval, or a question/plan card the walker split
-  // into its own bubble — and a user message after it is a NEW prompt, not the
-  // one the card gated, so it must not be lifted above the card.
-  return (
-    bubble.kind === "assistant" &&
-    bubble.responseId.startsWith(ELICITATION_RESPONSE_PREFIX) &&
-    bubble.items.length > 0 &&
-    bubble.items.every(
-      (it) => it.kind === "elicitation" && (it.phase === "request" || it.phase === "pre_tool_use"),
-    )
-  );
-}
-
-// Pull a committed REQUEST-phase elicitation card below the user message
-// it gated.
-//
-// Once a REQUEST-phase ASK is approved, the parked user message is
-// consumed and appended to `blocks` — but AFTER the elicitation card,
-// which arrived (and committed) while the message was still parked
-// server-side. The committed order is therefore [card, message], so the
-// approved card would sit ABOVE the prompt that triggered it. Swap each
-// such card with the user bubble that immediately follows it so the
-// prompt stays on top, matching the pre-approval pending layout
-// (`mergePendingBubbles`). A card with no following user bubble (declined
-// / still pending) is left untouched. Returns the input array unchanged
-// (same reference) when no swap applies, so the memo stays stable.
-export function reorderCommittedRequestElicitations(committed: Bubble[]): Bubble[] {
-  let result: Bubble[] | null = null;
-  for (let i = 0; i < committed.length - 1; i += 1) {
-    if (isStandaloneElicitationBubble(committed[i]!) && committed[i + 1]!.kind === "user") {
-      if (result === null) result = [...committed];
-      const card = result[i]!;
-      result[i] = result[i + 1]!;
-      result[i + 1] = card;
-    }
-  }
-  return result ?? committed;
-}
-
-// Insertion point above a run of create-time routing chips — session-scope
-// decisions recorded before the session had any conversation, so they open
-// the committed timeline. Only a run that STARTS the timeline qualifies: a
-// chip anywhere else already sits where it belongs (below its message, or
-// standalone for a sub-agent spawn), and lifting a prompt above it would
-// reorder history.
-function liftAboveCreateRoutingChips(committed: Bubble[], end: number): number {
-  let start = end;
-  while (start > 0) {
-    const chip = committed[start - 1]!;
-    if (chip.kind !== "routing_decision" || !isSessionScopedDecision(chip.routing?.scope)) break;
-    start -= 1;
-  }
-  return start === 0 ? start : end;
-}
-
-// Place optimistic pending user bubbles into the committed timeline.
-//
-// Pending sends normally trail everything (the input should be visible
-// immediately, and they migrate into `blocks` once their
-// `session.input.consumed` event lands). Two exceptions put committed
-// bubbles below the pending prompt:
-//
-//   • a REQUEST-phase policy ASK — that message never gets a consumed event
-//     until approval, so it stays pending while its elicitation card renders
-//     as a committed bubble, and appending after the card would show the
-//     approval prompt ABOVE the message that triggered it;
-//   • a create-time routing chip — a pinned Smart Routing create routes
-//     before the pane launches, so the chip is committed while the prompt it
-//     decides is still pending, and `buildBubbles` cannot see a pending
-//     message. Splicing above the chip renders it below the prompt from the
-//     first paint, where the persisted message will pair it anyway.
-//
-// When the timeline ends in a run of either, splice the pending bubbles in
-// just before that run so the prompt stays on top.
-export function mergePendingBubbles(committed: Bubble[], pending: Bubble[]): Bubble[] {
-  if (pending.length === 0) return committed;
-  let insertAt = committed.length;
-  while (insertAt > 0 && isStandaloneElicitationBubble(committed[insertAt - 1]!)) {
-    insertAt -= 1;
-  }
-  insertAt = liftAboveCreateRoutingChips(committed, insertAt);
-  if (insertAt === committed.length) return [...committed, ...pending];
-  return [...committed.slice(0, insertAt), ...pending, ...committed.slice(insertAt)];
-}
-
-type ElicitationItem = Extract<RenderItem, { kind: "elicitation" }>;
-
-// A pending elicitation is unanswered — only these float to the bottom.
-function isPendingElicitation(item: RenderItem): item is ElicitationItem {
-  return item.kind === "elicitation" && item.status === "pending";
-}
-
-// Pending elicitation cards float to the bottom of the chat: lifted out of
-// their inline position and re-rendered as the last items in the scroll flow,
-// so stick-to-bottom keeps an outstanding question in view no matter how much
-// text the agent streams after it (otherwise the card scrolls up off the top
-// of the viewport). Collect them in document order — oldest first, so the
-// newest sits last, closest to the composer. Once answered, a card drops out
-// of this list (status flips to "responded") and stays inline at its natural
-// spot (it is no longer removed by `stripPendingElicitations`).
-export function collectPendingElicitations(bubbles: Bubble[]): ElicitationItem[] {
-  const pending: ElicitationItem[] = [];
-  for (const bubble of bubbles) {
-    if (bubble.kind !== "assistant") continue;
-    for (const item of bubble.items) {
-      if (isPendingElicitation(item)) pending.push(item);
-    }
-  }
-  return pending;
-}
-
-// Drop the pending elicitation cards from the transcript bubbles so they
-// don't render twice — once at the bottom, once inline. Only clones the
-// assistant bubbles that actually carry a pending card; every other bubble
-// keeps its reference so `BubbleView`'s memo holds. An assistant bubble left
-// with no items renders nothing (`AssistantBubble` returns null), so a
-// standalone elicitation bubble collapses cleanly while its gating user
-// message stays put. Returns the input array unchanged when nothing is
-// pending, so the memo stays stable.
-export function stripPendingElicitations(bubbles: Bubble[]): Bubble[] {
-  let result: Bubble[] | null = null;
-  for (let i = 0; i < bubbles.length; i += 1) {
-    const bubble = bubbles[i]!;
-    if (bubble.kind !== "assistant" || !bubble.items.some(isPendingElicitation)) continue;
-    if (result === null) result = [...bubbles];
-    result[i] = { ...bubble, items: bubble.items.filter((it) => !isPendingElicitation(it)) };
-  }
-  return result ?? bubbles;
-}
-
-// Hide the sub-agent spawn chips of a session whose sub-agent routing is not
-// "on". Deliberate product decision: the toggle hides `native_subagent` chips
-// WHOLESALE, including historic chips for spawns that already ran routed while
-// the switch was on — the display follows the current setting, not per-row
-// history. Rows stay persisted (audit trail; flipping the switch back reveals
-// them) and the session's own session/turn chips are untouched. Returns the
-// input array unchanged when nothing is hidden, so the memo stays stable.
-export function stripGatedSubagentRoutingChips(
-  bubbles: Bubble[],
-  subagentRoutingOverride: "on" | "off" | null,
-): Bubble[] {
-  if (subagentRoutingOverride === "on") return bubbles;
-  const shown = bubbles.filter(
-    (b) =>
-      b.kind !== "routing_decision" ||
-      showsRoutingDecisionChip(b.routing?.scope, subagentRoutingOverride),
-  );
-  return shown.length === bubbles.length ? bubbles : shown;
-}
-
-// Whether a user bubble should carry the author's avatar badge (and the
-// author-tinted background): only in a shared session, only when a human
-// author is attached (agent/tool/system output and pre-attribution
-// history leave createdBy undefined), and NEVER on the viewer's own
-// messages — you know what you sent; the badge marks OTHER contributors.
-export function shouldShowAuthorBadge(
-  author: string | undefined,
-  viewerId: string | null,
-  isSessionShared: boolean,
-): boolean {
-  return isSessionShared && author !== undefined && author !== viewerId;
 }
 
 /**
@@ -677,10 +340,6 @@ export function shouldQueueSend(
   const isBusy = status === "streaming" || sessionStatus === "running";
   return isBusy || hasQueued;
 }
-
-// Author labels render only in a shared session; ChatPage provides the
-// value and UserBubble reads it, so the gate lives in one place.
-const SessionSharedContext = createContext(false);
 
 // Iterate code points (not UTF-16 units) so emoji aren't cut mid-surrogate;
 // prefer the last word boundary within 10 chars of the limit so we don't
@@ -810,10 +469,13 @@ export function ChatPage() {
   // Subscribe to the bits of store state we render. Each is a
   // primitive selector so re-renders fire only when that specific
   // field changes — no `useShallow` needed.
-  const blocks = useChatStore((s) => s.blocks);
-  const pendingUserMessages = useChatStore((s) => s.pendingUserMessages);
-  const activeResponse = useChatStore((s) => s.activeResponse);
-  const interruptedResponseIds = useChatStore((s) => s.interruptedResponseIds);
+  //
+  // The streaming-hot fields (`blocks`, `activeResponse`,
+  // `pendingUserMessages`, `interruptedResponseIds`) are NOT subscribed here:
+  // they live in <Transcript>, so an SSE frame re-renders that subtree alone
+  // and this root (and the composer/chrome it feeds) bails out. See
+  // `hasPendingElicitation` below for the one blocks-derived value the root
+  // still needs, read through an edge-stable boolean selector.
   const status = useChatStore((s) => s.status);
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
   // True while the session's managed-sandbox launch is still running
@@ -844,59 +506,6 @@ export function ChatPage() {
   const { data: boundAgentBySession } = useSessionAgent(urlConvId ?? null);
   const hasMoreHistory = useChatStore((s) => s.hasMoreHistory);
   const loadingMoreHistory = useChatStore((s) => s.loadingMoreHistory);
-  // Gates the sub-agent spawn chips: only a session that explicitly turned
-  // sub-agent routing on shows them (see stripGatedSubagentRoutingChips).
-  const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
-
-  // Build bubbles once per blocks/activeResponse change. Memo here so
-  // unrelated store updates (status, loading flags) don't re-walk.
-  // Pending user messages (POSTed but not yet acked by
-  // `session.input.consumed`) render as trailing user bubbles so the
-  // input is visible immediately. They migrate into `blocks` the moment
-  // their consumed event arrives.
-  // Per-surface reuse cache so a streaming append rebuilds only the
-  // active bubble, reusing the finalized prefix by reference.
-  const bubbleCacheRef = useRef<BubbleCache>(createBubbleCache());
-  const bubbles = useMemo<Bubble[]>(() => {
-    // A REQUEST-phase elicitation card commits before the user message it
-    // gates: while pending, the message is an optimistic trailing bubble
-    // (`mergePendingBubbles` lifts it above the card); once approved, the
-    // consumed message lands in `blocks` AFTER the card
-    // (`reorderCommittedRequestElicitations` swaps the card below it).
-    // Both keep the prompt on top across the pending → approved flip.
-    const committed = stripGatedSubagentRoutingChips(
-      reorderCommittedRequestElicitations(
-        buildBubbles(
-          blocks,
-          activeResponse,
-          bubbleCacheRef.current,
-          interruptedResponseIds,
-          // Spin the newest turn's in-flight tools while the session runs —
-          // for claude-native, whose running/idle lives in `sessionStatus`
-          // and never opens a streaming `activeResponse`.
-          computeIsWorking(sessionStatus),
-        ),
-      ),
-      subagentRoutingOverride,
-    );
-    // claude-native live previews are NOT trailing bubbles — they live in
-    // `blocks` as provisional `live:*` text blocks at their streamed
-    // position (see chatStore), so they render in-order with later tool /
-    // elicitation cards. The optimistic pending user message trails too,
-    // except when the timeline ends in a REQUEST-phase elicitation card.
-    if (pendingUserMessages.length === 0) return committed;
-    return mergePendingBubbles(
-      committed,
-      buildPendingBubbles(pendingUserMessages, getCurrentAuthorId()),
-    );
-  }, [
-    blocks,
-    activeResponse,
-    interruptedResponseIds,
-    pendingUserMessages,
-    subagentRoutingOverride,
-    sessionStatus,
-  ]);
 
   // Picker selection. ChatPage stays mounted across `/` to `/c/:id`,
   // so the pick survives sidebar clicks; resets on full page reload.
@@ -1002,10 +611,12 @@ export function ChatPage() {
   const [reconnectDialogOpen, setReconnectDialogOpen] = useState(false);
 
   // Pending elicitation = parked on user input — suppress shimmer. Must
-  // sit before the early-return guards below (Rules of Hooks).
-  const hasPendingElicitation = useMemo(
-    () => blocks.some((b) => b.type === "elicitation" && b.status === "pending"),
-    [blocks],
+  // sit before the early-return guards below (Rules of Hooks). Read through
+  // a boolean selector (not the whole `blocks` array): Zustand bails out when
+  // the flag is unchanged, so `blocks` reference churn on every streaming
+  // frame no longer re-renders this root — only an elicitation edge does.
+  const hasPendingElicitation = useChatStore((s) =>
+    s.blocks.some((b) => b.type === "elicitation" && b.status === "pending"),
   );
 
   // Single-session snapshot (shared cache with chatStore.bindStream).
@@ -1357,7 +968,6 @@ export function ChatPage() {
   const mainAgent = (
     <MainAgentSurface
       conversationId={urlConvId ?? null}
-      bubbles={bubbles}
       status={status}
       isWorking={isWorking}
       showsWorking={showsWorking}
@@ -1389,6 +999,7 @@ export function ChatPage() {
       codexModelOptions={codexModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
       showClaudePermissionMode={shouldShowClaudePermissionModeControl(capabilitySource)}
+      showCodexApprovalMode={shouldShowCodexApprovalModeControl(capabilitySource)}
       showGoalControl={shouldShowGoalControl(capabilitySource)}
       showClaudeGoalControl={shouldShowPollyClaudeGoalControl(activeSession)}
       showPollyCodexGoalControl={shouldShowPollyCodexGoalControl(activeSession)}
@@ -1588,7 +1199,6 @@ interface MainAgentSurfaceProps {
    * session in terminal-first mode.
    */
   conversationId: string | null;
-  bubbles: Bubble[];
   status: "idle" | "streaming";
   /** Local stream OR cross-client `session.status: running`. Gates the
    *  composer's Stop/Interrupt button — the parent's OWN turn only. */
@@ -1636,6 +1246,7 @@ interface MainAgentSurfaceProps {
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
   showClaudePermissionMode?: boolean;
+  showCodexApprovalMode?: boolean;
   /** Show the session Goal control. */
   showGoalControl?: boolean;
   /** Show Polly's Claude SDK command-backed Goal control. */
@@ -1756,7 +1367,6 @@ export function updateWarmTerminalSurfaces(
  */
 function MainAgentSurface({
   conversationId,
-  bubbles,
   status,
   isWorking,
   showsWorking,
@@ -1781,6 +1391,7 @@ function MainAgentSurface({
   codexModelOptions,
   showCodexPlanMode,
   showClaudePermissionMode = false,
+  showCodexApprovalMode = false,
   showGoalControl = false,
   showClaudeGoalControl = false,
   showPollyCodexGoalControl = false,
@@ -1790,6 +1401,7 @@ function MainAgentSurface({
   wrapperLabel,
 }: MainAgentSurfaceProps) {
   const terminalFirst = useTerminalFirst();
+  // Streaming-hot subscriptions and the bubble pipeline live in <Transcript>.
   // The turn rail is a hover minimap with no mobile affordance (CSS-hidden
   // under `md`). Gate its MOUNT — not just its visibility — on the viewport so
   // mobile never mounts observers and history listeners for a rail it can't see.
@@ -1800,16 +1412,6 @@ function MainAgentSurface({
   // the not-yet-host-bound session as stranded.
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
   const sandboxLaunching = sandboxStatus !== null && sandboxStatus.stage !== "failed";
-  // True while the harness reports MCP-server startup state (codex-native).
-  // Forces the message-flow branch below even with zero bubbles, so a user
-  // staring at a fresh session during a slow MCP boot sees the startup band
-  // instead of a bare "What should we work on?" empty state.
-  const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
-  // Session publishes a task list — pins the collapsible Plan accordion above
-  // the thread. When set, the accordion (a solid bar) clears the floating
-  // header and occludes scrolled content, so the viewport drops its top fade
-  // and reserves only a small gap instead of the full header clearance.
-  const hasTasks = useChatStore((s) => s.todos.length > 0);
   // Render the inline terminal whenever the user has opted in via the
   // connection pill. The terminal surface owns its no-terminal state,
   // including stopped/resumable sessions, and the connection indicator
@@ -1820,97 +1422,12 @@ function MainAgentSurface({
   // `showTerminal` — Rules of Hooks. The single return at the bottom
   // renders the persistent terminal overlay and, when the terminal view
   // is closed, the chat surface beside it.
-
-  // Single nav instance shared by hotkey + buttons (see useUserMessageNav).
-  // System-message bubbles (`[System: ...]` notifications rendered via
-  // SystemMessageView) are excluded — the hotkey is for navigating real
-  // user turns, not runtime markers.
-  const userMessageIds = useMemo(
-    () =>
-      bubbles
-        .filter(
-          (b): b is Extract<Bubble, { kind: "user" }> => b.kind === "user" && !isSystemBubble(b),
-        )
-        .map((b) => b.itemId),
-    [bubbles],
-  );
-  const nav = useUserMessageNav(userMessageIds);
-
-  // One rail tick per real user turn, paired with a preview of the reply that
-  // followed. Walk bubbles in order: each non-system user bubble opens a turn,
-  // and the first assistant text after it (before the next user bubble) is the
-  // preview. It mirrors the transcript's loaded window and grows lazily as
-  // older pages arrive.
-  const turns = useMemo<Turn[]>(() => {
-    const out: Turn[] = [];
-    for (let i = 0; i < bubbles.length; i++) {
-      const b = bubbles[i];
-      if (b.kind !== "user" || isSystemBubble(b)) continue;
-      let preview = "";
-      for (let j = i + 1; j < bubbles.length; j++) {
-        const next = bubbles[j];
-        // Stop at the next REAL user turn only. A system-marker user bubble
-        // isn't a tick of its own, so breaking on it would strand this turn
-        // with a blank preview even though its reply follows the marker.
-        if (next.kind === "user" && !isSystemBubble(next)) break;
-        if (next.kind === "assistant") {
-          const textItem = next.items.find((it) => it.kind === "text" && it.text.trim());
-          if (textItem && textItem.kind === "text") {
-            preview = textItem.text.trim();
-            break;
-          }
-        }
-      }
-      out.push({
-        itemId: b.itemId,
-        userText: extractUserText(b.content),
-        responsePreview: preview.slice(0, 240),
-      });
-    }
-    return out;
-  }, [bubbles]);
-
-  // Pending elicitation cards float to the bottom of the chat: rendered as the
-  // last items in the scroll flow and removed from their inline position so
-  // they don't render twice. Stick-to-bottom then keeps an outstanding
-  // question in view instead of letting trailing text scroll it off the top.
-  // Answered cards stay inline at their natural spot. `streamBubbles` keeps
-  // `bubbles`' reference when nothing is pending, so the common case allocates
-  // nothing.
-  const pendingElicitations = useMemo(() => collectPendingElicitations(bubbles), [bubbles]);
-  const streamBubbles = useMemo(
-    () => (pendingElicitations.length === 0 ? bubbles : stripPendingElicitations(bubbles)),
-    [bubbles, pendingElicitations.length],
-  );
-  // While the session runs, the last assistant bubble is (or may be) the
-  // live turn even if its lifecycle reads settled — BlockRenderer keeps
-  // its "Worked for" fold suppressed until a terminal status edge lands.
-  // Once a newer real user message follows it (optimistic pending bubbles
-  // included — they're merged into `bubbles` above), the running status
-  // belongs to that newer turn instead, so no bubble is possibly-live and
-  // no fold is suppressed (index -1).
-  const lastAssistantIndex = useMemo(
-    () => liveCandidateAssistantIndex(streamBubbles),
-    [streamBubbles],
-  );
-
-  // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) — the composer's own unmodified
-  // ArrowUp/Down history-recall skips modified arrows, so this fires there too.
-  useEffect(() => {
-    // globalThis prefix because React's KeyboardEvent is imported above.
-    const handler = (e: globalThis.KeyboardEvent) => {
-      if (!(e.metaKey || e.ctrlKey) || !e.altKey) return;
-      if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
-      // Yield to a focused widget that already claimed the chord for its own
-      // list navigation (command palette, mention / slash menus).
-      if (e.defaultPrevented) return;
-      e.preventDefault();
-      if (e.key === "ArrowUp") nav.goPrev();
-      else nav.goNext();
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [nav]);
+  //
+  // The bubble pipeline (buildBubbles, the turn rail, elicitation floats,
+  // the working indicator) and its streaming-hot store subscriptions live in
+  // `<Transcript>` — the only subtree that re-renders per SSE frame. This
+  // surface subscribes to nothing hot, so the composer and chrome below bail
+  // out of streaming-frame re-renders.
 
   // Active reply quotes — each "Reply ↵" click appends; consumed by Composer.
   const [replyQuotes, setReplyQuotes] = useState<ReplyQuote[]>([]);
@@ -1943,10 +1460,6 @@ function MainAgentSurface({
     if (!isIOSShell()) return;
     return () => setNativeServerSwitcherHidden(true);
   }, []);
-  // Keys the transcript so a warm switch (no hydration remount) still re-runs
-  // its mount-only scroll-to-bottom and anchor capture. Store id, not the URL
-  // prop, which leads the mirrored blocks by a commit (see the switchTo effect).
-  const activeConversationId = useChatStore((s) => s.conversationId);
   // The conversation's scroll container + the StickToBottom controls needed to
   // override its bottom-lock, lifted out of the context by
   // ConversationScrollRefBridge so the pinned-but-unmasked JumpToTopButton can
@@ -2020,12 +1533,6 @@ function MainAgentSurface({
     [onSendSlashCommand, isNativeWrapper],
   );
 
-  // "Working…" stays lit for the whole busy turn — through streaming text,
-  // tool runs, and reasoning gaps — including after a reload that hydrates
-  // `running` before any bubbles exist locally. Only a trailing compaction
-  // spinner suppresses it (that bubble owns the slot with its own animation).
-  const showWorkingIndicator = shouldShowWorkingIndicator(showsWorking, bubbles);
-
   // Persistent terminal surfaces for terminal-first sessions. Each is
   // mounted from the moment its terminal is reachable — not just when the
   // view is open — and kept mounted as a visibility-toggled overlay, so
@@ -2049,14 +1556,13 @@ function MainAgentSurface({
     if (!mountTerminal || !conversationId) return;
     setWarmTerminals((prev) => updateWarmTerminalSurfaces(prev, conversationId, terminalReadOnly));
   }, [mountTerminal, conversationId, terminalReadOnly]);
-  // Render from a derived list that already includes the active session,
-  // so a fresh session's surface mounts in the same commit (the effect
-  // above persists it one commit later) and its readOnly snapshot tracks
-  // a late permission hydrate while it is the active session.
-  const renderedTerminals =
-    mountTerminal && conversationId
-      ? updateWarmTerminalSurfaces(warmTerminals, conversationId, terminalReadOnly)
-      : warmTerminals;
+  // Derive from warmTerminals only — the effect above adds the active session
+  // after the first paint, so xterm (a lazy chunk) never loads on the initial
+  // render. Previously the active session was included here same-commit to
+  // avoid the one-frame delay; that optimization is removed so the terminal
+  // chunk defers until after first paint. Returning to an already-warm
+  // background session is still same-commit (it's already in warmTerminals).
+  const renderedTerminals = warmTerminals;
   const handleTerminalResume = useCallback(async () => {
     if (!conversationId) throw new Error("Session is not available");
     if (liveness.kind === "host_offline" || liveness.kind === "local_stranded") {
@@ -2103,194 +1609,23 @@ function MainAgentSurface({
       {terminalSurfaces}
       {!showTerminal && (
         <>
-          {/* Task tracker pinned above the thread. Sibling of the viewport (not
-          an overlay) so it shrinks the scroll area rather than covering
-          messages. mt clears the floating header (h-14 mobile / h-12 desktop);
-          native shells shift the header by the safe area, so index.css
-          re-derives this offset for them (.chat-plan-accordion). Self-hides
-          with no tasks. */}
-          <ChatPlanAccordion className="mt-14 md:mt-12" />
-          {/* Wrapper div gives us a ref to scope the SelectionPopup to the
-          conversation area without requiring Conversation to forward refs. */}
-          <div
-            ref={setConversationEl}
-            className="@container/chat relative flex min-h-0 flex-1 overflow-hidden"
-          >
-            {/* chat-scroll-fade masks the viewport's top edge so scrolling
-            content dissolves into the canvas before reaching the
-            ChatHeader overlay's controls (geometry in index.css). Dropped
-            when the Plan accordion is pinned above — its solid bar already
-            occludes content scrolling past the viewport's top edge. */}
-            <Conversation
-              key={activeConversationId ?? "landing"}
-              className={cn(!hasTasks && "chat-scroll-fade", "flex-1")}
-            >
-              {/* Override ConversationContent's default spacing so the thread keeps
-              16px side gutters and consecutive agent turns read as one thread.
-              The left inset grows *continuously* as the conversation area
-              narrows: the centered column slides left with the area until its
-              edge nears the left-edge TurnRail, then the inset ramps up to hold
-              a minimum gap from the ticks — capped at 1.5rem so it stops moving
-              rather than stepping. Keyed on the area's width via cqi (the
-              @container/chat context on the wrapper), not the viewport, so
-              opening the sidebar — which narrows the area — feeds it too. The
-              ramp (1rem→1.5rem as the area crosses ~54rem) matches where the
-              48rem column's auto-margins shrink past the clearance. md+ only:
-              the rail is hidden on mobile, which keeps the plain 1rem gutter. */}
-              {/* Native scroll anchoring holds position across a history prepend —
-              the browser does it off the main thread, so it can't interrupt an
-              in-flight scroll the way an imperative scrollTop write does. */}
-              <ConversationContent
-                scrollClassName="transcript-hide-native-scrollbar"
-                className={cn(
-                  "chat-conversation-content mx-auto w-full gap-4 px-4 pb-6",
-                  // pt-20 reserves the floating-header clearance + fade band.
-                  // With the Plan accordion pinned above, the header is already
-                  // cleared, so only a small gap below the accordion is needed.
-                  hasTasks ? "pt-4" : "pt-20",
-                  "md:pl-[clamp(1rem,(54rem-100cqi)*0.5+1rem,1.5rem)]",
-                  CHAT_COLUMN_WIDTH,
-                )}
-              >
-                {/* Scroll helpers — must live inside StickToBottom to access context. */}
-                <ScrollToBottomOnSend nonce={sendScrollNonce} />
-                <KeepBottomOnViewportResize />
-                <ConversationScrollRefBridge onScroller={setScroller} />
-                <HistoryAutoLoader scrollElement={scroller?.el ?? null} />
-                {bubbles.length === 0 && !showWorkingIndicator && !mcpStartupActive ? (
-                  // Cold launch: a centered spinner instead of the "ready to
-                  // type" empty state (the create-then-send path uses the
-                  // "row" variant). Two launch shapes land here: a
-                  // terminal-first spin-up (gate on isTerminalFirst too —
-                  // terminalStartingUp is set for non-terminal-first sessions
-                  // as well) and a managed-sandbox launch, whose stage text
-                  // renders in the same spot for ANY session type.
-                  (terminalFirst?.isTerminalFirst && terminalFirst.terminalStartingUp) ||
-                  sandboxLaunching ? (
-                    <RunnerStartingIndicator variant="hero" />
-                  ) : (
-                    <ConversationEmptyState>
-                      <div className="space-y-1.5">
-                        <h3 className="text-2xl font-medium tracking-[-0.02em]">
-                          What should we work on?
-                        </h3>
-                        <p className="text-muted-foreground text-ui">
-                          {agentsError
-                            ? `Failed to load agents: ${agentsError instanceof Error ? agentsError.message : String(agentsError)}`
-                            : "Send a message to get started."}
-                        </p>
-                      </div>
-                    </ConversationEmptyState>
-                  )
-                ) : (
-                  <>
-                    {/* Older pages prepend here while their request is in flight. */}
-                    {loadingMoreHistory && <HistoryLoadingIndicator />}
-                    {streamBubbles.map((bubble, bubbleIndex) => (
-                      <BubbleView
-                        key={bubbleKey(bubble)}
-                        bubble={bubble}
-                        isLastAssistant={bubbleIndex === lastAssistantIndex}
-                        showsWorking={showsWorking && bubbleIndex === lastAssistantIndex}
-                      />
-                    ))}
-                    {/* Pending elicitation cards, floated to the bottom of the
-                    chat so an outstanding question stays in view (stick-to-
-                    bottom) no matter how much text the agent streamed after
-                    it. Wrapped in an assistant Message so each matches an
-                    inline card's look; removed from their inline slot by
-                    `stripPendingElicitations`. Newest renders last, nearest
-                    the composer. Rendered ABOVE the Working… indicator so the
-                    card sits closest to the prompt and the shimmer stays the
-                    last thing in the flow. */}
-                    {pendingElicitations.map((item) => (
-                      <Message
-                        key={item.elicitationId}
-                        from="assistant"
-                        className="max-w-full"
-                        data-testid="bottom-elicitation"
-                      >
-                        <MessageContent className="w-full">
-                          <ElicitationCard item={item} />
-                        </MessageContent>
-                      </Message>
-                    ))}
-                    {/* Working… shimmer, lit for the whole busy turn so the user
-                    always sees the session is still going. Suppressed when the
-                    last bubble is a compaction spinner — that bubble already
-                    owns the "in-progress" slot. Owns the sole aria-live region
-                    announcing the working state (its visible label is
-                    aria-hidden, so the rotating text never re-announces). */}
-                    {showWorkingIndicator && <WorkingIndicator />}
-                    {/* Terminal-first spin-up cue beneath the just-sent first
-                    message: the prompt bubble renders immediately (no
-                    runner-online send gate), but `showWorkingIndicator` stays
-                    suppressed while the runner is offline, so without this the
-                    user's message sits with no sign anything is happening.
-                    Self-gates to null off the spin-up window; rendered only
-                    when not already showing Working… so the two never stack. */}
-                    {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
-                    {/* MCP-server startup band (codex-native): renders while the
-                    harness boots its MCP servers and, after startup settles,
-                    when servers failed or were cancelled. Independent of the
-                    Working… shimmer — it is strictly more specific about why
-                    the turn hasn't produced output yet. */}
-                    <McpStartupIndicator />
-                  </>
-                )}
-                {/* Frames the initially loaded turn at the top of the viewport and
-                keeps the pane scrollable so older history stays reachable.
-                Always mounted — including for an empty new conversation — so
-                a fast first send cannot become the captured initial anchor.
-                Last child so it measures everything above it. */}
-                <LatestTurnSpacer
-                  scrollElement={scroller?.el ?? null}
-                  // Match the reduced pt-4 top inset so a framed turn rests just
-                  // below the Plan accordion, not under the (now absent) fade band.
-                  topGapPx={hasTasks ? 16 : undefined}
-                />
-              </ConversationContent>
-              <ConversationScrollButton />
-              <UserMessageNavConnected
-                goPrev={nav.goPrev}
-                goNext={nav.goNext}
-                canPrev={nav.canPrev}
-                canNext={nav.canNext}
-                hidden={userMessageIds.length === 0}
-              />
-            </Conversation>
-            {/* Constant-height scrollbar. Sibling of Conversation for the same
-            reason as JumpToTopButton — outside the chat-scroll-fade mask, which
-            would otherwise dissolve it against the header. With the Plan
-            accordion pinned above, this container already starts below the
-            header, so the track drops its header-clearing top inset. */}
-            <TranscriptScrollbar scroller={scroller} topInset={hasTasks ? 12 : undefined} />
-            {/* Hover the top edge to reveal a pill that loads all older history and
-            scrolls to the first message. Rendered here (a wrapper sibling of
-            Conversation) rather than inside it so it escapes the chat-scroll-fade
-            mask and can sit right at the fade border. */}
-            <JumpToTopButton
-              containerEl={containerEl}
-              scroller={scroller}
-              hasMoreHistory={hasMoreHistory}
-            />
-            {/* Too-many-tabs warning: floats as a rounded card just below the
-            header, a sibling of Conversation for the same reason as
-            JumpToTopButton — outside the chat-scroll-fade mask. */}
-            <StreamBudgetBanner />
-            {/* Left-edge minimap: one tick per turn, scrolls independently, pages
-            in older history on scroll-up. Sibling of Conversation for the same
-            reason as JumpToTopButton — it escapes the chat-scroll-fade mask.
-            Desktop-only: not mounted on mobile where the rail is hidden. */}
-            {!isMobileViewport && (
-              <TurnRail
-                turns={turns}
-                scroller={scroller}
-                hasMoreHistory={hasMoreHistory}
-                loadingMoreHistory={loadingMoreHistory}
-              />
-            )}
-          </div>
+          {/* The scrolling transcript column owns every streaming-hot store
+          subscription and the bubble pipeline, so an SSE frame re-renders it
+          alone — this surface's composer and chrome below bail out. */}
+          <Transcript
+            setConversationEl={setConversationEl}
+            containerEl={containerEl}
+            scroller={scroller}
+            setScroller={setScroller}
+            sendScrollNonce={sendScrollNonce}
+            hasMoreHistory={hasMoreHistory}
+            loadingMoreHistory={loadingMoreHistory}
+            isMobileViewport={isMobileViewport}
+            showsWorking={showsWorking}
+            agentsError={agentsError}
+            sandboxLaunching={sandboxLaunching}
+            terminalFirst={terminalFirst}
+          />
           {/* Floating reply button — scoped to the conversation container. */}
           <SelectionPopup
             containerRef={conversationRef}
@@ -2323,6 +1658,7 @@ function MainAgentSurface({
             codexModelOptions={codexModelOptions}
             showCodexPlanMode={showCodexPlanMode}
             showClaudePermissionMode={showClaudePermissionMode}
+            showCodexApprovalMode={showCodexApprovalMode}
             showGoalControl={showGoalControl}
             showClaudeGoalControl={showClaudeGoalControl}
             showPollyCodexGoalControl={showPollyCodexGoalControl}
@@ -2392,1339 +1728,6 @@ function ConversationLoadError({
   );
 }
 
-/**
- * Adds scroll-state CSS classes to UserMessageNav. The responsive behavior
- * itself stays in Tailwind classes: hidden below `md` only while pinned to
- * the bottom, visible again as soon as the user scrolls up.
- */
-function UserMessageNavConnected(props: React.ComponentProps<typeof UserMessageNav>) {
-  const { isAtBottom } = useStickToBottomContext();
-  return (
-    <UserMessageNav
-      {...props}
-      // Mobile-only: the TurnRail (a hover minimap) replaces these buttons on
-      // desktop, but mobile has no hover, so the ↑↓ nav stays there. Hidden at
-      // the bottom on mobile too — nothing above to page up to matters less
-      // than keeping the composer area clear. Keyboard ⌘⌥↑↓ still works on all
-      // sizes regardless of the buttons.
-      className={cn(props.className, "md:hidden", isAtBottom && "max-md:hidden")}
-    />
-  );
-}
-
-/**
- * Forces the conversation back to the bottom when this client submits a
- * new message. StickToBottom intentionally respects a user who has scrolled
- * up while streaming, but an explicit send should bring the fresh user bubble
- * and ensuing response back into view.
- */
-function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
-  const { scrollToBottom } = useStickToBottomContext();
-
-  useLayoutEffect(() => {
-    if (nonce === 0) return;
-    scrollToBottom("instant");
-    requestAnimationFrame(() => scrollToBottom("instant"));
-  }, [nonce, scrollToBottom]);
-
-  return null;
-}
-
-/** Keep bottom-locked readers pinned when the composer changes viewport height. */
-export function KeepBottomOnViewportResize() {
-  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
-    scrollRef?: React.RefObject<HTMLElement>;
-  };
-  const scrollRef = ctx.scrollRef;
-  const state = ctx.state;
-  const scrollToBottom = ctx.scrollToBottom;
-
-  useEffect(() => {
-    const el = scrollRef?.current;
-    if (!el || typeof ResizeObserver === "undefined") return;
-    const isPhysicallyAtBottom = () => el.scrollHeight - el.clientHeight - el.scrollTop <= 1;
-    let wasBottomLocked = state.isAtBottom && !state.escapedFromLock && isPhysicallyAtBottom();
-    let clientHeight = el.clientHeight;
-    let frame: number | null = null;
-    const onScroll = () => {
-      wasBottomLocked = isPhysicallyAtBottom();
-    };
-    const observer = new ResizeObserver(() => {
-      const nextHeight = el.clientHeight;
-      if (nextHeight === clientHeight) return;
-      clientHeight = nextHeight;
-      if (!wasBottomLocked) return;
-      scrollToBottom("instant");
-      if (frame !== null) cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(() => {
-        frame = null;
-        scrollToBottom("instant");
-      });
-    });
-    el.addEventListener("scroll", onScroll, { passive: true });
-    observer.observe(el);
-    return () => {
-      el.removeEventListener("scroll", onScroll);
-      observer.disconnect();
-      if (frame !== null) cancelAnimationFrame(frame);
-    };
-  }, [scrollRef, scrollToBottom, state]);
-
-  return null;
-}
-
-function HistoryLoadingIndicator() {
-  return (
-    <div
-      role="status"
-      className="flex items-center justify-center gap-2 py-2 text-muted-foreground text-ui"
-    >
-      <Loader2Icon className="size-4 animate-spin" aria-hidden />
-      Loading earlier messages…
-    </div>
-  );
-}
-
-/**
- * Builds the initial history window, then keeps loading near the top.
- *
- * The fetch fires this many viewports from the top. It has to be generous:
- * the browser suppresses scroll anchoring at offset 0, so a page that lands
- * while the reader is sitting at the very top shifts the transcript with
- * nothing to absorb it. Firing viewports early means the prepend settles far
- * from that edge, where anchoring holds — and out of sight either way.
- */
-const HISTORY_LOAD_TOP_VIEWPORTS = 2.5;
-/** Floor for very short viewports, where 2.5x would still be a few hundred px. */
-const HISTORY_LOAD_TOP_MIN_PX = 1200;
-
-function historyLoadThreshold(el: HTMLElement): number {
-  return Math.max(HISTORY_LOAD_TOP_MIN_PX, el.clientHeight * HISTORY_LOAD_TOP_VIEWPORTS);
-}
-
-/** Finger travel before a touch drag counts as "show me what's above". */
-const TOUCH_DRAG_SLOP_PX = 8;
-
-/**
- * Follow-up pages one gesture may chain beyond the page it fetched itself.
- *
- * Settled tool-heavy turns mount folded behind "Worked for" rows, so a fetched
- * page can land with near-zero height: scrollTop never crosses the load
- * threshold and the moved cursor would otherwise re-feed the next fetch until
- * history ran out — one small drag used to page in the entire transcript. A
- * fresh gesture grants a fresh budget, so older history stays reachable at a
- * reader-paced rate instead of a runaway loop.
- */
-const PREPEND_CHAIN_PAGES_PER_GESTURE = 2;
-
-/** Quiet gap after which the next wheel-up tick counts as a new gesture. */
-const WHEEL_GESTURE_QUIET_MS = 300;
-
-export function HistoryAutoLoader({
-  scrollElement,
-}: {
-  scrollElement?: HTMLElement | null;
-} = {}) {
-  // useStickToBottomContext exposes scrollRef (the actual scroll container
-  // element) in the runtime context even though the public TS types only
-  // declare isAtBottom and scrollToBottom. Cast to access it.
-  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
-    scrollRef: React.RefObject<HTMLElement>;
-  };
-  const historyGeneration = useChatStore((s) => s.historyGeneration);
-  const loadingMoreHistory = useChatStore((s) => s.loadingMoreHistory);
-  // A successful page updates this cursor in the same store transaction that
-  // prepends its items and clears loadingMoreHistory. Unlike scrollHeight, it
-  // still changes when many fetched tool calls collapse into one visual row.
-  const oldestItemId = useChatStore((s) => s.oldestItemId);
-  const generationRef = useRef(historyGeneration);
-  const [scrollRevision, setScrollRevision] = useState(0);
-  const handledScrollRevisionRef = useRef(scrollRevision);
-  const oldestItemIdRef = useRef(oldestItemId);
-  // Whether the reader has asked to move the transcript upward yet.
-  //
-  // "Near the top" alone is not a request for older history: opening a session
-  // scrolls the pane to the bottom, and on a transcript shorter than the fetch
-  // threshold that lands trivially near the top — so the open fetched a page,
-  // the prepend moved the cursor, and that fed the next fetch. Fifteen
-  // requests and a "Loading earlier messages…" row, for someone who never
-  // touched the scrollbar.
-  //
-  // Intent, not movement: a window taller than the transcript has no scroll
-  // range at all, so waiting for scrollTop to fall would strand older history
-  // behind a gesture the pane can never report.
-  const scrolledUpRef = useRef(false);
-  const lastScrollTopRef = useRef<number | null>(null);
-  const touchStartYRef = useRef<number | null>(null);
-  // Whether the current touch sequence already granted its gesture budget.
-  const touchGestureSpentRef = useRef(false);
-  const lastWheelUpAtRef = useRef(Number.NEGATIVE_INFINITY);
-  // Prepend-fed fetches left before the chain must wait for a fresh gesture.
-  const chainBudgetRef = useRef(PREPEND_CHAIN_PAGES_PER_GESTURE);
-
-  // Position across a prepend is held by native scroll anchoring, not by this
-  // component. Writing scrollTop here instead used to interrupt the reader's
-  // gesture — an imperative write cancels in-flight momentum, so a page landing
-  // mid-flick yanked the transcript (measured: corrections up to ~2000px, every
-  // one of them while the wheel was still moving). The browser does the same
-  // correction off the main thread without touching the gesture.
-  useLayoutEffect(() => {
-    const el = scrollElement ?? ctx.scrollRef?.current;
-    if (!el) return;
-    // Baseline from where the pane currently sits, so the reader's very first
-    // upward scroll already has something to compare against.
-    lastScrollTopRef.current = el.scrollTop;
-    // A gesture has to re-run the paging effect itself: a pane with no scroll
-    // range fires no scroll event, so nothing else would notice it. It also
-    // refills the chain budget — every fresh ask for what's above buys a
-    // bounded amount of prepend-fed follow-up, never the whole history.
-    const noteUpwardGesture = () => {
-      scrolledUpRef.current = true;
-      chainBudgetRef.current = PREPEND_CHAIN_PAGES_PER_GESTURE;
-      setScrollRevision((revision) => revision + 1);
-    };
-    const handleScroll = () => {
-      const previous = lastScrollTopRef.current;
-      lastScrollTopRef.current = el.scrollTop;
-      // Only an upward move counts. The open's scroll-to-bottom and a
-      // prepend's native anchor correction both move scrollTop DOWN the
-      // document (larger), so neither can arm paging on its own.
-      if (previous !== null && el.scrollTop < previous - 0.5) {
-        scrolledUpRef.current = true;
-        chainBudgetRef.current = PREPEND_CHAIN_PAGES_PER_GESTURE;
-      }
-      // Every scroll re-runs the paging effect, armed or not: staying near the
-      // top has to keep paging, not just the moment the reader arrives there.
-      setScrollRevision((revision) => revision + 1);
-    };
-    // Wheel/trackpad up, and a touch drag downward (which reveals what is
-    // above). These fire whether or not the pane has anywhere to scroll.
-    // Both emit many events per physical gesture, so the budget refill keys
-    // on the gesture's start — one touch sequence grants once, and a wheel
-    // burst grants again only after a quiet gap — keeping the bound truly
-    // per-gesture even when pages settle mid-drag.
-    const handleWheel = (event: WheelEvent) => {
-      if (event.deltaY >= 0) return;
-      const now = performance.now();
-      const newGesture = now - lastWheelUpAtRef.current > WHEEL_GESTURE_QUIET_MS;
-      lastWheelUpAtRef.current = now;
-      if (newGesture) noteUpwardGesture();
-    };
-    const handleTouchStart = (event: TouchEvent) => {
-      touchStartYRef.current = event.touches[0]?.clientY ?? null;
-      touchGestureSpentRef.current = false;
-    };
-    const handleTouchMove = (event: TouchEvent) => {
-      const start = touchStartYRef.current;
-      const current = event.touches[0]?.clientY;
-      if (start === null || current === undefined || current <= start + TOUCH_DRAG_SLOP_PX) return;
-      if (touchGestureSpentRef.current) return;
-      touchGestureSpentRef.current = true;
-      noteUpwardGesture();
-    };
-    el.addEventListener("scroll", handleScroll, { passive: true });
-    el.addEventListener("wheel", handleWheel, { passive: true });
-    el.addEventListener("touchstart", handleTouchStart, { passive: true });
-    el.addEventListener("touchmove", handleTouchMove, { passive: true });
-    return () => {
-      el.removeEventListener("scroll", handleScroll);
-      el.removeEventListener("wheel", handleWheel);
-      el.removeEventListener("touchstart", handleTouchStart);
-      el.removeEventListener("touchmove", handleTouchMove);
-    };
-  }, [ctx.scrollRef, scrollElement]);
-
-  // This is the single paging effect. Fetches are driven by user scrolls or a
-  // changed oldest item, including a visually height-neutral prepend.
-  useLayoutEffect(() => {
-    const el = scrollElement ?? ctx.scrollRef?.current;
-    if (!el) return;
-
-    const generationChanged = generationRef.current !== historyGeneration;
-    const itemsChanged = !generationChanged && oldestItemIdRef.current !== oldestItemId;
-    const scrollPositionChanged =
-      !generationChanged && handledScrollRevisionRef.current !== scrollRevision;
-    oldestItemIdRef.current = oldestItemId;
-    handledScrollRevisionRef.current = scrollRevision;
-
-    if (generationChanged) {
-      generationRef.current = historyGeneration;
-      // A new window is a new open: require a fresh upward scroll.
-      scrolledUpRef.current = false;
-      chainBudgetRef.current = PREPEND_CHAIN_PAGES_PER_GESTURE;
-      lastScrollTopRef.current = el.scrollTop;
-    }
-
-    const state = useChatStore.getState();
-
-    // Reader-driven only. Opening a session used to keep paging from here
-    // until it found the previous prompt, so history kept landing for seconds
-    // after the page had settled and the transcript shifted under someone who
-    // had not scrolled at all. The bind now fetches its whole window in one
-    // request, and this waits for the reader to actually scroll up.
-    if (
-      !scrolledUpRef.current ||
-      !state.oldestItemId ||
-      !state.hasMoreHistory ||
-      state.loadingMoreHistory ||
-      !(itemsChanged || scrollPositionChanged) ||
-      el.scrollTop >= historyLoadThreshold(el)
-    ) {
-      return;
-    }
-
-    // A prepend re-feeding the chain spends gesture budget: without a bound,
-    // folded (height-neutral) pages would re-feed fetches until history ran
-    // out. A real-height prepend passes here too until its async anchor
-    // scroll lands; that upward-scroll refill keeps scroll-range paging
-    // unchanged. Once spent, the chain waits for the reader's next gesture.
-    if (itemsChanged && !scrollPositionChanged) {
-      if (chainBudgetRef.current <= 0) return;
-      chainBudgetRef.current -= 1;
-    }
-
-    void state.loadMoreHistory();
-  }, [
-    ctx.scrollRef,
-    historyGeneration,
-    loadingMoreHistory,
-    oldestItemId,
-    scrollElement,
-    scrollRevision,
-  ]);
-
-  // No visible control — history loads purely on scroll-up.
-  return null;
-}
-
-/** Top inset for a pinned anchor: 16px beyond the fade's fully opaque edge. */
-const PINNED_ANCHOR_TOP_GAP_PX = 96;
-
-/**
- * Ceiling on the reserved space, as a share of the viewport. Pinning a SHORT
- * latest turn to the top costs almost a full screen of blank, with readable
- * history sitting just above the fold. Capping it keeps most of the viewport
- * showing real messages; a long turn is unaffected, since it already needs
- * little or no reserved space to reach the top.
- */
-const MAX_RESERVED_VIEWPORT_FRACTION = 1 / 3;
-
-/**
- * Trailing spacer that pins the initially loaded turn's anchor to the top of
- * the viewport — the newest committed user prompt, or (on a page deep in a
- * long tool chain with no prompt yet) the newest assistant text output. The
- * anchor is captured once when the hydrated chat surface mounts. Live sends
- * therefore consume the reserved space instead of becoming a new anchor and
- * jumping to the top before the harness starts processing them.
- *
- * As a side effect it keeps the transcript taller than its scroll container
- * whenever any content sits above the anchor, so older history stays reachable
- * by scroll-up without a viewport-fill loop.
- *
- * Height = clientHeight − (anchor-top → spacer-top) − top gap − the column's
- * trailing padding, clamped to ≥ 0: a short reply leaves empty space below
- * (anchor stays pinned at top); once the reply alone exceeds the viewport the
- * spacer collapses to 0 and normal stick-to-bottom following resumes. The
- * trailing padding scrolls below the spacer, so reserving it again would leave
- * the document taller than the viewport — a phantom scroll range that paints a
- * scrollbar over a fully-visible transcript. Every measured edge is fixed by
- * content outside the height we set — the measurement can't feed back on
- * itself.
- */
-export function LatestTurnSpacer({
-  scrollElement,
-  // Gap left above the pinned anchor. Defaults to clearing the top fade band;
-  // with the Plan accordion pinned above (fade dropped, container already below
-  // the header), the caller passes the small content inset so a framed turn
-  // rests just below the accordion instead of 80px lower.
-  topGapPx = PINNED_ANCHOR_TOP_GAP_PX,
-}: {
-  scrollElement?: HTMLElement | null;
-  topGapPx?: number;
-} = {}) {
-  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
-    scrollRef: React.RefObject<HTMLElement>;
-  };
-  // Block changes remeasure the frozen anchor; streaming growth is covered by
-  // the ResizeObserver. The hydration gate remounts this component on a
-  // conversation switch, which captures that conversation's initial anchor.
-  const blockCount = useChatStore((s) => s.blocks.length);
-  const spacerRef = useRef<HTMLDivElement>(null);
-  // `undefined` means capture has not run; `null` is a completed capture with
-  // no suitable initial anchor (for example a brand-new empty conversation).
-  const initialAnchorRef = useRef<HTMLElement | null | undefined>(undefined);
-  const initialCommittedUserIdsRef = useRef<Set<string> | null>(null);
-  if (initialCommittedUserIdsRef.current === null) {
-    const ids = new Set<string>();
-    for (const block of useChatStore.getState().blocks) {
-      if (
-        block.type === "user_message" &&
-        !isSystemUserContent(block.content) &&
-        block.ctx.itemId !== null
-      ) {
-        ids.add(block.ctx.itemId);
-      }
-    }
-    initialCommittedUserIdsRef.current = ids;
-  }
-
-  const measure = useCallback(() => {
-    const scrollEl = scrollElement ?? ctx.scrollRef?.current;
-    const spacerEl = spacerRef.current;
-    if (!scrollEl || !spacerEl) return;
-    if (initialAnchorRef.current === undefined) {
-      // Match DOM bubbles against committed blocks so an optimistic pending
-      // send visible during this first layout can never become the anchor.
-      const users = scrollEl.querySelectorAll<HTMLElement>(
-        '[data-role="user"][data-user-message-id]',
-      );
-      let initialUser: HTMLElement | null = null;
-      for (let index = users.length - 1; index >= 0; index -= 1) {
-        const candidate = users[index]!;
-        const itemId = candidate.dataset.userMessageId;
-        if (itemId !== undefined && initialCommittedUserIdsRef.current!.has(itemId)) {
-          initialUser = candidate;
-          break;
-        }
-      }
-      const texts = scrollEl.querySelectorAll<HTMLElement>(
-        '[data-testid="assistant-text-section"]',
-      );
-      initialAnchorRef.current = initialUser ?? texts[texts.length - 1] ?? null;
-    }
-    const anchor = initialAnchorRef.current;
-    if (!anchor) {
-      // Do not let the always-mounted sentinel become a zero-height flex item:
-      // the content column's gap would otherwise shift an empty-state layout.
-      spacerEl.style.display = "none";
-      return;
-    }
-    // rect diffs are scroll-invariant (both edges shift together), and the
-    // spacer's top is fixed by the content above it, so this is stable across
-    // the height we're about to set — it converges in one pass.
-    const spacerRect = spacerEl.getBoundingClientRect();
-    const anchorToEnd = spacerRect.top - anchor.getBoundingClientRect().top;
-    // The content column's trailing padding sits below the spacer and scrolls
-    // with it; leaving it out of the reservation keeps the document from
-    // outgrowing the viewport by that padding (a phantom scroll range that
-    // paints a scrollbar thumb over a fully-visible transcript).
-    const trailing = spacerEl.parentElement
-      ? Math.max(0, spacerEl.parentElement.getBoundingClientRect().bottom - spacerRect.bottom)
-      : 0;
-    const viewport = scrollEl.clientHeight;
-    const next = Math.max(
-      0,
-      Math.min(
-        viewport - anchorToEnd - topGapPx - trailing,
-        viewport * MAX_RESERVED_VIEWPORT_FRACTION,
-      ),
-    );
-    const current = Number.parseFloat(spacerEl.style.height) || 0;
-    if (Math.abs(current - next) >= 1) spacerEl.style.height = `${next}px`;
-  }, [ctx.scrollRef, scrollElement, topGapPx]);
-
-  useLayoutEffect(() => {
-    measure();
-  }, [measure, blockCount]);
-
-  useLayoutEffect(() => {
-    const scrollEl = scrollElement ?? ctx.scrollRef?.current;
-    const contentEl = spacerRef.current?.parentElement;
-    if (!scrollEl || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => measure());
-    observer.observe(scrollEl); // viewport (clientHeight) changes
-    if (contentEl) observer.observe(contentEl); // streaming / reflow growth
-    return () => observer.disconnect();
-  }, [ctx.scrollRef, measure, scrollElement]);
-
-  return <div ref={spacerRef} aria-hidden style={{ flexShrink: 0 }} />;
-}
-
-/**
- * The conversation's scroll container plus the minimal StickToBottom controls
- * the JumpToTopButton needs to override the library's bottom-lock. `state` is a
- * stable, mutable object: clearing `isAtBottom`/`escapedFromLock` makes the
- * resize-driven `scrollToBottom({preserveScrollPosition})` — fired on every
- * history prepend — bail instead of yanking the view back to the bottom.
- */
-interface ConversationScroller {
-  el: HTMLElement;
-  state: { isAtBottom: boolean; escapedFromLock: boolean };
-  stopScroll: () => void;
-}
-
-/**
- * Lifts the StickToBottom scroll container (and lock controls) out of the
- * context so a sibling rendered *outside* `<Conversation>` (and thus outside
- * its `chat-scroll-fade` mask) can still read and drive it. `scrollRef`,
- * `state`, and `stopScroll` are stable identities (see HistoryAutoLoader for
- * the runtime-vs-types cast). Renders nothing.
- */
-function ConversationScrollRefBridge({
-  onScroller,
-}: {
-  onScroller: (s: ConversationScroller | null) => void;
-}) {
-  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
-    scrollRef: React.RefObject<HTMLElement>;
-    state: ConversationScroller["state"];
-    stopScroll: () => void;
-  };
-  useEffect(() => {
-    // Runs after commit, when StickToBottom has populated scrollRef.current.
-    const el = ctx.scrollRef?.current ?? null;
-    onScroller(el ? { el, state: ctx.state, stopScroll: ctx.stopScroll } : null);
-    return () => onScroller(null);
-  }, [ctx.scrollRef, ctx.state, ctx.stopScroll, onScroller]);
-  return null;
-}
-
-/**
- * Hover-revealed "Jump to top" pill, mirroring {@link ConversationScrollButton}
- * but for the other end. Hovering near the top edge of the conversation
- * surfaces a pill at the fade border; clicking it pages in every older history
- * block (the conversation is lazily paginated — see {@link HistoryAutoLoader})
- * and then scrolls to the very first message.
- *
- * Rendered as a sibling of `<Conversation>`, not a child: the scroll viewport's
- * top ~80px is mask-faded (`chat-scroll-fade`), so a pill inside it would fade
- * out too. Sitting in the wrapper keeps it at full opacity right at the fade
- * line, and `z-40` lifts it over the `z-30` ChatHeader so it stays clickable.
- *
- * Hover is detected in JS off the **wrapper** (`containerEl`), the common
- * ancestor of both the scroll area and this pill — listening on the scroll
- * element instead would fire `mouseleave` the instant the cursor crossed onto
- * the pill (a non-descendant), killing the click. `scroller` carries the inner
- * scroll container plus the StickToBottom lock controls.
- *
- * @param containerEl - The conversation wrapper; hover/anchor reference.
- * @param scroller - Scroll container + lock controls (ConversationScrollRefBridge).
- * @param hasMoreHistory - Whether older messages exist before the loaded window.
- */
-export function JumpToTopButton({
-  containerEl,
-  scroller,
-  hasMoreHistory,
-}: {
-  containerEl: HTMLElement | null;
-  scroller: ConversationScroller | null;
-  hasMoreHistory: boolean;
-}) {
-  const [atTop, setAtTop] = useState(true);
-  const [hovering, setHovering] = useState(false);
-  const [jumping, setJumping] = useState(false);
-  // Reveal the pill while the user is scrolling up, then fade it back out once
-  // they pause — so it's reachable without having to find the top hover band.
-  const [scrolledUp, setScrolledUp] = useState(false);
-
-  // How long the pill lingers after the last upward scroll before fading out.
-  const SCROLL_REVEAL_MS = 2000;
-
-  // Pixels below the conversation's top edge that count as "hovering the top".
-  // Comfortably clears the pill (anchored at the fade border, ~50px) so moving
-  // onto it to click never drops the hover state.
-  const HOVER_BAND_PX = 140;
-
-  // Hover detection on the wrapper so the pill (a wrapper child) stays in-band.
-  useEffect(() => {
-    if (!containerEl) return;
-    const onMove = (e: MouseEvent) => {
-      const next = e.clientY - containerEl.getBoundingClientRect().top < HOVER_BAND_PX;
-      // Only commit on a transition — mousemove fires continuously, and React
-      // bails on a no-op setState anyway, but skipping it avoids the work.
-      setHovering((prev) => (prev === next ? prev : next));
-    };
-    const onLeave = () => setHovering(false);
-    containerEl.addEventListener("mousemove", onMove, { passive: true });
-    containerEl.addEventListener("mouseleave", onLeave);
-    return () => {
-      containerEl.removeEventListener("mousemove", onMove);
-      containerEl.removeEventListener("mouseleave", onLeave);
-    };
-  }, [containerEl]);
-
-  // Track whether the loaded window is scrolled to its very top, and reveal the
-  // pill whenever the user scrolls up (auto-hiding after they pause).
-  const scrollEl = scroller?.el ?? null;
-  useEffect(() => {
-    if (!scrollEl) return;
-    let lastTop = scrollEl.scrollTop;
-    let hideTimer: ReturnType<typeof setTimeout> | undefined;
-    const onScroll = () => {
-      const top = scrollEl.scrollTop;
-      const next = top <= 1;
-      setAtTop((prev) => (prev === next ? prev : next));
-      // Upward scroll (and not already pinned to the top): show the pill and
-      // (re)arm the idle timer that fades it out once scrolling settles.
-      if (top < lastTop - 1 && top > 1) {
-        setScrolledUp(true);
-        clearTimeout(hideTimer);
-        hideTimer = setTimeout(() => setScrolledUp(false), SCROLL_REVEAL_MS);
-      }
-      lastTop = top;
-    };
-    onScroll();
-    scrollEl.addEventListener("scroll", onScroll, { passive: true });
-    return () => {
-      clearTimeout(hideTimer);
-      scrollEl.removeEventListener("scroll", onScroll);
-    };
-  }, [scrollEl]);
-
-  // Somewhere to go: older pages exist, or we're scrolled down within the
-  // loaded window. At the very first message there's nothing to jump to.
-  const canJump = hasMoreHistory || !atTop;
-  const visible = jumping || ((hovering || scrolledUp) && canJump);
-
-  const jumpToTop = useCallback(async () => {
-    if (!scroller) return;
-    const { el, state, stopScroll } = scroller;
-    const nextFrame = () =>
-      new Promise<void>((resolve) => {
-        requestAnimationFrame(() => resolve());
-      });
-    setJumping(true);
-    try {
-      // Release StickToBottom's bottom-lock. Without this, every history prepend
-      // resizes the content and the library's ResizeObserver yanks the view back
-      // to the bottom (scrollToBottom with preserveScrollPosition, which sticks
-      // whenever state.isAtBottom is true) — so our scrollTop=0 lost the fight
-      // and only a *second* click (everything already loaded, no resizes) won.
-      // Clearing the lock here makes those prepend-driven scrolls bail.
-      stopScroll();
-      state.isAtBottom = false;
-      state.escapedFromLock = true;
-
-      // Page in every older block before scrolling. loadMoreHistory serializes
-      // via its own loadingMoreHistory guard (so a concurrent HistoryAutoLoader
-      // fetch is harmless), and flips hasMoreHistory to false at the start of
-      // history or on error. The rAF wait yields a frame for the prepend to
-      // commit and for the in-flight flag to settle between pages. The
-      // iteration cap is a backstop against a server that never reports done.
-      /* oxlint-disable no-await-in-loop */
-      for (let i = 0; i < 1000 && useChatStore.getState().hasMoreHistory; i++) {
-        await useChatStore.getState().loadMoreHistory();
-        // Keep the lock released — a prepend that briefly lands us near the
-        // bottom can otherwise re-arm it via the library's scroll handler.
-        state.isAtBottom = false;
-        state.escapedFromLock = true;
-        await nextFrame();
-      }
-      // Pin to the very top, re-asserting across frames until it holds. The last
-      // prepends keep growing scrollHeight after the store settles, and
-      // HistoryAutoLoader's offset-preservation can bump scrollTop right after
-      // we zero it. Force 0 each frame until it stays 0 for two consecutive
-      // frames (or we hit the frame cap).
-      for (let i = 0, stable = 0; i < 60 && stable < 2; i++) {
-        if (el.scrollTop === 0) stable += 1;
-        else {
-          el.scrollTop = 0;
-          stable = 0;
-        }
-        await nextFrame();
-      }
-      /* oxlint-enable no-await-in-loop */
-    } finally {
-      setJumping(false);
-    }
-  }, [scroller]);
-
-  return (
-    <div
-      // top 50px centers the pill on the chat-scroll-fade border (the mask ramps
-      // 48px→80px), just below the h-14 ChatHeader. z-40 > header z-30. On the
-      // iOS shell the header and fade border shift down by the safe-area inset
-      // (see .chat-scroll-fade in index.css), so add --omnigent-inset-top here
-      // too to keep the pill centered on the border. The var is 0px off-shell.
-      style={{ top: "calc(50px + var(--omnigent-inset-top))" }}
-      className={cn(
-        "pointer-events-none absolute inset-x-0 z-40 flex justify-center transition-opacity duration-150",
-        visible ? "opacity-100" : "opacity-0",
-      )}
-    >
-      <Button
-        type="button"
-        variant="outline"
-        size="sm"
-        disabled={jumping}
-        onClick={() => void jumpToTop()}
-        aria-label="Jump to the first message"
-        componentId="chat.nav.jump_to_top"
-        // When hidden (opacity-0 / pointer-events-none) keep the button out of
-        // the tab order and the accessibility tree so it can't take focus or be
-        // announced while invisible.
-        tabIndex={visible ? 0 : -1}
-        aria-hidden={!visible}
-        className={cn(
-          "h-7 gap-1.5 rounded-full px-3 text-sm shadow-sm",
-          // Force an OPAQUE background in both themes and on hover. The outline
-          // variant's hover (bg-muted) is a translucent black wash (--muted is
-          // #0000000f), so over the faded chat text behind the pill it bleeds
-          // through and reads as transparent. bg-background is opaque (#fff /
-          // #0e1013); hover feedback comes from a brightness filter, which keeps
-          // the fill fully opaque.
-          "bg-background hover:bg-background hover:brightness-95",
-          "dark:bg-background dark:hover:bg-background dark:hover:brightness-125",
-          visible ? "pointer-events-auto" : "pointer-events-none",
-        )}
-      >
-        {jumping ? (
-          <Loader2Icon className="size-3.5 animate-spin" aria-hidden />
-        ) : (
-          <ArrowUpIcon className="size-3.5" aria-hidden />
-        )}
-        {jumping ? "Loading history…" : "Jump to top"}
-      </Button>
-    </div>
-  );
-}
-
-/** Stable React key per bubble. */
-function bubbleKey(bubble: Bubble): string {
-  // Prefer stableKey (the optimistic temp id) for promoted user bubbles
-  // so the key holds steady across the optimistic→committed swap on
-  // `session.input.consumed` — a changing key remounts the node (flink).
-  if (bubble.kind === "user") return `user:${bubble.stableKey ?? bubble.itemId}`;
-  if (bubble.kind === "compaction_loading") return `compaction_loading:${bubble.itemId}`;
-  if (bubble.kind === "compaction") return `compaction:${bubble.itemId}`;
-  if (bubble.kind === "routing_decision") return `routing_decision:${bubble.itemId}`;
-  return `assistant:${bubble.stableId}`;
-}
-
-/**
- * Playful labels the idle-but-busy indicator rotates through (one per
- * `ROTATE_MS`). Index 0 MUST stay "Working…": it's the label a fresh tick
- * (and every unit test) lands on. Keep each entry a single short word +
- * ellipsis — `Shimmer` scales its sweep width to the text length, so uniform
- * lengths keep the animation steady across rotations.
- */
-export const WORKING_MESSAGES = [
-  "Working…",
-  "Cooking…",
-  "Crunching…",
-  "Tinkering…",
-  "Pondering…",
-  "Brewing…",
-] as const;
-
-/**
- * Busy only because background tasks outlive a FINISHED turn (a dev server, a
- * background shell) — the agent's own turn has ended and nothing's blocked. The
- * composer's `BackgroundTaskPill` reports the count and the "Working…" shimmer
- * stays off (it would misread as the agent still thinking). While the turn is
- * still active (`agentWorking`) the shimmer wins, and the pill shows the count
- * alongside it.
- */
-export function isBackgroundTasksOnly(
-  bgCount: number,
-  blockedOn: string | null,
-  agentWorking: boolean,
-): boolean {
-  return !agentWorking && !blockedOn && bgCount > 0;
-}
-
-/**
- * Whether the agent's own turn is in progress — server `running`/`waiting`, or
- * a local send in flight — as opposed to being busy only because background
- * tasks outlive a finished turn. Separates the shimmer's "working" state from
- * the pill's "background-tasks-only" state.
- */
-function useAgentTurnActive(): boolean {
-  const sessionStatus = useChatStore((s) => s.sessionStatus);
-  const localSending = useChatStore((s) => s.status === "streaming");
-  return computeIsWorking(sessionStatus) || localSending;
-}
-
-/**
- * The label shown next to the working shimmer. When the agent is parked on a
- * dialog (`blockedOn`) it says so — that outranks the rotation, because it is
- * the one case where the session needs the user rather than time, and the
- * dialog may live only in the terminal tab. Otherwise it rotates through
- * `WORKING_MESSAGES` by wall-clock `tick`. Background-task counts belong to
- * `BackgroundTaskPill`, not this shimmer.
- */
-export function workingIndicatorLabel(tick = 0, blockedOn: string | null = null): string {
-  if (blockedOn) {
-    return `Blocked on: ${blockedOn}`;
-  }
-  return WORKING_MESSAGES[tick % WORKING_MESSAGES.length]!;
-}
-
-function WorkingIndicator() {
-  const bgCount = useChatStore((s) => s.backgroundTaskCount);
-  const blockedOn = useChatStore((s) => s.blockedOn);
-  const agentWorking = useAgentTurnActive();
-  const tick = useWorkingLabelTick();
-  // Once the turn ends but background shells outlive it, BackgroundTaskPill owns
-  // the state and the shimmer stays off (it would misread as the agent still
-  // thinking). While the turn is active the shimmer shows, with the pill beside it.
-  if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) return null;
-  const label = workingIndicatorLabel(tick, blockedOn);
-  return (
-    <>
-      {/* Sole aria-live region for the working state. A stable "Working…" (not
-          the rotating label) so screen readers announce the turn once, without
-          re-announcing every few seconds; the visible shimmer below stays
-          aria-hidden. */}
-      <span role="status" aria-live="polite" className="sr-only">
-        Working…
-      </span>
-      <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
-        <MessageContent>
-          <div className="flex items-center gap-1.5 py-0.5">
-            <BrandLogo variant="icon" className="otto-working h-4 w-auto shrink-0" />
-            <Shimmer className="text-sm font-mono" duration={1.5}>
-              {label}
-            </Shimmer>
-          </div>
-        </MessageContent>
-      </Message>
-    </>
-  );
-}
-
-/**
- * Decide whether to render the main chat's "Working…" indicator.
- *
- * Lit for the whole busy turn — through streaming text, tool runs, and
- * reasoning gaps — so the user always sees the session is still going. A
- * reload can hydrate a custom-agent session as ``running`` before any bubble
- * exists locally; the indicator stays visible in that empty-but-busy state
- * too.
- *
- * @param showsWorking - True when the session snapshot or local response
- *   state says the main session is still working.
- * @param bubbles - Rendered chat bubbles currently hydrated in the main
- *   session, e.g. assistant, user, or compaction-loading bubbles.
- * @returns True when the standalone working indicator should render; false
- *   when the session is idle, or a compaction-loading bubble is last and
- *   already represents the busy state with its own animation.
- */
-export function shouldShowWorkingIndicator(showsWorking: boolean, bubbles: Bubble[]): boolean {
-  if (!showsWorking) return false;
-  return bubbles[bubbles.length - 1]?.kind !== "compaction_loading";
-}
-
-/**
- * Whether a user-role bubble is a runtime-injected `[System: ...]`
- * notification (rendered via SystemMessageView, not as a normal user
- * bubble). Matches the gate in `UserBubble`: pure text, no attachments,
- * recognizable system header.
- */
-function isSystemBubble(bubble: Bubble): boolean {
-  if (bubble.kind !== "user") return false;
-  return isSystemUserContent(bubble.content);
-}
-
-function CompactionLoadingIndicator({ createdAtS }: { createdAtS?: number }) {
-  const [elapsed, setElapsed] = useState(0);
-
-  useEffect(() => {
-    // Calculate elapsed time from the actual compaction start time (if available)
-    // rather than component mount time, so the timer persists across session switches.
-    const startTimeMs = createdAtS != null ? createdAtS * 1000 : Date.now();
-
-    const updateElapsed = () => {
-      setElapsed(Math.round((Date.now() - startTimeMs) / 1000));
-    };
-
-    updateElapsed();
-    const id = window.setInterval(updateElapsed, 1000);
-    return () => window.clearInterval(id);
-  }, [createdAtS]);
-
-  return (
-    <Message from="assistant" data-testid="compacting-indicator">
-      <MessageContent>
-        <div className="flex items-center gap-2 text-sm font-mono">
-          <Shimmer as="span" duration={1.5}>
-            Compacting conversation…
-          </Shimmer>
-          {elapsed > 0 && <span className="text-muted-foreground">({elapsed}s)</span>}
-        </div>
-        <div className="mt-2 h-1 overflow-hidden rounded-full bg-muted">
-          <div
-            className="h-full w-1/3 rounded-full bg-muted-foreground/40"
-            style={{ animation: "compaction-slide 1.5s ease-in-out infinite alternate" }}
-          />
-        </div>
-      </MessageContent>
-    </Message>
-  );
-}
-
-// Memoized so a streaming delta (which rebuilds the whole bubble array) only
-// re-renders the bubble that actually changed, not every prior message's
-// markdown/syntax-highlighting subtree. See `bubblesEqual`. Exported for
-// the user-bubble markdown render tests.
-function formatBubbleTimestamp(epochSeconds: number | undefined): string | null {
-  if (epochSeconds === undefined || epochSeconds === 0) return null;
-  const d = new Date(epochSeconds * 1000);
-  const now = new Date();
-  const time = d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-  if (
-    d.getFullYear() === now.getFullYear() &&
-    d.getMonth() === now.getMonth() &&
-    d.getDate() === now.getDate()
-  ) {
-    return time;
-  }
-  const date = d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
-  if (d.getFullYear() !== now.getFullYear()) {
-    return `${d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}, ${time}`;
-  }
-  return `${date}, ${time}`;
-}
-
-export const BubbleView = memo(
-  function BubbleView({
-    bubble,
-    isLastAssistant = false,
-    showsWorking = false,
-  }: {
-    bubble: Bubble;
-    isLastAssistant?: boolean;
-    showsWorking?: boolean;
-  }) {
-    if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
-    if (bubble.kind === "compaction_loading") {
-      return <CompactionLoadingIndicator createdAtS={bubble.createdAtS} />;
-    }
-    if (bubble.kind === "compaction") return <CompactionMarker />;
-    if (bubble.kind === "routing_decision") {
-      return (
-        <RoutingDecisionCard
-          model={bubble.model}
-          applied={bubble.applied}
-          rationale={bubble.rationale}
-          agent={bubble.agent}
-          routing={bubble.routing}
-        />
-      );
-    }
-    return (
-      <AssistantBubble
-        bubble={bubble}
-        isLastAssistant={isLastAssistant}
-        showsWorking={showsWorking}
-      />
-    );
-  },
-  (prev, next) =>
-    (prev.isLastAssistant ?? false) === (next.isLastAssistant ?? false) &&
-    (prev.showsWorking ?? false) === (next.showsWorking ?? false) &&
-    bubblesEqual(prev.bubble, next.bubble),
-);
-
-/**
- * Copy-to-clipboard handler for a message bubble's "Copy" action.
- *
- * Uses the shared {@link copyText} helper (async Clipboard API with an
- * `execCommand` fallback) rather than `navigator.clipboard.writeText`
- * directly — the latter is undefined in the iOS webview and on non-secure
- * origins, where a bare guard made the button silently no-op. Drives the
- * inline check-icon confirmation for 2s, and on mobile (where the desktop
- * hover affordance and tooltip aren't visible) also fires a toast so the
- * copy is confirmed.
- *
- * @param getText - Produces the text to copy at click time.
- * @returns `{ isCopied, handleCopy }` for the action button.
- */
-function useCopyMessage(getText: () => string): {
-  isCopied: boolean;
-  handleCopy: () => void;
-} {
-  const [isCopied, setIsCopied] = useState(false);
-  const timeoutRef = useRef<number>(0);
-  const isMobile = useIsMobileViewport();
-
-  useEffect(() => () => window.clearTimeout(timeoutRef.current), []);
-
-  const handleCopy = useCallback(() => {
-    if (isCopied) return;
-    const text = getText();
-    if (!text) return;
-    copyText(text).then(
-      () => {
-        setIsCopied(true);
-        window.clearTimeout(timeoutRef.current);
-        timeoutRef.current = window.setTimeout(() => setIsCopied(false), 2000);
-        if (isMobile) {
-          showToast(<span className="text-ui">Copied to clipboard</span>, { duration: 1500 });
-        }
-      },
-      (error) => {
-        console.warn("Failed to copy message", error);
-      },
-    );
-  }, [getText, isCopied, isMobile]);
-
-  return { isCopied, handleCopy };
-}
-
-function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
-  const sessionId = useChatStore((s) => s.conversationId);
-  // Author labels only matter once the session is shared with someone else.
-  const isSessionShared = useContext(SessionSharedContext);
-  // Plain-text path is the common case.
-  // - input_image: render inline <img> when the file is uploaded (file_id
-  //   doesn't start with "pending:"); show a chip while the upload is
-  //   in-flight.
-  // - input_file: always render as a chip (non-image files can't be
-  //   previewed inline).
-  const text = extractUserText(bubble.content);
-  const images = bubble.content.filter(
-    (c): c is Extract<MessageContentBlock, { type: "input_image" }> => c.type === "input_image",
-  );
-  const fileChips = bubble.content.filter(
-    (c): c is Extract<MessageContentBlock, { type: "input_file" }> => c.type === "input_file",
-  );
-  // "@"-mentioned workspace files/folders ride in as "[Attached: …]" text
-  // markers (no input_file block), so surface them as chips — otherwise the
-  // marker is stripped and the user can't see what they attached.
-  const mentionedChips = extractAttachedPaths(bubble.content);
-  // Equality selector so Zustand only re-renders the matching bubble.
-  const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
-  const { isCopied, handleCopy } = useCopyMessage(() => text);
-  const ts = formatBubbleTimestamp(bubble.createdAtS);
-  // Runtime-injected `[System: ...]` notifications (task completion,
-  // timer firings, terminal idle) ride in on role=user. When the content
-  // is a pure system marker — no attached images or files — swap the
-  // normal bubble for a muted centered indicator.
-  if (images.length === 0 && fileChips.length === 0 && mentionedChips.length === 0) {
-    const parsed = parseSystemMessage(text);
-    if (parsed) return <SystemMessageView message={parsed} />;
-  }
-  // Badge OTHER contributors' messages only (never your own) — an avatar
-  // circle + author-tinted bubble, not an email label.
-  const author = bubble.createdBy;
-  const showAuthorBadge = shouldShowAuthorBadge(author, getCurrentAuthorId(), isSessionShared);
-
-  return (
-    <Message
-      from="user"
-      data-testid="message-bubble"
-      data-role="user"
-      data-user-message-id={bubble.itemId}
-      className="max-w-[640px]"
-    >
-      <div className="ml-auto flex w-fit max-w-full flex-col items-end">
-        {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
-            immediately left of the right-aligned bubble (the bubble's own
-            ml-auto has no free space to absorb inside a fit-width row). */}
-        <div className="flex w-fit max-w-full items-center gap-1.5">
-          {showAuthorBadge && author && (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Avatar
-                  size="sm"
-                  data-testid="message-author"
-                  aria-label={author}
-                  className="shrink-0"
-                >
-                  <AvatarFallback
-                    className="font-medium text-white"
-                    style={{ backgroundColor: userColor(author) }}
-                  >
-                    {userInitials(author)}
-                  </AvatarFallback>
-                </Avatar>
-              </TooltipTrigger>
-              <TooltipContent>{author}</TooltipContent>
-            </Tooltip>
-          )}
-          <MessageContent
-            className={cn(flashing && "animate-user-msg-flash")}
-            // Another contributor's bubble takes their avatar color at low
-            // alpha instead of the default bg-muted, so authorship reads at
-            // a glance without any email text.
-            style={
-              showAuthorBadge && author ? { backgroundColor: userColorTint(author) } : undefined
-            }
-          >
-            {/* Inline image previews — one non-wrapping strip. Wrapping would
-                re-flow the row as each image's width resolves on load, changing
-                the bubble's height and shoving the transcript; scrolling keeps
-                the row exactly one preview tall no matter what lands. */}
-            {images.length > 0 && (
-              <div className="mb-1.5 flex gap-2 overflow-x-auto">
-                {images.map((img) =>
-                  img.file_id.startsWith("pending:") ? (
-                    // Upload in-flight — show a chip placeholder
-                    <span
-                      key={img.file_id}
-                      className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                    >
-                      <ImageIcon className="size-3 shrink-0" />
-                      <span className="max-w-[180px] truncate">
-                        {img.filename ?? img.file_id.replace("pending:", "")}
-                      </span>
-                    </span>
-                  ) : (
-                    // Uploaded — render the actual image
-                    <SessionImage
-                      key={img.file_id}
-                      path={
-                        sessionId
-                          ? `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(img.file_id)}/content`
-                          : undefined
-                      }
-                      alt={img.filename ?? img.file_id}
-                      // Sizing lives in SessionImage, which reserves a matching
-                      // box so the bubble's height is settled before bytes land.
-                      className="rounded-md object-contain"
-                    />
-                  ),
-                )}
-              </div>
-            )}
-            {/* Non-image file chips */}
-            {fileChips.length > 0 && (
-              <div className="mb-1.5 flex flex-wrap gap-1.5">
-                {fileChips.map((att) => (
-                  <span
-                    key={att.file_id}
-                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                  >
-                    <FileTextIcon className="size-3 shrink-0" />
-                    <span className="max-w-[180px] truncate">{att.filename ?? att.file_id}</span>
-                  </span>
-                ))}
-              </div>
-            )}
-            {/* "@"-mentioned workspace files/folders (delivered as text markers) */}
-            {mentionedChips.length > 0 && (
-              <div className="mb-1.5 flex flex-wrap gap-1.5">
-                {mentionedChips.map((item) => (
-                  <span
-                    key={mentionItemPath(item)}
-                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                  >
-                    {item.isDir ? (
-                      <FolderIcon className="size-3 shrink-0" />
-                    ) : (
-                      <FileTextIcon className="size-3 shrink-0" />
-                    )}
-                    <span className="max-w-[180px] truncate" title={mentionItemPath(item)}>
-                      @{item.path}
-                      {item.isDir ? "/" : ""}
-                    </span>
-                    {item.lineRange && (
-                      <span className="shrink-0">
-                        :{item.lineRange.start}-{item.lineRange.end}
-                      </span>
-                    )}
-                  </span>
-                ))}
-              </div>
-            )}
-            {/* Render user text as markdown, matching the assistant bubble
-              (headings, lists, code fences, file-path links). `breaks` keeps
-              single newlines as line breaks — users type multi-line messages
-              without blank-line paragraph separators and expect their line
-              breaks preserved. Empty text — e.g. an attachments-only message —
-              renders nothing rather than an empty markdown block. */}
-            {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
-          </MessageContent>
-        </div>
-        {/* Skip an empty row when there is neither a timestamp nor a copy
-            action. 40%-visible on touch (no hover), hover/focus-reveal on
-            desktop. py-1 matches the design prototype's 24px action row;
-            the timestamp rides inside it instead of adding a new row. */}
-        {(ts || text) && (
-          <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
-            {ts && (
-              <span
-                className="select-none text-[11px] leading-4 text-foreground/56"
-                data-testid="message-timestamp"
-              >
-                {ts}
-              </span>
-            )}
-            {text && (
-              <MessageActions>
-                <MessageAction
-                  tooltip="Copy"
-                  size="icon-xxs"
-                  onClick={handleCopy}
-                  componentId="chat.message.copy_user"
-                >
-                  {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-                </MessageAction>
-              </MessageActions>
-            )}
-          </div>
-        )}
-      </div>
-    </Message>
-  );
-}
-
-function AssistantBubble({
-  bubble,
-  isLastAssistant = false,
-  showsWorking = false,
-}: {
-  bubble: Extract<Bubble, { kind: "assistant" }>;
-  isLastAssistant?: boolean;
-  showsWorking?: boolean;
-}) {
-  // The walker only emits an assistant bubble when at least one
-  // assistant-side block exists, so `items` is non-empty here in the
-  // common case. The "Working…" shimmer for the empty-items / streaming
-  // gap is rendered at the page level, not inside this component.
-  const sessionStatus = useChatStore((s) => s.sessionStatus);
-  const conversationId = useChatStore((s) => s.conversationId);
-  // A pending elicitation means the turn is parked awaiting the user —
-  // still in flight even when its lifecycle or the session status reads
-  // settled (e.g. a reload while parked). Feeds the fold suppression.
-  const hasPendingElicitation = useChatStore((s) =>
-    s.blocks.some((b) => b.type === "elicitation" && b.status === "pending"),
-  );
-  // Getter computes the markdown lazily at click time — the hook must run
-  // before the early return below (rules of hooks), but `markdownText` is
-  // derived after it.
-  const { isCopied, handleCopy } = useCopyMessage(() => collectBubbleMarkdown(bubble.items));
-  // null outside AppShell's provider (isolated tests) → hide the action.
-  const forkDialog = useForkDialog();
-  const handleRetryError = useCallback(async () => {
-    if (!conversationId) throw new Error("Session is not available");
-    const result = await retrySession(conversationId);
-    if (!result.recovered) {
-      throw new Error("The session is already connected; no recovery was performed");
-    }
-  }, [conversationId]);
-
-  if (bubble.items.length === 0) return null;
-
-  const markdownText = collectBubbleMarkdown(bubble.items);
-  const ts = formatBubbleTimestamp(bubble.createdAtS);
-
-  // The bubble collapses to nothing but the "Worked for" row — its text
-  // all sits inside the fold, and its answer lands in a later bubble.
-  const foldOnly = rendersOnlyWorkedFold({
-    items: bubble.items,
-    sessionStatus,
-    turnLifecycle: bubble.lifecycle,
-    continued: bubble.continued,
-    isLastAssistant,
-    hasPendingElicitation,
-    showsWorking,
-  });
-
-  // Elicitation cards (e.g. AskUserQuestion form) want full chat-column
-  // width to match the composer, not the default w-fit shrink-to-content.
-  const hasElicitation = bubble.items.some((it) => it.kind === "elicitation");
-  const isWide =
-    hasElicitation || containsMarkdownTable(bubble.items) || containsDisplayMath(bubble.items);
-  // An error banner's dashed rule spans the full chat column: MessageContent
-  // is w-fit, so without w-full an error-only bubble shrink-wraps the 560px
-  // pill and the rule clips to it instead of reaching the column edges.
-  const hasError = bubble.items.some((it) => it.kind === "error");
-  // A bubble carrying an error but no prose stands alone as a thread-level
-  // element — the hover footer's timestamp/actions belong to assistant text,
-  // not to the error.
-  const errorOnly = hasError && !markdownText;
-  const spansFullColumn = isWide || hasError;
-
-  return (
-    <>
-      <Message
-        from="assistant"
-        data-testid="message-bubble"
-        data-role="assistant"
-        className={
-          spansFullColumn ? "max-w-full" : "max-w-3xl min-[2561px]:max-w-[clamp(56rem,30vw,64rem)]"
-        }
-      >
-        {/* A fold-only bubble takes w-full at the ordinary max-w-3xl cap
-            rather than shrink-wrapping to the summary row's ~110px, which
-            collapsed the row's trailing hairline (a flex-1 span) to zero
-            and stopped its click target short of the column. Keeping the
-            cap lands the hairline where an answered turn's does. */}
-        <MessageContent className={spansFullColumn || foldOnly ? "w-full" : undefined}>
-          <BlockRenderer
-            items={bubble.items}
-            sessionStatus={sessionStatus}
-            turnLifecycle={bubble.lifecycle}
-            workedForS={bubble.workedForS}
-            continued={bubble.continued}
-            isLastAssistant={isLastAssistant}
-            hasPendingElicitation={hasPendingElicitation}
-            lastActivityAtS={bubble.lastActivityAtS}
-            showsWorking={showsWorking}
-            onRetryError={handleRetryError}
-          />
-        </MessageContent>
-        {bubble.lifecycle === "cancelled" && (
-          <p
-            className="mt-1 flex items-center gap-1 text-sm text-muted-foreground"
-            data-testid="assistant-interrupted-indicator"
-          >
-            <XIcon className="size-3" aria-hidden="true" />
-            <span>Interrupted</span>
-          </p>
-        )}
-        {/* Skipped on a fold-only bubble: the actions belong to content
-            the user can see, and hanging them off a collapsed row spaced
-            consecutive rows unevenly depending on hidden narration. Also
-            skipped when there is neither a timestamp nor actions to show.
-            Also skipped on an error-only bubble: the banner stands alone as
-            a thread-level element, so no timestamp/actions hang off it.
-            40%-visible on touch (no hover), hover/focus-reveal on desktop.
-            Order matches the design target: actions, then timestamp. */}
-        {!foldOnly && !errorOnly && (ts || markdownText) && (
-          <div className="flex items-center gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
-            {markdownText && (
-              <MessageActions>
-                <MessageAction
-                  tooltip="Copy"
-                  size="icon-xxs"
-                  onClick={handleCopy}
-                  componentId="chat.message.copy_assistant"
-                >
-                  {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-                </MessageAction>
-                {/* Fork from this response: clone the session with history
-                    truncated after this turn. Hidden while the response is
-                    still streaming (its items aren't committed yet) and when
-                    the session can't be forked (sub-agent / isolated mount). */}
-                {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
-                  <MessageAction
-                    tooltip="Fork from here"
-                    size="icon-xxs"
-                    data-testid="fork-from-response"
-                    onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
-                    componentId="chat.message.fork"
-                  >
-                    <GitForkIcon size={14} />
-                  </MessageAction>
-                )}
-              </MessageActions>
-            )}
-            {ts && (
-              <span
-                className="select-none text-[11px] leading-4 text-foreground/56"
-                data-testid="message-timestamp"
-              >
-                {ts}
-              </span>
-            )}
-          </div>
-        )}
-      </Message>
-
-      {/* Surface a turn-level failure (a failed send or stream) as the same
-          destructive pill an error block renders — never raw red text. A
-          dropped host connection already carries its own error pill inside the
-          bubble and leaves `bubble.error` null, so this stays hidden there. */}
-      {bubble.lifecycle === "failed" && bubble.error && (
-        <ErrorBanner message={bubble.error} source="" code="" />
-      )}
-    </>
-  );
-}
-
 interface ReplyQuote {
   id: string;
   text: string;
@@ -3778,6 +1781,7 @@ interface ComposerProps {
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
   showClaudePermissionMode?: boolean;
+  showCodexApprovalMode?: boolean;
   /** Show the session Goal control. */
   showGoalControl?: boolean;
   /** Show Polly's Claude SDK command-backed Goal control. */
@@ -4404,6 +2408,7 @@ export function Composer({
   codexModelOptions,
   showCodexPlanMode,
   showClaudePermissionMode = false,
+  showCodexApprovalMode = false,
   showGoalControl = false,
   showClaudeGoalControl = false,
   showPollyCodexGoalControl = false,
@@ -5645,19 +3650,26 @@ export function Composer({
               />
             )}
             <div className="flex min-h-9 min-w-0 items-center rounded-lg transition-colors empty:hidden md:min-h-8 has-[button:not([aria-disabled=true])]:hover:bg-muted dark:has-[button:not([aria-disabled=true])]:hover:bg-muted/50 [&>button]:bg-transparent!">
-              <ComposerModelEffortLabel
-                showModels={showModels}
-                showEffort={showEffort}
+              <ComposerModelSource
                 modelPickerKind={modelPickerKind}
                 codexModelOptions={codexModelOptions}
                 costRoutingEligible={costRoutingEligible}
-                harnessLabel={harnessLabel}
-              />
+              >
+                <ComposerModelEffortLabel
+                  showModels={showModels}
+                  showEffort={showEffort}
+                  modelPickerKind={modelPickerKind}
+                  codexModelOptions={codexModelOptions}
+                  costRoutingEligible={costRoutingEligible}
+                  harnessLabel={harnessLabel}
+                />
+              </ComposerModelSource>
               <ComposerConfigGear
                 harnessLabel={harnessLabel}
                 showModels={showModels}
                 showEffort={showEffort}
                 showClaudePermissionMode={showClaudePermissionMode}
+                showCodexApprovalMode={showCodexApprovalMode}
                 effortLevels={effortLevels}
                 modelPickerKind={modelPickerKind}
                 codexModelOptions={codexModelOptions}
@@ -5723,14 +3735,6 @@ export function Composer({
       />
     </form>
   );
-}
-
-// The "Working…" shimmer tracks the server-side session status 1:1 with the
-// status badge — no optimistic bridges. There is a brief gap after a send
-// before the server confirms `running` (exactly like the badge); that's the
-// intended behavior — the indicator reflects what the agent is actually doing.
-export function computeIsWorking(sessionStatus: SessionStatus): boolean {
-  return sessionStatus === "running" || sessionStatus === "waiting";
 }
 
 /**
@@ -6104,6 +4108,22 @@ export function shouldShowClaudePermissionModeControl(
 }
 
 /**
+ * True when the codex-native approval-mode picker should be visible.
+ *
+ * Codex-native sessions only: the switch drives Codex's own approval/sandbox
+ * presets (the ``/permissions`` popup), which no other harness has.
+ *
+ * :param conv: Session-like object carrying `labels`; a missing session or
+ *     missing labels fails closed.
+ * :returns: True only for sessions running the codex-native wrapper.
+ */
+export function shouldShowCodexApprovalModeControl(
+  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+): boolean {
+  return isCodexNativeSession(conv);
+}
+
+/**
  * True when the session Goal control should be visible.
  *
  * @param conv - Session or sidebar row carrying labels. ``null`` or missing
@@ -6169,6 +4189,7 @@ function SessionConfigModal({
   showModels,
   showEffort,
   showClaudePermissionMode = false,
+  showCodexApprovalMode = false,
   effortLevels,
   modelPickerKind,
   codexModelOptions,
@@ -6181,6 +4202,7 @@ function SessionConfigModal({
   showModels: boolean;
   showEffort: boolean;
   showClaudePermissionMode?: boolean;
+  showCodexApprovalMode?: boolean;
   effortLevels: readonly string[];
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
@@ -6189,6 +4211,7 @@ function SessionConfigModal({
 }) {
   const selectedEffort = useSessionEffort();
   const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
+  const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const conversationId = useChatStore((s) => s.conversationId);
@@ -6219,6 +4242,12 @@ function SessionConfigModal({
   const [draftEffort, setDraftEffort] = useState<string | null>(selectedEffort);
   const [draftRoutingOn, setDraftRoutingOn] = useState(liveRoutingOn);
   const [draftPermissionMode, setDraftPermissionMode] = useState(claudePermissionMode);
+  const [draftApprovalMode, setDraftApprovalMode] = useState(codexApprovalMode);
+  // Unlike the other drafts (snapshot-on-open), the approval picker must track
+  // live store changes while the modal stays open — a /permissions change in
+  // the TUI republishes the mode via SSE. This flags a user pick so the resync
+  // effect below stops mirroring once they've started editing.
+  const approvalTouchedRef = useRef(false);
   // The sub-agent row is stored as a PICK, not a pre-seeded draft:
   // `undefined` means "untouched", so the row mirrors the live stored value for
   // as long as the user hasn't chosen anything. A draft seeded once per open
@@ -6234,6 +4263,8 @@ function SessionConfigModal({
     setDraftEffort(selectedEffort);
     setDraftRoutingOn(liveRoutingOn);
     setDraftPermissionMode(claudePermissionMode);
+    setDraftApprovalMode(codexApprovalMode);
+    approvalTouchedRef.current = false;
     setPickedSubagentRouting(undefined);
     // Nothing pushes a routing-switch change to the client (no SSE event, and
     // the session query never goes stale), so re-read them here — otherwise the
@@ -6243,6 +4274,12 @@ function SessionConfigModal({
     // session changes under an open modal (its drafts describe the old one).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, conversationId]);
+
+  // Follow live approval-mode changes while the modal is open (a TUI
+  // /permissions switch republishes via SSE), until the user picks here.
+  useEffect(() => {
+    if (open && !approvalTouchedRef.current) setDraftApprovalMode(codexApprovalMode);
+  }, [open, codexApprovalMode]);
 
   // The Select value: the router sentinel when routing is drafted on, else the
   // drafted model, else the "Default" sentinel (no override).
@@ -6344,6 +4381,10 @@ function SessionConfigModal({
         // sequence rather than firing concurrently.
         if (showClaudePermissionMode && draftPermissionMode !== claudePermissionMode)
           await store.setClaudePermissionMode(draftPermissionMode);
+        // Codex approval switch drives Codex's own /permissions popup on the
+        // runner — same awaited sequence so it can't race the others.
+        if (showCodexApprovalMode && draftApprovalMode !== codexApprovalMode)
+          await store.setCodexApprovalMode(draftApprovalMode);
         // Sub-agent routing is independent of this session's own model — a
         // plain PATCH with no slash-command injection, so ordering is free.
         // Only an explicit pick is written, and only when it still differs from
@@ -6489,6 +4530,43 @@ function SessionConfigModal({
               </Select>
             </ConfigRow>
           )}
+          {showCodexApprovalMode && (
+            <ConfigRow label="Approvals" description="How much Codex asks before acting">
+              {/* Drives Codex's own /permissions popup by keystroke injection,
+                  so the options mirror it exactly. An empty draft (no switch
+                  seen yet) reads as the placeholder rather than a guessed
+                  default. */}
+              <Select
+                value={draftApprovalMode}
+                onValueChange={(v) => {
+                  approvalTouchedRef.current = true;
+                  setDraftApprovalMode(v);
+                }}
+                componentId="chat.composer.codex_approval_mode"
+                valueHasNoPii
+              >
+                <SelectTrigger
+                  className="w-full"
+                  data-testid="composer-config-approval-mode"
+                  aria-label="Approval mode"
+                >
+                  <SelectValue placeholder="Set in Codex">
+                    {codexApprovalModeLabel(draftApprovalMode) || undefined}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent position="popper" align="start">
+                  {CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS.map((mode) => (
+                    <SelectItem key={mode.value} value={mode.value} data-approval-mode={mode.value}>
+                      <span className="flex flex-col items-start">
+                        <span>{mode.label}</span>
+                        <span className="text-muted-foreground text-xs">{mode.description}</span>
+                      </span>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </ConfigRow>
+          )}
           {/* Sub-agent routing — the only in-session routing control, for a
           native session whose launch installed the spawn-routing apparatus
           (spawns route through the harness hook) and for SDK/bundle agents
@@ -6558,6 +4636,7 @@ function ComposerConfigGear({
   showModels,
   showEffort,
   showClaudePermissionMode = false,
+  showCodexApprovalMode = false,
   effortLevels,
   modelPickerKind,
   codexModelOptions,
@@ -6570,6 +4649,7 @@ function ComposerConfigGear({
   showModels: boolean;
   showEffort: boolean;
   showClaudePermissionMode?: boolean;
+  showCodexApprovalMode?: boolean;
   effortLevels: readonly string[];
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
@@ -6603,7 +4683,8 @@ function ComposerConfigGear({
     !showEffort &&
     !costRoutingEligible &&
     !subagentRoutingEligible &&
-    !showClaudePermissionMode
+    !showClaudePermissionMode &&
+    !showCodexApprovalMode
   )
     return null;
 
@@ -6642,11 +4723,11 @@ function ComposerConfigGear({
           {summary.length > 0 && (
             <TooltipContent
               side="top"
-              className="flex-col items-start gap-0.5 px-3 py-2"
+              className="max-w-80 flex-col items-start gap-0.5 px-3 py-2"
               data-testid="composer-config-gear-tooltip"
             >
               {summary.map((row) => (
-                <span key={row.label} className="text-muted-foreground">
+                <span key={row.label} className="max-w-72 truncate text-muted-foreground">
                   {row.label}:{" "}
                   <span className="text-background dark:text-popover-foreground">{row.value}</span>
                 </span>
@@ -6662,6 +4743,7 @@ function ComposerConfigGear({
         showModels={showModels}
         showEffort={showEffort}
         showClaudePermissionMode={showClaudePermissionMode}
+        showCodexApprovalMode={showCodexApprovalMode}
         effortLevels={effortLevels}
         modelPickerKind={modelPickerKind}
         codexModelOptions={codexModelOptions}
@@ -6694,7 +4776,10 @@ function useSessionConfigSummary({
 }): { label: string; value: string }[] {
   const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
-  const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
+  const { effectiveModel, modelLabel } = useResolvedComposerModel(
+    modelPickerKind,
+    codexModelOptions,
+  );
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
 
   const rows: { label: string; value: string }[] = [];
@@ -6710,6 +4795,12 @@ function useSessionConfigSummary({
   if (showEffort && !routingOn) {
     const effortValue = formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex");
     rows.push({ label: "Effort", value: effortValue ?? "Default" });
+  }
+  if (!routingOn) {
+    const source =
+      findNativeModelOption(codexModelOptions, effectiveModel)?.source ??
+      codexModelOptions.find((option) => option.source)?.source;
+    rows.push(...modelConfigurationSourceRows(source));
   }
   return rows;
 }
@@ -6818,6 +4909,59 @@ function useResolvedComposerModel(
     effectiveModel,
     modelLabel,
   };
+}
+
+/** Compact, inspectable provenance beside the composer's model label. */
+function ComposerModelSource({
+  modelPickerKind,
+  codexModelOptions,
+  costRoutingEligible,
+  children,
+}: {
+  modelPickerKind: NativeModelPickerKind | null;
+  codexModelOptions: readonly NativeModelOption[];
+  costRoutingEligible: boolean;
+  children: ReactNode;
+}) {
+  const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
+  const { effectiveModel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
+  const source =
+    findNativeModelOption(codexModelOptions, effectiveModel)?.source ??
+    codexModelOptions.find((option) => option.source)?.source;
+  const routingOn = costRoutingEligible && costControlModeOverride === "on";
+  if (routingOn || !source) return children;
+
+  const rows = modelConfigurationSourceRows(source);
+  return (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span
+            tabIndex={0}
+            data-testid="composer-model-source"
+            className="min-w-0 shrink outline-none rounded-md focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {children}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent
+          side="top"
+          className="flex max-w-80 flex-col items-start gap-1 px-3 py-2"
+          data-testid="composer-model-source-tooltip"
+        >
+          <span className="font-medium text-background dark:text-popover-foreground">
+            Model configuration
+          </span>
+          {rows.map((row) => (
+            <span key={row.label} className="max-w-72 truncate text-muted-foreground">
+              {row.label}:{" "}
+              <span className="text-background dark:text-popover-foreground">{row.value}</span>
+            </span>
+          ))}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
 }
 
 /**

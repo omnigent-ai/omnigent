@@ -1,4 +1,4 @@
-import { BotIcon, ChevronLeftIcon, FolderIcon } from "lucide-react";
+import { BotIcon, ChevronLeftIcon } from "lucide-react";
 import type { ReactNode } from "react";
 import { Link } from "@/lib/routing";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -6,6 +6,7 @@ import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { nativeCodingAgentForSubagentWrapper } from "@/lib/nativeCodingAgents";
 import type { Agent } from "@/hooks/useAgents";
 import { cn } from "@/lib/utils";
+import { ProjectRowIcon } from "./ProjectPicker";
 
 /**
  * `[folder] / <title> [/ <sub-agent>]` breadcrumb for the active conversation.
@@ -24,6 +25,7 @@ import { cn } from "@/lib/utils";
 export function ConversationBreadcrumb({
   conversationTitle,
   projectName,
+  projectIcon,
   projectTag,
   titleSlot,
   titleLinkTo,
@@ -38,6 +40,12 @@ export function ConversationBreadcrumb({
   conversationTitle: string;
   /** Project the conversation is filed under, or `null` when unfiled. */
   projectName: string | null;
+  /**
+   * The filed project's chosen emoji icon (a unicode grapheme), or `null` for
+   * the default folder glyph. Used by the static leading segment (when
+   * `projectTag` is omitted); the interactive tag carries its own icon.
+   */
+  projectIcon?: string | null;
   /**
    * Leading folder segment. When set (the desktop title shortcut), it replaces
    * the static folder icon with an interactive "Move to…" trigger and self-gates
@@ -98,17 +106,22 @@ export function ConversationBreadcrumb({
             <Tooltip>
               <TooltipTrigger asChild>
                 <span
-                  className="breadcrumb-folder flex shrink-0 items-center text-muted-foreground opacity-40 hover:opacity-100"
+                  className={cn(
+                    "breadcrumb-folder flex shrink-0 items-center text-muted-foreground hover:opacity-100",
+                    // A full-color emoji reads as washed-out when faded, so only
+                    // dim the monochrome folder fallback.
+                    projectIcon ? "opacity-100" : "opacity-40",
+                  )}
                   aria-label={`Project: ${projectName}`}
                 >
-                  <FolderIcon className="size-4" />
+                  <ProjectRowIcon icon={projectIcon} className="size-4 text-[16px]" />
                 </span>
               </TooltipTrigger>
               <TooltipContent side="bottom" align="start">
                 <div>
                   <span className="font-semibold text-ui">{conversationTitle}</span>
                   <div className="flex gap-1 text-muted-foreground">
-                    <FolderIcon className="size-4" />
+                    <ProjectRowIcon icon={projectIcon} className="size-4 text-[16px]" />
                     {projectName}
                   </div>
                 </div>

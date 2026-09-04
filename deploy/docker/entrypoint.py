@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from fastapi import FastAPI
 
+    from omnigent.server.managed_hosts import ManagedSandboxDeployment
     from omnigent.stores.artifact_store import ArtifactStore
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True)
@@ -309,6 +310,35 @@ def _resolve_execution_timeout(cfg: dict[str, Any]) -> int:
     return int(cfg.get("execution_timeout") or 7200)
 
 
+def log_capabilities(
+    sandbox_config: ManagedSandboxDeployment | None,
+    github_config: object | None,
+    github_store: object | None,
+) -> None:
+    """
+    Log the same flags ``/v1/info`` exposes, so a missing ``sandbox:``
+    block or GitHub App env shows up in pod logs without curling.
+
+    Reads ``sandbox_config.default.provider``, not ``.provider``:
+    :class:`ManagedSandboxDeployment` wraps one config PER PROVIDER and has
+    no ``provider`` of its own, so the bare attribute raises
+    ``AttributeError`` and kills the server at boot. Split out of
+    :func:`build_app` so the expression is reachable from a test without
+    standing up a database.
+
+    :param sandbox_config: The resolved sandbox deployment, or ``None``.
+    :param github_config: The GitHub App config, or ``None``.
+    :param github_store: The GitHub connection store, or ``None``.
+    """
+    managed = sandbox_config is not None and sandbox_config.managed_launch_supported
+    logger.info(
+        "Capabilities: managed_sandboxes=%s provider=%s github_app=%s",
+        managed,
+        sandbox_config.default.provider if managed and sandbox_config else None,
+        github_config is not None and github_store is not None,
+    )
+
+
 def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     """Resolve config if needed, wire the stores, and build the app.
 
@@ -460,15 +490,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         github_store=github_store,
     )
 
-    # Surface the same flags /v1/info exposes so a missing sandbox:
-    # block or GitHub App env shows up in pod logs without curling.
-    managed = sandbox_config is not None and sandbox_config.managed_launch_supported
-    logger.info(
-        "Capabilities: managed_sandboxes=%s provider=%s github_app=%s",
-        managed,
-        sandbox_config.provider if managed else None,
-        github_config is not None and github_store is not None,
-    )
+    log_capabilities(sandbox_config, github_config, github_store)
 
     return _BuiltApp(app=app, host=resolved_config.host, port=resolved_config.port)
 

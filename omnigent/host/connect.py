@@ -883,6 +883,29 @@ class ModelOptionsResult:
     routable_models: list[str]
 
 
+def _model_configuration_source_for_harness(harness: str) -> dict[str, str] | None:
+    """Resolve the host's ambient model provider without exposing credentials."""
+    from omnigent.model_catalog import model_configuration_source, resolve_model_provider
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="host-model-preview",
+        executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+    )
+    provider = resolve_model_provider(spec, harness)
+    return model_configuration_source(provider, harness=harness)
+
+
+def _with_model_configuration_source(
+    models: list[dict[str, object]], harness: str
+) -> list[dict[str, object]]:
+    source = _model_configuration_source_for_harness(harness)
+    if source is None:
+        return models
+    return [{**model, "source": source} for model in models]
+
+
 @dataclass
 class _RunnerHandle:
     """A spawned runner subprocess and where its output lands.
@@ -1503,10 +1526,12 @@ class HostProcess:
                 "registered to a different account on this server, so the "
                 "account you authenticated as cannot claim it. This usually "
                 "means the host was first registered under another identity "
-                "(e.g. the single-user 'local' owner before the server "
-                "switched to accounts auth). Ask an administrator to remove "
-                "the existing host registration, or reset this machine's host "
-                "id, then retry. " + self._login_fix_hint()
+                "(e.g. an M2M service principal selected from "
+                "~/.databrickscfg, or the single-user 'local' owner before "
+                "the server switched to accounts auth). Run "
+                f"`{cli_invocation()} host reset-id` to mint a fresh host id "
+                "for this machine and retry, or ask an administrator to "
+                "remove the existing host registration. " + self._login_fix_hint()
             )
         # Any other permanent 4xx (e.g. a 400 for a malformed host id, or an
         # edge/proxy rejection): the server's own body is the authoritative
@@ -2709,6 +2734,7 @@ class HostProcess:
         re-reads that authoritative snapshot after bind.
         """
         harness = canonicalize_harness(frame.harness) or frame.harness
+        with_source = functools.partial(_with_model_configuration_source, harness=harness)
         if harness == "codex-native":
             # Harness-truth lane: every launch shape is answered from the
             # shared catalog, probed from the configured Codex binary itself.
@@ -2719,7 +2745,7 @@ class HostProcess:
                 return HostModelOptionsResultFrame(
                     request_id=frame.request_id,
                     status="ok",
-                    models=probed.models,
+                    models=with_source(probed.models),
                     routable_models=probed.routable_models,
                 )
             return HostModelOptionsResultFrame(
@@ -2744,7 +2770,7 @@ class HostProcess:
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,
                 status="ok",
-                models=pi_models,
+                models=with_source(pi_models),
             )
 
         if is_claude_sdk_harness_name(harness):
@@ -2780,13 +2806,15 @@ class HostProcess:
                     return HostModelOptionsResultFrame(
                         request_id=frame.request_id,
                         status="ok",
-                        models=probed.models,
+                        models=with_source(probed.models),
                         routable_models=probed.routable_models,
                     )
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,
                 status="ok",
-                models=[{"id": model.id, "displayName": model.id} for model in listing.models],
+                models=with_source(
+                    [{"id": model.id, "displayName": model.id} for model in listing.models]
+                ),
                 routable_models=[model.id for model in listing.models],
             )
         if harness != "claude-native":
@@ -2800,7 +2828,7 @@ class HostProcess:
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,
                 status="ok",
-                models=probed.models,
+                models=with_source(probed.models),
                 routable_models=probed.routable_models,
             )
         return HostModelOptionsResultFrame(
@@ -2853,14 +2881,14 @@ class HostProcess:
         if op == "github_info":
             return r.github_info()
         if op == "github_changes":
-            return r.github_changes(cast("str | None", params.get("base")))
+            return r.github_changes()
         if op == "github_diff":
             return r.github_file_diff(
                 cast("str | None", params.get("base")),
                 str(params.get("path", "")),
             )
         if op == "github_pr_diff":
-            return r.github_pr_diff(cast("str | None", params.get("base")))
+            return r.github_pr_diff()
         raise ValueError(f"unknown fs op: {op!r}")
 
     async def _handle_create_worktree(
@@ -3998,6 +4026,14 @@ def run_host_process(
     _cli_log = current_cli_log_path()
     if _cli_log is not None and _cli_log != host_log_path:
         print(f"CLI diagnostics: {display_log_path(_cli_log)}")
+
+    # Executor-agnostic GitHub setup: point git at the server's credential
+    # broker and attribute commits to the owner. Best-effort; the host runs in
+    # every executor and holds the launch token, so no launcher needs to inject
+    # anything GitHub-specific.
+    from omnigent.git_credential_github import configure_host_git
+
+    configure_host_git(server_url, identity.host_id)
 
     if lifecycle_lock is None and daemon_target is not None:
         lifecycle_lock = DaemonLifecycleLock.for_target(daemon_target)

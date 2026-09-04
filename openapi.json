@@ -4515,6 +4515,7 @@
             "session.agent_changed": "#/components/schemas/SessionAgentChangedEvent",
             "session.changed_files.invalidated": "#/components/schemas/SessionChangedFilesInvalidatedEvent",
             "session.child_session.updated": "#/components/schemas/SessionChildSessionUpdatedEvent",
+            "session.codex_approval_mode": "#/components/schemas/SessionCodexApprovalModeEvent",
             "session.collaboration_mode": "#/components/schemas/SessionCollaborationModeEvent",
             "session.created": "#/components/schemas/SessionCreatedEvent",
             "session.heartbeat": "#/components/schemas/SessionHeartbeatEvent",
@@ -4565,6 +4566,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionPermissionModeEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionCodexApprovalModeEvent"
           },
           {
             "$ref": "#/components/schemas/SessionAgentChangedEvent"
@@ -4843,6 +4847,47 @@
           "child"
         ],
         "title": "SessionChildSessionUpdatedEvent",
+        "type": "object"
+      },
+      "SessionCodexApprovalModeEvent": {
+        "description": "Active approval/sandbox-mode update from a codex-native session.\n\nEmitted after the web UI switches the mode, and after the Codex forwarder\nobserves a `thread/settings/updated` notification \u2014 an approval change the\nuser made inside Codex's `/permissions` popup, which Omnigent has no other\nway to see. Lets the composer's approval picker track the thread without a\nreload.",
+        "properties": {
+          "approval_mode": {
+            "description": "The active mode, one of `\"ask-for-approval\"`, `\"approve-for-me\"`, `\"full-access\"`, `\"read-only\"`. Category: **transient** (SSE-only). The server also writes `omnigent.codex_native.approval_mode` on the conversation labels (and `terminal_launch_args`), so reconnecting clients restore the same state from the session snapshot.",
+            "title": "Approval Mode",
+            "type": "string"
+          },
+          "conversation_id": {
+            "description": "Session identifier, e.g. `\"conv_abc123\"`.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.codex_approval_mode",
+            "description": "Always `\"session.codex_approval_mode\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "approval_mode"
+        ],
+        "title": "SessionCodexApprovalModeEvent",
         "type": "object"
       },
       "SessionCollaborationModeEvent": {
@@ -7940,6 +7985,18 @@
         "additionalProperties": false,
         "description": "Request body for `PATCH /v1/sessions/{id}`.\n\nThe Alpha runner-state pivot makes this endpoint the mutable\nsession affinity primitive when `runner_id` is provided. The\nserver validates that the runner is online, then replaces\n`conversations.runner_id`. Existing session metadata updates\nremain supported for clients that update title, labels, or\nreasoning effort through the sessions API.",
         "properties": {
+          "approval_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Codex-native approval mode to switch a running session to, one of `\"ask-for-approval\"`, `\"approve-for-me\"`, `\"full-access\"`, `\"read-only\"` \u2014 Codex's own `/permissions` presets (the set is codex-version-dependent, so an older build may not offer every one). Only valid for sessions stamped with the codex-native wrapper label. The runner applies it by driving Codex's `/permissions` popup and confirms the switch echoed before returning, so a failure to reach the mode surfaces as an error. The confirmed mode is stored on the read-back label only (Codex owns the durable approval state), so it is not written to `terminal_launch_args`. Omitted leaves unchanged.",
+            "title": "Approval Mode"
+          },
           "archived": {
             "anyOf": [
               {
@@ -8995,6 +9052,76 @@
           }
         },
         "summary": "Detect Host Credentials",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/credentials/{provider}": {
+      "get": {
+        "description": "Return the session owner's *provider* credential for *host_id*.\n\nAuthenticated by the launch token (constant-time, expiry-aware, and\nbound to *host_id*), exactly like the host tunnel. `401` when the\ntoken doesn't resolve; `404` for a provider with no broker resolver or\nnot configured on this server; `{\"connected\": false}` when the owner\nhasn't linked it, so a caller can fall back cleanly.",
+        "operationId": "host_credential_v1_hosts__host_id__credentials__provider__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "provider",
+            "required": true,
+            "schema": {
+              "title": "Provider",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-omnigent-host-token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Omnigent-Host-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Host Credential V1 Hosts  Host Id  Credentials  Provider  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Host Credential",
         "tags": [
           "hosts"
         ]
@@ -10558,7 +10685,7 @@
     },
     "/v1/sessions/{session_id}": {
       "delete": {
-        "description": "Delete a session and all associated resources.\n\nRequires owner-level access. Tears down tasks, runner-side\nresources (environments, terminals), session files, and the\nconversation row.\n\n**Returns:** A `ConversationDeleted` confirmation.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access, 403 if insufficient permissions.",
+        "description": "Delete a session and all associated resources.\n\nRequires owner-level access. Tears down tasks, runner-side\nresources (environments, terminals), session files, and the\nconversation row.\n\n**Returns:** A `ConversationDeleted` confirmation.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access, 403 if insufficient permissions, 409 if `delete_branch=true` and the host is offline so worktree cleanup cannot run.",
         "operationId": "delete_session_v1_sessions__session_id__delete",
         "parameters": [
           {
@@ -10572,7 +10699,7 @@
             }
           },
           {
-            "description": "Opt-in git cleanup, as a query param (`?delete_branch=true`). When `True` and the session has a server-created worktree (`git_branch` set), the host removes the worktree directory and deletes its branch (`git worktree remove --force` then `git branch -D`). Ignored for sessions with no worktree. Best-effort: a cleanup failure does not block the delete. Defaults to `False` (worktree and branch left untouched). See designs/SESSION_GIT_WORKTREE.md.",
+            "description": "Opt-in git cleanup, as a query param (`?delete_branch=true`). When `True` and the session has a server-created worktree (`git_branch` set), the host removes the worktree directory and deletes its branch (`git worktree remove --force` then `git branch -D`). Ignored for sessions with no worktree. If the host tunnel is down (typically `runner_online: false`), the delete is rejected with 409 so the caller can retry without cleanup rather than receiving a misleading 404. A host-reported git failure is still logged and does not block the delete. Defaults to `False` (worktree and branch left untouched). See designs/SESSION_GIT_WORKTREE.md.",
             "in": "query",
             "name": "delete_branch",
             "required": false,
@@ -13801,7 +13928,7 @@
     },
     "/v1/sessions/{session_id}/resources/github/changes": {
       "get": {
-        "description": "List files changed on the branch relative to its base (PR diff).\n\n**Returns:** Flat list of changed files with `status` and line counts.",
+        "description": "List the PR's changed files (empty when the branch has no PR).\n\n**Returns:** Flat list of changed files with `status` and line counts.",
         "operationId": "list_session_github_changes_v1_sessions__session_id__resources_github_changes_get",
         "parameters": [
           {
@@ -13812,23 +13939,6 @@
             "schema": {
               "title": "Session Id",
               "type": "string"
-            }
-          },
-          {
-            "description": "Base branch name; the runner derives the default when omitted.",
-            "in": "query",
-            "name": "base",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Base"
             }
           }
         ],
