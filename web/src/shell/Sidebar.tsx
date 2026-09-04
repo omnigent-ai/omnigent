@@ -626,7 +626,11 @@ export function Sidebar({
       ...(filteredConversationsQuery.data?.pages ?? []).flatMap((p) => p.data),
     ];
     const seen = new Set<string>();
-    return rows.filter((c) => !seen.has(c.id) && (seen.add(c.id) as true));
+    return rows.filter((c) => {
+      if (seen.has(c.id)) return false;
+      seen.add(c.id);
+      return true;
+    });
   }, [conversationsQuery.data, filteredConversationsQuery.data]);
   const pendingApprovals = useMemo(() => sumPendingApprovals(loadedRows), [loadedRows]);
   // Plus unseen file comments — the badge counts everything the Inbox
