@@ -10472,13 +10472,13 @@
             }
           },
           {
-            "description": "Ownership filter for the sidebar's My/Shared split. `\"mine\"` returns only sessions the caller owns (owner-level grant). `\"shared\"` returns only sessions accessible to the caller but owned by someone else. `\"all\"` (default) returns all accessible sessions, matching the legacy behaviour.",
+            "description": "Ownership/archive filter for the sidebar tabs. `\"mine\"` returns only sessions the caller owns (owner-level grant). `\"shared\"` returns only sessions accessible but not owned. `\"archived\"` returns only archived sessions. `\"all\"` (default) returns all accessible non-archived sessions, matching the legacy behaviour.",
             "in": "query",
             "name": "visibility",
             "required": false,
             "schema": {
               "default": "all",
-              "pattern": "^(all|mine|shared)$",
+              "pattern": "^(all|mine|shared|archived)$",
               "title": "Visibility",
               "type": "string"
             }

@@ -427,7 +427,7 @@ async function fetchConversationsPage({
   searchQuery: string;
   includeArchived: boolean;
   project?: string;
-  visibility?: "mine" | "shared";
+  visibility?: "mine" | "shared" | "archived";
   queryClient: QueryClient;
 }): Promise<ConversationsPage> {
   // `updated_at` matches the sidebar's sort, which keeps server
@@ -513,7 +513,7 @@ export function useConversations(
   includeArchived = false,
   options: UseConversationsOptions = {},
   project?: string,
-  visibility?: "mine" | "shared",
+  visibility?: "mine" | "shared" | "archived",
 ) {
   // Live updates arrive over the `WS /v1/sessions/updates` push stream
   // (SessionUpdatesProvider), which patches this cache in place as watched

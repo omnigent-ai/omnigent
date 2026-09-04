@@ -5780,6 +5780,20 @@ def test_list_conversations_shared_only_empty_when_no_shared_sessions(
     assert result.data == []
 
 
+def test_list_conversations_archived_only_returns_only_archived(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``archived_only=True`` returns only archived sessions; active ones are excluded."""
+    active = conversation_store.create_conversation()
+    archived = conversation_store.create_conversation()
+    conversation_store.update_conversation(archived.id, archived=True)
+
+    result = conversation_store.list_conversations(archived_only=True, include_archived=True)
+    ids = {c.id for c in result.data}
+    assert archived.id in ids
+    assert active.id not in ids
+
+
 def test_live_state_columns_round_trip_without_bumping_updated_at(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

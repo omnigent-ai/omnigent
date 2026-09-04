@@ -589,12 +589,18 @@ export function Sidebar({
     reconcileWhileConnected: true,
   });
 
-  // Tab-scoped query — server-filtered for "mine" or "shared", disabled on
-  // other tabs. Paginates only the sessions relevant to the active tab so the
-  // sidebar never churns through hundreds of irrelevant pages while the user
-  // looks at a small filtered set (OMNI-6002).
+  // Tab-scoped query — server-filtered for "mine", "shared", or "archived",
+  // disabled on the "all" tab. Paginates only the sessions relevant to the
+  // active tab so the sidebar never churns through hundreds of irrelevant pages
+  // while the user looks at a small filtered set (OMNI-6002).
   const tabVisibility =
-    activeTab === "mine" ? "mine" : activeTab === "shared" ? "shared" : undefined;
+    activeTab === "mine"
+      ? "mine"
+      : activeTab === "shared"
+        ? "shared"
+        : activeTab === "archived"
+          ? "archived"
+          : undefined;
   const filteredConversationsQuery = useConversations(
     "",
     false,
@@ -602,8 +608,8 @@ export function Sidebar({
     undefined,
     tabVisibility,
   );
-  // "all" and "archived" tabs reuse the existing all-sessions query for display;
-  // "mine" and "shared" use the fast tab-scoped query.
+  // "all" tab reuses the all-sessions query for display; every other tab uses
+  // the server-filtered query so the sentinel only paginates matching sessions.
   const displayQuery = tabVisibility ? filteredConversationsQuery : conversationsQuery;
 
   // The scrollable list container — used as the IntersectionObserver root for

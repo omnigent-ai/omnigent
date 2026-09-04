@@ -958,7 +958,7 @@ def register_core_routes(
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
         project: str | None = Query(default=None),
         pinned: bool = Query(default=False),
-        visibility: str = Query(default="all", pattern="^(all|mine|shared)$"),
+        visibility: str = Query(default="all", pattern="^(all|mine|shared|archived)$"),
     ) -> PaginatedList:
         """
         List sessions with cursor-based pagination.
@@ -1006,12 +1006,12 @@ def register_core_routes(
             has pinned (the ``omnigent.pinned`` label). Lets the
             sidebar enumerate pinned sessions that fall outside the
             loaded pagination window. ``False`` (default) disables it.
-        :param visibility: Ownership filter for the sidebar's
-            My/Shared split. ``"mine"`` returns only sessions the
-            caller owns (owner-level grant). ``"shared"`` returns only
-            sessions accessible to the caller but owned by someone else.
-            ``"all"`` (default) returns all accessible sessions,
-            matching the legacy behaviour.
+        :param visibility: Ownership/archive filter for the sidebar tabs.
+            ``"mine"`` returns only sessions the caller owns (owner-level
+            grant). ``"shared"`` returns only sessions accessible but not
+            owned. ``"archived"`` returns only archived sessions.
+            ``"all"`` (default) returns all accessible non-archived
+            sessions, matching the legacy behaviour.
         :returns: A :class:`PaginatedList` of
             :class:`SessionListItem`.
         """
@@ -1040,10 +1040,22 @@ def register_core_routes(
             accessible_by_param: str | None = None
             owned_by_param: str | None = user_id
             shared_only_param = False
+            include_archived_param = False
+            archived_only_param = False
         elif visibility == "shared":
             accessible_by_param = user_id
             owned_by_param = None
             shared_only_param = True
+            include_archived_param = False
+            archived_only_param = False
+        elif visibility == "archived":
+            accessible_by_param = user_id
+            owned_by_param = None
+            shared_only_param = False
+            # archived_only=True implies include_archived=True — the store
+            # filters to archived=True regardless of include_archived.
+            include_archived_param = True
+            archived_only_param = True
         else:  # "all"
             accessible_by_param = user_id
             # A specific project folder ("My sessions"-only) must show only the
@@ -1055,6 +1067,8 @@ def register_core_routes(
             # shared sessions still surface for the "Shared with me" tab.
             owned_by_param = user_id if project else None
             shared_only_param = False
+            include_archived_param = include_archived
+            archived_only_param = False
         page = await asyncio.to_thread(
             conversation_store.list_conversations,
             limit=limit,
@@ -1073,7 +1087,8 @@ def register_core_routes(
             order=order,
             sort_by=sort_by,
             search_query=normalized_query,
-            include_archived=include_archived,
+            include_archived=include_archived_param,
+            archived_only=archived_only_param,
             project=project,
             pinned=pinned,
             # Pins are per-user: filter to the caller's own pin key.

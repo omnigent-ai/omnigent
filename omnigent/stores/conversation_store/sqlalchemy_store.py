@@ -2307,6 +2307,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         owned_by: str | None = None,
         shared_only: bool = False,
         include_archived: bool = False,
+        archived_only: bool = False,
         project: str | None = None,
         pinned: bool = False,
         pinned_owner: str | None = None,
@@ -2480,7 +2481,9 @@ class SqlAlchemyConversationStore(ConversationStore):
 
             # archived lives on the AP conversations table, so exclude it inline
             # (no metadata prefetch, no post-fetch filtering).
-            if not include_archived:
+            if archived_only:
+                stmt = stmt.where(SqlConversation.archived.is_(True))
+            elif not include_archived:
                 stmt = stmt.where(SqlConversation.archived.is_(False))
 
             if parent_conversation_id is not None:
