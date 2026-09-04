@@ -5460,12 +5460,12 @@ async def _await_settled_managed_launch(launch: ManagedLaunch) -> None:
     :raises OmnigentError: 503 when the launch failed or is still
         running at the timeout.
     """
-    from omnigent.server.managed_hosts import MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S
+    from omnigent.server.managed_hosts import managed_launch_rendezvous_timeout_s
 
     try:
         await asyncio.wait_for(
             launch.settled.wait(),
-            timeout=MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S,
+            timeout=managed_launch_rendezvous_timeout_s(),
         )
     except asyncio.TimeoutError:
         raise OmnigentError(

@@ -141,6 +141,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import os
 import posixpath
 import re
 import secrets
@@ -200,8 +201,17 @@ PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
 # before declaring failure. The image is pre-baked (no pip install at
 # boot), so a healthy launch registers in seconds; the budget covers a
 # cold registry pull of the image on first use.
-MANAGED_HOST_ONLINE_TIMEOUT_S = 120
+DEFAULT_MANAGED_HOST_ONLINE_TIMEOUT_S = 120
 _ONLINE_POLL_INTERVAL_S = 1.0
+
+ONLINE_TIMEOUT_ENV_VAR: str = "OMNIGENT_MANAGED_HOST_ONLINE_TIMEOUT_S"
+"""Environment variable overriding the host-registration budget in
+seconds (default :data:`DEFAULT_MANAGED_HOST_ONLINE_TIMEOUT_S`, 120 s).
+Provider-agnostic: it covers the wait for the host process INSIDE the
+sandbox to register, after the provider's own "is my instance running"
+wait (e.g. Kubernetes's ``pod_ready_timeout_s``) already succeeded. Raise
+it for a deployment whose host image or first-boot script is slow enough
+to blow past the default."""
 
 # Launch-token lifetime for the YAML modal path: Modal's 24h sandbox
 # cap plus an hour of slack, so a live sandbox can always
@@ -264,18 +274,15 @@ KUBERNETES_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # errors so an operator knows where to look inside the sandbox.
 _HOST_LOG_PATH = "/tmp/omnigent-host.log"
 
-# How long a message POST waits for an in-flight managed launch to
-# settle before giving up (see ManagedLaunchTracker). Covers the full
-# launch/wake pipeline ON TOP OF the host-registration wait
-# (MANAGED_HOST_ONLINE_TIMEOUT_S): the provider's provision/resume call
-# (StartSandbox has no fixed upper bound), the host-tunnel reconnect on
-# this replica, and the runner spawn/connect. The 120s slack must cover
-# all of those so a slow cold launch/wake doesn't time the parked message
-# out before the background launch settles — otherwise the first
-# post-dormancy turn is lost even though the wake later succeeds. The wait
-# resolves as soon as the launch settles, so this bound only bites a
-# genuinely slow launch.
-MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S = MANAGED_HOST_ONLINE_TIMEOUT_S + 120
+# Slack a message POST allows an in-flight managed launch ON TOP OF the
+# host-registration wait (see ManagedLaunchTracker and
+# managed_launch_rendezvous_timeout_s): the provider's provision/resume
+# call (StartSandbox has no fixed upper bound), the host-tunnel reconnect
+# on this replica, and the runner spawn/connect. It must cover all of
+# those so a slow cold launch/wake doesn't time the parked message out
+# before the background launch settles — otherwise the first
+# post-dormancy turn is lost even though the wake later succeeds.
+_RENDEZVOUS_SLACK_S = 120
 
 # Server-internal sandbox lifecycle labels — currently the repository a relaunch
 # re-clones. A client seed would forge that reconstruction, so session
@@ -288,6 +295,49 @@ MANAGED_SANDBOX_LABEL_NAMESPACE = "omnigent.sandbox."
 # path at bind time, so this label is what a sandbox RELAUNCH parses
 # to re-clone the repository into the fresh generation's workspace.
 MANAGED_REPO_LABEL_KEY = "omnigent.sandbox.repo"
+
+
+def resolve_managed_host_online_timeout_s() -> float:
+    """
+    Resolve how long a managed launch waits for its host to register.
+
+    :data:`ONLINE_TIMEOUT_ENV_VAR` overrides the 120 s default. Read at
+    call time so an operator's value reaches every derived budget rather
+    than whichever ones happened to be computed at import.
+
+    :returns: The registration budget in seconds.
+    :raises click.ClickException: When the env override is not a
+        positive number.
+    """
+    raw = os.environ.get(ONLINE_TIMEOUT_ENV_VAR)
+    if raw is None:
+        return float(DEFAULT_MANAGED_HOST_ONLINE_TIMEOUT_S)
+    try:
+        timeout = float(raw)
+    except ValueError as exc:
+        raise click.ClickException(
+            f"{ONLINE_TIMEOUT_ENV_VAR} must be a number of seconds"
+        ) from exc
+    if timeout <= 0:
+        # A zero/negative budget fails every launch before a healthy host
+        # could ever register; refuse it here rather than at launch.
+        raise click.ClickException(f"{ONLINE_TIMEOUT_ENV_VAR} must be greater than zero")
+    return timeout
+
+
+def managed_launch_rendezvous_timeout_s() -> float:
+    """
+    Resolve how long a message POST waits for an in-flight launch.
+
+    Derived from (and always above) the host-registration budget so the
+    rendezvous outlives the wait it covers — a raised registration budget
+    must not leave a parked message expiring first.
+
+    :returns: The rendezvous budget in seconds.
+    :raises click.ClickException: When the env override is not a
+        positive number.
+    """
+    return resolve_managed_host_online_timeout_s() + _RENDEZVOUS_SLACK_S
 
 
 def resolve_managed_agent_label(
@@ -3015,10 +3065,11 @@ async def _wait_for_host_online(host_store: HostStore, host_id: str) -> None:
 
     :param host_store: Persistent host registrations.
     :param host_id: The launched host's identifier.
-    :raises HTTPException: 502 when the host does not come online
-        within :data:`MANAGED_HOST_ONLINE_TIMEOUT_S`.
+    :raises HTTPException: 502 when the host does not come online within
+        the budget from :func:`resolve_managed_host_online_timeout_s`.
     """
-    deadline = time.monotonic() + MANAGED_HOST_ONLINE_TIMEOUT_S
+    timeout_s = resolve_managed_host_online_timeout_s()
+    deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if await asyncio.to_thread(host_store.is_online, host_id):
             return
@@ -3027,7 +3078,7 @@ async def _wait_for_host_online(host_store: HostStore, host_id: str) -> None:
         status_code=502,
         detail=(
             f"managed host did not come online within "
-            f"{MANAGED_HOST_ONLINE_TIMEOUT_S}s — check {_HOST_LOG_PATH} "
+            f"{timeout_s:g}s — check {_HOST_LOG_PATH} "
             "inside the sandbox"
         ),
     )
