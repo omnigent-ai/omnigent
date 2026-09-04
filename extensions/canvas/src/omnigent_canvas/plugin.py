@@ -20,7 +20,7 @@ def get_manifest() -> ExtensionManifest:
         display_name="Canvas",
         distribution="omnigent-canvas",
         version="0.1.0",
-        requires_omnigent=">=0.11.0.dev0,<1",
+        requires_omnigent=">=0.13.0.dev0,<1",
         extension_api=EXTENSION_API_VERSION,
         entrypoints=ExtensionEntrypoints(
             browser="dist/extension.js",

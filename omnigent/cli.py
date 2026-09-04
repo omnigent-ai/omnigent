@@ -4784,6 +4784,18 @@ def extensions_doctor(extension_id: str) -> None:
     state = plugin_state()
     manifest = state.get(extension_id)
     if manifest is None:
+        # A rejected manifest never reaches the catalog; its entry point key
+        # (``<distribution>:<name>``) and error are all that is left of it.
+        needle = extension_id.lower().replace(".", "-").replace("_", "-")
+        rejected = {
+            entry_point: error
+            for entry_point, error in state.load_errors.items()
+            if needle in entry_point.lower().replace("_", "-") or extension_id in error
+        }
+        for entry_point, error in rejected.items():
+            click.echo(f"rejected {entry_point}: {error}", err=True)
+        if rejected:
+            raise click.ClickException(f"Extension {extension_id!r} was rejected while loading")
         raise click.ClickException(f"Extension {extension_id!r} is not installed or was rejected")
     raw_overrides = os.environ.get("OMNIGENT_EXTENSION_DEV_BUNDLES", "").strip()
     try:

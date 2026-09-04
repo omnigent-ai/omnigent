@@ -5,8 +5,6 @@ from types import MappingProxyType
 
 from click.testing import CliRunner
 
-import omnigent.extensions as extensions_api
-import omnigent.extensions.assets as extension_assets
 from omnigent.cli import cli
 from omnigent.extensions import (
     EXTENSION_API_VERSION,
@@ -30,8 +28,7 @@ def _manifest() -> ExtensionManifest:
 
 def test_extensions_list(monkeypatch) -> None:
     monkeypatch.setattr(
-        extensions_api,
-        "plugin_state",
+        "omnigent.extensions.plugin_state",
         lambda: ExtensionPluginState(manifests=(_manifest(),)),
     )
 
@@ -52,10 +49,9 @@ def test_extensions_doctor_reports_resolved_bundle(monkeypatch) -> None:
         digest="a" * 64,
         assets=MappingProxyType({}),
     )
-    monkeypatch.setattr(extensions_api, "plugin_state", lambda: state)
+    monkeypatch.setattr("omnigent.extensions.plugin_state", lambda: state)
     monkeypatch.setattr(
-        extension_assets,
-        "resolve_bundle",
+        "omnigent.extensions.assets.resolve_bundle",
         lambda _manifest, **_kwargs: bundle,
     )
 
@@ -74,8 +70,7 @@ def test_extensions_doctor_honors_development_override(monkeypatch, tmp_path) ->
     (package_root / "dist").mkdir(parents=True)
     (package_root / "dist" / "extension.js").write_text("hello", encoding="utf-8")
     monkeypatch.setattr(
-        extensions_api,
-        "plugin_state",
+        "omnigent.extensions.plugin_state",
         lambda: ExtensionPluginState(manifests=(manifest,)),
     )
     monkeypatch.setenv(
@@ -95,8 +90,7 @@ def test_extensions_doctor_reports_invalid_development_override(monkeypatch) -> 
         entrypoints=ExtensionEntrypoints(browser="dist/extension.js"),
     )
     monkeypatch.setattr(
-        extensions_api,
-        "plugin_state",
+        "omnigent.extensions.plugin_state",
         lambda: ExtensionPluginState(manifests=(manifest,)),
     )
     monkeypatch.setenv("OMNIGENT_EXTENSION_DEV_BUNDLES", "not-json")
@@ -109,8 +103,7 @@ def test_extensions_doctor_reports_invalid_development_override(monkeypatch) -> 
 
 def test_extensions_doctor_rejects_unknown_extension(monkeypatch) -> None:
     monkeypatch.setattr(
-        extensions_api,
-        "plugin_state",
+        "omnigent.extensions.plugin_state",
         lambda: ExtensionPluginState(manifests=()),
     )
 
@@ -118,3 +111,22 @@ def test_extensions_doctor_rejects_unknown_extension(monkeypatch) -> None:
 
     assert result.exit_code == 1
     assert "not installed or was rejected" in result.output
+
+
+def test_extensions_doctor_surfaces_load_error_for_rejected_extension(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.extensions.plugin_state",
+        lambda: ExtensionPluginState(
+            manifests=(),
+            load_errors={"acme-review:review": "manifest version does not match distribution"},
+        ),
+    )
+
+    result = CliRunner().invoke(cli, ["extensions", "doctor", "acme.review"])
+
+    assert result.exit_code == 1
+    assert (
+        "rejected acme-review:review: manifest version does not match distribution"
+        in result.output
+    )
+    assert "was rejected while loading" in result.output
