@@ -10,6 +10,16 @@
 
 const STORAGE_KEY = "omnigent:last-sandbox-repo";
 
+/**
+ * Strip any userinfo (`user[:secret]@`) from an http(s) URL, so a pasted
+ * tokenized clone URL (e.g. `https://x-access-token:PAT@github.com/o/r`) is
+ * never persisted to localStorage as a secret at rest. Non-http(s) URLs
+ * (e.g. `git@github.com:o/r`) are left unchanged.
+ */
+function stripUrlUserinfo(url: string): string {
+  return url.replace(/^(https?:\/\/)[^/@]*@/i, "$1");
+}
+
 /** The last repo the user launched with: its clone URL and branch (may be ""). */
 export interface LastSandboxRepo {
   /** Repo URL, e.g. ``https://github.com/org/repo.git`` (never blank). */
@@ -32,7 +42,7 @@ export function readLastSandboxRepo(): LastSandboxRepo | null {
     if (!raw) return null;
     const parsed = JSON.parse(raw) as unknown;
     if (typeof parsed !== "object" || parsed === null) return null;
-    const url = String((parsed as { url?: unknown }).url ?? "").trim();
+    const url = stripUrlUserinfo(String((parsed as { url?: unknown }).url ?? "").trim());
     const branch = String((parsed as { branch?: unknown }).branch ?? "").trim();
     return url === "" ? null : { url, branch };
   } catch {
@@ -48,7 +58,7 @@ export function readLastSandboxRepo(): LastSandboxRepo | null {
 export function writeLastSandboxRepo(url: string, branch: string): void {
   if (typeof window === "undefined") return;
   try {
-    const trimmedUrl = url.trim();
+    const trimmedUrl = stripUrlUserinfo(url.trim());
     if (trimmedUrl === "") {
       window.localStorage.removeItem(STORAGE_KEY);
       return;

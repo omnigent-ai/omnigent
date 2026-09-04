@@ -70,4 +70,24 @@ describe("repoPreferences", () => {
     expect(() => writeLastSandboxRepo("https://github.com/org/repo.git", "main")).not.toThrow();
     expect(readLastSandboxRepo()).toBeNull();
   });
+
+  it("strips URL userinfo so a tokenized URL is not persisted (secret at rest)", () => {
+    writeLastSandboxRepo("https://x-access-token:s3cr3tpat@github.com/org/repo.git", "main");
+    expect(readLastSandboxRepo()).toEqual({
+      url: "https://github.com/org/repo.git",
+      branch: "main",
+    });
+    expect(localStorage.getItem("omnigent:last-sandbox-repo") ?? "").not.toContain("s3cr3tpat");
+  });
+
+  it("strips userinfo from a legacy stored tokenized URL on read (defensive)", () => {
+    localStorage.setItem(
+      "omnigent:last-sandbox-repo",
+      JSON.stringify({ url: "https://user:PAT@github.com/org/repo.git", branch: "dev" }),
+    );
+    expect(readLastSandboxRepo()).toEqual({
+      url: "https://github.com/org/repo.git",
+      branch: "dev",
+    });
+  });
 });

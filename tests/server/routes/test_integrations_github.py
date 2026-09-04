@@ -7,6 +7,7 @@ status → disconnect flow is exercised end-to-end without the network.
 
 from __future__ import annotations
 
+import httpx
 import jwt
 import pytest
 from fastapi import FastAPI, Request
@@ -289,6 +290,25 @@ def test_repos_lists_when_connected(db_uri: str) -> None:
     assert body["connected"] is True
     assert [r["full_name"] for r in body["repos"]] == ["caffeinelabs/app"]
     assert body["repos"][0]["default_branch"] == "main"
+
+
+def test_repos_returns_502_on_transient_github_error(db_uri: str) -> None:
+    # A transient GitHub fault (httpx error / bad JSON) must surface as the
+    # endpoint's defined 502, not escape as an unhandled 500.
+    tc, store, _config, client = _app(db_uri)
+    store.upsert(
+        "alice@example.com",
+        github_login="octocat",
+        github_user_id=42,
+        tokens=GitHubTokenSet("ghu_a", "ghr_a", None, None, "repo"),
+    )
+
+    async def _boom(_access_token: str) -> tuple[list[dict[str, object]], bool]:
+        raise httpx.ConnectError("boom")
+
+    client.list_repos = _boom  # type: ignore[assignment,method-assign]
+    resp = tc.get("/v1/connections/github/repos", headers=_USER)
+    assert resp.status_code == 502
 
 
 def test_repo_branches_unconnected_returns_false(db_uri: str) -> None:

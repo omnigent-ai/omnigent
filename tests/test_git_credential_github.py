@@ -155,3 +155,21 @@ def test_configure_clone_credentials_noop_without_token(monkeypatch: pytest.Monk
     monkeypatch.setattr(h.subprocess, "run", lambda *a, **k: calls.append(a))
     assert h.configure_clone_credentials("http://srv", "host1") is False
     assert calls == []
+
+
+def test_configure_clone_credentials_fails_closed_when_probe_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A transient probe failure (``_fetch`` -> None) is indistinguishable from
+    # "not linked", so fail closed: install the broker anyway rather than let the
+    # clone silently fall back to the shared $GIT_TOKEN identity for what may be a
+    # linked owner. Only a *successful* ``connected: false`` keeps the fallback.
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
+    monkeypatch.setattr(h, "_fetch", lambda *a, **k: None)
+    assert h.configure_clone_credentials("http://srv", "host1") is True
+    key = "credential.https://github.com.helper"
+    assert any(
+        c[:5] == ["git", "config", "--global", "--add", key] and "host1" in c[-1] for c in calls
+    )

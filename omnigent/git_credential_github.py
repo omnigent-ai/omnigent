@@ -151,24 +151,32 @@ def configure_host_git(server_url: str, host_id: str) -> None:
 
 
 def configure_clone_credentials(server_url: str, host_id: str) -> bool:
-    """Wire the per-user broker for the initial workspace clone — only if connected.
+    """Wire the per-user broker for the initial workspace clone.
 
     Called by the managed-sandbox ``workspace-prep`` init container BEFORE it
     clones the workspace repo. Unlike :func:`configure_host_git` (which makes the
-    broker authoritative for the running host unconditionally), this leaves the
+    broker authoritative for the running host unconditionally), this keeps the
     ambient credential chain — notably the image's shared ``$GIT_TOKEN`` helper —
-    intact when the owner has NOT linked GitHub, so a shared-token clone still
-    works. When the owner IS connected, the broker becomes the sole github.com
-    helper so the clone authenticates as them. Best-effort: never raises.
+    only when the owner is *definitively* not linked, so a shared-token clone
+    still works for them.
 
-    :returns: ``True`` when the per-user broker was wired (owner connected);
-        ``False`` otherwise (ambient credentials left untouched).
+    Fails closed on an ambiguous probe: :func:`_fetch` returns ``None`` on any
+    transient fault (timeout, non-200, bad JSON), which is indistinguishable from
+    "not linked". Treating that as unlinked would silently clone a *linked*
+    owner's private repo under the shared image identity, defeating the per-user
+    contract. So only a **successful** ``connected: false`` keeps the shared
+    fallback; a connected owner — or an unresolved probe — installs the broker,
+    so the clone authenticates per-user or fails visibly instead of quietly
+    falling back to the shared token. Best-effort: never raises.
+
+    :returns: ``True`` when the broker was wired (owner connected, or the probe
+        was inconclusive); ``False`` only when the owner is confirmed not linked.
     """
     token = (os.environ.get(_HOST_TOKEN_ENV_VAR) or "").strip()
     if not token:
         return False
-    data = _fetch(server_url, host_id, token) or {}
-    if not data.get("connected"):
+    data = _fetch(server_url, host_id, token)
+    if data is not None and not data.get("connected"):
         return False
     _install_broker_helper(server_url, host_id, token)
     return True

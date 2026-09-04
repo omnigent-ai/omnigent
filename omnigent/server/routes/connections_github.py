@@ -151,7 +151,7 @@ def create_connections_github_router(
                 return {"connected": False, "repos": [], "truncated": False}
             try:
                 repo_list, truncated = await api.list_repos(token)
-            except GitHubAppError as exc:
+            except (GitHubAppError, HTTPError, ValueError) as exc:
                 _logger.warning("GitHub repo list failed for %s: %s", user_id, exc)
                 raise HTTPException(
                     status_code=502, detail="Failed to list GitHub repositories"
@@ -174,7 +174,7 @@ def create_connections_github_router(
                 return {"connected": False, "branches": []}
             try:
                 branches = await api.list_branches(token, f"{owner}/{repo}")
-            except GitHubAppError as exc:
+            except (GitHubAppError, HTTPError, ValueError) as exc:
                 _logger.warning("GitHub branch list failed for %s/%s: %s", owner, repo, exc)
                 raise HTTPException(
                     status_code=502, detail="Failed to list GitHub branches"
