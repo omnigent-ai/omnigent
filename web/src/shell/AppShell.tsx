@@ -1296,12 +1296,16 @@ export function AppShell() {
     };
     // Anything the peek card legitimately spawns outside its own subtree (Radix
     // menus, tooltips, dialogs) must not count as "outside", or opening a row's
-    // context menu would dismiss the card under it.
+    // context menu would dismiss the card under it. Both peek triggers count as
+    // inside too: while the card's entry animation keeps it click-through, the
+    // pointer still rests on the chat-header toggle beneath it, and a wobble
+    // there must not arm the dismiss timer.
     const insidePeekSurface = (target: EventTarget | null) => {
       if (!(target instanceof Element)) return false;
       return !!target.closest(
         [
           "aside.conversations-sidebar",
+          ".chat-header-sidebar-toggle",
           ".electron-sidebar-header-actions",
           "[data-radix-popper-content-wrapper]",
           '[role="menu"]',
