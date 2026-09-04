@@ -478,6 +478,7 @@ class CompactionData(BaseModel):
     token_count: int
     compacted_messages: list[dict[str, Any]] | None = None
     window_id: int | None = None
+    snapshot_source: Literal["transcript", "hook_fallback"] | None = None
 
     @field_validator("compacted_messages")
     @classmethod

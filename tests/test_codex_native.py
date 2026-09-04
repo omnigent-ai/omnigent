@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
+import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -8586,6 +8589,71 @@ async def test_prepare_codex_terminal_hot_resume_does_not_rewrite_rollout(
 
 
 @pytest.mark.asyncio
+async def test_prepare_codex_terminal_reattaches_during_first_start_id_race(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A running terminal wins even before its thread id reaches the server."""
+    original_async_client = httpx.AsyncClient
+    session_id = "conv_first_start_race"
+    bridge_id = "bridge_first_start_race"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "bridges")
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if request.url.path == f"/v1/sessions/{session_id}":
+            return httpx.Response(
+                200,
+                json={
+                    "labels": {
+                        "omnigent.wrapper": "codex-native-ui",
+                        "omnigent.codex_native.bridge_id": bridge_id,
+                    },
+                    "external_session_id": None,
+                },
+            )
+        if request.url.path.endswith("/resources/terminals/terminal_codex_main"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "terminal_codex_main",
+                    "metadata": {
+                        "tmux_socket": "/tmp/first-start.sock",
+                        "tmux_target": "first-start:main",
+                    },
+                },
+            )
+        return httpx.Response(500, json={"error": {"message": "must not relaunch"}})
+
+    transport = httpx.MockTransport(handler)
+
+    def client_factory(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        kwargs["transport"] = transport
+        return original_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(codex_native.httpx, "AsyncClient", client_factory)
+    prepared = await codex_native._prepare_codex_terminal(
+        base_url="https://example.com",
+        headers={},
+        session_id=session_id,
+        runner_id="runner_local",
+        session_bundle=None,
+        codex_args=(),
+        command="/opt/codex/bin/codex",
+        model=None,
+    )
+
+    assert prepared.reattached is True
+    assert prepared.thread_id is None
+    assert prepared.terminal_id == "terminal_codex_main"
+    assert not any(method in {"PATCH", "POST"} for method, _path in calls)
+    bridge_dir = codex_native.bridge_dir_for_bridge_id(bridge_id)
+    assert not bridge_dir.exists(), "warm reattach must not clear or recreate bridge state"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("status_code", "body"),
     [
@@ -10368,7 +10436,14 @@ def _write_source_rollout(*, codex_home: Path, thread_id: str, source_cwd: str) 
         {
             "timestamp": "2026-06-05T07:23:34.547Z",
             "type": "session_meta",
-            "payload": {"id": thread_id, "cwd": source_cwd, "originator": "test"},
+            "payload": {
+                "id": thread_id,
+                "cwd": source_cwd,
+                "originator": "test",
+                "cli_version": "0.136.0",
+                "model_provider": "openai",
+                "timestamp": "2026-06-05T07:23:34.547Z",
+            },
         },
         {
             "timestamp": "2026-06-05T07:23:34.549Z",
@@ -10820,6 +10895,296 @@ async def test_ensure_local_codex_resume_rollout_preserves_existing_rollout(
 
 
 @pytest.mark.asyncio
+async def test_ensure_local_codex_resume_rollout_backs_up_corrupt_file_and_reconstructs(
+    tmp_path: Path,
+) -> None:
+    """A matching but unparseable rollout is preserved, then reconstructed."""
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    codex_home = tmp_path / "codex-home"
+    corrupt = _write_source_rollout(
+        codex_home=codex_home,
+        thread_id=thread_id,
+        source_cwd="/source",
+    )
+    corrupt_bytes = corrupt.read_bytes() + b'{"type":"response_item"\n'
+    corrupt.write_bytes(corrupt_bytes)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/conv_codex/items"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "msg_1",
+                        "response_id": "turn_1",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "recover me"}],
+                    }
+                ],
+                "has_more": False,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        rollout = await codex_native._ensure_local_codex_resume_rollout(
+            client,
+            session_id="conv_codex",
+            external_session_id=thread_id,
+            codex_home=codex_home,
+            workspace=tmp_path.resolve(),
+            model_provider="openai",
+            codex_path=None,
+        )
+
+    backups = list(corrupt.parent.glob(f"{corrupt.name}.omnigent-backup-*"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == corrupt_bytes
+    assert rollout == corrupt
+    assert codex_native._codex_rollout_is_resumable(rollout, thread_id)
+    assert "recover me" in rollout.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_ensure_local_codex_resume_rollout_empty_server_starts_blank(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Empty server history produces a valid blank rollout and warning."""
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/conv_codex/items"
+        return httpx.Response(200, json={"data": [], "has_more": False})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        rollout = await codex_native._ensure_local_codex_resume_rollout(
+            client,
+            session_id="conv_codex",
+            external_session_id=thread_id,
+            codex_home=tmp_path / "codex-home",
+            workspace=tmp_path.resolve(),
+            model_provider="openai",
+            codex_path=None,
+        )
+
+    records = [json.loads(line) for line in rollout.read_text().splitlines()]
+    assert [record["type"] for record in records] == ["session_meta"]
+    assert codex_native._codex_rollout_is_resumable(rollout, thread_id)
+    assert "starting a blank Codex thread" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_resolve_codex_cold_resume_keeps_existing_non_v7_thread_id(
+    tmp_path: Path,
+) -> None:
+    """Persisted UUID thread ids must resume even when they are not v7.
+
+    Reminting would PATCH a new ``external_session_id`` over a set-once
+    column and leave the existing rollout unreachable.
+    """
+    recorded_id = "11111111-2222-4333-8444-555566667777"
+    assert uuid.UUID(recorded_id).version == 4
+    patches: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH":
+            patches.append(json.loads(request.content))
+            return httpx.Response(200, json={})
+        raise AssertionError(f"unexpected request {request.method} {request.url.path}")
+
+    existing = _write_source_rollout(
+        codex_home=tmp_path / "codex-home",
+        thread_id=recorded_id,
+        source_cwd="/repo",
+    )
+    before = existing.read_bytes()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        thread_id = await codex_native._resolve_codex_cold_resume_thread_id(
+            client,
+            session_id="conv_codex",
+            external_session_id=recorded_id,
+            codex_home=tmp_path / "codex-home",
+            workspace=tmp_path.resolve(),
+            model_provider="openai",
+            codex_path=None,
+        )
+
+    assert thread_id == recorded_id
+    assert patches == []
+    assert existing.read_bytes() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recorded_id", [None, "../../etc/passwd", "not-a-uuid"])
+async def test_resolve_codex_cold_resume_mints_and_persists_safe_id(
+    tmp_path: Path,
+    recorded_id: str | None,
+) -> None:
+    """Missing and malformed persisted IDs recover under a new UUIDv7."""
+    patches: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH":
+            patches.append(json.loads(request.content))
+            return httpx.Response(200, json={})
+        assert request.url.path == "/v1/sessions/conv_codex/items"
+        return httpx.Response(200, json={"data": [], "has_more": False})
+
+    codex_home = tmp_path / "codex-home"
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        thread_id = await codex_native._resolve_codex_cold_resume_thread_id(
+            client,
+            session_id="conv_codex",
+            external_session_id=recorded_id,
+            codex_home=codex_home,
+            workspace=tmp_path.resolve(),
+            model_provider="openai",
+            codex_path=None,
+        )
+
+    assert codex_native._is_safe_codex_thread_id(thread_id)
+    assert patches == [{"external_session_id": thread_id}]
+    rollout = codex_native._find_codex_rollout(codex_home, thread_id)
+    assert rollout is not None
+    assert codex_native._codex_rollout_is_resumable(rollout, thread_id)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_missing_id_resumes_share_authoritative_winner(
+    tmp_path: Path,
+) -> None:
+    """A losing set-once bind reconstructs the winner and leaves no orphan."""
+    authoritative_id: str | None = None
+    proposals: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal authoritative_id
+        if request.method == "PATCH":
+            proposed = json.loads(request.content)["external_session_id"]
+            proposals.append(proposed)
+            if authoritative_id is None:
+                authoritative_id = proposed
+                return httpx.Response(200, json={"external_session_id": proposed})
+            return httpx.Response(409, json={"error": {"message": "already bound"}})
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_race":
+            return httpx.Response(200, json={"external_session_id": authoritative_id})
+        if request.url.path == "/v1/sessions/conv_race/items":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "msg_1",
+                            "response_id": "turn_1",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "keep me"}],
+                        }
+                    ],
+                    "has_more": False,
+                },
+            )
+        raise AssertionError(f"unexpected request {request.method} {request.url.path}")
+
+    codex_home = tmp_path / "codex-home"
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        resolved = await asyncio.gather(
+            *[
+                codex_native._resolve_codex_cold_resume_thread_id(
+                    client,
+                    session_id="conv_race",
+                    external_session_id=None,
+                    codex_home=codex_home,
+                    workspace=tmp_path.resolve(),
+                    model_provider="openai",
+                    codex_path=None,
+                )
+                for _ in range(2)
+            ]
+        )
+
+    assert len(set(proposals)) == 2
+    assert authoritative_id is not None
+    assert resolved == [authoritative_id, authoritative_id]
+    rollouts = list((codex_home / "sessions").glob("**/rollout-*.jsonl"))
+    assert len(rollouts) == 1
+    assert rollouts[0].name.endswith(f"-{authoritative_id}.jsonl")
+    assert "keep me" in rollouts[0].read_text()
+    assert not list(rollouts[0].parent.glob("*.tmp"))
+    loser = next(proposal for proposal in proposals if proposal != authoritative_id)
+    assert codex_native._find_codex_rollout(codex_home, loser) is None
+
+
+@pytest.mark.asyncio
+async def test_old_codex_rollout_without_cli_version_is_preserved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex 0.132 may resume its native rollout without 0.133 metadata."""
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    codex_home = tmp_path / "codex-home"
+    rollout = _write_source_rollout(
+        codex_home=codex_home,
+        thread_id=thread_id,
+        source_cwd="/repo",
+    )
+    records = [json.loads(line) for line in rollout.read_text().splitlines()]
+    records[0]["payload"].pop("cli_version")
+    records.append(
+        {
+            "timestamp": "2026-06-05T07:24:00.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "local-only tail"}],
+            },
+        }
+    )
+    rollout.write_text("".join(json.dumps(record) + "\n" for record in records))
+    before = rollout.read_bytes()
+
+    async def old_version(_path: str) -> tuple[int, ...]:
+        return (0, 132, 0)
+
+    monkeypatch.setattr("omnigent.inner.codex_executor._codex_cli_version", old_version)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("compatible local rollout must not fetch server history")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        result = await codex_native._ensure_local_codex_resume_rollout(
+            client,
+            session_id="conv_old",
+            external_session_id=thread_id,
+            codex_home=codex_home,
+            workspace=tmp_path,
+            model_provider="openai",
+            codex_path="/opt/codex-0.132/bin/codex",
+        )
+
+    assert result == rollout
+    assert rollout.read_bytes() == before
+    assert codex_native._codex_rollout_is_resumable(rollout, thread_id, codex_version=(0, 132, 0))
+    assert not codex_native._codex_rollout_is_resumable(
+        rollout, thread_id, codex_version=(0, 133, 0)
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("bad_item", "message"),
     [
@@ -11037,6 +11402,413 @@ def test_forwarder_mirrors_codex_context_compaction(tmp_path: Path) -> None:
         {"type": "external_compaction_status", "data": {"status": "in_progress"}},
         {"type": "external_compaction_status", "data": {"status": "completed"}},
     ]
+
+
+def _codex_compaction_rollout(tmp_path: Path, *, thread_id: str = "thread_123") -> Path:
+    """Create bridge state and return its live Codex rollout path."""
+    codex_home = tmp_path / "codex-home"
+    rollout_dir = codex_home / "sessions" / "2026" / "09" / "03"
+    rollout_dir.mkdir(parents=True)
+    rollout = rollout_dir / f"rollout-2026-09-03T12-00-00-{thread_id}.jsonl"
+    rollout.write_text('{"type":"session_meta","payload":{}}\n', encoding="utf-8")
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id=thread_id,
+            codex_home=str(codex_home),
+        ),
+    )
+    return rollout
+
+
+def _codex_compacted_line(marker: str, *, window_id: int = 7) -> str:
+    """Build one realistic Codex compacted rollout record."""
+    return json.dumps(
+        {
+            "type": "compacted",
+            "payload": {
+                "replacement_history": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": marker}],
+                    }
+                ],
+                "window_id": window_id,
+            },
+        }
+    )
+
+
+def _codex_compaction_transport(
+    posted: list[dict[str, Any]],
+    *,
+    fail_posts: list[bool] | None = None,
+    existing_items: list[dict[str, Any]] | None = None,
+) -> httpx.MockTransport:
+    """Return a mock Omnigent transport for compaction scanner tests."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={"data": existing_items or [{"id": "msg_boundary"}]},
+            )
+        payload = json.loads(request.content)
+        if fail_posts and fail_posts.pop(0):
+            return httpx.Response(503, json={"detail": "retry"})
+        posted.append(payload)
+        return httpx.Response(202, json={"queued": True})
+
+    return httpx.MockTransport(handler)
+
+
+def test_codex_compaction_periodic_scan_recovers_missing_notification(tmp_path: Path) -> None:
+    """A rollout compaction persists even when Codex emits no usable signal."""
+    rollout = _codex_compaction_rollout(tmp_path)
+    with rollout.open("a", encoding="utf-8") as handle:
+        handle.write(_codex_compacted_line("periodic") + "\n")
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=_codex_compaction_transport(posted),
+        ) as client:
+            scanner = codex_native_forwarder._CodexCompactionScanner(
+                client,
+                session_id="conv_123",
+                thread_id="thread_123",
+                bridge_dir=tmp_path,
+                interval_seconds=0.01,
+            )
+            scanner.start()
+            try:
+
+                async def persisted() -> None:
+                    while not posted:
+                        await asyncio.sleep(0.005)
+
+                await asyncio.wait_for(persisted(), timeout=1)
+            finally:
+                await scanner.close()
+
+    asyncio.run(run())
+    assert posted[0]["data"]["window_id"] == 7
+    assert posted[0]["data"]["compacted_messages"][0]["content"][0]["text"] == "periodic"
+
+
+def test_codex_compaction_notification_before_write_recovers_later(tmp_path: Path) -> None:
+    """A completion notification racing before the append is retried periodically."""
+    rollout = _codex_compaction_rollout(tmp_path)
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=_codex_compaction_transport(posted),
+        ) as client:
+            scanner = codex_native_forwarder._CodexCompactionScanner(
+                client,
+                session_id="conv_123",
+                thread_id="thread_123",
+                bridge_dir=tmp_path,
+                interval_seconds=0.01,
+            )
+            state = codex_native_forwarder._CodexForwarderState(compaction_scanner=scanner)
+            scanner.start()
+            try:
+                await codex_native_forwarder._scan_codex_compactions_after_signal(
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    forwarder_state=state,
+                )
+                assert posted == []
+                with rollout.open("a", encoding="utf-8") as handle:
+                    handle.write(_codex_compacted_line("delayed") + "\n")
+                while not posted:
+                    await asyncio.sleep(0.005)
+            finally:
+                await scanner.close()
+
+    asyncio.run(asyncio.wait_for(run(), timeout=1))
+    assert len(posted) == 1
+
+
+def test_codex_compaction_duplicate_signals_persist_once(tmp_path: Path) -> None:
+    """Repeated completion signals converge on one rollout record POST."""
+    rollout = _codex_compaction_rollout(tmp_path)
+    with rollout.open("a", encoding="utf-8") as handle:
+        handle.write(_codex_compacted_line("duplicate") + "\n")
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=_codex_compaction_transport(posted),
+        ) as client:
+            scanner = codex_native_forwarder._CodexCompactionScanner(
+                client,
+                session_id="conv_123",
+                thread_id="thread_123",
+                bridge_dir=tmp_path,
+            )
+            state = codex_native_forwarder._CodexForwarderState(compaction_scanner=scanner)
+            for _ in range(2):
+                await codex_native_forwarder._scan_codex_compactions_after_signal(
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    forwarder_state=state,
+                )
+
+    asyncio.run(run())
+    assert len(posted) == 1
+
+
+def test_codex_compaction_restart_does_not_replay_persisted_record(tmp_path: Path) -> None:
+    """A new scanner loads durable identities and skips prior compactions."""
+    rollout = _codex_compaction_rollout(tmp_path)
+    with rollout.open("a", encoding="utf-8") as handle:
+        handle.write(_codex_compacted_line("restart") + "\n")
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=_codex_compaction_transport(posted),
+        ) as client:
+            for _ in range(2):
+                scanner = codex_native_forwarder._CodexCompactionScanner(
+                    client,
+                    session_id="conv_123",
+                    thread_id="thread_123",
+                    bridge_dir=tmp_path,
+                )
+                await scanner.scan_now()
+
+    asyncio.run(run())
+    assert len(posted) == 1
+    durable = codex_native_forwarder._read_codex_compaction_state(tmp_path)
+    assert len(durable.observed_record_ids) == 1
+
+
+def test_codex_compaction_initial_scan_adopts_existing_server_row(tmp_path: Path) -> None:
+    """An upgrade seeds state from an exact row instead of duplicating it."""
+    rollout = _codex_compaction_rollout(tmp_path)
+    with rollout.open("a", encoding="utf-8") as handle:
+        handle.write(_codex_compacted_line("legacy") + "\n")
+    history = json.loads(_codex_compacted_line("legacy"))["payload"]["replacement_history"]
+    posted: list[dict[str, Any]] = []
+    existing = [
+        {
+            "id": "compact_existing",
+            "type": "compaction",
+            "compacted_messages": history,
+            "window_id": 7,
+        }
+    ]
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=_codex_compaction_transport(posted, existing_items=existing),
+        ) as client:
+            scanner = codex_native_forwarder._CodexCompactionScanner(
+                client,
+                session_id="conv_123",
+                thread_id="thread_123",
+                bridge_dir=tmp_path,
+            )
+            await scanner.scan_now()
+
+    asyncio.run(run())
+    assert posted == []
+    assert (
+        len(codex_native_forwarder._read_codex_compaction_state(tmp_path).observed_record_ids) == 1
+    )
+
+
+def test_codex_compaction_state_reads_legacy_integer_cursor(tmp_path: Path) -> None:
+    """State loading preserves old bare offsets and ignores unknown fields."""
+    state_path = tmp_path / codex_native_forwarder._CODEX_COMPACTION_STATE_FILE
+    state_path.write_text(
+        json.dumps(
+            {
+                "cursors": {"/old/rollout.jsonl": 41},
+                "observed_record_ids": ["record_a", 17],
+                "future_field": {"safe": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = codex_native_forwarder._read_codex_compaction_state(tmp_path)
+
+    assert state.cursors["/old/rollout.jsonl"].offset == 41
+    assert state.cursors["/old/rollout.jsonl"].fingerprint is None
+    assert state.observed_record_ids == ("record_a",)
+
+
+def test_codex_compaction_rollout_path_change_preserves_identity(tmp_path: Path) -> None:
+    """Moving a rollout to the archive neither duplicates nor hides later records."""
+    rollout = _codex_compaction_rollout(tmp_path)
+    with rollout.open("a", encoding="utf-8") as handle:
+        handle.write(_codex_compacted_line("before move") + "\n")
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=_codex_compaction_transport(posted),
+        ) as client:
+            scanner = codex_native_forwarder._CodexCompactionScanner(
+                client,
+                session_id="conv_123",
+                thread_id="thread_123",
+                bridge_dir=tmp_path,
+            )
+            await scanner.scan_now()
+            archived = tmp_path / "codex-home" / "archived_sessions" / rollout.name
+            archived.parent.mkdir(parents=True)
+            rollout.replace(archived)
+            await scanner.scan_now()
+            with archived.open("a", encoding="utf-8") as handle:
+                handle.write(_codex_compacted_line("after move") + "\n")
+            await scanner.scan_now()
+
+    asyncio.run(run())
+    assert [
+        payload["data"]["compacted_messages"][0]["content"][0]["text"] for payload in posted
+    ] == ["before move", "after move"]
+
+
+def test_codex_compaction_same_window_new_record_is_not_deduped(tmp_path: Path) -> None:
+    """Artifact identity, not window id, distinguishes successive compactions."""
+    rollout = _codex_compaction_rollout(tmp_path)
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=_codex_compaction_transport(posted),
+        ) as client:
+            scanner = codex_native_forwarder._CodexCompactionScanner(
+                client,
+                session_id="conv_123",
+                thread_id="thread_123",
+                bridge_dir=tmp_path,
+            )
+            for marker in ("first", "second"):
+                with rollout.open("a", encoding="utf-8") as handle:
+                    handle.write(_codex_compacted_line(marker, window_id=7) + "\n")
+                await scanner.scan_now()
+
+    asyncio.run(run())
+    assert [payload["data"]["window_id"] for payload in posted] == [7, 7]
+    assert [
+        payload["data"]["compacted_messages"][0]["content"][0]["text"] for payload in posted
+    ] == ["first", "second"]
+
+
+def test_codex_compaction_post_failure_retries_same_record(tmp_path: Path) -> None:
+    """A failed POST leaves the artifact unobserved for the next scan."""
+    rollout = _codex_compaction_rollout(tmp_path)
+    with rollout.open("a", encoding="utf-8") as handle:
+        handle.write(_codex_compacted_line("retry") + "\n")
+    posted: list[dict[str, Any]] = []
+    failures = [True, False]
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=_codex_compaction_transport(posted, fail_posts=failures),
+        ) as client:
+            scanner = codex_native_forwarder._CodexCompactionScanner(
+                client,
+                session_id="conv_123",
+                thread_id="thread_123",
+                bridge_dir=tmp_path,
+            )
+            with pytest.raises(httpx.HTTPStatusError):
+                await scanner.scan_now()
+            assert (
+                codex_native_forwarder._read_codex_compaction_state(tmp_path).observed_record_ids
+                == ()
+            )
+            await scanner.scan_now()
+
+    asyncio.run(run())
+    assert len(posted) == 1
+
+
+def test_codex_compaction_partial_trailing_line_waits_for_completion(tmp_path: Path) -> None:
+    """A partial JSON tail is retried from its first byte after the newline lands."""
+    rollout = _codex_compaction_rollout(tmp_path)
+    line = _codex_compacted_line("partial")
+    with rollout.open("a", encoding="utf-8") as handle:
+        handle.write(line)
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=_codex_compaction_transport(posted),
+        ) as client:
+            scanner = codex_native_forwarder._CodexCompactionScanner(
+                client,
+                session_id="conv_123",
+                thread_id="thread_123",
+                bridge_dir=tmp_path,
+            )
+            await scanner.scan_now()
+            assert posted == []
+            with rollout.open("a", encoding="utf-8") as handle:
+                handle.write("\n")
+            await scanner.scan_now()
+
+    asyncio.run(run())
+    assert len(posted) == 1
+
+
+def test_codex_compaction_rollout_scan_does_not_block_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Slow rollout I/O runs in a worker while other async work proceeds."""
+    _codex_compaction_rollout(tmp_path)
+    original = codex_native_forwarder._read_codex_compacted_records
+    scan_started = threading.Event()
+
+    def slow_read(*args: Any, **kwargs: Any) -> Any:
+        scan_started.set()
+        time.sleep(0.15)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(codex_native_forwarder, "_read_codex_compacted_records", slow_read)
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=_codex_compaction_transport([]),
+        ) as client:
+            scanner = codex_native_forwarder._CodexCompactionScanner(
+                client,
+                session_id="conv_123",
+                thread_id="thread_123",
+                bridge_dir=tmp_path,
+            )
+            scan_task = asyncio.create_task(scanner.scan_now())
+            await asyncio.to_thread(scan_started.wait)
+            heartbeat = asyncio.create_task(asyncio.sleep(0.01))
+            await asyncio.wait_for(heartbeat, timeout=0.05)
+            assert not scan_task.done()
+            await scan_task
+
+    asyncio.run(run())
 
 
 def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None:

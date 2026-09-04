@@ -1038,6 +1038,21 @@
             "description": "The model used to generate the summary, e.g. `\"openai/gpt-4o\"`.",
             "title": "Model"
           },
+          "snapshot_source": {
+            "anyOf": [
+              {
+                "enum": [
+                  "transcript",
+                  "hook_fallback"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Source"
+          },
           "summary": {
             "description": "The LLM-generated summary text covering all conversation items up through `last_item_id`, e.g. `\"User asked to analyze a dataset. Agent loaded data.csv and computed statistics.\"`.",
             "title": "Summary",

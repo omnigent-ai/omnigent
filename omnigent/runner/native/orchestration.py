@@ -28,7 +28,10 @@ from omnigent.json_types import JsonObject as _JsonObject
 if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
     # graph (they are imported lazily inside the codex-native helpers).
-    from omnigent.claude_native import ClaudeNativeUcodeConfig
+    from omnigent.claude_native import (
+        ClaudeNativeUcodeConfig,
+        ClaudeResumeTranscriptResolution,
+    )
     from omnigent.codex_native_app_server import CodexAppServerClient, CodexNativeAppServer
     from omnigent.inner.datamodel import OSEnvSpec
     from omnigent.opencode_native_app_server import OpenCodeNativeServer
@@ -2334,6 +2337,147 @@ _CODEX_THREAD_RESET_NOTICE = (
     "restored."
 )
 
+_CLAUDE_DEGRADED_SYNC_NOTICE = (
+    "Claude's saved forwarding cursor no longer matched the local transcript. "
+    "Omnigent resumed Claude with the local context intact, but started syncing "
+    "new transcript items from the current end of the file to avoid replaying "
+    "older messages. Some activity written outside Omnigent may not appear here."
+)
+
+
+def _backup_unparseable_native_artifact(path: Path) -> Path:
+    """Preserve an unparseable native artifact before server reconstruction."""
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    backup = path.with_name(f"{path.name}.omnigent-backup-{stamp}")
+    suffix = 1
+    while backup.exists():
+        backup = path.with_name(f"{path.name}.omnigent-backup-{stamp}-{suffix}")
+        suffix += 1
+    shutil.copy2(path, backup)
+    return backup
+
+
+async def _resolve_runner_claude_resume(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    external_session_id: str,
+    workspace: Path,
+) -> ClaudeResumeTranscriptResolution:
+    """Resolve Claude resume state through the shared local-first policy."""
+    from omnigent.claude_native import (
+        _CLAUDE_SESSION_ID_RE,
+        ClaudeResumeTranscriptResolution,
+        _ensure_local_claude_resume_transcript,
+    )
+
+    if not _CLAUDE_SESSION_ID_RE.fullmatch(external_session_id):
+        return ClaudeResumeTranscriptResolution(
+            None,
+            reused_local=False,
+            synthesized=False,
+        )
+    return await _ensure_local_claude_resume_transcript(
+        client,
+        session_id=session_id,
+        external_session_id=external_session_id,
+        workspace=workspace,
+    )
+
+
+async def _resolve_missing_runner_claude_resume(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    workspace: Path,
+) -> tuple[str | None, ClaudeResumeTranscriptResolution]:
+    """Mint, synthesize, and persist a Claude id when server history exists."""
+    from omnigent.claude_native import (
+        ClaudeResumeTranscriptResolution,
+        _ensure_local_claude_resume_transcript,
+    )
+
+    minted_session_id = str(uuid.uuid4())
+    resolution = await _ensure_local_claude_resume_transcript(
+        client,
+        session_id=session_id,
+        external_session_id=minted_session_id,
+        workspace=workspace,
+    )
+    if resolution.path is None:
+        _logger.warning(
+            "Claude session %s has no native id or committed history; launching fresh",
+            session_id,
+        )
+        return None, ClaudeResumeTranscriptResolution(
+            None,
+            reused_local=False,
+            synthesized=False,
+        )
+    resp = await client.patch(
+        f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+        json={"external_session_id": minted_session_id},
+        timeout=10.0,
+    )
+    resp.raise_for_status()
+    return minted_session_id, resolution
+
+
+def _prepare_claude_resume_forwarder(
+    bridge_dir: Path,
+    resolution: ClaudeResumeTranscriptResolution,
+    *,
+    session_id: str = "runner-cold-resume",
+) -> tuple[int | None, bool]:
+    """Atomically preserve/seed the cursor and return prefix plus degradation."""
+    from omnigent.claude_native import _prepare_cold_resume_forward_state
+
+    degraded = _prepare_cold_resume_forward_state(
+        bridge_dir=bridge_dir,
+        resolution=resolution,
+        session_id=session_id,
+    )
+    prefix = (
+        _measured_prefix_bytes(resolution.path)
+        if resolution.synthesized and resolution.path is not None
+        else None
+    )
+    return prefix, degraded
+
+
+async def _post_claude_degraded_sync_notice(
+    *,
+    session_id: str,
+    server_client: httpx.AsyncClient | None,
+) -> None:
+    """Best-effort user-visible notice for an invalid local forward cursor."""
+    if server_client is None:
+        return
+    try:
+        resp = await server_client.post(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "error",
+                    "item_data": {
+                        "source": "harness",
+                        "code": "claude_degraded_sync",
+                        "message": _CLAUDE_DEGRADED_SYNC_NOTICE,
+                        "level": "info",
+                    },
+                },
+            },
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "claude-native: failed to surface degraded-sync notice for session %s",
+            session_id,
+            exc_info=True,
+        )
+
 
 async def _post_codex_thread_reset_notice(
     *,
@@ -3858,7 +4002,6 @@ async def _auto_create_codex_terminal(
         session_id=session_id,
         server_client=server_client,
     )
-    original_external_session_id = launch_config.external_session_id
     workspace = str(launch_config.workspace)
     bridge_dir = prepare_bridge_dir(session_id)
     socket_path = socket_path_for_bridge_dir(bridge_dir)
@@ -3878,6 +4021,8 @@ async def _auto_create_codex_terminal(
     from omnigent.inner.codex_executor import _find_codex_cli
 
     _codex_cli_path = _find_codex_cli()
+    from omnigent.codex_native import _is_safe_codex_thread_id
+
     # Explicit launches (model-flows design §4): validate an explicit request
     # against the shared catalog, and give a Default launch on codex's own
     # login the ACCOUNT's real default — so the ``model =`` line copied from
@@ -3953,17 +4098,35 @@ async def _auto_create_codex_terminal(
         and launch_config.fork_source_external_id is not None
         and launch_config.fork_source_id is not None
     ):
-        from omnigent.codex_native import _clone_codex_rollout, _mint_codex_thread_id
+        from omnigent.codex_native import (
+            _bind_codex_thread_id_set_once,
+            _clone_codex_rollout,
+            _mint_codex_thread_id,
+        )
 
-        target_thread_id = _mint_codex_thread_id()
+        if server_client is None:
+            raise RuntimeError("server_client is required to bind a forked Codex thread.")
+        source_session_id = launch_config.fork_source_id
+        source_thread_id = launch_config.fork_source_external_id
+        proposed_thread_id = _mint_codex_thread_id()
+        target_thread_id = await _bind_codex_thread_id_set_once(
+            server_client,
+            session_id=session_id,
+            proposed_thread_id=proposed_thread_id,
+        )
+        launch_config = dataclasses.replace(launch_config, external_session_id=target_thread_id)
         clone_workspace = Path(workspace).resolve()
         try:
-            cloned_rollout = _clone_codex_rollout(
-                source_session_id=launch_config.fork_source_id,
-                source_thread_id=launch_config.fork_source_external_id,
-                target_thread_id=target_thread_id,
-                clone_codex_home=codex_home,
-                clone_workspace=clone_workspace,
+            cloned_rollout = (
+                _clone_codex_rollout(
+                    source_session_id=source_session_id,
+                    source_thread_id=source_thread_id,
+                    target_thread_id=target_thread_id,
+                    clone_codex_home=codex_home,
+                    clone_workspace=clone_workspace,
+                )
+                if target_thread_id == proposed_thread_id
+                else None
             )
         except Exception:  # noqa: BLE001 — best-effort; fall back to stored items
             cloned_rollout = None
@@ -3984,34 +4147,6 @@ async def _auto_create_codex_terminal(
             str(cloned_rollout) if cloned_rollout is not None else None,
             extra={"session_id": session_id},
         )
-        if cloned_rollout is not None:
-            # Resume our OWN clone via the existing resume path below.
-            launch_config = dataclasses.replace(
-                launch_config, external_session_id=target_thread_id
-            )
-            # Record the assigned thread id now so Omnigent reflects the clone's
-            # own Codex thread immediately and a later relaunch resumes it.
-            # Best-effort, like the claude-native fork branch.
-            if server_client is not None:
-                try:
-                    await server_client.patch(
-                        f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-                        json={"external_session_id": target_thread_id},
-                        timeout=10.0,
-                    )
-                except httpx.HTTPError:
-                    # The clone resumes via the known-thread forwarder (no
-                    # discovery), so nothing re-captures the id later: it stays
-                    # unset on the Omnigent session and a future relaunch of this
-                    # clone will start fresh rather than resume the cloned
-                    # rollout. The cloned rollout itself is already on disk, so
-                    # the current launch still resumes with history.
-                    _logger.warning(
-                        "Could not pre-set external_session_id for forked codex clone %s; "
-                        "it will remain unset and a future relaunch will start fresh",
-                        session_id,
-                        exc_info=True,
-                    )
     if (
         launch_config.external_session_id is None
         and launch_config.fork_carry_history
@@ -4025,30 +4160,28 @@ async def _auto_create_codex_terminal(
         # uses, so the clone opens with the prior conversation as Codex context.
         # Best-effort: launch fresh on failure. See designs/FORK_SESSION_UX.md.
         from omnigent.codex_native import (
+            _bind_codex_thread_id_set_once,
             _ensure_local_codex_resume_rollout,
             _mint_codex_thread_id,
         )
 
-        target_thread_id = _mint_codex_thread_id()
+        proposed_thread_id = _mint_codex_thread_id()
+        target_thread_id = await _bind_codex_thread_id_set_once(
+            server_client,
+            session_id=session_id,
+            proposed_thread_id=proposed_thread_id,
+        )
         clone_workspace = Path(workspace).resolve()
-        try:
-            built_rollout = await _ensure_local_codex_resume_rollout(
-                server_client,
-                session_id=session_id,
-                external_session_id=target_thread_id,
-                codex_home=codex_home,
-                workspace=clone_workspace,
-                model_provider=_session_meta_provider,
-                codex_path=_codex_cli_path,
-                terminal_launch_args=launch_config.terminal_launch_args,
-            )
-        except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
-            built_rollout = None
-            _logger.warning(
-                "Could not build rollout from items for forked codex clone %s; launching fresh",
-                session_id,
-                exc_info=True,
-            )
+        built_rollout = await _ensure_local_codex_resume_rollout(
+            server_client,
+            session_id=session_id,
+            external_session_id=target_thread_id,
+            codex_home=codex_home,
+            workspace=clone_workspace,
+            model_provider=_session_meta_provider,
+            codex_path=_codex_cli_path,
+            terminal_launch_args=launch_config.terminal_launch_args,
+        )
         _logger.info(
             "Codex terminal fork-rebuild decision: session=%s our_thread=%s "
             "clone_workspace=%s built_rollout=%s",
@@ -4058,25 +4191,46 @@ async def _auto_create_codex_terminal(
             str(built_rollout) if built_rollout is not None else None,
             extra={"session_id": session_id},
         )
-        if built_rollout is not None:
+        launch_config = dataclasses.replace(launch_config, external_session_id=target_thread_id)
+
+    resolved_standard_resume = False
+    if (
+        not _is_safe_codex_thread_id(launch_config.external_session_id)
+        and launch_config.fork_source_external_id is None
+        and not launch_config.fork_carry_history
+        and server_client is not None
+    ):
+        # Missing and malformed ids share the CLI's conflict-aware set-once
+        # resolver. It binds before reconstruction, so a concurrent loser
+        # never launches or leaves a rollout under its private proposal.
+        from omnigent.codex_native import (
+            _fetch_all_session_items_for_codex_resume,
+            _resolve_codex_cold_resume_thread_id,
+        )
+
+        history = await _fetch_all_session_items_for_codex_resume(server_client, session_id)
+        if history or launch_config.external_session_id is not None:
+            target_thread_id = await _resolve_codex_cold_resume_thread_id(
+                server_client,
+                session_id=session_id,
+                external_session_id=launch_config.external_session_id,
+                codex_home=codex_home,
+                workspace=Path(workspace).resolve(),
+                model_provider=_session_meta_provider,
+                codex_path=_codex_cli_path,
+                terminal_launch_args=launch_config.terminal_launch_args,
+            )
             launch_config = dataclasses.replace(
                 launch_config, external_session_id=target_thread_id
             )
-            try:
-                await server_client.patch(
-                    f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-                    json={"external_session_id": target_thread_id},
-                    timeout=10.0,
-                )
-            except httpx.HTTPError:
-                _logger.warning(
-                    "Could not pre-set external_session_id for forked codex clone %s; "
-                    "it will remain unset and a future relaunch will start fresh",
-                    session_id,
-                    exc_info=True,
-                )
+            resolved_standard_resume = True
+        else:
+            _logger.warning(
+                "Codex session %s has no native thread id or committed history; launching fresh",
+                session_id,
+            )
 
-    if launch_config.external_session_id is not None and original_external_session_id is not None:
+    if launch_config.external_session_id is not None and not resolved_standard_resume:
         from omnigent.codex_native import _ensure_local_codex_resume_rollout
 
         if server_client is None:
@@ -6515,19 +6669,6 @@ async def _auto_create_claude_terminal(
                 "Could not set bridge_id label for %s; relay may target wrong dir",
                 session_id,
             )
-    # Capture the previous claude_session_id from the bridge state file BEFORE
-    # prepare_bridge_dir unlinks it. read_claude_session_id reads _STATE_FILE,
-    # which prepare_bridge_dir removes as part of its refresh; reading it here
-    # lets the cold-resume fallback below use it when the server GET missed the
-    # external_session_id binding (e.g. workspace-scope ContextVar not set).
-    from omnigent.claude_native_bridge import (
-        bridge_dir_for_bridge_id as _bridge_dir_for_bridge_id,
-    )
-    from omnigent.claude_native_bridge import (
-        read_claude_session_id as _read_csid_pre_wipe,
-    )
-
-    _pre_wipe_claude_sid = _read_csid_pre_wipe(_bridge_dir_for_bridge_id(bridge_id))
     # Resolved once here and reused below (env_spec) so the bridge's own
     # sys_os_* tools and the terminal process see the same sandbox — the
     # agent's declared os_env.sandbox, already overridden by any
@@ -6539,10 +6680,10 @@ async def _auto_create_claude_terminal(
         workspace=Path(workspace),
         sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
     )
-    # Cancel any surviving forwarder BEFORE wiping its cursor/seen state, else it
-    # re-posts with fresh dedup state alongside the forwarder spawned below.
+    # Cancel any surviving forwarder before resolving cold resume. Whether its
+    # durable cursor survives depends on the artifact decision below: local
+    # reuse preserves it, while reconstructed/fresh artifacts reset it.
     await _cancel_auto_forwarder_task(session_id)
-    reset_transcript_forward_state(bridge_dir)
     _logger.info(
         "Claude terminal bridge prepared: session=%s bridge_dir=%s",
         session_id,
@@ -6600,20 +6741,6 @@ async def _auto_create_claude_terminal(
     fork_source_external_id = launch_metadata.fork_source_external_id
     fork_carry_history = launch_metadata.fork_carry_history
 
-    # The server GET may miss the external_session_id binding when the
-    # reconnect request arrives without a workspace-scoped context (the
-    # ContextVar defaults to 0 on fresh tasks). Fall back to the claude_session_id
-    # captured from the bridge state file before prepare_bridge_dir wiped it.
-    if session_external_id is None and _pre_wipe_claude_sid is not None:
-        session_external_id = _pre_wipe_claude_sid
-        _logger.info(
-            "cold-resume fallback: server snapshot missing external_session_id, "
-            "using local bridge hint: session=%s local_claude_sid=%s",
-            session_id,
-            _pre_wipe_claude_sid,
-            extra={"session_id": session_id},
-        )
-
     # Cold resume: when this session wraps a prior Claude session,
     # synthesize the local ``~/.claude/projects/<workspace>/<sid>.jsonl``
     # transcript that Claude's ``--resume`` reads, then pass ``--resume``.
@@ -6623,6 +6750,7 @@ async def _auto_create_claude_terminal(
     # transcript that doesn't exist. See
     # designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
     resume_external_session_id: str | None = None
+    reset_forward_state = True
     # Byte length of the resume transcript this launch synthesized, measured
     # BEFORE Claude starts. The forwarder seeds its cursor from this rather than
     # from a live end-offset: resolving the transcript path needs Claude's first
@@ -6630,24 +6758,25 @@ async def _auto_create_claude_terminal(
     # ``stat`` taken later routinely skips the freshly-injected message.
     resume_prefix_bytes: int | None = None
     if server_client is not None and session_external_id is not None:
-        from omnigent.claude_native import _ensure_local_claude_resume_transcript
-
-        try:
-            _transcript = await _ensure_local_claude_resume_transcript(
-                server_client,
+        resolution = await _resolve_runner_claude_resume(
+            server_client,
+            session_id=session_id,
+            external_session_id=session_external_id,
+            workspace=Path(workspace).resolve(),
+        )
+        if resolution.path is not None:
+            resume_external_session_id = session_external_id
+            resume_prefix_bytes, degraded_sync = _prepare_claude_resume_forwarder(
+                bridge_dir,
+                resolution,
                 session_id=session_id,
-                external_session_id=session_external_id,
-                workspace=Path(workspace).resolve(),
             )
-            if _transcript is not None:
-                resume_external_session_id = session_external_id
-                resume_prefix_bytes = _measured_prefix_bytes(_transcript)
-        except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
-            _logger.warning(
-                "Could not synthesize Claude resume transcript for %s; launching without --resume",
-                session_id,
-                exc_info=True,
-            )
+            reset_forward_state = False
+            if degraded_sync:
+                await _post_claude_degraded_sync_notice(
+                    session_id=session_id,
+                    server_client=server_client,
+                )
     elif session_external_id is None and fork_source_external_id is not None:
         # Forked clone with no native session yet: clone the SOURCE's
         # local Claude transcript into the clone's OWN project dir under a
@@ -6663,19 +6792,25 @@ async def _auto_create_claude_terminal(
 
         our_uuid = str(uuid.uuid4())
         _clone_workspace = Path(workspace).resolve()
-        try:
-            _cloned = _clone_claude_transcript(
-                source_external_session_id=fork_source_external_id,
-                target_external_session_id=our_uuid,
-                clone_workspace=_clone_workspace,
+        _cloned = _clone_claude_transcript(
+            source_external_session_id=fork_source_external_id,
+            target_external_session_id=our_uuid,
+            clone_workspace=_clone_workspace,
+        )
+        if _cloned is None:
+            # The source artifact can be absent on a different runner.  The
+            # clone's copied Omnigent items are the authoritative fallback;
+            # conversion failures must abort instead of silently opening an
+            # empty Claude session.
+            from omnigent.claude_native import _ensure_local_claude_resume_transcript
+
+            _fallback = await _ensure_local_claude_resume_transcript(
+                server_client,
+                session_id=session_id,
+                external_session_id=our_uuid,
+                workspace=_clone_workspace,
             )
-        except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
-            _cloned = None
-            _logger.warning(
-                "Could not clone source transcript for forked clone %s; launching fresh",
-                session_id,
-                exc_info=True,
-            )
+            _cloned = _fallback.path
         _logger.info(
             "Claude terminal fork-resume decision: session=%s source_ext=%s "
             "our_uuid=%s clone_workspace=%s cloned_transcript=%s",
@@ -6690,24 +6825,14 @@ async def _auto_create_claude_terminal(
             # Resume our OWN clone (plain --resume, no --fork-session).
             resume_external_session_id = our_uuid
             resume_prefix_bytes = _measured_prefix_bytes(_cloned)
-            # Record the assigned id now so Omnigent reflects the clone's own
-            # Claude session immediately, and a later relaunch resumes it
-            # via the normal cold-resume path (this branch is gated on
-            # external_session_id being unset). Best-effort.
-            if server_client is not None:
-                try:
-                    await server_client.patch(
-                        f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-                        json={"external_session_id": our_uuid},
-                        timeout=10.0,
-                    )
-                except httpx.HTTPError:
-                    _logger.warning(
-                        "Could not pre-set external_session_id for forked clone %s; "
-                        "relying on hook capture",
-                        session_id,
-                        exc_info=True,
-                    )
+            # The assigned id must be durable before launching it. Relying on
+            # later hook capture can bind a different session after a race.
+            patch_resp = await server_client.patch(
+                f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+                json={"external_session_id": our_uuid},
+                timeout=10.0,
+            )
+            patch_resp.raise_for_status()
     elif (
         server_client is not None
         and fork_carry_history
@@ -6727,21 +6852,13 @@ async def _auto_create_claude_terminal(
 
         our_uuid = str(uuid.uuid4())
         _clone_workspace = Path(workspace).resolve()
-        try:
-            _built = await _ensure_local_claude_resume_transcript(
-                server_client,
-                session_id=session_id,
-                external_session_id=our_uuid,
-                workspace=_clone_workspace,
-            )
-        except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
-            _built = None
-            _logger.warning(
-                "Could not build native transcript from items for forked clone %s; "
-                "launching fresh",
-                session_id,
-                exc_info=True,
-            )
+        _built_resolution = await _ensure_local_claude_resume_transcript(
+            server_client,
+            session_id=session_id,
+            external_session_id=our_uuid,
+            workspace=_clone_workspace,
+        )
+        _built = _built_resolution.path
         _logger.info(
             "Claude terminal fork-rebuild decision: session=%s our_uuid=%s "
             "clone_workspace=%s built_transcript=%s",
@@ -6754,22 +6871,36 @@ async def _auto_create_claude_terminal(
         if _built is not None:
             resume_external_session_id = our_uuid
             resume_prefix_bytes = _measured_prefix_bytes(_built)
-            # Record the assigned id so Omnigent reflects the clone's own Claude
-            # session and a later relaunch resumes it via the cold-resume
-            # path above. Best-effort, mirroring the clone branch.
-            try:
-                await server_client.patch(
-                    f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-                    json={"external_session_id": our_uuid},
-                    timeout=10.0,
-                )
-            except httpx.HTTPError:
-                _logger.warning(
-                    "Could not pre-set external_session_id for forked clone %s; "
-                    "relying on hook capture",
-                    session_id,
-                    exc_info=True,
-                )
+            patch_resp = await server_client.patch(
+                f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+                json={"external_session_id": our_uuid},
+                timeout=10.0,
+            )
+            patch_resp.raise_for_status()
+    elif (
+        server_client is not None
+        and session_external_id is None
+        and fork_source_external_id is None
+        and not fork_carry_history
+    ):
+        # Missing native ids can occur when Claude's first hook never mirrored
+        # the id. Preserve server history by minting an id and synthesizing
+        # under it; only an actually empty history launches blank.
+        minted_session_id, resolution = await _resolve_missing_runner_claude_resume(
+            server_client,
+            session_id=session_id,
+            workspace=Path(workspace).resolve(),
+        )
+        if minted_session_id is not None and resolution.path is not None:
+            resume_external_session_id = minted_session_id
+            resume_prefix_bytes, _ = _prepare_claude_resume_forwarder(
+                bridge_dir,
+                resolution,
+                session_id=session_id,
+            )
+            reset_forward_state = False
+    if reset_forward_state:
+        reset_transcript_forward_state(bridge_dir)
     _logger.info(
         "Claude terminal cold-resume decision: session=%s external_session_id_set=%s "
         "fork_source_set=%s resume_enabled=%s",

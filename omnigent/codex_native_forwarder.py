@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
+import os
+import tempfile
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import BinaryIO
 
 import httpx
 
@@ -106,6 +110,8 @@ _EXTERNAL_COMPACTION_STATUS_TYPE = "external_compaction_status"
 # handlers are harmless no-ops if a build spells these differently.
 _CODEX_COMPACTION_ITEM_TYPE = "contextCompaction"
 _CODEX_THREAD_COMPACTED_METHOD = "thread/compacted"
+_CODEX_COMPACTION_SCAN_INTERVAL_SECONDS = 1.0
+_CODEX_COMPACTION_STATE_FILE = "codex_compaction_forwarder.json"
 # Transient reasoning (chain-of-thought) delta — the reasoning analogue of
 # ``external_output_text_delta``. Nothing is persisted; it publishes
 # ``response.reasoning_text.delta`` (preceded by ``response.reasoning.started``
@@ -430,10 +436,8 @@ class _CodexForwarderState:
     # identical posts when Codex signals completion via both a
     # ``contextCompaction`` item and a ``thread/compacted`` notification.
     compaction_status_posted: str | None = None
-    # Whether the compaction item has already been persisted for the current
-    # compaction boundary.  Reset to ``False`` when a new ``"in_progress"``
-    # status is posted.
-    compaction_item_persisted: bool = False
+    # Durable rollout reconciler owned by ``supervise_forwarder``.
+    compaction_scanner: _CodexCompactionScanner | None = None
     # Codex reasoning item id whose live deltas are currently being mirrored.
     # When a delta arrives for a different item, it opens a new reasoning
     # block (``started=True`` → ``response.reasoning.started``). Reset at each
@@ -1828,6 +1832,383 @@ async def _sleep(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
 
+@dataclass(frozen=True)
+class _CodexRolloutCursor:
+    """Durable read position for one Codex rollout artifact."""
+
+    offset: int = 0
+    fingerprint: str | None = None
+
+
+@dataclass(frozen=True)
+class _CodexCompactionForwardState:
+    """Durable cursors and successfully persisted rollout record identities."""
+
+    cursors: dict[str, _CodexRolloutCursor] = field(default_factory=dict)
+    observed_record_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _CodexCompactedRecord:
+    """One complete ``type=compacted`` rollout line awaiting persistence."""
+
+    record_id: str
+    path_key: str
+    cursor_after: _CodexRolloutCursor
+    replacement_history: list[dict[str, object]]
+    window_id: int | None
+
+
+def _read_codex_compaction_state(bridge_dir: Path) -> _CodexCompactionForwardState:
+    """Read compaction cursors, accepting missing and older state shapes."""
+    try:
+        raw = json.loads((bridge_dir / _CODEX_COMPACTION_STATE_FILE).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return _CodexCompactionForwardState()
+    if not isinstance(raw, dict):
+        return _CodexCompactionForwardState()
+
+    cursors: dict[str, _CodexRolloutCursor] = {}
+    raw_cursors = raw.get("cursors")
+    if isinstance(raw_cursors, dict):
+        for path_key, value in raw_cursors.items():
+            if not isinstance(path_key, str):
+                continue
+            # Early development versions stored a bare integer offset. Keep
+            # accepting it so an upgrade never rewinds a valid cursor.
+            if isinstance(value, int) and value >= 0:
+                cursors[path_key] = _CodexRolloutCursor(offset=value)
+                continue
+            if not isinstance(value, dict):
+                continue
+            offset = value.get("offset")
+            fingerprint = value.get("fingerprint")
+            if isinstance(offset, int) and offset >= 0:
+                cursors[path_key] = _CodexRolloutCursor(
+                    offset=offset,
+                    fingerprint=fingerprint if isinstance(fingerprint, str) else None,
+                )
+
+    observed = raw.get("observed_record_ids")
+    observed_record_ids = (
+        tuple(value for value in observed if isinstance(value, str))
+        if isinstance(observed, list)
+        else ()
+    )
+    return _CodexCompactionForwardState(
+        cursors=cursors,
+        observed_record_ids=observed_record_ids,
+    )
+
+
+def _write_codex_compaction_state(bridge_dir: Path, state: _CodexCompactionForwardState) -> None:
+    """Atomically persist compaction cursors after successful delivery."""
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = bridge_dir / _CODEX_COMPACTION_STATE_FILE
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=bridge_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "version": 1,
+                    "cursors": {
+                        path_key: {
+                            "offset": cursor.offset,
+                            "fingerprint": cursor.fingerprint,
+                        }
+                        for path_key, cursor in state.cursors.items()
+                    },
+                    "observed_record_ids": list(state.observed_record_ids),
+                },
+                handle,
+                sort_keys=True,
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_name, 0o600)
+        os.replace(temporary_name, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary_name)
+
+
+def _rollout_cursor_fingerprint(handle: BinaryIO, offset: int) -> str:
+    """Hash the bytes immediately before *offset* to detect file replacement."""
+    sample_start = max(0, offset - 128)
+    handle.seek(sample_start)
+    sample = handle.read(offset - sample_start)
+    return hashlib.sha256(offset.to_bytes(8, "big") + sample).hexdigest()
+
+
+def _codex_rollout_paths(codex_home: Path, thread_id: str) -> list[Path]:
+    """Find active and archived rollout paths for a Codex thread."""
+    pattern = f"rollout-*-{thread_id}.jsonl"
+    paths = [path for path in codex_home.glob(f"sessions/**/{pattern}") if path.is_file()]
+    paths.extend(
+        path for path in codex_home.glob(f"archived_sessions/**/{pattern}") if path.is_file()
+    )
+    return sorted(set(paths), key=lambda path: str(path))
+
+
+def _read_codex_compacted_records(
+    bridge_dir: Path,
+    thread_id: str,
+    cursors: dict[str, _CodexRolloutCursor],
+) -> tuple[list[_CodexCompactedRecord], dict[str, _CodexRolloutCursor]]:
+    """Read complete new compacted lines without consuming a partial tail."""
+    bridge_state = read_bridge_state(bridge_dir)
+    if bridge_state is None:
+        return [], dict(cursors)
+
+    records: list[_CodexCompactedRecord] = []
+    final_cursors = dict(cursors)
+    for rollout_path in _codex_rollout_paths(Path(bridge_state.codex_home), thread_id):
+        path_key = str(rollout_path.resolve())
+        cursor = cursors.get(path_key, _CodexRolloutCursor())
+        with rollout_path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            offset = cursor.offset
+            if offset > size:
+                offset = 0
+            elif cursor.fingerprint is not None:
+                actual = _rollout_cursor_fingerprint(handle, offset)
+                if actual != cursor.fingerprint:
+                    offset = 0
+            handle.seek(offset)
+            while True:
+                line_start = handle.tell()
+                line = handle.readline()
+                if not line:
+                    break
+                if not line.endswith(b"\n"):
+                    # Codex may still be appending this JSON object. Retrying
+                    # from its first byte avoids treating a partial line as bad.
+                    handle.seek(line_start)
+                    break
+                line_end = handle.tell()
+                try:
+                    entry = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(entry, dict) or entry.get("type") != "compacted":
+                    continue
+                payload = entry.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                history = payload.get("replacement_history")
+                if not isinstance(history, list) or not all(
+                    isinstance(item, dict) for item in history
+                ):
+                    continue
+                window_id = payload.get("window_id")
+                if window_id is not None and (
+                    not isinstance(window_id, int) or isinstance(window_id, bool)
+                ):
+                    continue
+                identity_input = (
+                    thread_id.encode("utf-8")
+                    + b"\0"
+                    + line_start.to_bytes(8, "big")
+                    + b"\0"
+                    + line
+                )
+                cursor_after = _CodexRolloutCursor(
+                    offset=line_end,
+                    fingerprint=_rollout_cursor_fingerprint(handle, line_end),
+                )
+                records.append(
+                    _CodexCompactedRecord(
+                        record_id=hashlib.sha256(identity_input).hexdigest(),
+                        path_key=path_key,
+                        cursor_after=cursor_after,
+                        replacement_history=history,
+                        window_id=window_id,
+                    )
+                )
+                handle.seek(line_end)
+            safe_offset = handle.tell()
+            final_cursors[path_key] = _CodexRolloutCursor(
+                offset=safe_offset,
+                fingerprint=_rollout_cursor_fingerprint(handle, safe_offset),
+            )
+    return records, final_cursors
+
+
+def _codex_compaction_signature(
+    replacement_history: object,
+    window_id: object,
+) -> str | None:
+    """Return a stable signature for an exact persisted compaction snapshot."""
+    if not isinstance(replacement_history, list) or not all(
+        isinstance(item, dict) for item in replacement_history
+    ):
+        return None
+    if window_id is not None and (not isinstance(window_id, int) or isinstance(window_id, bool)):
+        return None
+    return json.dumps(
+        {"replacement_history": replacement_history, "window_id": window_id},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+async def _existing_codex_compaction_counts(
+    client: httpx.AsyncClient, session_id: str
+) -> dict[str, int]:
+    """Count exact server snapshots for one-time legacy-state reconciliation."""
+    counts: dict[str, int] = {}
+    after: str | None = None
+    while True:
+        params: dict[str, str | int] = {"limit": 1000, "order": "asc"}
+        if after is not None:
+            params["after"] = after
+        response = await client.get(f"/v1/sessions/{session_id}/items", params=params)
+        response.raise_for_status()
+        payload = response.json()
+        items = payload.get("data", []) if isinstance(payload, dict) else []
+        if not isinstance(items, list):
+            raise RuntimeError("Codex compaction reconciliation received malformed items")
+        for item in items:
+            if not isinstance(item, dict) or item.get("type") != "compaction":
+                continue
+            signature = _codex_compaction_signature(
+                item.get("compacted_messages"), item.get("window_id")
+            )
+            if signature is not None:
+                counts[signature] = counts.get(signature, 0) + 1
+        if len(items) < 1000:
+            break
+        last_id = payload.get("last_id") if isinstance(payload, dict) else None
+        if not isinstance(last_id, str) or not last_id or last_id == after:
+            break
+        after = last_id
+    return counts
+
+
+class _CodexCompactionScanner:
+    """Reconcile authoritative rollout compactions with the server store."""
+
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        thread_id: str,
+        bridge_dir: Path,
+        interval_seconds: float = _CODEX_COMPACTION_SCAN_INTERVAL_SECONDS,
+    ) -> None:
+        self._client = client
+        self._session_id = session_id
+        self._thread_id = thread_id
+        self._bridge_dir = bridge_dir
+        self._interval_seconds = interval_seconds
+        self._scan_lock = asyncio.Lock()
+        self._wake = asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
+
+    def update_target(self, *, session_id: str, thread_id: str) -> None:
+        """Point later scans at a newly rotated session and rollout."""
+        self._session_id = session_id
+        self._thread_id = thread_id
+        self.trigger()
+
+    def trigger(self) -> None:
+        """Request an immediate scan after a live compaction signal."""
+        self._wake.set()
+
+    def start(self) -> None:
+        """Start the bounded periodic recovery loop."""
+        if self._task is None:
+            self._task = asyncio.create_task(self._run(), name="codex-compaction-scanner")
+
+    async def close(self) -> None:
+        """Stop the periodic recovery loop."""
+        if self._task is None:
+            return
+        self._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._task
+        self._task = None
+
+    async def _run(self) -> None:
+        while True:
+            try:
+                await self.scan_now()
+            except Exception:  # noqa: BLE001 - a later scan retries the same record.
+                _logger.warning("Codex rollout compaction scan failed", exc_info=True)
+            try:
+                await asyncio.wait_for(self._wake.wait(), timeout=self._interval_seconds)
+                self._wake.clear()
+            except TimeoutError:
+                pass
+
+    async def scan_now(self) -> None:
+        """Persist every complete unseen compaction record in artifact order."""
+        async with self._scan_lock:
+            session_id = self._session_id
+            thread_id = self._thread_id
+            state = await asyncio.to_thread(_read_codex_compaction_state, self._bridge_dir)
+            records, final_cursors = await asyncio.to_thread(
+                _read_codex_compacted_records,
+                self._bridge_dir,
+                thread_id,
+                state.cursors,
+            )
+            observed = list(state.observed_record_ids)
+            observed_set = set(observed)
+            cursors = dict(state.cursors)
+            # Before this feature existed, a notification may already have
+            # persisted the rollout record without leaving durable forwarder
+            # state. On the first scan only, match exact server snapshots as a
+            # multiset so upgrades recover missing rows without duplicating
+            # rows that are already present. Subsequent scans trust artifact
+            # identities, allowing equal-content records at different offsets.
+            legacy_counts = (
+                await _existing_codex_compaction_counts(self._client, session_id)
+                if records and not state.cursors and not observed
+                else {}
+            )
+            for record in records:
+                if record.record_id not in observed_set:
+                    signature = _codex_compaction_signature(
+                        record.replacement_history, record.window_id
+                    )
+                    already_persisted = bool(signature and legacy_counts.get(signature, 0) > 0)
+                    if already_persisted:
+                        assert signature is not None
+                        legacy_counts[signature] -= 1
+                    else:
+                        await _persist_codex_compaction_item(
+                            self._client,
+                            session_id=session_id,
+                            compacted=record,
+                        )
+                    # The POST is authoritative: never mark a record observed
+                    # before it succeeds. Exact legacy matches are rows whose
+                    # successful POST predates the state file.
+                    observed.append(record.record_id)
+                    observed_set.add(record.record_id)
+                cursors[record.path_key] = record.cursor_after
+                await asyncio.to_thread(
+                    _write_codex_compaction_state,
+                    self._bridge_dir,
+                    _CodexCompactionForwardState(
+                        cursors=dict(cursors), observed_record_ids=tuple(observed)
+                    ),
+                )
+            if cursors != final_cursors:
+                cursors = final_cursors
+                await asyncio.to_thread(
+                    _write_codex_compaction_state,
+                    self._bridge_dir,
+                    _CodexCompactionForwardState(
+                        cursors=dict(cursors), observed_record_ids=tuple(observed)
+                    ),
+                )
+
+
 async def supervise_forwarder(
     *,
     base_url: str,
@@ -1902,6 +2283,14 @@ async def supervise_forwarder(
             parent_session_id=session_id,
             codex_client=client,
         )
+        compaction_scanner = _CodexCompactionScanner(
+            ap_client,
+            session_id=target.session_id,
+            thread_id=target.thread_id,
+            bridge_dir=bridge_dir,
+        )
+        forwarder_state.compaction_scanner = compaction_scanner
+        compaction_scanner.start()
         # Released when the live event stream shows the thread became
         # active (its first turn materializes the rollout). Lets the
         # subscribe task park instead of blind-polling ``thread/resume``
@@ -1934,6 +2323,10 @@ async def supervise_forwarder(
                     )
                     if rotated:
                         forwarder_state.note_parent_rotation(target.session_id)
+                        compaction_scanner.update_target(
+                            session_id=target.session_id,
+                            thread_id=target.thread_id,
+                        )
                         subscribe_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
                             await subscribe_task
@@ -1976,6 +2369,7 @@ async def supervise_forwarder(
                 except Exception:  # noqa: BLE001 - keep the long-lived mirror alive.
                     _logger.warning("Codex forwarder event handling failed", exc_info=True)
         finally:
+            await compaction_scanner.close()
             if mcp_settle_timer is not None:
                 mcp_settle_timer.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -3198,18 +3592,12 @@ async def _maybe_handle_turn_event(
         await _post_compaction_status(
             client, session_id, "completed", forwarder_state=forwarder_state
         )
-        if forwarder_state is None or not forwarder_state.compaction_item_persisted:
-            try:
-                await _persist_codex_compaction_item(
-                    client, session_id=session_id, bridge_dir=bridge_dir
-                )
-            except Exception:  # noqa: BLE001
-                _logger.warning(
-                    "Failed to persist codex compaction item for %s", session_id, exc_info=True
-                )
-            else:
-                if forwarder_state is not None:
-                    forwarder_state.compaction_item_persisted = True
+        await _scan_codex_compactions_after_signal(
+            client,
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            forwarder_state=forwarder_state,
+        )
         return True
     if method == "turn/diff/updated":
         _handle_turn_diff_updated(params, forwarder_state)
@@ -4563,18 +4951,12 @@ async def _handle_completed_item(
         await _post_compaction_status(
             client, session_id, "completed", forwarder_state=forwarder_state
         )
-        if forwarder_state is None or not forwarder_state.compaction_item_persisted:
-            try:
-                await _persist_codex_compaction_item(
-                    client, session_id=session_id, bridge_dir=bridge_dir
-                )
-            except Exception:  # noqa: BLE001
-                _logger.warning(
-                    "Failed to persist codex compaction item for %s", session_id, exc_info=True
-                )
-            else:
-                if forwarder_state is not None:
-                    forwarder_state.compaction_item_persisted = True
+        await _scan_codex_compactions_after_signal(
+            client,
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            forwarder_state=forwarder_state,
+        )
         return
     if not _claim_completed_item(params, item, forwarder_state):
         return
@@ -6228,24 +6610,15 @@ async def _post_compaction_status(
     _log_failed_session_event_post(_EXTERNAL_COMPACTION_STATUS_TYPE, response)
     if forwarder_state is not None and response is not None and response.status_code < 400:
         forwarder_state.compaction_status_posted = status
-        if status == "in_progress":
-            forwarder_state.compaction_item_persisted = False
 
 
 async def _persist_codex_compaction_item(
     client: httpx.AsyncClient,
     *,
     session_id: str,
-    bridge_dir: Path | None = None,
+    compacted: _CodexCompactedRecord,
 ) -> None:
-    """Persist a compaction boundary item to the conversation store.
-
-    Codex appends a ``Compacted`` entry to the rollout JSONL after
-    compaction. That entry carries ``replacement_history`` — the
-    post-compaction context. When ``bridge_dir`` is available, we
-    read the latest ``Compacted`` entry from the rollout and use
-    its ``replacement_history`` as ``compacted_messages``.
-    """
+    """Persist one exact rollout compaction record to the conversation store."""
     resp = await client.get(
         f"/v1/sessions/{session_id}/items",
         params={"limit": 1, "order": "desc"},
@@ -6254,37 +6627,15 @@ async def _persist_codex_compaction_item(
     items = resp.json().get("data", [])
     last_item_id = items[0]["id"] if items else f"compact_boundary_{session_id}"
 
-    compacted = None
-    if bridge_dir is not None:
-        try:
-            state = read_bridge_state(bridge_dir)
-            if state is not None:
-                codex_home = Path(state.codex_home)
-                thread_id = state.thread_id
-                rollout_files = sorted(
-                    codex_home.glob(f"sessions/**/*rollout-*{thread_id}.jsonl"),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                )
-                if rollout_files:
-                    compacted = _read_compacted_history(rollout_files[0])
-        except Exception:  # noqa: BLE001
-            _logger.debug(
-                "Failed to read codex rollout for compaction persist",
-                exc_info=True,
-            )
-
     data: dict[str, object] = {
         "summary": "[Codex compaction — context was compacted in the terminal]",
         "last_item_id": last_item_id,
         "model": "unknown",
         "token_count": 0,
+        "compacted_messages": compacted.replacement_history,
     }
-    if compacted is not None:
-        if compacted.get("replacement_history"):
-            data["compacted_messages"] = compacted["replacement_history"]
-        if compacted.get("window_id") is not None:
-            data["window_id"] = compacted["window_id"]
+    if compacted.window_id is not None:
+        data["window_id"] = compacted.window_id
 
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
@@ -6293,42 +6644,37 @@ async def _persist_codex_compaction_item(
     resp.raise_for_status()
 
 
-def _read_compacted_history(rollout_path: Path) -> dict[str, object] | None:
-    """Read the last ``Compacted`` entry from a rollout JSONL.
-
-    Codex appends a ``{type: "compacted", payload: {replacement_history: [...],
-    window_id: N}}`` entry after compaction. Returns a dict with
-    ``replacement_history`` and ``window_id`` for persistence, or ``None``.
-
-    :param rollout_path: Path to the rollout JSONL.
-    :returns: Dict with ``replacement_history`` and ``window_id``, or ``None``.
-    """
-    last_compacted = None
-    with rollout_path.open() as f:
-        for line in f:
-            try:
-                entry = json.loads(line)
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if entry.get("type") == "compacted":
-                last_compacted = entry
-    if last_compacted is None:
-        return None
-    payload = last_compacted.get("payload")
-    if not isinstance(payload, dict):
-        return None
-    history = payload.get("replacement_history")
-    if not isinstance(history, list) or not history:
-        return None
-    # Store the full replacement_history — messages + compaction
-    # tokens. Although the messages duplicate pre-compaction items
-    # in the conversation store, they are needed for rollout
-    # reconstruction (e.g. sandbox recovery where the rollout file
-    # is lost).
-    return {
-        "replacement_history": [item for item in history if isinstance(item, dict)],
-        "window_id": payload.get("window_id"),
-    }
+async def _scan_codex_compactions_after_signal(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path | None,
+    forwarder_state: _CodexForwarderState | None,
+) -> None:
+    """Scan immediately after a signal; the periodic loop covers write races."""
+    scanner = forwarder_state.compaction_scanner if forwarder_state is not None else None
+    if scanner is None:
+        if bridge_dir is None:
+            return
+        bridge_state = await asyncio.to_thread(read_bridge_state, bridge_dir)
+        if bridge_state is None:
+            return
+        scanner = _CodexCompactionScanner(
+            client,
+            session_id=session_id,
+            thread_id=bridge_state.thread_id,
+            bridge_dir=bridge_dir,
+        )
+    else:
+        scanner.trigger()
+    try:
+        await scanner.scan_now()
+    except Exception:  # noqa: BLE001 - periodic scan retries after transient failures.
+        _logger.warning(
+            "Failed to persist codex rollout compaction for %s",
+            session_id,
+            exc_info=True,
+        )
 
 
 async def _handle_reasoning_delta(

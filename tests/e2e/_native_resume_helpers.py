@@ -225,6 +225,8 @@ class PtyHandle:
     _buf: list[bytes] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _stop: threading.Event = field(default_factory=threading.Event)
+    _reaped: bool = False
+    _closed: bool = False
 
     def output(self) -> str:
         """
@@ -235,6 +237,42 @@ class PtyHandle:
         with self._lock:
             return b"".join(self._buf).decode("utf-8", "replace")
 
+    def send_line(self, text: str) -> None:
+        """
+        Type one line into the attached native TUI.
+
+        This is intentionally a write to this fixture-owned PTY rather than a
+        process-name lookup or a global tmux command. It is used by live tests
+        for native slash commands such as ``/exit``.
+
+        :param text: Line to submit without a trailing newline.
+        """
+        os.write(self.fd, text.encode("utf-8") + b"\r")
+
+    def wait(self, timeout: float) -> bool:
+        """
+        Wait up to *timeout* seconds for the fixture-owned child to exit.
+
+        :returns: ``True`` when the child exited and was reaped, otherwise
+            ``False``. The method never signals the process.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._reaped:
+                return True
+            try:
+                waited, _ = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                self._reaped = True
+                self._close_fd()
+                return True
+            if waited == self.pid:
+                self._reaped = True
+                self._close_fd()
+                return True
+            time.sleep(0.1)
+        return False
+
     def terminate(self) -> None:
         """
         Kill the CLI process and stop the drain thread.
@@ -244,10 +282,20 @@ class PtyHandle:
 
         :returns: None.
         """
+        if not self._reaped:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(self.pid, signal.SIGKILL)
+        if not self._reaped:
+            _reap(self.pid)
+            self._reaped = True
+        self._close_fd()
+
+    def _close_fd(self) -> None:
+        """Stop the reader and close this fixture-owned PTY exactly once."""
+        if self._closed:
+            return
+        self._closed = True
         self._stop.set()
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(self.pid, signal.SIGKILL)
-        _reap(self.pid)
         with contextlib.suppress(OSError):
             os.close(self.fd)
 
@@ -303,7 +351,7 @@ def spawn_cli_background(
     return handle
 
 
-_CONV_ID_RE = re.compile(r"(conv_[0-9a-f]+)")
+_CONV_ID_RE = re.compile(r"/c/((?:conv_)?[0-9a-f]{24,32})(?:\b|$)")
 
 
 def wait_for_conversation_id(handle: PtyHandle, *, timeout: float) -> str:
@@ -340,7 +388,9 @@ def conversation_id_from_output(output: str) -> str:
     :returns: The conversation id.
     :raises AssertionError: If no id is found (the run never created a session).
     """
-    match = re.search(r"--resume (conv_[0-9a-f]+)", output) or _CONV_ID_RE.search(output)
+    match = re.search(r"--resume ((?:conv_)?[0-9a-f]{24,32})(?:\b|$)", output)
+    if match is None:
+        match = _CONV_ID_RE.search(output)
     assert match is not None, f"no conversation id in CLI output:\n{output[-2000:]}"
     return match.group(1)
 

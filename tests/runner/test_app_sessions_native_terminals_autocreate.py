@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ from omnigent.antigravity_native_bridge import (
 from omnigent.antigravity_native_bridge import (
     write_bridge_state as write_antigravity_bridge_state,
 )
+from omnigent.claude_native import ClaudeResumeTranscriptResolution
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
     bridge_dir_for_bridge_id,
@@ -77,6 +79,31 @@ from tests.runner.conftest import (
     _ScriptedHarnessClient,
 )
 from tests.runner.helpers import NullServerClient
+
+
+@pytest.fixture(autouse=True)
+def _default_empty_claude_missing_id_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep unrelated launch tests focused while missing-id policy is unit tested."""
+
+    async def _empty_resolution(
+        _client: Any,
+        *,
+        session_id: str,
+        workspace: Path,
+    ) -> tuple[str | None, ClaudeResumeTranscriptResolution]:
+        del session_id, workspace
+        return None, ClaudeResumeTranscriptResolution(
+            None,
+            reused_local=False,
+            synthesized=False,
+        )
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._resolve_missing_runner_claude_resume",
+        _empty_resolution,
+    )
 
 
 def _load_claude_invocation_settings(args: list[str]) -> dict[str, Any]:
@@ -709,8 +736,10 @@ async def test_auto_create_claude_terminal_passes_session_effort(
 
     # Fake Omnigent server client that returns a session with reasoning_effort.
     def _handle_request(_request: httpx.Request) -> httpx.Response:
+        if _request.url.path.endswith("/items"):
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if use_envelope:
-            raise AssertionError("envelope terminal startup made a legacy HTTP callback")
+            raise AssertionError("envelope terminal startup re-fetched snapshot metadata")
         return httpx.Response(
             200,
             json={"reasoning_effort": "high", "labels": {}},
@@ -1542,15 +1571,47 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         session_id: str,
         external_session_id: str,
         workspace: Path,
-    ) -> Path:
+    ) -> ClaudeResumeTranscriptResolution:
         """Record the resume id and return a transcript path."""
         del client, session_id, workspace
         synth_calls.append(external_session_id)
-        return tmp_path / f"{external_session_id}.jsonl"
+        if snapshot_external_id is None:
+            return ClaudeResumeTranscriptResolution(
+                None,
+                reused_local=False,
+                synthesized=False,
+            )
+        transcript = tmp_path / f"{external_session_id}.jsonl"
+        transcript.write_text('{"type":"user","message":{}}\n')
+        return ClaudeResumeTranscriptResolution(
+            transcript,
+            reused_local=False,
+            synthesized=True,
+        )
 
     monkeypatch.setattr(
         "omnigent.claude_native._ensure_local_claude_resume_transcript",
         _fake_synth,
+    )
+
+    async def _resolve_missing(
+        _client: Any,
+        *,
+        session_id: str,
+        workspace: Path,
+    ) -> tuple[str | None, ClaudeResumeTranscriptResolution]:
+        del session_id, workspace
+        minted = str(uuid.uuid4())
+        synth_calls.append(minted)
+        return None, ClaudeResumeTranscriptResolution(
+            None,
+            reused_local=False,
+            synthesized=False,
+        )
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._resolve_missing_runner_claude_resume",
+        _resolve_missing,
     )
 
     snapshot: dict[str, Any] = {}
@@ -1576,6 +1637,16 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
                         return {"labels": {}}
 
                 return _LabelsResponse()
+
+            if url.endswith("/items"):
+
+                class _ItemsResponse(NullServerClient._Response):
+                    """No committed history keeps a truly fresh launch blank."""
+
+                    def json(self) -> dict[str, Any]:
+                        return {"data": [], "has_more": False}
+
+                return _ItemsResponse()
 
             assert url == "/v1/sessions/5cdbea97a2fb0c659bc09605401e2bb2"
 
@@ -1639,11 +1710,12 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         f"transcript is re-posted."
     )
 
-    # ``start_at_end`` must be correct *because* the resume branch ran, not
-    # by coincidence: synthesis happens exactly when (and only when) the
-    # snapshot carried an external session id.
+    # ``start_at_end`` must be correct because the resume branch ran, not by
+    # coincidence. A missing id now also attempts mint+synthesis; this fixture
+    # returns no history so that case remains a genuinely fresh launch.
     if snapshot_external_id is None:
-        assert synth_calls == []
+        assert len(synth_calls) == 1
+        uuid.UUID(synth_calls[0])
     else:
         assert synth_calls == [snapshot_external_id]
 
@@ -1653,19 +1725,11 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
 
 
 @pytest.mark.asyncio
-async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_bridge_sid(
+async def test_auto_create_claude_terminal_missing_snapshot_id_ignores_pre_wipe_bridge_sid(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Fallback fires when server GET omits external_session_id but local bridge has it.
-
-    Simulates the workspace-scope miss (ES-2065116): the server snapshot
-    returns no external_session_id, but the bridge state.json from the
-    previous launch holds a claude_session_id. The runner must read it
-    *before* prepare_bridge_dir wipes the file and use it as the resume
-    hint, so _ensure_local_claude_resume_transcript is called with the
-    local sid and --resume is passed.
-    """
+    """An explicit missing binding mints instead of trusting stale bridge state."""
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
@@ -1690,14 +1754,40 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
         session_id: str,
         external_session_id: str,
         workspace: Path,
-    ) -> Path:
+    ) -> ClaudeResumeTranscriptResolution:
         del client, session_id, workspace
         synth_calls.append(external_session_id)
-        return tmp_path / f"{external_session_id}.jsonl"
+        transcript = tmp_path / f"{external_session_id}.jsonl"
+        transcript.write_text('{"type":"user","message":{}}\n')
+        return ClaudeResumeTranscriptResolution(
+            transcript,
+            reused_local=False,
+            synthesized=True,
+        )
 
     monkeypatch.setattr(
         "omnigent.claude_native._ensure_local_claude_resume_transcript",
         _fake_synth,
+    )
+
+    async def _resolve_missing(
+        client: Any,
+        *,
+        session_id: str,
+        workspace: Path,
+    ) -> tuple[str | None, ClaudeResumeTranscriptResolution]:
+        minted = str(uuid.uuid4())
+        resolution = await _fake_synth(
+            client,
+            session_id=session_id,
+            external_session_id=minted,
+            workspace=workspace,
+        )
+        return minted, resolution
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._resolve_missing_runner_claude_resume",
+        _resolve_missing,
     )
 
     forwarder_kwargs: dict[str, Any] = {}
@@ -1761,13 +1851,9 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
 
     await asyncio.sleep(0)
 
-    # The fallback must have fired: synthesis is called with the local bridge
-    # sid, not skipped (which would leave the user with no context).
-    assert synth_calls == [prior_claude_sid], (
-        f"Expected synthesis with prior claude sid {prior_claude_sid!r}; "
-        f"got {synth_calls!r}. The fallback may be reading the bridge dir "
-        "after prepare_bridge_dir already wiped state.json."
-    )
+    assert len(synth_calls) == 1
+    uuid.UUID(synth_calls[0])
+    assert synth_calls[0] != prior_claude_sid
     # The forwarder must start past the replayed transcript (same as a
     # normal cold resume where the server returned the binding directly).
     assert forwarder_kwargs.get("start_at_end") is True

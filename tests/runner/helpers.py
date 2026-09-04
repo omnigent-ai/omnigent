@@ -37,6 +37,14 @@ class NullServerClient:
         :param kwargs: Extra keyword arguments (ignored).
         :returns: Stub 200 response with empty JSON body.
         """
+        if url.endswith("/items"):
+
+            class _EmptyItemsResponse(self._Response):
+                def json(self) -> dict[str, Any]:
+                    return {"data": [], "has_more": False}
+
+            del kwargs
+            return _EmptyItemsResponse()
         del url, kwargs
         return self._Response()
 

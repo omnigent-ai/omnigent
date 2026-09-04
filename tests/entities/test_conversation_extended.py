@@ -99,11 +99,40 @@ def test_compaction_data_valid() -> None:
         last_item_id="msg_abc123",
         model="openai/gpt-4o",
         token_count=342,
+        snapshot_source="transcript",
     )
     assert cd.summary.startswith("User asked")
     assert cd.last_item_id == "msg_abc123"
     assert cd.model == "openai/gpt-4o"
     assert cd.token_count == 342
+    assert cd.snapshot_source == "transcript"
+
+
+def test_compaction_data_rejects_unknown_snapshot_source() -> None:
+    with pytest.raises(ValidationError, match="snapshot_source"):
+        CompactionData(
+            summary="s",
+            last_item_id="msg_1",
+            token_count=1,
+            snapshot_source="sdk_guess",  # type: ignore[arg-type]
+        )
+
+
+def test_parse_compaction_item_preserves_snapshot_source() -> None:
+    data = parse_item_data(
+        "compaction",
+        {
+            "type": "compaction",
+            "summary": "durable transcript summary",
+            "last_item_id": "msg_1",
+            "token_count": 1,
+            "snapshot_source": "transcript",
+        },
+    )
+
+    assert isinstance(data, CompactionData)
+    assert data.snapshot_source == "transcript"
+    assert data.model_dump()["snapshot_source"] == "transcript"
 
 
 def test_compaction_data_missing_field() -> None:

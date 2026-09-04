@@ -708,7 +708,13 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
     class _ForkSnapshotClient:
         """Server client returning a forked clone snapshot (no thread id)."""
 
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+        async def get(
+            self,
+            url: str,
+            *,
+            timeout: float | None = None,
+            params: dict[str, Any] | None = None,
+        ) -> httpx.Response:
             """
             Return the clone's snapshot carrying fork labels but no thread id.
 
@@ -716,7 +722,13 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
             :param timeout: Request timeout in seconds.
             :returns: HTTP 200 response with fork labels.
             """
-            del timeout
+            del timeout, params
+            if url.endswith("/items"):
+                return httpx.Response(
+                    200,
+                    json={"data": [], "has_more": False},
+                    request=httpx.Request("GET", url),
+                )
             assert url == f"/v1/sessions/{session_id}"
             return httpx.Response(
                 200,
@@ -1234,7 +1246,13 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     class _WorktreeSnapshotClient:
         """Server client whose session snapshot carries a worktree workspace."""
 
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+        async def get(
+            self,
+            url: str,
+            *,
+            timeout: float | None = None,
+            params: dict[str, Any] | None = None,
+        ) -> httpx.Response:
             """
             Return the session snapshot with a worktree ``workspace``.
 
@@ -1243,7 +1261,13 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
             :param timeout: Request timeout in seconds.
             :returns: HTTP 200 response carrying the worktree workspace.
             """
-            del timeout
+            del timeout, params
+            if url.endswith("/items"):
+                return httpx.Response(
+                    200,
+                    json={"data": [], "has_more": False},
+                    request=httpx.Request("GET", url),
+                )
             assert url == f"/v1/sessions/{session_id}"
             return httpx.Response(
                 200,
@@ -1472,9 +1496,21 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     class _SnapshotClient:
         """Fresh-session snapshot (no external thread → discovery path)."""
 
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+        async def get(
+            self,
+            url: str,
+            *,
+            timeout: float | None = None,
+            params: dict[str, Any] | None = None,
+        ) -> httpx.Response:
             """:returns: HTTP 200 fresh-session snapshot."""
-            del timeout, url
+            del timeout, params
+            if url.endswith("/items"):
+                return httpx.Response(
+                    200,
+                    json={"data": [], "has_more": False},
+                    request=httpx.Request("GET", url),
+                )
             return httpx.Response(
                 200,
                 json={

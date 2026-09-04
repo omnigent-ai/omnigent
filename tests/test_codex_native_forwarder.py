@@ -1664,7 +1664,7 @@ async def test_reasoning_delta_skips_empty_non_opening_delta() -> None:
 
 @pytest.mark.asyncio
 async def test_persist_codex_compaction_item_posts_event() -> None:
-    """Compaction event is posted with last_item_id and Codex summary."""
+    """Compaction event is posted with the authoritative rollout snapshot."""
     get_resp = MagicMock()
     get_resp.json.return_value = {"data": [{"id": "item_codex"}]}
     get_resp.raise_for_status = MagicMock()
@@ -1676,7 +1676,24 @@ async def test_persist_codex_compaction_item_posts_event() -> None:
     post_resp.raise_for_status = MagicMock()
     client.post = AsyncMock(return_value=post_resp)
 
-    await _persist_codex_compaction_item(client, session_id="conv_codex")
+    compacted = fwd._CodexCompactedRecord(
+        record_id="record-1",
+        path_key="/tmp/rollout.jsonl",
+        cursor_after=fwd._CodexRolloutCursor(offset=123),
+        replacement_history=[
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "remember this"}],
+            }
+        ],
+        window_id=2,
+    )
+    await _persist_codex_compaction_item(
+        client,
+        session_id="conv_codex",
+        compacted=compacted,
+    )
 
     client.post.assert_called_once()
     _url, kwargs = client.post.call_args
@@ -1684,8 +1701,8 @@ async def test_persist_codex_compaction_item_posts_event() -> None:
     assert body["type"] == "compaction"
     assert body["data"]["last_item_id"] == "item_codex"
     assert "Codex" in body["data"]["summary"]
-    # Codex can't read post-compaction state, so no compacted_messages
-    assert "compacted_messages" not in body["data"]
+    assert body["data"]["compacted_messages"] == compacted.replacement_history
+    assert body["data"]["window_id"] == 2
 
 
 @pytest.mark.asyncio
@@ -1702,69 +1719,25 @@ async def test_persist_codex_compaction_item_empty_items_fallback() -> None:
     post_resp.raise_for_status = MagicMock()
     client.post = AsyncMock(return_value=post_resp)
 
-    await _persist_codex_compaction_item(client, session_id="conv_codex")
+    compacted = fwd._CodexCompactedRecord(
+        record_id="record-1",
+        path_key="/tmp/rollout.jsonl",
+        cursor_after=fwd._CodexRolloutCursor(offset=123),
+        replacement_history=[],
+        window_id=None,
+    )
+    await _persist_codex_compaction_item(
+        client,
+        session_id="conv_codex",
+        compacted=compacted,
+    )
 
     client.post.assert_called_once()
     _url, kwargs = client.post.call_args
     body = kwargs["json"]
     assert body["data"]["last_item_id"].startswith("compact_boundary_")
-    assert "compacted_messages" not in body["data"]
-
-
-def test_read_compacted_history_extracts_replacement_history_and_window_id(
-    tmp_path: Path,
-) -> None:
-    """_read_compacted_history returns replacement_history and window_id."""
-    import json as _json
-
-    rollout = tmp_path / "rollout.jsonl"
-    lines = [
-        _json.dumps({"type": "session_meta", "payload": {"id": "abc"}}),
-        _json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user"}}),
-        _json.dumps(
-            {
-                "type": "compacted",
-                "payload": {
-                    "message": "summary",
-                    "replacement_history": [
-                        {
-                            "type": "message",
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": "hi"}],
-                        },
-                        {
-                            "type": "compaction",
-                            "encrypted_content": "gAAAA_test_token",
-                        },
-                    ],
-                    "window_id": 2,
-                },
-            }
-        ),
-    ]
-    rollout.write_text("\n".join(lines) + "\n")
-
-    result = fwd._read_compacted_history(rollout)
-
-    assert result is not None
-    assert result["window_id"] == 2
-    assert len(result["replacement_history"]) == 2
-    assert result["replacement_history"][0]["type"] == "message"
-    assert result["replacement_history"][0]["role"] == "user"
-    assert result["replacement_history"][1]["type"] == "compaction"
-    assert result["replacement_history"][1]["encrypted_content"] == "gAAAA_test_token"
-
-
-def test_read_compacted_history_returns_none_for_no_compacted_entry(
-    tmp_path: Path,
-) -> None:
-    """_read_compacted_history returns None when no Compacted entry exists."""
-    import json as _json
-
-    rollout = tmp_path / "rollout.jsonl"
-    rollout.write_text(_json.dumps({"type": "session_meta", "payload": {"id": "abc"}}) + "\n")
-
-    assert fwd._read_compacted_history(rollout) is None
+    assert body["data"]["compacted_messages"] == []
+    assert "window_id" not in body["data"]
 
 
 @pytest.mark.asyncio

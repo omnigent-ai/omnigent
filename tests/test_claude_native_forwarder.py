@@ -35,9 +35,11 @@ from omnigent.claude_native_bridge import (
 )
 from omnigent.claude_native_forwarder import (
     CompactionForwardState,
+    _acknowledge_compaction_completion,
     _claim_standalone_completion,
     _consume_pending_compaction,
     _handle_compact_summary_item,
+    _maybe_persist_compaction_fallback,
     _note_precompact,
     _persist_native_compaction_item,
     _PostRetryTracker,
@@ -7009,6 +7011,7 @@ async def test_persist_native_compaction_item_posts_compaction_event(tmp_path: P
     assert body["data"]["summary"] is not None
     assert body["data"]["model"] == "unknown"
     assert body["data"]["token_count"] == 0
+    assert body["data"]["snapshot_source"] == "hook_fallback"
     # compacted_messages should contain the converted fake message.
     assert body["data"]["compacted_messages"] == [
         {"type": "message", "role": "assistant", "content": [{"type": "text", "text": "hello"}]},
@@ -7211,7 +7214,11 @@ async def test_compaction_in_progress_does_not_persist(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _compact_summary_item(text: str = "compaction summary text") -> ClaudeTranscriptItem:
+def _compact_summary_item(
+    text: str = "compaction summary text",
+    *,
+    summary_uuid: str = "summary-uuid",
+) -> ClaudeTranscriptItem:
     """
     Build a transcript item flagged as a Claude ``isCompactSummary`` record.
 
@@ -7219,7 +7226,7 @@ def _compact_summary_item(text: str = "compaction summary text") -> ClaudeTransc
     :returns: A ``ClaudeTranscriptItem`` with ``is_compact_summary=True``.
     """
     return ClaudeTranscriptItem(
-        source_id="summary-uuid:0:compact_summary",
+        source_id=f"{summary_uuid}:0:compact_summary",
         item_type="message",
         data={"role": "user", "content": [{"type": "input_text", "text": text}]},
         response_id="resp_summary",
@@ -7236,6 +7243,463 @@ def _persist_mock() -> AsyncMock:
     return AsyncMock(return_value=None)
 
 
+def _write_compaction_transcript(
+    path: Path,
+    *,
+    summary_uuid: str = "summary-uuid",
+    summary: str = "compaction summary text",
+) -> None:
+    """Write the native boundary/summary shape emitted by Claude Code."""
+    records = [
+        {
+            "type": "user",
+            "uuid": "preserved-user",
+            "parentUuid": None,
+            "message": {"role": "user", "content": "preserved question"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "preserved-assistant",
+            "parentUuid": "preserved-user",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "preserved answer"}],
+            },
+        },
+        {
+            "type": "system",
+            "subtype": "compact_boundary",
+            "uuid": "boundary-uuid",
+            "parentUuid": "preserved-assistant",
+            "compactMetadata": {
+                "preservedMessages": {
+                    "uuids": ["preserved-user", "preserved-assistant"],
+                }
+            },
+        },
+        {
+            "type": "user",
+            "uuid": summary_uuid,
+            "parentUuid": "boundary-uuid",
+            "isCompactSummary": True,
+            "message": {"role": "user", "content": summary},
+        },
+    ]
+    path.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_compact_summary_first_claims_generation_from_artifact(tmp_path: Path) -> None:
+    """A durable summary wins even when its PreCompact hook has not appeared."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript = tmp_path / "session.jsonl"
+    _write_compaction_transcript(transcript)
+    with patch(
+        "omnigent.claude_native_forwarder.read_transcript_path",
+        return_value=transcript,
+    ):
+        persist = _persist_mock()
+        with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+            handled = await _handle_compact_summary_item(
+                AsyncMock(),
+                session_id="conv-summary-first",
+                bridge_dir=bridge_dir,
+                item=_compact_summary_item(),
+                retry_tracker=_PostRetryTracker(),
+            )
+
+    assert handled is True
+    assert persist.call_args.kwargs["snapshot_source"] == "transcript"
+    assert persist.call_args.kwargs["compacted_messages_override"] == [
+        {"type": "message", "role": "user", "content": "compaction summary text"},
+        {"type": "message", "role": "user", "content": "preserved question"},
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "preserved answer"}],
+        },
+    ]
+
+
+def test_compaction_snapshot_orders_shuffled_tools_and_excludes_sidechain(
+    tmp_path: Path,
+) -> None:
+    """Preserved UUID metadata is membership-only; the main transcript chain orders it."""
+    transcript = tmp_path / "session.jsonl"
+    records = [
+        {
+            "type": "user",
+            "uuid": "prompt",
+            "parentUuid": None,
+            "isSidechain": False,
+            "message": {"role": "user", "content": "inspect the file"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "tool-use",
+            "parentUuid": "prompt",
+            "isSidechain": False,
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_read",
+                        "name": "Read",
+                        "input": {"file_path": "/tmp/example"},
+                    }
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "uuid": "tool-result",
+            "parentUuid": "tool-use",
+            "isSidechain": False,
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_read",
+                        "content": "contents",
+                    }
+                ],
+            },
+        },
+        {
+            "type": "assistant",
+            "uuid": "sidechain",
+            "parentUuid": "prompt",
+            "isSidechain": True,
+            "message": {"role": "assistant", "content": "side investigation"},
+        },
+        {
+            "type": "system",
+            "subtype": "compact_boundary",
+            "uuid": "boundary",
+            "parentUuid": "tool-result",
+            "isSidechain": False,
+            "compactMetadata": {
+                "preservedMessages": {
+                    # Deliberately reverse tool records and include a sidechain.
+                    "uuids": ["tool-result", "sidechain", "prompt", "tool-use"],
+                }
+            },
+        },
+        {
+            "type": "user",
+            "uuid": "summary",
+            "parentUuid": "boundary",
+            "isSidechain": False,
+            "isCompactSummary": True,
+            "message": {"role": "user", "content": "summary context"},
+        },
+    ]
+    transcript.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records),
+        encoding="utf-8",
+    )
+
+    summary_id, snapshot = forwarder._read_native_compaction_snapshot(
+        transcript,
+        "summary:0:compact_summary",
+    )
+
+    assert summary_id == "summary"
+    assert [(message["role"], message["content"]) for message in snapshot] == [
+        ("user", "summary context"),
+        ("user", "inspect the file"),
+        (
+            "assistant",
+            [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_read",
+                    "name": "Read",
+                    "input": {"file_path": "/tmp/example"},
+                }
+            ],
+        ),
+        (
+            "user",
+            [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_read",
+                    "content": "contents",
+                }
+            ],
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_hook_ack_waits_for_summary_durability(tmp_path: Path) -> None:
+    """The compact SessionStart cannot persist stale history before the deadline."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript = tmp_path / "session.jsonl"
+    await _note_precompact(
+        bridge_dir,
+        claude_session_id="claude-1",
+        transcript_path=str(transcript),
+    )
+    await _acknowledge_compaction_completion(
+        bridge_dir,
+        claude_session_id="claude-1",
+        transcript_path=str(transcript),
+        now=10.0,
+    )
+    persist = _persist_mock()
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        assert not await _maybe_persist_compaction_fallback(
+            AsyncMock(),
+            session_id="conv-hook-first",
+            bridge_dir=bridge_dir,
+            now=11.9,
+        )
+        _write_compaction_transcript(transcript)
+        assert await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv-hook-first",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    persist.assert_called_once()
+    assert persist.call_args.kwargs["snapshot_source"] == "transcript"
+
+
+@pytest.mark.asyncio
+async def test_fallback_is_superseded_once_by_durable_summary(tmp_path: Path) -> None:
+    """A late authoritative summary replaces one marked fallback, exactly once."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript = tmp_path / "session.jsonl"
+    await _note_precompact(
+        bridge_dir,
+        claude_session_id="claude-1",
+        transcript_path=str(transcript),
+    )
+    await _acknowledge_compaction_completion(
+        bridge_dir,
+        claude_session_id="claude-1",
+        transcript_path=str(transcript),
+        now=10.0,
+    )
+    persist = _persist_mock()
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        assert await _maybe_persist_compaction_fallback(
+            AsyncMock(),
+            session_id="conv-supersede",
+            bridge_dir=bridge_dir,
+            now=12.0,
+        )
+        assert not await _maybe_persist_compaction_fallback(
+            AsyncMock(),
+            session_id="conv-supersede",
+            bridge_dir=bridge_dir,
+            now=20.0,
+        )
+        _write_compaction_transcript(transcript)
+        for _ in range(2):
+            assert await _handle_compact_summary_item(
+                AsyncMock(),
+                session_id="conv-supersede",
+                bridge_dir=bridge_dir,
+                item=_compact_summary_item(),
+                retry_tracker=_PostRetryTracker(),
+            )
+
+    assert [call.kwargs["snapshot_source"] for call in persist.await_args_list] == [
+        "hook_fallback",
+        "transcript",
+    ]
+    state = _read_compaction_state(bridge_dir)
+    assert state.persisted_summary_ids == ("summary-uuid",)
+    assert state.pending is None
+
+
+@pytest.mark.asyncio
+async def test_fallback_sdk_read_does_not_block_event_loop(tmp_path: Path) -> None:
+    """A blocked synchronous SDK snapshot runs in a worker thread."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await _note_precompact(
+        bridge_dir,
+        claude_session_id="claude-1",
+        transcript_path=None,
+    )
+    await _acknowledge_compaction_completion(
+        bridge_dir,
+        claude_session_id="claude-1",
+        transcript_path=None,
+        now=10.0,
+    )
+    sdk_entered = threading.Event()
+    sdk_release = threading.Event()
+
+    def blocking_session_read(_session_id: str) -> list[Any]:
+        sdk_entered.set()
+        assert sdk_release.wait(timeout=5.0)
+        return []
+
+    persist = _persist_mock()
+    with (
+        patch(
+            "omnigent.claude_native_forwarder.read_claude_session_id",
+            return_value="claude-1",
+        ),
+        patch(
+            "claude_agent_sdk.get_session_messages",
+            side_effect=blocking_session_read,
+        ),
+        patch(
+            "omnigent.claude_native_forwarder._persist_native_compaction_item",
+            persist,
+        ),
+    ):
+        fallback = asyncio.create_task(
+            _maybe_persist_compaction_fallback(
+                AsyncMock(),
+                session_id="conv-heartbeat",
+                bridge_dir=bridge_dir,
+                now=12.0,
+            )
+        )
+        try:
+            assert await asyncio.to_thread(sdk_entered.wait, 1.0)
+            heartbeat = asyncio.Event()
+
+            async def beat() -> None:
+                await asyncio.sleep(0)
+                heartbeat.set()
+
+            heartbeat_task = asyncio.create_task(beat())
+            await asyncio.wait_for(heartbeat.wait(), timeout=0.5)
+            await heartbeat_task
+        finally:
+            sdk_release.set()
+        assert await fallback is True
+
+    persist.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_transcript_summary_wins_during_threaded_fallback_read(
+    tmp_path: Path,
+) -> None:
+    """A durable summary arriving during the SDK read prevents a stale fallback POST."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript = tmp_path / "session.jsonl"
+    _write_compaction_transcript(transcript)
+    await _note_precompact(
+        bridge_dir,
+        claude_session_id="claude-1",
+        transcript_path=str(transcript),
+    )
+    await _acknowledge_compaction_completion(
+        bridge_dir,
+        claude_session_id="claude-1",
+        transcript_path=str(transcript),
+        now=10.0,
+    )
+    sdk_entered = threading.Event()
+    sdk_release = threading.Event()
+
+    def blocking_session_read(_session_id: str) -> list[Any]:
+        sdk_entered.set()
+        assert sdk_release.wait(timeout=5.0)
+        return []
+
+    persist = _persist_mock()
+    with (
+        patch(
+            "omnigent.claude_native_forwarder.read_claude_session_id",
+            return_value="claude-1",
+        ),
+        patch(
+            "claude_agent_sdk.get_session_messages",
+            side_effect=blocking_session_read,
+        ),
+        patch(
+            "omnigent.claude_native_forwarder._persist_native_compaction_item",
+            persist,
+        ),
+    ):
+        fallback = asyncio.create_task(
+            _maybe_persist_compaction_fallback(
+                AsyncMock(),
+                session_id="conv-race",
+                bridge_dir=bridge_dir,
+                now=12.0,
+            )
+        )
+        try:
+            assert await asyncio.to_thread(sdk_entered.wait, 1.0)
+            assert await _handle_compact_summary_item(
+                AsyncMock(),
+                session_id="conv-race",
+                bridge_dir=bridge_dir,
+                item=_compact_summary_item(),
+                retry_tracker=_PostRetryTracker(),
+            )
+        finally:
+            sdk_release.set()
+
+        assert await fallback is False
+
+    persist.assert_awaited_once()
+    assert persist.call_args.kwargs["snapshot_source"] == "transcript"
+    state = _read_compaction_state(bridge_dir)
+    assert state.fallback_persisted_seq == 0
+    assert state.persisted_summary_ids == ("summary-uuid",)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_summary_callbacks_persist_once(tmp_path: Path) -> None:
+    """Concurrent callbacks serialize against the durable summary id."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript = tmp_path / "session.jsonl"
+    _write_compaction_transcript(transcript)
+    await _note_precompact(
+        bridge_dir,
+        claude_session_id="claude-1",
+        transcript_path=str(transcript),
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def persist_once(*args: Any, **kwargs: Any) -> None:
+        entered.set()
+        await release.wait()
+
+    persist = AsyncMock(side_effect=persist_once)
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        callbacks = [
+            asyncio.create_task(
+                _handle_compact_summary_item(
+                    AsyncMock(),
+                    session_id="conv-concurrent",
+                    bridge_dir=bridge_dir,
+                    item=_compact_summary_item(),
+                    retry_tracker=_PostRetryTracker(),
+                )
+            )
+            for _ in range(2)
+        ]
+        await entered.wait()
+        release.set()
+        assert await asyncio.gather(*callbacks) == [True, True]
+
+    persist.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_missing_compact_session_start_still_persists_from_transcript(
     tmp_path: Path,
@@ -7250,8 +7714,10 @@ async def test_missing_compact_session_start_still_persists_from_transcript(
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
+    transcript = tmp_path / "session.jsonl"
+    _write_compaction_transcript(transcript, summary="the summary")
     await _note_precompact(
-        bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
+        bridge_dir, claude_session_id="claude-1", transcript_path=str(transcript)
     )
 
     persist = _persist_mock()
@@ -7286,7 +7752,11 @@ async def test_normal_hook_after_transcript_does_not_double_persist(tmp_path: Pa
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+    transcript = tmp_path / "session.jsonl"
+    _write_compaction_transcript(transcript)
+    await _note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=str(transcript)
+    )
 
     persist = _persist_mock()
     with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
@@ -7395,25 +7865,32 @@ async def test_repeated_compactions_persist_distinct_boundaries(tmp_path: Path) 
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
+    transcript = tmp_path / "session.jsonl"
     persist = _persist_mock()
 
     with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
         # First compaction.
-        await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+        _write_compaction_transcript(transcript, summary_uuid="summary-first", summary="first")
+        await _note_precompact(
+            bridge_dir, claude_session_id="claude-1", transcript_path=str(transcript)
+        )
         await _handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_repeat",
             bridge_dir=bridge_dir,
-            item=_compact_summary_item("first"),
+            item=_compact_summary_item("first", summary_uuid="summary-first"),
             retry_tracker=_PostRetryTracker(),
         )
         # Second compaction, later in the same session.
-        await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+        _write_compaction_transcript(transcript, summary_uuid="summary-second", summary="second")
+        await _note_precompact(
+            bridge_dir, claude_session_id="claude-1", transcript_path=str(transcript)
+        )
         await _handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_repeat",
             bridge_dir=bridge_dir,
-            item=_compact_summary_item("second"),
+            item=_compact_summary_item("second", summary_uuid="summary-second"),
             retry_tracker=_PostRetryTracker(),
         )
 
@@ -7435,6 +7912,16 @@ async def test_historical_summary_without_pending_is_skipped(tmp_path: Path) -> 
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()  # no _note_precompact — no pending token
+    from omnigent.claude_native_forwarder import _write_compaction_state
+
+    _write_compaction_state(
+        bridge_dir,
+        CompactionForwardState(
+            last_seq=1,
+            persisted_seqs=(1,),
+            persisted_summary_ids=("summary-uuid",),
+        ),
+    )
 
     persist = _persist_mock()
     with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
@@ -7448,29 +7935,29 @@ async def test_historical_summary_without_pending_is_skipped(tmp_path: Path) -> 
 
     assert handled is True
     persist.assert_not_called()
-    assert _read_compaction_state(bridge_dir).persisted_seqs == ()
+    assert _read_compaction_state(bridge_dir).persisted_seqs == (1,)
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_boundary_post_marks_persisted(tmp_path: Path) -> None:
+async def test_ambiguous_authoritative_boundary_post_holds_cursor(tmp_path: Path) -> None:
     """
-    An ambiguous POST failure is treated as delivered (no duplicate boundary).
+    An ambiguous authoritative POST does not consume the summary.
 
-    Mirrors the item-forwarding rule: when the server may already have
-    committed the boundary (e.g. a dropped response on a 2xx), retrying would
-    risk a duplicate compaction bubble, so the sequence is marked persisted
-    and the record advanced.
+    The transcript snapshot is the authoritative compaction record. Without a
+    confirmed successful POST, its cursor must remain before the summary so a
+    later poll retries rather than silently losing resumable context.
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+    transcript = tmp_path / "session.jsonl"
+    _write_compaction_transcript(transcript)
+    await _note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=str(transcript)
+    )
 
     ambiguous = AsyncMock(side_effect=httpx.ReadError("connection dropped mid-response"))
 
-    with (
-        patch("omnigent.claude_native_forwarder._persist_native_compaction_item", ambiguous),
-        patch("omnigent.claude_native_forwarder.post_may_have_been_delivered", return_value=True),
-    ):
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", ambiguous):
         handled = await _handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_ambiguous",
@@ -7479,10 +7966,11 @@ async def test_ambiguous_boundary_post_marks_persisted(tmp_path: Path) -> None:
             retry_tracker=_PostRetryTracker(),
         )
 
-    assert handled is True
+    assert handled is False
     state = _read_compaction_state(bridge_dir)
-    assert 1 in state.persisted_seqs
-    assert state.pending is None
+    assert state.persisted_seqs == ()
+    assert state.pending is not None
+    assert state.pending.seq == 1
 
 
 @pytest.mark.asyncio
@@ -7500,11 +7988,17 @@ async def test_precompact_and_summary_same_poll_persists_boundary(tmp_path: Path
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
+    transcript = tmp_path / "session.jsonl"
+    _write_compaction_transcript(transcript, summary="same-poll summary")
     # A PreCompact hook is written but the hook cursor has NOT advanced past
     # it yet (mirrors the same-poll ordering: hooks are forwarded AFTER items).
     record_hook_event(
         bridge_dir,
-        {"hook_event_name": "PreCompact", "session_id": "claude-1"},
+        {
+            "hook_event_name": "PreCompact",
+            "session_id": "claude-1",
+            "transcript_path": str(transcript),
+        },
     )
     hook_state = await forwarder._ensure_hook_state(
         bridge_dir, start_at_end=False, session_id="conv_same_poll"
@@ -7627,7 +8121,11 @@ async def test_completion_hook_after_transcript_persist_is_absorbed(tmp_path: Pa
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+    transcript = tmp_path / "session.jsonl"
+    _write_compaction_transcript(transcript)
+    await _note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=str(transcript)
+    )
 
     persist = _persist_mock()
     with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
@@ -7648,7 +8146,11 @@ async def test_completion_hook_after_transcript_persist_is_absorbed(tmp_path: Pa
         bridge_dir, claude_session_id="claude-1", transcript_path=None
     )
     assert seq is None
-    seq = await _claim_standalone_completion(bridge_dir)
+    seq = await _acknowledge_compaction_completion(
+        bridge_dir,
+        claude_session_id="claude-1",
+        transcript_path=str(transcript),
+    )
     assert seq is None  # absorbed, NOT a new standalone boundary
     after = _read_compaction_state(bridge_dir)
     assert after.expect_completion_ack is False
@@ -7656,22 +8158,24 @@ async def test_completion_hook_after_transcript_persist_is_absorbed(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_precompact_miss_is_counted_and_warned(tmp_path: Path) -> None:
+async def test_precompact_miss_is_claimed_from_authoritative_summary(tmp_path: Path) -> None:
     """
     P1-3: a summary skipped with no token and no boundary is counted as a miss.
 
-    A skipped ``isCompactSummary`` with no pending token AND no boundary ever
-    persisted is the observable ``PreCompact``-miss failure mode — it must
-    bump the ``precompact_miss`` counter (not be silently dropped). A skip
-    that follows a persisted boundary is an expected replay/dedupe and bumps
-    ``expected_skip`` instead.
+    A durable ``isCompactSummary`` does not need a hook token. It claims a
+    generation, persists, and records the missing PreCompact diagnostically.
     """
     _reset_compaction_skip_stats()
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()  # no PreCompact, no persisted boundary
+    transcript = tmp_path / "session.jsonl"
+    _write_compaction_transcript(transcript)
 
     persist = _persist_mock()
-    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+    with (
+        patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist),
+        patch("omnigent.claude_native_forwarder.read_transcript_path", return_value=transcript),
+    ):
         handled = await _handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_miss",
@@ -7681,17 +8185,11 @@ async def test_precompact_miss_is_counted_and_warned(tmp_path: Path) -> None:
         )
 
     assert handled is True
-    persist.assert_not_called()
+    persist.assert_called_once()
     assert forwarder._compaction_skip_stats.precompact_miss == 1
     assert forwarder._compaction_skip_stats.expected_skip == 0
 
-    # A skip AFTER a boundary was persisted is an expected replay, not a miss.
-    from omnigent.claude_native_forwarder import _write_compaction_state
-
-    _write_compaction_state(
-        bridge_dir,
-        CompactionForwardState(pending=None, last_seq=1, persisted_seqs=(1,)),
-    )
+    # Re-reading the same summary is deterministic replay.
     with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
         await _handle_compact_summary_item(
             AsyncMock(),
@@ -7702,6 +8200,7 @@ async def test_precompact_miss_is_counted_and_warned(tmp_path: Path) -> None:
         )
     assert forwarder._compaction_skip_stats.precompact_miss == 1  # unchanged
     assert forwarder._compaction_skip_stats.expected_skip == 1
+    persist.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -7725,7 +8224,11 @@ async def test_stale_completion_ack_does_not_swallow_a_later_boundary(
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+    transcript = tmp_path / "session.jsonl"
+    _write_compaction_transcript(transcript)
+    await _note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=str(transcript)
+    )
 
     persist = _persist_mock()
     with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
@@ -7798,20 +8301,15 @@ async def test_completion_ack_armed_for_unpersisted_seq_biases_to_persist(
 
 
 @pytest.mark.asyncio
-async def test_standalone_hook_persist_failure_holds_cursor_for_retry(
+async def test_standalone_hook_fallback_failure_retries_without_replaying_hook(
     tmp_path: Path,
 ) -> None:
     """
-    P2-2: a standalone-completion persist failure holds the hook cursor.
+    A standalone completion is acknowledged before its bounded fallback.
 
-    A ``SessionStart source=compact`` with no pending token and no transcript
-    summary is a hook-only standalone compaction. If its boundary POST fails
-    transiently the forwarder must NOT advance past the hook (losing the
-    boundary, since no transcript summary will ever retry it) — it holds the
-    hook cursor and retries next poll, mirroring the transcript path. The
-    pending token minted by ``_claim_standalone_completion`` makes the retry
-    idempotent: the re-seen hook re-consumes the same seq. A later successful
-    POST persists exactly one boundary.
+    The hook cursor advances immediately because SessionStart is only an ack.
+    A failed delayed fallback leaves the generation pending, and a later poll
+    retries the same generation without replaying the hook.
     """
     bridge_dir = tmp_path / "bridge"
     # A lone compact SessionStart (no preceding PreCompact) — standalone.
@@ -7850,27 +8348,42 @@ async def test_standalone_hook_persist_failure_holds_cursor_for_retry(
                 task_order=[],
             )
 
-    # Poll 1: persist fails → cursor is held BEFORE the compaction hook record,
-    # a pending token is minted, and no boundary is marked persisted.
+    # Poll 1: the hook only acknowledges and advances.
     with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", failing):
-        after_fail = await _run_once(start_state)
-    assert failing.await_count == 1
-    assert after_fail.event_cursor == start_state.event_cursor  # cursor held
+        after_ack = await _run_once(start_state)
+    assert failing.await_count == 0
+    assert after_ack.event_cursor > start_state.event_cursor
     held = _read_compaction_state(bridge_dir)
-    assert held.pending is not None  # token minted, awaiting a durable persist
-    assert not held.persisted_seqs  # nothing marked persisted on failure
+    assert held.pending is not None
+    assert held.acknowledged_at is not None
     minted_seq = held.pending.seq
 
-    # Poll 2 (retry): the same hook record is re-seen; the persist succeeds and
-    # re-consumes the SAME seq (idempotent), marking exactly one boundary.
+    # The first fallback attempt fails and does not consume the generation.
+    with (
+        patch("omnigent.claude_native_forwarder._persist_native_compaction_item", failing),
+        pytest.raises(httpx.HTTPStatusError),
+    ):
+        await _maybe_persist_compaction_fallback(
+            AsyncMock(),
+            session_id="conv_p22",
+            bridge_dir=bridge_dir,
+            now=held.acknowledged_at + 2.0,
+        )
+    assert _read_compaction_state(bridge_dir).fallback_persisted_seq == 0
+
+    # A later poll retries and records exactly one marked fallback.
     ok = _persist_mock()
     with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", ok):
-        after_ok = await _run_once(after_fail)
+        assert await _maybe_persist_compaction_fallback(
+            AsyncMock(),
+            session_id="conv_p22",
+            bridge_dir=bridge_dir,
+            now=held.acknowledged_at + 3.0,
+        )
     assert ok.await_count == 1
     persisted = _read_compaction_state(bridge_dir)
-    assert persisted.persisted_seqs == (minted_seq,)  # exactly one boundary
-    assert persisted.pending is None
-    assert after_ok.event_cursor > after_fail.event_cursor  # cursor advanced
+    assert persisted.fallback_persisted_seq == minted_seq
+    assert persisted.pending is not None
 
 
 def test_forward_failures_escalate_to_degraded_once() -> None:
