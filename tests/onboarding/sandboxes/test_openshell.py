@@ -272,8 +272,8 @@ def test_put_raises_on_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
         launcher.put("sb-1", local_file, "/tmp/wheels.tgz")
 
 
-def test_launcher_capabilities_join_resume_framework() -> None:
-    """The launcher advertises in-place resume of a stopped sandbox.
+def test_launcher_capabilities_join_resume_framework(sdk: _SDKState) -> None:
+    """With a resume-capable SDK, the launcher advertises in-place resume.
 
     This is the gate the server's managed-host wake path
     (``host_resume_supported`` / ``resume_managed_host``) consults, so a
@@ -284,6 +284,28 @@ def test_launcher_capabilities_join_resume_framework() -> None:
     caps = OpenShellSandboxLauncher().capabilities
     assert caps.resume_stopped is True
     assert caps.snapshot_restore is False
+
+
+def test_launcher_capabilities_gate_resume_on_sdk_primitive(
+    sdk: _SDKState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An SDK predating ``SandboxClient.start`` must not advertise resume.
+
+    Advertised-but-unusable resume would render every dormant host as
+    wakeable while each wake fails; the gate keeps the honest offline state.
+    """
+    monkeypatch.delattr(sys.modules["openshell"].SandboxClient, "start")
+    assert OpenShellSandboxLauncher().capabilities.resume_stopped is False
+
+
+def test_launcher_capabilities_without_sdk_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no openshell SDK importable, resume is not advertised."""
+    # An empty stand-in module has no SandboxClient, so the probe's
+    # ``from openshell import SandboxClient`` raises ImportError.
+    monkeypatch.setitem(sys.modules, "openshell", types.ModuleType("openshell"))
+    assert OpenShellSandboxLauncher().capabilities.resume_stopped is False
 
 
 def test_resume_delegates_to_client(monkeypatch: pytest.MonkeyPatch) -> None:

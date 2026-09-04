@@ -70,10 +70,6 @@ class SandboxCapabilities:
         sandbox for the App OAuth callback flow.
     :param resume_stopped: Provider can resume a stopped sandbox in place
         with its persistent volume.
-    :param snapshot_restore: Resuming a stopped sandbox restores a
-        suspend-time snapshot (dependencies installed, caches warm)
-        rather than cold-starting it. Only meaningful alongside
-        ``resume_stopped``.
     :param programmatic_terminate: Provider can terminate a sandbox
         programmatically.
     :param file_copy: Provider supports copying files into the sandbox.
@@ -87,18 +83,24 @@ class SandboxCapabilities:
         ``omnigent.ai/agent`` label). When set, the managed launch path
         threads ``agent_name`` into ``start_host``; providers that leave
         it ``False`` never receive the keyword.
+    :param snapshot_restore: Resuming a stopped sandbox restores a
+        suspend-time snapshot (dependencies installed, caches warm)
+        rather than cold-starting it. Only meaningful alongside
+        ``resume_stopped``.
     """
 
     cli_bootstrap: bool = False
     managed_launch: bool = False
     local_port_forward: bool = False
     resume_stopped: bool = False
-    snapshot_restore: bool = False
     programmatic_terminate: bool = False
     file_copy: bool = False
     streaming_exec: bool = False
     foreground_exec: bool = False
     classifies_runner_by_agent: bool = False
+    # New fields append at the end to preserve positional-constructor
+    # compatibility for out-of-tree providers.
+    snapshot_restore: bool = False
 
 
 @dataclass(frozen=True)

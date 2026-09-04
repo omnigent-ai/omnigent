@@ -41,6 +41,7 @@ import logging
 import os
 import shlex
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, ClassVar, TypeVar
 
@@ -106,6 +107,20 @@ _SANDBOX_HOME = "/sandbox"
 _T = TypeVar("_T")
 
 
+def _sdk_supports_resume() -> bool:
+    """Whether the installed openshell SDK can drive an in-place resume.
+
+    The gateway's resume primitive is ``SandboxClient.start`` (available
+    from openshell 0.0.105). Returns ``False`` when the SDK is missing or
+    predates it, so callers never advertise a wake they cannot perform.
+    """
+    try:
+        from openshell import SandboxClient
+    except ImportError:
+        return False
+    return callable(getattr(SandboxClient, "start", None))
+
+
 def _ensure_sdk() -> None:
     """Verify the openshell SDK is importable, with an install hint when not."""
     try:
@@ -133,7 +148,10 @@ class _OpenShellClient:
             cli_bootstrap=True,
             managed_launch=True,
             local_port_forward=False,
-            resume_stopped=True,
+            # Only an SDK exposing the resume primitive can wake a stopped
+            # sandbox; advertising it on an older SDK would promise a wake
+            # that always fails.
+            resume_stopped=_sdk_supports_resume(),
             # Flips once the gateway's agent-sandbox backend exposes its
             # suspend+snapshot restore through the SDK.
             snapshot_restore=False,
@@ -375,10 +393,20 @@ class OpenShellSandboxLauncher(SandboxLauncher):
 
     provider: ClassVar[str] = "openshell"
     supports_local_port_forward: ClassVar[bool] = False
-    # The gateway's compute backend keeps a stopped sandbox and its volume, so
-    # a dormant managed host is woken in place via :meth:`resume`; a gateway
-    # without the resume primitive fails the wake with an actionable error.
-    can_resume: ClassVar[bool] = True
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        """Feature flags, with in-place resume gated on the installed SDK.
+
+        The gateway's compute backend keeps a stopped sandbox and its
+        volume, so a dormant managed host is woken in place via
+        :meth:`resume` — but only an SDK exposing the resume primitive
+        (``SandboxClient.start``, openshell>=0.0.105) can drive the wake.
+        Advertising ``resume_stopped`` on an older SDK would render dormant
+        hosts as wakeable while every wake fails, so those installs keep
+        the honest ``host_offline`` state instead.
+        """
+        return replace(super().capabilities, resume_stopped=_sdk_supports_resume())
 
     def __init__(
         self,
