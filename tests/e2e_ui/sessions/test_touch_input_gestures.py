@@ -1,11 +1,11 @@
 """E2E: touch input across the web shell.
 
-Four journeys, each driven with real (CDP-synthesized) touch input against the
+Five journeys, each driven with real (CDP-synthesized) touch input against the
 live SPA so Chromium's gesture recognizer arbitrates them as a finger would:
 a touch drag on a pane divider resizes it, a horizontal swipe on a session row
-tracks the finger or commits its action, a long-press with realistic finger
-wobble opens the row menu, and a hover-incapable md+ tablet keeps the row's
-controls visible without hover.
+tracks the finger, a leftward swipe opens the default delete confirmation,
+a long-press with realistic finger wobble opens the row menu, and a
+hover-incapable md+ tablet keeps the row's controls visible without hover.
 """
 
 from __future__ import annotations
@@ -64,6 +64,62 @@ def test_sidebar_resize_handle_supports_touch_drag(
             "touch drag on the sidebar resize handle did not resize the sidebar "
             f"(width {width_before:.0f}px -> {width_after:.0f}px); the divider is mouse-only"
         )
+    finally:
+        context.close()
+
+
+def test_session_row_swipe_tracks_finger(
+    browser: Browser,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A horizontal swipe visually moves the row before any action commits."""
+    base_url, session_id = seeded_session
+    context = new_touch_context(browser, viewport=_PHONE_VIEWPORT, is_mobile=True)
+    try:
+        page = context.new_page()
+        page.goto(f"{base_url}/c/{session_id}?sidebar=open")
+
+        row_link = page.locator(f'a[href="/c/{session_id}"]')
+        expect(row_link).to_be_visible()
+
+        page.evaluate(
+            """(sessionId) => {
+                const link = document.querySelector(`a[href="/c/${sessionId}"]`);
+                const row = link.closest('li') ?? link;
+                const surface = row.querySelector('[data-testid="conversation-swipe-surface"]');
+                const probe = (element) => {
+                    const style = getComputedStyle(element);
+                    return `${style.transform}|${style.marginLeft}|${style.marginRight}`;
+                };
+                const baseline = probe(surface);
+                window.__swipeProbe = { moved: false, raf: 0 };
+                const sample = () => {
+                    if (probe(surface) !== baseline) window.__swipeProbe.moved = true;
+                    window.__swipeProbe.raf = requestAnimationFrame(sample);
+                };
+                sample();
+            }""",
+            session_id,
+        )
+
+        box = row_link.bounding_box()
+        assert box is not None
+        start_x = box["x"] + box["width"] * 0.85
+        start_y = box["y"] + box["height"] / 2
+        cdp = context.new_cdp_session(page)
+        touch(cdp, "touchStart", start_x, start_y)
+        try:
+            for offset_x in (-25, -35, -45):
+                touch(cdp, "touchMove", start_x + offset_x, start_y)
+                page.wait_for_timeout(50)
+
+            moved = page.evaluate(
+                "() => { cancelAnimationFrame(window.__swipeProbe.raf);"
+                " return window.__swipeProbe.moved; }"
+            )
+            assert moved, "the session row never visually tracked the finger during the swipe"
+        finally:
+            touch(cdp, "touchEnd")
     finally:
         context.close()
 
