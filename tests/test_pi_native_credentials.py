@@ -2266,3 +2266,85 @@ def test_cli_config_pi_provider_discovery_failure_falls_back_to_catalog_default(
     assert provider.model == "catalog-databricks-claude-default", (
         f"discovery failure must fall back to catalog default; got {provider.model!r}"
     )
+
+
+def _write_pi_global_store(
+    agent_dir: Path,
+    providers: dict[str, list[dict[str, object]]],
+    *,
+    auth: dict[str, object] | None = None,
+) -> Path:
+    """Write a fake Pi global agent dir (models-store.json + optional auth.json)."""
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    store = {
+        provider_id: {"models": models, "checkedAt": "2026-09-03T00:00:00Z"}
+        for provider_id, models in providers.items()
+    }
+    (agent_dir / "models-store.json").write_text(json.dumps(store), encoding="utf-8")
+    if auth is not None:
+        (agent_dir / "auth.json").write_text(json.dumps(auth), encoding="utf-8")
+    return agent_dir
+
+
+def test_pi_native_model_options_falls_back_to_pi_global_models(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With no managed provider, the picker lists Pi's authenticated models.
+
+    Without the fallback the Configure-Pi dialog showed a lone "Default":
+    ``pi_native_model_options`` returned ``[]`` even though Pi itself was
+    logged in with usable models.
+    """
+    agent_dir = _write_pi_global_store(
+        tmp_path / "pi-global",
+        {
+            "opencode": [
+                {"id": "muse-spark-1.3-contributor-free", "name": "Muse Spark 1.3 Free"},
+                {"id": "kimi-k2.6"},
+            ],
+            "signed-out": [{"id": "ghost-model", "name": "Ghost"}],
+        },
+        auth={"opencode": {"type": "api_key", "key": "sk-test"}},
+    )
+    monkeypatch.setattr(creds, "resolve_pi_native_provider", lambda: None)
+
+    assert creds.pi_native_model_options(global_agent_dir=agent_dir) == [
+        {
+            "id": "opencode/kimi-k2.6",
+            "model": "opencode/kimi-k2.6",
+            "displayName": "kimi-k2.6",
+        },
+        {
+            "id": "opencode/muse-spark-1.3-contributor-free",
+            "model": "opencode/muse-spark-1.3-contributor-free",
+            "displayName": "Muse Spark 1.3 Free",
+        },
+    ]
+
+
+def test_pi_native_model_options_fallback_lists_all_when_auth_unknown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An unreadable auth.json fails open instead of hiding every choice."""
+    agent_dir = _write_pi_global_store(
+        tmp_path / "pi-global",
+        {"opencode": [{"id": "muse-spark-1.3-contributor-free"}]},
+    )
+    monkeypatch.setattr(creds, "resolve_pi_native_provider", lambda: None)
+
+    assert creds.pi_native_model_options(global_agent_dir=agent_dir) == [
+        {
+            "id": "opencode/muse-spark-1.3-contributor-free",
+            "model": "opencode/muse-spark-1.3-contributor-free",
+            "displayName": "muse-spark-1.3-contributor-free",
+        }
+    ]
+
+
+def test_pi_native_model_options_fallback_empty_without_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No managed provider and no Pi store → an honest empty list."""
+    monkeypatch.setattr(creds, "resolve_pi_native_provider", lambda: None)
+
+    assert creds.pi_native_model_options(global_agent_dir=tmp_path / "missing") == []

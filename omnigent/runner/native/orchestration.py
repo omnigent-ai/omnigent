@@ -2214,6 +2214,12 @@ async def _auto_create_pi_terminal(
                 or provider.credential_warning
                 or launch.effort_warning
             )
+        elif spec_model:
+            # No omnigent-managed provider: Pi falls back to its own login,
+            # so a pre-launch model pick must still reach the CLI — otherwise
+            # the choice is silently dropped and Pi opens its default model.
+            # Pi natively accepts "provider/id" in --model.
+            pi_args.extend(["--model", spec_model])
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_required_terminal falls back to

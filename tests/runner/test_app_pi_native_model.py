@@ -392,3 +392,98 @@ async def test_auto_create_pi_terminal_bakes_tunnel_token_into_config(
         )
     )
     assert config["authHeaders"][RUNNER_TUNNEL_TOKEN_HEADER] == "tok-abc"
+
+
+@pytest.mark.asyncio
+async def test_auto_create_pi_terminal_forwards_model_without_managed_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unmanaged Pi still honors a pre-launch model pick via ``--model``.
+
+    When Omnigent configures no Pi provider, Pi falls back to its own login —
+    but the picker's choice (persisted as the spec/override model) must still
+    reach the CLI. Without the passthrough the choice was silently dropped and
+    Pi opened its default model.
+    """
+    import omnigent.pi_native_bridge as pi_bridge
+    import omnigent.pi_native_credentials as creds
+
+    session_id = "conv_pi_model_fallback"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(pi_bridge, "_BRIDGE_ROOT", tmp_path / "pi-native")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr("omnigent.pi_native.resolve_pi_executable", lambda: "/usr/bin/pi")
+    # No omnigent-managed Pi provider: Pi will use its own login.
+    monkeypatch.setattr(creds, "resolve_pi_native_provider", lambda *a, **k: None)
+
+    class _SnapshotClient:
+        """Fresh pi-native session snapshot (no launch args / external id)."""
+
+        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+            del url, timeout
+            return httpx.Response(
+                200,
+                json={
+                    "workspace": str(workspace),
+                    "terminal_launch_args": None,
+                    "external_session_id": None,
+                },
+                request=httpx.Request("GET", f"/v1/sessions/{session_id}"),
+            )
+
+    launched: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        """Captures the launched terminal spec (args + env)."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            *,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            del terminal_name, session_key, resource_role, parent_os_env
+            launched["args"] = list(spec.args)
+            launched["env"] = dict(spec.env)
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi",
+            )
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="pi-fallback-model",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "pi-native"},
+            model="opencode/muse-spark-1.3-contributor-free",
+        ),
+    )
+
+    await _auto_create_pi_terminal(
+        session_id,
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _event: None,
+        server_client=_SnapshotClient(),  # type: ignore[arg-type]
+        agent_spec=spec,
+    )
+
+    # The pick reaches Pi's CLI (which natively accepts "provider/id"), and no
+    # managed config dir is injected — Pi uses its own login.
+    args = launched["args"]
+    assert "--model" in args
+    assert args[args.index("--model") + 1] == "opencode/muse-spark-1.3-contributor-free"
+    assert "--provider" not in args
+    assert "PI_CODING_AGENT_DIR" not in launched["env"]
