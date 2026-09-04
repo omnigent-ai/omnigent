@@ -61,6 +61,17 @@ def _run(argv: list[str], cwd: Path) -> None:
     subprocess.run(argv, cwd=cwd, check=True, capture_output=True, env=_git_env())
 
 
+def _set_fork_push(repo: Path, *, owner: str, head_ref: str, remote: str = "origin") -> None:
+    """Mark the ``feature`` branch as pushed to ``owner``'s fork under ``head_ref``.
+
+    Mirrors a triangular / fork push: an upstream (``branch.feature.merge``) whose
+    ref differs from the local name, tracking a remote whose URL owner is ``owner``.
+    """
+    _run(["git", "remote", "add", remote, f"git@github.com:{owner}/repo.git"], repo)
+    _run(["git", "config", "branch.feature.remote", remote], repo)
+    _run(["git", "config", "branch.feature.merge", f"refs/heads/{head_ref}"], repo)
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     """A repo with a ``main`` base and a ``feature`` branch that adds/edits/deletes.
@@ -108,6 +119,124 @@ def test_github_info_not_a_git_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     info = github_info(str(tmp_path))
     assert info["available"] is False
     assert info["reason"] == "not_a_git_repo"
+
+
+def _is_bare_pr_view(argv: Sequence[str]) -> bool:
+    """True for ``gh pr view --json …`` (no selector), False for ``… <selector> --json``."""
+    return tuple(argv[:2]) == ("pr", "view") and (len(argv) <= 2 or argv[2] == "--json")
+
+
+def test_github_info_pr_fallback_via_owner_head_selector(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PR a bare ``gh pr view`` can't resolve is recovered via ``<owner>:<head-ref>``.
+
+    In a fork / triangular flow the head is ``acme:alice/feature`` — owner from
+    the push remote's URL, head ref from ``branch.<n>.merge`` — both differing
+    from the checkout's ``feature``, so the retry must name the head from those.
+    """
+    _set_fork_push(repo, owner="acme", head_ref="alice/feature")
+    pr = {
+        "number": 42,
+        "title": "Add thing",
+        "state": "OPEN",
+        "url": "https://github.com/acme/repo/pull/42",
+        "isDraft": True,
+        "author": {"login": "alice"},
+        "baseRefName": "main",
+        "headRefName": "alice/feature",
+        "statusCheckRollup": [],
+    }
+    calls: list[tuple[str, ...]] = []
+
+    def fake_gh(argv: Sequence[str], *, cwd: str) -> tuple[int, str, str]:
+        calls.append(tuple(argv))
+        head = tuple(argv[:2])
+        if head == ("auth", "status"):
+            return (0, "", "")
+        if head == ("repo", "view"):
+            return (0, json.dumps({"nameWithOwner": "acme/repo"}), "")
+        if head == ("pr", "view"):
+            # The bare form finds nothing; the explicit selector resolves the PR.
+            return (1, "", "not found") if _is_bare_pr_view(argv) else (0, json.dumps(pr), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
+
+    info = github_info(str(repo))
+    assert info["pr"]["number"] == 42
+    assert info["pr"]["head_ref"] == "alice/feature"
+    assert info["pr"]["is_draft"] is True
+    assert info["base_ref"] == "main"
+    # The retry named the head as <push-remote-owner>:<upstream-ref>.
+    selectors = [c[2] for c in calls if not _is_bare_pr_view(c) and c[:2] == ("pr", "view")]
+    assert selectors == ["acme:alice/feature"]
+
+
+def test_github_info_pr_view_hit_skips_fallback(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the bare ``gh pr view`` resolves the PR, no ``<owner>:<head-ref>`` retry runs."""
+    view = {
+        "number": 5,
+        "title": "t",
+        "state": "OPEN",
+        "url": "u",
+        "isDraft": False,
+        "author": {"login": "a"},
+        "baseRefName": "main",
+        "headRefName": "feature",
+        "statusCheckRollup": [],
+    }
+    calls: list[tuple[str, ...]] = []
+
+    def fake_gh(argv: Sequence[str], *, cwd: str) -> tuple[int, str, str]:
+        calls.append(tuple(argv))
+        head = tuple(argv[:2])
+        if head == ("auth", "status"):
+            return (0, "", "")
+        if head == ("repo", "view"):
+            return (0, json.dumps({"nameWithOwner": "o/r"}), "")
+        if head == ("pr", "view"):
+            return (0, json.dumps(view), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
+
+    info = github_info(str(repo))
+    assert info["pr"]["number"] == 5
+    # Only the bare form ran; no explicit-selector retry.
+    assert all(_is_bare_pr_view(c) for c in calls if c[:2] == ("pr", "view"))
+
+
+def test_github_changed_files_fallback_via_owner_head_selector(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The changed-files list resolves a PR the bare ``gh pr view`` misses.
+
+    Exercises the second call site (:func:`_pr_number`): the bare view finds
+    nothing, the ``<owner>:<head-ref>`` retry supplies the number, and the files
+    fetch runs.
+    """
+    _set_fork_push(repo, owner="acme", head_ref="alice/feature")
+    files = [{"filename": "a.py", "status": "added", "additions": 1, "deletions": 0}]
+
+    def fake_gh(argv: Sequence[str], *, cwd: str) -> tuple[int, str, str]:
+        if tuple(argv[:2]) == ("pr", "view"):
+            return (
+                (1, "", "not found")
+                if _is_bare_pr_view(argv)
+                else (0, json.dumps({"number": 9}), "")
+            )
+        if argv and argv[0] == "api":
+            return (0, json.dumps(files), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    result = github_changed_files(str(repo))
+    assert [entry["path"] for entry in result["data"]] == ["a.py"]
 
 
 def test_github_changed_files_maps_pr_file_statuses(monkeypatch: pytest.MonkeyPatch) -> None:

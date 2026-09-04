@@ -17,6 +17,10 @@ Design notes:
 - Only the on-demand per-file expand-context reader (:func:`github_file_diff`)
   still uses ``git show`` for full before/after content — a unified-diff blob
   can't drive the viewer's context expansion.
+- The branch→PR lookup tries a bare ``gh pr view`` first, then retries with the
+  head named explicitly as ``<owner>:<head-ref>`` when that finds nothing — the
+  fallback catches a PR whose head is a fork branch under a renamed ref, which a
+  bare ``gh pr view`` misses because it guesses the head repo owner.
 - ``available: false`` payloads let the tab render a message ("gh not installed",
   "not a git repo") instead of surfacing an error.
 """
@@ -26,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -164,6 +169,80 @@ def _summarize_checks(rollup: Any) -> dict[str, Any]:
     }
 
 
+def _current_branch(root: str) -> str | None:
+    """Return the workspace's current branch name, or ``None`` (detached / not a repo)."""
+    rc, out, _ = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=root)
+    if rc != 0:
+        return None
+    return out.strip() or None
+
+
+def _remote_owner(url: str) -> str | None:
+    """Parse ``<owner>`` from a GitHub remote URL (ssh scp-like, ``ssh://``, https)."""
+    # Strip the transport + host prefix, leaving ``<owner>/<repo>[.git]``.
+    path = re.sub(r"^(?:git@[^:]+:|ssh://[^/]+/|https?://[^/]+/)", "", url)
+    return path.split("/", 1)[0] or None
+
+
+def _pushed_pr_selector(root: str, branch: str) -> str | None:
+    """Build an ``<owner>:<head-ref>`` selector naming the branch's PR head.
+
+    A bare ``gh pr view`` guesses the head repo owner and so misses a PR whose
+    head is a fork branch under a renamed ref (the triangular push flow). Naming
+    the head explicitly bypasses the guess: the head ref is the configured
+    upstream (``branch.<name>.merge``) and the owner is the push remote's repo
+    owner — both exactly what was pushed. ``None`` if either can't be derived.
+    """
+    rc, merge, _ = _git(["config", f"branch.{branch}.merge"], cwd=root)
+    if rc != 0 or not merge.strip():
+        return None
+    head_ref = merge.strip().removeprefix("refs/heads/")
+
+    rc, remote, _ = _git(["config", f"branch.{branch}.remote"], cwd=root)
+    if rc != 0 or not remote.strip():
+        return None
+    rc, url, _ = _git(["remote", "get-url", remote.strip()], cwd=root)
+    if rc != 0 or not url.strip():
+        return None
+    owner = _remote_owner(url.strip())
+    return f"{owner}:{head_ref}" if owner else None
+
+
+def _loads_pr_object(out: str) -> dict[str, Any] | None:
+    """Parse ``gh pr view --json`` stdout into a PR object, or ``None``."""
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _pr_view_json(root: str, fields: str) -> dict[str, Any] | None:
+    """Return the branch's PR as a ``gh``-JSON object for ``fields``, or ``None``.
+
+    Tries a bare ``gh pr view`` first (its own branch→PR resolution). Only when
+    that finds nothing does it touch git and retry with the head named as
+    ``<owner>:<head-ref>`` (see :func:`_pushed_pr_selector`) — the bare form
+    guesses the head repo owner and so misses a PR whose head is a fork branch
+    under a renamed ref (the triangular push flow). Both forms return one PR
+    object, so the result parses identically.
+    """
+    rc, out, _ = _gh(["pr", "view", "--json", fields], cwd=root)
+    if rc == 0:
+        data = _loads_pr_object(out)
+        if data is not None:
+            return data
+
+    branch = _current_branch(root)
+    if branch is None:
+        return None
+    selector = _pushed_pr_selector(root, branch)
+    if selector is None:
+        return None
+    rc, out, _ = _gh(["pr", "view", selector, "--json", fields], cwd=root)
+    return _loads_pr_object(out) if rc == 0 else None
+
+
 def github_info(root: str) -> dict[str, Any]:
     """Resolve GitHub context for the workspace: repo, branch, base, and PR.
 
@@ -215,24 +294,20 @@ def github_info(root: str) -> dict[str, Any]:
             pass
 
     pr: dict[str, Any] | None = None
-    rc, out, _ = _gh(["pr", "view", "--json", _PR_VIEW_FIELDS], cwd=root)
-    if rc == 0:
-        try:
-            data = json.loads(out)
-            author = data.get("author")
-            pr = {
-                "number": data.get("number"),
-                "title": data.get("title"),
-                "state": data.get("state"),
-                "url": data.get("url"),
-                "is_draft": data.get("isDraft", False),
-                "author": author.get("login") if isinstance(author, dict) else None,
-                "base_ref": data.get("baseRefName"),
-                "head_ref": data.get("headRefName"),
-                "checks": _summarize_checks(data.get("statusCheckRollup")),
-            }
-        except (ValueError, AttributeError):
-            pr = None
+    data = _pr_view_json(root, _PR_VIEW_FIELDS)
+    if data is not None:
+        author = data.get("author")
+        pr = {
+            "number": data.get("number"),
+            "title": data.get("title"),
+            "state": data.get("state"),
+            "url": data.get("url"),
+            "is_draft": data.get("isDraft", False),
+            "author": author.get("login") if isinstance(author, dict) else None,
+            "base_ref": data.get("baseRefName"),
+            "head_ref": data.get("headRefName"),
+            "checks": _summarize_checks(data.get("statusCheckRollup")),
+        }
     payload["pr"] = pr
 
     # A pure PR view: the base is the PR's base branch, else null (no PR).
@@ -297,16 +372,13 @@ def _pr_number(root: str) -> int | None:
     """Return the PR number for the workspace's branch, or ``None``.
 
     :param root: Absolute workspace path.
-    :returns: The associated PR's number, or ``None`` when ``gh`` finds no PR
-        (none for the branch, ``gh`` missing, or not authenticated).
+    :returns: The associated PR's number, or ``None`` when no PR resolves (none
+        for the branch, ``gh`` missing, or not authenticated).
     """
-    rc, out, _ = _gh(["pr", "view", "--json", "number"], cwd=root)
-    if rc != 0:
+    data = _pr_view_json(root, "number")
+    if data is None:
         return None
-    try:
-        number = json.loads(out).get("number")
-    except (ValueError, AttributeError):
-        return None
+    number = data.get("number")
     return number if isinstance(number, int) else None
 
 
