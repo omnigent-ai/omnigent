@@ -59,6 +59,8 @@ from omnigent.spec.types import RetryPolicy
 
 _logger = logging.getLogger(__name__)
 
+_AGENT_NAME = "genie"
+
 _ENV_MODEL = "HARNESS_GENIE_MODEL"
 _ENV_GATEWAY = "HARNESS_GENIE_GATEWAY"
 _ENV_DATABRICKS_PROFILE = "HARNESS_GENIE_DATABRICKS_PROFILE"
@@ -183,6 +185,35 @@ def _build_genie_executor() -> Executor:
         agent_name=agent_name,
         skills_filter=_resolve_skills_filter(),
     )
+
+
+def _materialize_genie_agent_spec(tmpdir: Path) -> Path:
+    """
+    Write the headless session agent spec used by Genie in the web UI picker.
+
+    :param tmpdir: Temporary directory for the generated YAML file.
+    :returns: Path to a generated YAML spec.
+    """
+    yaml_path = tmpdir / "genie.yaml"
+    raw = {
+        "name": _AGENT_NAME,
+        "prompt": (
+            "Genie is running as a headless coding agent through Omnigent. "
+            "Web UI messages are forwarded to the Genie CLI."
+        ),
+        "executor": {
+            "harness": "genie",
+            # Conservative default; genie will negotiate the actual window
+            # size via its API responses.
+            "context_window": 200_000,
+        },
+    }
+    # Write minimal YAML without external dependencies
+    import yaml
+
+    with open(yaml_path, "w") as f:
+        yaml.dump(raw, f, default_flow_style=False)
+    return yaml_path
 
 
 def create_app() -> FastAPI:

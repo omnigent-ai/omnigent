@@ -675,6 +675,7 @@ def _ensure_default_agents(
     _ensure_default_acp_agents(agent_store, artifact_store, agent_cache)
     _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_genie_agent(agent_store, artifact_store, agent_cache)
     _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
 
 
@@ -1056,6 +1057,43 @@ def _ensure_default_polly_agent(
         agent_cache,
         name=_POLLY_AGENT_NAME,
         bundle_bytes=_build_polly_bundle(),
+    )
+
+
+def _ensure_default_genie_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """
+    Register the headless Genie agent.
+
+    Genie is a headless CLI-driven coding agent (Databricks' fork of Codex).
+    Seeding it lets the Web UI's new-session picker offer Genie as a
+    host-launchable card next to Claude Code and Codex. Unlike polly and debby,
+    Genie's spec is materialized on-the-fly since it's a built-in harness with
+    no external bundle.
+
+    :param agent_store: Store for agent metadata.
+    :param artifact_store: Store for agent bundles.
+    :param agent_cache: Cache for loaded agent specs.
+    """
+    import tempfile
+
+    from omnigent.inner.genie_harness import _materialize_genie_agent_spec
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spec_path = _materialize_genie_agent_spec(Path(tmpdir))
+        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
+        bundle_bytes = _tar_gz_dir(bundle_dir)
+
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name="genie",
+        bundle_bytes=bundle_bytes,
     )
 
 

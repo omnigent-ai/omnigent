@@ -149,6 +149,7 @@ import {
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import {
   isAcpHarnessAgent,
+  isHeadlessCliHarness,
   partitionAgentsByKind,
   selectableSessionAgents,
 } from "@/lib/agentGrouping";
@@ -1217,7 +1218,12 @@ export function AgentHarnessPicker({
       // The preference hides harnesses that can't launch here — it outranks
       // both support level and recency, but never buries the active pick.
       if (!selected && hideUnconfigured && harnessUnconfiguredOnHost(a.harness, host)) continue;
-      if (selected || isFullySupportedNativeCodingAgent(a) || isRecentHarness(a, recentHarnesses)) {
+      if (
+        selected ||
+        isFullySupportedNativeCodingAgent(a) ||
+        isHeadlessCliHarness(a) ||
+        isRecentHarness(a, recentHarnesses)
+      ) {
         ready.push(a);
       } else more.push(a);
     }
@@ -2292,11 +2298,21 @@ export function NewChatLandingScreen() {
   // split: Polly & Debby are built-ins but are composed agents, so they stay
   // under "Agents". ACP agents aren't native, so they fold into "More".
   const harnessEntries = useMemo(
-    () => agentList.filter((a) => isNativeCodingAgent(a) || isAcpHarnessAgent(a)),
+    () =>
+      agentList.filter(
+        (a) =>
+          isNativeCodingAgent(a) || isAcpHarnessAgent(a) || isHeadlessCliHarness(a),
+      ),
     [agentList],
   );
   const agentEntries = useMemo(
-    () => agentList.filter((a) => !isNativeCodingAgent(a) && !isAcpHarnessAgent(a)),
+    () =>
+      agentList.filter(
+        (a) =>
+          !isNativeCodingAgent(a) &&
+          !isAcpHarnessAgent(a) &&
+          !isHeadlessCliHarness(a),
+      ),
     [agentList],
   );
 
