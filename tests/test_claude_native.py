@@ -3441,7 +3441,7 @@ async def test_attach_with_reconnect_exits_immediately_on_user_request(
         attach=attach,
         attach_url="wss://example.com/attach",
         headers={"Authorization": "Bearer tok"},
-        recover=lambda: _noop_async(),
+        recover=_noop_async,
     )
 
     # Exactly one attach call — no retries after a clean user exit.
@@ -3581,6 +3581,28 @@ async def test_attach_with_reconnect_retries_after_websocket_exception(
         f"expected 3 attach calls (2 fail + 1 succeed), got {len(attach.calls)}; "
         "the reconnect loop is not retrying after a transient WS error"
     )
+
+
+@pytest.mark.asyncio
+async def test_attach_with_reconnect_uses_session_name_in_clean_close_message(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Shared reconnect messages identify the active native wrapper."""
+    monkeypatch.setattr(claude_native, "_sleep", _noop_sleep)
+    attach = _ScriptedAttach(script=[False, True])
+
+    await claude_native._attach_with_reconnect(
+        attach=attach,
+        attach_url="wss://example.com/attach",
+        headers={"Authorization": "Bearer tok"},
+        recover=lambda: _noop_async(),
+        session_name="Codex",
+    )
+
+    captured = capsys.readouterr()
+    assert "Codex session connection closed by server; reconnecting..." in captured.err
+    assert "Claude session" not in captured.err
 
 
 @pytest.mark.asyncio
