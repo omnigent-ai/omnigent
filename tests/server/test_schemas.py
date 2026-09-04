@@ -1037,3 +1037,11 @@ def test_session_response_status_rejects_unknown_value() -> None:
 
     with pytest.raises(ValidationError):
         SessionResponse(id="conv_x", agent_id="ag_x", status="launching", created_at=0)
+
+
+def test_sandbox_status_accepts_waking_resume_stage() -> None:
+    """A managed resume has distinct progress from fresh provisioning."""
+    from omnigent.server.schemas import SandboxStatus
+
+    status = SandboxStatus(stage="waking")
+    assert status.model_dump() == {"stage": "waking", "error": None}

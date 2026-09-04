@@ -1351,6 +1351,16 @@ describe("session.sandbox_status (FLAT envelope)", () => {
     expect(out).toEqual([]);
   });
 
+  it("parses a managed sandbox wake stage", () => {
+    const out = parse("session.sandbox_status", {
+      type: "session.sandbox_status",
+      conversation_id: "conv_abc",
+      stage: "waking",
+    });
+    expect(out).toHaveLength(1);
+    expect((out[0] as SessionSandboxStatusEvent).stage).toBe("waking");
+  });
+
   it("rejects missing conversation_id", () => {
     const out = parse("session.sandbox_status", {
       type: "session.sandbox_status",

@@ -617,6 +617,29 @@ async def test_attach_terminal_runner_close_propagates_close_code(
     assert exc_info.value.code == 4404
 
 
+async def test_attach_terminal_reserved_runner_close_uses_internal_error(
+    app: FastAPI,
+) -> None:
+    """A reserved runner close code is not mirrored onto the browser socket."""
+    from websockets.exceptions import ConnectionClosedError
+    from websockets.frames import Close
+
+    class _ImmediateCloseConn(_FakeRunnerWSConn):
+        async def recv(self) -> bytes | str:
+            raise ConnectionClosedError(Close(1006, ""), None, None)
+
+    factory = _FakeRunnerWSFactory(_ImmediateCloseConn())
+    set_runner_ws_factory(factory)
+
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/conv_ws/resources/terminals/terminal_bash_missing/attach"
+    ) as ws:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_bytes()
+
+    assert exc_info.value.code == 4500
+
+
 # ── WS attach: local fallback when no ws factory ─────────
 
 

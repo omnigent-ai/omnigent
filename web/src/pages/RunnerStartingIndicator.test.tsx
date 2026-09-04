@@ -91,6 +91,12 @@ describe("RunnerStartingIndicator", () => {
     },
   );
 
+  it.each(["hero", "row"] as const)("%s: names a managed resume as waking", (variant) => {
+    useChatStore.setState({ sandboxStatus: { stage: "waking", error: null } });
+    renderWithContext(variant, makeCtx({ isTerminalFirst: false, terminalStartingUp: false }));
+    expect(screen.getByTestId("runner-starting-indicator")).toHaveTextContent(/waking sandbox/i);
+  });
+
   it.each(["hero", "row"] as const)(
     "%s: renders nothing for a non-terminal-first session (no terminal context)",
     (variant) => {

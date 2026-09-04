@@ -1317,6 +1317,7 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
     assert calls == ["wake"]
     assert host_deregistered == ["055e31f38d07908f171ebad4ff5cbe9c"]
     assert runner_deregistered == ["runner_stale_tunnel"]
+    assert conv.id not in sessions_module._managed_wake_sessions
 
 
 async def test_managed_wake_fails_when_runner_never_reconnects(

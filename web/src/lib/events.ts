@@ -654,9 +654,9 @@ export interface SessionTerminalPendingEvent {
 }
 
 /**
- * `session.sandbox_status` — the session's managed-sandbox launch
- * advanced a stage (provision → clone → host start → runner connect),
- * settled successfully (`ready`), or failed (`failed` + `error`).
+ * `session.sandbox_status` — the session's managed-sandbox launch or
+ * resume advanced a stage, settled successfully (`ready`), or failed
+ * (`failed` + `error`).
  * Drives the provisioning indicator on the session page so the
  * background launch reads as live progress instead of a dead chat.
  */
