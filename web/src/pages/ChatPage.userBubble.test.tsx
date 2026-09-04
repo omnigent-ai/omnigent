@@ -52,6 +52,24 @@ function renderBubble(bubble: Bubble) {
 }
 
 describe("UserBubble markdown rendering", () => {
+  it("renders text, an image, and following text in their authored order", () => {
+    renderBubble(
+      userBubble("beforeafter", {
+        content: [
+          { type: "input_text", text: "before" },
+          { type: "input_image", file_id: "pending:shot.png", filename: "shot.png" },
+          { type: "input_text", text: "after" },
+        ],
+      }),
+    );
+
+    const before = screen.getByText("before");
+    const image = screen.getByText("shot.png");
+    const after = screen.getByText("after");
+    expect(before.compareDocumentPosition(image) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(image.compareDocumentPosition(after) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it("renders **bold** markdown as a strong node, not literal asterisks", () => {
     renderBubble(userBubble("hello **world**"));
     // Streamdown emits bold as an element tagged data-streamdown="strong"

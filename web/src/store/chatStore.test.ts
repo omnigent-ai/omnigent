@@ -3281,6 +3281,52 @@ describe("chatStore — send (cross-session routing)", () => {
 });
 
 describe("chatStore — send (file attachments)", () => {
+  it("keeps an inline attachment between the surrounding text blocks", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/resources/files")) {
+        return mockResponse({
+          id: "file_inline_1",
+          name: "middle.png",
+          metadata: { filename: "middle.png", bytes: 10, created_at: 0 },
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const file = new File(["bytes"], "middle.png", { type: "image/png" });
+    await useChatStore.getState().send("before after", "agent_xyz", [file], {
+      composerParts: [
+        { type: "text", text: "before " },
+        { type: "attachment", file },
+        { type: "text", text: "after" },
+      ],
+    });
+
+    expect(useChatStore.getState().pendingUserMessages[0]!.content).toEqual([
+      { type: "input_text", text: "before " },
+      { type: "input_image", file_id: "file_inline_1", filename: "middle.png" },
+      { type: "input_text", text: "after" },
+    ]);
+
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "msg_inline_1",
+      itemType: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "before after" }] },
+    });
+    expect((useChatStore.getState().blocks[0] as UserMessageBlock).content).toEqual([
+      { type: "input_text", text: "before " },
+      { type: "input_image", file_id: "file_inline_1", filename: "middle.png" },
+      { type: "input_text", text: "after" },
+    ]);
+  });
+
   it("refreshes the pending entry with real file_ids after upload", async () => {
     // Claude-native's session.input.consumed is text-only, so the
     // consumed handler merges pending file blocks with server text;
@@ -3407,14 +3453,11 @@ describe("chatStore — send (file attachments)", () => {
     const promoted = state.blocks[0] as UserMessageBlock;
     expect(promoted.type).toBe("user_message");
     expect(promoted.ctx.itemId).toBe("msg_persisted_1");
-    // input_text still carries "[Attached: ...]"; ChatPage strips it
-    // via ATTACHED_RE at render time.
+    // The matched optimistic content is the only source that retains the
+    // user's exact file/text interleaving after a text-only native round-trip.
     expect(promoted.content).toEqual([
       { type: "input_image", file_id: "file_real_xyz789", filename: "screenshot.png" },
-      {
-        type: "input_text",
-        text: "[Attached: /tmp/uploads/screenshot.png]\n\nwhats going on",
-      },
+      { type: "input_text", text: "whats going on" },
     ]);
   });
 
@@ -3527,7 +3570,6 @@ describe("chatStore — send (file attachments)", () => {
     expect(steered.ctx.itemId).toBe("msg_steer");
     expect(steered.content).toEqual([
       { type: "input_image", file_id: "file_real_shot", filename: "shot.png" },
-      { type: "input_text", text: "[Attached: /tmp/uploads/shot.png]" },
     ]);
   });
 
@@ -3572,7 +3614,7 @@ describe("chatStore — send (file attachments)", () => {
 
     // Text-only consume (transcript round-trip). clearedPendingId names
     // the server id, which the optimistic bubble does not carry, so the
-    // FIFO head path promotes it — and still merges the image.
+    // FIFO head path promotes it and keeps the exact optimistic composition.
     handleSessionEvent({
       type: "session_input_consumed",
       itemId: "msg_native_1",
@@ -3587,11 +3629,11 @@ describe("chatStore — send (file attachments)", () => {
     const state = useChatStore.getState();
     expect(state.pendingUserMessages).toEqual([]);
     const promoted = state.blocks[0] as UserMessageBlock;
-    // The image survived the promotion — merged ahead of the text-only
-    // transcript content.
+    // The image survives the promotion without reintroducing the transport's
+    // path marker into the user-visible semantic content.
     expect(promoted.content).toEqual([
       { type: "input_image", file_id: "file_real_native", filename: "diagram.png" },
-      { type: "input_text", text: "[Attached: /tmp/diagram.png]\n\ndraw this" },
+      { type: "input_text", text: "draw this" },
     ]);
   });
 
@@ -5533,6 +5575,35 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(state.pendingUserMessages).toEqual([]);
       expect(state.blocks).toHaveLength(1);
       expect((state.blocks[0] as UserMessageBlock).ctx.itemId).toBe("msg_hi");
+    });
+
+    it("does not let direct terminal text consume an attachment-bearing pending message", () => {
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          {
+            tempId: "pend_web",
+            content: [
+              { type: "input_text", text: "before" },
+              { type: "input_image", file_id: "file_real", filename: "shot.png" },
+              { type: "input_text", text: "after" },
+            ],
+          },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_terminal",
+        itemType: "message",
+        data: { role: "user", content: [{ type: "input_text", text: "typed in terminal" }] },
+      });
+
+      const state = useChatStore.getState();
+      expect(state.pendingUserMessages).toHaveLength(1);
+      expect((state.blocks[0] as UserMessageBlock).content).toEqual([
+        { type: "input_text", text: "typed in terminal" },
+      ]);
     });
   });
 

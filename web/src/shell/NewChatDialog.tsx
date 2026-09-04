@@ -15,7 +15,6 @@ import {
   Loader2Icon,
   FileTextIcon,
   FolderIcon,
-  ImageIcon,
   PaperclipIcon,
   PlusIcon,
   SettingsIcon,
@@ -70,7 +69,16 @@ import { authenticatedFetch } from "@/lib/identity";
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { isComposerSendKey, readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
-import { attachmentKey, validateAttachments } from "@/lib/attachments";
+import {
+  COMPOSER_ATTACHMENT_PLACEHOLDER,
+  composerAttachments,
+  composerPartsFromProjection,
+  composerPartsToProjection,
+  composerPartsToText,
+  normalizeComposerParts,
+  replaceComposerText,
+  type ComposerDraftPart,
+} from "@/lib/composerContent";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
@@ -101,6 +109,11 @@ import {
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
 import { setPendingInitialPrompt } from "@/store/chatStore";
+import {
+  InlineComposerEditor,
+  type InlineComposerEditorHandle,
+} from "@/components/InlineComposerEditor";
+import { FileDropOverlay } from "@/components/FileDropOverlay";
 import { markSessionCreated } from "@/store/interactionTelemetry";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
@@ -197,7 +210,6 @@ import {
   prefetchAvailableAgentDetails,
   type AvailableAgent,
 } from "@/hooks/useAvailableAgents";
-import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useRecentHarnesses } from "@/hooks/useRecentHarnesses";
@@ -225,7 +237,6 @@ import {
 } from "@/lib/sessionListCache";
 import { nextPushedSession } from "@/lib/sessionUpdatesSocket";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
-import { FileDropOverlay } from "@/components/FileDropOverlay";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
   buildMentionPreamble,
@@ -2345,40 +2356,67 @@ export function NewChatLandingScreen() {
           prefilledBranch: "",
         };
 
-  const [message, setMessage] = useState<string>(() => restoredDraft?.message ?? "");
+  const [composerParts, setComposerParts] = useState<ComposerDraftPart[]>(() =>
+    composerPartsFromProjection(restoredDraft?.message ?? "", restoredDraft?.files ?? []),
+  );
+  const composerPartsRef = useRef(composerParts);
+  composerPartsRef.current = composerParts;
+  const message = composerPartsToProjection(composerParts);
+  const files = composerAttachments(composerParts);
+  const filesRef = useRef(files);
+  filesRef.current = files;
+  const inlineEditorRef = useRef<InlineComposerEditorHandle>(null);
+  const replaceComposerParts = useCallback((next: readonly ComposerDraftPart[]) => {
+    const normalized = normalizeComposerParts(next);
+    composerPartsRef.current = normalized;
+    setComposerParts(normalized);
+    inlineEditorRef.current?.setParts(normalized);
+  }, []);
+  const setMessage = useCallback(
+    (next: string) => {
+      const nextParts =
+        filesRef.current.length > 0 && !next.includes(COMPOSER_ATTACHMENT_PLACEHOLDER)
+          ? replaceComposerText(composerPartsRef.current, next)
+          : composerPartsFromProjection(next, filesRef.current);
+      replaceComposerParts(nextParts);
+    },
+    [replaceComposerParts],
+  );
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  if (textareaRef.current === null) {
+    textareaRef.current = {
+      get selectionStart() {
+        return inlineEditorRef.current?.getSelection().start ?? 0;
+      },
+      get selectionEnd() {
+        return inlineEditorRef.current?.getSelection().end ?? 0;
+      },
+      setSelectionRange(start: number, end: number) {
+        inlineEditorRef.current?.setSelection(start, end);
+      },
+      focus() {
+        inlineEditorRef.current?.focus();
+      },
+      scrollTop: 0,
+      scrollLeft: 0,
+    } as HTMLTextAreaElement;
+  }
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
   const dictation = useDictationInsert(message, setMessage, textareaRef);
   const isComposingRef = useRef(false);
-  // maxRows 9 = 180px of 20px lines, matching the composer's 200px
-  // border-box max (180px content + 16px top / 4px bottom padding).
-  useAutoGrowTextarea(textareaRef, message, 9);
-
-  // Attachments for the first message — same affordances as the in-session
-  // composer (paperclip + paste); carried to ChatPage via the pending
-  // initial prompt and sent with the auto-dispatched first turn.
-  const [files, setFiles] = useState<File[]>(() => restoredDraft?.files ?? []);
+  // Attachments for the first message live inline with text and are carried to
+  // ChatPage in the same visual order for the auto-dispatched first turn.
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  // Reject unsupported types (only images, PDF, and text/code) and oversized
-  // files here, before the session exists. Without this the upload only fails
-  // after the session is created and navigated into, where the first turn's
-  // 415 strands the typed message in a session the user never wanted.
   const addFiles = (incoming: File[]) => {
-    const { accepted, errors } = validateAttachments(incoming);
-    if (accepted.length > 0) setFiles((prev) => [...prev, ...accepted]);
-    setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
-  };
-  const removeFile = (index: number) => {
-    setFiles((prev) => prev.filter((_, i) => i !== index));
-    setAttachmentError(null);
+    inlineEditorRef.current?.insertFiles(incoming);
   };
 
-  // Drag-and-drop — as in the in-session composer, a file dropped anywhere on
-  // the landing surface attaches here. Declared after ``landingSurface``.
+  // Files dropped elsewhere on the landing still insert at the editor's last
+  // caret. Drops inside the editor are consumed there at the exact pointer position.
   const isDragActive = useFileDropTarget(landingSurface, addFiles);
 
   // Gates the sandbox host option: only servers whose sandbox
@@ -3942,7 +3980,7 @@ export function NewChatLandingScreen() {
   });
 
   const canSubmit =
-    message.trim().length > 0 &&
+    (message.trim().length > 0 || files.length > 0) &&
     selectedAgent != null &&
     (sandboxSelected ? sandboxRepoValid : !!selectedHostId && workspaceValid) &&
     !creating;
@@ -3959,7 +3997,7 @@ export function NewChatLandingScreen() {
         ? "Please choose a host and working directory"
         : configuredAgentUnavailable && selectedAgent == null
           ? "This project's configured agent is unavailable — pick an agent to continue"
-          : message.trim().length === 0
+          : message.trim().length === 0 && files.length === 0
             ? "Enter a message to get started"
             : null;
 
@@ -4260,6 +4298,12 @@ export function NewChatLandingScreen() {
     // draft back via returnDraftToUser.
     submittedRef.current = true;
     try {
+      // Read the editor snapshot at submit time. File insertion publishes its
+      // state synchronously, while React may not have rendered the new closure
+      // yet when a user picks a file and immediately presses Start.
+      const submittedParts = composerPartsRef.current;
+      const submittedProjection = composerPartsToProjection(submittedParts);
+      const submittedFiles = composerAttachments(submittedParts);
       const trimmedBranch = branchName.trim();
       // `shouldCreateWorktree` (component scope): true only when a branch is
       // named and the workspace isn't already an existing worktree. Starting
@@ -4307,9 +4351,14 @@ export function NewChatLandingScreen() {
       // from the marker; no upload happens. Folders carry a trailing "/".
       // Computed BEFORE the create so `smart_routing_message` classifies the
       // prompt the agent actually receives, not the raw textarea value.
-      const initialPrompt =
-        buildMentionPreamble(mentionedItems, selectedAgent?.harness ?? null) +
-        sanitizeInitialPrompt(message);
+      const sanitizedProjection = sanitizeInitialPrompt(submittedProjection);
+      const promptParts = composerPartsFromProjection(sanitizedProjection, submittedFiles);
+      const mentionPreamble = buildMentionPreamble(mentionedItems, selectedAgent?.harness ?? null);
+      const orderedPromptParts = normalizeComposerParts([
+        ...(mentionPreamble ? [{ type: "text" as const, text: mentionPreamble }] : []),
+        ...promptParts,
+      ]);
+      const initialPrompt = mentionPreamble + composerPartsToText(promptParts);
 
       // Native terminal agents open terminal-first: `omnigent.ui: terminal`
       // tells the UI to render the terminal wrapper, and `omnigent.wrapper`
@@ -4652,10 +4701,12 @@ export function NewChatLandingScreen() {
       // terminal agents keep plain text — their CLI owns slash commands.
       setPendingInitialPrompt(data.id, {
         text: initialPrompt,
-        skill: isNativeTerminalAgent
-          ? null
-          : matchSkillInvocation(initialPrompt, agent?.skills ?? []),
-        files,
+        skill:
+          isNativeTerminalAgent || submittedFiles.length > 0
+            ? null
+            : matchSkillInvocation(initialPrompt, agent?.skills ?? []),
+        files: submittedFiles,
+        ...(submittedFiles.length > 0 ? { composerParts: orderedPromptParts } : {}),
       });
       // Label the new row with the prompt until the server's seed title lands.
       recordOptimisticTitle(data.id, initialPrompt);
@@ -4679,6 +4730,72 @@ export function NewChatLandingScreen() {
       setCreating(false);
     }
   }
+
+  const handleLandingKeyDown = (
+    event: globalThis.KeyboardEvent,
+    _selection: { start: number; end: number },
+  ): boolean => {
+    if (isImeCompositionKeyEvent({ nativeEvent: event }, isComposingRef.current)) return false;
+
+    // Touch-primary surfaces keep Enter as an editor newline.
+    if (preventsKeyboardSubmit && event.key === "Enter") return false;
+
+    const shouldSubmitFromKeyboard = isComposerSendKey(
+      {
+        key: event.key,
+        shiftKey: event.shiftKey,
+        metaKey: event.metaKey,
+        ctrlKey: event.ctrlKey,
+        altKey: event.altKey,
+        isComposing: event.isComposing,
+      },
+      submitWithModEnter,
+      preventsKeyboardSubmit,
+    );
+    const shouldPreferSendOverCompletion = submitWithModEnter && shouldSubmitFromKeyboard;
+
+    const mentionEvent = {
+      key: event.key,
+      shiftKey: event.shiftKey,
+      preventDefault: () => event.preventDefault(),
+    };
+    if (!shouldPreferSendOverCompletion && handleMentionKeyDown(mentionEvent)) return true;
+
+    if (slashMenuOpen && slashMenuMatches.length > 0) {
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setSlashMenuIndex((index) => (index + 1) % slashMenuMatches.length);
+        return true;
+      }
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setSlashMenuIndex((index) => (index <= 0 ? slashMenuMatches.length - 1 : index - 1));
+        return true;
+      }
+      if (
+        !shouldPreferSendOverCompletion &&
+        (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey)) &&
+        slashMenuIndex >= 0
+      ) {
+        event.preventDefault();
+        applySlashSelection(slashMenuMatches[slashMenuIndex]!);
+        return true;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setMessage("");
+        setSlashMenuIndex(-1);
+        return true;
+      }
+    }
+    if (shouldSubmitFromKeyboard) {
+      event.preventDefault();
+      if (mentionListingPending) return true;
+      void handleCreate();
+      return true;
+    }
+    return false;
+  };
 
   const placeholderText = selectedProject
     ? `Start a new session in ${selectedProject}`
@@ -4743,7 +4860,6 @@ export function NewChatLandingScreen() {
             </h1>
           ) : null}
         </div>
-        {/* Drop cue, spanning the landing surface. */}
         {isDragActive && landingSurface ? <FileDropOverlay container={landingSurface} /> : null}
         <div className="relative flex w-full flex-col gap-1">
           <form
@@ -4756,7 +4872,7 @@ export function NewChatLandingScreen() {
             // dark:bg-card-solid stays opaque so dark glass --card doesn't show
             // through. Drag-over keeps its separate inset ring.
             className={cn(
-              "relative z-10 flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
+              "relative z-10 flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid transition-shadow duration-150 focus-within:shadow-[var(--composer-shadow-focus)]",
               isDragActive && "ring-2 ring-ring ring-inset",
             )}
             data-testid="new-chat-landing-composer"
@@ -4782,147 +4898,36 @@ export function NewChatLandingScreen() {
               />
             )}
             <div className="relative overflow-hidden">
-              <textarea
-                ref={textareaRef}
-                value={message}
-                onChange={(e) => {
-                  setMessage(e.target.value);
-                  // A rejected attachment is never added, so there's no chip to
-                  // remove and nothing else would ever clear this. Left sticky it
-                  // reads as a blocker on a composer the user can actually submit.
+              <InlineComposerEditor
+                ref={inlineEditorRef}
+                initialParts={composerParts}
+                onChange={(nextParts) => {
+                  composerPartsRef.current = nextParts;
+                  setComposerParts(nextParts);
                   if (attachmentError !== null) setAttachmentError(null);
-                  // Recompute the active "@"-mention from the caret each keystroke
-                  // (native terminal agents with a workspace — ``mentionEnabled``).
-                  setMention(
-                    mentionEnabled
-                      ? detectMentionAt(
-                          e.target.value,
-                          e.target.selectionStart ?? e.target.value.length,
-                        )
-                      : null,
-                  );
+                  const projection = composerPartsToProjection(nextParts);
+                  const caret = inlineEditorRef.current?.getSelection().start ?? projection.length;
+                  setMention(mentionEnabled ? detectMentionAt(projection, caret) : null);
                 }}
-                onFocus={() => {
-                  // From here the textarea's caret is one the user placed, so
-                  // dictation inserts there instead of at the end of the draft.
-                  dictation.noteFocus();
-                }}
-                onBlur={() => {
-                  // Dismiss the mention menu when focus leaves the textarea; menu
-                  // rows preventDefault on mousedown so selecting one doesn't blur.
-                  dismissMention();
-                }}
+                onRejectedFiles={(errors) =>
+                  setAttachmentError(errors.length > 0 ? errors.join("\n") : null)
+                }
+                onFocus={() => dictation.noteFocus()}
+                onBlur={dismissMention}
                 onCompositionStart={() => {
                   isComposingRef.current = true;
                 }}
                 onCompositionEnd={() => {
                   isComposingRef.current = false;
                 }}
-                onKeyDown={(e) => {
-                  if (isImeCompositionKeyEvent(e, isComposingRef.current)) {
-                    return;
-                  }
-
-                  // Touch-primary newline behavior outranks autocomplete and
-                  // desktop submit preferences. The textarea owns line insertion.
-                  if (preventsKeyboardSubmit && e.key === "Enter") {
-                    return;
-                  }
-
-                  const shouldSubmitFromKeyboard = isComposerSendKey(
-                    {
-                      key: e.key,
-                      shiftKey: e.shiftKey,
-                      metaKey: e.metaKey,
-                      ctrlKey: e.ctrlKey,
-                      altKey: e.altKey,
-                      isComposing: e.nativeEvent.isComposing,
-                    },
-                    submitWithModEnter,
-                    preventsKeyboardSubmit,
-                  );
-                  const shouldPreferSendOverCompletion =
-                    submitWithModEnter && shouldSubmitFromKeyboard;
-
-                  // "@"-mention menu navigation (shared useMentionBrowser) —
-                  // mutually exclusive with the slash menu (a token can't be both)
-                  // and takes priority over submission.
-                  if (!shouldPreferSendOverCompletion && handleMentionKeyDown(e)) return;
-
-                  // While the skills menu is open, ArrowUp/Down navigate it and
-                  // Enter/Tab complete the highlighted item — these take
-                  // priority over submission (same UX as the in-session
-                  // composer).
-                  if (slashMenuOpen && slashMenuMatches.length > 0) {
-                    if (e.key === "ArrowDown") {
-                      e.preventDefault();
-                      setSlashMenuIndex((i) => (i + 1) % slashMenuMatches.length);
-                      return;
-                    }
-                    if (e.key === "ArrowUp") {
-                      e.preventDefault();
-                      setSlashMenuIndex((i) => (i <= 0 ? slashMenuMatches.length - 1 : i - 1));
-                      return;
-                    }
-                    if (
-                      !shouldPreferSendOverCompletion &&
-                      (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) &&
-                      slashMenuIndex >= 0
-                    ) {
-                      e.preventDefault();
-                      applySlashSelection(slashMenuMatches[slashMenuIndex]!);
-                      return;
-                    }
-                    if (e.key === "Escape") {
-                      e.preventDefault();
-                      // Dismiss the menu by clearing the draft so the user can
-                      // start fresh.
-                      setMessage("");
-                      setSlashMenuIndex(-1);
-                      return;
-                    }
-                  }
-                  if (shouldSubmitFromKeyboard) {
-                    e.preventDefault();
-                    // The mention menu is briefly closed while its listing loads;
-                    // swallow Enter so the in-progress "@dir/" token isn't sent.
-                    if (mentionListingPending) return;
-                    void handleCreate();
-                  }
-                }}
-                onPaste={(e) => {
-                  // Pasted images/files attach instead of inserting as text,
-                  // mirroring the in-session composer.
-                  const pasted = Array.from(e.clipboardData.items)
-                    .filter((item) => item.kind === "file")
-                    .map((item) => item.getAsFile())
-                    .filter((f): f is File => f !== null);
-                  if (pasted.length > 0) {
-                    e.preventDefault();
-                    addFiles(pasted);
-                  }
-                }}
-                // Suppress the native placeholder when the overlay supplies its
-                // own prompt text; aria-label preserves the accessible name.
+                onKeyDown={handleLandingKeyDown}
                 placeholder={pillSkills.length > 0 ? "" : placeholderText}
-                aria-label={placeholderText}
-                rows={1}
-                // Desktop only. This screen mounts on every arrival at "/" —
-                // including ones the user didn't make to type, like Back out of
-                // Settings — and on a phone focusing the field throws up the
-                // keyboard (and auto-zooms, per the note below) over whatever
-                // is on screen, sometimes with the sidebar drawer still open on
-                // top of it. Phones expect to be tapped before they type.
+                ariaLabel={placeholderText}
+                testId="new-chat-landing-input"
                 autoFocus={!isMobileViewport}
-                data-testid="new-chat-landing-input"
-                // Compose-pill text spec: inherited UI font at 14px/20px.
-                // (Note: sub-16px inputs make mobile Safari
-                // auto-zoom on focus — accepted tradeoff per the design.)
-                // Heights are border-box (12px top + 8px bottom padding lives
-                // inside them): max 200px = the spec's 180px of content.
-                // A 60px floor holds two 20px lines plus that padding;
-                // useAutoGrowTextarea expands from there to the unchanged cap.
-                className="block min-h-[60px] max-h-[200px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-3 pb-2 text-ui leading-5 text-foreground outline-none [scrollbar-width:none] placeholder:text-muted-foreground md:select-text [&::-webkit-scrollbar]:hidden"
+                disabled={creating}
+                className="w-full overflow-hidden leading-5 md:select-text"
+                editorClassName="min-h-[60px] max-h-[200px]"
               />
               {/* Gated on an empty draft so it reads as the placeholder.
                   pointer-events-none lets clicks fall through to focus the
@@ -4976,32 +4981,6 @@ export function NewChatLandingScreen() {
                       onClick={() => removeMentionedItem(i)}
                       className="ml-0.5 rounded-full hover:text-foreground"
                       aria-label={`Remove ${item.path}`}
-                    >
-                      <XIcon className="size-3" />
-                    </button>
-                  </span>
-                ))}
-              </div>
-            )}
-            {/* File chips — shown below the textarea when files are attached. */}
-            {files.length > 0 && (
-              <div className="flex flex-wrap gap-1.5 px-4 pb-2">
-                {files.map((file, i) => (
-                  <span
-                    key={attachmentKey(file)}
-                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                  >
-                    {file.type.startsWith("image/") ? (
-                      <ImageIcon className="size-3 shrink-0" />
-                    ) : (
-                      <FileTextIcon className="size-3 shrink-0" />
-                    )}
-                    <span className="max-w-[140px] truncate">{file.name || "image.png"}</span>
-                    <button
-                      type="button"
-                      onClick={() => removeFile(i)}
-                      className="ml-0.5 rounded-full hover:text-foreground"
-                      aria-label={`Remove ${file.name || "image.png"}`}
                     >
                       <XIcon className="size-3" />
                     </button>

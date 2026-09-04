@@ -50,9 +50,12 @@ export function useFileDropTarget(
 
     const drop = (e: DragEvent): void => {
       if (!carriesFiles(e.dataTransfer)) return;
-      e.preventDefault();
       depth = 0;
       setIsDragActive(false);
+      // An inline editor may already have consumed the drop at an exact
+      // document position. Leave that event alone so the file is not added twice.
+      if (e.defaultPrevented) return;
+      e.preventDefault();
       const files = Array.from(e.dataTransfer?.files ?? []);
       if (files.length > 0) onFilesRef.current(files);
     };

@@ -953,6 +953,28 @@ class GooseExecutor(Executor):
         return "\n".join(parts)
 
     @classmethod
+    def _ordered_prompt_blocks(
+        cls,
+        blocks: list[object],
+        *,
+        image_supported: bool,
+    ) -> list[_AcpJsonObject]:
+        """Translate message blocks to ACP blocks without changing their order."""
+        out: list[_AcpJsonObject] = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "input_image" and image_supported:
+                images = cls._image_blocks_from_content([block])
+                if images:
+                    out.extend(images)
+                    continue
+            text = cls._text_from_blocks([block], emit_image_marker=not image_supported)
+            if text:
+                out.append({"type": "text", "text": text})
+        return out
+
+    @classmethod
     def _history_prefix(cls, prior: Sequence[object]) -> str:
         """Serialize prior conversation turns into a text prefix.
 
@@ -1118,6 +1140,7 @@ class GooseExecutor(Executor):
         # Build the prompt payload from the most recent user message.
         user_text = ""
         image_blocks: list[_AcpJsonObject] = []
+        ordered_prompt_blocks: list[_AcpJsonObject] | None = None
         latest_user_idx: int | None = None
         for idx in range(len(messages) - 1, -1, -1):
             msg = messages[idx]
@@ -1130,6 +1153,10 @@ class GooseExecutor(Executor):
                 elif isinstance(content, list):
                     if self._image_supported:
                         image_blocks = self._image_blocks_from_content(content)
+                    ordered_prompt_blocks = self._ordered_prompt_blocks(
+                        content,
+                        image_supported=self._image_supported,
+                    )
                     user_text = self._text_from_blocks(
                         content, emit_image_marker=not self._image_supported
                     )
@@ -1152,10 +1179,27 @@ class GooseExecutor(Executor):
                 user_text = f"{system_prompt}\n\n{user_text}" if user_text else system_prompt
             self._system_prompt_sent = True
 
-        prompt_blocks: list[_AcpJsonObject] = []
-        if user_text or not image_blocks:
-            prompt_blocks.append({"type": "text", "text": user_text})
-        prompt_blocks.extend(image_blocks)
+        if ordered_prompt_blocks is None:
+            prompt_blocks: list[_AcpJsonObject] = []
+            if user_text or not image_blocks:
+                prompt_blocks.append({"type": "text", "text": user_text})
+            prompt_blocks.extend(image_blocks)
+        else:
+            latest_text = self._text_from_blocks(
+                content,
+                emit_image_marker=not self._image_supported,
+            )
+            prefix = (
+                user_text[: -len(latest_text)]
+                if latest_text and user_text.endswith(latest_text)
+                else user_text
+            )
+            prompt_blocks = (
+                ([{"type": "text", "text": prefix}] if prefix else [])
+                + ordered_prompt_blocks
+            )
+            if not prompt_blocks:
+                prompt_blocks = [{"type": "text", "text": ""}]
 
         # Drain stale items from a prior turn; answer any leftover server request.
         while not self._queue.empty():

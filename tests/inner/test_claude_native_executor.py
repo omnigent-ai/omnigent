@@ -504,6 +504,43 @@ async def test_run_turn_materializes_image_to_bridge_dir(
 
 
 @pytest.mark.asyncio
+async def test_run_turn_keeps_image_between_surrounding_text(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The live native turn preserves text-image-text semantic order."""
+    sent: list[dict[str, Any]] = []
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", _stub_inject(sent))
+
+    executor = ClaudeNativeExecutor(tmp_path)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "before"},
+                        {
+                            "type": "input_image",
+                            "image_url": _TINY_PNG_DATA_URI,
+                            "filename": "middle.png",
+                        },
+                        {"type": "input_text", "text": "after"},
+                    ],
+                }
+            ],
+            tools=[],
+            system_prompt="ignored",
+        )
+    ]
+
+    assert events == [TurnComplete(response=None)]
+    injected = sent[0]["content"]
+    assert injected.index("before") < injected.index("[Attached:") < injected.index("after")
+
+
+@pytest.mark.asyncio
 async def test_run_turn_image_only_no_text_still_injects(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -109,6 +109,11 @@ import type {
 } from "@/lib/types";
 import { uploadFile } from "@/lib/filesApi";
 import { attachmentKey } from "@/lib/attachments";
+import {
+  composerPartsToContentBlocks,
+  legacyComposerParts,
+  type ComposerDraftPart,
+} from "@/lib/composerContent";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
@@ -138,6 +143,8 @@ export interface SendOptions {
    * `send` already set `conversationId` before the callback.
    */
   onConversationCreated?: (conversationId: string) => void;
+  /** Exact visual composer order. Omitted by legacy text/files callers. */
+  composerParts?: ComposerDraftPart[];
 }
 
 /**
@@ -196,6 +203,8 @@ export interface QueuedMessage {
   text: string;
   /** Attachments to send with the message. */
   files?: File[];
+  /** Exact visual order of text spans and inline attachments. */
+  composerParts?: ComposerDraftPart[];
   /** Owning conversation, so a switch/idle only flushes its own queue. */
   conversationId: string;
   /**
@@ -428,7 +437,12 @@ export interface ConversationState {
    * into — but the landing path binds a session first, so the reported flow
    * is covered.
    */
-  failedSendDraft: { conversationId: string; text: string; files: File[] } | null;
+  failedSendDraft: {
+    conversationId: string;
+    text: string;
+    files: File[];
+    composerParts?: ComposerDraftPart[];
+  } | null;
   /**
    * When a send last latched THIS conversation's `status` to "streaming", or
    * `null`. Conversation-scoped, not a module global, because `status` is now
@@ -662,7 +676,7 @@ export interface ChatActions {
    * while the agent is busy. The head is flushed automatically (FIFO, one per
    * turn) when the session next goes idle — see the `session_status` handler.
    */
-  enqueueMessage: (text: string, files?: File[]) => void;
+  enqueueMessage: (text: string, files?: File[], composerParts?: ComposerDraftPart[]) => void;
   /** Remove a queued message by id (the strip's per-row delete). */
   dequeueMessage: (queueId: string) => void;
   /**
@@ -1095,19 +1109,6 @@ async function uploadFileBlock(sessionId: string, file: File): Promise<ContentBl
   return block;
 }
 
-async function uploadFileBlocks(
-  sessionId: string,
-  files: readonly File[],
-): Promise<ContentBlock[]> {
-  const blocks: ContentBlock[] = [];
-  // Stop at the first failure so later uploads cannot outlive a requeued send.
-  for (const file of files) {
-    // oxlint-disable-next-line no-await-in-loop
-    blocks.push(await uploadFileBlock(sessionId, file));
-  }
-  return blocks;
-}
-
 // Must match the @keyframes user-msg-flash duration in index.css.
 const FLASH_DURATION_MS = 800;
 const WORKSPACE_INVALIDATION_DEBOUNCE_MS = 750;
@@ -1262,6 +1263,8 @@ export interface PendingInitialPrompt {
    *  first message. Skill invocations don't carry files (same as the
    *  in-session composer's slash-command path). */
   files?: File[];
+  /** Exact visual order of text spans and inline attachments. */
+  composerParts?: ComposerDraftPart[];
 }
 
 // First-message handoff from NewChatDialog to ChatPage, keyed by the
@@ -1281,15 +1284,15 @@ const pendingInitialPrompts = new Map<string, PendingInitialPrompt>();
  *
  * @param conversationId The new conversation's id, e.g. `"conv_abc123"`.
  * @param prompt The user's first message (already sanitized by the
- *   dialog) plus its matched skill invocation, if any. Prompts with
- *   empty `text` are ignored so a blank prompt never queues an
+ *   dialog) plus its matched skill invocation, if any. Prompts with neither
+ *   text nor attachments are ignored so a blank prompt never queues an
  *   auto-send.
  */
 export function setPendingInitialPrompt(
   conversationId: string,
   prompt: PendingInitialPrompt,
 ): void {
-  if (!prompt.text) return;
+  if (!prompt.text && (prompt.files?.length ?? 0) === 0) return;
   pendingInitialPrompts.set(conversationId, prompt);
 }
 
@@ -1368,7 +1371,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   abortController: null,
   historyGeneration: 0,
 
-  enqueueMessage: (text, files) => {
+  enqueueMessage: (text, files, composerParts) => {
     const { conversationId, boundAgentId } = get();
     if (conversationId === null) return;
     queueSeq += 1;
@@ -1382,6 +1385,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           conversationId,
           ...(boundAgentId !== null ? { agentId: boundAgentId } : {}),
           ...(files && files.length > 0 ? { files } : {}),
+          ...(composerParts ? { composerParts } : {}),
         },
       ],
     }));
@@ -1433,7 +1437,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (target === undefined || agentId === null) return;
     // Remove BEFORE the POST so a concurrent flush can't also send it.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId) });
-    void s.send(target.text, agentId, target.files);
+    void s.send(target.text, agentId, target.files, {
+      ...(target.composerParts ? { composerParts: target.composerParts } : {}),
+    });
   },
 
   clearQueuedMessages: (conversationId) => {
@@ -1480,7 +1486,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (head === undefined) return;
     // Remove it BEFORE the POST so a re-entrant flush can't double-send.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
-    void s.send(head.text, head.agentId ?? s.boundAgentId, head.files);
+    void s.send(head.text, head.agentId ?? s.boundAgentId, head.files, {
+      ...(head.composerParts ? { composerParts: head.composerParts } : {}),
+    });
   },
 
   flushBackgroundQueues: () => {
@@ -1555,11 +1563,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         await waitForPrior();
         // Reuse prior successful uploads so cooldown-paced retries do not
         // orphan blobs that already landed.
-        const fileBlocks = await uploadFileBlocks(conversationId, head.files ?? []);
-        const content: ContentBlock[] = [
-          ...fileBlocks,
-          ...(head.text.trim() ? [{ type: "input_text" as const, text: head.text }] : []),
-        ];
+        const orderedParts = head.composerParts ?? legacyComposerParts(head.text, head.files ?? []);
+        const content = await composerPartsToContentBlocks(orderedParts, (file) =>
+          uploadFileBlock(conversationId, file),
+        );
         await postEvent(conversationId, {
           type: "message",
           data: { role: "user", content },
@@ -1616,22 +1623,17 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // entry to the eventual server item id.
     pendingSeq += 1;
     const tempId = `pend_${pendingSeq}`;
-    const pendingFileBlocks: MessageContentBlock[] = (files ?? []).map((file) => {
-      const filename = file.name || "image.png";
-      // Key the placeholder id on the File's stable identity, not its name:
-      // pasted screenshots all arrive named "image.png", so a name-derived
-      // id would collide across attachments and strand a ghost chip (React
-      // dedupes on the shared key) until a refresh replaces it with the
-      // server's unique file_id.
-      const fileId = `pending:${attachmentKey(file)}`;
-      return file.type.startsWith("image/")
-        ? { type: "input_image" as const, file_id: fileId, filename }
-        : { type: "input_file" as const, file_id: fileId, filename };
+    const orderedParts = opts?.composerParts ?? legacyComposerParts(text, files ?? []);
+    const content: MessageContentBlock[] = orderedParts.flatMap<MessageContentBlock>((part) => {
+      if (part.type === "text") {
+        return part.text ? [{ type: "input_text" as const, text: part.text }] : [];
+      }
+      const filename = part.file.name || "image.png";
+      const fileId = `pending:${attachmentKey(part.file)}`;
+      return part.file.type.startsWith("image/")
+        ? [{ type: "input_image" as const, file_id: fileId, filename }]
+        : [{ type: "input_file" as const, file_id: fileId, filename }];
     });
-    const content: MessageContentBlock[] = [
-      ...pendingFileBlocks,
-      ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
-    ];
     const selfAuthor = getCurrentAuthorId();
     setActive((s) => ({
       pendingUserMessages: [
@@ -1682,11 +1684,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // otherwise). Plain text (if any) appended last. uploadFileBlock reuses
       // a prior successful upload of the same File so a retry after a
       // post-phase failure doesn't re-upload — and orphan — blobs that landed.
-      const fileBlocks = await uploadFileBlocks(sessionId, files ?? []);
-      const serverContent: ContentBlock[] = [
-        ...fileBlocks,
-        ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
-      ];
+      const serverContent = await composerPartsToContentBlocks(orderedParts, (file) =>
+        uploadFileBlock(sessionId, file),
+      );
+      const fileBlocks = serverContent.filter(
+        (block): block is Extract<ContentBlock, { type: "input_image" | "input_file" }> =>
+          block.type === "input_image" || block.type === "input_file",
+      );
 
       // Promote "pending:<filename>" to real file_ids. Claude-native's
       // session.input.consumed is text-only (transcript round-trip
@@ -1768,7 +1772,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const draftSessionId = postedSessionId ?? submitConversationId;
       if (draftSessionId !== null && (text.trim() !== "" || (files?.length ?? 0) > 0)) {
         setterFor(draftSessionId)({
-          failedSendDraft: { conversationId: draftSessionId, text, files: files ?? [] },
+          failedSendDraft: {
+            conversationId: draftSessionId,
+            text,
+            files: files ?? [],
+            ...(opts?.composerParts ? { composerParts: opts.composerParts } : {}),
+          },
         });
       }
       // Settle the conversation this send targeted, wherever the user is now:
@@ -4988,10 +4997,9 @@ function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
  *
  * Native sessions' `session.input.consumed` round-trips through the
  * transcript forwarder, which carries only text — no input_image /
- * input_file. When the server content has no file blocks, prepend the
- * ones from the matched optimistic bubble so the thumbnail stays
- * visible. Falls back to the pending content when the event carries no
- * user-message payload at all.
+ * input_file. When that happens, the matched optimistic content is the
+ * only source that still knows the user's exact interleaving, so retain
+ * it as a unit instead of moving every file ahead of the server text.
  *
  * @param event - The consumed event.
  * @param pendingContent - Content of the optimistic bubble being promoted, or null when none matched.
@@ -5008,10 +5016,29 @@ function committedContentFor(
     (b) => b.type === "input_image" || b.type === "input_file",
   );
   if (serverHasFiles) return serverContent;
-  const pendingFiles = pendingContent.filter(
+  const pendingHasFiles = pendingContent.some(
     (b) => b.type === "input_image" || b.type === "input_file",
   );
-  return [...pendingFiles, ...serverContent];
+  return pendingHasFiles ? pendingContent : serverContent;
+}
+
+/** Whether an id-less consumed event can safely claim the FIFO pending head. */
+function pendingMatchesConsumedEvent(
+  event: SessionInputConsumedEvent,
+  pending: PendingUserMessage,
+): boolean {
+  const hasFiles = pending.content.some(
+    (block) => block.type === "input_image" || block.type === "input_file",
+  );
+  if (!hasFiles) return true;
+  const eventContent = userContentFromEvent(event);
+  if (eventContent === null) return false;
+  const withoutMarkers = (content: MessageContentBlock[]) =>
+    messageContentText(content)
+      .replace(/\[Attached(?: file)?:\s*[^\]]*\]\s*/gi, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  return withoutMarkers(eventContent) === withoutMarkers(pending.content);
 }
 
 /**
@@ -5761,6 +5788,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           const eventContent = userContentFromEvent(event);
           if (eventContent !== null && isSystemUserContent(eventContent)) return {};
           if (s.pendingUserMessages.length === 0) return {};
+          if (!pendingMatchesConsumedEvent(event, s.pendingUserMessages[0]!)) return {};
           return { pendingUserMessages: s.pendingUserMessages.slice(1) };
         }
 
@@ -5806,8 +5834,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           eventContent !== null && isSystemUserContent(eventContent)
             ? undefined
             : s.pendingUserMessages[0];
-        if (head) {
-          const content = committedContentFor(event, head.content);
+        const matchedHead = head && pendingMatchesConsumedEvent(event, head) ? head : undefined;
+        if (matchedHead) {
+          const content = committedContentFor(event, matchedHead.content);
           if (content === null) return {};
           return {
             pendingUserMessages: s.pendingUserMessages.slice(1),
@@ -5818,9 +5847,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               committedUserBlock(
                 event.itemId,
                 content,
-                head.tempId,
-                event.createdBy ?? head.author,
-                head.createdAtS,
+                matchedHead.tempId,
+                event.createdBy ?? matchedHead.author,
+                matchedHead.createdAtS,
               ),
             ],
           };

@@ -611,6 +611,7 @@ describe("NewChatLandingScreen create flow", () => {
     fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
       target: { files: [file] },
     });
+    await screen.findByLabelText(/Image attachment diagram\.png/);
     typeMessage("what is in this image?");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -622,6 +623,10 @@ describe("NewChatLandingScreen create flow", () => {
         text: "what is in this image?",
         skill: null,
         files: [file],
+        composerParts: [
+          { type: "attachment", file },
+          { type: "text", text: "what is in this image?" },
+        ],
       }),
     );
   });
@@ -652,6 +657,34 @@ describe("NewChatLandingScreen create flow", () => {
         skill: { name: "review-pr", args: "123 focus on auth" },
         files: [],
       }),
+    );
+  });
+
+  it("keeps a bundled-skill-looking first message plain when it has an attachment", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    setAgents([agent({ skills: [{ name: "review-pr", description: "Review a pull request" }] })]);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("/review-pr 123");
+    const file = new File(["x"], "diagram.png", { type: "image/png" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [file] },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith(
+        "conv_new",
+        expect.objectContaining({
+          text: "/review-pr 123",
+          skill: null,
+          files: [file],
+        }),
+      ),
     );
   });
 

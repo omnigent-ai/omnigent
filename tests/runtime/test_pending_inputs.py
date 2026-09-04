@@ -177,6 +177,33 @@ def test_resolve_oldest_returns_content_with_file_blocks() -> None:
     assert drained.content == content
 
 
+def test_attachment_pending_does_not_consume_unrelated_terminal_text() -> None:
+    """Direct terminal input cannot steal an attachment-bearing web entry."""
+    content = [
+        _text_block("before after"),
+        {"type": "input_image", "file_id": "file_real", "filename": "a.png"},
+    ]
+    pending_id = pending_inputs.record("conv_a", content)
+
+    assert pending_inputs.resolve_oldest_for_mirrored_text("conv_a", "typed in terminal") is None
+    assert pending_inputs.snapshot_for("conv_a")[0]["pending_id"] == pending_id
+
+
+def test_attachment_pending_matches_after_materialized_marker_is_removed() -> None:
+    """The native attachment marker does not prevent the real FIFO match."""
+    content = [
+        _text_block("before after"),
+        {"type": "input_image", "file_id": "file_real", "filename": "a.png"},
+    ]
+    pending_id = pending_inputs.record("conv_a", content)
+
+    drained = pending_inputs.resolve_oldest_for_mirrored_text(
+        "conv_a",
+        "[Attached: /tmp/uploads/a.png]\n\nbefore after",
+    )
+    assert drained is not None and drained.pending_id == pending_id
+
+
 def test_resolve_matching_text_skips_older_unmatched_entries() -> None:
     """Kiro can match the accepted prompt and identify older failed inputs."""
     first = pending_inputs.record(

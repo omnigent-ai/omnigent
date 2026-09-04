@@ -40,6 +40,23 @@ describe("useFileDropTarget", () => {
     expect(onFiles).toHaveBeenCalledWith([file]);
   });
 
+  it("does not attach a file twice when a nested editor consumes the drop", () => {
+    const onFiles = vi.fn();
+    render(<Harness onFiles={onFiles} />);
+    const inside = screen.getByTestId("inside");
+    inside.addEventListener("drop", (event) => event.preventDefault());
+
+    fireEvent.dragEnter(inside, { dataTransfer: fileDrag() });
+    expect(state()).toBe("active");
+
+    fireEvent.drop(inside, {
+      dataTransfer: fileDrag([new File(["x"], "shot.png", { type: "image/png" })]),
+    });
+
+    expect(onFiles).not.toHaveBeenCalled();
+    expect(state()).toBe("idle");
+  });
+
   // The shell around the chat is not an attachment surface.
   it("ignores a drop outside the target", () => {
     const onFiles = vi.fn();

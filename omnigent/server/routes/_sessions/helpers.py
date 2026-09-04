@@ -3905,14 +3905,15 @@ def _merge_pending_file_blocks(
     pending_content: list[dict[str, Any]],
 ) -> NewConversationItem:
     """
-    Prepend a pending entry's file blocks onto a user-message item.
+    Restore a pending entry's ordered content onto a user-message item.
 
     The claude-native transcript mirrors a user message back as
     text-only — ``input_image`` / ``input_file`` blocks are dropped. The
-    optimistic pending-input entry still carries them (with real
-    ``file_id``s, assigned at upload), so we fold them into the durable
-    item here. Without it the image renders only on the optimistic
-    bubble and vanishes from history on the next reload.
+    optimistic pending-input entry still carries the complete ordered content
+    (with real ``file_id``s, assigned at upload), so it becomes the durable
+    item here. Without it the image renders only on the optimistic bubble and
+    vanishes from history on the next reload; restoring only its file blocks
+    would move every attachment ahead of the text.
 
     No-op when the pending entry has no file blocks, or when the item
     already carries file blocks (defensive — a future transcript that
@@ -3925,8 +3926,8 @@ def _merge_pending_file_blocks(
     :param pending_content: The drained pending entry's content blocks,
         e.g. ``[{"type": "input_image", "file_id": "file_x",
         "filename": "a.png"}, {"type": "input_text", "text": "hi"}]``.
-    :returns: A copy of *item* with the file blocks prepended, or *item*
-        unchanged when there is nothing to merge.
+    :returns: A copy of *item* with the pending ordered content restored, or
+        *item* unchanged when there is nothing to merge.
     """
     if not isinstance(item.data, MessageData):
         return item
@@ -3943,7 +3944,11 @@ def _merge_pending_file_blocks(
     )
     if already_has_files:
         return item
-    merged_data = item.data.model_copy(update={"content": [*file_blocks, *item.data.content]})
+    # The native transcript is text-only, while the drained pending entry is
+    # the only surviving record of where each attachment sat between text
+    # spans. Keep that ordered content as a unit; prepending only the files
+    # destroys the user's visual/semantic insertion order.
+    merged_data = item.data.model_copy(update={"content": list(pending_content)})
     return item.model_copy(update={"data": merged_data})
 
 
