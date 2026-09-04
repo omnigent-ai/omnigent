@@ -364,7 +364,72 @@ async def test_supervise_mirror_skips_request_resolved_in_same_poll_batch(
 
 
 @pytest.mark.asyncio
-async def test_supervise_mirror_skips_additional_request_while_one_is_pending(
+async def test_supervise_mirror_queues_requests_while_one_is_pending(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class _FakeAsyncClient:
+        def __init__(self, **_kw: object) -> None:
+            pass
+
+        async def __aenter__(self) -> _FakeAsyncClient:
+            return self
+
+        async def __aexit__(self, *_args: object) -> bool:
+            return False
+
+        async def post(self, url: str, *, json: dict, **_kw: object) -> httpx.Response:
+            return httpx.Response(200, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(knp.httpx, "AsyncClient", _FakeAsyncClient)
+    request_ids = ("req-1", "req-2", "req-3")
+    started = {request_id: asyncio.Event() for request_id in request_ids}
+    release = {request_id: asyncio.Event() for request_id in request_ids}
+    run_one_calls: list[str] = []
+
+    async def _fake_run_one(_client: object, *, permission: object, **_kw: object) -> None:
+        request_id = permission.request_id  # type: ignore[attr-defined]
+        run_one_calls.append(request_id)
+        started[request_id].set()
+        await release[request_id].wait()
+
+    monkeypatch.setattr(knp, "_run_one_permission", _fake_run_one)
+    record_file = acp_record_path(tmp_path)
+    record_file.write_bytes(b"")
+
+    task = asyncio.create_task(
+        knp.supervise_kiro_permission_mirror(
+            base_url="http://t",
+            headers={},
+            session_id="conv_5",
+            bridge_dir=tmp_path,
+            poll_interval_s=0.001,
+        )
+    )
+    try:
+        await asyncio.sleep(0.05)
+        with record_file.open("ab") as handle:
+            handle.write(b"".join(_record_bytes(_permission_msg(rid)) for rid in request_ids))
+        await asyncio.wait_for(started["req-1"].wait(), 2.0)
+        assert run_one_calls == ["req-1"]
+
+        release["req-1"].set()
+        await asyncio.wait_for(started["req-2"].wait(), 2.0)
+        assert run_one_calls == ["req-1", "req-2"]
+
+        release["req-2"].set()
+        await asyncio.wait_for(started["req-3"].wait(), 2.0)
+        assert run_one_calls == ["req-1", "req-2", "req-3"]
+    finally:
+        for event in release.values():
+            event.set()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_supervise_mirror_drops_queued_request_resolved_in_terminal(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -387,7 +452,8 @@ async def test_supervise_mirror_skips_additional_request_while_one_is_pending(
     run_one_calls: list[str] = []
 
     async def _fake_run_one(_client: object, *, permission: object, **_kw: object) -> None:
-        run_one_calls.append(permission.request_id)  # type: ignore[attr-defined]
+        request_id = permission.request_id  # type: ignore[attr-defined]
+        run_one_calls.append(request_id)
         started.set()
         await release.wait()
 
@@ -399,7 +465,7 @@ async def test_supervise_mirror_skips_additional_request_while_one_is_pending(
         knp.supervise_kiro_permission_mirror(
             base_url="http://t",
             headers={},
-            session_id="conv_5",
+            session_id="conv_queued_terminal_resolution",
             bridge_dir=tmp_path,
             poll_interval_s=0.001,
         )
@@ -407,10 +473,14 @@ async def test_supervise_mirror_skips_additional_request_while_one_is_pending(
     try:
         await asyncio.sleep(0.05)
         with record_file.open("ab") as handle:
-            handle.write(_record_bytes(_permission_msg("req-1")))
+            handle.write(
+                _record_bytes(_permission_msg("req-1")) + _record_bytes(_permission_msg("req-2"))
+            )
         await asyncio.wait_for(started.wait(), 2.0)
         with record_file.open("ab") as handle:
-            handle.write(_record_bytes(_permission_msg("req-2")))
+            handle.write(_record_bytes(_permission_result_msg("req-2"), direction="in"))
+        await asyncio.sleep(0.05)
+        release.set()
         await asyncio.sleep(0.05)
         assert run_one_calls == ["req-1"]
     finally:

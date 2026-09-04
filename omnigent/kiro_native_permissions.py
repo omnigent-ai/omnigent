@@ -202,6 +202,7 @@ async def supervise_kiro_permission_mirror(
     except OSError:
         offset = 0
     pending: dict[str, _PendingPermission] = {}
+    queued: dict[str, KiroPermissionRequest] = {}
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
     from omnigent.cli_auth import open_server_client
 
@@ -224,27 +225,15 @@ async def supervise_kiro_permission_mirror(
                 for event in events:
                     if event.kind == "request":
                         if (
-                            pending
-                            or event.permission is None
+                            event.permission is None
                             or event.request_id in resolved_in_batch
+                            or event.request_id in pending
+                            or event.request_id in queued
                         ):
                             continue
-                        elicitation_id = kiro_permission_elicitation_id(
-                            session_id, event.request_id
-                        )
-                        task = asyncio.create_task(
-                            _run_one_permission(
-                                client,
-                                session_id=session_id,
-                                bridge_dir=bridge_dir,
-                                permission=event.permission,
-                                elicitation_id=elicitation_id,
-                            ),
-                            name=f"kiro-permission-{event.request_id}",
-                        )
-                        task.add_done_callback(_consume_task_result)
-                        pending[event.request_id] = _PendingPermission(elicitation_id, task)
+                        queued[event.request_id] = event.permission
                     else:
+                        queued.pop(event.request_id, None)
                         entry = pending.pop(event.request_id, None)
                         if entry is None:
                             continue
@@ -253,6 +242,22 @@ async def supervise_kiro_permission_mirror(
                                 client, session_id, entry.elicitation_id
                             )
                             entry.task.cancel()
+                if not pending and queued:
+                    request_id = next(iter(queued))
+                    permission = queued.pop(request_id)
+                    elicitation_id = kiro_permission_elicitation_id(session_id, request_id)
+                    task = asyncio.create_task(
+                        _run_one_permission(
+                            client,
+                            session_id=session_id,
+                            bridge_dir=bridge_dir,
+                            permission=permission,
+                            elicitation_id=elicitation_id,
+                        ),
+                        name=f"kiro-permission-{request_id}",
+                    )
+                    task.add_done_callback(_consume_task_result)
+                    pending[request_id] = _PendingPermission(elicitation_id, task)
             except asyncio.CancelledError:
                 raise
             except Exception:
