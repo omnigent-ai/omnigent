@@ -1528,27 +1528,63 @@ def _pending_elicitation_snapshot_for_session(
     other than ``conv`` has an outstanding prompt in the in-memory
     index (the common case is none anywhere).
 
+    An index with nothing for a session is the signature of a server restart,
+    so the payloads are reloaded from the ``elicitations`` table and the prompt
+    renders and stays answerable. This deliberately does not first consult the
+    conversation's mirrored count: that count is written best-effort on a
+    background executor, so a crash between the row commit and the count write
+    would hide a real row from a count-gated read — the exact crash the durable
+    rows exist to survive. ``restore_for`` bounds itself to one query per
+    conversation per process instead.
+
     :param conv_store: Store used to list descendant sub-agents.
     :param conv: Session conversation being snapshotted.
     :returns: Pending elicitation event dicts suitable for
         :class:`SessionResponse.pending_elicitations`.
     """
     events = pending_elicitations.snapshot_for(conv.id)
-    if not (set(pending_elicitations.pending_session_ids()) - {conv.id}):
+    if not events:
+        events = pending_elicitations.restore_for(conv.id)
+    # After a restart the index is cold for every session, so the cheap
+    # "anything pending anywhere?" gate below would also hide a child's
+    # durably-parked prompt from its ancestor. Each ancestor gets one
+    # gate-free walk per process so the children's rows can be restored.
+    walk_for_restore = pending_elicitations.claim_descendant_restore(conv.id)
+    if not walk_for_restore and not (set(pending_elicitations.pending_session_ids()) - {conv.id}):
         return events
     seen = {
         event.get("elicitation_id")
         for event in events
         if isinstance(event.get("elicitation_id"), str)
     }
-    for child in _descendant_sessions(conv_store, conv.id):
-        for event in pending_elicitations.snapshot_for(child.id):
-            elicitation_id = event.get("elicitation_id")
-            if isinstance(elicitation_id, str) and elicitation_id in seen:
-                continue
-            if isinstance(elicitation_id, str):
-                seen.add(elicitation_id)
-            events.append(_targeted_elicitation_event(event, target_session_id=child.id))
+    # A walk that does not complete cleanly must hand its claim back: a
+    # consumed claim with no completed walk (a child restore hit a store
+    # outage, or listing/reading a child raised) would hide the children's
+    # parked prompts for the process's life.
+    walk_clean = True
+    try:
+        for child in _descendant_sessions(conv_store, conv.id):
+            child_events = pending_elicitations.snapshot_for(child.id)
+            if not child_events and walk_for_restore:
+                child_events = pending_elicitations.restore_for(child.id)
+                if not child_events and pending_elicitations.needs_restore(child.id):
+                    # The child's restore failed (store outage), not "nothing
+                    # there". A later snapshot must retry it instead of hiding
+                    # the child's prompt for the process's life.
+                    walk_clean = False
+            for event in child_events:
+                elicitation_id = event.get("elicitation_id")
+                if isinstance(elicitation_id, str) and elicitation_id in seen:
+                    continue
+                if isinstance(elicitation_id, str):
+                    seen.add(elicitation_id)
+                events.append(_targeted_elicitation_event(event, target_session_id=child.id))
+    except BaseException:
+        walk_clean = False
+        raise
+    finally:
+        if walk_for_restore and not walk_clean:
+            pending_elicitations.release_descendant_restore(conv.id)
     return events
 
 

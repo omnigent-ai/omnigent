@@ -686,3 +686,684 @@ def test_snapshot_for_returns_independent_copies() -> None:
     # the index; if "tampered-top-level", the top-level copy is
     # there but nested values are still shared.
     assert snap2[0]["params"]["message"] == "original"
+
+
+class _FakeStore:
+    """In-memory stand-in for the elicitation store.
+
+    Records call order so tests can pin that the durable write leads the index
+    mutation — the ordering the mirror depends on to be recoverable.
+    """
+
+    def __init__(self) -> None:
+        self.rows: dict[str, Any] = {}
+        self.calls: list[str] = []
+        self.fail_on_put = False
+
+    def put(self, elicitation: Any) -> None:
+        self.calls.append(f"put:{elicitation.id}")
+        if self.fail_on_put:
+            raise RuntimeError("store is down")
+        self.rows[elicitation.id] = elicitation
+
+    def delete(self, conversation_id: str, elicitation_id: str) -> bool:
+        self.calls.append(f"delete:{elicitation_id}")
+        return self.rows.pop(elicitation_id, None) is not None
+
+    def list_for_conversation(
+        self,
+        conversation_id: str,
+        *,
+        not_before: int | None = None,
+    ) -> list[Any]:
+        self.calls.append(f"list:{conversation_id}")
+        return [
+            row
+            for row in self.rows.values()
+            if row.conversation_id == conversation_id
+            and (not_before is None or row.created_at >= not_before)
+        ]
+
+
+def _request_event(elicitation_id: str, message: str = "Approve?") -> dict[str, Any]:
+    """Build a ``response.elicitation_request`` event."""
+    return {
+        "type": "response.elicitation_request",
+        "elicitation_id": elicitation_id,
+        "params": {"message": message},
+    }
+
+
+def test_no_store_leaves_the_index_in_memory_only() -> None:
+    """The runner and unit tests never wire a store; nothing may break there."""
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1"))
+    pending_elicitations.resolve("conv_a", "elicit_1")
+
+    assert pending_elicitations.count_for("conv_a") == 0
+    assert pending_elicitations.restore_for("conv_a") == []
+
+
+def test_publish_writes_the_row_before_indexing_it() -> None:
+    """Write-ahead: a crash between the two must not lose the prompt.
+
+    A row for a prompt the index never learned about is recoverable; an indexed
+    prompt with no row is the loss this mirror exists to prevent.
+    """
+    store = _FakeStore()
+    pending_elicitations.set_store(store)
+
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1"))
+
+    assert store.calls == ["put:elicit_1"]
+    assert store.rows["elicit_1"].event == _request_event("elicit_1")
+    assert store.rows["elicit_1"].conversation_id == "conv_a"
+    assert pending_elicitations.count_for("conv_a") == 1
+
+
+def test_resolve_deletes_the_row() -> None:
+    """An answered prompt must not come back after a restart."""
+    store = _FakeStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1"))
+
+    pending_elicitations.resolve("conv_a", "elicit_1")
+
+    assert store.rows == {}
+    assert store.calls == ["put:elicit_1", "delete:elicit_1"]
+
+
+def test_resolve_deletes_the_row_even_when_the_index_already_forgot() -> None:
+    """The runner publishes a resolved event on every exit path.
+
+    A second resolve for the same id finds nothing in the index, but the row
+    must still go — otherwise a timed-out prompt is restored as answerable.
+    """
+    store = _FakeStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1"))
+    pending_elicitations.resolve("conv_a", "elicit_1")
+    store.rows["elicit_1"] = object()  # a row the index no longer knows about
+
+    pending_elicitations.resolve("conv_a", "elicit_1")
+
+    assert store.rows == {}
+
+
+def test_a_failed_write_still_raises_the_prompt() -> None:
+    """Losing durability is not a reason to refuse to ask the human."""
+    store = _FakeStore()
+    store.fail_on_put = True
+    pending_elicitations.set_store(store)
+
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1"))
+
+    assert pending_elicitations.count_for("conv_a") == 1
+    assert pending_elicitations.snapshot_for("conv_a")[0]["elicitation_id"] == "elicit_1"
+
+
+def test_restore_repopulates_the_index_after_a_restart() -> None:
+    """The whole point: a prompt outstanding across a restart is answerable."""
+    store = _FakeStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1", "gate me"))
+
+    # A restart wipes the index but not the store.
+    rows = dict(store.rows)
+    pending_elicitations.reset_for_tests()
+    store.rows = rows
+    pending_elicitations.set_store(store)
+    assert pending_elicitations.snapshot_for("conv_a") == []
+
+    restored = pending_elicitations.restore_for("conv_a")
+
+    assert [event["elicitation_id"] for event in restored] == ["elicit_1"]
+    assert restored[0]["params"]["message"] == "gate me"
+    assert pending_elicitations.count_for("conv_a") == 1
+    # And it is now resolvable through the ordinary path.
+    pending_elicitations.resolve("conv_a", "elicit_1")
+    assert pending_elicitations.count_for("conv_a") == 0
+    assert store.rows == {}
+
+
+def test_restore_skips_prompts_too_old_to_have_an_awaiter() -> None:
+    """A day-old prompt has no parked awaiter, so offering it is a lie."""
+    import time as _time
+
+    store = _FakeStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_stale"))
+    # The entity is frozen, so age it by rebuilding rather than mutating.
+    stale = store.rows["elicit_stale"]
+    store.rows["elicit_stale"] = type(stale)(
+        id=stale.id,
+        workspace_id=stale.workspace_id,
+        conversation_id=stale.conversation_id,
+        created_at=int(_time.time()) - 90_000,
+        event=stale.event,
+    )
+    pending_elicitations.reset_for_tests()
+    pending_elicitations.set_store(store)
+
+    assert pending_elicitations.restore_for("conv_a") == []
+    assert pending_elicitations.count_for("conv_a") == 0
+
+
+def test_restore_does_not_clobber_a_live_index_entry() -> None:
+    """A prompt raised since the restart must not be replaced by its old row."""
+    store = _FakeStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1", "old"))
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1", "new"))
+
+    restored = pending_elicitations.restore_for("conv_a")
+
+    assert [event["params"]["message"] for event in restored] == ["new"]
+
+
+def test_a_failed_restore_degrades_to_an_empty_snapshot() -> None:
+    """A store outage must not 500 a session snapshot."""
+
+    class _BrokenStore(_FakeStore):
+        def list_for_conversation(self, conversation_id: str, **kwargs: Any) -> list[Any]:
+            raise RuntimeError("store is down")
+
+    pending_elicitations.set_store(_BrokenStore())
+
+    assert pending_elicitations.restore_for("conv_a") == []
+
+
+def test_restore_does_not_depend_on_the_conversation_count() -> None:
+    """The durable row is the truth; the mirrored count is best-effort.
+
+    The count is written on a background executor and dropped on failure, so a
+    crash between the row commit and the count write leaves a real row behind.
+    Gating the read on that count would hide it — in exactly the crash the rows
+    exist to survive.
+    """
+    store = _FakeStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1"))
+
+    rows = dict(store.rows)
+    pending_elicitations.reset_for_tests()
+    store.rows = rows
+    pending_elicitations.set_store(store)
+
+    # No count was ever persisted for this conversation; the row must still
+    # come back.
+    restored = pending_elicitations.restore_for("conv_a")
+
+    assert [event["elicitation_id"] for event in restored] == ["elicit_1"]
+
+
+def test_restore_asks_the_store_once_per_conversation() -> None:
+    """Dropping the count gate must not become a query on every session read."""
+    store = _FakeStore()
+    pending_elicitations.set_store(store)
+
+    for _ in range(5):
+        pending_elicitations.restore_for("conv_quiet")
+
+    assert store.calls.count("list:conv_quiet") == 1
+
+
+def test_a_failed_restore_can_be_retried() -> None:
+    """A briefly-unavailable store must not cost the only restore attempt.
+
+    ``restore_for`` remembers which conversations it has asked about so it
+    queries once per process. A failure has to un-remember, or one blip
+    permanently hides that session's parked prompts.
+    """
+
+    class _FlakyStore(_FakeStore):
+        fail_next = True
+
+        def list_for_conversation(self, conversation_id: str, **kwargs: Any) -> list[Any]:
+            if self.fail_next:
+                self.fail_next = False
+                raise RuntimeError("store is down")
+            return super().list_for_conversation(conversation_id, **kwargs)
+
+    store = _FlakyStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1"))
+    rows = dict(store.rows)
+
+    # Restart: index gone, rows kept, and the first read hits the outage.
+    pending_elicitations.reset_for_tests()
+    store.rows = rows
+    pending_elicitations.set_store(store)
+    assert pending_elicitations.restore_for("conv_a") == []
+
+    # The store recovers; the next read must try again rather than stay silent.
+    restored = pending_elicitations.restore_for("conv_a")
+
+    assert [event["elicitation_id"] for event in restored] == ["elicit_1"]
+
+
+def test_an_ancestor_mirror_does_not_steal_the_child_row() -> None:
+    """A child's prompt is mirrored into every ancestor's stream.
+
+    The durable row is keyed by elicitation id alone, so if a mirror persisted
+    too, the last ancestor to publish would move the child's only row onto
+    itself and the child would restore nothing.
+    """
+    store = _FakeStore()
+    pending_elicitations.set_store(store)
+
+    child_event = _request_event("elicit_1")
+    pending_elicitations.record_publish("conv_child", child_event)
+
+    mirrored = {
+        **child_event,
+        "params": {**child_event["params"], "target_session_id": "conv_child"},
+    }
+    pending_elicitations.record_publish("conv_parent", mirrored)
+
+    assert store.rows["elicit_1"].conversation_id == "conv_child"
+    # The ancestor still renders it — the index tracks mirrors, only the
+    # durable row is owner-only.
+    assert pending_elicitations.count_for("conv_parent") == 1
+
+
+def test_a_failed_delete_does_not_resurrect_the_prompt_on_restore() -> None:
+    """A verdict whose row delete failed must stay answered.
+
+    The in-memory index drops the prompt either way, so if the orphaned row
+    were restored, the user would be shown a card for a question already
+    answered — whose awaiter no longer exists.
+    """
+
+    class _DeleteDownStore(_FakeStore):
+        fail_on_delete = False
+
+        def delete(self, conversation_id: str, elicitation_id: str) -> bool:
+            if self.fail_on_delete:
+                raise RuntimeError("store is down")
+            return super().delete(conversation_id, elicitation_id)
+
+    store = _DeleteDownStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1"))
+
+    store.fail_on_delete = True
+    pending_elicitations.resolve("conv_a", "elicit_1")
+    assert "elicit_1" in store.rows  # the orphan this test is about
+
+    restored = pending_elicitations.restore_for("conv_a")
+
+    assert restored == []
+    assert pending_elicitations.count_for("conv_a") == 0
+
+
+def test_a_failed_delete_is_retried_on_the_next_store_call() -> None:
+    """A transient outage must not leave answered rows until the next restart."""
+
+    class _DeleteDownStore(_FakeStore):
+        fail_on_delete = False
+
+        def delete(self, conversation_id: str, elicitation_id: str) -> bool:
+            self.calls.append(f"delete:{elicitation_id}")
+            if self.fail_on_delete:
+                raise RuntimeError("store is down")
+            return self.rows.pop(elicitation_id, None) is not None
+
+    store = _DeleteDownStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1"))
+
+    store.fail_on_delete = True
+    pending_elicitations.resolve("conv_a", "elicit_1")
+    assert "elicit_1" in store.rows
+
+    # The store recovers; the next successful call sweeps the orphan.
+    store.fail_on_delete = False
+    pending_elicitations.resolve("conv_a", "elicit_other")
+
+    assert "elicit_1" not in store.rows
+
+
+def test_a_republished_id_is_restorable_again_after_its_resolve() -> None:
+    """Deterministic harness ids repeat across turns.
+
+    Resolving turn one's prompt must not tombstone turn two's re-publish of
+    the same id out of restart survival.
+    """
+    store = _FakeStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1", "turn one"))
+    pending_elicitations.resolve("conv_a", "elicit_1")
+
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1", "turn two"))
+
+    # Restart: index gone, rows kept.
+    rows = dict(store.rows)
+    pending_elicitations.reset_for_tests()
+    store.rows = rows
+    pending_elicitations.set_store(store)
+
+    restored = pending_elicitations.restore_for("conv_a")
+
+    assert [event["params"]["message"] for event in restored] == ["turn two"]
+
+
+def test_descendant_restore_claim_is_granted_once_per_conversation() -> None:
+    """The gate-free descendant walk must stay bounded per process."""
+    pending_elicitations.set_store(_FakeStore())
+
+    assert pending_elicitations.claim_descendant_restore("conv_a") is True
+    assert pending_elicitations.claim_descendant_restore("conv_a") is False
+    assert pending_elicitations.claim_descendant_restore("conv_b") is True
+
+
+def test_descendant_restore_claim_needs_a_store() -> None:
+    """Without durable rows there is nothing a walk could restore."""
+    assert pending_elicitations.claim_descendant_restore("conv_a") is False
+
+
+def test_a_republish_supersedes_its_queued_failed_delete() -> None:
+    """A queued delete retry must not erase a re-published prompt's new row.
+
+    Deterministic harness ids repeat: after turn one's delete fails and turn
+    two re-publishes the same id, retrying the stale delete would silently
+    cost the fresh prompt its restart survival.
+    """
+
+    class _DeleteDownStore(_FakeStore):
+        fail_on_delete = False
+
+        def delete(self, conversation_id: str, elicitation_id: str) -> bool:
+            if self.fail_on_delete:
+                raise RuntimeError("store is down")
+            return self.rows.pop(elicitation_id, None) is not None
+
+    store = _DeleteDownStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1", "turn one"))
+    store.fail_on_delete = True
+    pending_elicitations.resolve("conv_a", "elicit_1")
+    store.fail_on_delete = False
+
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1", "turn two"))
+
+    assert "elicit_1" in store.rows, "the re-published prompt's row must survive the retry sweep"
+    assert store.rows["elicit_1"].event["params"]["message"] == "turn two"
+
+
+def test_restore_deletes_rows_too_old_to_have_an_awaiter() -> None:
+    """The table holds only the parked set; no other collector exists."""
+    import time as _time
+
+    store = _FakeStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_stale"))
+    stale = store.rows["elicit_stale"]
+    store.rows["elicit_stale"] = type(stale)(
+        id=stale.id,
+        workspace_id=stale.workspace_id,
+        conversation_id=stale.conversation_id,
+        created_at=int(_time.time()) - 90_000,
+        event=stale.event,
+    )
+    pending_elicitations.reset_for_tests()
+    pending_elicitations.set_store(store)
+
+    assert pending_elicitations.restore_for("conv_a") == []
+    assert "elicit_stale" not in store.rows
+
+
+def test_restore_reconciles_the_persisted_badge_count() -> None:
+    """A badge count that outlived its prompt must not stay lit forever.
+
+    If the runner timed out while the server was down, the persisted count
+    still says 1 with no restorable prompt behind it. The restore's count
+    hook rewrites it to what is actually answerable.
+    """
+    observed: list[tuple[str, int]] = []
+    store = _FakeStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1"))
+    del store.rows["elicit_1"]  # the awaiter died; the row was collected
+
+    pending_elicitations.reset_for_tests()
+    pending_elicitations.set_store(store)
+    pending_elicitations.set_count_persist_hook(lambda conv, count: observed.append((conv, count)))
+    try:
+        assert pending_elicitations.restore_for("conv_a") == []
+        assert observed == [("conv_a", 0)]
+    finally:
+        pending_elicitations.set_count_persist_hook(None)
+
+
+def test_a_released_descendant_claim_can_be_claimed_again() -> None:
+    """A store outage during the walk must not hide a child prompt forever."""
+    pending_elicitations.set_store(_FakeStore())
+
+    assert pending_elicitations.claim_descendant_restore("conv_a") is True
+    pending_elicitations.release_descendant_restore("conv_a")
+
+    assert pending_elicitations.claim_descendant_restore("conv_a") is True
+
+
+def test_needs_restore_reports_a_failed_restore() -> None:
+    """Distinguish "restored, nothing there" from "could not ask"."""
+
+    class _BrokenStore(_FakeStore):
+        def list_for_conversation(self, conversation_id: str, **kwargs: Any) -> list[Any]:
+            raise RuntimeError("store is down")
+
+    pending_elicitations.set_store(_BrokenStore())
+    assert pending_elicitations.needs_restore("conv_a") is True
+    assert pending_elicitations.restore_for("conv_a") == []
+    assert pending_elicitations.needs_restore("conv_a") is True  # failure hands back the claim
+
+    pending_elicitations.set_store(_FakeStore())
+    pending_elicitations.restore_for("conv_a")
+    assert pending_elicitations.needs_restore("conv_a") is False
+
+
+def test_a_failed_delete_is_swept_under_its_own_workspace() -> None:
+    """A retry triggered from another tenant must still collect the orphan.
+
+    The store scopes deletes to the ambient workspace, so a sweep that runs
+    during another workspace's request would match nothing — and silently
+    drop its retry claim, leaving the answered row to resurrect on the next
+    restart.
+    """
+    from omnigent.db.db_models import current_workspace_id, workspace_scope
+
+    class _WorkspaceStore(_FakeStore):
+        """Rows keyed by (workspace, id); deletes scoped like the real store."""
+
+        fail_on_delete = False
+
+        def put(self, elicitation: Any) -> None:
+            self.rows[(elicitation.workspace_id, elicitation.id)] = elicitation
+
+        def delete(self, conversation_id: str, elicitation_id: str) -> bool:
+            if self.fail_on_delete:
+                raise RuntimeError("store is down")
+            return self.rows.pop((current_workspace_id(), elicitation_id), None) is not None
+
+        def list_for_conversation(self, conversation_id: str, **kwargs: Any) -> list[Any]:
+            return [
+                row
+                for (ws, _), row in self.rows.items()
+                if ws == current_workspace_id() and row.conversation_id == conversation_id
+            ]
+
+    store = _WorkspaceStore()
+    pending_elicitations.set_store(store)
+    with workspace_scope(7):
+        pending_elicitations.record_publish("conv_a", _request_event("elicit_1"))
+        store.fail_on_delete = True
+        pending_elicitations.resolve("conv_a", "elicit_1")
+        store.fail_on_delete = False
+    assert (7, "elicit_1") in store.rows  # the orphan awaiting collection
+
+    # The store recovers; the sweep fires from a different tenant's request.
+    with workspace_scope(8):
+        pending_elicitations.record_publish("conv_b", _request_event("elicit_2"))
+
+    assert (7, "elicit_1") not in store.rows, (
+        "the sweep must delete the orphan under the workspace that owns it"
+    )
+
+
+def test_a_concurrent_republish_survives_an_in_flight_retry_sweep() -> None:
+    """A re-publish racing the retry sweep must keep its fresh row.
+
+    The sweep snapshots the queue, then deletes outside the index lock. If a
+    re-publish of the same deterministic id lands between the snapshot and
+    the delete — supersede the entry, write a fresh row — the stale delete
+    would erase that row and silently cost the new prompt its restart
+    survival. The persist lock serializes the two, whichever wins.
+    """
+    import threading
+
+    sweep_entered = threading.Event()
+    release_sweep = threading.Event()
+
+    class _SlowSweepStore(_FakeStore):
+        """Parks the sweep's delete of elicit_1 so the race window is open."""
+
+        fail_on_delete = False
+        park_next_elicit_1_delete = False
+
+        def delete(self, conversation_id: str, elicitation_id: str) -> bool:
+            if self.fail_on_delete:
+                raise RuntimeError("store is down")
+            if elicitation_id == "elicit_1" and self.park_next_elicit_1_delete:
+                self.park_next_elicit_1_delete = False
+                sweep_entered.set()
+                assert release_sweep.wait(5), "test deadlock: sweep never released"
+            return self.rows.pop(elicitation_id, None) is not None
+
+    store = _SlowSweepStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1", "turn one"))
+    store.fail_on_delete = True
+    pending_elicitations.resolve("conv_a", "elicit_1")  # queues the failed delete
+    store.fail_on_delete = False
+
+    # A store call from elsewhere triggers the sweep; its delete parks inside
+    # the store with the race window open.
+    store.park_next_elicit_1_delete = True
+    sweeper = threading.Thread(
+        target=pending_elicitations.resolve, args=("conv_a", "elicit_other")
+    )
+    sweeper.start()
+    assert sweep_entered.wait(5), "the sweep never reached the parked delete"
+
+    # The re-publish lands while the sweep is mid-delete. With the persist
+    # lock it waits its turn; without it, it completes now and the parked
+    # stale delete then erases its fresh row.
+    republisher = threading.Thread(
+        target=pending_elicitations.record_publish,
+        args=("conv_a", _request_event("elicit_1", "turn two")),
+    )
+    republisher.start()
+    republisher.join(0.5)  # give the unfixed interleaving time to complete
+    release_sweep.set()
+    sweeper.join(5)
+    republisher.join(5)
+    assert not sweeper.is_alive() and not republisher.is_alive()
+
+    assert "elicit_1" in store.rows, (
+        "an in-flight retry sweep must not erase a re-published prompt's row"
+    )
+    assert store.rows["elicit_1"].event["params"]["message"] == "turn two"
+
+
+def test_a_failed_republish_write_keeps_the_stale_rows_retry_claim() -> None:
+    """A re-publish whose durable write fails must not consume the retry claim.
+
+    When a prior delete failed, the answered row is still durable and the
+    claim is what collects it. Superseding the claim is only safe once the
+    fresh write actually replaced that row; dropping it before a write that
+    then fails leaves the answered prompt to resurrect on the next restart
+    with nothing left to collect it.
+    """
+
+    class _FlakyWriteStore(_FakeStore):
+        fail_on_delete = False
+
+        def delete(self, conversation_id: str, elicitation_id: str) -> bool:
+            if self.fail_on_delete:
+                raise RuntimeError("store is down")
+            return super().delete(conversation_id, elicitation_id)
+
+    store = _FlakyWriteStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1", "turn one"))
+    store.fail_on_delete = True
+    pending_elicitations.resolve("conv_a", "elicit_1")  # queues the failed delete
+    store.fail_on_delete = False
+    assert "elicit_1" in store.rows  # the answered orphan awaiting collection
+
+    store.fail_on_put = True
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1", "turn two"))
+    store.fail_on_put = False
+
+    # The store recovers; any later successful call triggers the sweep.
+    pending_elicitations.resolve("conv_a", "elicit_other")
+
+    assert "elicit_1" not in store.rows, (
+        "a re-publish whose write failed must leave the retry claim in place "
+        "so the answered row is still collected"
+    )
+
+
+def test_a_direct_resolve_cannot_erase_a_republished_row() -> None:
+    """A resolve's in-flight delete must not erase a re-published fresh row.
+
+    ``resolve`` deletes the durable row on the approval-dispatch thread while
+    the workflow thread may re-publish the same deterministic id for the next
+    turn. Without the persist lock on the direct delete, the interleaving
+    delete-issued -> fresh-row-written -> delete-lands silently costs the new
+    prompt its restart survival — the same race the retry sweep already
+    guards against.
+    """
+    import threading
+
+    delete_entered = threading.Event()
+    release_delete = threading.Event()
+
+    class _SlowDeleteStore(_FakeStore):
+        park_next_elicit_1_delete = False
+
+        def delete(self, conversation_id: str, elicitation_id: str) -> bool:
+            if elicitation_id == "elicit_1" and self.park_next_elicit_1_delete:
+                self.park_next_elicit_1_delete = False
+                delete_entered.set()
+                assert release_delete.wait(5), "test deadlock: delete never released"
+            return super().delete(conversation_id, elicitation_id)
+
+    store = _SlowDeleteStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1", "turn one"))
+
+    # The verdict arrives; its delete parks inside the store mid-flight.
+    store.park_next_elicit_1_delete = True
+    resolver = threading.Thread(target=pending_elicitations.resolve, args=("conv_a", "elicit_1"))
+    resolver.start()
+    assert delete_entered.wait(5), "the resolve never reached the parked delete"
+
+    # Turn two re-publishes the same deterministic id while the delete is in
+    # flight. With the persist lock it waits its turn; without it, its fresh
+    # row is written now and the parked stale delete then erases it.
+    republisher = threading.Thread(
+        target=pending_elicitations.record_publish,
+        args=("conv_a", _request_event("elicit_1", "turn two")),
+    )
+    republisher.start()
+    republisher.join(0.5)  # give the unfixed interleaving time to complete
+    release_delete.set()
+    resolver.join(5)
+    republisher.join(5)
+    assert not resolver.is_alive() and not republisher.is_alive()
+
+    assert "elicit_1" in store.rows, (
+        "a direct resolve's in-flight delete must not erase a re-published prompt's row"
+    )
+    assert store.rows["elicit_1"].event["params"]["message"] == "turn two"

@@ -4110,6 +4110,7 @@ def server(
     # with "unable to open database file".
     _ensure_sqlite_parent_dir(db_uri)
 
+    from omnigent.stores.elicitation_store.sqlalchemy_store import SqlAlchemyElicitationStore
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
     from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
@@ -4123,6 +4124,7 @@ def server(
     policy_store = SqlAlchemyPolicyStore(db_uri)
     permission_store = SqlAlchemyPermissionStore(db_uri)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(db_uri)
+    elicitation_store = SqlAlchemyElicitationStore(db_uri)
     project_store = SqlAlchemyProjectStore(db_uri)
     artifact_store = _create_artifact_store(art_loc)
 
@@ -4289,6 +4291,7 @@ def server(
         runner_tunnel_tokens=_runner_tunnel_tokens,
         permission_store=permission_store,
         scheduled_task_store=scheduled_task_store,
+        elicitation_store=elicitation_store,
         project_store=project_store,
         auth_provider=auth_provider,
         host_store=host_store,

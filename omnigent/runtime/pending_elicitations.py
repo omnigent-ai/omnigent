@@ -26,12 +26,22 @@ UI's chat blocks on cold load — the SSE stream itself has no replay,
 so an elicitation emitted before the user opened the chat would
 otherwise render as nothing.
 
+Outstanding entries are also mirrored to the ``elicitations`` table when a
+store is wired (:func:`set_store` — the server does this at startup; the runner
+and unit tests leave it unset and are unaffected). The index stays the read
+path; the rows exist so a server restart does not take the parked set with it.
+:func:`restore_for` reads them back. Unlike the count mirror on the
+conversation row, which is best-effort because a stale count self-corrects on
+the next transition, these writes are synchronous and lead the index — losing
+one is the very failure the mirror exists to prevent.
+
 Limitations:
 
-* In-memory only; multi-replica Omnigent deploys would each see their own
-  slice. This matches the existing ``_harness_elicitation_registry``
-  constraint — when a shared backplane is added for the registry,
-  this index should be wired through the same backplane.
+* Without a store the index is in-memory only; multi-replica Omnigent deploys
+  would each see their own slice. This matches the existing
+  ``_harness_elicitation_registry`` constraint — when a shared backplane is
+  added for the registry, this index should be wired through the same
+  backplane.
 * Events emitted before the Omnigent server starts (e.g. between turns,
   with the session_stream having dropped them) are not tracked,
   same as every other AP-server-side in-memory state.
@@ -40,9 +50,22 @@ Limitations:
 from __future__ import annotations
 
 import copy
+import logging
 import threading
+import time
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from omnigent.stores.elicitation_store import ElicitationStore
+
+_logger = logging.getLogger(__name__)
+
+# Longest a prompt can still have something waiting on it. The runner parks an
+# ASK for at most ``pending_approvals._DEFAULT_WAIT_SECONDS`` (one day), so a
+# restored row older than this has no awaiter left to release and is dropped on
+# read rather than shown as answerable.
+_MAX_PARK_SECONDS = 86400
 
 # Per-conversation mapping of outstanding elicitation_id → original
 # event payload. Storing the full event (not just the id) lets
@@ -55,6 +78,11 @@ from typing import Any
 # :func:`count_for` doesn't see stale keys.
 _pending: dict[str, dict[str, dict[str, Any]]] = {}
 _lock = threading.Lock()
+
+# Serializes a prompt's durable write against the failed-delete retry sweep,
+# so a stale queued delete can never erase a re-published prompt's fresh row.
+# Separate from ``_lock`` so the hot index path never waits on store I/O.
+_persist_lock = threading.Lock()
 
 # Optional observer (``subagent_block_notifier``) run synchronously on every
 # tracked event — must be cheap + non-blocking. ``None`` (runner, tests) skips it.
@@ -104,6 +132,353 @@ def _notify_count_hook(conversation_id: str, count: int) -> None:
         hook(conversation_id, count)
 
 
+# Durable mirror of the index. ``None`` (runner, unit tests) keeps the index
+# purely in-memory and every store call below a no-op.
+_store: ElicitationStore | None = None
+
+# Conversations this process has already asked the store about. Bounds
+# :func:`restore_for` to one query per conversation per process, which is what
+# lets it run without a precondition — a restore is only ever needed once,
+# after which the index is authoritative for the rest of the process's life.
+_restored: set[str] = set()
+
+# Conversations whose descendant walk has already been granted once by
+# :func:`claim_descendant_restore`. Same one-per-process bound as ``_restored``,
+# for the ancestor-snapshot path that must look below itself after a restart.
+_descendants_probed: set[str] = set()
+
+# Prompts this process has resolved. :func:`restore_for` must never re-surface
+# one: its durable row can outlive the verdict (a delete that failed, or a
+# store read racing the delete), and replaying it would ask an answered
+# question again — the exact defect the mirror exists to prevent.
+_resolved_tombstones: set[tuple[str, str]] = set()
+
+# Deletes that failed and still have a durable row to collect. Retried on
+# later store activity so a transient outage does not leave answered prompts
+# behind to resurrect on the next restart. Keyed by (workspace_id,
+# conversation_id, elicitation_id): the store scopes deletes to the ambient
+# workspace, and the retry may fire from another tenant's request.
+# Known limitation: this queue (and the tombstones above) is process memory,
+# so a restart *during* a store outage that already failed a delete loses the
+# claim, and the answered row can resurrect once. Closing that double-fault
+# window needs durable tombstones (extra schema); accepted for now.
+_failed_deletes: set[tuple[int, str, str]] = set()
+
+
+def set_store(store: ElicitationStore | None) -> None:
+    """
+    Wire (or clear) the store outstanding prompts are mirrored to.
+
+    :param store: The server's elicitation store, or ``None`` to keep the
+        index in-memory only (the runner process and unit tests).
+    """
+    global _store
+    _store = store
+    with _lock:
+        _restored.clear()
+        _descendants_probed.clear()
+
+
+def _owns_elicitation(conversation_id: str, event: dict[str, Any]) -> bool:
+    """
+    Whether this conversation owns the prompt, rather than mirroring it.
+
+    A child's prompt is republished into every ancestor's stream so an
+    ancestor chat can render and resolve it, carrying ``target_session_id`` to
+    say which session actually owns the parked awaiter. Only the owner may
+    persist: the durable row is keyed by elicitation id alone, so letting a
+    mirror write would move the child's only row onto whichever ancestor
+    published last, and the child would restore nothing.
+
+    The index still tracks mirrors — that is what makes the ancestor's card
+    render — but the index is per-conversation and cannot collide this way.
+
+    :param conversation_id: Conversation the event was published on.
+    :param event: The ``response.elicitation_request`` payload.
+    :returns: ``True`` when *conversation_id* owns the prompt.
+    """
+    params = event.get("params")
+    if not isinstance(params, dict):
+        return True
+    target = params.get("target_session_id")
+    if not isinstance(target, str) or not target:
+        return True
+    return target == conversation_id
+
+
+def _persist_add(conversation_id: str, elicitation_id: str, event: dict[str, Any]) -> None:
+    """
+    Write an outstanding prompt to the store, ahead of indexing it.
+
+    Write-ahead so a crash between the two leaves a row for a prompt the index
+    never learned about — recoverable — rather than an indexed prompt with no
+    row, which is the loss this mirror exists to prevent.
+
+    Failures log and are dropped: a prompt that cannot be persisted should
+    still be raised. The session keeps working; only its restart-survival is
+    lost, which is the behaviour before this mirror existed.
+
+    :param conversation_id: Session the prompt was raised on.
+    :param elicitation_id: The prompt's correlation id.
+    :param event: The ``response.elicitation_request`` payload.
+    """
+    store = _store
+    if store is None:
+        return
+    from omnigent.db.db_models import current_workspace_id
+    from omnigent.entities import Elicitation
+
+    # A re-publish supersedes any failed delete still queued for this id:
+    # retrying that delete after the write below would erase the new row and
+    # silently cost the fresh prompt its restart survival. The persist lock
+    # keeps the supersede-and-write atomic against an in-flight retry sweep,
+    # whose stale delete could otherwise land between the two. The claim is
+    # dropped only after the write succeeds: a failed write leaves the
+    # answered row durable, and only the claim still collects it.
+    try:
+        with _persist_lock:
+            store.put(
+                Elicitation(
+                    id=elicitation_id,
+                    workspace_id=current_workspace_id(),
+                    conversation_id=conversation_id,
+                    created_at=int(time.time()),
+                    event=event,
+                )
+            )
+            with _lock:
+                _failed_deletes.discard((current_workspace_id(), conversation_id, elicitation_id))
+    except Exception:  # never block raising the prompt
+        _logger.warning(
+            "Could not persist elicitation %r; it will not survive a restart",
+            elicitation_id,
+            exc_info=True,
+        )
+        return
+    _retry_failed_deletes(store)
+
+
+def _persist_remove(conversation_id: str, elicitation_id: str) -> None:
+    """
+    Drop a resolved prompt from the store, ahead of dropping it from the index.
+
+    Store-first for the same reason :func:`_persist_add` is: a crash between
+    the two leaves the index holding a prompt whose row is already gone, so the
+    next restart forgets it — correct, since it was answered. The reverse order
+    would resurrect an answered prompt and ask the user twice.
+
+    :param conversation_id: Session the prompt was raised on.
+    :param elicitation_id: The prompt's correlation id.
+    """
+    store = _store
+    if store is None:
+        return
+    from omnigent.db.db_models import current_workspace_id
+
+    # Under the persist lock: a workflow thread may be re-publishing this
+    # deterministic id for the next turn, and this delete landing after that
+    # write would erase the fresh row — the same interleaving the retry sweep
+    # guards against, on the far more common direct path.
+    try:
+        with _persist_lock:
+            store.delete(conversation_id, elicitation_id)
+    except Exception:  # never block resolving the prompt
+        # Remember the orphaned row: a restore must not replay it (the
+        # tombstone in :func:`resolve` covers that) and a later successful
+        # store call retries the delete so the row does not sit until the
+        # next restart resurrects it.
+        with _lock:
+            _failed_deletes.add((current_workspace_id(), conversation_id, elicitation_id))
+        _logger.warning(
+            "Could not delete resolved elicitation %r",
+            elicitation_id,
+            exc_info=True,
+        )
+        return
+    _retry_failed_deletes(store)
+
+
+def _retry_failed_deletes(store: ElicitationStore) -> None:
+    """
+    Retry deletes that failed earlier, now that the store answered a call.
+
+    Each entry's claim is re-checked and its delete performed under the
+    persist lock, which :func:`_persist_add` holds across its supersede and
+    write — so a concurrent re-publish of the same id cannot interleave with a
+    stale delete and lose the fresh row's restart survival. The delete also
+    runs under the workspace that queued it: the store scopes deletes to the
+    ambient tenant, and this sweep may be triggered by another workspace's
+    request, where the delete would match nothing while the entry was
+    unconditionally dropped — leaving the answered row to resurrect on the
+    next restart.
+
+    A delete that raises stops the sweep — the store is presumably down again
+    and the remaining entries keep their retry claim. A delete that returns
+    ``False`` means the row is already gone (collected elsewhere), so the
+    entry is dropped either way.
+
+    :param store: The store that just served a successful call.
+    """
+    from omnigent.db.db_models import workspace_scope
+
+    with _lock:
+        retry = list(_failed_deletes)
+    for entry in retry:
+        workspace_id, conv_id, elicit_id = entry
+        with _persist_lock:
+            with _lock:
+                # Superseded by a re-publish while this sweep was running:
+                # the fresh row must not be erased by the stale delete.
+                if entry not in _failed_deletes:
+                    continue
+            try:
+                with workspace_scope(workspace_id):
+                    store.delete(conv_id, elicit_id)
+            except Exception:
+                return
+            with _lock:
+                _failed_deletes.discard(entry)
+
+
+def restore_for(conversation_id: str) -> list[dict[str, Any]]:
+    """
+    Reload one session's outstanding prompts from the store into the index.
+
+    Called whenever a session's index is empty. It deliberately does **not**
+    take the conversation's mirrored count as a precondition: that count is
+    written best-effort on a background executor, so a crash between the row
+    commit and the count write leaves a durable row that a count-gated read
+    would never ask for — which is precisely the crash this whole mechanism
+    exists to survive.
+
+    The cost of dropping that gate is bounded by remembering which
+    conversations have already been looked up, so a process pays at most one
+    indexed query per conversation however many times the session is loaded.
+    Once the index holds an entry there is nothing to restore anyway.
+
+    Prompts older than :data:`_MAX_PARK_SECONDS` are dropped: nothing can
+    still be parked on them, so surfacing one would offer the user a button
+    that resolves nothing. Their rows are deleted here — the table's contract
+    is to hold only the parked set, and no other collector exists.
+
+    After a successful read the count hook fires with the index's real count,
+    so a persisted badge count that outlived its prompt (the runner timed out
+    while the server was down) reconciles to what is actually answerable
+    instead of staying lit forever.
+
+    :param conversation_id: Session to restore, e.g. ``"conv_abc123"``.
+    :returns: The restored event payloads, oldest first. Empty when no store
+        is wired, the store fails, or nothing survives the age check.
+    """
+    store = _store
+    if store is None:
+        return []
+    with _lock:
+        if conversation_id in _restored:
+            return []
+        _restored.add(conversation_id)
+    try:
+        rows = store.list_for_conversation(conversation_id)
+    except Exception:  # a failed restore degrades to the pre-mirror behaviour
+        # Let the next read try again: a store that was briefly unavailable
+        # must not cost this conversation its only restore for the lifetime of
+        # the process.
+        with _lock:
+            _restored.discard(conversation_id)
+        _logger.warning(
+            "Could not restore outstanding elicitations for %s",
+            conversation_id,
+            exc_info=True,
+        )
+        return []
+    cutoff = int(time.time()) - _MAX_PARK_SECONDS
+    for row in rows:
+        if row.created_at >= cutoff:
+            continue
+        # Same persist-lock rule as ``_persist_remove``: this age-out delete
+        # must not land on top of a concurrent re-publish's fresh row.
+        try:
+            with _persist_lock:
+                store.delete(conversation_id, row.id)
+        except Exception:
+            with _lock:
+                _failed_deletes.add((row.workspace_id, conversation_id, row.id))
+    with _lock:
+        live = [
+            row
+            for row in rows
+            if row.created_at >= cutoff and (conversation_id, row.id) not in _resolved_tombstones
+        ]
+        ids = _pending.setdefault(conversation_id, {})
+        for row in live:
+            ids.setdefault(row.id, row.event)
+        restored = [copy.deepcopy(event) for event in ids.values()]
+        count = len(ids)
+        if not ids:
+            _pending.pop(conversation_id, None)
+    # Reconcile the persisted badge count with what is actually answerable.
+    _notify_count_hook(conversation_id, count)
+    return restored
+
+
+def claim_descendant_restore(conversation_id: str) -> bool:
+    """
+    Claim the one-per-process descendant restore for an ancestor snapshot.
+
+    After a restart the in-memory index is empty everywhere, so the cheap
+    "anything pending anywhere?" pre-check that gates the descendant walk in
+    ``GET /v1/sessions/{id}`` reports nothing — including for a child whose
+    durable row is genuinely parked. The first snapshot of each ancestor per
+    process therefore gets one walk regardless of that gate, letting
+    :func:`restore_for` on each child pull its rows back. Subsequent
+    snapshots return ``False`` and fall back to the in-memory gate.
+
+    :param conversation_id: Ancestor session being snapshotted.
+    :returns: ``True`` exactly once per conversation per process, and only
+        when a store is wired (without one there is nothing to restore).
+    """
+    if _store is None:
+        return False
+    with _lock:
+        if conversation_id in _descendants_probed:
+            return False
+        _descendants_probed.add(conversation_id)
+        return True
+
+
+def release_descendant_restore(conversation_id: str) -> None:
+    """
+    Hand back a descendant-restore claim whose walk could not complete.
+
+    A transient store outage during the walk must not permanently consume the
+    ancestor's only gate-free walk — the child prompt it would have surfaced
+    stays hidden for the life of the process otherwise. The next snapshot of
+    this ancestor claims and walks again.
+
+    :param conversation_id: Ancestor whose claim to release.
+    """
+    with _lock:
+        _descendants_probed.discard(conversation_id)
+
+
+def needs_restore(conversation_id: str) -> bool:
+    """
+    Whether a session's durable rows have not yet been (re)loaded.
+
+    ``True`` right after a failed :func:`restore_for` (the failure hands back
+    the one-per-process claim), letting a caller that drove a batch of
+    restores tell "restored, nothing there" apart from "could not ask".
+
+    :param conversation_id: Session to check.
+    :returns: ``True`` when a store is wired and the session has no completed
+        restore recorded for this process.
+    """
+    if _store is None:
+        return False
+    with _lock:
+        return conversation_id not in _restored
+
+
 def record_publish(conversation_id: str, event: dict[str, Any]) -> None:
     """
     Update the index when an SSE event is published.
@@ -145,7 +520,12 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> None:
         elicitation_id = event.get("elicitation_id")
         if not isinstance(elicitation_id, str) or not elicitation_id:
             return
+        if _owns_elicitation(conversation_id, event):
+            _persist_add(conversation_id, elicitation_id, event)
         with _lock:
+            # A fresh publish reopens the id: deterministic harness ids repeat
+            # across turns, and the new question must be restorable again.
+            _resolved_tombstones.discard((conversation_id, elicitation_id))
             ids = _pending.setdefault(conversation_id, {})
             ids[elicitation_id] = event
             count = len(ids)
@@ -202,6 +582,14 @@ def resolve(conversation_id: str, elicitation_id: str) -> None:
     :param elicitation_id: The elicitation correlation id from the
         approval payload, e.g. ``"elicit_abc123"``.
     """
+    # Tombstone first: an in-flight restore that already read this row must
+    # not re-insert an answered prompt after we drop it below.
+    with _lock:
+        _resolved_tombstones.add((conversation_id, elicitation_id))
+    # Unconditional, and before the index drop: this call may be the second
+    # resolve for an id the index already forgot (the runner publishes a
+    # resolved event on every exit path), and the row must go either way.
+    _persist_remove(conversation_id, elicitation_id)
     with _lock:
         ids = _pending.get(conversation_id)
         if ids is None:
@@ -377,7 +765,12 @@ def reset_for_tests() -> None:
     production callers — there is no legitimate use case for
     wiping the index at runtime.
     """
-    global _observer
+    global _observer, _store
     with _lock:
         _pending.clear()
+        _restored.clear()
+        _descendants_probed.clear()
+        _resolved_tombstones.clear()
+        _failed_deletes.clear()
     _observer = None
+    _store = None

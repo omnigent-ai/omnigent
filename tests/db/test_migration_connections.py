@@ -34,7 +34,11 @@ def _downgrade(uri: str, engine: sa.Engine, revision: str) -> None:
 def test_single_alembic_head() -> None:
     script = ScriptDirectory.from_config(_build_alembic_config("sqlite://"))
     heads = script.get_heads()
-    assert heads == ["ga1b2c3d4e5f"], f"expected a single head, got {heads!r}"
+    assert len(heads) == 1, f"expected a single head, got {heads!r}"
+    # The head moves as later migrations stack on top; the guard is that the
+    # graph never forks and our migration stays in the mainline lineage.
+    lineage = {rev.revision for rev in script.walk_revisions(base="base", head=heads[0])}
+    assert "ga1b2c3d4e5f" in lineage, f"connections migration not in lineage of {heads[0]!r}"
 
 
 def test_upgrade_creates_table_downgrade_drops_it(tmp_path: Path) -> None:

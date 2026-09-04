@@ -54,6 +54,7 @@ _BOOT_STORE_CLASSES = (
     "omnigent.stores.artifact_store.databricks_volumes.DatabricksVolumesArtifactStore",
     "omnigent.stores.comment_store.sqlalchemy_store.SqlAlchemyCommentStore",
     "omnigent.stores.conversation_store.sqlalchemy_store.SqlAlchemyConversationStore",
+    "omnigent.stores.elicitation_store.sqlalchemy_store.SqlAlchemyElicitationStore",
     "omnigent.stores.file_store.sqlalchemy_store.SqlAlchemyFileStore",
     "omnigent.stores.host_store.HostStore",
     "omnigent.stores.permission_store.sqlalchemy_store.SqlAlchemyPermissionStore",

@@ -27,6 +27,7 @@ from omnigent.entities.conversation import (
     synthesize_conversation_title,
 )
 from omnigent.entities.device_grant import DeviceGrant
+from omnigent.entities.elicitation import Elicitation
 from omnigent.entities.file import StoredFile
 from omnigent.entities.github_connection import GithubConnection
 from omnigent.entities.pagination import PagedList
@@ -56,6 +57,7 @@ __all__ = [
     "Conversation",
     "ConversationItem",
     "DeviceGrant",
+    "Elicitation",
     "ErrorData",
     "FunctionCallData",
     "FunctionCallOutputData",
