@@ -14,11 +14,11 @@ import re
 import pytest
 
 from dev.resolve import (
-    ticket_slug,
     branch_slug,
     build_payload,
     parse_ci_run_url,
     parse_session_ref,
+    ticket_slug,
 )
 
 
@@ -168,5 +168,17 @@ def test_branch_slug_ticket_only() -> None:
     assert ticket_slug("https://linear.app/omnigent/issue/OMNI-6145/slug") == "omni-6145"
     assert ticket_slug("https://github.com/omnigent-ai/omnigent/issues/1234") == "issue-1234"
     assert ticket_slug("https://example.com/") == "bug"
-    assert branch_slug(session=None, ci_link=None, bug_url="https://linear.app/omnigent/issue/OMNI-6145/x") == "omni-6145"
-    assert branch_slug(session="dc59e331-abcd", ci_link=None, bug_url="https://linear.app/omnigent/issue/OMNI-1/x") == "dc59e331"
+    assert (
+        branch_slug(
+            session=None, ci_link=None, bug_url="https://linear.app/omnigent/issue/OMNI-6145/x"
+        )
+        == "omni-6145"
+    )
+    assert (
+        branch_slug(
+            session="dc59e331-abcd",
+            ci_link=None,
+            bug_url="https://linear.app/omnigent/issue/OMNI-1/x",
+        )
+        == "dc59e331"
+    )
