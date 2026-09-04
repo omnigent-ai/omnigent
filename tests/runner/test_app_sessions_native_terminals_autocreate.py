@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import click
 import httpx
 import pytest
 
@@ -3379,7 +3378,7 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
     the catalog spells that family as alias rows and the 1M default. On a
     canonical endpoint the relaunch must pass the id through as ``--model``
     rather than refuse the resume; a gateway, which routes only its own
-    spellings, keeps refusing it.
+    spellings, launches on its own default instead and resets the pick to Default.
     """
     from omnigent.claude_native import ClaudeNativeUcodeConfig
 
@@ -3439,7 +3438,11 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
                 metadata={"terminal_name": "claude", "session_key": "main", "running": True},
             )
 
-    def _handle_request(_request: httpx.Request) -> httpx.Response:
+    patches: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH":
+            patches.append(json.loads(request.content))
         return httpx.Response(200, json={"model_override": "claude-opus-4-8", "labels": {}})
 
     fake_client = httpx.AsyncClient(
@@ -3460,26 +3463,329 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         return config
 
     session_id = "0f2d3d5c9a6b4e1f8c7d6e5f4a3b2c1d"
+    await _auto_create_claude_terminal(
+        session_id,
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+        resolve_launch_config=_resolve,
+    )
+    args = captured["spec"].args
+    pick_resets = [body for body in patches if "model_override" in body]
     if endpoint == "subscription":
+        assert args[args.index("--model") + 1] == "claude-opus-4-8"
+        assert pick_resets == []
+    else:
+        assert args[args.index("--model") + 1] == "system.ai.claude-opus-5"
+        assert pick_resets == [{"model_override": "default"}]
+
+    await fake_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_unserved_pick_resets_to_the_catalog_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A pick no row can serve launches on the catalog's default and resets the pick.
+
+    The pick outlives the provider it was made under, so a relaunch that
+    cannot honor it must still bring the session back: it takes the Default
+    launch (the fresh catalog's ``isDefault`` row) and clears the persisted
+    pick, so the picker shows the Default the session now runs.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+
+    async def _no_op_forwarder(**kwargs: Any) -> None:
+        del kwargs
+
+    monkeypatch.setattr(
+        "omnigent.claude_native_forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+    catalog = [
+        {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
+        {
+            "id": "claude-opus-4-8[1m]",
+            "model": "claude-opus-4-8[1m]",
+            "displayName": "Opus 4.8 (1M context)",
+            "isDefault": True,
+        },
+    ]
+
+    async def _catalog(config: object) -> list[dict[str, object]]:
+        del config
+        return catalog
+
+    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", _catalog)
+    monkeypatch.setattr(
+        "omnigent.claude_native.claude_launch_catalog_is_stale", lambda config: False
+    )
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        """Captures the launched terminal spec."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Record the spec and return a terminal resource view."""
+            del terminal_name, session_key
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=session_id,
+                name="claude:main",
+                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+            )
+
+    patches: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH":
+            patches.append(json.loads(request.content))
+        return httpx.Response(200, json={"model_override": "gpt-5.4", "labels": {}})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(_handle_request),
+    )
+
+    async def _resolve() -> None:
+        return None
+
+    await _auto_create_claude_terminal(
+        "1a2b3c4d5e6f47a8b9c0d1e2f3a4b5c6",
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+        resolve_launch_config=_resolve,
+    )
+    args = captured["spec"].args
+    assert args[args.index("--model") + 1] == "claude-opus-4-8[1m]"
+    assert [body for body in patches if "model_override" in body] == [
+        {"model_override": "default"}
+    ]
+
+    await fake_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_keeps_the_pick_when_the_terminal_fails_to_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A pick is reset only once the fallback terminal is up.
+
+    The reset would otherwise outlive a launch that failed after the gate, so
+    a tmux or bridge failure must leave the persisted pick untouched.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    catalog = [
+        {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5", "isDefault": True}
+    ]
+
+    async def _catalog(config: object) -> list[dict[str, object]]:
+        del config
+        return catalog
+
+    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", _catalog)
+    monkeypatch.setattr(
+        "omnigent.claude_native.claude_launch_catalog_is_stale", lambda config: False
+    )
+
+    class _FailingResourceRegistry:
+        """Fails the tmux launch after the gate has run."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(self, **kwargs: Any) -> SessionResourceView:
+            """Raise the way a tmux launch failure does."""
+            del kwargs
+            raise RuntimeError("tmux exited")
+
+    patches: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH":
+            patches.append(json.loads(request.content))
+        return httpx.Response(200, json={"model_override": "gpt-5.4", "labels": {}})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(_handle_request),
+    )
+
+    async def _resolve() -> None:
+        return None
+
+    with pytest.raises(RuntimeError, match="tmux exited"):
         await _auto_create_claude_terminal(
-            session_id,
-            _FakeResourceRegistry(),
+            "3c4d5e6f7a8b49c0d1e2f3a4b5c6d7e8",
+            _FailingResourceRegistry(),
             lambda _sid, _evt: None,
             server_client=fake_client,
             resolve_launch_config=_resolve,
         )
-        args = captured["spec"].args
-        assert args[args.index("--model") + 1] == "claude-opus-4-8"
-    else:
-        with pytest.raises(click.ClickException, match="not in this host's current model list"):
-            await _auto_create_claude_terminal(
-                session_id,
-                _FakeResourceRegistry(),
-                lambda _sid, _evt: None,
-                server_client=fake_client,
-                resolve_launch_config=_resolve,
+    assert [body for body in patches if "model_override" in body] == []
+
+    await fake_client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refresh", ["serves_pick", "lacks_pick", "fails"])
+async def test_auto_create_claude_terminal_refreshes_a_stale_catalog_before_resetting_the_pick(
+    refresh: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A pick the stale catalog does not serve is re-checked against a fresh probe.
+
+    The stored rows may predate a provider change, so resetting the pick on
+    them alone could discard a model the provider serves today. The launch
+    awaits the re-probe: a fresh row serving the pick keeps it, only a fresh
+    catalog that still lacks it resets the pick, and a failed probe launches
+    on the default while keeping the pick for the next relaunch.
+    """
+    import os
+    import time
+
+    from omnigent import model_catalog_store
+    from omnigent.claude_native import claude_catalog_fingerprint
+    from tests.runner.conftest import (
+        REAL_CLAUDE_LAUNCH_CATALOG,
+        REAL_CLAUDE_REPROBED_LAUNCH_CATALOG,
+    )
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+
+    async def _no_op_forwarder(**kwargs: Any) -> None:
+        del kwargs
+
+    monkeypatch.setattr(
+        "omnigent.claude_native_forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG)
+    monkeypatch.setattr(
+        "omnigent.claude_native.claude_reprobed_launch_catalog",
+        REAL_CLAUDE_REPROBED_LAUNCH_CATALOG,
+    )
+    stale_rows = [
+        {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
+        {
+            "id": "claude-opus-4-8[1m]",
+            "model": "claude-opus-4-8[1m]",
+            "displayName": "Opus 4.8 (1M context)",
+            "isDefault": True,
+        },
+    ]
+    refreshed_rows = list(stale_rows)
+    if refresh == "serves_pick":
+        refreshed_rows.append({"id": "haiku", "model": "claude-haiku-4-5-20251001"})
+    probes: list[int] = []
+
+    async def _probe(config: object) -> list[dict[str, object]]:
+        del config
+        probes.append(1)
+        if refresh == "fails":
+            raise OSError("provider unreachable")
+        return refreshed_rows
+
+    monkeypatch.setattr("omnigent.claude_native.claude_model_catalog", _probe)
+    fingerprint = claude_catalog_fingerprint(None)
+    model_catalog_store.write_catalog("claude-native", fingerprint, stale_rows)
+    path = model_catalog_store.catalog_path("claude-native", fingerprint)
+    old = time.time() - (model_catalog_store.CATALOG_STALE_AFTER_S + 60)
+    os.utime(path, (old, old))
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        """Captures the launched terminal spec."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Record the spec and return a terminal resource view."""
+            del terminal_name, session_key
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=session_id,
+                name="claude:main",
+                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
             )
-        assert "spec" not in captured, "a refused launch must not start a terminal"
+
+    patches: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH":
+            patches.append(json.loads(request.content))
+        return httpx.Response(200, json={"model_override": "claude-haiku-4-5", "labels": {}})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(_handle_request),
+    )
+
+    async def _resolve() -> None:
+        return None
+
+    await _auto_create_claude_terminal(
+        "2b3c4d5e6f7a48b9c0d1e2f3a4b5c6d7",
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+        resolve_launch_config=_resolve,
+    )
+    args = captured["spec"].args
+    assert probes == [1], "the launch must await exactly one re-probe"
+    pick_resets = [body for body in patches if "model_override" in body]
+    if refresh == "serves_pick":
+        assert model_catalog_store.read_catalog("claude-native", fingerprint) == refreshed_rows
+        assert args[args.index("--model") + 1] == "claude-haiku-4-5"
+        assert pick_resets == []
+    elif refresh == "lacks_pick":
+        assert model_catalog_store.read_catalog("claude-native", fingerprint) == refreshed_rows
+        assert args[args.index("--model") + 1] == "claude-opus-4-8[1m]"
+        assert pick_resets == [{"model_override": "default"}]
+    else:
+        # No fresh rows: the stale entry stays, the Default launch of a stale
+        # catalog goes bare, and the pick survives for the next relaunch.
+        assert model_catalog_store.read_catalog("claude-native", fingerprint) == stale_rows
+        assert "--model" not in args
+        assert pick_resets == []
 
     await fake_client.aclose()
 

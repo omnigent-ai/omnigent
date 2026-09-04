@@ -15,6 +15,7 @@ import functools
 import itertools
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -22,7 +23,7 @@ import tempfile
 import time
 import urllib.parse
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, cast, overload
 
@@ -136,7 +137,7 @@ from omnigent.runner.native import (
     _unwrap_resolved_spec,
 )
 from omnigent.runner.native import orchestration as _native_runtime
-from omnigent.runner.native.interrupt import NativeInterruptRunner
+from omnigent.runner.native.interrupt import MarkSubagentTerminalAndWake, NativeInterruptRunner
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -185,6 +186,11 @@ _logger = logging.getLogger(__name__)
 # tests can patch the pacing.
 _CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S = 2.5
 
+# How long a claude-native session's model rows are served from the runner's
+# own cache before the shared catalog store is re-read, so a store refresh
+# (its background re-probe) reaches the picker without a runner restart.
+_CLAUDE_MODEL_OPTIONS_CACHE_TTL_S = 15.0
+
 # Claude-native model switch confirmation: how long to watch the pane's
 # statusLine snapshot for the switched model after typing ``/model``, and how
 # often to re-read it. Module-level so tests can patch the pacing.
@@ -205,6 +211,18 @@ _CLAUDE_MODEL_LATE_DIALOG_POLL_S = 2.0
 # can tighten the budget.
 _CLAUDE_PANE_READY_TIMEOUT_S = 30.0
 _CLAUDE_PANE_READY_POLL_S = 0.25
+
+# Settle delay between keystrokes when driving Codex's /permissions popup. The
+# slash-command menu, the popup, and the Full Access confirm sub-dialog are each
+# drawn asynchronously; without a pause the next key races ahead (e.g. Enter
+# arrives before the /permissions menu commits, so the command never submits).
+_CODEX_PERMISSION_POPUP_RENDER_S = 0.7
+
+# Budget for confirming an approval switch actually landed. Codex echoes
+# "Permissions updated to <label>" once the popup applies; we poll the pane for
+# it so a no-op (e.g. a preset this codex build's /permissions doesn't offer)
+# fails loud instead of the label claiming a mode the TUI never entered.
+_CODEX_PERMISSION_CONFIRM_BUDGET_S = 4.0
 
 
 def _warn_unresolved_sub_agent(session_id: str | None, sub_agent_name: str) -> None:
@@ -399,11 +417,56 @@ def _unwrap_spec_entry(entry: _SpecEntry | None) -> AgentSpec | None:
 
 _NO_BODY_STATUS_CODES = {204, 304}
 _SUBAGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+# Liveness budget for a sub-agent dispatch stuck in ``launching``: a child
+# that has produced NO edge at all (no running/waiting/terminal status, no
+# in-flight response) within this window never started — fail it loudly
+# instead of letting the dispatched work wedge forever with no error surfaced.
+_SUBAGENT_LAUNCH_TIMEOUT_S_ENV = "OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S"
+_DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S = 180.0
+# Interval for the background sweep in the runner entrypoint.
+SUBAGENT_LAUNCH_REAP_INTERVAL_S = 30.0
+
+
+def resolve_subagent_launch_timeout_s() -> float:
+    """
+    Resolve the sub-agent launch liveness budget in seconds.
+
+    Values ``<= 0`` disable the reaper. A non-numeric override is rejected
+    with a warning and falls back to the default.
+
+    :returns: The budget in seconds, e.g. ``180.0``.
+    """
+    raw = os.environ.get(_SUBAGENT_LAUNCH_TIMEOUT_S_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        value = None
+    # Non-finite values (nan/inf) would silently disable reaping without the
+    # explicit ``<= 0`` "disabled" intent — reject them like non-numeric input.
+    if value is None or not math.isfinite(value):
+        _logger.warning(
+            "Invalid %s=%r; using default %ss",
+            _SUBAGENT_LAUNCH_TIMEOUT_S_ENV,
+            raw,
+            _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S,
+        )
+        return _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S
+    return value
+
+
 _SUBAGENT_DELIVERY_DELIVERED = "delivered"
 _SUBAGENT_DELIVERY_ALREADY_DELIVERED = "already_delivered"
 _SUBAGENT_DELIVERY_UNTRACKED = "untracked"
 _SUBAGENT_DELIVERY_MISSING_WORK_ENTRY = "missing_work_entry"
 _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX = "missing_parent_inbox"
+# Runner-owned labels on a child session that make sub-agent result delivery
+# durable across a runner restart. The dispatch id is stamped when a turn is
+# sent to the child; the delivered id is the receipt the parent's
+# ``sys_read_inbox`` drain writes once it has consumed that turn's result.
+SUBAGENT_DISPATCH_ID_LABEL_KEY = "omnigent.subagent.dispatch_id"
+SUBAGENT_DELIVERED_ID_LABEL_KEY = "omnigent.subagent.delivered_id"
 # Read budget for runner→server POSTs that can PARK behind a human-approval
 # ASK gate: policy evaluation (``_evaluate_policy_via_omnigent``) and sub-agent
 # wake-notice delivery (``_deliver_subagent_wake_post``). Both are gated at the
@@ -1512,6 +1575,11 @@ class _SubagentDeliveryAck:
 _subagent_work_by_child: dict[str, _SubagentWorkEntry] = {}
 _subagent_work_by_parent: dict[str, set[str]] = {}
 _drained_delivered_subagent_children: set[str] = set()
+# Parents whose restart-recovery scan completed in this process, plus a
+# per-parent lock so an init racing a sys_read_inbox drain cannot run two
+# scans that both pass the registry check and queue one result twice.
+_subagent_recovery_done: set[str] = set()
+_subagent_recovery_locks: dict[str, asyncio.Lock] = {}
 
 # Per-(parent, agent_type) monotonic ordinal counter for structured
 # sub-agent names (e.g. "researcher-1", "researcher-2").
@@ -1548,6 +1616,15 @@ def recover_subagent_ordinals(
     _subagent_ordinal_counters[key] = max_ordinal
 
 
+def new_subagent_work_id() -> str:
+    """
+    Mint the id of one sub-agent dispatch, e.g. ``"subagent_a1b2c3d4e5f6"``.
+
+    :returns: A fresh dispatch id.
+    """
+    return f"subagent_{uuid.uuid4().hex[:12]}"
+
+
 def register_subagent_work(
     *,
     parent_session_id: str,
@@ -1556,6 +1633,7 @@ def register_subagent_work(
     title: str,
     wrapper_label: str | None = None,
     created_by: str | None = None,
+    work_id: str | None = None,
 ) -> _SubagentWorkEntry:
     """
     Register one running sub-agent dispatch.
@@ -1573,6 +1651,8 @@ def register_subagent_work(
         label, e.g. ``"claude-code-native-ui"``.
     :param created_by: Human actor that dispatched this child turn, if
         known from the parent turn context.
+    :param work_id: Dispatch id already stamped on the child session,
+        e.g. ``"subagent_a1b2c3d4e5f6"``; ``None`` mints a new one.
     :returns: The registered work entry.
     """
     prior = _subagent_work_by_child.get(child_session_id)
@@ -1586,7 +1666,7 @@ def register_subagent_work(
     entry = _SubagentWorkEntry(
         parent_session_id=parent_session_id,
         child_session_id=child_session_id,
-        work_id=f"subagent_{uuid.uuid4().hex[:12]}",
+        work_id=work_id or new_subagent_work_id(),
         agent=agent,
         title=title,
         wrapper_label=wrapper_label,
@@ -1701,6 +1781,155 @@ def list_subagent_work(parent_session_id: str) -> list[_SubagentWorkEntry]:
     return sorted(entries, key=lambda entry: entry.created_at)
 
 
+def undelivered_subagent_dispatch_id(labels: Mapping[str, object]) -> str | None:
+    """
+    Return the dispatch id of a child turn whose result the parent never drained.
+
+    :param labels: Child session labels, e.g.
+        ``{"omnigent.subagent.dispatch_id": "subagent_a1b2c3d4e5f6"}``.
+    :returns: The dispatch id when the delivered-id receipt is missing or
+        names an earlier turn; ``None`` for a drained turn, or for a child
+        created before dispatch ids were stamped.
+    """
+    dispatch_id = labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
+    if not isinstance(dispatch_id, str) or not dispatch_id:
+        return None
+    if labels.get(SUBAGENT_DELIVERED_ID_LABEL_KEY) == dispatch_id:
+        return None
+    return dispatch_id
+
+
+class _SubagentRecoveryReadError(Exception):
+    """A sessions API read needed by restart recovery returned a non-200."""
+
+
+async def _get_recovery_page(
+    server_client: httpx.AsyncClient, path: str, params: dict[str, str]
+) -> Any:
+    """
+    Read one page of a sessions API listing for restart recovery.
+
+    :param server_client: HTTP client connected to the Omnigent server.
+    :param path: Sessions API path, e.g. ``"/v1/sessions/conv_p/child_sessions"``.
+    :param params: Query parameters, e.g. ``{"limit": "1000"}``.
+    :returns: The decoded JSON page.
+    :raises _SubagentRecoveryReadError: When the server returns a non-200.
+    """
+    response = await server_client.get(path, params=params, timeout=10.0)
+    if response.status_code != 200:
+        raise _SubagentRecoveryReadError(f"{path} returned {response.status_code}")
+    return response.json()
+
+
+async def _list_child_sessions(
+    server_client: httpx.AsyncClient, parent_id: str
+) -> list[_JsonObject]:
+    """
+    Return every child-session summary of a parent, following pagination.
+
+    :param server_client: HTTP client connected to the Omnigent server.
+    :param parent_id: Parent session id, e.g. ``"conv_parent123"``.
+    :returns: Child summaries as returned by the sessions API.
+    :raises _SubagentRecoveryReadError: When a page read fails.
+    """
+    children: list[_JsonObject] = []
+    params: dict[str, str] = {"limit": "1000"}
+    while True:
+        page = await _get_recovery_page(
+            server_client, f"/v1/sessions/{parent_id}/child_sessions", params
+        )
+        children.extend(page.get("data", []))
+        if not page.get("has_more") or not page.get("last_id"):
+            return children
+        params["after"] = page["last_id"]
+
+
+async def _fetch_latest_assistant_text(
+    server_client: httpx.AsyncClient, session_id: str
+) -> str | None:
+    """
+    Return the newest assistant message text of a session, reading newest first.
+
+    :param server_client: HTTP client connected to the Omnigent server.
+    :param session_id: Session to read, e.g. ``"conv_child456"``.
+    :returns: Joined text blocks of the newest assistant message (empty when
+        that message carries no text, matching live delivery), or ``None``
+        when the transcript holds no assistant message.
+    :raises _SubagentRecoveryReadError: When a page read fails.
+    """
+    params: dict[str, str] = {"limit": "100", "order": "desc"}
+    while True:
+        page = await _get_recovery_page(server_client, f"/v1/sessions/{session_id}/items", params)
+        for item in page.get("data", []):
+            if item.get("type") != "message" or item.get("role") != "assistant":
+                continue
+            return "\n".join(
+                block["text"]
+                for block in item.get("content", [])
+                if block.get("type") in {"output_text", "text"} and block.get("text")
+            )
+        if not page.get("has_more") or not page.get("last_id"):
+            return None
+        params["after"] = page["last_id"]
+
+
+async def _recover_subagent_results_from_server(
+    *,
+    server_client: httpx.AsyncClient,
+    parent_id: str,
+    schedule_wake: Callable[[_SubagentWorkEntry], None],
+) -> None:
+    """
+    Re-queue terminal child results whose delivery receipt is missing.
+
+    A child turn is stamped with a dispatch id when it is sent, and the
+    parent's ``sys_read_inbox`` drain writes that id back as the delivered
+    id. A terminal child whose two ids differ was never drained, so its
+    result is rebuilt from the child transcript and queued again under the
+    same dispatch id, letting the eventual drain close the loop.
+
+    :param server_client: HTTP client connected to the Omnigent server.
+    :param parent_id: Parent session whose inbox was recreated, e.g.
+        ``"conv_parent123"``.
+    :param schedule_wake: Callback that posts the parent wake notice.
+    :raises _SubagentRecoveryReadError: When a server read returns a
+        non-200; the caller retries on the next drain.
+    """
+    for child in await _list_child_sessions(server_client, parent_id):
+        child_id = child.get("id")
+        status = child.get("current_task_status")
+        if not isinstance(child_id, str) or not isinstance(status, str):
+            continue
+        if status not in _SUBAGENT_TERMINAL_STATUSES:
+            continue
+        if (
+            get_subagent_work(child_id) is not None
+            or child_id in _drained_delivered_subagent_children
+        ):
+            continue
+        labels = child.get("labels")
+        dispatch_id = undelivered_subagent_dispatch_id(labels if isinstance(labels, dict) else {})
+        if dispatch_id is None:
+            continue
+        output: str | None = None
+        if status == "failed":
+            error = child.get("last_task_error")
+            message = error.get("message") if isinstance(error, dict) else None
+            output = message if isinstance(message, str) else None
+        else:
+            output = await _fetch_latest_assistant_text(server_client, child_id)
+        entry = register_subagent_work(
+            parent_session_id=parent_id,
+            child_session_id=child_id,
+            agent=str(child.get("tool") or child.get("agent_name") or "sub-agent"),
+            title=str(child.get("session_name") or ""),
+            work_id=dispatch_id,
+        )
+        ack = mark_subagent_work_terminal(child_id, status=status, output=output)
+        if ack.delivered_now:
+            schedule_wake(entry)
+
+
 def mark_subagent_work_terminal(
     child_session_id: str,
     *,
@@ -1742,6 +1971,19 @@ def mark_subagent_work_terminal(
             reason=_SUBAGENT_DELIVERY_UNTRACKED,
         )
     if entry.status in _SUBAGENT_TERMINAL_STATUSES:
+        # ``failed`` outranks ``completed``: a quiescence-derived ``completed``
+        # (the watcher's ``idle`` edge) can be recorded — and delivered — before
+        # the turn's real ``failed`` edge lands. The failure must replace it and
+        # be re-delivered, or the parent is left believing the turn succeeded
+        # and the error text is silently dropped. A parent may act on the false
+        # success before the re-delivery arrives — that window is inherent to
+        # the edge race; re-delivery is the mitigation, not a prevention.
+        if status == "failed" and entry.status == "completed":
+            entry.status = status
+            entry.output = output
+            entry.completed_at = time.time()
+            entry.delivered = False
+            return _deliver_subagent_completion(entry)
         if entry.delivered:
             return _SubagentDeliveryAck(
                 entry=entry,
@@ -1750,8 +1992,12 @@ def mark_subagent_work_terminal(
                 reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
             )
         # A late stop_session-driven "cancelled" must not downgrade an
-        # already-recorded "completed"/"failed" still awaiting delivery.
-        if status != "cancelled" or entry.status == "cancelled":
+        # already-recorded "completed"/"failed" still awaiting delivery, and a
+        # trailing quiescence "completed" must not launder a recorded "failed".
+        keep_recorded = (status == "cancelled" and entry.status != "cancelled") or (
+            status == "completed" and entry.status == "failed"
+        )
+        if not keep_recorded:
             entry.status = status
             entry.output = output
             entry.completed_at = time.time()
@@ -1814,6 +2060,86 @@ def _deliver_subagent_completion(entry: _SubagentWorkEntry) -> _SubagentDelivery
         delivered_now=True,
         reason=_SUBAGENT_DELIVERY_DELIVERED,
     )
+
+
+def reap_stalled_subagent_launches(
+    *,
+    now: float | None = None,
+    timeout_s: float | None = None,
+    mark_terminal: MarkSubagentTerminalAndWake | None = None,
+) -> list[_SubagentWorkEntry]:
+    """
+    Fail sub-agent dispatches stuck in ``launching`` beyond the liveness budget.
+
+    A child that has produced no edge at all (no running/waiting/terminal
+    status) within the budget never started; without this sweep the dispatched
+    work wedges forever and the parent is never told. Each reaped entry is
+    marked ``failed`` and its failure is delivered to the parent inbox through
+    ``mark_terminal``.
+
+    :param now: Clock override for tests, e.g. ``time.time()``.
+    :param timeout_s: Budget override for tests; defaults to
+        :func:`resolve_subagent_launch_timeout_s`.
+    :param mark_terminal: Terminal-delivery callback. Production passes the
+        app's ``mark_subagent_terminal_and_wake`` seam so the reaped failure
+        also schedules the parent wake POST — the sole signal that rouses an
+        idle parent to drain its inbox. Defaults to the inbox-only
+        :func:`mark_subagent_work_terminal`.
+    :returns: The entries that were failed by this sweep.
+    """
+    budget = resolve_subagent_launch_timeout_s() if timeout_s is None else timeout_s
+    if budget <= 0:
+        return []
+    deliver = mark_subagent_work_terminal if mark_terminal is None else mark_terminal
+    current = time.time() if now is None else now
+    reaped: list[_SubagentWorkEntry] = []
+    for entry in list(_subagent_work_by_child.values()):
+        if entry.status != "launching":
+            continue
+        if current - entry.created_at < budget:
+            continue
+        _logger.warning(
+            "Sub-agent dispatch stuck in launching for %.0fs; failing it: parent=%s child=%s",
+            current - entry.created_at,
+            entry.parent_session_id,
+            entry.child_session_id,
+        )
+        deliver(
+            entry.child_session_id,
+            status="failed",
+            output=(
+                f"Error: sub-agent {entry.agent!r} title {entry.title!r} produced no "
+                f"activity within {budget:.0f}s of dispatch; the child session never "
+                "started. The dispatched message was not processed."
+            ),
+        )
+        reaped.append(entry)
+    return reaped
+
+
+async def run_subagent_launch_reaper(
+    *,
+    interval_s: float = SUBAGENT_LAUNCH_REAP_INTERVAL_S,
+    mark_terminal: MarkSubagentTerminalAndWake | None = None,
+) -> None:
+    """
+    Periodically sweep for sub-agent dispatches wedged in ``launching``.
+
+    Runs until cancelled; started by the runner entrypoint alongside the
+    process manager. Sweep errors are logged and never end the loop.
+
+    :param interval_s: Seconds between sweeps, e.g. ``30.0``.
+    :param mark_terminal: Terminal-delivery callback forwarded to each sweep;
+        the entrypoint passes the app's wake-scheduling seam so a reaped
+        failure wakes the parent, not just its inbox.
+    :returns: None.
+    """
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            reap_stalled_subagent_launches(mark_terminal=mark_terminal)
+        except Exception:  # noqa: BLE001 — the sweep is a backstop; never die.
+            _logger.warning("sub-agent launch reaper sweep failed", exc_info=True)
 
 
 async def _wake_retry_sleep(seconds: float) -> None:
@@ -2397,6 +2723,19 @@ def create_runner_app(
     _session_claude_launch_config_tasks: dict[
         str, asyncio.Task[ClaudeNativeUcodeConfig | None]
     ] = {}
+    # Claude's session listing IS the shared launch catalog: the same
+    # fingerprint-keyed store file the launch resolved against and the
+    # host's pre-launch picker serves — identical by construction, no
+    # separate composition. Rows are re-read from the store once
+    # ``_CLAUDE_MODEL_OPTIONS_CACHE_TTL_S`` passes (so its background
+    # re-probe reaches the picker) and dropped whenever the launch config is
+    # recorded or dropped, so a relaunch under another provider never serves
+    # the previous one's rows. Entries pair a ``time.monotonic()`` deadline
+    # with the rows. A cold store pays one probe: a short inline wait answers
+    # a warm one, past that the endpoint answers 503 (the server's fetch
+    # retries those) while the store's single-flight probe completes in the
+    # background.
+    _claude_model_options_rows: dict[str, tuple[float, list[dict[str, object]]]] = {}
 
     async def _resolve_session_claude_launch_config(
         session_id: str,
@@ -2428,9 +2767,19 @@ def create_runner_app(
 
     def _drop_session_claude_launch_config(session_id: str) -> None:
         _session_claude_launch_configs.pop(session_id, None)
+        _claude_model_options_rows.pop(session_id, None)
         task = _session_claude_launch_config_tasks.pop(session_id, None)
         if task is not None:
             task.cancel()
+
+    def _record_session_claude_launch_config(
+        session_id: str, config: ClaudeNativeUcodeConfig | None
+    ) -> None:
+        """
+        Memoize the config a launch resolved; rows listed under the old one retire.
+        """
+        _session_claude_launch_configs[session_id] = config
+        _claude_model_options_rows.pop(session_id, None)
 
     _session_agent_ids = _session_agent_ids_ref  # shared with module-level get_session_agent_id
     _session_sub_agent_names: dict[str, str] = {}
@@ -2622,6 +2971,14 @@ def create_runner_app(
     ) -> _JsonObject | None:
         if status in ("running", "waiting"):
             mark_subagent_work_started(session_id)
+        # ``failed`` is sticky against a trailing ``idle``, mirroring the
+        # server invariant (see ``omnigent/server/routes/_sessions/helpers.py``):
+        # a failed native turn's pane goes quiet, so the PTY-activity watcher
+        # emits a trailing ``idle`` ~1s later — republishing the child as
+        # ``completed`` would show a green child for a turn that died. A later
+        # ``running``/``waiting`` edge (new activity) clears it normally.
+        if status == "idle" and meta.last_task_status == "failed":
+            return None
         busy = status in ("running", "waiting")
         task_status = _session_status_to_task_status(status)
         error_signature = (error["code"], error["message"]) if error is not None else None
@@ -3420,6 +3777,9 @@ def create_runner_app(
             _session_event_queues[session_id] = asyncio.Queue()
         if session_id not in _session_inboxes:
             _session_inboxes[session_id] = asyncio.Queue()
+        # A fresh queue can mean a fresh runner process rather than a fresh
+        # session: re-queue results the previous process never drained.
+        await _recover_undrained_subagent_results(session_id)
         if session_id not in _session_async_tasks:
             _session_async_tasks[session_id] = {}
         raw_sub_agent_name = body.get("sub_agent_name")
@@ -3548,7 +3908,7 @@ def create_runner_app(
                         resolve_launch_config=lambda: _resolve_session_claude_launch_config(
                             session_id
                         ),
-                        record_launch_config=_session_claude_launch_configs.__setitem__,
+                        record_launch_config=_record_session_claude_launch_config,
                     )
 
                 _launch_pre = _claude_pre_launch
@@ -3760,6 +4120,8 @@ def create_runner_app(
                 msg_body = {
                     "agent_id": agent_id,
                     "model": body.get("model", agent_id),
+                    # Recovery has no live server dispatch carrying renderer state.
+                    "browser_renderer_available": False,
                 }
                 _turn_task = asyncio.create_task(
                     _run_turn_bg(msg_body, session_id),
@@ -3836,7 +4198,6 @@ def create_runner_app(
 
     @app.get("/v1/sessions/{session_id}/stream")
     async def stream_session(session_id: str) -> StreamingResponse:
-
         async def _event_generator() -> AsyncIterator[bytes]:
             queue = _session_event_queues.get(session_id)
             if queue is None:
@@ -4017,6 +4378,8 @@ def create_runner_app(
         _last_server_item_id.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
         _session_inboxes.pop(session_id, None)
+        _subagent_recovery_done.discard(session_id)
+        _subagent_recovery_locks.pop(session_id, None)
         _subagent_wake_pending.discard(session_id)
         _stranded_wake_parents.discard(session_id)
         _last_rewake_notice.pop(session_id, None)
@@ -4488,6 +4851,47 @@ def create_runner_app(
             title=snapshot.sub_agent_name or "",
         )
 
+    async def _recover_undrained_subagent_results(parent_id: str) -> None:
+        """
+        Re-queue terminal child results lost with a runner process restart.
+
+        The parent inbox is a process-local queue, so a result queued before
+        a restart but not yet drained would otherwise vanish. Runs once per
+        parent per process; a scan that fails on a server read is retried
+        before the next ``sys_read_inbox`` drain. The inbox is created here
+        when missing: after a reconnect the server can dispatch a pending
+        message before it re-initializes the session, and that turn's drain
+        must still see the recovered results.
+
+        :param parent_id: Parent session whose inbox was recreated, e.g.
+            ``"conv_parent123"``.
+        :returns: None.
+        """
+        if parent_id in _subagent_recovery_done:
+            return
+        _session_inboxes.setdefault(parent_id, asyncio.Queue())
+        lock = _subagent_recovery_locks.setdefault(parent_id, asyncio.Lock())
+        async with lock:
+            if parent_id in _subagent_recovery_done:
+                return
+            try:
+                await _recover_subagent_results_from_server(
+                    server_client=server_client,
+                    parent_id=parent_id,
+                    schedule_wake=_schedule_subagent_wake,
+                )
+            except (httpx.HTTPError, _SubagentRecoveryReadError, ValueError):
+                _logger.warning(
+                    "Failed to recover undrained sub-agent results for %s",
+                    parent_id,
+                    exc_info=True,
+                    extra={"session_id": parent_id},
+                )
+                return
+            _subagent_recovery_done.add(parent_id)
+
+    app.state.recover_undrained_subagent_results = _recover_undrained_subagent_results
+
     def _note_session_harness_override(conv_id: str, harness_override: str | None) -> None:
         """Record the harness a session was forwarded, so reads match the run.
 
@@ -4763,6 +5167,75 @@ def create_runner_app(
                 },
             },
         )
+
+    async def _handle_codex_native_approval_mode_change(
+        conv_id: str,
+        mode: str,
+    ) -> Response:
+        # Codex switches approval stance through its own /permissions popup, not
+        # thread/settings/update (that RPC drives model/effort but no-ops for
+        # approval). So drive the popup by keystroke into the codex tmux pane —
+        # the same channel /compact uses — selecting the preset by its menu digit.
+        from omnigent.codex_approval_modes import codex_permission_preset
+
+        preset = codex_permission_preset(mode)
+        if preset is None:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_input",
+                    "detail": f"Unknown codex approval mode {mode!r}",
+                },
+            )
+        registry = resource_registry.terminal_registry
+        instance = registry.get(conv_id, "codex", "main") if registry is not None else None
+        if instance is None or not instance.running:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_approval_mode_failed",
+                    "detail": "Codex terminal is not running; reconnect first.",
+                },
+            )
+        try:
+            await asyncio.to_thread(
+                _inject_codex_permission_mode,
+                str(instance.socket_path),
+                instance.tmux_target,
+                menu_key=preset.menu_key,
+                needs_confirm=preset.needs_confirm,
+            )
+            # Confirm the switch landed before reporting success — the injection
+            # is otherwise fire-and-forget, so an unsupported preset (a menu row
+            # this codex build lacks) would silently no-op.
+            confirmed = await asyncio.to_thread(
+                _codex_permission_mode_confirmed,
+                str(instance.socket_path),
+                instance.tmux_target,
+                preset.label,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_approval_mode_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="codex-native approval mode change"
+                    ),
+                },
+            )
+        if not confirmed:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_approval_mode_failed",
+                    "detail": (
+                        f"Codex did not confirm the switch to {preset.label!r}; this codex "
+                        "build's /permissions may not offer it."
+                    ),
+                },
+            )
+        return JSONResponse(status_code=200, content={"approval_mode": preset.value})
 
     async def _codex_native_model_options(conv_id: str) -> list[_JsonObject]:
         from omnigent.codex_native_app_server import (
@@ -5211,7 +5684,8 @@ def create_runner_app(
         # actually switched; the swallowed-dialog case answers non-2xx so the
         # server surfaces it instead of the row silently claiming the pick.
         expected = {value for value in (resolved_model, model_arg) if value}
-        for row in _claude_model_options_rows.get(conv_id) or []:
+        cached_rows = _claude_model_options_rows.get(conv_id)
+        for row in cached_rows[1] if cached_rows is not None else []:
             if row.get("id") in (selected_model, resolved_model) or row.get("model") in (
                 selected_model,
                 resolved_model,
@@ -5574,6 +6048,54 @@ def create_runner_app(
         _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
         _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/compact")
         _run_tmux(socket_path, "send-keys", "-t", target, "Enter")
+
+    def _inject_codex_permission_mode(
+        socket_path: str,
+        target: str,
+        *,
+        menu_key: str,
+        needs_confirm: bool,
+    ) -> None:
+        # Drive Codex's /permissions popup: open it, then select the preset by
+        # its menu digit (position-independent, unlike arrow navigation). Full
+        # Access opens a "Yes, continue anyway" sub-dialog whose first option
+        # (digit 1) confirms. A settle pause between keystrokes is required — each
+        # screen draws asynchronously, and typing the command then pressing Enter
+        # back-to-back races the slash-menu so the command never submits.
+        from omnigent.claude_native_bridge import _run_tmux
+
+        # Reset to a clean composer so the command submits: close any stray
+        # menu/popup, then clear the line. C-u also wipes any text the TUI user
+        # was mid-typing — a rare, accepted cost for reliable injection.
+        _run_tmux(socket_path, "send-keys", "-t", target, "Escape")
+        _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
+        _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/permissions")
+        time.sleep(_CODEX_PERMISSION_POPUP_RENDER_S)
+        _run_tmux(socket_path, "send-keys", "-t", target, "Enter")
+        time.sleep(_CODEX_PERMISSION_POPUP_RENDER_S)
+        _run_tmux(socket_path, "send-keys", "-l", "-t", target, menu_key)
+        if needs_confirm:
+            time.sleep(_CODEX_PERMISSION_POPUP_RENDER_S)
+            _run_tmux(socket_path, "send-keys", "-l", "-t", target, "1")
+
+    def _codex_permission_mode_confirmed(socket_path: str, target: str, label: str) -> bool:
+        # Codex echoes "Permissions updated to <label>" when a /permissions switch
+        # applies. Poll the pane and require the most-recent such line to match the
+        # target, so a keystroke that hit a non-existent menu row (a preset this
+        # codex build doesn't offer) is reported as not-applied rather than the
+        # label claiming a mode the TUI never entered.
+        from omnigent.claude_native_bridge import _capture_pane
+
+        marker = "Permissions updated to "
+        deadline = time.monotonic() + _CODEX_PERMISSION_CONFIRM_BUDGET_S
+        while True:
+            pane = _capture_pane(socket_path, target)
+            updates = [line for line in pane.splitlines() if marker in line]
+            if updates and updates[-1].split(marker, 1)[1].strip() == label:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(_CODEX_PERMISSION_POPUP_RENDER_S)
 
     async def _handle_hermes_native_compact(conv_id: str) -> Response:
         from omnigent.hermes_native_bridge import (
@@ -6208,7 +6730,6 @@ def create_runner_app(
     async def _check_and_start_next_turn(
         session_id: str,
     ) -> None:
-
         _seq = _ingest_next_seq.get(session_id, 0)
         _ingest_next_seq[session_id] = _seq + 1
         _cond = _ingest_cond.get(session_id)
@@ -6433,6 +6954,10 @@ def create_runner_app(
         if ack.entry is not None and ack.delivered_now:
             _schedule_subagent_wake(ack.entry)
         return ack
+
+    # Seam for the entrypoint's launch reaper (and tests): terminal delivery
+    # that also schedules the parent wake POST, not just the inbox insert.
+    app.state.mark_subagent_terminal_and_wake = _mark_subagent_terminal_and_wake
 
     _native_interrupt_runner = NativeInterruptRunner(
         server_client=server_client,
@@ -6970,6 +7495,16 @@ def create_runner_app(
                     )
 
         _spec_tools = _session_tool_schemas.get(conv) or []
+        # Request-driven harnesses should not advertise browser tools when no
+        # renderer is subscribed. Native harnesses ignore this per-turn list
+        # and keep their session-scoped relay surface; their calls still use
+        # the prompt no-renderer failure below. An absent hint from an older
+        # server preserves the previous advertised surface. Only the spec
+        # surface is filtered; request-supplied tools remain caller-owned.
+        if msg_body.get("browser_renderer_available") is False:
+            from omnigent.runner.tool_dispatch import strip_browser_tool_schemas
+
+            _spec_tools = strip_browser_tool_schemas(_spec_tools)
         _client_tools = cast(list[_JsonObject], msg_body.get("tools") or [])
         merged_tools = _merge_request_client_tools(_spec_tools, _client_tools)
         if merged_tools:
@@ -8213,6 +8748,24 @@ def create_runner_app(
                 )
             return Response(status_code=204)
 
+        if body_type == "codex_approval_mode_change":
+            harness = _session_harness_name(conversation_id)
+            if harness == "codex-native":
+                mode = body.get("approval_mode") if isinstance(body, dict) else None
+                if not isinstance(mode, str) or not mode:
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "error": "invalid_input",
+                            "detail": "Body 'approval_mode' must be a non-empty string",
+                        },
+                    )
+                return await _handle_codex_native_approval_mode_change(
+                    conversation_id,
+                    mode,
+                )
+            return Response(status_code=204)
+
         codex_goal_response = await codex_goal_runner.handle_event(
             conversation_id,
             body_type,
@@ -8291,7 +8844,15 @@ def create_runner_app(
         if body_type == "approval":
             _data = body.get("data") or body
             _elicit_action = _data.get("action", "")
-            pending_approvals.resolve(_data.get("elicitation_id", ""), _elicit_action == "accept")
+            # ``content`` is the person's answer when the prompt asked for
+            # more than consent (an MCP ``requestedSchema``). Dropping it here
+            # is what used to make the awaiting caller invent one.
+            _elicit_content = _data.get("content")
+            pending_approvals.resolve(
+                _data.get("elicitation_id", ""),
+                _elicit_action == "accept",
+                _elicit_content if isinstance(_elicit_content, dict) else None,
+            )
             if _elicit_action == "decline":
                 try:
                     _int_client = await process_manager.get_client(conversation_id, "any")
@@ -8617,7 +9178,7 @@ def create_runner_app(
                         resolve_launch_config=lambda: _resolve_session_claude_launch_config(
                             session_id
                         ),
-                        record_launch_config=_session_claude_launch_configs.__setitem__,
+                        record_launch_config=_record_session_claude_launch_config,
                     )
 
                 _ensure_build = _claude_ensure_build
@@ -9368,6 +9929,80 @@ def create_runner_app(
             },
         )
 
+    # ── GitHub integration (read-only): PR metadata + the PR's files / diff ──
+    # The list and patch come from the ``gh`` CLI (the PR's "Files changed");
+    # only the per-file expand-context reader uses ``git show``. See
+    # omnigent.runner.github_resource. Each shells out synchronously, so it is
+    # offloaded to a thread like the changed-files / diff routes above (a blocked
+    # loop 503s the session).
+
+    async def _github_workspace_root(session_id: str) -> str:
+        """Resolve the workspace root for GitHub routes, or 404 when headless."""
+        agent_spec = await _require_os_env(session_id)
+        root = resource_registry.compute_default_env_root(session_id, agent_spec)
+        if root is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Session has no filesystem; GitHub API unavailable.",
+            )
+        return root
+
+    @app.get("/v1/sessions/{session_id}/resources/github")
+    async def read_github_info(session_id: str) -> JSONResponse:
+        import asyncio as _asyncio
+
+        from omnigent.runner.github_resource import github_info
+
+        root = await _github_workspace_root(session_id)
+        info = await _asyncio.to_thread(github_info, root)
+        return JSONResponse(status_code=200, content=info)
+
+    @app.get("/v1/sessions/{session_id}/resources/github/changes")
+    async def read_github_changes(session_id: str) -> JSONResponse:
+        import asyncio as _asyncio
+
+        from omnigent.runner.github_resource import github_changed_files
+
+        root = await _github_workspace_root(session_id)
+        result = await _asyncio.to_thread(github_changed_files, root)
+        return JSONResponse(status_code=200, content=result)
+
+    @app.get("/v1/sessions/{session_id}/resources/github/diff")
+    async def read_github_pr_diff(session_id: str) -> JSONResponse:
+        import asyncio as _asyncio
+
+        from omnigent.runner.github_resource import github_pr_diff
+
+        root = await _github_workspace_root(session_id)
+        result = await _asyncio.to_thread(github_pr_diff, root)
+        return JSONResponse(status_code=200, content=result)
+
+    @app.get("/v1/sessions/{session_id}/resources/github/diff/{relative_path:path}")
+    async def read_github_file_diff(
+        session_id: str,
+        relative_path: str,
+        base: str | None = Query(default=None),
+    ) -> JSONResponse:
+        import asyncio as _asyncio
+
+        from omnigent.runner.github_resource import github_file_diff, resolve_base_ref
+
+        # Repo-root-relative paths only; reject traversal even though ``git show``
+        # reads from the object store (not disk) and rejects out-of-tree paths.
+        if relative_path.startswith("/") or any(
+            seg in ("", "..") for seg in relative_path.split("/")
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"code": "invalid_path", "message": "Invalid path"}},
+            )
+        root = await _github_workspace_root(session_id)
+        resolved_base = await _asyncio.to_thread(resolve_base_ref, root, base)
+        result = await _asyncio.to_thread(
+            github_file_diff, root, resolved_base or "", relative_path
+        )
+        return JSONResponse(status_code=200, content=result)
+
     @app.get(
         "/v1/sessions/{session_id}/resources/environments"
         "/{environment_id}/filesystem/{relative_path:path}"
@@ -9380,8 +10015,11 @@ def create_runner_app(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
-    ) -> JSONResponse:
+        download: bool = False,
+    ) -> Response:
         await _require_os_env(session_id)
+        if download:
+            return await _fs_download(session_id, environment_id, relative_path)
         return await _fs_list_or_read(
             session_id,
             environment_id,
@@ -9707,7 +10345,10 @@ def create_runner_app(
         if harness == "opencode-native":
             try:
                 models = await _opencode_native_model_options(session_id)
-                return JSONResponse(status_code=200, content={"models": models})
+                return JSONResponse(
+                    status_code=200,
+                    content={"models": _with_model_configuration_source(session_id, models)},
+                )
             except _CodexNativeModelOptionsNotReady:
                 return JSONResponse(
                     status_code=503,
@@ -9733,9 +10374,10 @@ def create_runner_app(
                     },
                 )
         try:
+            models = await _codex_native_model_options(session_id)
             return JSONResponse(
                 status_code=200,
-                content={"models": await _codex_native_model_options(session_id)},
+                content={"models": _with_model_configuration_source(session_id, models)},
             )
         except _CodexNativeModelOptionsNotReady:
             return JSONResponse(
@@ -9782,7 +10424,10 @@ def create_runner_app(
                     "detail": _client_safe_error_detail(exc, context="kiro-native model options"),
                 },
             )
-        return JSONResponse(status_code=200, content={"models": models})
+        return JSONResponse(
+            status_code=200,
+            content={"models": _with_model_configuration_source(session_id, models)},
+        )
 
     @app.get("/v1/sessions/{session_id}/cursor-model-options")
     async def get_session_cursor_model_options(session_id: str) -> JSONResponse:
@@ -9813,17 +10458,30 @@ def create_runner_app(
             for option in models
             if option.get("id") and option.get("displayName")
         }
-        return JSONResponse(status_code=200, content={"models": models})
+        return JSONResponse(
+            status_code=200,
+            content={"models": _with_model_configuration_source(session_id, models)},
+        )
 
-    # Claude's session listing IS the shared launch catalog: the same
-    # fingerprint-keyed store file the launch resolved against and the
-    # host's pre-launch picker serves — identical by construction, no
-    # separate composition. Cached per session for its lifetime (the launch
-    # config cannot change under it). A cold store pays one probe: a short
-    # inline wait answers a warm one, past that the endpoint answers 503
-    # (the server's fetch retries those) while the store's single-flight
-    # probe completes in the background.
-    _claude_model_options_rows: dict[str, list[dict[str, object]]] = {}
+    def _model_configuration_source(session_id: str) -> dict[str, str] | None:
+        """Return the session's non-secret model-provider coordinates."""
+        from omnigent.model_catalog import model_configuration_source, resolve_model_provider
+
+        spec_entry = _session_spec_cache.get(session_id)
+        if spec_entry is None:
+            return None
+        spec = spec_entry.spec if hasattr(spec_entry, "spec") else spec_entry
+        harness = _session_harness_name(session_id)
+        provider = resolve_model_provider(spec, harness)
+        return model_configuration_source(provider, harness=harness)
+
+    def _with_model_configuration_source(
+        session_id: str, rows: Sequence[Mapping[str, object]]
+    ) -> list[dict[str, object]]:
+        source = _model_configuration_source(session_id)
+        if source is None:
+            return [dict(row) for row in rows]
+        return [{**row, "source": source} for row in rows]
 
     @app.get("/v1/sessions/{session_id}/claude-model-options")
     async def get_session_claude_model_options(session_id: str) -> JSONResponse:
@@ -9831,7 +10489,9 @@ def create_runner_app(
             return JSONResponse(status_code=200, content={"models": []})
         cached = _claude_model_options_rows.get(session_id)
         if cached is not None:
-            return JSONResponse(status_code=200, content={"models": cached})
+            expires_at, cached_rows = cached
+            if time.monotonic() < expires_at:
+                return JSONResponse(status_code=200, content={"models": cached_rows})
         try:
             claude_config = await _resolve_session_claude_launch_config(session_id)
         except click.ClickException as exc:
@@ -9890,7 +10550,11 @@ def create_runner_app(
                     "detail": "the harness model probe failed; retrying",
                 },
             )
-        _claude_model_options_rows[session_id] = rows
+        rows = _with_model_configuration_source(session_id, rows)
+        _claude_model_options_rows[session_id] = (
+            time.monotonic() + _CLAUDE_MODEL_OPTIONS_CACHE_TTL_S,
+            rows,
+        )
         return JSONResponse(status_code=200, content={"models": rows})
 
     @app.get("/v1/sessions/{session_id}/model-options")
@@ -9955,6 +10619,68 @@ def create_runner_app(
         return JSONResponse(
             status_code=200,
             content={"meta_text": format_skill_meta_text(skill, arguments)},
+        )
+
+    async def _fs_download(
+        session_id: str,
+        environment_id: str,
+        path: str,
+    ) -> StreamingResponse:
+        """Serve a file's complete bytes as an attachment.
+
+        The read path inlines content in a JSON envelope, so it caps at
+        ``_MAX_READ_BYTES``. A download streams from a descriptor and needs
+        no cap; ``open_download`` binds that descriptor to what the sandbox
+        can read before a byte is served.
+
+        :param session_id: Session identifier.
+        :param environment_id: Environment resource id.
+        :param path: Path within the environment, or an absolute path.
+        :returns: The file streamed with ``Content-Disposition: attachment``.
+        :raises InvalidPath: If the path names a directory.
+        :raises FilesystemPathNotFound: If nothing the caller may see exists
+            at the path.
+        """
+        from omnigent.runner.environment_filesystem import CallerProcessFilesystem
+
+        await _ensure_session_registered(session_id)
+        agent_spec = await _resolve_session_agent_spec(session_id)
+        env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
+        fobj, resolved, size = await CallerProcessFilesystem(env).open_download(path)
+
+        async def _chunks() -> AsyncIterator[bytes]:
+            # Stop at the size announced in Content-Length so a file growing
+            # underneath the download cannot overrun the response.
+            remaining = size
+            try:
+                while remaining > 0:
+                    chunk = await asyncio.to_thread(fobj.read, min(64 * 1024, remaining))
+                    if not chunk:
+                        # Ending short of Content-Length would hand the client
+                        # a silently incomplete file; abort the transfer instead.
+                        raise RuntimeError(f"{resolved.name} shrank during download")
+                    remaining -= len(chunk)
+                    yield chunk
+            finally:
+                fobj.close()
+
+        # Same header Starlette's FileResponse builds: a plain quoted filename
+        # when it is URL-safe, else the RFC 5987 encoded form.
+        quoted = urllib.parse.quote(resolved.name)
+        disposition = (
+            f'attachment; filename="{resolved.name}"'
+            if quoted == resolved.name
+            else f"attachment; filename*=utf-8''{quoted}"
+        )
+        return StreamingResponse(
+            _chunks(),
+            media_type=mimetypes.guess_type(resolved.name)[0] or "application/octet-stream",
+            headers={
+                "Content-Length": str(size),
+                "Content-Disposition": disposition,
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     async def _fs_list_or_read(
@@ -10297,6 +11023,11 @@ def create_runner_app(
                     status_code=200,
                     content={"error": {"code": -32000, "message": "Missing tool name"}},
                 )
+
+            if tool_name == "sys_read_inbox":
+                # A scan that failed at initialization must not leave the
+                # drain reporting an empty inbox; this is a no-op once done.
+                await _recover_undrained_subagent_results(session_id)
 
             if "__" in tool_name:
                 if mcp_manager is None:
@@ -10722,6 +11453,8 @@ def create_runner_app(
                     msg_body: _JsonObject = {
                         "agent_id": agent_id,
                         "model": agent_id or "",
+                        # Catch-up has no live server dispatch carrying renderer state.
+                        "browser_renderer_available": False,
                     }
                     _turn_task = asyncio.create_task(
                         _run_turn_bg(msg_body, session_id),

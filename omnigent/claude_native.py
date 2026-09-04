@@ -27,6 +27,7 @@ from omnigent.llms.adapters._content import redact_binary_payloads
 from omnigent.runtime.tool_result_replay import (
     blocks_from_parsed_list,
     image_payloads_in_blocks,
+    sanitize_replayed_image_blocks,
     strip_unparseable_image_output,
     tool_result_content_blocks,
 )
@@ -199,6 +200,12 @@ _CLAUDE_CODE_USE_GATEWAY_ENV = "CLAUDE_CODE_USE_GATEWAY"
 #: Kill-switch Claude Code treats as covering nonessential startup traffic;
 #: the probe strips it so speed knobs never mask harness output.
 _CLAUDE_NONESSENTIAL_TRAFFIC_ENV = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+#: Starting page size for the cold-resume history fetch. On a 5xx the fetch
+#: halves the page size down to the floor before giving up — a deployed
+#: backend can choke on one oversized page of a big conversation while the
+#: same rows page fine at smaller sizes.
+_CLAUDE_RESUME_ITEMS_PAGE_LIMIT = 1000
+_CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR = 100
 _CLAUDE_MODEL_PROBE_TIMEOUT_S = 20.0
 #: Wall-clock cap for the per-alias resolution fan-out as a whole; aliases
 #: still unresolved when it expires keep their bare rows (the cache's
@@ -479,6 +486,43 @@ def claude_catalog_serves_model(
     return family is not None and any(
         _claude_family(str(row.get("id") or row.get("model") or "")) == family for row in rows
     )
+
+
+def _endpoint_origin(url: str) -> str:
+    """
+    Reduce an endpoint URL to its scheme and host, for log lines.
+
+    :param url: An endpoint URL, e.g. ``"https://user:pw@gw.example/anthropic?sig=1"``.
+    :returns: The origin only, e.g. ``"https://gw.example"``; the URL itself
+        when it has no scheme.
+    """
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.hostname:
+        return url
+    host = f"{parsed.hostname}:{parsed.port}" if parsed.port else parsed.hostname
+    return f"{parsed.scheme}://{host}"
+
+
+def claude_launch_endpoint_label(claude_config: ClaudeNativeUcodeConfig | None) -> str:
+    """
+    Name where a launch config sends Claude Code's inference, for log lines.
+
+    Only the endpoint's origin is named: a custom base URL can carry userinfo
+    or a signed query string that must not reach the logs.
+
+    :param claude_config: The resolved launch config, or ``None`` (Claude
+        Code's own login).
+    :returns: A short phrase, e.g. ``"the gateway at
+        https://example.databricks.com"``.
+    """
+    if claude_config is not None:
+        bedrock_url = claude_config.env.get(_ANTHROPIC_BEDROCK_BASE_URL_ENV)
+        if bedrock_url:
+            return f"the Bedrock endpoint at {_endpoint_origin(bedrock_url)}"
+        base_url = claude_config.env.get(_UCODE_CLAUDE_BASE_URL_ENV)
+        if base_url:
+            return f"the gateway at {_endpoint_origin(base_url)}"
+    return "Claude Code's own login"
 
 
 def resolve_claude_native_model_selection(
@@ -1219,6 +1263,27 @@ async def claude_launch_catalog(
     )
 
 
+async def claude_reprobed_launch_catalog(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> list[dict[str, object]] | None:
+    """
+    Re-probe this config's catalog now and return the fresh rows.
+
+    For the launch gate's destructive path: a stale entry may predate a
+    provider change, so a pick it does not serve is re-checked against a
+    probe that is awaited rather than left to the background.
+
+    :param claude_config: The resolved launch config, or ``None``.
+    :returns: The fresh rows, or ``None`` when the probe failed.
+    """
+    from omnigent import model_catalog_store
+
+    fingerprint = claude_catalog_fingerprint(claude_config)
+    return await model_catalog_store.reprobe_catalog(
+        "claude-native", fingerprint, lambda: claude_model_catalog(claude_config)
+    )
+
+
 def claude_launch_catalog_is_stale(claude_config: ClaudeNativeUcodeConfig | None) -> bool:
     """
     Whether this config's stored catalog is past the freshness TTL.
@@ -1423,29 +1488,54 @@ def _resolve_session_id_for_resume(
 
     :param base_url: Omnigent server base URL.
     :param headers: HTTP auth headers; ``{}`` for local server.
-    :param session_id: Explicit ``--resume <id>``; wins over the picker.
+    :param session_id: Explicit ``--resume <id>``; wins over the picker
+        and is never host-filtered (diagnostics / migration workflows).
     :param resume_picker: ``True`` for bare ``--resume`` (no value).
     :returns: Conversation id, or ``None`` for "start fresh" / picker cancelled.
-    :raises click.ClickException: Picker requested but no prior sessions exist.
+    :raises click.ClickException: Picker requested but the session list
+        could not be fetched (a persistent rate-limit, an auth/server
+        failure, …) or the local host identity is mis-configured — a
+        concise error, never a raw SDK traceback.
     """
     if session_id is not None:
         return session_id
     if not resume_picker:
         return None
     # Deferred — omnigent_client / repl pull in heavy graphs we don't want at startup.
-    from omnigent_client import OmnigentClient
+    from omnigent_client import OmnigentClient, OmnigentError
 
+    from omnigent.host.identity import load_host_identity_if_present
     from omnigent.repl._resume_picker import pick_conversation_by_wrapper_label_from_sdk
+
+    # Native transcript / workspace state is host-local, so the picker
+    # scopes to sessions bound to THIS machine's host id. Read-only
+    # lookup: a machine that never registered as a host has no id and
+    # the picker lists unfiltered rather than minting an identity here.
+    # A mis-configured identity (only one of the launch env vars set)
+    # raises ValueError — keep that concise too.
+    try:
+        identity = load_host_identity_if_present()
+    except ValueError as exc:
+        raise click.ClickException(
+            f"Could not resolve this machine's host identity: {exc}"
+        ) from exc
+    invoking_host_id = identity.host_id if identity is not None else None
 
     async def _drive() -> str | None:
         async with OmnigentClient(
             base_url=base_url, headers=headers if headers else None
         ) as client:
             return await pick_conversation_by_wrapper_label_from_sdk(
-                client, wrapper_value=_WRAPPER_LABEL_VALUE, agent_name=_AGENT_NAME
+                client,
+                wrapper_value=_WRAPPER_LABEL_VALUE,
+                agent_name=_AGENT_NAME,
+                host_id=invoking_host_id,
             )
 
-    return asyncio.run(_drive())
+    try:
+        return asyncio.run(_drive())
+    except OmnigentError as exc:
+        raise click.ClickException(f"Could not list sessions to resume: {exc}") from exc
 
 
 def _align_working_directory_with_session(
@@ -2060,7 +2150,7 @@ def _fetch_external_session_id_for_redirect(
         if resp.status_code >= 400:
             return None
         payload = resp.json()
-    except Exception:  # noqa: BLE001 - optional redirect preflight
+    except Exception:  # noqa: BLE001
         _logger.warning(
             "failed to fetch external Claude session id for redirect; session=%s",
             session_id,
@@ -2563,7 +2653,7 @@ def _ucode_config_for_profile(
             live_catalog = discover_databricks_claude_catalog(creds.host, creds.token)
             live_models = live_catalog.families
             routable_models = live_catalog.model_ids
-        except Exception:  # noqa: BLE001 — cached ucode state is the launch fallback
+        except Exception:  # noqa: BLE001
             _logger.warning(
                 "native-claude: live Databricks model discovery failed for profile %r; "
                 "using cached ucode models",
@@ -3091,7 +3181,7 @@ def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
 
     try:
         spec = load_agent_spec(spec_path, expand_env=False)
-    except Exception:  # noqa: BLE001 — best-effort; never block the launch
+    except Exception:  # noqa: BLE001
         _logger.warning(
             "Could not resolve raw instructions from wrapper spec %s",
             spec_path,
@@ -3498,6 +3588,7 @@ async def _attach_with_transcript_forwarder(
                 attach_url=attach_url,
                 headers=headers,
                 recover=recover,
+                session_name="Claude",
                 base_url=base_url,
                 session_id=prepared.session_id,
                 terminal_id=prepared.terminal_id,
@@ -3511,7 +3602,7 @@ async def _attach_with_transcript_forwarder(
                 await forwarder
             except asyncio.CancelledError:
                 pass
-            except Exception:  # noqa: BLE001 — cleanup must run regardless
+            except Exception:  # noqa: BLE001
                 # The forwarder is best-effort mirroring. A bug there
                 # (corrupt transcript JSONL, file-system error, anything
                 # uncaught in the parser) must not skip the Omnigent terminal
@@ -3541,6 +3632,7 @@ async def _attach_with_reconnect(
     attach_url: str,
     headers: dict[str, str],
     recover: Callable[[], Awaitable[None]] | None,
+    session_name: str = "Claude",
     base_url: str | None = None,
     session_id: str | None = None,
     terminal_id: str | None = None,
@@ -3571,6 +3663,8 @@ async def _attach_with_reconnect(
         (not before the first). ``None`` disables reconnect; the
         loop returns after one ``attach`` call. Callback exceptions
         are logged and the loop still retries.
+    :param session_name: User-facing native session name used in reconnect
+        messages, e.g. ``"Claude"`` or ``"Codex"``.
     :param base_url: Omnigent server URL for the post-close terminal probe;
         ``None`` disables the probe.
     :param session_id: Session/conversation id for the probe path.
@@ -3606,9 +3700,10 @@ async def _attach_with_reconnect(
         if not first_attempt and recover is not None:
             try:
                 await recover()
-            except Exception:  # noqa: BLE001 — best-effort recovery
+            except Exception:  # noqa: BLE001
                 _logger.warning(
-                    "claude-native reconnect recovery callback raised; retrying attach anyway",
+                    "%s-native reconnect recovery callback raised; retrying attach anyway",
+                    session_name.lower(),
                     exc_info=True,
                 )
         first_attempt = False
@@ -3667,14 +3762,15 @@ async def _attach_with_reconnect(
             if recover is None:
                 raise
             click.echo(
-                f"\nClaude session connection lost ({exc}); reconnecting...",
+                f"\n{session_name} session connection lost ({exc}); reconnecting...",
                 err=True,
             )
         except (WebSocketException, OSError, ConnectionError) as exc:
             if recover is None:
                 raise
             click.echo(
-                f"\nClaude session connection lost ({type(exc).__name__}: {exc}); reconnecting...",
+                f"\n{session_name} session connection lost "
+                f"({type(exc).__name__}: {exc}); reconnecting...",
                 err=True,
             )
         else:
@@ -3693,7 +3789,7 @@ async def _attach_with_reconnect(
                     )
                     return _AttachOutcome.EXITED
             click.echo(
-                "\nClaude session connection closed by server; reconnecting...",
+                f"\n{session_name} session connection closed by server; reconnecting...",
                 err=True,
             )
         await _sleep(delay)
@@ -4756,7 +4852,25 @@ async def _ensure_local_claude_resume_transcript(
     target_dir = _claude_project_dir_for_cwd(current)
     target = target_dir / f"{external_session_id}.jsonl"
 
-    items = await _fetch_all_session_items_for_claude_resume(client, session_id)
+    try:
+        items = await _fetch_all_session_items_for_claude_resume(client, session_id)
+    except _ResumeHistoryUnavailableError:
+        # Server history is unreachable (5xx / dropped connections at every
+        # page size), but an intact local transcript from a previous run on
+        # this machine can still resume the conversation — far better than
+        # silently starting blank. It may be somewhat stale relative to the
+        # server, which the resumed session tolerates. 4xx contract errors
+        # (plain ClickException) still propagate: the server explicitly
+        # rejected the conversation, so reviving local history is unsafe.
+        if _is_resumable_claude_transcript(target):
+            _logger.warning(
+                "Could not fetch server history for %r; resuming from the "
+                "existing local transcript %s",
+                session_id,
+                target,
+            )
+            return target
+        raise
     # Items are persisted with unresolved file_id attachment blocks;
     # fetch the bytes back so the rebuilt transcript can reference a
     # live local file instead of silently dropping the attachment.
@@ -4790,6 +4904,47 @@ async def _ensure_local_claude_resume_transcript(
     return target
 
 
+def _is_resumable_claude_transcript(path: Path) -> bool:
+    """
+    Whether *path* holds a transcript ``claude --resume`` can start from.
+
+    ``--resume`` against an empty or non-JSONL file exits fatally instead of
+    starting, which for claude-native (terminal == agent) kills the session.
+    A transcript qualifies when at least one line parses as a JSON object —
+    the minimum Claude Code accepts as a conversation record.
+
+    :param path: Candidate ``<sid>.jsonl`` transcript path.
+    :returns: ``True`` when the file exists and holds a JSON-object line.
+    """
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    return False
+                return isinstance(record, dict)
+    except (OSError, UnicodeDecodeError):
+        # A binary/non-UTF-8 file raises mid-iteration, outside the per-line
+        # JSON guard — it is just as unresumable as non-JSONL content.
+        return False
+    return False
+
+
+class _ResumeHistoryUnavailableError(click.ClickException):
+    """Server history stayed unreachable after every page-size retry.
+
+    Distinct from a plain :class:`click.ClickException` so callers can tell
+    "the backend cannot serve the rows right now" (a local-transcript
+    fallback is safe) apart from 4xx contract errors (the server explicitly
+    rejected the conversation — resuming local history could revive the
+    wrong session).
+    """
+
+
 async def _fetch_all_session_items_for_claude_resume(
     client: httpx.AsyncClient,
     session_id: str,
@@ -4807,14 +4962,54 @@ async def _fetch_all_session_items_for_claude_resume(
     """
     items: list[_JsonObject] = []
     after: str | None = None
+    limit = _CLAUDE_RESUME_ITEMS_PAGE_LIMIT
     while True:
-        params: dict[str, str | int] = {"limit": 1000, "order": "asc"}
+        params: dict[str, str | int] = {"limit": limit, "order": "asc"}
         if after is not None:
             params["after"] = after
-        resp = await client.get(
-            f"/v1/sessions/{url_component(session_id)}/items",
-            params=params,
-        )
+        try:
+            resp = await client.get(
+                f"/v1/sessions/{url_component(session_id)}/items",
+                params=params,
+            )
+        except httpx.TransportError as exc:
+            # A backend choking on one oversized page can also drop the
+            # connection mid-response instead of returning a clean 5xx;
+            # treat it the same way and retry the page smaller. Broad on
+            # purpose: total connectivity loss also degrades to the floor,
+            # then the local-transcript fallback rescues the resume.
+            if limit > _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR:
+                limit = max(limit // 2, _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR)
+                _logger.warning(
+                    "History page fetch for %r failed (%s); retrying at smaller limit=%d",
+                    session_id,
+                    type(exc).__name__,
+                    limit,
+                )
+                continue
+            raise _ResumeHistoryUnavailableError(
+                f"Failed to fetch history for {session_id!r}: {exc}"
+            ) from exc
+        if resp.status_code >= 500 and limit > _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR:
+            # A deployed backend can fail reading one LARGE page of a big
+            # conversation while serving the same rows fine at smaller page
+            # sizes. The history is recoverable, so retry this page smaller
+            # instead of abandoning the resume (which silently launches a
+            # blank session). 4xx responses are contract errors and still
+            # raise immediately below.
+            limit = max(limit // 2, _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR)
+            _logger.warning(
+                "History page fetch for %r failed (%s); retrying at smaller limit=%d",
+                session_id,
+                resp.status_code,
+                limit,
+            )
+            continue
+        if resp.status_code >= 500:
+            raise _ResumeHistoryUnavailableError(
+                f"Failed to fetch history for {session_id!r} "
+                f"({resp.status_code}): {error_text(resp)}"
+            )
         if resp.status_code >= 400:
             raise click.ClickException(
                 f"Failed to fetch history for {session_id!r} "
@@ -4975,6 +5170,7 @@ def _claude_transcript_records_from_session_items(
                         parent_uuid=parent_uuid,
                         cwd=cwd,
                         bridge_dir=bridge_dir,
+                        allow_native_message_content=True,
                     )
                     if cm_record is not None:
                         records.append(cm_record)
@@ -5013,6 +5209,7 @@ def _claude_transcript_record_from_session_item(
     parent_uuid: str | None,
     cwd: Path,
     bridge_dir: Path,
+    allow_native_message_content: bool = False,
 ) -> _JsonObject | None:
     """
     Convert one Omnigent item into one Claude transcript record.
@@ -5036,6 +5233,8 @@ def _claude_transcript_record_from_session_item(
         ``Path("/home/me/repo")``.
     :param bridge_dir: Session bridge directory for re-materializing
         attachment blocks.
+    :param allow_native_message_content: Accept Claude-native string and
+        content-block shapes when API-block conversion finds no content.
     :returns: Claude transcript record, or ``None`` for unsupported or
         empty Omnigent items.
     """
@@ -5047,12 +5246,18 @@ def _claude_transcript_record_from_session_item(
         role = item.get("role")
         if role == "user":
             user_content = _claude_user_content_from_api_blocks(item.get("content"), bridge_dir)
+            if user_content is None and allow_native_message_content:
+                user_content = _claude_native_message_content(item.get("content"), role="user")
             if user_content is None:
                 return None
             record_type = "user"
             message = {"role": "user", "content": user_content}
         elif role == "assistant":
             assistant_content = _claude_assistant_content_from_api_blocks(item.get("content"))
+            if assistant_content is None and allow_native_message_content:
+                assistant_content = _claude_native_message_content(
+                    item.get("content"), role="assistant"
+                )
             if assistant_content is None:
                 return None
             record_type = "assistant"
@@ -5131,6 +5336,33 @@ def _claude_transcript_record_from_session_item(
         "message": message,
         **extra,
     }
+
+
+def _claude_native_message_content(
+    content: object,
+    *,
+    role: str,
+) -> str | list[_JsonObject] | None:
+    """Validate Claude-native message content for transcript reconstruction."""
+    if isinstance(content, str):
+        if not content:
+            return None
+        if role == "assistant":
+            return [{"type": "text", "text": content}]
+        return content
+    if not isinstance(content, list) or not content:
+        return None
+    blocks: list[_JsonObject] = []
+    for value in content:
+        block = _json_object(value)
+        if block is None or not isinstance(block.get("type"), str):
+            return None
+        blocks.append(block)
+    # A compaction snapshot strips image base64 to a marker; replayed verbatim
+    # that marker reaches the provider as source.data and fails the resume, so
+    # downgrade any unusable image block to its omitted-image placeholder.
+    sanitized = sanitize_replayed_image_blocks(blocks)
+    return cast(list[_JsonObject], sanitized)
 
 
 def _synthetic_claude_transcript_uuid(

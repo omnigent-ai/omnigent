@@ -494,6 +494,40 @@ class CodexAppServerResponseError(RuntimeError):
         super().__init__(str(error))
 
 
+#: JSON-RPC internal-error code codex returns when its thread-store fails.
+_CODEX_INTERNAL_ERROR_CODE = -32603
+
+#: Substring in codex's ``-32603`` message when its thread-store cannot
+#: load/resume a thread's rollout — stable across the wrapper phrasings
+#: different codex versions use (``failed to read thread: …`` vs
+#: ``error resuming thread: …``).
+_CODEX_THREAD_STORE_ERROR = "thread-store internal error"
+
+
+def is_unreadable_thread_error(exc: BaseException) -> bool:
+    """
+    Whether a ``thread/resume`` failure means codex cannot load the thread.
+
+    Codex answers ``-32603`` with a ``thread-store internal error`` when it
+    cannot load or resume a thread's rollout JSONL — e.g. a large transcript
+    whose multibyte character straddles a read-buffer boundary is rejected as
+    invalid UTF-8 (``failed to read thread: …``), or a rollout record it
+    cannot resume (``error resuming thread: …``). Retrying never resumes such
+    a thread, unlike a refused resume (``-32600``, another writer holds the
+    thread) that clears once the holder exits.
+
+    :param exc: The exception raised by the resume request, e.g. a
+        :class:`CodexAppServerResponseError`.
+    :returns: ``True`` when only a fresh thread can carry the session on.
+    """
+    return (
+        isinstance(exc, CodexAppServerResponseError)
+        and exc.code == _CODEX_INTERNAL_ERROR_CODE
+        and exc.message is not None
+        and _CODEX_THREAD_STORE_ERROR in exc.message
+    )
+
+
 class CodexAppServerClient:
     """JSON-RPC client for a Codex app-server.
 
@@ -862,10 +896,15 @@ def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
     Persistent (unlike the hermetic discovery's temp dir) so Codex's own
     ``models_cache.json`` ETag handling makes repeat probes cheap; keyed by
     the override set so a provider change never replays another provider's
-    cache. The account's real ``auth.json`` is symlinked in, the same way
-    a session launch links it: the credential decides which models the
-    account's catalog lists (login-gated entries, the account default), so
-    a credential-less probe answers for a catalog no session will see.
+    cache.
+
+    Materialized by the same bridge a session launch uses, in its minimal
+    shape. Both halves matter: the credential decides which models the
+    account's catalog lists (login-gated entries, the account default), and
+    the provider tables decide whether Codex loads its config at all, since
+    an override naming a ``model_provider`` the home does not define fails
+    config load outright. Minimal keeps the probe from starting the user's
+    MCPs, hooks and plugins.
 
     :param config_overrides: The probe's ``-c`` overrides.
     :returns: The created ``CODEX_HOME`` directory.
@@ -873,13 +912,11 @@ def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
     key = hashlib.sha256("\n".join(config_overrides).encode("utf-8")).hexdigest()[:12]
     home = Path.home() / ".omnigent" / "cache" / "codex-model-probe" / key
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
-    real_auth = _codex_home_config_source_from_env() / "auth.json"
-    probe_auth = home / "auth.json"
-    if real_auth.exists():
-        with contextlib.suppress(OSError):
-            if probe_auth.is_symlink() or probe_auth.exists():
-                probe_auth.unlink()
-            probe_auth.symlink_to(real_auth)
+    # The bridge skips files that already exist, and config.toml is copied
+    # (not symlinked), so drop the copy to re-read an edited source config.
+    with contextlib.suppress(OSError):
+        (home / "config.toml").unlink(missing_ok=True)
+    _populate_codex_home_config(home, _codex_home_config_source_from_env(), minimal_config=True)
     return home
 
 
@@ -1128,6 +1165,14 @@ class CodexNativeAppServer:
         session config before startup. Runner-owned headless sessions set
         this because nobody can answer Codex's project-trust TUI prompt.
         Interactive CLI sessions leave it disabled.
+    :param trust_all_hooks: Whether to persist trust for every merged hook
+        (user hooks included) during :meth:`start`. Runner-owned headless
+        sessions set this because codex ignores their
+        ``--dangerously-bypass-hook-trust`` flag for the startup
+        hook-review screen on a persistent ``resume`` attach; persisted
+        trust keeps that interactive screen from stranding a resumed web
+        session (see :func:`trust_all_codex_hooks`). Interactive CLI
+        sessions leave it disabled so a human reviews their own hooks.
     :param policy_notice_pending: One-shot flag: ``True`` once a degrade
         reason is recorded, until the runner's terminal-ensure handler
         surfaces it to Omnigent (which posts a single durable banner). Prevents
@@ -1157,6 +1202,7 @@ class CodexNativeAppServer:
     process_owner_lock: CodexNativeProcessOwnerLock | None = None
     codex_cli_version: tuple[int, int, int] | None = None
     trust_project: bool = False
+    trust_all_hooks: bool = False
     router_hooks_registered: bool = False
 
     async def start(self) -> None:
@@ -1390,6 +1436,31 @@ class CodexNativeAppServer:
                 except Exception:  # noqa: BLE001 - routing trust never blocks startup
                     _logger.warning(
                         "codex subagent-routing hook trust failed; routing will not be enforced",
+                        exc_info=True,
+                    )
+            # Runner-owned sessions launch the TUI with
+            # ``--dangerously-bypass-hook-trust``, but codex ignores that flag
+            # for the startup hook-review screen on a persistent ``resume``
+            # attach, stranding a resumed web session behind the interactive
+            # "Hooks need review" prompt. Persist trust for every merged hook so
+            # the review finds nothing to review. Best effort: a failure only
+            # risks the review screen reappearing, never blocks startup.
+            if self.trust_all_hooks:
+                try:
+                    still_untrusted = await trust_all_codex_hooks(
+                        client.request, cwd=str(self.cwd)
+                    )
+                    if still_untrusted:
+                        _logger.warning(
+                            "codex hook trust-all left %d hook(s) untrusted; the startup "
+                            "hook-review screen may still appear on resume: %s",
+                            len(still_untrusted),
+                            ", ".join(still_untrusted),
+                        )
+                except Exception:  # noqa: BLE001 - trust-all never blocks startup
+                    _logger.warning(
+                        "codex hook trust-all failed; the startup hook-review screen "
+                        "may appear on resume",
                         exc_info=True,
                     )
         except RuntimeError as exc:
@@ -1724,19 +1795,22 @@ def _write_codex_policy_hooks_file(
     _ = write_codex_hooks_file(codex_home, payloads, user_hooks_source=user_hooks_source)
 
 
-def _our_hooks_from_list(listed: _JsonObject, cwd: str, module: str) -> list[_JsonObject]:
+def _our_hooks_from_list(listed: _JsonObject, cwd: str, module: str | None) -> list[_JsonObject]:
     """
-    Extract the hooks for *cwd* whose command runs *module*.
+    Extract the hooks for *cwd*, optionally only those running *module*.
 
-    Filtering by module keeps the trust step from ever touching hooks the
-    user's own ``hooks.json`` contributed to the merged file.
+    Filtering by module keeps a trust step from ever touching hooks the
+    user's own ``hooks.json`` contributed to the merged file. Pass
+    ``module=None`` to return every hook for *cwd* (used by the
+    runner-owned trust-all pass, which deliberately covers user hooks —
+    see :func:`trust_all_codex_hooks`).
 
     :param listed: Parsed ``hooks/list`` response envelope, with
         ``result.data`` a list of ``{cwd, hooks: [...]}`` entries.
     :param cwd: The cwd whose hook set to read, e.g.
         ``"/home/user/repo"``.
-    :param module: Hook-script module marker, e.g.
-        ``"omnigent.codex_native_hook"``.
+    :param module: Hook-script module marker to filter on, e.g.
+        ``"omnigent.codex_native_hook"``; ``None`` returns all hooks.
     :returns: The matching hook metadata dicts (possibly empty), each
         with ``key``, ``currentHash``, ``trustStatus``.
     """
@@ -1752,7 +1826,7 @@ def _our_hooks_from_list(listed: _JsonObject, cwd: str, module: str) -> list[_Js
                 hook
                 for raw_hook in hooks
                 if (hook := _string_object_dict(raw_hook)) is not None
-                and module in str(hook.get("command", ""))
+                and (module is None or module in str(hook.get("command", "")))
             ]
     return []
 
@@ -1933,6 +2007,57 @@ async def trust_codex_router_hooks(request: CodexRequestFn, *, cwd: str) -> list
         len(ours),
         ", ".join(sorted(str(h.get("eventName")) for h in ours)),
     )
+    return []
+
+
+async def trust_all_codex_hooks(request: CodexRequestFn, *, cwd: str) -> list[str]:
+    """
+    Persist trust for every hook discovered for *cwd*, user hooks included.
+
+    Runner-owned native sessions launch the TUI with
+    ``--dangerously-bypass-hook-trust``, which already runs every enabled
+    hook regardless of trust state. But codex only honors that flag for the
+    interactive startup hook-review *screen* when the session is not a
+    persistent resume: it computes ``bypass_hook_trust && !is_persistent_resume``,
+    and an Omnigent ``resume <thread_id> --remote`` attach is a persistent
+    resume. So a resumed web/headless session drops back to the interactive
+    "Hooks need review" screen that nobody can answer, stranding the queued
+    chat message. Persisting trust for the merged hooks (the same
+    ``hooks/list`` -> ``config/batchWrite`` flow the TUI's own "Trust all"
+    button uses) makes codex's startup review find nothing to review, so the
+    screen never appears — on a fresh launch or a resume alike.
+
+    This is not a new trust surface: these sessions already execute the very
+    same hooks unconditionally via the bypass flag. It only makes the
+    persisted trust state match that already-chosen behavior. Interactive
+    ``omnigent codex`` sessions never call this — a human at the terminal
+    reviews their own new or changed hooks.
+
+    Best-effort: a trust failure here only means the review screen may still
+    appear, so it returns the still-untrusted keys instead of raising.
+
+    :param request: Bound app-server JSON-RPC request coroutine, e.g.
+        ``client.request``.
+    :param cwd: The session cwd the hooks are scoped to, e.g.
+        ``"/home/user/repo"``.
+    :returns: Keys of hooks still untrusted afterwards; empty when every
+        discovered hook is trusted (or none are).
+    """
+    listed = await request("hooks/list", {"cwds": [cwd]})
+    all_hooks = _our_hooks_from_list(listed, cwd, None)
+    untrusted = [h for h in all_hooks if h.get("trustStatus") not in _TRUSTED_HOOK_STATUSES]
+    if not untrusted:
+        return []
+    await _persist_hook_trust(request, untrusted)
+    relisted = await request("hooks/list", {"cwds": [cwd]})
+    still_untrusted = [
+        h
+        for h in _our_hooks_from_list(relisted, cwd, None)
+        if h.get("trustStatus") not in _TRUSTED_HOOK_STATUSES
+    ]
+    if still_untrusted:
+        return [str(h.get("key")) for h in still_untrusted]
+    _logger.info("codex hook trust-all: trusted %d hook(s) for cwd %s", len(untrusted), cwd)
     return []
 
 
@@ -2160,6 +2285,7 @@ def build_codex_native_server(
     developer_instructions: str | None = None,
     bypass_sandbox: bool = False,
     trust_project: bool = False,
+    trust_all_hooks: bool = False,
 ) -> CodexNativeAppServer:
     """
     Build a configured native Codex app-server process wrapper.
@@ -2198,6 +2324,12 @@ def build_codex_native_server(
     :param trust_project: Whether to trust ``cwd`` in the private session
         config before app-server startup. Intended for runner-owned headless
         sessions whose hidden TUI cannot answer Codex's project-trust prompt.
+    :param trust_all_hooks: Whether to persist trust for every merged hook
+        during startup. Intended for runner-owned headless sessions whose
+        ``--dangerously-bypass-hook-trust`` flag codex ignores for the
+        startup hook-review screen on a persistent ``resume`` attach (see
+        :func:`trust_all_codex_hooks`). Interactive CLI sessions leave it
+        disabled so a human reviews their own new or changed hooks.
     :returns: Configured app-server process wrapper.
     :raises ImportError: If no Codex CLI is available.
     :raises OSError: If Databricks routing was requested but no
@@ -2260,6 +2392,7 @@ def build_codex_native_server(
         python_executable=python_executable,
         pinned_model=pinned_model,
         trust_project=trust_project,
+        trust_all_hooks=trust_all_hooks,
     )
 
 
@@ -2953,16 +3086,37 @@ def client_for_transport(
 def normalize_codex_permission_launch_args(
     terminal_launch_args: Sequence[str] | None,
 ) -> list[str]:
-    """Complete legacy Full Access args with their approval policy."""
+    """Complete permission launch args into their effective stance.
+
+    Two normalizations:
+
+    - Legacy Full Access args (a ``default_permissions=":danger-full-access"``
+      profile with no approval policy) gain ``approval_policy="never"``.
+    - The bare default stance — no approval policy, sandbox, permission
+      profile, reviewer, or bypass flag — gains
+      ``approvals_reviewer="auto_review"``. Codex's built-in default routes
+      escalated approvals (e.g. an out-of-workspace write) to the human,
+      which parks web turns on an approval card even though the default
+      permission mode is presented as automatic. ``auto_review`` keeps the
+      workspace-write sandbox and approval boundaries but lets Codex's
+      automatic reviewer settle eligible requests instead of prompting.
+      Any explicit approval/sandbox/reviewer/profile choice wins untouched.
+    """
     args = list(terminal_launch_args or ())
     full_access = False
+    has_permission_profile = False
+    has_reviewer = False
+    has_sandbox = False
     has_approval_policy = "--dangerously-bypass-approvals-and-sandbox" in args
+    explicit_bypass = has_approval_policy
     index = 0
     while index < len(args):
         arg = args[index]
         assignment: str | None = None
         if arg in {"--ask-for-approval", "-a"} or arg.startswith(("--ask-for-approval=", "-a=")):
             has_approval_policy = True
+        elif arg in {"--sandbox", "-s"} or arg.startswith(("--sandbox=", "-s=")):
+            has_sandbox = True
         elif arg in {"--config", "-c"} and index + 1 < len(args):
             index += 1
             assignment = args[index]
@@ -2970,13 +3124,28 @@ def normalize_codex_permission_launch_args(
             assignment = arg.split("=", 1)[1]
         if assignment is not None:
             key, _, raw_value = assignment.partition("=")
-            if key.strip() == "approval_policy":
+            key = key.strip()
+            if key == "approval_policy":
                 has_approval_policy = True
-            elif key.strip() == "default_permissions":
+            elif key == "sandbox_mode":
+                has_sandbox = True
+            elif key == "approvals_reviewer":
+                has_reviewer = True
+            elif key == "default_permissions":
+                has_permission_profile = True
                 full_access = _codex_config_string(raw_value) == ":danger-full-access"
         index += 1
     if full_access and not has_approval_policy:
         args.extend(["-c", 'approval_policy="never"'])
+        has_approval_policy = True
+    if not (
+        explicit_bypass
+        or has_approval_policy
+        or has_sandbox
+        or has_reviewer
+        or has_permission_profile
+    ):
+        args.extend(["-c", 'approvals_reviewer="auto_review"'])
     return args
 
 

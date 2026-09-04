@@ -117,6 +117,7 @@ from omnigent.process_logging import (
     env_truthy,
     open_process_log_file,
     process_log_dir,
+    should_log_to_stderr,
 )
 from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 from omnigent.runner.identity import (
@@ -143,6 +144,8 @@ from omnigent.runner.transports.ws_tunnel.limits import (
 from omnigent.runtime.websocket_metrics import (
     record_websocket_connected,
     record_websocket_disconnected,
+    websocket_close_code,
+    websocket_close_reason,
 )
 from omnigent.suspend_watch import watch_for_resume
 from omnigent.tls import client_ssl_context
@@ -387,6 +390,10 @@ except ValueError:
 # full default timeout on each reconnect after an established tunnel drops.
 _INITIAL_CONNECT_OPEN_TIMEOUT_S = 10.0
 _RECONNECT_OPEN_TIMEOUT_S = 3.0
+# Consecutive handshake recycle failures before the prompt cadence gives way
+# to normal backoff. An ingress cycle is brief; sustained 502 responses are an
+# outage and shouldn't hammer the endpoint twice a second.
+_RECYCLE_PROMPT_MAX_STREAK = 10
 # Fresh hosts get a short auth-retry window for Databricks OAuth refreshes.
 # Established hosts retry auth failures indefinitely to preserve sessions.
 _MAX_CONSECUTIVE_AUTH_ERRORS = 3
@@ -553,6 +560,13 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # auth, which fails for non-AWS proxies. Same rationale as
         # CLAUDE_CODE_USE_BEDROCK above. Safe to propagate: not a secret.
         "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+        # Claude Code's telemetry opt-in: a non-secret boolean the claude-sdk
+        # harness reads to export claude_code.* metrics/events. Must survive
+        # the CLI→daemon→runner env strips alongside its OTEL_* exporter
+        # config (prefix allowlist) and OMNIGENT_TELEMETRY_ENABLED below —
+        # otherwise a background daemon silently disables Claude Code
+        # telemetry that a foreground run exports fine.
+        "CLAUDE_CODE_ENABLE_TELEMETRY",
         # Non-secret Claude Code flags the native-claude provider path reads from
         # os.environ. If stripped, the runner re-adds CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1,
         # which turns off MCP tool search and loads every tool schema eagerly.
@@ -869,6 +883,29 @@ class ModelOptionsResult:
     routable_models: list[str]
 
 
+def _model_configuration_source_for_harness(harness: str) -> dict[str, str] | None:
+    """Resolve the host's ambient model provider without exposing credentials."""
+    from omnigent.model_catalog import model_configuration_source, resolve_model_provider
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="host-model-preview",
+        executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+    )
+    provider = resolve_model_provider(spec, harness)
+    return model_configuration_source(provider, harness=harness)
+
+
+def _with_model_configuration_source(
+    models: list[dict[str, object]], harness: str
+) -> list[dict[str, object]]:
+    source = _model_configuration_source_for_harness(harness)
+    if source is None:
+        return models
+    return [{**model, "source": source} for model in models]
+
+
 @dataclass
 class _RunnerHandle:
     """A spawned runner subprocess and where its output lands.
@@ -971,6 +1008,7 @@ class HostProcess:
         # Consecutive connections that were accepted but died without a single
         # inbound frame; reset by any received frame or a rejected upgrade.
         # Past a bound the reconnect loop escalates instead of fast-recycling.
+        self._recycle_streak = 0
         self._silent_connect_streak = 0
         # Per-connection markers feeding the silent-connect streak.
         self._conn_upgrade_accepted = False
@@ -1488,10 +1526,12 @@ class HostProcess:
                 "registered to a different account on this server, so the "
                 "account you authenticated as cannot claim it. This usually "
                 "means the host was first registered under another identity "
-                "(e.g. the single-user 'local' owner before the server "
-                "switched to accounts auth). Ask an administrator to remove "
-                "the existing host registration, or reset this machine's host "
-                "id, then retry. " + self._login_fix_hint()
+                "(e.g. an M2M service principal selected from "
+                "~/.databrickscfg, or the single-user 'local' owner before "
+                "the server switched to accounts auth). Run "
+                f"`{cli_invocation()} host reset-id` to mint a fresh host id "
+                "for this machine and retry, or ask an administrator to "
+                "remove the existing host registration. " + self._login_fix_hint()
             )
         # Any other permanent 4xx (e.g. a 400 for a malformed host id, or an
         # edge/proxy rejection): the server's own body is the authoritative
@@ -2548,11 +2588,12 @@ class HostProcess:
         """Serve a read-only workspace filesystem request from the host.
 
         Runs :class:`omnigent.workspace_fs.WorkspaceReader` against the
-        session's workspace so the web UI's file panel keeps working when
-        the runner is offline but the host still holds the workspace on
-        disk. Read-only and confined to the workspace root; never writes
-        or runs a shell. Called inside a worker thread by the dispatcher
-        because git / directory-walk work can block.
+        session's workspace so the web UI's file and GitHub panels keep
+        working when the runner is offline but the host still holds the
+        workspace on disk. Read-only and confined to the workspace root; it
+        never writes, but does run read-only ``git`` (status/show/diff) and,
+        for the GitHub ops, the developer's own ``gh`` CLI. Called inside a
+        worker thread by the dispatcher because that work can block.
 
         :param frame: The fs request frame (op + workspace + params).
         :returns: A result frame with the runner-shaped payload, or an
@@ -2693,6 +2734,7 @@ class HostProcess:
         re-reads that authoritative snapshot after bind.
         """
         harness = canonicalize_harness(frame.harness) or frame.harness
+        with_source = functools.partial(_with_model_configuration_source, harness=harness)
         if harness == "codex-native":
             # Harness-truth lane: every launch shape is answered from the
             # shared catalog, probed from the configured Codex binary itself.
@@ -2703,7 +2745,7 @@ class HostProcess:
                 return HostModelOptionsResultFrame(
                     request_id=frame.request_id,
                     status="ok",
-                    models=probed.models,
+                    models=with_source(probed.models),
                     routable_models=probed.routable_models,
                 )
             return HostModelOptionsResultFrame(
@@ -2728,7 +2770,7 @@ class HostProcess:
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,
                 status="ok",
-                models=pi_models,
+                models=with_source(pi_models),
             )
 
         if is_claude_sdk_harness_name(harness):
@@ -2764,13 +2806,15 @@ class HostProcess:
                     return HostModelOptionsResultFrame(
                         request_id=frame.request_id,
                         status="ok",
-                        models=probed.models,
+                        models=with_source(probed.models),
                         routable_models=probed.routable_models,
                     )
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,
                 status="ok",
-                models=[{"id": model.id, "displayName": model.id} for model in listing.models],
+                models=with_source(
+                    [{"id": model.id, "displayName": model.id} for model in listing.models]
+                ),
                 routable_models=[model.id for model in listing.models],
             )
         if harness != "claude-native":
@@ -2784,7 +2828,7 @@ class HostProcess:
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,
                 status="ok",
-                models=probed.models,
+                models=with_source(probed.models),
                 routable_models=probed.routable_models,
             )
         return HostModelOptionsResultFrame(
@@ -2834,6 +2878,17 @@ class HostProcess:
                 exclude=cast("str | None", params.get("exclude")),
                 limit=_coerce_int(params.get("limit", 500)),
             )
+        if op == "github_info":
+            return r.github_info()
+        if op == "github_changes":
+            return r.github_changes()
+        if op == "github_diff":
+            return r.github_file_diff(
+                cast("str | None", params.get("base")),
+                str(params.get("path", "")),
+            )
+        if op == "github_pr_diff":
+            return r.github_pr_diff()
         raise ValueError(f"unknown fs op: {op!r}")
 
     async def _handle_create_worktree(
@@ -3103,6 +3158,23 @@ class HostProcess:
         self._reaper_task = asyncio.create_task(
             self._orphan_reaper_loop(), name="host-orphan-reaper"
         )
+        # Reap per-session native-harness bridge dirs orphaned by a runner
+        # that died uncleanly (crash / SIGKILL / host restart mid-run). The
+        # runner performs the same sweep at its own startup, but after a
+        # crash no new runner may ever launch on this machine, so the host
+        # (re)start is the reliable moment to reclaim them. Best-effort and
+        # off-loop: a sweep failure must never block host registration.
+        from omnigent.native_bridge_common import reap_orphaned_native_bridge_dirs
+
+        try:
+            reaped_bridge_dirs = await asyncio.to_thread(reap_orphaned_native_bridge_dirs)
+            if reaped_bridge_dirs:
+                _logger.info(
+                    "Reaped %d orphaned native bridge dir(s) from prior runs",
+                    reaped_bridge_dirs,
+                )
+        except Exception:  # noqa: BLE001 — housekeeping must never block registration
+            _logger.debug("native bridge-dir orphan sweep failed", exc_info=True)
         # Detect wake from system suspend (laptop sleep) and force-drop the
         # then-dead tunnel so the reconnect loop reattaches within seconds
         # instead of waiting out the ~90s keepalive ping timeout.
@@ -3230,11 +3302,14 @@ class HostProcess:
                     # so the overlap window closes and the tunnel settles (and a
                     # genuinely persistent failure surfaces instead of a silent
                     # tight loop).
-                    reason = str(exc).lower()
-                    explicit_recycle = any(
-                        t in reason for t in ("1012", "service restart", "1001", "going away")
+                    close_code = websocket_close_code(exc)
+                    close_reason = (websocket_close_reason(exc) or "").lower()
+                    explicit_recycle = close_code in {1001, 1012} or any(
+                        token in close_reason for token in ("service restart", "going away")
                     )
-                    ingress_recycle = any(t in reason for t in ("no close frame", "502"))
+                    ingress_recycle = (
+                        isinstance(exc, InvalidStatus) and exc.response.status_code == 502
+                    ) or (isinstance(exc, ConnectionClosed) and close_code is None)
                     # A silent-connect streak overrides the recycle fast path:
                     # prompt reconnects are for endpoints that answer.
                     silent_churn = self._silent_connect_streak >= _SILENT_CONNECT_ESCALATE_ATTEMPTS
@@ -3246,13 +3321,19 @@ class HostProcess:
                     # outside the silent-churn gate so wake never takes the slow path.
                     woke = self._woke_from_suspend
                     self._woke_from_suspend = False
-                    recycle = woke or (
-                        (
-                            explicit_recycle
-                            or (ingress_recycle and not _url_is_loopback(self._server_url))
-                        )
-                        and not silent_churn
-                    )
+                    classified_recycle = (
+                        explicit_recycle
+                        or (ingress_recycle and not _url_is_loopback(self._server_url))
+                    ) and not silent_churn
+                    if classified_recycle:
+                        self._recycle_streak += 1
+                        if self._recycle_streak > _RECYCLE_PROMPT_MAX_STREAK:
+                            # A recycle is a brief, self-healing event; a
+                            # sustained run of them is an outage. Fall back to
+                            # the backoff ladder so a dead endpoint is probed
+                            # gently instead of twice a second forever.
+                            classified_recycle = False
+                    recycle = woke or classified_recycle
                     wait_s = _RECONNECT_BASE_S if recycle else backoff
                     _logger.warning(
                         "Host tunnel disconnected: %s. Reconnecting in %.1fs%s",
@@ -3428,6 +3509,9 @@ class HostProcess:
         self._auth_retry_streak = 0
         self._refused_streak = 0
         self._conn_upgrade_accepted = True
+        # A completed upgrade proves the endpoint healthy — the next drop's
+        # prompt reconnect is wanted again.
+        self._recycle_streak = 0
         record_websocket_connected("host", reconnect=reconnect)
         disconnect_error: BaseException | None = None
         try:
@@ -3897,7 +3981,10 @@ def run_host_process(
         loopback server that is gone). The actionable cause is printed
         to stderr first.
     """
-    host_log_path = configure_process_logging("host")
+    host_log_path = configure_process_logging(
+        "host",
+        log_to_stderr=should_log_to_stderr() or sys.stderr.isatty(),
+    )
     # Initialize tracing so the host daemon exports its own spans
     # (e.g. handling launch_runner / stat / list_dir frames) into the
     # same distributed trace as the server that requested them. The
@@ -3939,6 +4026,14 @@ def run_host_process(
     _cli_log = current_cli_log_path()
     if _cli_log is not None and _cli_log != host_log_path:
         print(f"CLI diagnostics: {display_log_path(_cli_log)}")
+
+    # Executor-agnostic GitHub setup: point git at the server's credential
+    # broker and attribute commits to the owner. Best-effort; the host runs in
+    # every executor and holds the launch token, so no launcher needs to inject
+    # anything GitHub-specific.
+    from omnigent.git_credential_github import configure_host_git
+
+    configure_host_git(server_url, identity.host_id)
 
     if lifecycle_lock is None and daemon_target is not None:
         lifecycle_lock = DaemonLifecycleLock.for_target(daemon_target)

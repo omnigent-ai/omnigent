@@ -1,8 +1,9 @@
 name: Maintainer Approval
 
-# Gates merge on a maintainer's approval. The job *is* the required check: it
-# exits non-zero until a maintainer approves, and GitHub reports that pass/fail
-# as the `Maintainer Approval` status. No commit status is posted (a fork's token
+# Gates merge on a maintainer's approval, except for explicitly trusted automation
+# authors. The job *is* the required check: it exits non-zero until approval (or
+# a trusted author) is present, and GitHub reports that pass/fail as the
+# `Maintainer Approval` status. No commit status is posted (a fork's token
 # is read-only, so a `gh api .../statuses` POST would 403), so the check is the
 # job result instead.
 #
@@ -15,6 +16,10 @@ name: Maintainer Approval
 #
 # `pull_request_target` doesn't fire on reviews, so maintainer-approval-rerun.yml
 # + -rerun-run.yml re-run this workflow on an approving review to flip it green.
+#
+# An approval is carried across later commits only when every push since it was
+# made by trusted automation, judged by the authenticated actor of each head's
+# `pull_request_target` run (hence `actions: read`), never by the commit email.
 
 on:
   pull_request_target:
@@ -34,6 +39,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      actions: read
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
@@ -53,4 +59,5 @@ jobs:
           python3 .github/scripts/maintainer_approval.py \
             --repository "$REPO" \
             --pr-number "$PR" \
+            --trusted-author 'omni-resolve-agent[bot]' \
             --trusted-successor 'omni-resolve-agent[bot]'

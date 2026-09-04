@@ -19,10 +19,14 @@ const CARD_WIDTH = 440;
 const LOGO_SIZE = 56;
 
 export interface AnimatedOmnigentPanelProps {
-  /** Outer card height in px. */
+  /** Fixed outer card height in px. Ignored when `autoHeight` is set. */
   height?: number;
-  /** Animated pixel panel height in px. */
+  /** Animated pixel panel (canvas) height in px. */
   panelHeight?: number;
+  /** Size the card to its content instead of `height` (panel stays fixed). */
+  autoHeight?: boolean;
+  /** Center the logo in the panel instead of pinning it near the top. */
+  centeredLogo?: boolean;
   /** Card body rendered below the panel (the current onboarding step). */
   children?: ReactNode;
 }
@@ -30,6 +34,8 @@ export interface AnimatedOmnigentPanelProps {
 export function AnimatedOmnigentPanel({
   height = 560,
   panelHeight = 308,
+  autoHeight = false,
+  centeredLogo = false,
   children,
 }: AnimatedOmnigentPanelProps) {
   const reduceMotion =
@@ -37,8 +43,8 @@ export function AnimatedOmnigentPanel({
 
   return (
     <section
-      className="omnigent-card"
-      style={{ width: CARD_WIDTH, height }}
+      className={`omnigent-card${autoHeight ? " omnigent-card--auto" : ""}`}
+      style={{ width: CARD_WIDTH, ...(autoHeight ? {} : { height }) }}
       aria-label="Omnigent onboarding"
     >
       <div className="omnigent-animated-panel" style={{ height: panelHeight }}>
@@ -51,7 +57,7 @@ export function AnimatedOmnigentPanel({
         <img
           src={omnigentLogo}
           alt="Omnigent"
-          className="omnigent-panel-logo"
+          className={`omnigent-panel-logo${centeredLogo ? " omnigent-panel-logo--centered" : ""}`}
           style={{ width: LOGO_SIZE, height: LOGO_SIZE }}
         />
       </div>

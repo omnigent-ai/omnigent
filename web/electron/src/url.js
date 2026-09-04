@@ -233,6 +233,31 @@
   }
 
   /**
+   * True when a server URL is hosted by Databricks — a workspace domain
+   * (workspace-mounted Omnigent) or a Databricks App. Https-only: a local or
+   * self-hosted server is never "Databricks-managed", whatever its hostname
+   * claims. Used to scope Databricks-internal desktop features (e.g. the Arca
+   * host option) to Databricks-managed servers.
+   *
+   * @param {string | null | undefined} rawUrl
+   * @returns {boolean}
+   */
+  function isDatabricksManagedServerUrl(rawUrl) {
+    let url;
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      return false;
+    }
+    if (url.protocol !== "https:") return false;
+    const host = url.hostname.toLowerCase();
+    if (host === DATABRICKS_APPS_HOST_SUFFIX || host.endsWith(`.${DATABRICKS_APPS_HOST_SUFFIX}`)) {
+      return true;
+    }
+    return isDatabricksWorkspaceHost(host);
+  }
+
+  /**
    * Probe timeout for Databricks workspace detection. Deliberately short: a
    * slow or unreachable host must not stall the connect flow — on timeout we
    * fall back to loading the URL exactly as entered.
@@ -400,6 +425,7 @@
     WORKSPACE_PROBE_TIMEOUT_MS,
     databricksWorkspaceUiUrl,
     expandDatabricksWorkspaceUrl,
+    isDatabricksManagedServerUrl,
     WELL_KNOWN_MANIFEST_PATH,
     MANIFEST_FETCH_TIMEOUT_MS,
     PRE_MANIFEST_BASELINE,

@@ -1462,6 +1462,23 @@ def create_app(
             extra={"session_id": runner_primary_session_id()},
         )
 
+    # Reap per-session native-harness bridge dirs (bridge.json token, MCP/
+    # policy config, permission_hook.json) leaked by a prior runner that died
+    # without running the explicit delete path. Dynamic across all native
+    # harnesses — see native_bridge_common.reap_orphaned_native_bridge_dirs.
+    # Best-effort: a sweep failure must never crash runner startup.
+    try:
+        from omnigent.native_bridge_common import reap_orphaned_native_bridge_dirs
+
+        _reaped_bridge_dirs = reap_orphaned_native_bridge_dirs()
+        if _reaped_bridge_dirs:
+            _logger.info(
+                "Reaped %d orphaned native bridge dir(s) from prior runs",
+                _reaped_bridge_dirs,
+            )
+    except Exception:  # noqa: BLE001 — housekeeping must never block startup
+        _logger.debug("native bridge-dir orphan sweep failed", exc_info=True)
+
     # Reuse the tunnel binding token for runner-side request auth.
     # The same secret is already shared between the
     # CLI launcher and this runner process via env var.
@@ -1521,12 +1538,30 @@ def create_app(
 
         with contextlib.suppress(Exception):
             await asyncio.to_thread(reconcile_codex_native_process_registry)
+        # Liveness backstop for sub-agent dispatches wedged in ``launching``:
+        # a child that never emits any edge would otherwise hold the parent's
+        # work handle open forever with no error surfaced. The app's
+        # wake-scheduling seam is passed so a reaped failure also wakes the
+        # idle parent — the inbox insert alone would never be read.
+        from omnigent.runner.app import run_subagent_launch_reaper
+
+        app.state.subagent_launch_reaper = asyncio.create_task(
+            run_subagent_launch_reaper(
+                mark_terminal=app.state.mark_subagent_terminal_and_wake,
+            ),
+            name="runner-subagent-launch-reaper",
+        )
 
     async def _stop_pm() -> None:
         """Stop runner-owned resources for graceful process exit.
 
         :returns: None.
         """
+        _launch_reaper = getattr(app.state, "subagent_launch_reaper", None)
+        if _launch_reaper is not None:
+            _launch_reaper.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await _launch_reaper
         _pane_reaper = getattr(app.state, "native_pane_reaper", None)
         if _pane_reaper is not None:
             await _pane_reaper.shutdown()

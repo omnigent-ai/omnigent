@@ -40,10 +40,15 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequen
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from types import ModuleType
-from typing import Any, Protocol, TypeAlias, cast
+from typing import Any, NamedTuple, Protocol, TypeAlias, cast
 
 from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary, stable_user_id
+from omnigent.claude_model_vocabulary import (
+    ALIAS_MODEL_ENV_VARS,
+    served_alias_pins,
+    served_canonical_overrides,
+)
 from omnigent.cli_invocation import cli_invocation
 from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
 from omnigent.inner import _proc
@@ -1017,6 +1022,96 @@ def _resolve_databricks_claude_model(profile: str | None) -> str:
     return model_catalog.resolve_catalog_model("databricks", family="claude").model_id
 
 
+class _GatewayModelVocabulary(NamedTuple):
+    """How a gateway's served ids map onto Claude Code's model vocabulary.
+
+    :param alias_pins: ``{env_var: served_id}`` pinning each family alias.
+    :param model_overrides: ``{canonical_id: served_id}`` rewrites for the ids
+        Claude Code names itself.
+    """
+
+    alias_pins: dict[str, str]
+    model_overrides: dict[str, str]
+
+
+_EMPTY_GATEWAY_VOCABULARY = _GatewayModelVocabulary(alias_pins={}, model_overrides={})
+
+
+def _gateway_model_vocabulary(base_url: str, auth_command: str | None) -> _GatewayModelVocabulary:
+    """Read Claude Code's model vocabulary off a gateway's model listing.
+
+    Claude Code resolves a family alias — ``opus`` / ``sonnet`` / ``haiku`` /
+    ``fable`` — through ``ANTHROPIC_DEFAULT_<FAMILY>_MODEL``, and every alias
+    surface speaks them: the refusal-fallback (a flagged message re-issues on
+    Opus), ``/model``, ``Agent``-tool spawns. Unpinned, an alias resolves to a
+    canonical vendor id (``claude-opus-4-8``). A gateway that serves Claude under
+    its own ids (``databricks-claude-opus-4-8``) rejects that with
+    ``model_not_found``, and a refusal-fallback then kills the whole turn. List
+    what the gateway serves and pin each alias to it.
+
+    Claude Code reaches a model two ways, and a gateway with its own ids
+    breaks both. Through a family alias — ``opus`` / ``sonnet`` / ``haiku`` /
+    ``fable``, resolved via ``ANTHROPIC_DEFAULT_<FAMILY>_MODEL`` and spoken by
+    ``/model`` and ``Agent``-tool spawns — which resolves to a canonical vendor
+    id when unpinned. And by naming a canonical id itself: the refusal-fallback
+    re-issues a safeguard-flagged turn on a model from a route table internal
+    to the CLI. Either way the gateway answers ``model_not_found`` and the turn
+    dies. One listing answers both: pin the aliases, and hand Claude Code the
+    canonical-to-served rewrites for the ids it names on its own.
+
+    :param base_url: The gateway's ``ANTHROPIC_BASE_URL``.
+    :param auth_command: The gateway ``apiKeyHelper`` command; minted into the
+        bearer the listing is fetched with.
+    :returns: The pins and rewrites the listing supports. Empty — leaving
+        today's behavior — when the gateway lists no Claude models or the
+        listing cannot be fetched.
+    """
+    from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GATEWAY_KIND
+
+    provider = model_catalog.ResolvedModelProvider(
+        kind=GATEWAY_KIND,
+        family=ANTHROPIC_FAMILY,
+        base_url=base_url,
+        auth_command=auth_command,
+        detail="claude-sdk gateway transport",
+    )
+    try:
+        listing = model_catalog.listing_for_provider(provider)
+    except Exception:  # noqa: BLE001 — best-effort; unpinned aliases are the safe default
+        logger.warning(
+            "claude-sdk: could not list the gateway's models; leaving "
+            "ANTHROPIC_DEFAULT_*_MODEL and modelOverrides unset",
+            exc_info=True,
+        )
+        return _EMPTY_GATEWAY_VOCABULARY
+    served = [entry.id for entry in listing.models if entry.family == "claude"]
+    return _GatewayModelVocabulary(
+        alias_pins={
+            ALIAS_MODEL_ENV_VARS[alias]: model_id
+            for alias, model_id in served_alias_pins(served).items()
+        },
+        model_overrides=served_canonical_overrides(served),
+    )
+
+
+def _claude_settings_payload(
+    api_key_helper: str | None, model_overrides: dict[str, str]
+) -> str | None:
+    """Serialize the invocation-local settings Claude Code launches with.
+
+    :param api_key_helper: The gateway ``apiKeyHelper`` command, or ``None``.
+    :param model_overrides: Canonical-to-served model id rewrites.
+    :returns: Compact JSON for ``ClaudeAgentOptions.settings``, or ``None``
+        when there is nothing to configure.
+    """
+    settings: dict[str, Any] = {}
+    if api_key_helper:
+        settings["apiKeyHelper"] = api_key_helper
+    if model_overrides:
+        settings["modelOverrides"] = model_overrides
+    return json.dumps(settings, separators=(",", ":")) if settings else None
+
+
 def _resolve_gateway_env(
     profile: str | None = None,
     *,
@@ -1634,6 +1729,13 @@ class ClaudeSDKExecutor(Executor):
         # Started on the first gateway turn — __init__ has no event loop.
         self._gateway_shim: ClaudeGatewayShim | None = None
 
+        # Claude Code's model vocabulary for this gateway — alias pins and
+        # canonical-to-served rewrites — read from the gateway's model listing
+        # on the first gateway turn (see
+        # :meth:`_apply_gateway_model_vocabulary`). ``None`` until resolved;
+        # the resolved value may be empty (discovery found nothing).
+        self._gateway_vocabulary: _GatewayModelVocabulary | None = None
+
         # Eagerly resolve the gateway transport env so errors surface at
         # construction time.
         self._extra_env: dict[str, str] = {}
@@ -2024,6 +2126,40 @@ class ClaudeSDKExecutor(Executor):
                 return str(metadata["session_id"])
         return "default"
 
+    async def _apply_gateway_model_vocabulary(
+        self, env: dict[str, str], auth_command: str | None
+    ) -> dict[str, str]:
+        """
+        Pin the family aliases in *env* and report Claude Code's id rewrites.
+
+        On a gateway transport, list the gateway's models once and derive both
+        halves of Claude Code's model vocabulary from that listing: the
+        ``ANTHROPIC_DEFAULT_*_MODEL`` pins that resolve a family alias to a
+        served id, and the canonical-to-served rewrites for the ids the CLI
+        names on its own (its refusal-fallback route table). A no-op off the
+        gateway, where a direct Anthropic endpoint speaks canonical ids itself.
+
+        Pins already present are respected. The rewrites still apply to those
+        launches: pinning an alias does not teach Claude Code how this gateway
+        spells the canonical ids its own route table names.
+
+        :param env: The child-process env dict, mutated in place with the pins.
+        :param auth_command: The gateway ``apiKeyHelper`` command used to mint
+            a bearer for the model listing.
+        :returns: Canonical-to-served rewrites for the ``modelOverrides``
+            setting. Empty off the gateway or when discovery found nothing.
+        """
+        base_url = env.get("ANTHROPIC_BASE_URL")
+        if not self._gateway or not base_url:
+            return {}
+        if self._gateway_vocabulary is None:
+            self._gateway_vocabulary = await run_sync_on_thread(
+                _gateway_model_vocabulary, base_url, auth_command
+            )
+        for var, model_id in self._gateway_vocabulary.alias_pins.items():
+            env.setdefault(var, model_id)
+        return self._gateway_vocabulary.model_overrides
+
     def _install_subagent_router_hook(
         self,
         sdk: _ClaudeSDK,
@@ -2370,11 +2506,12 @@ class ClaudeSDKExecutor(Executor):
         # ``""`` here would still leave an empty key in the child env.
         env = dict(self._extra_env)
         api_key_helper = env.pop(_CLAUDE_API_KEY_HELPER_ENV_KEY, None)
-        settings_payload = (
-            json.dumps({"apiKeyHelper": api_key_helper}, separators=(",", ":"))
-            if api_key_helper
-            else None
-        )
+        # Teach Claude Code this gateway's spellings so no model surface routes
+        # to an id the gateway rejects: pins for the family aliases, rewrites
+        # for the canonical ids the CLI names itself (the refusal-fallback).
+        # No-op off the gateway transport.
+        model_overrides = await self._apply_gateway_model_vocabulary(env, api_key_helper)
+        settings_payload = _claude_settings_payload(api_key_helper, model_overrides)
 
         # Capture stderr from the CLI subprocess for diagnostics
         stderr_lines: list[str] = []

@@ -24,7 +24,11 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
+from omnigent.entities import (
+    USER_SESSION_TITLE_MAX_CHARS,
+    MessageData,
+    NewConversationItem,
+)
 from omnigent.llms.context_window import ModelPricing
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.background_session_titles import BackgroundTitleRequest
@@ -1639,6 +1643,9 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
             "agent_id": agent["id"],
             "model": "skill-agent",
             "has_mcp_servers": False,
+            # No renderer subscribes to the session stream in this test,
+            # so the turn is stamped headless (browser tools stripped).
+            "browser_renderer_available": False,
             # The forwarded message is the meta item; its store id lets the
             # runner dedup it on a cold-cache history reload.
             "persisted_item_id": meta["id"],
@@ -2505,6 +2512,114 @@ async def test_create_session_without_terminal_launch_args_is_null(
     assert session["terminal_launch_args"] is None
 
 
+_CODEX_BYPASS_ARGS = ["--dangerously-bypass-approvals-and-sandbox"]
+
+
+async def test_create_session_derives_explicit_yolo_from_agent_spec(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A body-less JSON create honors the agent spec's explicit ``yolo: true``.
+
+    A custom codex-native agent that declares ``executor.config.yolo:
+    true`` opted into full bypass in its own trusted, server-stored
+    bundle. With no ``terminal_launch_args`` in the create body the
+    session must persist the codex bypass flag, matching the named-worker
+    path — otherwise codex launches at its default approval stance and an
+    unattended orchestrator parks on approval prompts despite the opt-in.
+    """
+    agent = await create_test_agent(
+        client,
+        name="codex-yolo-self-resolved",
+        executor={"type": "omnigent", "config": {"harness": "codex-native", "yolo": True}},
+    )
+    session = await _create_session(client, agent["id"])
+    assert session["terminal_launch_args"] == _CODEX_BYPASS_ARGS
+
+    snap = await client.get(f"/v1/sessions/{session['id']}")
+    assert snap.status_code == 200
+    assert snap.json()["terminal_launch_args"] == _CODEX_BYPASS_ARGS
+
+
+async def test_create_session_undeclared_codex_spec_keeps_launch_args_null(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    No spec opt-in → no derived args: the headless default must not leak.
+
+    codex-native named WORKERS default to full bypass because nobody can
+    answer a headless prompt, but a top-level session is interactive — a
+    human can answer the ApprovalCard. A codex-native spec that never
+    mentions ``yolo`` must keep ``terminal_launch_args`` NULL rather than
+    silently launching every custom codex agent with approvals and
+    sandbox bypassed.
+    """
+    agent = await create_test_agent(
+        client,
+        name="codex-plain-self-resolved",
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+    )
+    session = await _create_session(client, agent["id"])
+    assert session["terminal_launch_args"] is None
+
+
+async def test_create_session_body_launch_args_override_spec_yolo(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Explicit body args keep precedence over the spec's opt-in.
+
+    The web permission-mode selector posts concrete args at create time;
+    the spec seam only fills the gap when the body carries none.
+    """
+    agent = await create_test_agent(
+        client,
+        name="codex-yolo-body-override",
+        executor={"type": "omnigent", "config": {"harness": "codex-native", "yolo": True}},
+    )
+    session = await _create_session(
+        client,
+        agent["id"],
+        terminal_launch_args=["--sandbox", "read-only"],
+    )
+    assert session["terminal_launch_args"] == ["--sandbox", "read-only"]
+
+
+async def test_bundle_create_derives_explicit_yolo_launch_args(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    The multipart bundle create (``omnigent run <dir>``) honors ``yolo: true``.
+
+    ``create_test_agent`` creates its owning session via the multipart
+    bundle path with no metadata launch args, so the owning session's row
+    must carry the spec-derived codex bypass flag — the exact journey the
+    reporter hit with a custom top-level codex-native bundle.
+    """
+    agent = await create_test_agent(
+        client,
+        name="codex-yolo-bundle",
+        executor={"type": "omnigent", "config": {"harness": "codex-native", "yolo": True}},
+    )
+    owning = await client.get(f"/v1/sessions/{agent['_session_id']}")
+    assert owning.status_code == 200
+    assert owning.json()["terminal_launch_args"] == _CODEX_BYPASS_ARGS
+
+
+async def test_bundle_create_undeclared_codex_spec_keeps_launch_args_null(
+    client: httpx.AsyncClient,
+) -> None:
+    """A bundle that never mentions ``yolo`` gets no default bypass on upload."""
+    agent = await create_test_agent(
+        client,
+        name="codex-plain-bundle",
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+    )
+    owning = await client.get(f"/v1/sessions/{agent['_session_id']}")
+    assert owning.status_code == 200
+    assert owning.json()["terminal_launch_args"] is None
+
+
 async def test_create_session_rejects_oversized_terminal_launch_args(
     client: httpx.AsyncClient,
 ) -> None:
@@ -3277,6 +3392,85 @@ async def test_list_session_items_404_for_nonexistent(
     """Items endpoint returns 404 for a session that doesn't exist."""
     resp = await client.get("/v1/sessions/ad563e906854634c49e1a6fd2fbb31d4/items")
     assert resp.status_code == 404
+
+
+async def test_list_session_items_big_page_survives_bounded_read_backend(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    ``limit=1000`` on a large conversation must not 500 when the backend can
+    only serve bounded reads.
+
+    A deployed managed-Postgres backend failed single big-page reads of a
+    large conversation (500 at ``limit>=500``, 200 at ``limit<=400``), which
+    turned every valid ``limit=1000`` request into ``internal_error`` — most
+    visibly breaking claude-native cold resume. The route must assemble the
+    page from bounded per-statement reads, so the same request returns 200
+    with the complete, ordered page. The choke is injected at the engine
+    boundary to mirror that deployed failure signature.
+    """
+    from sqlalchemy import event as _sa_event
+
+    # The deployed signature: reads of <=400 rows serve fine, bigger ones fail.
+    deployed_safe_read_rows = 400
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    appended = store.append(
+        session["id"],
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_big",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": f"item-{i}"}],
+                ),
+            )
+            for i in range(600)
+        ],
+    )
+
+    def _choke_on_oversized_reads(conn, clauseelement, multiparams, params, execution_options):
+        limit_clause = getattr(clauseelement, "_limit_clause", None)
+        value = getattr(limit_clause, "value", None)
+        if (
+            isinstance(value, int)
+            and value > deployed_safe_read_rows
+            and "conversation_items" in str(clauseelement)
+        ):
+            raise RuntimeError(f"simulated backend failure on oversized read (limit={value})")
+
+    _sa_event.listen(store._conv_engine, "before_execute", _choke_on_oversized_reads)
+    try:
+        resp = await client.get(
+            f"/v1/sessions/{session['id']}/items",
+            params={"limit": 1000},
+        )
+        assert resp.status_code == 200, resp.text
+        page = resp.json()
+        assert [i["id"] for i in page["data"]] == [i.id for i in appended]
+        assert page["has_more"] is False
+        assert page["first_id"] == appended[0].id
+        assert page["last_id"] == appended[-1].id
+
+        # Cursor pagination stays correct across the same bounded backend.
+        first = await client.get(
+            f"/v1/sessions/{session['id']}/items",
+            params={"limit": 500},
+        )
+        assert first.status_code == 200, first.text
+        assert first.json()["has_more"] is True
+        rest = await client.get(
+            f"/v1/sessions/{session['id']}/items",
+            params={"limit": 500, "after": first.json()["last_id"]},
+        )
+        assert rest.status_code == 200, rest.text
+        assert [i["id"] for i in rest.json()["data"]] == [i.id for i in appended[500:]]
+    finally:
+        _sa_event.remove(store._conv_engine, "before_execute", _choke_on_oversized_reads)
 
 
 # ── GET /v1/sessions/{id} snapshot fields ────────────────
@@ -8855,6 +9049,236 @@ async def test_patch_collaboration_mode_rejects_non_codex_session(
     assert "collaboration_mode is only supported" in resp.text
 
 
+async def test_patch_approval_mode_forwards_and_persists_label(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    PATCH ``approval_mode`` drives the Codex ``/permissions`` popup and records it.
+
+    The web picker writes through the sessions PATCH route. The server forwards a
+    harness-agnostic ``codex_approval_mode_change`` event so the runner keys the
+    preset into the Codex TUI, then persists the read-back label and publishes a
+    live ``session.codex_approval_mode``. Codex owns the durable state (its own
+    session config), so the route writes no ``terminal_launch_args``.
+    """
+    from omnigent.runtime import set_runner_client
+
+    captured: list[_ForwardedEffort] = []
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Accept the injection like the codex-native runner handler."""
+        if request.method != "POST":
+            return httpx.Response(204)
+        body: dict[str, Any] | None = None
+        if request.content:
+            body = json.loads(request.content)
+        captured.append(_ForwardedEffort(url=str(request.url), body=body))
+        return httpx.Response(200, json={"approval_mode": "full-access"})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+    set_runner_client(fake_runner)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(
+            client,
+            agent["id"],
+            labels={
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "codex-native-ui",
+            },
+            terminal_launch_args=["--model", "gpt-5-codex"],
+        )
+        captured.clear()
+
+        resp = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"approval_mode": "full-access"},
+        )
+    finally:
+        await fake_runner.aclose()
+        set_runner_client(None)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["labels"]["omnigent.codex_native.approval_mode"] == "full-access"
+    # Runtime approval rides the /permissions popup, not launch args: the caller's
+    # existing args are left untouched.
+    assert resp.json()["terminal_launch_args"] == ["--model", "gpt-5-codex"]
+    forwards = [f for f in captured if f.url.endswith(f"/v1/sessions/{session['id']}/events")]
+    assert len(forwards) == 1, f"Expected one runner forward, got {captured!r}"
+    assert forwards[0].body == {
+        "type": "codex_approval_mode_change",
+        "approval_mode": "full-access",
+    }
+    assert [event["type"] for _, event in published] == ["session.codex_approval_mode"]
+    assert published[0][1]["approval_mode"] == "full-access"
+
+
+@pytest.mark.parametrize("runner_status", [None, 503], ids=["no_runner", "runner_rejects"])
+async def test_patch_approval_mode_requires_live_runner_before_persisting(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    runner_status: int | None,
+) -> None:
+    """
+    PATCH ``approval_mode`` must not persist UI state before live success.
+
+    An approval switch is only correct if the runner drove the ``/permissions``
+    popup. With no runner, or a runner that rejects it (e.g. the terminal is not
+    running), the route must fail and leave the approval label absent so the
+    picker rolls back instead of showing a false mode.
+    """
+    from omnigent.runtime import set_runner_client
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+
+    fake_runner: httpx.AsyncClient | None = None
+    if runner_status is not None:
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            """Reject the injection like a stopped codex terminal."""
+            return httpx.Response(
+                runner_status,
+                json={
+                    "error": "codex_native_approval_mode_failed",
+                    "detail": "Codex terminal is not running; reconnect first.",
+                },
+            )
+
+        fake_runner = httpx.AsyncClient(
+            transport=httpx.MockTransport(_handler),
+            base_url="http://runner",
+        )
+
+    set_runner_client(fake_runner)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(
+            client,
+            agent["id"],
+            labels={
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "codex-native-ui",
+            },
+        )
+
+        resp = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"approval_mode": "full-access"},
+        )
+        snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    finally:
+        if fake_runner is not None:
+            await fake_runner.aclose()
+        set_runner_client(None)
+
+    assert resp.status_code == 503, resp.text
+    assert "Could not switch to full-access approval mode" in resp.text
+    assert "omnigent.codex_native.approval_mode" not in snapshot["labels"]
+    assert published == []
+
+
+async def test_patch_approval_mode_rejects_non_codex_session(
+    client: httpx.AsyncClient,
+) -> None:
+    """``approval_mode`` is rejected for sessions that are not Codex-native."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"approval_mode": "ask-for-approval"},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "approval_mode is only supported" in resp.text
+
+
+async def test_patch_approval_mode_rejects_unknown_mode(
+    client: httpx.AsyncClient,
+) -> None:
+    """An approval mode outside the /permissions presets is rejected pre-forward."""
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={
+            "omnigent.ui": "terminal",
+            "omnigent.wrapper": "codex-native-ui",
+        },
+    )
+
+    resp = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"approval_mode": "turbo"},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "approval_mode must be one of" in resp.text
+
+
+async def test_post_external_codex_approval_mode_change_sets_label_and_publishes(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A /permissions change inside the Codex TUI reaches the web picker (TUI→UI).
+
+    The forwarder posts ``external_codex_approval_mode_change`` with the runtime
+    preset it read from ``thread/settings/updated``. The server stamps the
+    read-back label and publishes ``session.codex_approval_mode`` so a connected
+    picker tracks the TUI without a reload.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_codex_approval_mode_change",
+            "data": {"approval_mode": "full-access"},
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert [event["type"] for _, event in published] == ["session.codex_approval_mode"]
+    assert published[0][1]["approval_mode"] == "full-access"
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["labels"]["omnigent.codex_native.approval_mode"] == "full-access"
+
+
+async def test_post_external_codex_approval_mode_change_requires_a_field(
+    client: httpx.AsyncClient,
+) -> None:
+    """The event must carry terminal_launch_args or approval_mode."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_codex_approval_mode_change", "data": {}},
+    )
+
+    assert resp.status_code == 400, resp.text
+
+
 async def test_patch_permission_mode_persists_label_and_forwards_event(
     client: httpx.AsyncClient,
 ) -> None:
@@ -10251,3 +10675,50 @@ async def test_create_session_notifies_runner_with_init_envelope(
         "runner seeds it into the first spawn; got "
         f"{envelope.snapshot.model_override!r}"
     )
+
+
+async def test_external_info_error_item_publishes_and_persists_level(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An external ``error`` item with ``level: "info"`` keeps its level on both
+    the live ``response.output_item.done`` frame and the persisted item.
+
+    This is the runner's fresh-thread notice: the web renders it as a neutral
+    pill live, and again after reload from the items endpoint.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "error",
+                "item_data": {
+                    "source": "harness",
+                    "code": "codex_thread_reset",
+                    "message": "Codex started a fresh thread.",
+                    "level": "info",
+                },
+            },
+        },
+    )
+    assert resp.status_code in (200, 202)
+
+    done = [ev for _sid, ev in published if ev.get("type") == "response.output_item.done"]
+    assert len(done) == 1
+    assert done[0]["item"]["type"] == "error"
+    assert done[0]["item"]["level"] == "info"
+
+    items = await client.get(f"/v1/sessions/{session['id']}/items")
+    errors = [item for item in items.json()["data"] if item["type"] == "error"]
+    assert len(errors) == 1
+    assert errors[0]["level"] == "info"

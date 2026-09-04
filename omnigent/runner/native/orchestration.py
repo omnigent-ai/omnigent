@@ -84,6 +84,7 @@ _logger = logging.getLogger("omnigent.runner.app")
 _OMNIGENT_PACKAGE_DIR = Path(__file__).resolve().parent.parent.parent
 
 _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
+
 _REPL_TERMINAL_NAME = "tui"
 _REPL_TERMINAL_SESSION_KEY = "main"
 _NO_BODY_STATUS_CODES = {204, 304}
@@ -2326,6 +2327,64 @@ async def _post_pi_native_credential_warning(
         )
 
 
+_CODEX_THREAD_RESET_NOTICE = (
+    "Codex reported an internal error while loading this session's saved transcript, "
+    "so Omnigent started a fresh Codex thread instead of failing the turn. The chat "
+    "history here is intact, but Codex's own memory of the earlier turns is not "
+    "restored."
+)
+
+
+async def _post_codex_thread_reset_notice(
+    *,
+    session_id: str,
+    server_client: httpx.AsyncClient | None,
+    codex_error: str,
+) -> None:
+    """Surface a codex fresh-thread fallback into the session as a notice.
+
+    Posts an ``error`` item with ``level: "info"`` via
+    ``external_conversation_item`` so the web UI renders a neutral notice pill
+    at the point the thread was reset, persists it across reload, and — because
+    ``error`` is a non-content item type — keeps it out of the next turn's
+    model context. The body quotes codex's own error so the cause is clearly
+    codex-side. Best-effort: a failed post only loses the notice.
+
+    :param session_id: Session/conversation identifier.
+    :param server_client: Runner Omnigent server client (``None`` in tests).
+    :param codex_error: The error text codex returned for ``thread/resume``,
+        e.g. ``"failed to read thread: thread-store internal error: …"``.
+    """
+    if server_client is None:
+        return
+    try:
+        resp = await server_client.post(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "error",
+                    "item_data": {
+                        "source": "harness",
+                        "code": "codex_thread_reset",
+                        "message": (
+                            f"{_CODEX_THREAD_RESET_NOTICE}\n\nCodex reported: {codex_error}"
+                        ),
+                        "level": "info",
+                    },
+                },
+            },
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "codex-native: failed to surface the fresh-thread notice for session %s",
+            session_id,
+            exc_info=True,
+        )
+
+
 async def _auto_create_cursor_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -3741,9 +3800,11 @@ async def _auto_create_codex_terminal(
     forwarder so the chat and terminal share one thread.
 
     Fresh sessions launch without a thread id so the TUI owns thread
-    creation; resume sessions launch with the persisted Codex thread id.
-    The runner does not pre-create a thread, because ``codex resume`` of a
-    thread with no rollout yet exits the TUI (leaving a dead pane).
+    creation; resume sessions launch with the persisted Codex thread id,
+    falling back to a fresh thread when Codex cannot read that thread's
+    rollout (see :func:`is_unreadable_thread_error`). The runner does not
+    pre-create a thread, because ``codex resume`` of a thread with no
+    rollout yet exits the TUI (leaving a dead pane).
 
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
@@ -3775,10 +3836,12 @@ async def _auto_create_codex_terminal(
     from omnigent.codex_native_app_server import (
         _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION,
         CodexAppServerClient,
+        CodexAppServerResponseError,
         build_codex_native_server,
         build_codex_remote_args,
         codex_session_meta_model_provider,
         codex_terminal_env,
+        is_unreadable_thread_error,
         preload_codex_thread_for_resume,
         resolve_native_codex_launch,
     )
@@ -4122,6 +4185,12 @@ async def _auto_create_codex_terminal(
         # creating a thread. This TUI runs detached for the web UI, so persist
         # the runner-owned acknowledgements in the private session config.
         trust_project=True,
+        # Codex ignores --dangerously-bypass-hook-trust for the startup
+        # hook-review screen on a persistent ``resume`` attach, which strands a
+        # resumed web session behind the interactive "Hooks need review" prompt.
+        # Persist trust for every merged hook so the review finds nothing to
+        # review. See trust_all_codex_hooks.
+        trust_all_hooks=True,
     )
     # Generate routing hooks.json (and bypass codex's hook-trust prompt): the
     # app-server reads the endpoint out of its own process env at start, and
@@ -4165,6 +4234,57 @@ async def _auto_create_codex_terminal(
         ws_url=codex_ws_url,
         client_name="omnigent-codex-native-auto",
     )
+    if launch_config.external_session_id is not None:
+        from omnigent.codex_native_bridge import CodexNativeBridgeState, write_bridge_state
+
+        try:
+            await preload_codex_thread_for_resume(
+                codex_ws_url,
+                launch_config.external_session_id,
+                terminal_launch_args=launch_config.terminal_launch_args,
+            )
+        except Exception as exc:
+            if not is_unreadable_thread_error(exc):
+                # The app-server started above must not outlive a refused resume:
+                # without this close, every retry stacked another live codex
+                # process (and only the newest stayed tracked for teardown).
+                with contextlib.suppress(Exception):
+                    await app_server.close()
+                _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+                raise
+            # Codex cannot load this thread's rollout, so no retry can resume
+            # it. Start a fresh thread on the same app-server instead of
+            # failing every turn; the discovery path records the new id.
+            _logger.warning(
+                "Codex cannot read thread %s for session %s; starting a fresh "
+                "thread (earlier Codex-side context is not restored): %s",
+                launch_config.external_session_id,
+                session_id,
+                exc,
+                extra={"session_id": session_id},
+            )
+            codex_error = (
+                exc.message
+                if isinstance(exc, CodexAppServerResponseError) and exc.message
+                else str(exc)
+            )
+            await _post_codex_thread_reset_notice(
+                session_id=session_id, server_client=server_client, codex_error=codex_error
+            )
+            launch_config = dataclasses.replace(launch_config, external_session_id=None)
+        else:
+            write_bridge_state(
+                bridge_dir,
+                CodexNativeBridgeState(
+                    session_id=session_id,
+                    socket_path=codex_ws_url,
+                    thread_id=launch_config.external_session_id,
+                    codex_home=str(codex_home),
+                    # The session workspace: without it the executor falls back
+                    # to the runner process's own cwd when starting turns.
+                    cwd=workspace,
+                ),
+            )
     if launch_config.external_session_id is None:
         try:
             # Connect the listener BEFORE launching the TUI so it observes the
@@ -4180,35 +4300,6 @@ async def _auto_create_codex_terminal(
             await app_server.close()
             _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
             raise
-    else:
-        from omnigent.codex_native_bridge import CodexNativeBridgeState, write_bridge_state
-
-        try:
-            await preload_codex_thread_for_resume(
-                codex_ws_url,
-                launch_config.external_session_id,
-                terminal_launch_args=launch_config.terminal_launch_args,
-            )
-        except Exception:
-            # The app-server started above must not outlive a refused resume:
-            # without this close, every retry stacked another live codex
-            # process (and only the newest stayed tracked for teardown).
-            with contextlib.suppress(Exception):
-                await app_server.close()
-            _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
-            raise
-        write_bridge_state(
-            bridge_dir,
-            CodexNativeBridgeState(
-                session_id=session_id,
-                socket_path=codex_ws_url,
-                thread_id=launch_config.external_session_id,
-                codex_home=str(codex_home),
-                # The session workspace: without it the executor falls back
-                # to the runner process's own cwd when starting turns.
-                cwd=workspace,
-            ),
-        )
 
     # Register the Codex TUI as a streamable terminal resource attached to
     # the app-server started above (``--remote`` over its loopback ws
@@ -6271,6 +6362,35 @@ async def _load_claude_launch_metadata(
     return metadata
 
 
+async def _clear_session_model_override(
+    session_id: str,
+    server_client: httpx.AsyncClient,
+) -> None:
+    """
+    Reset a session's persisted model pick to Default.
+
+    The server clears the pick only for its explicit ``"default"`` alias; a
+    JSON ``null`` leaves it unchanged. Best-effort: a failed reset keeps the
+    pick, and the next relaunch repeats the fallback.
+
+    :param session_id: Session/conversation identifier.
+    :param server_client: Runner Omnigent server client.
+    """
+    try:
+        resp = await server_client.patch(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+            json={"model_override": "default"},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "claude-native: could not reset the model pick for session %s",
+            session_id,
+            exc_info=True,
+        )
+
+
 async def _auto_create_claude_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -6703,12 +6823,22 @@ async def _auto_create_claude_terminal(
         from omnigent.server.smart_routing import task_v1_claude_arms
 
         claude_config = claude_config_with_routed_arms_pinned(claude_config, task_v1_claude_arms())
-    launch_model = resolve_claude_native_model_selection(
-        session_model_override
-        or _claude_native_model_from_spec(agent_spec)
+    # The launch model without the session's pick: the agent-spec pin, else
+    # the provider's own default. Also what a pick the provider cannot serve
+    # falls back to.
+    unpinned_launch_model = resolve_claude_native_model_selection(
+        _claude_native_model_from_spec(agent_spec)
         or (claude_config.model if claude_config is not None else None),
         claude_config,
     )
+    launch_model = (
+        resolve_claude_native_model_selection(session_model_override, claude_config)
+        if session_model_override
+        else unpinned_launch_model
+    )
+    # A pick the provider cannot serve is dropped only once the fallback
+    # terminal is actually up, so a failed launch never loses it.
+    reset_pick_after_launch = False
     # Explicit launches (model-flows design §4): consult the shared catalog
     # only when it can change the outcome — to validate an explicit request,
     # or to resolve a Default launch that would otherwise pass no ``--model``
@@ -6718,6 +6848,8 @@ async def _auto_create_claude_terminal(
             claude_catalog_serves_model,
             claude_launch_catalog,
             claude_launch_catalog_is_stale,
+            claude_launch_endpoint_label,
+            claude_reprobed_launch_catalog,
         )
         from omnigent.model_catalog_store import default_row
 
@@ -6737,21 +6869,55 @@ async def _auto_create_claude_terminal(
                 extra={"session_id": session_id},
             )
         if session_model_override and launch_catalog:
-            resolved_request = (
-                resolve_claude_native_model_selection(session_model_override, claude_config)
-                or session_model_override
-            )
-            # A pane's ``/model`` persists the exact id it runs; the catalog
-            # may spell that model only by its family alias.
-            if not (
-                claude_catalog_serves_model(launch_catalog, session_model_override, claude_config)
-                or claude_catalog_serves_model(launch_catalog, resolved_request, claude_config)
-            ):
-                raise click.ClickException(
-                    f"the requested model {session_model_override!r} is not in this "
-                    "host's current model list — it may have changed since the pick. "
-                    "Pick again from the model menu."
+            pick = session_model_override
+            resolved_request = resolve_claude_native_model_selection(pick, claude_config) or pick
+
+            def _serves_pick(rows: list[dict[str, object]]) -> bool:
+                """
+                Whether *rows* serve the pick by its persisted or resolved spelling.
+                """
+                # A pane's ``/model`` persists the exact id it runs; the catalog
+                # may spell that model only by its family alias.
+                return claude_catalog_serves_model(
+                    rows, pick, claude_config
+                ) or claude_catalog_serves_model(rows, resolved_request, claude_config)
+
+            # Only rows that are fresh may retire the pick: a stale entry may
+            # predate a provider change, so it is re-probed first, and a
+            # failed probe leaves no fresh rows at all.
+            fresh_rows: list[dict[str, object]] | None = launch_catalog
+            if launch_catalog_was_stale and not _serves_pick(launch_catalog):
+                fresh_rows = await claude_reprobed_launch_catalog(claude_config)
+                if fresh_rows:
+                    launch_catalog = fresh_rows
+                    launch_catalog_was_stale = False
+            if not _serves_pick(launch_catalog):
+                # The pick outlives the provider it was made under (a later
+                # ``omnigent setup`` can re-point the default). Launch on what
+                # this provider serves; reset the pick to Default only on fresh
+                # evidence, so the picker shows what the session now runs.
+                offered = ", ".join(
+                    str(row.get("id") or row.get("model") or "") for row in launch_catalog
                 )
+                if fresh_rows:
+                    reset_pick_after_launch = True
+                    outcome = "launching on the provider default and resetting the pick to Default"
+                else:
+                    outcome = (
+                        "the re-probe failed, so launching on the provider default and "
+                        "keeping the pick for the next relaunch"
+                    )
+                _logger.warning(
+                    "claude-native: model pick %r for session %s is not served by %s "
+                    "(it offers: %s); %s",
+                    pick,
+                    session_id,
+                    claude_launch_endpoint_label(claude_config),
+                    offered,
+                    outcome,
+                    extra={"session_id": session_id},
+                )
+                launch_model = unpinned_launch_model
         if launch_model is None and launch_catalog:
             # A stale entry's default is yesterday's answer: pinning it as
             # ``--model`` turns a provider-side retirement or entitlement
@@ -6970,6 +7136,8 @@ async def _auto_create_claude_terminal(
             extra={"session_id": session_id},
         )
         raise
+    if reset_pick_after_launch:
+        await _clear_session_model_override(session_id, server_client)
     # Surface the terminal on the live SSE stream so an already-connected
     # web UI enables the Terminal toggle immediately. The required-terminal
     # launch helper registers the resource and starts the activity watcher but

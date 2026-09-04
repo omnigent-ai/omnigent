@@ -199,6 +199,12 @@ _CODEX_NATIVE_SUBAGENT_ROLE_LABEL_KEY = "omnigent.codex_native.agent_role"
 _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = "omnigent.codex_native.collaboration_mode"
 
 
+# Current approval/sandbox mode of a live codex-native session. ``terminal_launch_args``
+# carries the persisted CLI form; this label is the read-back the web picker prefers,
+# mirroring ``_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY``.
+_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY = "omnigent.codex_native.approval_mode"
+
+
 _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE: str = "external_codex_collaboration_mode_change"
 
 
@@ -372,7 +378,19 @@ _browser_action_owners: dict[str, str] = {}  # -> issuing session_id (result POS
 _browser_action_claims: dict[str, str] = {}
 
 
+_browser_action_claim_events: dict[str, asyncio.Event] = {}
+
+
+# The Electron relay claims before doing browser work, so this only budgets
+# event delivery plus the claim round-trip. Keep it short enough that a generic
+# stream subscriber cannot recreate the old 30-second no-renderer stall.
+_BROWSER_ACTION_CLAIM_GRACE_S = 2.0
+
+
 _BROWSER_ACTION_AWAIT_S = 30.0
+
+
+_BROWSER_ACTION_NO_RENDERER_RESULT: dict[str, Any] = {"error": "no browser renderer is connected"}
 
 
 _BROWSER_ACTION_TIMEOUT_RESULT: dict[str, Any] = {
@@ -834,6 +852,8 @@ __all__ = [
     "_ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",
     "_APPROVAL_TYPE",
     "_BROWSER_ACTION_AWAIT_S",
+    "_BROWSER_ACTION_CLAIM_GRACE_S",
+    "_BROWSER_ACTION_NO_RENDERER_RESULT",
     "_BROWSER_ACTION_TIMEOUT_RESULT",
     "_CHILD_PREVIEW_LIMIT",
     "_CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY",
@@ -852,6 +872,7 @@ __all__ = [
     "_CLAUDE_NATIVE_UI_LABEL_VALUE",
     "_CLAUDE_NATIVE_WRAPPER_LABEL_KEY",
     "_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE",
+    "_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY",
     "_CODEX_NATIVE_COLLABORATION_MODES",
     "_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY",
     "_CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S",
@@ -959,6 +980,7 @@ __all__ = [
     "_MirroredToolCall",
     "_PendingPolicyAskWrites",
     "_RelayHandle",
+    "_browser_action_claim_events",
     "_browser_action_claims",
     "_browser_action_owners",
     "_browser_action_registry",

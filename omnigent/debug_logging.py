@@ -35,6 +35,7 @@ from dataclasses import dataclass
 
 import httpx
 
+from omnigent.process_logging import redact_log_text
 from omnigent.version import VERSION
 
 # ── environment contract ────────────────────────────────────────────────────
@@ -421,8 +422,9 @@ def _attributes(record: logging.LogRecord) -> dict[str, str]:
     raw = getattr(record, "attributes", None)
     if not isinstance(raw, dict):
         return {}
-    # The target column is MAP<STRING,STRING>; coerce values and drop nulls.
-    return {str(k): str(v) for k, v in raw.items() if v is not None}
+    # The target column is MAP<STRING,STRING>; coerce values, redact them, and
+    # drop nulls. Event attributes share the same privacy boundary as messages.
+    return {str(k): redact_log_text(str(v)) for k, v in raw.items() if v is not None}
 
 
 def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
@@ -451,6 +453,7 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
     null on the managed service.
     """
     workspace_id, app_name = _process_identity()
+    stack_trace = _stack_trace(record)
     return {
         "session_id": (
             getattr(record, "session_id", None)
@@ -461,13 +464,13 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
         "source": source,
         "event_name": getattr(record, "event_name", None),
         "level": record.levelname,
-        "message": record.getMessage(),
+        "message": redact_log_text(record.getMessage()),
         "client_time": int(record.created * 1_000_000),
         "hostname": _HOSTNAME,
         "logger_name": record.name,
         "func_name": record.funcName,
         "app_version": VERSION,
-        "stack_trace": _stack_trace(record),
+        "stack_trace": redact_log_text(stack_trace) if stack_trace is not None else None,
         "attributes": _attributes(record),
         "log_id": uuid.uuid4().hex,
         "user_id": getattr(record, "user_id", None) or current_user_id(),

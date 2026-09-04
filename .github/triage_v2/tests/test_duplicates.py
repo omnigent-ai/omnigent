@@ -1,7 +1,7 @@
 import unittest
 from typing import Any
 
-from issue_duplicates import (
+from issue_prioritization.duplicates import (
     AUTO_CLOSE_CONFIDENCE,
     CLOSE_COSINE_FLOOR,
     SIMILAR_MIN_CONFIDENCE,
@@ -564,8 +564,7 @@ class IssueDuplicatesTest(unittest.TestCase):
                 {
                     "number": 2304,
                     "title": (
-                        "Runner subprocess inherits host daemon cwd, breaking os_env "
-                        "cwd resolution"
+                        "Runner subprocess inherits host daemon cwd, breaking os_env cwd resolution"
                     ),
                     "body": (
                         "Runner subprocesses are spawned without cwd=<workspace>, so "

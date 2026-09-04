@@ -21,10 +21,11 @@ Endpoints (all mounted at the app root):
   returns delegated access + refresh tokens.
 - ``POST /oauth/revoke`` — revoke a grant (backs client logout).
 
-Mounted only in ``accounts`` auth mode (and only when
-``OMNIGENT_DEVICE_GRANT_ENABLED`` is set). OIDC deployments delegate login
-to the IdP via the cli-ticket flow (``/auth/cli-login``) and never use this
-grant; header mode has no server-mintable identity.
+Mounted in ``accounts`` and ``oidc`` (standard OIDC) auth modes when
+``OMNIGENT_DEVICE_GRANT_ENABLED`` is set. GitHub OAuth (``provider_type=="github"``)
+and header mode are excluded: GitHub does not support ``prompt=login``/
+``max_age=0`` so the anti-phishing re-auth gate cannot be enforced;
+header mode has no server-mintable identity.
 
 See ``designs/DEVICE_AUTH.md`` for the full design + threat model.
 
@@ -632,20 +633,32 @@ def create_device_auth_router(
 ) -> APIRouter:
     """Build the ``/oauth/*`` device-grant router.
 
-    :param auth_provider: The active provider. Must be ``accounts`` mode;
-        its cookie config supplies the HMAC signing key and public base URL.
+    :param auth_provider: The active provider. Must be ``accounts`` or
+        ``oidc`` mode; its cookie config supplies the HMAC signing key
+        and public base URL. Header mode has no server-mintable identity
+        and raises.
     :param device_grant_store: Persistence for device grants.
     :returns: APIRouter to mount at the app root.
     """
-    if auth_provider._source != "accounts":
-        raise RuntimeError(
-            f"create_device_auth_router requires accounts auth (got {auth_provider._source!r})"
-        )
-    cookie_config = auth_provider._accounts_config
-    assert cookie_config is not None, "accounts mode must have an accounts config"
-    cookie_secret = cookie_config.cookie_secret
-    base_url = cookie_config.base_url
-    provider_name = auth_provider._source
+    cookie_secret, provider_name = _resolve_signing_config(auth_provider)
+    if auth_provider._source == "accounts":
+        assert auth_provider._accounts_config is not None
+        _mode_cfg = auth_provider._accounts_config
+    else:
+        assert auth_provider._oidc_config is not None
+        _mode_cfg = auth_provider._oidc_config
+        # GitHub OAuth runs under _source == "oidc" but does not support
+        # prompt=login / max_age, so the anti-phishing reauth gate cannot
+        # be enforced. Refuse to build the device-grant router for it.
+        if getattr(_mode_cfg, "provider_type", None) == "github":
+            raise RuntimeError(
+                "create_device_auth_router: GitHub OAuth does not support forced "
+                "re-authentication (prompt=login); the device-grant anti-phishing "
+                "gate cannot be enforced. Set OMNIGENT_DEVICE_GRANT_ENABLED only "
+                "for standard OIDC deployments."
+            )
+    base_url = _mode_cfg.base_url
+    session_cookie_name: str = _mode_cfg.session_cookie_name
 
     _client_secret_ok = _make_client_secret_gate()
     # Resolve grant max lifetime once at mount (not on every purge).
@@ -770,7 +783,7 @@ def create_device_auth_router(
         time). ``None`` when absent/invalid. Used to enforce that consent
         follows a login started FOR this device flow.
         """
-        token = request.cookies.get(cookie_config.session_cookie_name)
+        token = request.cookies.get(session_cookie_name)
         if not token:
             return None
         try:

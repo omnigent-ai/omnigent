@@ -51,6 +51,8 @@ import selectors
 import socket
 import sys
 import threading
+from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -80,6 +82,24 @@ _ZYGOTE_TEST_CHILD_RAISE_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_RAISE"
 # genuinely alive) instead of exiting, so a test can kill the zygote out from
 # under a live child and assert the crash-recovery path. Never set in prod.
 _ZYGOTE_TEST_CHILD_SLEEP_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_SLEEP"
+
+
+@dataclass(frozen=True)
+class _SourceFileStamp:
+    """Metadata identifying one package source file."""
+
+    path: Path
+    modified_ns: int
+    size: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class _GraphStamp:
+    """Build and source state backing the zygote's imported graph."""
+
+    build: tuple[float, str] | None
+    sources: tuple[_SourceFileStamp, ...] | None
 
 
 def _disk_build_stamp(package_dir: Path | None = None) -> tuple[float, str] | None:
@@ -115,6 +135,46 @@ def _disk_build_stamp(package_dir: Path | None = None) -> tuple[float, str] | No
         return None
 
 
+def _source_file_stamps(paths: Iterable[Path]) -> tuple[_SourceFileStamp, ...] | None:
+    """Capture file metadata, returning ``None`` if the baseline is incomplete."""
+    stamps: list[_SourceFileStamp] = []
+    try:
+        unique_paths = sorted(set(paths))
+    except OSError:
+        return None
+    for path in unique_paths:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        stamps.append(
+            _SourceFileStamp(
+                path=path,
+                modified_ns=stat.st_mtime_ns,
+                size=stat.st_size,
+                inode=stat.st_ino,
+            )
+        )
+    return tuple(stamps)
+
+
+def _package_source_stamps(
+    package_dir: Path | None = None,
+) -> tuple[_SourceFileStamp, ...] | None:
+    """Fingerprint all Python sources, including modules imported lazily later."""
+    package_root = (package_dir or Path(__file__).resolve().parents[1]).resolve()
+    return _source_file_stamps(package_root.rglob("*.py"))
+
+
+def _source_files_match(stamps: tuple[_SourceFileStamp, ...] | None) -> bool:
+    """Return whether every package source still matches its boot metadata."""
+    if stamps is None:
+        return False
+    if not stamps:
+        return True
+    return _source_file_stamps(stamp.path for stamp in stamps) == stamps
+
+
 def _import_runner_graph() -> None:
     """Eagerly import the heavy runner graph so the ~120MB lands once.
 
@@ -128,6 +188,11 @@ def _import_runner_graph() -> None:
     already holds, so this adds little resident cost).
     """
     from omnigent.runner import _entry, app, native  # noqa: F401
+    from omnigent.runner.background_titles import (  # noqa: F401
+        claude_native,
+        codex_native,
+        sdk,
+    )
     from omnigent.runtime.harnesses import _runner as _harness_runner  # noqa: F401
 
 
@@ -302,18 +367,16 @@ class _ZygoteServer:
     thread per connection.
 
     :param control_sock: The daemon control socket (role ``"daemon"``).
-    :param graph_stamp: The on-disk build stamp captured when the zygote
-        imported its graph, or ``None`` when unknown (unbuilt checkout).
-        Both runner and harness forks are refused once the on-disk stamp no
-        longer matches: the child would resolve its lazily-imported modules
-        from the *new* files against the *old* pre-imported graph, breaking
-        on any cross-version import.
+    :param graph_stamp: Build and package-source state captured before the
+        zygote imports its graph. Both runner and harness forks are refused
+        once either changes on disk: the child would otherwise resolve lazy
+        imports from new files against the old in-memory graph.
     """
 
     def __init__(
         self,
         control_sock: socket.socket,
-        graph_stamp: tuple[float, str] | None = None,
+        graph_stamp: _GraphStamp | None = None,
     ) -> None:
         self._graph_stamp = graph_stamp
         self._sel = selectors.DefaultSelector()
@@ -508,13 +571,17 @@ class _ZygoteServer:
             in the error so operator logs say which launch fell back.
         :returns: ``True`` when the request was refused (caller must return).
         """
-        if self._graph_stamp is None or _disk_build_stamp() == self._graph_stamp:
+        stamp = self._graph_stamp
+        if stamp is None:
+            return False
+        build_matches = stamp.build is None or _disk_build_stamp() == stamp.build
+        if build_matches and _source_files_match(stamp.sources):
             return False
         _send(
             conn,
             {
                 "error": (
-                    "omnigent was upgraded on disk after the zygote imported its "
+                    "omnigent changed on disk after the zygote imported its "
                     f"graph; refusing to fork a mixed-version {kind}"
                 )
             },
@@ -661,9 +728,11 @@ def main() -> None:
 
     control_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, fileno=control_fd)
 
-    # Capture the disk stamp of the graph about to be imported, so harness
-    # forks can detect an in-place upgrade landing after this point.
-    graph_stamp = _disk_build_stamp()
+    # A source update during graph import must make later forks fail closed.
+    graph_stamp = _GraphStamp(
+        build=_disk_build_stamp(),
+        sources=_package_source_stamps(),
+    )
     _import_runner_graph()
     # The import graph is now static; move it out of GC's tracked set so cyclic
     # collections stay cheap and don't dirty shared pages in forked children.

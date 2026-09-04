@@ -208,6 +208,16 @@ _JOB_BACKOFF_LIMIT: int = 6
 # launch-token TTL.
 _JOB_ACTIVE_DEADLINE_S: int = 7 * 24 * 3600
 
+# How long a Job's objects (and its terminated Pod) stick around after the
+# Job itself reaches a terminal state (Complete or Failed), before the
+# cluster garbage-collects them. Backstop for the case where nothing ever
+# calls terminate() on a Job that ends on its own — a crash-loop exhausting
+# backoffLimit, or activeDeadlineSeconds finally expiring — so a
+# credential-bearing Pod object doesn't linger indefinitely just because
+# application-level cleanup never ran. 24h leaves a window to inspect a
+# failed Job's status/logs before it's swept.
+_JOB_TTL_SECONDS_AFTER_FINISHED: int = 24 * 3600
+
 # Lines of container log tail surfaced in a start-failure message (e.g. the git
 # clone error from the init container).
 _LOG_TAIL_LINES: int = 20
@@ -447,6 +457,8 @@ def _render_workspace_prep_command(
     clone_dir: str | None,
     repo_url: str | None,
     repo_branch: str | None,
+    server_url: str,
+    host_id: str,
     host_config: dict[str, object] | None = None,
 ) -> list[str]:
     """
@@ -472,10 +484,20 @@ def _render_workspace_prep_command(
     """
     script = f"set -e\nmkdir -p {shlex.quote(workspace)}\n"
     if repo_url is not None and clone_dir is not None:
+        # Prefer the owner's per-user credential for the clone: when they've
+        # connected GitHub, wire the broker as the sole github.com helper so a
+        # private clone authenticates as *them*. When they haven't connected this
+        # is a no-op that leaves the image's shared ``$GIT_TOKEN`` helper in
+        # place; ``|| true`` keeps a broker hiccup from failing the clone (it
+        # then falls back to ``$GIT_TOKEN``). Needs OMNIGENT_HOST_TOKEN in-env.
+        wire = (
+            "from omnigent.git_credential_github import configure_clone_credentials; "
+            f"configure_clone_credentials({server_url!r}, {host_id!r})"
+        )
+        script += f"python3 -c {shlex.quote(wire)} || true\n"
         # ``--`` separates options from the (already-validated) URL so it can
         # never be parsed as a flag; --single-branch keeps branch-pinned clones
-        # fast. Private repos authenticate via the image's GIT_TOKEN credential
-        # helper (projected from the harness Secret).
+        # fast. Auth: the broker (above, if connected) else the image's GIT_TOKEN.
         branch = (
             f"--branch {shlex.quote(repo_branch)} --single-branch "
             if repo_branch is not None
@@ -564,6 +586,7 @@ def build_job_manifest(
     agent_name: str | None = None,
     backoff_limit: int = _JOB_BACKOFF_LIMIT,
     active_deadline_seconds: int = _JOB_ACTIVE_DEADLINE_S,
+    ttl_seconds_after_finished: int = _JOB_TTL_SECONDS_AFTER_FINISHED,
     runtime_class: str | None = None,
 ) -> dict[str, object]:
     """
@@ -577,10 +600,14 @@ def build_job_manifest(
     ``restartPolicy: OnFailure`` so the kubelet automatically restarts a
     crashed host container with exponential backoff (10 s, 20 s, 40 s, …
     capped at 5 min).  The Job's ``backoffLimit`` caps the total retry count,
-    and ``activeDeadlineSeconds`` enforces a hard lifetime.  Because
-    ``OnFailure`` restarts the SAME Pod in place, the Pod name is stable
-    across retries — the token Secret ``secretKeyRef`` keeps resolving and the
-    ``sandbox_id`` tracking in the managed-host machinery is unaffected.
+    and ``activeDeadlineSeconds`` enforces a hard lifetime.
+    ``ttlSecondsAfterFinished`` is a backstop on top of both: once a Job
+    reaches a terminal state on its own, the cluster garbage-collects it
+    even if this launcher's own ``terminate()`` never runs or never lands.
+    Because ``OnFailure`` restarts the SAME Pod in place, the Pod name is
+    stable across retries — the token Secret ``secretKeyRef`` keeps
+    resolving and the ``sandbox_id`` tracking in the managed-host machinery
+    is unaffected.
 
     The host's existing WebSocket reconnect logic (exponential backoff in
     ``omnigent/host/connect.py``) re-registers the tunnel automatically after
@@ -725,7 +752,21 @@ def build_job_manifest(
             {"name": f"secret-{i}", "mountPath": mount["mount_path"], "readOnly": True}
         )
 
-    init_env = [{"name": "HOME", "value": _HOME_DIR}]
+    init_env: list[dict[str, object]] = [{"name": "HOME", "value": _HOME_DIR}]
+    if repo_url is not None:
+        # The clone wires the per-user broker when the owner has connected GitHub
+        # (see _render_workspace_prep_command), which reads the launch token from
+        # the env — project it the same way the host container does. Only added
+        # when there's a repo to clone, so a workspace-less sandbox's init
+        # container never sees the token.
+        init_env.append(
+            {
+                "name": HOST_TOKEN_ENV_VAR,
+                "valueFrom": {
+                    "secretKeyRef": {"name": token_secret_name, "key": HOST_TOKEN_ENV_VAR}
+                },
+            }
+        )
     config_home = env_literals.get("OMNIGENT_CONFIG_HOME")
     if config_home is not None:
         # Init and host containers share ONLY the HOME emptyDir, and both run
@@ -758,7 +799,7 @@ def build_job_manifest(
         "image": image,
         "workingDir": _HOME_DIR,
         "command": _render_workspace_prep_command(
-            workspace, clone_dir, repo_url, repo_branch, host_config
+            workspace, clone_dir, repo_url, repo_branch, server_url, host_id, host_config
         ),
         "env": init_env,
         "resources": pod_resources,
@@ -846,6 +887,7 @@ def build_job_manifest(
         "spec": {
             "backoffLimit": backoff_limit,
             "activeDeadlineSeconds": active_deadline_seconds,
+            "ttlSecondsAfterFinished": ttl_seconds_after_finished,
             "template": {
                 "metadata": {"labels": labels},
                 "spec": pod_spec,
