@@ -104,6 +104,37 @@ def test_approval_card_reject(
     _wait_for(lambda: not _pending_elicitations(base_url, session_id))
 
 
+@pytest.mark.timeout(120)
+def test_pending_approval_keeps_interrupt_available(
+    page: Page,
+    approval_session: tuple[str, str],
+) -> None:
+    """A turn parked on an approval remains interruptible from the composer."""
+    base_url, session_id = approval_session
+    page.goto(f"{base_url}/c/{session_id}")
+
+    composer = page.get_by_placeholder(_COMPOSER)
+    expect(composer).to_be_visible(timeout=30_000)
+    composer.fill("Run the command now.")
+    page.get_by_role("button", name="Send", exact=True).click()
+
+    card = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]').first
+    expect(card).to_be_visible(timeout=_AGENT_TURN_TIMEOUT_MS)
+    interrupt = page.get_by_role("button", name="Interrupt", exact=True)
+    expect(interrupt).to_be_visible()
+    expect(interrupt).to_be_enabled()
+
+    with page.expect_request(
+        lambda request: (
+            request.method == "POST" and request.url.endswith(f"/v1/sessions/{session_id}/events")
+        )
+    ) as request_info:
+        interrupt.click()
+
+    assert request_info.value.post_data_json == {"type": "interrupt", "data": {}}
+    expect(interrupt).not_to_be_visible(timeout=_MOCK_ELICITATION_TIMEOUT_MS)
+
+
 @pytest.mark.timeout(90)
 def test_native_permission_card_names_the_harness(
     page: Page,
