@@ -60,6 +60,10 @@ def test_v2_owns_intake_when_enabled_and_manual_dispatch_is_dry_by_default() -> 
     assert "remove in 0.12.0" in legacy
     assert "cancel-in-progress: false" in intake
     assert "github.event.action == 'opened'" in prioritize
+    assert (
+        "issue_number: ${{ fromJSON(format('{0}', "
+        "github.event.issue.number || inputs.issue_number)) }}" in prioritize
+    )
     apply_expression = (
         "apply: ${{ github.event_name != 'workflow_dispatch' || inputs.apply_labels }}"
     )
