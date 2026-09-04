@@ -403,3 +403,42 @@ def test_summarize_checks_empty() -> None:
         "total": 0,
         "runs": [],
     }
+
+
+def test_gh_scrubs_env_tokens_in_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    # In a sandbox the panel's gh must authenticate as the connected owner via
+    # hosts.yml, never an ambient GH_TOKEN/GITHUB_TOKEN (gh ranks those above
+    # hosts.yml) — so they're scrubbed from gh's env, restoring the fail-closed
+    # property and preventing a stray token from making the panel a shared identity.
+    monkeypatch.setenv("IS_SANDBOX", "1")
+    monkeypatch.setenv("GH_TOKEN", "shared-tok")
+    monkeypatch.setenv("GITHUB_TOKEN", "shared-tok")
+    captured: dict[str, object] = {}
+
+    def fake_run(argv: Sequence[str], *, cwd: str, timeout: float, env=None):
+        captured["argv"] = list(argv)
+        captured["env"] = env
+        return 0, "", ""
+
+    monkeypatch.setattr(github_resource, "_run", fake_run)
+    github_resource._gh(["api", "user"], cwd="/tmp")
+    assert captured["argv"] == ["gh", "api", "user"]
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert "GH_TOKEN" not in env
+    assert "GITHUB_TOKEN" not in env
+
+
+def test_gh_inherits_env_outside_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Local dev (not a sandbox): env is inherited untouched (env=None), so the
+    # developer's own gh auth / GH_TOKEN keeps working — no regression.
+    monkeypatch.delenv("IS_SANDBOX", raising=False)
+    captured: dict[str, object] = {}
+
+    def fake_run(argv: Sequence[str], *, cwd: str, timeout: float, env=None):
+        captured["env"] = env
+        return 0, "", ""
+
+    monkeypatch.setattr(github_resource, "_run", fake_run)
+    github_resource._gh(["pr", "diff"], cwd="/tmp")
+    assert captured["env"] is None

@@ -14,7 +14,11 @@ Design notes:
   environment, so ``gh`` authenticates as it normally does — the developer's
   ``gh`` login in local dev, and in a managed sandbox the per-user ``hosts.yml``
   that :func:`omnigent.git_credential_github.configure_host_gh` writes from the
-  credential broker at host startup.
+  credential broker at host startup. In a sandbox we additionally scrub
+  ``GH_TOKEN``/``GITHUB_TOKEN`` from ``gh``'s env (gh ranks those *above*
+  ``hosts.yml``), so a stray ambient token — e.g. a gh-MCP env passthrough —
+  can't silently make the panel act as a shared identity instead of the
+  connected owner. Outside a sandbox the env is inherited untouched.
 - The list and patch are GitHub-computed, never a local ``git diff``, so a stale
   local ``origin/<base>`` can't inflate them with files outside the PR.
 - Only the on-demand per-file expand-context reader (:func:`github_file_diff`)
@@ -75,12 +79,15 @@ def _run(
     *,
     cwd: str,
     timeout: float,
+    env: dict[str, str] | None = None,
 ) -> tuple[int | None, str, str]:
     """Run a subprocess and capture its output, never raising.
 
     :param argv: Command and arguments.
     :param cwd: Working directory to run in.
     :param timeout: Wall-clock cap in seconds.
+    :param env: Full child environment, or ``None`` to inherit this process's
+        (the default).
     :returns: ``(returncode, stdout, stderr)``. ``returncode`` is ``None`` when
         the command could not run at all (spawn error / timeout), so callers can
         distinguish "ran and failed" from "never ran".
@@ -92,6 +99,7 @@ def _run(
             cwd=cwd,
             capture_output=True,
             timeout=timeout,
+            env=env,
         )
     except subprocess.TimeoutExpired:
         _logger.warning(
@@ -115,8 +123,22 @@ def _git(argv: list[str], *, cwd: str) -> tuple[int | None, str, str]:
     return _run(["git", *argv], cwd=cwd, timeout=_git_timeout_seconds())
 
 
+def _in_sandbox() -> bool:
+    """Whether the panel is running inside a managed sandbox (``IS_SANDBOX=1``)."""
+    return (os.environ.get("IS_SANDBOX") or "").strip() == "1"
+
+
 def _gh(argv: list[str], *, cwd: str) -> tuple[int | None, str, str]:
-    return _run(["gh", *argv], cwd=cwd, timeout=_gh_timeout_seconds())
+    # In a managed sandbox the panel must authenticate as the connected owner via
+    # the per-user hosts.yml that configure_host_gh writes — never an ambient
+    # GH_TOKEN/GITHUB_TOKEN, which gh ranks ABOVE hosts.yml. Scrub them so a stray
+    # token in the sandbox/runner env (e.g. a gh-MCP passthrough) can't silently
+    # make the panel act as a shared identity. Outside a sandbox (local dev) the
+    # env is inherited untouched, so the developer's own gh auth still works.
+    env: dict[str, str] | None = None
+    if _in_sandbox():
+        env = {k: v for k, v in os.environ.items() if k not in ("GH_TOKEN", "GITHUB_TOKEN")}
+    return _run(["gh", *argv], cwd=cwd, timeout=_gh_timeout_seconds(), env=env)
 
 
 # Cap the per-check list so a pathological rollup can't bloat the payload; the
