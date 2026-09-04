@@ -945,10 +945,21 @@ export function KeepBottomOnViewportResize() {
       if (nextHeight === clientHeight) return;
       clientHeight = nextHeight;
       if (!wasBottomLocked) return;
+      // Gecko delivers this callback before the frame paints, but the
+      // library's scrollToBottom always lands a frame later (it defers
+      // through a rAF promise), so the shrink paints with the transcript
+      // shoved up before the follow-up pin snaps it back — a visible
+      // bounce on every wrapped composer line. Pin synchronously here
+      // first; the async pins below stay as a safety net for engines that
+      // deliver the callback after paint. Target the library's park
+      // position (one pixel short) so the settle is identical whether our
+      // write or the library's lands last.
+      el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight - 1);
       scrollToBottom("instant");
       if (frame !== null) cancelAnimationFrame(frame);
       frame = requestAnimationFrame(() => {
         frame = null;
+        el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight - 1);
         scrollToBottom("instant");
       });
     });
@@ -1159,17 +1170,27 @@ const MAX_RESERVED_VIEWPORT_FRACTION = 1 / 3;
  */
 export function LatestTurnSpacer({
   scrollElement,
-  // Gap left above the pinned anchor. Defaults to clearing the top fade band.
+  // Gap left above the pinned anchor. Defaults to clearing the top fade band;
+  // with the Plan accordion pinned above (fade dropped, container already below
+  // the header), the caller passes the small content inset so a framed turn
+  // rests just below the accordion instead of 80px lower.
   topGapPx = PINNED_ANCHOR_TOP_GAP_PX,
+  // Set to the spacer's latest measure() so a sibling (the composer's
+  // same-task growth pin) can re-measure before reading scroll geometry —
+  // the spacer's own ResizeObserver delivery runs a frame later, and the
+  // intervening paint is the visible transcript jump.
+  measureRef,
 }: {
   scrollElement?: HTMLElement | null;
   topGapPx?: number;
+  measureRef?: React.RefObject<(() => void) | null>;
 } = {}) {
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     scrollRef: React.RefObject<HTMLElement>;
   };
   // Block changes remeasure the frozen anchor; streaming growth is covered by
-  // the ResizeObserver. The hydration gate remounts this component on a switch.
+  // the ResizeObserver. The hydration gate remounts this component on a
+  // conversation switch, which captures that conversation's initial anchor.
   const blockCount = useChatStore((s) => s.blocks.length);
   const spacerRef = useRef<HTMLDivElement>(null);
   // `undefined` means capture has not run; `null` is a completed capture with
@@ -1245,6 +1266,14 @@ export function LatestTurnSpacer({
   useLayoutEffect(() => {
     measure();
   }, [measure, blockCount]);
+
+  useLayoutEffect(() => {
+    if (!measureRef) return;
+    measureRef.current = measure;
+    return () => {
+      if (measureRef.current === measure) measureRef.current = null;
+    };
+  }, [measure, measureRef]);
 
   useLayoutEffect(() => {
     const scrollEl = scrollElement ?? ctx.scrollRef?.current;

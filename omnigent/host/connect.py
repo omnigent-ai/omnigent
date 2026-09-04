@@ -1526,10 +1526,12 @@ class HostProcess:
                 "registered to a different account on this server, so the "
                 "account you authenticated as cannot claim it. This usually "
                 "means the host was first registered under another identity "
-                "(e.g. the single-user 'local' owner before the server "
-                "switched to accounts auth). Ask an administrator to remove "
-                "the existing host registration, or reset this machine's host "
-                "id, then retry. " + self._login_fix_hint()
+                "(e.g. an M2M service principal selected from "
+                "~/.databrickscfg, or the single-user 'local' owner before "
+                "the server switched to accounts auth). Run "
+                f"`{cli_invocation()} host reset-id` to mint a fresh host id "
+                "for this machine and retry, or ask an administrator to "
+                "remove the existing host registration. " + self._login_fix_hint()
             )
         # Any other permanent 4xx (e.g. a 400 for a malformed host id, or an
         # edge/proxy rejection): the server's own body is the authoritative

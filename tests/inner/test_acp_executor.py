@@ -18,11 +18,13 @@ import asyncio
 import os
 import shlex
 import sys
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from omnigent.inner import _proc
 from omnigent.inner import acp_executor as acp_executor_module
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp, _to_acp_mcp_servers
 from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
@@ -1863,3 +1865,69 @@ def test_startup_error_names_the_exception_type_when_str_is_empty() -> None:
     """No stderr and an empty ``str(exc)`` still yields something actionable."""
     ex = AcpExecutor(AcpAgentConfig(command="x", name="A"))
     assert "TimeoutError" in ex._startup_error_message(TimeoutError())
+
+
+# ---------------------------------------------------------------------------
+# Process lifecycle: a torn-down executor must not strand the agent
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_spawned_agent_leads_its_own_process_group(tmp_path: Path) -> None:
+    """The spawned agent is a session/group leader, not in the harness's group.
+
+    Without the boundary ``_proc._killpg`` resolves the target group to the one
+    we share with the harness and daemon, refuses to signal it, and tree-aware
+    teardown silently degrades to a per-descendant walk.
+    """
+    agent_path = tmp_path / "sleepy_agent.py"
+    agent_path.write_text("import time\ntime.sleep(300)\n")
+    ex = AcpExecutor(
+        AcpAgentConfig(command=shlex.join([sys.executable, str(agent_path)]), name="Sleepy")
+    )
+
+    await ex._start_process()
+    try:
+        pid = ex._proc.pid  # type: ignore[union-attr]
+        assert os.getpgid(pid) == pid, "agent must lead its own process group"
+        assert os.getpgid(pid) != os.getpgid(0), "agent must not share our group"
+    finally:
+        await ex.close()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_close_reaps_the_agents_forked_children(tmp_path: Path) -> None:
+    """``close()`` stops the agent's descendants, not just the handle it holds.
+
+    Under a sandbox the handle is the seatbelt ``run_launcher`` wrapper, which
+    forks the real agent; a single-pid ``terminate()`` reached the wrapper and
+    left the agent running for the daemon's whole lifetime.
+    """
+    pid_file = tmp_path / "grandchild.pid"
+    agent_path = tmp_path / "forking_agent.py"
+    agent_path.write_text(
+        "import pathlib, subprocess, sys, time\n"
+        "kid = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(kid.pid))\n"
+        "time.sleep(300)\n"
+    )
+    ex = AcpExecutor(
+        AcpAgentConfig(command=shlex.join([sys.executable, str(agent_path)]), name="Forking")
+    )
+
+    await ex._start_process()
+    deadline = time.monotonic() + 10.0
+    while not pid_file.exists():
+        assert time.monotonic() < deadline, "the fake agent never forked its child"
+        await asyncio.sleep(0.05)
+    grandchild = int(pid_file.read_text())
+    assert _proc.process_alive(grandchild)
+
+    await ex.close()
+
+    deadline = time.monotonic() + 10.0
+    while _proc.process_alive(grandchild):
+        assert time.monotonic() < deadline, f"agent child {grandchild} survived close()"
+        await asyncio.sleep(0.05)

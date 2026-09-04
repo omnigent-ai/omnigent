@@ -175,9 +175,6 @@ _PASTE_COMMIT_TIMEOUT_S = 5.0
 # actually left the input box (re-sending Enter while it hasn't)
 # before failing loud.
 _SUBMIT_VERIFY_TIMEOUT_S = 10.0
-# UserPromptSubmit is the terminal's delivery acknowledgement. Composer
-# state alone is ambiguous because an in-pane restart also clears it.
-_DELIVERY_ACK_TIMEOUT_S = 10.0
 # Minimum spacing between repeated submit Enters during verification.
 # Long enough for the TUI to clear the box after a successful submit
 # (so a slow-but-successful first Enter isn't double-tapped), short
@@ -519,8 +516,6 @@ class ClaudeHookRecord:
         advance past it.
     :param source: Claude ``SessionStart`` source, e.g. ``"clear"``,
         or ``None`` for hook records without a source field.
-    :param prompt: User text from a ``UserPromptSubmit`` hook, or
-        ``None`` for other hook events.
     :param claude_session_id: Claude-native session uuid from the hook
         payload, e.g. ``"a1b2c3d4-1234-5678-9abc-def012345678"``,
         or ``None`` when absent.
@@ -577,7 +572,6 @@ class ClaudeHookRecord:
     event_name: str | None
     recorded_at: float | None = None
     source: str | None = None
-    prompt: str | None = None
     claude_session_id: str | None = None
     transcript_path: Path | None = None
     previous_claude_session_id: str | None = None
@@ -2792,87 +2786,6 @@ def read_hook_events_from_offset(
     )
 
 
-def _hook_file_size(bridge_dir: Path) -> int:
-    """Return the hook log size used to snapshot future events."""
-    path = bridge_dir / _HOOKS_FILE
-    try:
-        return path.stat().st_size
-    except FileNotFoundError:
-        return 0
-
-
-def _is_subagent_hook_record(record: ClaudeHookRecord) -> bool:
-    """Return whether a hook record belongs to a Claude subagent."""
-    return record.transcript_path is not None and "subagents" in record.transcript_path.parts
-
-
-def _normalized_delivery_prompt(prompt: str) -> str:
-    """Normalize hook and injected prompt text for acknowledgement matching."""
-    return prompt.replace("\r\n", "\n").replace("\r", "\n").rstrip()
-
-
-def _wait_for_user_prompt_submit_ack(
-    bridge_dir: Path,
-    *,
-    byte_offset: int,
-    expected_prompt: str,
-    expected_claude_session_id: str | None,
-    timeout_s: float | None = None,
-) -> None:
-    """Wait for Claude to acknowledge the exact prompt submitted after an offset."""
-    if timeout_s is None:
-        timeout_s = _DELIVERY_ACK_TIMEOUT_S
-    deadline = time.monotonic() + timeout_s
-    current_session_id = expected_claude_session_id
-    if byte_offset:
-        prior = read_hook_events_from_offset(bridge_dir, 0, start_event_count=0)
-        for record in prior.records:
-            if record.byte_offset > byte_offset:
-                break
-            if (
-                record.event_name == "SessionStart"
-                and record.claude_session_id
-                and not _is_subagent_hook_record(record)
-            ):
-                current_session_id = record.claude_session_id
-    restart_seen = False
-    expected = _normalized_delivery_prompt(expected_prompt)
-    offset = byte_offset
-    while time.monotonic() < deadline:
-        result = read_hook_events_from_offset(
-            bridge_dir,
-            offset,
-            start_event_count=0,
-        )
-        offset = result.byte_offset
-        for record in result.records:
-            if _is_subagent_hook_record(record):
-                continue
-            if record.event_name == "SessionStart" and record.claude_session_id:
-                if current_session_id and record.claude_session_id != current_session_id:
-                    restart_seen = True
-                current_session_id = record.claude_session_id
-                continue
-            if record.event_name != "UserPromptSubmit" or record.prompt is None:
-                continue
-            if _normalized_delivery_prompt(record.prompt) != expected:
-                continue
-            if current_session_id and record.claude_session_id != current_session_id:
-                continue
-            return
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-
-    if restart_seen:
-        raise RuntimeError(
-            "Claude Code restarted while the message was being submitted and the new "
-            "session did not acknowledge it. The message was not delivered."
-        )
-    raise RuntimeError(
-        f"Claude Code did not acknowledge the submitted message within {timeout_s}s. "
-        "The message may not have been delivered."
-    )
-
-
 def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
     """
     Return whether Claude reported a stop event after a hook cursor.
@@ -2975,7 +2888,6 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
     if isinstance(raw_event_name, str) and raw_event_name:
         event_name = raw_event_name
     raw_source = payload.get("source") if isinstance(payload, dict) else None
-    raw_prompt = payload.get("prompt") if isinstance(payload, dict) else None
     raw_recorded_at = envelope.get("recorded_at") if isinstance(envelope, dict) else None
     raw_claude_session_id = payload.get("session_id") if isinstance(payload, dict) else None
     raw_transcript_path = payload.get("transcript_path") if isinstance(payload, dict) else None
@@ -3066,7 +2978,6 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         if isinstance(raw_recorded_at, (int, float)) and not isinstance(raw_recorded_at, bool)
         else None,
         source=raw_source if isinstance(raw_source, str) and raw_source else None,
-        prompt=raw_prompt if isinstance(raw_prompt, str) else None,
         claude_session_id=(
             raw_claude_session_id
             if isinstance(raw_claude_session_id, str) and raw_claude_session_id
@@ -3247,17 +3158,14 @@ def inject_user_message(
     client→server command at ~16KB, so a large message — e.g. a PR diff
     in a sub-agent dispatch — failed with "command too long".
 
-    The submit is **acknowledged, not fire-and-forget**: Claude Code
+    The submit is **verified, not fire-and-forget**: Claude Code
     coalesces rapid stdin bursts into a paste, so an Enter that lands
     while the TUI is still consuming the paste is folded in as a
-    newline and the draft sits unsent. This helper polls ``capture-pane``
-    until the draft is visible in the input box (best-effort — a large
-    paste collapses to a ``[Pasted text]`` placeholder that may not match),
-    sends Enter, then polls that the draft left the box — re-sending Enter
-    while it hasn't — and raises if the message never submits. An empty
-    composer is not sufficient evidence: after it clears, this helper also
-    waits for the matching ``UserPromptSubmit`` hook from the active Claude
-    session, which is the authoritative delivery check.
+    newline and the draft sits unsent. This helper first polls
+    ``capture-pane`` until the draft is visible in the input box (the
+    paste was committed), sends Enter, then polls that the draft left
+    the box — re-sending Enter while it hasn't — and raises if the
+    message never submits.
 
     :param bridge_dir: Bridge directory path.
     :param content: User text from the Omnigent web UI. Must be non-empty.
@@ -3266,9 +3174,8 @@ def inject_user_message(
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in time,
         if Claude's input prompt never renders, if a ``tmux send-keys``
-        invocation fails, if the draft never leaves the input box after
-        repeated submit Enters, or if Claude never acknowledges the
-        submitted prompt via ``UserPromptSubmit``.
+        invocation fails, or if the draft never leaves the input box
+        after repeated submit Enters (message not delivered).
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     # A surface left occupying the composer swallows everything typed
@@ -3297,15 +3204,6 @@ def inject_user_message(
     # that Omnigent cannot drive. Allowed commands (``/clear``,
     # ``/model``, ``/fork``, skills, etc.) pass through unchanged.
     injected_text = _escape_unsupported_slash_command(content)
-    command_name = _first_slash_command_name(content)
-    needle = _submit_needle(content)
-    # Built-in lifecycle commands do not consistently emit UserPromptSubmit;
-    # whitespace-only submissions do not emit it at all.
-    require_delivery_ack = bool(needle) and (
-        command_name not in _CLAUDE_NATIVE_ALLOWED_USER_SLASH_COMMANDS
-    )
-    hook_offset = _hook_file_size(bridge_dir) if require_delivery_ack else 0
-    expected_claude_session_id = read_claude_session_id(bridge_dir)
     # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
     # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
     # client→server command at ~16KB, so per-byte hex argv blew up with
@@ -3314,12 +3212,10 @@ def inject_user_message(
     # ``paste-buffer -p`` wraps it in the same bracketed-paste markers so
     # interior newlines (mapped to CR below) stay data instead of becoming
     # per-line submits. See anthropics/claude-code#52126.
-    paste_payload = _paste_payload_bytes(injected_text + "\n")
-    expected_delivery_prompt = _normalized_delivery_prompt(paste_payload.decode("utf-8"))
     with tempfile.NamedTemporaryFile(
         dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
     ) as paste_file:
-        paste_file.write(paste_payload)
+        paste_file.write(_paste_payload_bytes(injected_text + "\n"))
         paste_path = paste_file.name
     try:
         _run_tmux(info["socket_path"], "load-buffer", "-b", "omnigent-paste", paste_path)
@@ -3341,20 +3237,24 @@ def inject_user_message(
     # into a paste; an Enter that arrives while it is still consuming
     # the paste becomes a newline inside the draft instead of a submit,
     # and the message sits unsent. A fixed sleep raced this (lost under
-    # load / large payloads); polling is deterministic.
-    # The draft-visibility poll is best-effort, not a gate: large or
-    # multi-line pastes render as a collapsed ``[Pasted text]`` placeholder
-    # whose glyph row may not match the needle within the window, so a
-    # timeout here does not mean the paste failed. Fall through to submit
-    # regardless — the ``UserPromptSubmit`` acknowledgement below is the
-    # authoritative delivery check and surfaces a genuine non-delivery.
+    # load / large payloads); polling is deterministic. Best-effort:
+    # when the draft never becomes identifiable (e.g. whitespace-only
+    # first line, custom statusline containing the glyph), fall through
+    # after the timeout and submit blind, matching the old behavior.
+    needle = _submit_needle(content)
+    draft_seen = False
     deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
     while time.monotonic() < deadline:
         if _draft_in_input_box(_capture_pane(info["socket_path"], info["tmux_target"]), needle):
+            draft_seen = True
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     time.sleep(_PASTE_SETTLE_S)
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
+    if not draft_seen:
+        # The draft was never observed, so its absence proves nothing —
+        # verification would trivially "pass". Submit blind as before.
+        return
     # Verify the submit took: a successful Enter clears the input box.
     # If the draft is still sitting there the Enter was swallowed into
     # the paste burst as a newline — re-send it (the retry lands well
@@ -3367,22 +3267,14 @@ def inject_user_message(
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
         pane = _capture_pane(info["socket_path"], info["tmux_target"])
         if not _draft_in_input_box(pane, needle):
-            break
+            return
         if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
             _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
             last_enter = time.monotonic()
-    else:
-        raise RuntimeError(
-            f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
-            "(the draft is still in the input box). The message was not delivered."
-        )
-    if require_delivery_ack:
-        _wait_for_user_prompt_submit_ack(
-            bridge_dir,
-            byte_offset=hook_offset,
-            expected_prompt=expected_delivery_prompt,
-            expected_claude_session_id=expected_claude_session_id,
-        )
+    raise RuntimeError(
+        f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
+        "(the draft is still in the input box). The message was not delivered."
+    )
 
 
 def inject_interrupt(

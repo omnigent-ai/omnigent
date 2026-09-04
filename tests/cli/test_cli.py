@@ -3491,6 +3491,21 @@ def test_materialize_harness_launcher_file_acp_slug() -> None:
     assert re.fullmatch(r"[a-zA-Z0-9_-]+", raw["name"])  # passes the agent-name validator
 
 
+def test_materialize_harness_launcher_file_acp_gets_os_env() -> None:
+    """``run --harness acp:<slug>`` bakes a caller-process ``os_env``.
+
+    Regression: ``acp`` was missing from ``_OS_ENV_HARNESSES``, so generic-ACP
+    launcher specs had no ``os_env`` block - the runner 404d the session's
+    default environment resource and the web UI unmounted the Files panel as
+    soon as the agent's first reply resolved availability.
+    """
+    generated = _materialize_harness_launcher_file(
+        harness="acp:qwenacp", model=None, system_prompt=None
+    )
+    raw = yaml.safe_load(generated.read_text())
+    assert raw["os_env"] == {"type": "caller_process", "sandbox": {"type": "none"}}
+
+
 def test_run_from_openclaw_dispatches_ephemeral_acp_agent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

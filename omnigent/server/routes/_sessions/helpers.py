@@ -7213,12 +7213,90 @@ async def _relay_persist(
         )
 
 
+async def _relay_response_policy_deny_reason(
+    conversation_store: ConversationStore,
+    session_id: str,
+    text: str,
+) -> str | None:
+    """
+    Evaluate *text* against the session's OUTPUT (RESPONSE) phase policies.
+
+    Runner-relayed (scaffold) harnesses never POST the assistant message
+    back through ``POST /v1/sessions/{id}/events``, so the
+    ``Phase.RESPONSE`` evaluator there is unreachable for them. The relay's
+    terminal text flush is their single persist point, so this evaluates the
+    same output policies over the final assistant text right before it
+    becomes durable — making a spec's ``response``-phase policy enforceable
+    in the runner topology.
+
+    Fails OPEN (returns ``None``) on any evaluation error, matching the LLM
+    phases' advisory default: a policy-engine hiccup must not destroy the
+    narration the user already watched.
+
+    :param conversation_store: Store for the conversation/labels lookup.
+    :param session_id: Session/conversation identifier.
+    :param text: The joined assistant text segment about to persist.
+    :returns: The deny reason when an output policy DENYs, else ``None``.
+    """
+    from omnigent.runtime._globals import _agent_store
+
+    if _agent_store is None:
+        # Fail open, but loudly: a mis-initialized runtime would otherwise
+        # silently disable RESPONSE-phase gating for every relayed session.
+        _logger.warning(
+            "Relay: agent store not initialized; skipping RESPONSE-phase "
+            "policy evaluation for session=%s",
+            session_id,
+            extra={"session_id": session_id},
+        )
+        return None
+    try:
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None or conv.agent_id is None:
+            return None
+        body = SessionEventInput(
+            type="message",
+            data={
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            },
+        )
+        # The relay has no HTTP caller; the acting principal is the
+        # turn-initiating human persisted at forward time (same label the
+        # policy-evaluate route falls back to), so per-user policies gate
+        # on the correct actor.
+        turn_actor = (conv.labels or {}).get(_TURN_ACTOR_LABEL)
+        verdict = await _evaluate_output_policy(
+            session_id,
+            conv,
+            body,
+            conversation_store,
+            _agent_store,
+            None,
+            actor=_build_actor(turn_actor),
+        )
+    except Exception:  # noqa: BLE001 — fail open: output phases are advisory on error
+        _logger.exception(
+            "Relay: RESPONSE-phase policy evaluation failed for session=%s; "
+            "persisting the text unmodified",
+            session_id,
+            extra={"session_id": session_id},
+        )
+        return None
+    if verdict is None:
+        return None
+    return str(verdict.get("reason") or "Denied by policy")
+
+
 async def _flush_relay_text(
     conversation_store: ConversationStore | None,
     session_id: str,
     text_acc: list[str],
     response_id: str | None,
     model_id: str | None,
+    *,
+    deny_reason: str | None = None,
+    evaluate_response_phase: bool = False,
 ) -> None:
     """
     Persist buffered assistant text as a message item and clear the buffer.
@@ -7253,12 +7331,32 @@ async def _flush_relay_text(
     permanently. On failure the buffers are left intact so the text still
     replays and is retried at the next flush / ``response.completed``.
 
+    On an OUTPUT-phase DENY the denied text must never become a durable
+    assistant message. Two deny sources feed this (both persist the same
+    ``[Denied by policy: ...]`` sentinel the ``_evaluate_output_policy``
+    route path uses):
+
+    - *deny_reason*: the ``PHASE_LLM_RESPONSE`` DENY the policy-evaluate
+      route recorded for this session's in-flight turn — the harness only
+      errors the turn after the text already streamed, so the relay is
+      the last gate before the denied content persists.
+    - *evaluate_response_phase*: evaluate the joined text against the
+      spec's ``Phase.RESPONSE`` policies right here. Runner-relayed
+      harnesses never POST the assistant message back through
+      ``POST .../events``, so this flush is the only place the
+      ``response`` phase can fire in this topology.
+
     :param conversation_store: Store to append to, or ``None`` to skip
         persistence (test parsing path).
     :param session_id: Conversation/session id, e.g. ``"conv_abc123"``.
     :param text_acc: Accumulated delta strings; cleared in place on success.
     :param response_id: Turn id so the segment groups with its tool calls.
     :param model_id: Assistant agent label for the message.
+    :param deny_reason: When set, an output policy already denied this
+        turn's assistant text; persist the deny sentinel instead of it.
+    :param evaluate_response_phase: When ``True`` (terminal flush), gate
+        the text through the spec's RESPONSE-phase policies before
+        persisting.
     """
     if not text_acc:
         return
@@ -7272,6 +7370,27 @@ async def _flush_relay_text(
     if conversation_store is None:
         text_acc.clear()
         return
+    if deny_reason is None and evaluate_response_phase:
+        deny_reason = await _relay_response_policy_deny_reason(
+            conversation_store, session_id, text
+        )
+    if deny_reason is not None:
+        # Substitute the sentinel for the denied content — same Option-B
+        # shape as the ``_evaluate_output_policy`` route path, so follow-up
+        # turns and the items API see a consistent deny record. Publish the
+        # sentinel delta too: live clients already rendered the denied text
+        # from the stream (that flash is the residual gap full buffering
+        # would close), so without a visible sentinel the deny would only
+        # be discoverable after a reload.
+        text = f"{_DENY_SENTINEL_PREFIX}{deny_reason}]"
+        # Commit the substitution into the retry buffer itself: a failed
+        # persist below leaves ``text_acc`` for the next flush, and that
+        # retry must carry the sentinel, never the denied content. Without
+        # this, a RESPONSE-phase deny would be re-evaluated from scratch on
+        # retry — and a stateful policy whose labels moved on the first
+        # DENY could flip to ALLOW and leak the original text.
+        text_acc[:] = [text]
+        _publish_policy_deny(session_id, deny_reason)
     import uuid
 
     try:
@@ -8705,7 +8824,32 @@ def _spec_config_flag_explicitly_disabled(spec: AgentSpec, key: str) -> bool:
     return isinstance(value, str) and value.strip().lower() == "false"
 
 
-def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | None:
+def _spec_config_flag_explicitly_enabled(spec: AgentSpec, key: str) -> bool:
+    """
+    Return whether an ``executor.config`` flag is explicitly set true.
+
+    The mirror of :func:`_spec_config_flag_explicitly_disabled`, used for
+    opt-IN semantics: the flag defaults to off and only an intentional
+    ``true`` / ``True`` enables it. Enabling values are matched without
+    whitespace tolerance (the value-matching policy of
+    :func:`_derive_terminal_launch_args_from_spec`), so ``" true"`` does
+    not enable.
+
+    :param spec: A parsed agent / sub-agent spec.
+    :param key: The ``executor.config`` key to read, e.g. ``"yolo"``.
+    :returns: ``True`` only when the value is the boolean ``True`` or the
+        case-insensitive string ``"true"``; ``False`` otherwise (including
+        when the key is absent).
+    """
+    value = spec.executor.config.get(key)
+    if isinstance(value, bool):
+        return value is True
+    return isinstance(value, str) and value.lower() == "true"
+
+
+def _derive_terminal_launch_args_from_spec(
+    spec: AgentSpec, *, headless_defaults: bool = True
+) -> list[str] | None:
     """
     Derive native-terminal YOLO pass-through args from a trusted sub-spec.
 
@@ -8764,16 +8908,31 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
     this returns ``None`` so no terminal args are set. ``None`` is also
     returned when the relevant field is absent / falsey.
 
-    :param sub_spec: The trusted child sub-agent spec, resolved from the
-        server-loaded parent bundle via :func:`_resolve_subagent_spec`.
+    ``headless_defaults`` selects the stance for a spec that declares
+    nothing: named-worker / bundled-child creates keep the headless
+    default above (codex-native / cursor-native bypass by DEFAULT, because
+    nobody can answer their prompts). Top-level and self-resolved-agent
+    creates pass ``headless_defaults=False``: those sessions are
+    interactive — a human can answer an ApprovalCard — so only the spec's
+    EXPLICIT declarations are honored (``yolo: true``, a
+    ``permission_mode`` / ``exec_mode`` value) and an undeclared spec
+    keeps the harness's own default approval stance.
+
+    :param spec: A trusted, server-loaded spec: a named worker's sub-spec
+        (via :func:`_resolve_subagent_spec`), a bundled child's spec, or —
+        with ``headless_defaults=False`` — the session's own agent spec.
+    :param headless_defaults: Whether an undeclared codex-native /
+        cursor-native spec falls back to the headless full-bypass default.
+        ``True`` for headless worker creates; ``False`` for top-level /
+        self-resolved creates, where only explicit opt-ins translate.
     :returns: A flat CLI-arg list to store as the child session's
         ``terminal_launch_args``, or ``None`` when nothing should be set.
     :raises ValueError: If a spec-derived argument violates the same
         bounds enforced for request-supplied ``terminal_launch_args``.
     """
-    harness = _spec_harness(sub_spec)
+    harness = _spec_harness(spec)
     if harness == _CLAUDE_NATIVE_HARNESS:
-        permission_mode = sub_spec.executor.config.get("permission_mode")
+        permission_mode = spec.executor.config.get("permission_mode")
         if permission_mode:
             return _validate_terminal_launch_args(["--permission-mode", str(permission_mode)])
         return None
@@ -8786,7 +8945,9 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
         # approval/sandbox). Without the flag the thread is created at
         # codex's on-request + own-sandbox default and a headless worker
         # stalls. An explicit ``yolo: false`` is the opt-out. See #171.
-        if _spec_config_flag_explicitly_disabled(sub_spec, "yolo"):
+        if _spec_config_flag_explicitly_disabled(spec, "yolo"):
+            return None
+        if not headless_defaults and not _spec_config_flag_explicitly_enabled(spec, "yolo"):
             return None
         return _validate_terminal_launch_args(["--dangerously-bypass-approvals-and-sandbox"])
     if harness == _CURSOR_NATIVE_HARNESS:
@@ -8795,27 +8956,29 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
         # by default so headless polly workers don't stall on mirrored
         # approval cards. ``yolo: false`` is the keep-prompting opt-out.
         mode = (
-            sub_spec.executor.config.get("permission_mode")
-            or sub_spec.executor.config.get("exec_mode")
+            spec.executor.config.get("permission_mode")
+            or spec.executor.config.get("exec_mode")
             or ""
         )
         mode_norm = str(mode).strip().lower()
         if mode_norm in ("auto", "auto-review"):
             return _validate_terminal_launch_args(["--auto-review"])
-        if _spec_config_flag_explicitly_disabled(sub_spec, "yolo"):
+        if _spec_config_flag_explicitly_disabled(spec, "yolo"):
+            return None
+        if not headless_defaults and not _spec_config_flag_explicitly_enabled(spec, "yolo"):
             return None
         return _validate_terminal_launch_args(["--yolo"])
     if harness == _KIMI_NATIVE_HARNESS:
         # Opt-IN (unlike codex/cursor's headless default-bypass). The bool
         # arm covers programmatically built specs; the string arm covers the
         # parser's stringified ``"True"`` (see the value-matching policy).
-        yolo = sub_spec.executor.config.get("yolo")
+        yolo = spec.executor.config.get("yolo")
         if yolo is True or (isinstance(yolo, str) and yolo.lower() == "true"):
             return _validate_terminal_launch_args(["--yolo"])
         if (
             yolo is not None
             and yolo is not False
-            and not _spec_config_flag_explicitly_disabled(sub_spec, "yolo")
+            and not _spec_config_flag_explicitly_disabled(spec, "yolo")
         ):
             _logger.debug(
                 "kimi-native sub-spec has unrecognized yolo=%r; launching without --yolo.",
@@ -8825,7 +8988,7 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
     if harness == _ANTIGRAVITY_NATIVE_HARNESS:
         # Opt-IN, matched exactly like the runner's should_skip_permissions;
         # other modes have no agy analogue and leave args unset.
-        mode = sub_spec.executor.config.get("permission_mode")
+        mode = spec.executor.config.get("permission_mode")
         if isinstance(mode, str):
             if mode == "bypassPermissions":
                 return _validate_terminal_launch_args(["--dangerously-skip-permissions"])

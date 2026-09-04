@@ -86,6 +86,42 @@ def test_configure_host_git_noop_without_token(monkeypatch: pytest.MonkeyPatch) 
     assert calls == []  # no token → nothing configured
 
 
+def test_configure_host_git_clears_stale_broker_when_not_connected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Scoping: a confirmed not-connected owner (shared-$GIT_TOKEN / local model)
+    # must NOT install the broker. It must also CLEAR any stale broker a prior
+    # (inconclusive) clone probe installed — otherwise the reset it left strands
+    # in-session git behind a declining broker. So the one and only write is the
+    # unset that restores the ambient/shared helper; no --add, no identity.
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
+    monkeypatch.setattr(h, "_fetch", lambda *a, **k: {"connected": False})
+    h.configure_host_git("http://srv", "host1")
+    key = "credential.https://github.com.helper"
+    assert calls == [["git", "config", "--global", "--unset-all", key]]
+    flat = [" ".join(c) for c in calls]
+    assert not any("--add" in c for c in flat)
+    assert not any("user.email" in c for c in flat)
+
+
+def test_resolve_github_token_returns_token_when_connected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        h,
+        "_fetch",
+        lambda *a, **k: {"connected": True, "token": "ghu_x", "username": "x-access-token"},
+    )
+    assert h.resolve_github_token("http://srv", "host1", "tok") == "ghu_x"
+
+
+def test_resolve_github_token_none_when_not_connected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(h, "_fetch", lambda *a, **k: {"connected": False})
+    assert h.resolve_github_token("http://srv", "host1", "tok") is None
+
+
 def test_credential_url_targets_the_generic_provider_path() -> None:
     # The helper hits the provider-generic broker with provider=github.
     assert h._credential_url("http://s", "hid") == "http://s/v1/hosts/hid/credentials/github"

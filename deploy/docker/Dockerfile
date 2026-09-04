@@ -336,6 +336,38 @@ RUN set -eu; \
     fi; \
     echo "agy ${AGY_VERSION} pinned (sha256 verified)"
 
+# GitHub CLI (`gh`) — the read-only "GitHub" side panel shells out to `gh` in the
+# runner (omnigent/runner/github_resource.py: `gh pr view` / `gh pr diff` /
+# `gh api .../pulls/<n>/files`) to render the session branch's PR + file diffs, so
+# a managed host image must carry it or the panel degrades to a "gh not installed"
+# state. Pinned + SHA256-verified per arch, like agy above; to bump, update
+# GH_VERSION and both SHA256s from the release's `gh_<ver>_checksums.txt` at
+# https://github.com/cli/cli/releases.
+ARG GH_VERSION=2.100.0
+ARG GH_SHA256_AMD64=e4d4bb4498e8d007abe545b6568926793ace1b6447da598294a610018cb164be
+ARG GH_SHA256_ARM64=ea4e7a581a32ccad6cc7923cb1576ac5859ba4b9a16ab22eb8f8a96e78e2e961
+RUN set -eu; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) sha="$GH_SHA256_AMD64" ;; \
+      arm64) sha="$GH_SHA256_ARM64" ;; \
+      *) echo "ERROR: unsupported arch '$arch' for gh" >&2; exit 1 ;; \
+    esac; \
+    asset="gh_${GH_VERSION}_linux_${arch}.tar.gz"; \
+    curl -fsSL -o /tmp/gh.tar.gz \
+      "https://github.com/cli/cli/releases/download/v${GH_VERSION}/${asset}"; \
+    echo "${sha}  /tmp/gh.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/gh.tar.gz -C /tmp "gh_${GH_VERSION}_linux_${arch}/bin/gh"; \
+    install -m 0755 "/tmp/gh_${GH_VERSION}_linux_${arch}/bin/gh" /usr/local/bin/gh; \
+    rm -rf /tmp/gh.tar.gz "/tmp/gh_${GH_VERSION}_linux_${arch}"; \
+    test -x /usr/local/bin/gh; \
+    installed="$(/usr/local/bin/gh --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"; \
+    if [ "$installed" != "$GH_VERSION" ]; then \
+      echo "ERROR: gh reports '${installed:-<unparseable>}', expected '$GH_VERSION'." >&2; \
+      exit 1; \
+    fi; \
+    echo "gh ${GH_VERSION} pinned (sha256 verified)"
+
 # Copy the venv and source tree. The editable install's .pth files reference
 # /build/omnigent and /build/sdks/* -- both denied by the k8s Landlock LSM
 # policy. Re-install without -e so the package bytes land in the venv's

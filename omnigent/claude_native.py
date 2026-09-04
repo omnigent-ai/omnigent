@@ -27,6 +27,7 @@ from omnigent.llms.adapters._content import redact_binary_payloads
 from omnigent.runtime.tool_result_replay import (
     blocks_from_parsed_list,
     image_payloads_in_blocks,
+    sanitize_replayed_image_blocks,
     strip_unparseable_image_output,
     tool_result_content_blocks,
 )
@@ -3587,6 +3588,7 @@ async def _attach_with_transcript_forwarder(
                 attach_url=attach_url,
                 headers=headers,
                 recover=recover,
+                session_name="Claude",
                 base_url=base_url,
                 session_id=prepared.session_id,
                 terminal_id=prepared.terminal_id,
@@ -3630,6 +3632,7 @@ async def _attach_with_reconnect(
     attach_url: str,
     headers: dict[str, str],
     recover: Callable[[], Awaitable[None]] | None,
+    session_name: str = "Claude",
     base_url: str | None = None,
     session_id: str | None = None,
     terminal_id: str | None = None,
@@ -3660,6 +3663,8 @@ async def _attach_with_reconnect(
         (not before the first). ``None`` disables reconnect; the
         loop returns after one ``attach`` call. Callback exceptions
         are logged and the loop still retries.
+    :param session_name: User-facing native session name used in reconnect
+        messages, e.g. ``"Claude"`` or ``"Codex"``.
     :param base_url: Omnigent server URL for the post-close terminal probe;
         ``None`` disables the probe.
     :param session_id: Session/conversation id for the probe path.
@@ -3697,7 +3702,8 @@ async def _attach_with_reconnect(
                 await recover()
             except Exception:  # noqa: BLE001
                 _logger.warning(
-                    "claude-native reconnect recovery callback raised; retrying attach anyway",
+                    "%s-native reconnect recovery callback raised; retrying attach anyway",
+                    session_name.lower(),
                     exc_info=True,
                 )
         first_attempt = False
@@ -3756,14 +3762,15 @@ async def _attach_with_reconnect(
             if recover is None:
                 raise
             click.echo(
-                f"\nClaude session connection lost ({exc}); reconnecting...",
+                f"\n{session_name} session connection lost ({exc}); reconnecting...",
                 err=True,
             )
         except (WebSocketException, OSError, ConnectionError) as exc:
             if recover is None:
                 raise
             click.echo(
-                f"\nClaude session connection lost ({type(exc).__name__}: {exc}); reconnecting...",
+                f"\n{session_name} session connection lost "
+                f"({type(exc).__name__}: {exc}); reconnecting...",
                 err=True,
             )
         else:
@@ -3782,7 +3789,7 @@ async def _attach_with_reconnect(
                     )
                     return _AttachOutcome.EXITED
             click.echo(
-                "\nClaude session connection closed by server; reconnecting...",
+                f"\n{session_name} session connection closed by server; reconnecting...",
                 err=True,
             )
         await _sleep(delay)
@@ -5351,7 +5358,11 @@ def _claude_native_message_content(
         if block is None or not isinstance(block.get("type"), str):
             return None
         blocks.append(block)
-    return blocks
+    # A compaction snapshot strips image base64 to a marker; replayed verbatim
+    # that marker reaches the provider as source.data and fails the resume, so
+    # downgrade any unusable image block to its omitted-image placeholder.
+    sanitized = sanitize_replayed_image_blocks(blocks)
+    return cast(list[_JsonObject], sanitized)
 
 
 def _synthetic_claude_transcript_uuid(

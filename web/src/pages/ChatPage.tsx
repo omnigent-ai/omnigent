@@ -1533,6 +1533,50 @@ function MainAgentSurface({
     [onSendSlashCommand, isNativeWrapper],
   );
 
+  // Synchronous bottom re-pin for the composer's growth, called in the same
+  // task as the height change (before any paint — the only ordering Gecko
+  // doesn't paint past; every async pin leaves one intermediate frame).
+  // Guarded by the live lock state, not the public isAtBottom alias, so a
+  // reader who scrolled up mid-stream is never yanked down. The spacer
+  // re-measures first: its reserved height tracks the viewport, so it must
+  // shrink in this same task — otherwise the pin reads a stale scrollHeight
+  // and the browser paints the spacer's later RO settle as a visible shift.
+  const spacerMeasureRef = useRef<(() => void) | null>(null);
+  // Whether the transcript was physically at the bottom as of its last scroll
+  // event. Evaluated lazily-per-event (not at pin time) so the write never
+  // reads the just-shrunk viewport, where any distance readouts are already
+  // off the bottom by the growth amount — an escaped reader must be detected
+  // from their escape scroll, not from the shrink it preceded.
+  const pinnedToBottomRef = useRef(false);
+  useEffect(() => {
+    const scrollEl = scroller?.el;
+    if (!scrollEl) return;
+    const update = () => {
+      pinnedToBottomRef.current =
+        scrollEl.scrollHeight - scrollEl.clientHeight - scrollEl.scrollTop <= 1;
+    };
+    update();
+    scrollEl.addEventListener("scroll", update, { passive: true });
+    return () => scrollEl.removeEventListener("scroll", update);
+  }, [scroller]);
+
+  const pinScrollOnComposerGrowth = useCallback(() => {
+    spacerMeasureRef.current?.();
+    // Read through a local so the linter doesn't flag the DOM write as
+    // a mutation of the outer `scroller` state ref.
+    const scrollEl = scroller?.el;
+    if (!scrollEl) return;
+    const lockState = scroller?.state;
+    if (!lockState?.isAtBottom || lockState.escapedFromLock) return;
+    // A reader who escaped the bottom (or never arrived) keeps their
+    // position: growth must not yank it down.
+    if (!pinnedToBottomRef.current) return;
+    // Park at the same position stick-to-bottom settles on (one pixel short
+    // of the maximum); writing the exact bottom would leave the settle one
+    // pixel lower than the library's park and trail a 1px snap-back.
+    scrollEl.scrollTop = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight - 1);
+  }, [scroller]);
+
   // Persistent terminal surfaces for terminal-first sessions. Each is
   // mounted from the moment its terminal is reachable — not just when the
   // view is open — and kept mounted as a visibility-toggled overlay, so
@@ -1625,6 +1669,7 @@ function MainAgentSurface({
             agentsError={agentsError}
             sandboxLaunching={sandboxLaunching}
             terminalFirst={terminalFirst}
+            spacerMeasureRef={spacerMeasureRef}
           />
           {/* Floating reply button — scoped to the conversation container. */}
           <SelectionPopup
@@ -1673,6 +1718,7 @@ function MainAgentSurface({
             subagentRoutingEligible={subagentRoutingEligible}
             subAgentLabel={subAgentLabel}
             wrapperLabel={wrapperLabel}
+            onViewportShrinkPinScroll={pinScrollOnComposerGrowth}
           />
 
           {/* Reconnect-or-fork banner when unreachable, nothing otherwise.
@@ -1835,6 +1881,15 @@ interface ComposerProps {
    * keep using ``modelPickerKind`` / ``isNativeWrapper``.
    */
   wrapperLabel?: string | null;
+  /**
+   * Synchronous pin: called in the same task as the composer's height
+   * change so the transcript stays bottom-locked before the browser
+   * paints the now-smaller viewport with the scroll offset stale — Gecko
+   * visibly paints that intermediate frame, bouncing the last visible
+   * message. A same-task write is the only ordering no engine paints past.
+   * The callback itself decides whether the reader is bottom-locked.
+   */
+  onViewportShrinkPinScroll?: () => void;
 }
 
 /**
@@ -2420,6 +2475,7 @@ export function Composer({
   subagentRoutingEligible = false,
   subAgentLabel = null,
   wrapperLabel = null,
+  onViewportShrinkPinScroll,
 }: ComposerProps) {
   const [value, setValue] = useState("");
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
@@ -2955,7 +3011,22 @@ export function Composer({
   // Auto-grow the textarea from 1 row up to 10 rows, then let it scroll.
   // Growth stays in the flex column so the transcript viewport ends where the
   // composer begins instead of letting the card cover visible output.
-  useAutoGrowTextarea(textareaRef, value, 10);
+  // The onGrowth pin re-locks the transcript bottom in the same task as the
+  // height change, before any paint — see the prop doc on ComposerProps.
+  const onGrowthRef = useRef(onViewportShrinkPinScroll);
+  useLayoutEffect(() => {
+    onGrowthRef.current = onViewportShrinkPinScroll;
+  });
+  // The hook measures on every keystroke, but growth only changes at line
+  // wraps: skip the spacer re-measure and transcript pin while the box rests
+  // at an unchanged height.
+  const lastGrowthPxRef = useRef<number | null>(null);
+  const onGrowth = useCallback((px: number) => {
+    if (lastGrowthPxRef.current === px) return;
+    lastGrowthPxRef.current = px;
+    onGrowthRef.current?.();
+  }, []);
+  useAutoGrowTextarea(textareaRef, value, 10, onGrowth);
 
   // Scope recall to the active conversation so ArrowUp surfaces only this
   // chat's prompts, not the last thing typed in any other chat.

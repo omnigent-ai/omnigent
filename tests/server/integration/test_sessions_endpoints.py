@@ -2512,6 +2512,114 @@ async def test_create_session_without_terminal_launch_args_is_null(
     assert session["terminal_launch_args"] is None
 
 
+_CODEX_BYPASS_ARGS = ["--dangerously-bypass-approvals-and-sandbox"]
+
+
+async def test_create_session_derives_explicit_yolo_from_agent_spec(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A body-less JSON create honors the agent spec's explicit ``yolo: true``.
+
+    A custom codex-native agent that declares ``executor.config.yolo:
+    true`` opted into full bypass in its own trusted, server-stored
+    bundle. With no ``terminal_launch_args`` in the create body the
+    session must persist the codex bypass flag, matching the named-worker
+    path — otherwise codex launches at its default approval stance and an
+    unattended orchestrator parks on approval prompts despite the opt-in.
+    """
+    agent = await create_test_agent(
+        client,
+        name="codex-yolo-self-resolved",
+        executor={"type": "omnigent", "config": {"harness": "codex-native", "yolo": True}},
+    )
+    session = await _create_session(client, agent["id"])
+    assert session["terminal_launch_args"] == _CODEX_BYPASS_ARGS
+
+    snap = await client.get(f"/v1/sessions/{session['id']}")
+    assert snap.status_code == 200
+    assert snap.json()["terminal_launch_args"] == _CODEX_BYPASS_ARGS
+
+
+async def test_create_session_undeclared_codex_spec_keeps_launch_args_null(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    No spec opt-in → no derived args: the headless default must not leak.
+
+    codex-native named WORKERS default to full bypass because nobody can
+    answer a headless prompt, but a top-level session is interactive — a
+    human can answer the ApprovalCard. A codex-native spec that never
+    mentions ``yolo`` must keep ``terminal_launch_args`` NULL rather than
+    silently launching every custom codex agent with approvals and
+    sandbox bypassed.
+    """
+    agent = await create_test_agent(
+        client,
+        name="codex-plain-self-resolved",
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+    )
+    session = await _create_session(client, agent["id"])
+    assert session["terminal_launch_args"] is None
+
+
+async def test_create_session_body_launch_args_override_spec_yolo(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Explicit body args keep precedence over the spec's opt-in.
+
+    The web permission-mode selector posts concrete args at create time;
+    the spec seam only fills the gap when the body carries none.
+    """
+    agent = await create_test_agent(
+        client,
+        name="codex-yolo-body-override",
+        executor={"type": "omnigent", "config": {"harness": "codex-native", "yolo": True}},
+    )
+    session = await _create_session(
+        client,
+        agent["id"],
+        terminal_launch_args=["--sandbox", "read-only"],
+    )
+    assert session["terminal_launch_args"] == ["--sandbox", "read-only"]
+
+
+async def test_bundle_create_derives_explicit_yolo_launch_args(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    The multipart bundle create (``omnigent run <dir>``) honors ``yolo: true``.
+
+    ``create_test_agent`` creates its owning session via the multipart
+    bundle path with no metadata launch args, so the owning session's row
+    must carry the spec-derived codex bypass flag — the exact journey the
+    reporter hit with a custom top-level codex-native bundle.
+    """
+    agent = await create_test_agent(
+        client,
+        name="codex-yolo-bundle",
+        executor={"type": "omnigent", "config": {"harness": "codex-native", "yolo": True}},
+    )
+    owning = await client.get(f"/v1/sessions/{agent['_session_id']}")
+    assert owning.status_code == 200
+    assert owning.json()["terminal_launch_args"] == _CODEX_BYPASS_ARGS
+
+
+async def test_bundle_create_undeclared_codex_spec_keeps_launch_args_null(
+    client: httpx.AsyncClient,
+) -> None:
+    """A bundle that never mentions ``yolo`` gets no default bypass on upload."""
+    agent = await create_test_agent(
+        client,
+        name="codex-plain-bundle",
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+    )
+    owning = await client.get(f"/v1/sessions/{agent['_session_id']}")
+    assert owning.status_code == 200
+    assert owning.json()["terminal_launch_args"] is None
+
+
 async def test_create_session_rejects_oversized_terminal_launch_args(
     client: httpx.AsyncClient,
 ) -> None:

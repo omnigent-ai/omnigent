@@ -9202,6 +9202,7 @@ def test_attach_with_forwarder_falls_back_when_tmux_socket_is_not_local(
         """
         attach_url = kwargs["attach_url"]
         assert isinstance(attach_url, str)
+        assert kwargs["session_name"] == "Codex"
         active_session_id_reader = kwargs["active_session_id_reader"]
         assert callable(active_session_id_reader)
         assert active_session_id_reader() == "conv_rotated"

@@ -1,19 +1,25 @@
-"""E2E regression: native attach to an Omnigent-managed tmux terminal cannot
-reach the formatted scrollback above the viewport.
+"""E2E regression: a native attach to an Omnigent-managed tmux terminal must be
+able to reach the formatted scrollback above the viewport.
 
 The reported journey: run ``omnigent codex`` from a native terminal, produce
 more conversation output than fits the viewport, then scroll up with the mouse
-wheel or press Page Up. Nothing moves — the view stays pinned at the bottom and
-earlier formatted output is unreachable, even though tmux's history buffer
-holds it (an affected session reported ``history=288`` with
+wheel or press Page Up. Nothing moved — the view stayed pinned at the bottom and
+earlier formatted output was unreachable, even though tmux's history buffer
+held it (an affected session reported ``history=288`` with
 ``history-limit 100000``).
 
-Why: the managed tmux server disables every entry point into tmux copy mode —
-``mouse off`` (so wheel events never trigger ``WheelUpPane``), ``prefix None``
-+ ``prefix2 None`` + an emptied prefix table (so ``prefix [`` is gone), and no
-root-table binding maps Page Up to ``copy-mode`` (so the key passes through to
-the inner CLI, which ignores it). The user's own ``~/.tmux.conf`` cannot
-restore any of this because the native client attaches with ``-f /dev/null``.
+Why: the managed tmux server had disabled every entry point into tmux copy
+mode — ``mouse off`` (so wheel events never reached ``WheelUpPane``),
+``prefix None`` + ``prefix2 None`` + an emptied prefix table (so ``prefix [``
+is gone), and no root-table binding mapped Page Up to ``copy-mode`` (so the key
+passed through to the inner CLI, which ignores it: Codex handles neither the
+wheel nor Page Up, since it renders inline and leaves scrolling to the host
+terminal). The user's own ``~/.tmux.conf`` cannot restore any of this because
+the native client attaches with ``-f /dev/null``.
+
+Both routes are now open: ``mouse on`` for the wheel and a root-table Page Up
+binding for the keyboard. The wheel must still be *forwarded* to a pane that
+tracks the mouse, so a full-screen TUI keeps its own wheel handling.
 
 This test drives the real product path end-to-end, with no LLM and no codex
 binary (codex-native needs an interactive OAuth login, so the inner CLI is a
@@ -31,12 +37,9 @@ configuration and the attach command are the production ones):
 4. Assert some gesture reached the scrollback — the pane enters a scrolled
    (copy-mode) state with a non-zero scroll offset.
 
-Before a fix: no gesture enters copy mode (``pane_in_mode`` stays ``0``,
-``scroll_position`` stays empty), the earliest visible line is still the last
-screenful, and this test FAILS.
-After a fix (a root-table Page Up binding into copy-mode, tmux mouse support,
-or any other scrollback entry point): at least one gesture scrolls the view
-into history and it PASSES.
+Without a scrollback route no gesture enters copy mode (``pane_in_mode`` stays
+``0``, ``scroll_position`` stays empty), the earliest visible line is still the
+last screenful, and these tests FAIL.
 
 Runs with only ``tmux`` and ``pexpect``::
 
@@ -104,68 +107,100 @@ def _scrolled_state(socket_path: str) -> tuple[bool, str]:
     return scrolled, detail
 
 
+def _filler_pane_spec(cwd: Path) -> TerminalEnvSpec:
+    """Build a pane spec that overflows the viewport, then idles like a TUI.
+
+    :param cwd: Working directory for the pane process.
+    :returns: A managed-terminal spec emitting :data:`FILLER_LINES` lines.
+    """
+    return TerminalEnvSpec(
+        command="bash",
+        args=[
+            "-c",
+            f'for i in $(seq 1 {FILLER_LINES}); do echo "CODEX OUTPUT LINE $i"; done; '
+            "exec sleep 600",
+        ],
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(cwd),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+
+
+def _await_filled_history(socket_path: str) -> int:
+    """Wait until the pane has pushed real content into tmux history.
+
+    The precondition the bug report confirmed (``history=288``): without it a
+    scrollback assertion passes vacuously because there is nothing above the
+    viewport to reach.
+
+    :param socket_path: The managed terminal's private socket path.
+    :returns: The observed ``history_size``.
+    """
+    history_size = 0
+    for _ in range(120):
+        raw = _tmux_out(socket_path, "display-message", "-p", "-t", "main", "#{history_size}")
+        history_size = int(raw) if raw.isdigit() else 0
+        if history_size >= FILLER_LINES // 2:
+            break
+        time.sleep(0.25)
+    assert history_size >= FILLER_LINES // 2, (
+        f"pane never filled tmux history (history_size={history_size}); "
+        "the scrollback-gesture assertion below would be vacuous"
+    )
+    return history_size
+
+
+def _attach_native_client(socket_path: str) -> pexpect.spawn:
+    """Attach a real client PTY with the production native attach command.
+
+    Mirrors ``omnigent.codex_native._attach_direct_tmux``: ``tmux -S <sock>
+    -f /dev/null attach -t main`` with ``TMUX`` stripped so an outer user tmux
+    does not nest. ``TERM`` is forced because a bare CI shell may carry
+    ``TERM=dumb``, which tmux refuses to attach to.
+
+    :param socket_path: The managed terminal's private socket path.
+    :returns: The spawned client, for the caller to close.
+    """
+    env = dict(os.environ)
+    env.pop("TMUX", None)
+    env["TERM"] = "xterm-256color"
+    return pexpect.spawn(
+        "tmux",
+        ["-S", socket_path, "-f", os.devnull, "attach", "-t", "main"],
+        env=env,
+        dimensions=(24, 80),
+        timeout=10,
+    )
+
+
 async def test_native_attach_can_scroll_back_through_managed_tmux_history(
     tmp_path: Path,
 ) -> None:
     """A user attached to the managed tmux can scroll back to earlier output.
 
-    Regression guard: with the managed lockdown options (``mouse off``,
-    ``prefix None``, emptied prefix table, ``-f /dev/null`` attach) neither the
-    mouse wheel nor Page Up reaches tmux's history, so the conversation above
-    the viewport is unreachable from the native terminal.
+    Regression guard: the managed lockdown (``prefix None``, emptied prefix
+    table, ``-f /dev/null`` attach) leaves no prefix route into copy mode, so
+    at least one of the user's two gestures — the wheel or Page Up — has to
+    reach tmux's history or the conversation above the viewport is unreachable
+    from the native terminal.
+
+    :param tmp_path: Working directory for the managed terminal.
     """
     reg = TerminalRegistry()
     child: pexpect.spawn | None = None
     try:
         # 1. Launch the managed terminal exactly as the codex-native runner
-        #    does, with a pane command that overflows the viewport the way a
-        #    Codex conversation does, then stays alive like an idle TUI.
-        spec = TerminalEnvSpec(
-            command="bash",
-            args=[
-                "-c",
-                f'for i in $(seq 1 {FILLER_LINES}); do echo "CODEX OUTPUT LINE $i"; done; '
-                "exec sleep 600",
-            ],
-            os_env=OSEnvSpec(
-                type="caller_process",
-                cwd=str(tmp_path),
-                sandbox=OSEnvSandboxSpec(type="none"),
-            ),
-        )
-        instance = await reg.launch("conv_scrollback", "codex", "s1", spec)
+        #    does, with a pane that overflows the viewport the way a Codex
+        #    conversation does, then stays alive like an idle TUI.
+        instance = await reg.launch("conv_scrollback", "codex", "s1", _filler_pane_spec(tmp_path))
         socket_path = str(instance.socket_path)
+        _await_filled_history(socket_path)
 
-        # Wait for the pane to have pushed real content into tmux history —
-        # the precondition the bug report confirmed (``history=288``).
-        history_size = 0
-        for _ in range(120):
-            raw = _tmux_out(socket_path, "display-message", "-p", "-t", "main", "#{history_size}")
-            history_size = int(raw) if raw.isdigit() else 0
-            if history_size >= FILLER_LINES // 2:
-                break
-            time.sleep(0.25)
-        assert history_size >= FILLER_LINES // 2, (
-            f"pane never filled tmux history (history_size={history_size}); "
-            "the scrollback-gesture assertion below would be vacuous"
-        )
-
-        # 2. Attach a real client PTY with the exact production attach command
-        #    from ``_attach_direct_tmux``: tmux -S <sock> -f /dev/null attach
-        #    -t main, with TMUX stripped so an outer user tmux doesn't nest.
-        env = dict(os.environ)
-        env.pop("TMUX", None)
-        # The user's terminal always advertises a capable TERM; a bare CI
-        # shell may carry TERM=dumb, which tmux refuses to attach to.
-        env["TERM"] = "xterm-256color"
-        child = pexpect.spawn(
-            "tmux",
-            ["-S", socket_path, "-f", os.devnull, "attach", "-t", "main"],
-            env=env,
-            dimensions=(24, 80),
-            timeout=10,
-        )
-        # Let the attach settle and the client render the bottom of the pane.
+        # 2. Attach a real client PTY with the production attach command, then
+        #    let it render the bottom of the pane.
+        child = _attach_native_client(socket_path)
         child.expect("CODEX OUTPUT LINE", timeout=10)
         time.sleep(1.0)
 
@@ -189,11 +224,111 @@ async def test_native_attach_can_scroll_back_through_managed_tmux_history(
         assert scrolled, (
             "native attach cannot reach the managed tmux scrollback: neither "
             "Page Up nor the mouse wheel moved the view off the bottom "
-            f"({'; '.join(results)}). The managed options disable every "
-            "copy-mode entry point (mouse off, prefix None, emptied prefix "
-            "table, no root-table Page Up binding), and -f /dev/null blocks "
-            "the user's tmux.conf from restoring one, so earlier formatted "
-            "output above the viewport is unreachable."
+            f"({'; '.join(results)}). The managed options must keep a "
+            "copy-mode entry point (mouse on for the wheel, a root-table Page "
+            "Up binding for the keyboard) — -f /dev/null blocks the user's "
+            "tmux.conf from restoring one, so earlier formatted output above "
+            "the viewport is otherwise unreachable."
+        )
+    finally:
+        if child is not None:
+            child.close(force=True)
+        await reg.shutdown()
+
+
+async def test_native_attach_wheel_alone_reaches_scrollback(tmp_path: Path) -> None:
+    """The wheel on its own scrolls a native attach into managed tmux history.
+
+    The sibling test stops at the first gesture that works, so a Page Up
+    binding alone satisfies it and the wheel stays unguarded. This delivers
+    only wheel-up: with ``mouse off`` the report bytes pass through to the
+    inline pane program, which ignores them and nothing scrolls.
+
+    :param tmp_path: Working directory for the managed terminal.
+    """
+    reg = TerminalRegistry()
+    child: pexpect.spawn | None = None
+    try:
+        instance = await reg.launch("conv_wheel", "codex", "s1", _filler_pane_spec(tmp_path))
+        socket_path = str(instance.socket_path)
+        _await_filled_history(socket_path)
+
+        child = _attach_native_client(socket_path)
+        child.expect("CODEX OUTPUT LINE", timeout=10)
+        time.sleep(1.0)
+
+        child.send(WHEEL_UP * 4)
+        time.sleep(1.0)
+
+        scrolled, detail = _scrolled_state(socket_path)
+        assert scrolled, (
+            "the mouse wheel did not reach managed tmux scrollback from a "
+            f"native attach ({detail}). Without tmux mouse mode the wheel "
+            "reports are forwarded to the inline pane program, which ignores "
+            "them, so the wheel is dead for the whole conversation."
+        )
+    finally:
+        if child is not None:
+            child.close(force=True)
+        await reg.shutdown()
+
+
+async def test_native_attach_wheel_reaches_a_mouse_tracking_pane(
+    tmp_path: Path,
+) -> None:
+    """A pane that tracks the mouse keeps the wheel instead of losing it to tmux.
+
+    Enabling tmux mouse mode must not hijack the wheel from a full-screen TUI
+    that does its own scrolling (Claude Code, an editor): tmux's
+    ``WheelUpPane`` binding forwards the report when ``mouse_any_flag`` is set
+    and only takes the pane into copy mode when it is not. Guards the cost side
+    of ``mouse on``.
+
+    :param tmp_path: Working directory for the managed terminal.
+    """
+    reg = TerminalRegistry()
+    child: pexpect.spawn | None = None
+    try:
+        # DECSET 1002 + 1006: button/drag tracking with SGR reports, the modes
+        # a TUI that scrolls on the wheel requests at startup.
+        spec = TerminalEnvSpec(
+            command="bash",
+            args=["-c", 'printf "\\033[?1002h\\033[?1006h"; echo TRACKING; exec sleep 600'],
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=str(tmp_path),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            ),
+        )
+        instance = await reg.launch("conv_tracking", "codex", "s1", spec)
+        socket_path = str(instance.socket_path)
+
+        tracking = ""
+        for _ in range(40):
+            tracking = _tmux_out(
+                socket_path, "display-message", "-p", "-t", "main", "#{mouse_any_flag}"
+            )
+            if tracking == "1":
+                break
+            time.sleep(0.25)
+        assert tracking == "1", (
+            f"pane never entered mouse tracking (mouse_any_flag={tracking!r}); "
+            "the forwarding assertion below would be vacuous"
+        )
+
+        child = _attach_native_client(socket_path)
+        child.expect("TRACKING", timeout=10)
+        time.sleep(1.0)
+
+        child.send(WHEEL_UP * 4)
+        time.sleep(1.0)
+
+        in_mode = _tmux_out(socket_path, "display-message", "-p", "-t", "main", "#{pane_in_mode}")
+        assert in_mode == "0", (
+            "tmux took a mouse-tracking pane into copy mode on wheel-up "
+            f"(pane_in_mode={in_mode!r}). The wheel belongs to the pane "
+            "program whenever it tracks the mouse, or a full-screen TUI's own "
+            "scrolling stops working under a managed terminal."
         )
     finally:
         if child is not None:
