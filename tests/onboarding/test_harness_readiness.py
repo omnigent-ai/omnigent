@@ -929,6 +929,31 @@ def test_kimi_native_custom_supported_binary_ignores_older_path_binary(
     assert probes == [str(custom_kimi)]
 
 
+def test_kimi_native_invalid_override_reports_override_not_install(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A broken native override stays unavailable with actionable diagnosis."""
+    import omnigent.onboarding.kimi_auth as _ka
+
+    path_kimi = tmp_path / "path-kimi"
+    path_kimi.write_text("#!/bin/sh\n", encoding="utf-8")
+    path_kimi.chmod(0o755)
+    monkeypatch.setenv("OMNIGENT_KIMI_PATH", str(tmp_path / "missing-kimi"))
+    monkeypatch.setattr(
+        hi.shutil,
+        "which",
+        lambda name: str(path_kimi) if name == "kimi" else None,
+    )
+    monkeypatch.setattr(_ka, "kimi_auth_configured", lambda: True)
+
+    assert harness_is_configured("kimi-native") is False
+    hint = hi.harness_setup_hint("kimi-native")
+    assert "OMNIGENT_KIMI_PATH" in hint
+    assert "harness.kimi-native.command" in hint
+    assert "code.kimi.com/kimi-code/install.sh" not in hint
+
+
 def test_kimi_native_custom_outdated_binary_drives_diagnosis_once(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
