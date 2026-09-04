@@ -4259,6 +4259,17 @@ export function NewChatLandingScreen() {
     setCreating(true);
     setCreateError(null);
     let localConv: { tempConvId: string; pendingMsgTempId: string } | null = null;
+    // Single teardown for EVERY create-failure exit (the `catch` and the
+    // `"error" in created` early return): drop the client-only conversation and,
+    // if the user is still on it, send them back to landing so the restored
+    // draft (and the create error) have somewhere to surface. Without this, a
+    // failure after the navigate-first jump strands a read-only phantom chat.
+    const tearDownLocalConversation = () => {
+      if (localConv === null) return;
+      const wasViewing = removeLocalConversation(localConv.tempConvId);
+      // Gated on `wasViewing` (not `onScreenRef` — the landing already unmounted).
+      if (wasViewing) navigate("/");
+    };
     // The draft is spent from the moment it is submitted: it belongs to the
     // session now being created, so a detour back to this screen must not
     // hand it back pre-filled. Flipped here rather than on the response
@@ -4587,7 +4598,12 @@ export function NewChatLandingScreen() {
         // error the user needed to see on this screen.
         if ("error" in created) {
           returnDraftToUser();
-          setCreateError(created.error);
+          // On the navigate-first path the landing screen is unmounted, so tear
+          // down the phantom chat, return to landing, and surface the error as a
+          // toast (survives the remount); inline error only when still on landing.
+          tearDownLocalConversation();
+          if (localConv !== null) showToast(created.error);
+          else setCreateError(created.error);
           return;
         }
         data = { id: created.id };
@@ -4700,15 +4716,12 @@ export function NewChatLandingScreen() {
         if (onScreenRef.current) navigate(`/c/${data.id}`);
       }
     } catch {
-      // Tear down the client-only conversation; if the user is still on it, send
-      // them back to landing so the restored draft has somewhere to go. Gated on
-      // `wasViewing` (not `onScreenRef` — the landing already unmounted).
-      if (localConv !== null) {
-        const wasViewing = removeLocalConversation(localConv.tempConvId);
-        if (wasViewing) navigate("/");
-      }
+      const msg = "Couldn't reach the server. Check your connection and try again.";
+      tearDownLocalConversation();
       returnDraftToUser();
-      setCreateError("Couldn't reach the server. Check your connection and try again.");
+      // Toast when the landing screen is gone (navigate-first); inline otherwise.
+      if (localConv !== null) showToast(msg);
+      else setCreateError(msg);
     } finally {
       setCreating(false);
     }

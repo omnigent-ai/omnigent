@@ -60,6 +60,7 @@ import {
   handleSessionEvent,
   hydrateLocalConversation,
   isStaleCompletedResponse,
+  isStaleTempConvId,
   isTempConvId,
   initChatStore,
   pumpStreamEvents,
@@ -562,6 +563,17 @@ describe("isTempConvId", () => {
     expect(isTempConvId("pend_conv_1")).toBe(false); // sidebar-only skeleton id
     expect(isTempConvId(null)).toBe(false);
     expect(isTempConvId(undefined)).toBe(false);
+  });
+
+  it("isStaleTempConvId: true for a temp id with no live entry, false once live", () => {
+    // No entry → stale (a reloaded/foreign temp URL that can't be re-created).
+    expect(isStaleTempConvId("temp:00001111")).toBe(true);
+    // A live entry (mid-create) is NOT stale.
+    conversationRegistry.acquire("temp:00001111");
+    expect(isStaleTempConvId("temp:00001111")).toBe(false);
+    // Real ids and empties are never stale-temp.
+    expect(isStaleTempConvId("conv_real")).toBe(false);
+    expect(isStaleTempConvId(null)).toBe(false);
   });
 });
 

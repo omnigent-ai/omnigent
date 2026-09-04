@@ -1161,8 +1161,11 @@ function rekeySendChain(oldId: string, newId: string): void {
   const existing = sendChains.get(newId);
   if (existing !== undefined && existing !== chain) {
     // Splice ours behind an existing chain rather than dropping its queue.
-    const priorTail = existing.tail;
-    chain.tail = priorTail.then(() => chain.tail);
+    // Capture the current tail into a local first: reading `chain.tail` inside
+    // the `.then` after reassigning it to that same promise is a self-cycle
+    // (`TypeError: Chaining cycle detected`).
+    const own = chain.tail;
+    chain.tail = existing.tail.then(() => own);
   }
   sendChains.delete(oldId);
   sendChains.set(newId, chain);
@@ -1182,6 +1185,16 @@ function newTempConvId(): string {
 /** Whether an id is a client-only temp conversation id (not a server session). */
 export function isTempConvId(id: string | null | undefined): boolean {
   return typeof id === "string" && id.startsWith(TEMP_CONV_ID_PREFIX);
+}
+
+/**
+ * A temp URL with no live registry entry — a reload or fresh tab landed on a
+ * `temp:` id whose client-only conversation no longer exists (it can't be
+ * re-created). ChatPage redirects these to landing so the URL-keyed landing
+ * selection isn't stuck on a permanently read-only phantom chat.
+ */
+export function isStaleTempConvId(id: string | null | undefined): boolean {
+  return isTempConvId(id) && conversationRegistry.peek(id as string) === undefined;
 }
 
 /**
@@ -2301,11 +2314,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       return;
     }
 
-    // A client-only conversation (temp_conv_*) shown while `createSession` is in
+    // A client-only conversation (temp:*) shown while `createSession` is in
     // flight has no server session to bind — its entry holds the optimistic
     // first-message bubble locally. Paint it and return; the background create
     // rekeys it to the real id (which then binds). If the entry is gone (a stale
-    // temp URL survived a reload — it can't be re-created), fall back to landing.
+    // temp URL survived a reload — it can't be re-created), reset to landing
+    // state as a backstop; ChatPage redirects the URL to `/` (isStaleTempConvId).
     if (isTempConvId(conversationId)) {
       if (conversationRegistry.peek(conversationId) === undefined) {
         conversationRegistry.setActive(null);

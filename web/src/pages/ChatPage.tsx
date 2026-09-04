@@ -68,6 +68,7 @@ import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
   composerAttachmentKey,
   consumePendingInitialPrompt,
+  isStaleTempConvId,
   isTempConvId,
   type PendingInitialPrompt,
   type QueuedMessage,
@@ -439,8 +440,16 @@ export function ChatPage() {
   // intentionally don't await it here. The store's `loadingConversation` flag
   // drives the loading UI below; `conversationLoadError` drives the error UI.
   useEffect(() => {
+    // A stale temp URL (reload / fresh tab onto `/c/temp:*` whose client-only
+    // conversation is gone) has no forward path: landing is URL-keyed, so the
+    // page would sit on a permanently read-only phantom chat. Redirect to
+    // landing instead of binding a nonexistent session.
+    if (isStaleTempConvId(urlConvId)) {
+      navigate("/", { replace: true });
+      return;
+    }
     void useChatStore.getState().switchTo(urlConvId ?? null);
-  }, [urlConvId]);
+  }, [urlConvId, navigate]);
 
   // Server-driven redirect: when the active conversation is superseded
   // (a `session.superseded` event — e.g. a Claude `/clear` rotated it
@@ -2193,6 +2202,10 @@ function ComposerStatusLine({
   onHostReconnect?: () => void;
 }) {
   const conversationId = useChatStore((s) => s.conversationId);
+  // A client-only temp id has no server session — gate the server-scoped hooks
+  // below on it so they never fetch `/v1/sessions/temp:*` during the create
+  // window (mirrors ChatPage's top-level `sessionConvId`).
+  const sessionId = isTempConvId(conversationId) ? null : conversationId;
   const contextWindow = useChatStore((s) => s.contextWindow);
   const tokensUsed = useChatStore((s) => s.tokensUsed);
   const codexPlanMode = useChatStore((s) => s.codexPlanMode);
@@ -2203,12 +2216,12 @@ function ComposerStatusLine({
 
   // Host binding drives whether the HostBadge has anything to show — read it
   // from the same source the badge does so the tray's render guard matches.
-  const { session } = useSession(conversationId);
+  const { session } = useSession(sessionId);
   const isHostBound = !!session?.hostId;
 
   // PR link → opens the workspace rail's GitHub tab. Shares the info query's
   // cache with the GitHub panel, so opening the tab is instant.
-  const github = useGithubInfo(conversationId ?? undefined);
+  const github = useGithubInfo(sessionId ?? undefined);
   const openGithubTab = useOpenGithubTab();
   const prNumber = github.data?.pr?.number ?? null;
   const showPr = !!conversationId && !isSubAgentSession && prNumber !== null && !!openGithubTab;
@@ -2669,7 +2682,10 @@ function ComposerImpl({
     unreachable,
     maybeFlushQueuedHead,
   ]);
-  const { goal, setGoal: setGoalState } = useGoalState(conversationId, showGoalControl);
+  // No server session behind a temp id — gate goal/workspace fetches on it so
+  // the create window issues no `/v1/sessions/temp:*` requests.
+  const composerSessionId = isTempConvId(conversationId) ? null : conversationId;
+  const { goal, setGoal: setGoalState } = useGoalState(composerSessionId, showGoalControl);
   // "@"-file-mention is scoped to the native coding-agent harnesses: their
   // vendor CLIs run in the workspace and read an on-disk file from an
   // attachment marker the executor already emits. In-process SDK sessions
@@ -2682,7 +2698,7 @@ function ComposerImpl({
   // so the composer's "@" entry point can't split-brain from the file viewer's
   // "Attach to agent" gate (``canAttachToAgent``), which already uses it.
   const mentionEnabled = nativeCodingAgentForHarness(sessionHarness) !== undefined;
-  const workspaceFilesQuery = useWorkspaceAllFiles(conversationId ?? undefined, {
+  const workspaceFilesQuery = useWorkspaceAllFiles(composerSessionId ?? undefined, {
     enabled: mentionEnabled,
   });
   const valueRef = useRef(value);

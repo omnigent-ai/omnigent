@@ -278,13 +278,13 @@ describe("ConversationRegistry", () => {
   });
 
   it("rekey preserves state, moves the active pointer, and drops the old id", () => {
-    const temp = registry.acquire("temp_conv_1");
+    const temp = registry.acquire("temp:aaaa0001");
     temp.setState({ status: "streaming" });
-    registry.setActive("temp_conv_1");
+    registry.setActive("temp:aaaa0001");
 
-    registry.rekey("temp_conv_1", "conv_real");
+    registry.rekey("temp:aaaa0001", "conv_real");
 
-    expect(registry.has("temp_conv_1")).toBe(false);
+    expect(registry.has("temp:aaaa0001")).toBe(false);
     expect(temp.disposed).toBe(true);
     const real = registry.peek("conv_real");
     expect(real?.id).toBe("conv_real");
@@ -293,16 +293,16 @@ describe("ConversationRegistry", () => {
   });
 
   it("rekey onto an already-live id keeps the existing entry and disposes the old", () => {
-    const temp = registry.acquire("temp_conv_1");
+    const temp = registry.acquire("temp:aaaa0001");
     const existing = registry.acquire("conv_real");
-    registry.rekey("temp_conv_1", "conv_real");
+    registry.rekey("temp:aaaa0001", "conv_real");
     expect(registry.peek("conv_real")).toBe(existing);
     expect(temp.disposed).toBe(true);
-    expect(registry.has("temp_conv_1")).toBe(false);
+    expect(registry.has("temp:aaaa0001")).toBe(false);
   });
 
   it("rekey is a no-op when the old id is not live", () => {
-    registry.rekey("temp_conv_missing", "conv_real");
+    registry.rekey("temp:deadbeef", "conv_real");
     expect(registry.has("conv_real")).toBe(false);
   });
 });
