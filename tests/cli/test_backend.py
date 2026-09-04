@@ -1062,6 +1062,74 @@ def test_foreground_connect_local_prompt_aborted_leaves_server(
     assert "Left the local server running at http://127.0.0.1:8000." in result.output
 
 
+def test_host_reset_id_mints_fresh_id_when_no_daemon_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`host reset-id --yes` replaces the persisted host id.
+
+    The recovery path for the 409 "already registered to a different
+    account" refusal: the machine must be able to mint a fresh id and
+    re-register under the signed-in identity without an administrator.
+    """
+    import yaml
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"host": {"host_id": "a" * 32, "name": "my-laptop"}}))
+    monkeypatch.setattr("omnigent.host.identity.CONFIG_PATH", config_path)
+    monkeypatch.setattr(cli, "_list_daemon_records", lambda **_kw: [])
+
+    result = CliRunner().invoke(cli_group, ["host", "reset-id", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "Host id reset:" in result.output
+    cfg = yaml.safe_load(config_path.read_text())
+    assert cfg["host"]["host_id"] != "a" * 32
+    assert cfg["host"]["name"] == "my-laptop"
+
+
+def test_host_reset_id_refuses_while_a_daemon_is_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A live daemon still holds the old id — the reset must ask for a stop first.
+
+    Resetting under a running daemon would desync the persisted identity
+    from the registered tunnel; failing loud with the stop command is the
+    actionable path.
+    """
+    import yaml
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"host": {"host_id": "a" * 32, "name": "my-laptop"}}))
+    monkeypatch.setattr("omnigent.host.identity.CONFIG_PATH", config_path)
+    monkeypatch.setattr(cli, "_list_daemon_records", lambda **_kw: [_online_record()])
+    monkeypatch.setattr(cli, "_pid_alive", lambda _pid: True)
+
+    result = CliRunner().invoke(cli_group, ["host", "reset-id", "--yes"])
+
+    assert result.exit_code != 0
+    assert "host stop" in result.output
+    cfg = yaml.safe_load(config_path.read_text())
+    assert cfg["host"]["host_id"] == "a" * 32, "a refused reset must not touch the id"
+
+
+def test_host_reset_id_declined_prompt_leaves_id_untouched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Answering no at the confirmation keeps the persisted id."""
+    import yaml
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"host": {"host_id": "a" * 32, "name": "my-laptop"}}))
+    monkeypatch.setattr("omnigent.host.identity.CONFIG_PATH", config_path)
+    monkeypatch.setattr(cli, "_list_daemon_records", lambda **_kw: [])
+
+    result = CliRunner().invoke(cli_group, ["host", "reset-id"], input="n\n")
+
+    assert result.exit_code != 0  # click.Abort
+    cfg = yaml.safe_load(config_path.read_text())
+    assert cfg["host"]["host_id"] == "a" * 32
+
+
 def test_foreground_connect_local_prompts_after_keyboard_interrupt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

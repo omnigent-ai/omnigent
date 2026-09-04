@@ -99,6 +99,13 @@ const ARCHIVED_PROJECT_NAMES_KEY = ["archived-project-names"] as const;
 
 export interface UseConversationsOptions {
   reconcileWhileConnected?: boolean;
+  /**
+   * Which result fields trigger a consumer re-render (passed to the infinite
+   * query). Lets a consumer that holds the whole query object avoid re-rendering
+   * on the live-updates merge's per-frame result-object churn. Omit to notify on
+   * any observed field.
+   */
+  notifyOnChangeProps?: readonly (keyof ReturnType<typeof useInfiniteQuery>)[];
 }
 
 export class BulkConversationMutationError extends Error {
@@ -546,6 +553,12 @@ export function useConversations(
         ? CONNECTED_STREAM_REFETCH_INTERVAL_MS
         : false
       : DISCONNECTED_STREAM_REFETCH_INTERVAL_MS,
+    // Coalesce the live-updates object churn for consumers that opt in (see
+    // UseConversationsOptions.notifyOnChangeProps). Mutable copy — the query
+    // options type wants a mutable array.
+    ...(options.notifyOnChangeProps
+      ? { notifyOnChangeProps: [...options.notifyOnChangeProps] }
+      : {}),
   });
 }
 
