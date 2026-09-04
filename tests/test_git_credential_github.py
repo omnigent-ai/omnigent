@@ -106,22 +106,6 @@ def test_configure_host_git_clears_stale_broker_when_not_connected(
     assert not any("user.email" in c for c in flat)
 
 
-def test_resolve_github_token_returns_token_when_connected(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        h,
-        "_fetch",
-        lambda *a, **k: {"connected": True, "token": "ghu_x", "username": "x-access-token"},
-    )
-    assert h.resolve_github_token("http://srv", "host1", "tok") == "ghu_x"
-
-
-def test_resolve_github_token_none_when_not_connected(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(h, "_fetch", lambda *a, **k: {"connected": False})
-    assert h.resolve_github_token("http://srv", "host1", "tok") is None
-
-
 def test_credential_url_targets_the_generic_provider_path() -> None:
     # The helper hits the provider-generic broker with provider=github.
     assert h._credential_url("http://s", "hid") == "http://s/v1/hosts/hid/credentials/github"

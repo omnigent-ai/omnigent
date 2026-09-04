@@ -102,19 +102,6 @@ def _fetch_credential(server: str, host_id: str, host_token: str) -> tuple[str, 
     return str(data.get("username") or "x-access-token"), str(data["token"])
 
 
-def resolve_github_token(server_url: str, host_id: str, host_token: str) -> str | None:
-    """Fetch the connected owner's GitHub token from the broker, or ``None``.
-
-    Public wrapper over the broker fetch for non-git callers — the read-only
-    GitHub panel's ``gh`` invocations need the per-user token directly rather than
-    via git's ``credential.helper``. ``None`` when the owner hasn't connected
-    GitHub or the broker is unreachable, so callers fall back to their ambient
-    (shared-token / local ``gh``) auth. Never raises.
-    """
-    cred = _fetch_credential(server_url, host_id, host_token)
-    return cred[1] if cred else None
-
-
 def _git_config(*args: str) -> None:
     """Run ``git config --global`` best-effort (never raises; git may be absent)."""
     with contextlib.suppress(OSError, subprocess.SubprocessError):
