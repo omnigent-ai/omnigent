@@ -56,6 +56,7 @@ from omnigent.host.frames import (
     WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
 from omnigent.llms.context_window import resolve_effective_context_window
+from omnigent.model_metadata import concrete_reported_model
 from omnigent.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
@@ -1374,9 +1375,9 @@ async def _persist_relay_reported_model(
     if not isinstance(usage_obj, dict):
         return
     raw_model = usage_obj.get("model")
-    if not isinstance(raw_model, str) or not raw_model.strip():
+    model = concrete_reported_model(raw_model)
+    if model is None:
         return
-    model = raw_model.strip()
     conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
     if conv is None or conv.reported_model == model:
         return
@@ -9825,8 +9826,8 @@ async def _get_session_snapshot(
     # a verbatim ``reported_model``, it supersedes the spec-derived value on
     # the wire's ``llm_model`` field (the web renders and highlights only
     # from this).
-    if conv.reported_model:
-        llm_model = conv.reported_model
+    if reported_model := concrete_reported_model(conv.reported_model):
+        llm_model = reported_model
     # Skills are runner-owned: the bound runner discovers them against its
     # own filesystem (bundled skills + host skills under the session's
     # workspace and ``~/.claude/skills/``) — the host where the harness

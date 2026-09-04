@@ -58,6 +58,7 @@ from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.claude_native_status import CONTEXT_RAW_FILE
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.kiro_native_bridge import bridge_root as kiro_bridge_root
+from omnigent.model_metadata import concrete_reported_model
 
 if TYPE_CHECKING:
     import httpx
@@ -5537,10 +5538,7 @@ def _model_from_transcript_entry(entry: _JsonObject) -> str | None:
     message = entry.get("message")
     if not isinstance(message, dict) or message.get("role") != "assistant":
         return None
-    model = message.get("model")
-    if isinstance(model, str) and model:
-        return model
-    return None
+    return concrete_reported_model(message.get("model"))
 
 
 def _custom_title_from_transcript_entry(entry: _JsonObject) -> str | None:

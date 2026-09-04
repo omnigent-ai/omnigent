@@ -6832,6 +6832,52 @@ async def test_post_external_model_change_publishes_session_model(
     assert snapshot["model_override"] is None
 
 
+@pytest.mark.parametrize("sentinel", ["<synthetic>", " <synthetic> "])
+async def test_external_synthetic_model_preserves_report(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    sentinel: str,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+    response = await client.post(
+        f"/v1/sessions/{sid}/events",
+        json={"type": "external_model_change", "data": {"model": "gateway-claude-model"}},
+    )
+    assert response.status_code == 202
+    published: list[object] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda *args: published.append(args),
+    )
+    response = await client.post(
+        f"/v1/sessions/{sid}/events",
+        json={"type": "external_model_change", "data": {"model": sentinel}},
+    )
+    assert response.status_code == 202
+    assert published == []
+    snapshot = (await client.get(f"/v1/sessions/{sid}")).json()
+    assert snapshot["llm_model"] == "gateway-claude-model"
+    assert snapshot["model_override"] is None
+
+
+@pytest.mark.parametrize("sentinel", ["<synthetic>", " <synthetic> "])
+async def test_snapshot_ignores_legacy_synthetic_model(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    sentinel: str,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+    original = (await client.get(f"/v1/sessions/{sid}")).json()
+    SqlAlchemyConversationStore(db_uri).update_conversation(sid, reported_model=sentinel)
+    snapshot = (await client.get(f"/v1/sessions/{sid}")).json()
+    assert snapshot["llm_model"] == original["llm_model"]
+    assert snapshot["llm_model"] != sentinel
+
+
 async def test_post_external_model_change_dedupes_when_unchanged(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

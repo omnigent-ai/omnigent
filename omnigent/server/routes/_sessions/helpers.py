@@ -66,6 +66,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import (
     NativeCodingAgent,
 )
+from omnigent.model_metadata import concrete_reported_model
 from omnigent.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
@@ -2214,8 +2215,8 @@ async def _persist_external_model_change(
             "external_model_change requires data.model to be a non-empty string",
             code=ErrorCode.INVALID_INPUT,
         )
-    model = raw_model.strip()
-    if conv.reported_model == model:
+    model = concrete_reported_model(raw_model)
+    if model is None or conv.reported_model == model:
         return
     await asyncio.to_thread(
         conversation_store.update_conversation,
