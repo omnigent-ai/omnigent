@@ -14,6 +14,7 @@ import re
 import pytest
 
 from dev.resolve import (
+    ticket_slug,
     branch_slug,
     build_payload,
     parse_ci_run_url,
@@ -136,3 +137,36 @@ def test_branch_slug_session_sanitizes_and_bounds_length() -> None:
 
 def test_branch_slug_fallback() -> None:
     assert branch_slug(session=None, ci_link=None) == "bug"
+
+
+def test_build_payload_ticket_only_and_target_repo() -> None:
+    payload = json.loads(
+        build_payload(
+            session=None,
+            ci_link=None,
+            bug_url="https://linear.app/omnigent/issue/OMNI-6145/x",
+            target_repo="omnigent-ai/omnigent-internal",
+        )
+    )
+    assert payload == {
+        "bug_url": "https://linear.app/omnigent/issue/OMNI-6145/x",
+        "target_repo": "omnigent-ai/omnigent-internal",
+    }
+    assert "target_repo" not in json.loads(
+        build_payload(session="abc", ci_link=None, target_repo="")
+    )
+
+
+def test_build_payload_rejects_both_pointers_and_no_pointer() -> None:
+    with pytest.raises(ValueError):
+        build_payload(session="abc", ci_link="https://github.com/o/r/actions/runs/1", bug_url="x")
+    with pytest.raises(ValueError):
+        build_payload(session=None, ci_link=None, bug_url="   ")
+
+
+def test_branch_slug_ticket_only() -> None:
+    assert ticket_slug("https://linear.app/omnigent/issue/OMNI-6145/slug") == "omni-6145"
+    assert ticket_slug("https://github.com/omnigent-ai/omnigent/issues/1234") == "issue-1234"
+    assert ticket_slug("https://example.com/") == "bug"
+    assert branch_slug(session=None, ci_link=None, bug_url="https://linear.app/omnigent/issue/OMNI-6145/x") == "omni-6145"
+    assert branch_slug(session="dc59e331-abcd", ci_link=None, bug_url="https://linear.app/omnigent/issue/OMNI-1/x") == "dc59e331"
