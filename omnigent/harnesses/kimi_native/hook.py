@@ -236,9 +236,12 @@ def _main_permission_request(argv: list[str]) -> int:
        qwen/kiro/hermes/goose); the payload labels the card "Kimi", and the
        server publishes the ``response.elicitation_request`` approval card and
        long-polls for the web verdict.
-    2. On ``allow`` / ``deny``, inject the matching kimi permission-menu option
-       digit into the TUI pane via :func:`inject_approval_keystroke`
-       (:data:`APPROVE_KEY` "Approve once" / :data:`DENY_KEY` "Reject").
+    2. Answer kimi's permission menu from the web verdict via
+       :func:`inject_approval_keystroke` (option digit): ``accept``
+       types :data:`APPROVE_KEY` "Approve once"; ``cancel`` types
+       :data:`DENY_KEY` "Reject". ``decline`` types NOTHING — the server
+       forwards an Escape that rejects the menu, so a second keystroke would
+       race it.
 
     Fail-safe: on no verdict (timeout / server unreachable / the prompt was
     already answered in the terminal) it injects nothing and kimi's own TUI
@@ -284,8 +287,9 @@ def _main_permission_request(argv: list[str]) -> int:
     deadline = time.monotonic() + _PERMISSION_RETRY_WINDOW_S
     verdict = _request_web_approval(url, headers, body, bridge_dir=bridge_dir, deadline=deadline)
     if verdict is None or verdict == "decline":
-        # No web verdict leaves kimi's prompt for manual approval. On decline,
-        # the server's forwarded Escape rejects it; another key would race it.
+        # No verdict leaves kimi's prompt for manual approval. On decline the server
+        # best-effort forwards Escape; another key would race it. If forwarding
+        # fails, the menu stays open for manual input.
         return 0
     key = APPROVE_KEY if verdict == "accept" else DENY_KEY
     for attempt in range(2):
