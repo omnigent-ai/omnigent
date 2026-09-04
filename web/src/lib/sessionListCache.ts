@@ -326,13 +326,11 @@ export function insertNewRowsIntoPages(
   candidates: Map<string, SessionListWireItem>,
   filters: ConversationListFilters,
   skip?: (id: string) => boolean,
+  viewerId?: string | null,
 ): { data: ConversationsInfiniteData | undefined; inserted: Conversation[] } {
-  // New sessions are always owned (active, not archived), so inserting them into
-  // "shared" (accessible-but-not-owned) or "archived" caches would mis-place
-  // them. Skip insertion and let the debounced refetch reconcile instead.
+  // Archived caches hold only archived rows; new sessions are never archived.
   if (!data || candidates.size === 0 || filters.searchQuery) return { data, inserted: [] };
-  if (filters.visibility === "shared" || filters.visibility === "archived")
-    return { data, inserted: [] };
+  if (filters.visibility === "archived") return { data, inserted: [] };
   const present = new Set<string>();
   for (const page of data.pages) for (const c of page.data) present.add(c.id);
   const rows: Conversation[] = [];
@@ -349,6 +347,12 @@ export function insertNewRowsIntoPages(
       id,
     };
     if (conv.parent_session_id != null || violatesKnownMembership(conv, filters)) continue;
+    // Ownership-aware insertion for scoped caches. `conv.owner` is null/absent
+    // when the row is owned by the viewer (single-user / legacy shape) or
+    // explicitly set to another user's id when the session was shared.
+    const ownedByViewer = conv.owner == null || conv.owner === viewerId;
+    if (filters.visibility === "mine" && !ownedByViewer) continue;
+    if (filters.visibility === "shared" && ownedByViewer) continue;
     rows.push(conv);
   }
   if (rows.length === 0) return { data, inserted: [] };

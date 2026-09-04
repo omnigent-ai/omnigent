@@ -612,6 +612,31 @@ export function Sidebar({
   // the server-filtered query so the sentinel only paginates matching sessions.
   const displayQuery = tabVisibility ? filteredConversationsQuery : conversationsQuery;
 
+  // Bounded background pagination for conversationsQuery (inbox badge / WS
+  // watch-set). On filtered tabs the display sentinel never drives
+  // conversationsQuery, so the badge would stay capped at its initial 30
+  // sessions. We fetch up to BADGE_EXTRA_PAGES extra pages (one at a time,
+  // gated on a ref so we stop and never spam) as soon as the tab mounts.
+  const BADGE_EXTRA_PAGES = 3;
+  const badgeExtraFetched = useRef(0);
+  const lastBadgeTab = useRef<typeof tabVisibility>(undefined);
+  const {
+    hasNextPage: allHasNextPage,
+    isFetchingNextPage: allIsFetching,
+    fetchNextPage: allFetchNextPage,
+  } = conversationsQuery;
+  useEffect(() => {
+    if (!tabVisibility) return;
+    if (lastBadgeTab.current !== tabVisibility) {
+      lastBadgeTab.current = tabVisibility;
+      badgeExtraFetched.current = 0;
+    }
+    if (badgeExtraFetched.current >= BADGE_EXTRA_PAGES) return;
+    if (!allHasNextPage || allIsFetching) return;
+    badgeExtraFetched.current += 1;
+    allFetchNextPage();
+  }, [tabVisibility, allHasNextPage, allIsFetching, allFetchNextPage]);
+
   // The scrollable list container — used as the IntersectionObserver root for
   // infinite scroll (auto-loading the next page as the sentinel nears view).
   const scrollContainerRef = useRef<HTMLElement>(null);
