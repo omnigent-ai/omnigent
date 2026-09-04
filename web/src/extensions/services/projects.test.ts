@@ -1,5 +1,7 @@
+import { QueryClient } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  cachedProjectSummaries,
   createProjectSummary,
   listProjectSummaries,
   parseCreateProjectParams,
@@ -24,6 +26,23 @@ describe("projectSummary", () => {
     expect(summary.name).toHaveLength(100);
     expect(summary.icon).toHaveLength(16);
     expect(projectSummary({ id: "proj_2", name: "Plain" }).icon).toBeNull();
+  });
+});
+
+describe("cachedProjectSummaries", () => {
+  it("reuses first-class sidebar projects and ignores legacy label folders", () => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(
+      ["projects"],
+      [
+        { id: "proj_1", name: "Alpha", icon: "🅰️" },
+        { id: null, name: "Legacy", icon: null },
+      ],
+    );
+
+    expect(cachedProjectSummaries(queryClient)).toEqual([
+      { id: "proj_1", name: "Alpha", icon: "🅰️" },
+    ]);
   });
 });
 

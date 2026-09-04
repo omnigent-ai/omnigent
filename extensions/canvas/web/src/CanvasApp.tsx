@@ -46,6 +46,7 @@ import {
   canReadProjects,
   loadProjects,
   loadSessions,
+  type SessionLoadProgress,
 } from "./sessionData";
 import { SessionCardNode, type SessionCardData } from "./SessionCardNode";
 
@@ -108,6 +109,17 @@ function sessionCountLabel(count: number): string {
   return count === 1 ? "1 session" : `${count} sessions`;
 }
 
+function mergePartialSessions(
+  existing: ExtensionSessionSummary[],
+  loaded: ExtensionSessionSummary[],
+): ExtensionSessionSummary[] {
+  const loadedIds = new Set(loaded.map((session) => session.id));
+  return [
+    ...loaded,
+    ...existing.filter((session) => !loadedIds.has(session.id)),
+  ];
+}
+
 function CanvasSurface({ context }: { context: ExtensionContext }) {
   const flow = useReactFlow();
   const [nodes, setNodes] = useState<SessionNode[]>([]);
@@ -138,6 +150,7 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
   const [projectError, setProjectError] = useState<string | null>(null);
   const positionsRef = useRef<CanvasPositions>({});
   const persistedPositionsRef = useRef<CanvasPositions>({});
+  const sessionsRef = useRef<ExtensionSessionSummary[]>([]);
   const activeCanvasRef = useRef(MAIN_CANVAS_ID);
   const openingRef = useRef(false);
   const initializedRef = useRef(false);
@@ -298,20 +311,21 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
     async (
       items: ExtensionSessionSummary[],
       projectList: ExtensionProjectSummary[],
-      persistPruned: boolean,
+      complete: boolean,
     ) => {
       const previousPersisted = persistedPositionsRef.current;
-      const persisted = prunePositions(
-        previousPersisted,
-        items.map((session) => session.id),
-      );
+      const persisted = complete
+        ? prunePositions(
+            previousPersisted,
+            items.map((session) => session.id),
+          )
+        : previousPersisted;
       const ids = new Set(projectList.map((project) => project.id));
       persistedPositionsRef.current = persisted;
-      positionsRef.current = mergeCanvasPositions(
-        items,
-        ids,
-        positionsRef.current,
-      );
+      positionsRef.current = mergeCanvasPositions(items, ids, {
+        ...persisted,
+        ...positionsRef.current,
+      });
       if (
         activeCanvasRef.current !== MAIN_CANVAS_ID &&
         !ids.has(activeCanvasRef.current)
@@ -320,8 +334,9 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
         setActiveCanvas(MAIN_CANVAS_ID);
       }
       setProjects(projectList);
+      sessionsRef.current = items;
       setSessions(items);
-      if (persistPruned) {
+      if (complete) {
         const dirtyBuckets = new Set(
           Object.keys(previousPersisted)
             .filter((id) => !(id in persisted))
@@ -347,7 +362,17 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
   );
 
   const loadData = useCallback(
-    () => Promise.all([loadSessions(context), loadProjects(context)]),
+    async (
+      onProgress: (
+        progress: SessionLoadProgress,
+        projectList: ExtensionProjectSummary[],
+      ) => void | Promise<void>,
+    ) => {
+      const projectListPromise = loadProjects(context);
+      await loadSessions(context, async (progress) => {
+        await onProgress(progress, await projectListPromise);
+      });
+    },
     [context],
   );
 
@@ -355,19 +380,32 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
     (initial = false): Promise<void> => {
       if (refreshInFlightRef.current) return refreshInFlightRef.current;
       if (initial) setLoading(true);
+      const existing = sessionsRef.current;
+      let firstPage = true;
       const request = (async () => {
         try {
-          const [items, projectList] = await loadData();
-          if (!aliveRef.current) return;
-          await applyData(items, projectList, !initial);
-          if (!aliveRef.current) return;
-          setError(null);
-          if (initial) {
-            const ids = new Set(projectList.map((project) => project.id));
-            applyDefaultViewport(
-              sessionsOnCanvas(items, activeCanvasRef.current, ids).length,
-            );
-          }
+          await loadData(async (progress, projectList) => {
+            if (!aliveRef.current) return;
+            const items = progress.hasMore
+              ? mergePartialSessions(existing, progress.sessions)
+              : progress.sessions;
+            const applied = applyData(items, projectList, !progress.hasMore);
+            if (firstPage) {
+              firstPage = false;
+              setError(null);
+              setLoading(false);
+              if (initial) {
+                const ids = new Set(projectList.map((project) => project.id));
+                applyDefaultViewport(
+                  progress.hasMore
+                    ? LARGE_CANVAS_SESSION_COUNT + 1
+                    : sessionsOnCanvas(items, activeCanvasRef.current, ids)
+                        .length,
+                );
+              }
+            }
+            await applied;
+          });
         } catch (reason) {
           if (aliveRef.current) {
             setError(
@@ -394,35 +432,55 @@ function CanvasSurface({ context }: { context: ExtensionContext }) {
   useEffect(() => {
     if (initializedRef.current) return;
     let cancelled = false;
-    void Promise.all([
-      readCanvasLayout(context.storage.user).catch(() => ({
-        positions: {},
-        viewport: null,
-      })),
-      loadData(),
-    ]).then(
-      async ([layout, [items, projectList]]) => {
-        if (cancelled) return;
-        persistedPositionsRef.current = layout.positions;
-        positionsRef.current = layout.positions;
-        await applyData(items, projectList, true);
-        if (cancelled || !aliveRef.current) return;
-        initializedRef.current = true;
-        setLoading(false);
-        const ids = new Set(projectList.map((project) => project.id));
-        applyViewport(
-          layout.viewport,
-          sessionsOnCanvas(items, MAIN_CANVAS_ID, ids).length,
-        );
-      },
-      (reason: unknown) => {
+    let firstPage = true;
+    const layoutPromise = readCanvasLayout(context.storage.user).catch(() => ({
+      positions: {},
+      viewport: null,
+    }));
+    const request = (async () => {
+      try {
+        await loadData(async (progress, projectList) => {
+          const layout = firstPage ? await layoutPromise : null;
+          if (cancelled || !aliveRef.current) return;
+          if (layout) {
+            persistedPositionsRef.current = layout.positions;
+            positionsRef.current = layout.positions;
+          }
+          const applied = applyData(
+            progress.sessions,
+            projectList,
+            !progress.hasMore,
+          );
+          if (firstPage && layout) {
+            firstPage = false;
+            initializedRef.current = true;
+            setError(null);
+            setLoading(false);
+            const ids = new Set(projectList.map((project) => project.id));
+            applyViewport(
+              layout.viewport,
+              progress.hasMore
+                ? LARGE_CANVAS_SESSION_COUNT + 1
+                : sessionsOnCanvas(progress.sessions, MAIN_CANVAS_ID, ids)
+                    .length,
+            );
+          }
+          await applied;
+        });
+      } catch (reason) {
         if (cancelled) return;
         setError(
           reason instanceof Error ? reason.message : "Could not load sessions",
         );
         setLoading(false);
-      },
-    );
+      }
+    })();
+    refreshInFlightRef.current = request;
+    void request.finally(() => {
+      if (refreshInFlightRef.current === request) {
+        refreshInFlightRef.current = null;
+      }
+    });
     return () => {
       cancelled = true;
       if (viewportTimerRef.current) clearTimeout(viewportTimerRef.current);

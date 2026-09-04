@@ -1,4 +1,6 @@
+import type { InfiniteData, QueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import type { ConversationsPage } from "@/hooks/useConversations";
 import { isConversationUnseen } from "@/hooks/useUnseenConversations";
 import { getOptimisticTitle } from "@/lib/optimisticTitles";
 import type { ExtensionSessionPage, ExtensionSessionSummary } from "../types";
@@ -135,6 +137,38 @@ function projectSession(value: unknown): ExtensionSessionSummary {
     createdAt,
     updatedAt,
   };
+}
+
+export function cachedInitialSessionPage(
+  queryClient: QueryClient,
+  params: unknown,
+): ExtensionSessionPage | null {
+  const request = parseSessionPageRequest(params);
+  if (request.after !== null) return null;
+  const cached = queryClient.getQueryData<InfiniteData<ConversationsPage, string | undefined>>([
+    "conversations",
+    "",
+    true,
+  ]);
+  if (!cached || cached.pages.length === 0) return null;
+  const rows = cached.pages
+    .flatMap((page) => page.data)
+    .filter((session) => session.archived !== true && session.parent_session_id == null);
+  const selected = rows.slice(0, request.limit);
+  const cacheHasMore = rows.length > request.limit || cached.pages.at(-1)?.has_more === true;
+  if (cacheHasMore && selected.length === 0) return null;
+  try {
+    return projectSessionPage(
+      {
+        data: selected,
+        has_more: cacheHasMore,
+        last_id: cacheHasMore ? selected.at(-1)?.id : null,
+      },
+      request.limit,
+    );
+  } catch {
+    return null;
+  }
 }
 
 export function projectSessionPage(payload: unknown, limit: number): ExtensionSessionPage {

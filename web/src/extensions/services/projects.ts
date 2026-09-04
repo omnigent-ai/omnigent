@@ -1,3 +1,5 @@
+import type { QueryClient } from "@tanstack/react-query";
+import type { ProjectSummary } from "@/hooks/useConversations";
 import { createProject, listProjects, type Project } from "@/lib/projectsApi";
 import type { ExtensionProjectSummary } from "../types";
 import { ExtensionHostServiceError } from "./errors";
@@ -22,6 +24,24 @@ export function projectSummary(project: Project): ExtensionProjectSummary {
     icon:
       typeof icon === "string" && icon.length > 0 ? icon.slice(0, PROJECT_ICON_MAX_LENGTH) : null,
   };
+}
+
+export function cachedProjectSummaries(queryClient: QueryClient): ExtensionProjectSummary[] | null {
+  const cached = queryClient.getQueryData<ProjectSummary[]>(["projects"]);
+  if (!cached) return null;
+  try {
+    return cached
+      .filter((project): project is ProjectSummary & { id: string } => Boolean(project.id))
+      .map((project) =>
+        projectSummary({
+          id: project.id,
+          name: project.name,
+          config: project.icon ? { icon: project.icon } : {},
+        }),
+      );
+  } catch {
+    return null;
+  }
 }
 
 export function parseCreateProjectParams(params: unknown): string {

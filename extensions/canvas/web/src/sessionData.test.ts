@@ -1,11 +1,20 @@
 import { describe, expect, it, vi } from "vitest";
-import type { ExtensionContext } from "@omnigent/extension-sdk";
+import type {
+  ExtensionContext,
+  ExtensionSessionPage,
+} from "@omnigent/extension-sdk";
 import { loadProjects, loadSessions } from "./sessionData";
 
 function context(capabilities: string[]): ExtensionContext {
   return {
     capabilities,
-    sessions: { listAll: vi.fn(async () => []) },
+    sessions: {
+      listPage: vi.fn(async (): Promise<ExtensionSessionPage> => ({
+        sessions: [],
+        nextCursor: null,
+        hasMore: false,
+      })),
+    },
     projects: {
       list: vi.fn(async () => [{ id: "p1", name: "Alpha", icon: null }]),
     },
@@ -17,11 +26,53 @@ describe("loadSessions", () => {
     await expect(loadSessions(context([]))).rejects.toThrow("sessions.read");
   });
 
-  it("loads all bounded pages through the SDK", async () => {
+  it("reports each bounded page as it arrives", async () => {
     const extensionContext = context(["sessions.listPage"]);
-    await expect(loadSessions(extensionContext)).resolves.toEqual([]);
-    expect(extensionContext.sessions.listAll).toHaveBeenCalledWith({
-      pageLimit: 25,
+    const first = {
+      id: "s1",
+      title: "One",
+      status: "idle" as const,
+      unread: false,
+      titleProvisional: false,
+      workspace: null,
+      gitBranch: null,
+      projectId: null,
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    const second = { ...first, id: "s2", title: "Two" };
+    vi.mocked(extensionContext.sessions.listPage)
+      .mockResolvedValueOnce({
+        sessions: [first],
+        nextCursor: "next",
+        hasMore: true,
+      })
+      .mockResolvedValueOnce({
+        sessions: [second],
+        nextCursor: null,
+        hasMore: false,
+      });
+    const progress = vi.fn();
+
+    await expect(loadSessions(extensionContext, progress)).resolves.toEqual([
+      first,
+      second,
+    ]);
+    expect(extensionContext.sessions.listPage).toHaveBeenNthCalledWith(1, {
+      after: null,
+      limit: 25,
+    });
+    expect(extensionContext.sessions.listPage).toHaveBeenNthCalledWith(2, {
+      after: "next",
+      limit: 25,
+    });
+    expect(progress).toHaveBeenNthCalledWith(1, {
+      sessions: [first],
+      hasMore: true,
+    });
+    expect(progress).toHaveBeenNthCalledWith(2, {
+      sessions: [first, second],
+      hasMore: false,
     });
   });
 });

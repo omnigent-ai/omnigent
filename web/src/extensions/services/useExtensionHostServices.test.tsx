@@ -58,6 +58,7 @@ const wrapper = ({ children }: { children: ReactNode }) => (
 beforeEach(async () => {
   navigate.mockReset();
   authenticatedFetchMock.mockReset();
+  queryClient.clear();
   identityRef.current = "user@example.com";
   serverRef.current = "server-a";
   await resetExtensionStorageForTests();
@@ -148,6 +149,57 @@ describe("useExtensionHostServices", () => {
       nextCursor: null,
       hasMore: false,
     });
+  });
+
+  it("serves the initial canvas data from the live shell caches", async () => {
+    queryClient.setQueryData(["conversations", "", true], {
+      pages: [
+        {
+          data: [
+            {
+              id: "conv_cached",
+              title: "Cached",
+              status: "idle",
+              workspace: "/workspace",
+              created_at: 1,
+              updated_at: 2,
+              archived: false,
+            },
+          ],
+          has_more: true,
+          last_id: "conv_cached",
+        },
+      ],
+      pageParams: [undefined],
+    });
+    queryClient.setQueryData(
+      ["projects"],
+      [
+        { id: "proj_1", name: "Alpha", icon: "🅰️" },
+        { id: null, name: "Legacy", icon: null },
+      ],
+    );
+    authenticatedFetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ data: [], has_more: false, last_id: null }), {
+        status: 200,
+      }),
+    );
+    const { result } = renderHook(() => useExtensionHostServices(extension), {
+      wrapper,
+    });
+
+    expect(result.current.methods["sessions.listPage"]?.({}, signal())).toMatchObject({
+      sessions: [{ id: "conv_cached", title: "Cached" }],
+      nextCursor: "conv_cached",
+      hasMore: true,
+    });
+    expect(result.current.methods["projects.list"]?.({}, signal())).toEqual([
+      { id: "proj_1", name: "Alpha", icon: "🅰️" },
+    ]);
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+
+    await result.current.methods["sessions.listPage"]?.({}, signal());
+    expect(authenticatedFetchMock).toHaveBeenCalledOnce();
   });
 
   it("opens a project-scoped new session by resolving the project name", async () => {

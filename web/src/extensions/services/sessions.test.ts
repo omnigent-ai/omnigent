@@ -1,8 +1,10 @@
+import { QueryClient } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { authenticatedFetch } from "@/lib/identity";
 import { isExtensionPayloadWithinBudget } from "../rpc/validation";
 import { ExtensionHostServiceError } from "./errors";
 import {
+  cachedInitialSessionPage,
   listSessionPage,
   parseSessionPageRequest,
   SessionReadLimiter,
@@ -191,6 +193,39 @@ describe("projectSessionPage", () => {
     { data: Array.from({ length: 3 }, () => wireRow), has_more: false },
   ])("rejects malformed page %#", (payload) => {
     expect(() => projectSessionPage(payload, 2)).toThrow(ExtensionHostServiceError);
+  });
+});
+
+describe("cachedInitialSessionPage", () => {
+  it("projects a first page from the live sidebar cache", () => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(["conversations", "", true], {
+      pages: [
+        {
+          data: [
+            wireRow,
+            { ...wireRow, id: "archived", archived: true },
+            { ...wireRow, id: "child", parent_session_id: "conv_1" },
+            { ...wireRow, id: "conv_2", title: "Session two" },
+          ],
+          has_more: true,
+          last_id: "conv_2",
+        },
+      ],
+      pageParams: [undefined],
+    });
+
+    expect(cachedInitialSessionPage(queryClient, { limit: 2 })).toMatchObject({
+      sessions: [{ id: "conv_1" }, { id: "conv_2" }],
+      nextCursor: "conv_2",
+      hasMore: true,
+    });
+    expect(
+      cachedInitialSessionPage(queryClient, {
+        after: "conv_2",
+        limit: 2,
+      }),
+    ).toBeNull();
   });
 });
 

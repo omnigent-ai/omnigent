@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   ExtensionContext,
   ExtensionProjectSummary,
+  ExtensionSessionPage,
   ExtensionSessionSummary,
 } from "@omnigent/extension-sdk";
 
@@ -111,10 +112,23 @@ const sessions: ExtensionSessionSummary[] = [
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
     resolve = done;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, reject, resolve };
+}
+
+function page(
+  items: ExtensionSessionSummary[],
+  nextCursor: string | null = null,
+): ExtensionSessionPage {
+  return {
+    sessions: items,
+    nextCursor,
+    hasMore: nextCursor !== null,
+  };
 }
 
 function contextWith(
@@ -143,7 +157,19 @@ function contextWith(
       openExternal: vi.fn(async () => undefined),
     },
     sessions: {
-      listAll: vi.fn(async () => items),
+      listPage: vi.fn(
+        async (options?: {
+          after?: string | null;
+          limit?: number;
+        }): Promise<ExtensionSessionPage> => {
+          const start = options?.after ? Number(options.after) : 0;
+          const end = Math.min(start + (options?.limit ?? 25), items.length);
+          return page(
+            items.slice(start, end),
+            end < items.length ? String(end) : null,
+          );
+        },
+      ),
       pullRequest: vi.fn(async (sessionId: string) =>
         sessionId === "conv_branch"
           ? {
@@ -205,6 +231,87 @@ describe("CanvasApp", () => {
     expect(flowProps.current?.onlyRenderVisibleElements).toBe(true);
   });
 
+  it("renders the first page while later pages load and appends them progressively", async () => {
+    const later = {
+      ...sessions[1],
+      id: "conv_3",
+      title: "Three",
+    };
+    const secondPage = deferred<ExtensionSessionPage>();
+    const { context } = contextWith();
+    vi.mocked(context.sessions.listPage)
+      .mockResolvedValueOnce(page(sessions, "next"))
+      .mockImplementationOnce(() => secondPage.promise);
+
+    render(<CanvasApp context={context} />);
+
+    expect(await screen.findByText("2 sessions")).toBeInTheDocument();
+    expect(screen.getByTestId("flow-node-conv_1")).toBeInTheDocument();
+    expect(screen.queryByTestId("flow-node-conv_3")).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(setViewport).toHaveBeenCalledWith(
+        { x: 24, y: 24, zoom: 0.9 },
+        { duration: 0 },
+      ),
+    );
+
+    await act(async () => secondPage.resolve(page([later])));
+
+    expect(await screen.findByText("3 sessions")).toBeInTheDocument();
+    expect(screen.getByTestId("flow-node-conv_3")).toBeInTheDocument();
+  });
+
+  it("keeps the first page usable when a background page fails", async () => {
+    const secondPage = deferred<ExtensionSessionPage>();
+    const { context } = contextWith();
+    vi.mocked(context.sessions.listPage)
+      .mockResolvedValueOnce(page(sessions, "next"))
+      .mockImplementationOnce(() => secondPage.promise);
+
+    render(<CanvasApp context={context} />);
+    expect(await screen.findByText("2 sessions")).toBeInTheDocument();
+
+    await act(async () => secondPage.reject(new Error("page two timed out")));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Refresh failed: page two timed out",
+    );
+    expect(screen.getByTestId("flow-node-conv_1")).toBeInTheDocument();
+  });
+
+  it("retains saved positions for sessions that arrive on a later page", async () => {
+    const later = {
+      ...sessions[1],
+      id: "conv_later",
+      title: "Later",
+    };
+    const secondPage = deferred<ExtensionSessionPage>();
+    const saved = contextWith();
+    saved.values.set(LAYOUT_META_KEY, { version: 1 });
+    saved.values.set(positionBucketKey(positionBucket(later.id)), [
+      [later.id, 777, 888],
+    ]);
+    vi.mocked(saved.context.sessions.listPage)
+      .mockResolvedValueOnce(page(sessions, "next"))
+      .mockImplementationOnce(() => secondPage.promise);
+
+    render(<CanvasApp context={saved.context} />);
+    expect(await screen.findByText("2 sessions")).toBeInTheDocument();
+    expect(
+      saved.values.get(positionBucketKey(positionBucket(later.id))),
+    ).toContainEqual([later.id, 777, 888]);
+
+    await act(async () => secondPage.resolve(page([later])));
+    await screen.findByTestId("flow-node-conv_later");
+    const node = (
+      flowProps.current?.nodes as Array<{
+        id: string;
+        position: { x: number; y: number };
+      }>
+    ).find((item) => item.id === later.id);
+    expect(node?.position).toEqual({ x: 777, y: 888 });
+  });
+
   it("opens a card once on double-click", async () => {
     const { context, openSession } = contextWith();
     render(<CanvasApp context={context} />);
@@ -219,23 +326,25 @@ describe("CanvasApp", () => {
 
   it("keeps existing card positions when a focus refresh adds a session, and resets on demand", async () => {
     const { context } = contextWith();
-    vi.mocked(context.sessions.listAll)
-      .mockResolvedValueOnce(sessions)
-      .mockResolvedValueOnce([
-        ...sessions,
-        {
-          id: "conv_3",
-          title: "Three",
-          status: "idle",
-          unread: false,
-          titleProvisional: false,
-          gitBranch: null,
-          workspace: "/workspace/three",
-          projectId: null,
-          createdAt: 3,
-          updatedAt: 3,
-        },
-      ]);
+    vi.mocked(context.sessions.listPage)
+      .mockResolvedValueOnce(page(sessions))
+      .mockResolvedValueOnce(
+        page([
+          ...sessions,
+          {
+            id: "conv_3",
+            title: "Three",
+            status: "idle",
+            unread: false,
+            titleProvisional: false,
+            gitBranch: null,
+            workspace: "/workspace/three",
+            projectId: null,
+            createdAt: 3,
+            updatedAt: 3,
+          },
+        ]),
+      );
     render(<CanvasApp context={context} />);
     await screen.findByText("2 sessions");
     const before = Object.fromEntries(
@@ -293,7 +402,7 @@ describe("CanvasApp", () => {
     rendered.unmount();
 
     const failed = contextWith();
-    vi.mocked(failed.context.sessions.listAll).mockRejectedValue(
+    vi.mocked(failed.context.sessions.listPage).mockRejectedValue(
       new Error("offline"),
     );
     render(<CanvasApp context={failed.context} />);
@@ -445,20 +554,22 @@ describe("CanvasApp", () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
       const { context } = contextWith();
-      vi.mocked(context.sessions.listAll)
-        .mockResolvedValueOnce(sessions)
-        .mockResolvedValue([
-          { ...sessions[0], title: "One (renamed)", status: "running" },
-          sessions[1],
-        ]);
+      vi.mocked(context.sessions.listPage)
+        .mockResolvedValueOnce(page(sessions))
+        .mockResolvedValue(
+          page([
+            { ...sessions[0], title: "One (renamed)", status: "running" },
+            sessions[1],
+          ]),
+        );
       render(<CanvasApp context={context} />);
       await screen.findByText("2 sessions");
-      expect(context.sessions.listAll).toHaveBeenCalledTimes(1);
+      expect(context.sessions.listPage).toHaveBeenCalledTimes(1);
 
       await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS + 50);
 
       await waitFor(() =>
-        expect(context.sessions.listAll).toHaveBeenCalledTimes(2),
+        expect(context.sessions.listPage).toHaveBeenCalledTimes(2),
       );
       const node = (
         flowProps.current?.nodes as Array<{
@@ -478,25 +589,50 @@ describe("CanvasApp", () => {
   it("waits for a slow refresh before scheduling or accepting another", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
-      const slowRefresh = deferred<ExtensionSessionSummary[]>();
+      const slowRefresh = deferred<ExtensionSessionPage>();
       const { context } = contextWith();
-      vi.mocked(context.sessions.listAll)
-        .mockResolvedValueOnce(sessions)
+      vi.mocked(context.sessions.listPage)
+        .mockResolvedValueOnce(page(sessions))
         .mockImplementationOnce(() => slowRefresh.promise)
-        .mockResolvedValue(sessions);
+        .mockResolvedValue(page(sessions));
       render(<CanvasApp context={context} />);
       await screen.findByText("2 sessions");
 
       await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS + 50);
-      expect(context.sessions.listAll).toHaveBeenCalledTimes(2);
+      expect(context.sessions.listPage).toHaveBeenCalledTimes(2);
 
       fireEvent(window, new Event("focus"));
       await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS * 2);
-      expect(context.sessions.listAll).toHaveBeenCalledTimes(2);
+      expect(context.sessions.listPage).toHaveBeenCalledTimes(2);
 
-      await act(async () => slowRefresh.resolve(sessions));
+      await act(async () => slowRefresh.resolve(page(sessions)));
       await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS + 50);
-      expect(context.sessions.listAll).toHaveBeenCalledTimes(3);
+      expect(context.sessions.listPage).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not overlap polling with initial background pagination", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const secondPage = deferred<ExtensionSessionPage>();
+      const { context } = contextWith();
+      vi.mocked(context.sessions.listPage)
+        .mockResolvedValueOnce(page(sessions, "next"))
+        .mockImplementationOnce(() => secondPage.promise)
+        .mockResolvedValue(page(sessions));
+      render(<CanvasApp context={context} />);
+      await screen.findByText("2 sessions");
+      expect(context.sessions.listPage).toHaveBeenCalledTimes(2);
+
+      fireEvent(window, new Event("focus"));
+      await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS * 2);
+      expect(context.sessions.listPage).toHaveBeenCalledTimes(2);
+
+      await act(async () => secondPage.resolve(page([])));
+      await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS + 50);
+      expect(context.sessions.listPage).toHaveBeenCalledTimes(3);
     } finally {
       vi.useRealTimers();
     }
