@@ -20,6 +20,8 @@ import {
   RunnerOfflineError,
   runnerOfflineRetryDelay,
   shouldRetryRunnerOffline,
+  useSessionActive,
+  useTrailingInvalidate,
   useWorkspaceServeable,
   type WorkspaceChangedFile,
 } from "@/hooks/useWorkspaceChangedFiles";
@@ -163,15 +165,75 @@ async function fetchGithubInfo(conversationId: string): Promise<GithubInfo> {
   return (await res.json()) as GithubInfo;
 }
 
+/** Poll cadence while the panel is open and the GitHub state can still change.
+ *  Covers both the setup/availability states the user resolves outside the app
+ *  (install `gh`, `gh auth login`/`switch`, `cd` into a repo) — cheap local
+ *  git/gh checks — and the waiting-for-a-PR / CI-running states, which cost a
+ *  `gh` API call but only while the panel is actually focused. */
+const GITHUB_POLL_MS = 5_000;
+
+/**
+ * The panel's poll interval for the current GitHub info, or `false` to stop.
+ *
+ * While the panel is open we keep polling in every state that can still change
+ * from something the user does outside the app — the setup/availability states
+ * (no repo, `gh` missing, not authenticated, repo unresolved) as well as
+ * waiting for a PR and watching an open PR's checks. It rests (returns `false`)
+ * only at a stable end state: an open PR whose checks have all settled, or a
+ * merged/closed PR. A resting panel still refreshes on the turn-end invalidate
+ * (see {@link useGithubInfo}); resting only forgoes the interval poll. Kept pure
+ * and exported so each state is unit-testable.
+ *
+ * Note: an open PR on a repo with no CI stays at `total === 0` and so keeps
+ * polling while the panel is open+focused — we can't tell "no CI" from "checks
+ * haven't registered yet", and freshness wins for the cost of a focused poll.
+ */
+export function computeGithubPollInterval(info: GithubInfo | undefined): number | false {
+  // No usable info yet — an initial error, or a transient fetch failure with no
+  // cached data. Keep trying; runner-offline is gated off by `enabled`.
+  if (!info) return GITHUB_POLL_MS;
+  // Setup / availability states, all resolved outside the app.
+  if (
+    !info.available ||
+    info.gh_available === false ||
+    info.authenticated === false ||
+    !info.repo?.name_with_owner
+  ) {
+    return GITHUB_POLL_MS;
+  }
+  const pr = info.pr;
+  if (!pr) return GITHUB_POLL_MS; // set up, waiting for a PR to appear
+  if (pr.state !== "OPEN") return false; // merged/closed → nothing left to watch
+  // Open PR: poll while checks run or haven't registered; stop once settled.
+  return pr.checks.pending > 0 || pr.checks.total === 0 ? GITHUB_POLL_MS : false;
+}
+
 /**
  * Fetch GitHub context (repo, branch, base ref, PR + CI summary) for a session.
  *
  * Disabled when the runner is known offline. Retries the runner-offline case
  * with capped backoff so a cold-booting runner resolves before any error UI.
- * No polling — the panel refetches on a manual Refresh.
+ *
+ * Refetch is driven two ways, both harness-agnostic:
+ *   - Turn end: a trailing invalidate on the focused session's active→idle
+ *     transition, so a PR the agent opened during the turn shows up (in the
+ *     status-line indicator and the panel) without a manual refresh. This is
+ *     the always-on path — the status line uses it even with the tab closed.
+ *   - Panel poll: pass `{ poll: true }` (the GitHub panel does) to also poll
+ *     while the panel is open — see {@link computeGithubPollInterval} for which
+ *     states poll and which rest. It catches changes a turn boundary can't
+ *     (setup fixed outside the app, CI progressing after the turn). Backgrounded
+ *     tabs pause (`refetchIntervalInBackground: false`).
+ *
+ * Disabled when the runner is known offline. Retries the runner-offline case
+ * with capped backoff so a cold-booting runner resolves before any error UI.
  */
-export function useGithubInfo(conversationId: string | undefined) {
+export function useGithubInfo(conversationId: string | undefined, options?: { poll?: boolean }) {
   const serveable = useWorkspaceServeable(conversationId);
+  // Turn-end backstop: refetch when the focused session goes active→idle, so a
+  // just-opened PR appears without opening the tab. Keys off the turn lifecycle,
+  // so it works for every harness (no per-harness tool detection).
+  useTrailingInvalidate(conversationId, useSessionActive(conversationId), "github-info");
   return useQuery({
     queryKey: ["github-info", conversationId],
     queryFn: () => fetchGithubInfo(conversationId!),
@@ -179,6 +241,8 @@ export function useGithubInfo(conversationId: string | undefined) {
     retry: shouldRetryRunnerOffline,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
+    refetchInterval: options?.poll ? (query) => computeGithubPollInterval(query.state.data) : false,
+    refetchIntervalInBackground: false,
   });
 }
 
