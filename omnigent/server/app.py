@@ -3119,7 +3119,6 @@ def create_app(
             tags=["integrations"],
         )
 
-
     # Mount the auth router that matches the active provider. OIDC and
     # accounts share the /auth prefix but expose different endpoints
     # under it (OIDC: /login, /callback, /logout, /cli-login, /cli-poll;

@@ -112,8 +112,7 @@ def build_opencode_provider_config(resolution: OpenCodeGatewayResolution) -> dic
                     "apiKey": resolution.api_key,
                 },
                 "models": {
-                    mid: {"name": mid}
-                    for mid in (resolution.model_ids or (resolution.model_id,))
+                    mid: {"name": mid} for mid in (resolution.model_ids or (resolution.model_id,))
                 },
             }
         },
