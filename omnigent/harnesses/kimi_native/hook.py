@@ -23,10 +23,12 @@ stdin, and reads the decision back from stdout as
   ``PermissionRequest`` fire-and-forget (it does NOT read this hook's output —
   approval is answered by kimi's own TUI menu), so the hook cannot return an
   honored decision. Instead it drives a real web-UI Approve/Deny: it POSTs the
-  gated tool to ``/v1/sessions/{id}/hooks/permission-request`` (the same
-  endpoint claude-native uses — the server publishes the approval card and
-  long-polls for the web verdict), then types the answer back into kimi's
-  prompt via ``inject_approval_keystroke`` (option digit:
+  gated tool to ``/v1/sessions/{id}/hooks/native-permission-request`` (the
+  vendor-agnostic native-permission endpoint shared with qwen/kiro/hermes/goose
+  — the payload's ``agent`` / ``policy_name`` label the card "Kimi", and the
+  server publishes the approval card and long-polls for the web verdict), then
+  types the answer back into kimi's prompt via ``inject_approval_keystroke``
+  (option digit:
   :data:`~omnigent.harnesses.kimi_native.bridge.APPROVE_KEY` "Approve once" /
   :data:`~omnigent.harnesses.kimi_native.bridge.DENY_KEY` "Reject"). Fail-safe: on no
   verdict (timeout / unreachable / already answered in the terminal) it injects
@@ -208,10 +210,11 @@ def _main_permission_request(argv: list[str]) -> int:
     honors. Instead we drive an interactive web-UI approval and type the answer
     back into kimi's prompt:
 
-    1. POST the gated tool to ``/v1/sessions/{id}/hooks/permission-request`` —
-       the server publishes the standard ``response.elicitation_request``
-       approval card and long-polls for the web verdict (the very endpoint
-       claude-native uses).
+    1. POST the gated tool to ``/v1/sessions/{id}/hooks/native-permission-request``
+       — the vendor-agnostic native-permission endpoint (shared with
+       qwen/kiro/hermes/goose); the payload labels the card "Kimi", and the
+       server publishes the ``response.elicitation_request`` approval card and
+       long-polls for the web verdict.
     2. On ``allow`` / ``deny``, inject the matching kimi permission-menu option
        digit into the TUI pane via :func:`inject_approval_keystroke`
        (:data:`APPROVE_KEY` "Approve once" / :data:`DENY_KEY` "Reject").
@@ -241,10 +244,13 @@ def _main_permission_request(argv: list[str]) -> int:
     if not isinstance(tool_name, str) or not tool_name:
         return 0
     body: dict[str, object] = {
-        "tool_name": tool_name,
         # Stable re-attach id so a severed long-poll re-parks the SAME
-        # elicitation (mirrors the claude permission hook).
-        "_omnigent_elicitation_id": f"elicit_kimi_{secrets.token_hex(16)}",
+        # elicitation. ``agent`` / ``policy_name`` label the card "Kimi".
+        "elicitation_id": f"elicit_kimi_{secrets.token_hex(16)}",
+        "agent": "Kimi",
+        "policy_name": "kimi_native_permission",
+        "message": f"Kimi wants to call **{tool_name}**",
+        "operation_type": tool_name,
     }
     tool_input = payload.get("tool_input")
     if isinstance(tool_input, dict):
@@ -252,7 +258,7 @@ def _main_permission_request(argv: list[str]) -> int:
 
     url = (
         f"{ap_server_url.rstrip('/')}/v1/sessions/"
-        f"{_url_component(session_id)}/hooks/permission-request"
+        f"{_url_component(session_id)}/hooks/native-permission-request"
     )
     deadline = time.monotonic() + _PERMISSION_RETRY_WINDOW_S
     verdict = _request_web_approval(url, headers, body, bridge_dir=bridge_dir, deadline=deadline)
@@ -363,26 +369,18 @@ def _request_web_approval(
 
 
 def _verdict_from_response(data: object) -> str | None:
-    """Extract ``"allow"`` / ``"deny"`` from the PermissionRequest hook response.
+    """Extract ``"allow"`` / ``"deny"`` from the native-permission response.
 
-    The endpoint returns Claude's PermissionRequest contract
-    (``hookSpecificOutput.decision.behavior``), with ``permissionDecision`` as a
-    fallback shape. Any persistent-allow variant (``allow_*``) maps to allow.
+    The vendor-agnostic endpoint returns an ``ElicitationResult``
+    (``{"action": "accept"|"decline"|"cancel"}``): ``accept`` maps to allow,
+    ``decline`` / ``cancel`` to deny. Anything else is no verdict.
     """
     if not isinstance(data, dict):
         return None
-    hook_output = data.get("hookSpecificOutput")
-    if not isinstance(hook_output, dict):
-        return None
-    decision = hook_output.get("decision")
-    behavior = decision.get("behavior") if isinstance(decision, dict) else None
-    raw = behavior if isinstance(behavior, str) else hook_output.get("permissionDecision")
-    if not isinstance(raw, str):
-        return None
-    low = raw.lower()
-    if low.startswith("allow") or low in ("approve", "approved", "accept"):
+    action = data.get("action")
+    if action == "accept":
         return "allow"
-    if low in ("deny", "reject", "rejected", "block"):
+    if action in ("decline", "cancel"):
         return "deny"
     return None
 
