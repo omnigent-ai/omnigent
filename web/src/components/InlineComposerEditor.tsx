@@ -29,7 +29,7 @@ const SlashTokenHighlight = Extension.create({
           decorations(state) {
             const firstBlock = state.doc.firstChild;
             if (!firstBlock) return null;
-            const match = /^(\s*)(\/[A-Za-z][\w-]*)(?=\s|$)/.exec(firstBlock.textContent);
+            const match = firstBlock.textContent.match(/^(\s*)(\/[A-Za-z][\w-]*)(?=\s|$)/);
             if (!match) return null;
             const from = 1 + match[1].length;
             return DecorationSet.create(state.doc, [
