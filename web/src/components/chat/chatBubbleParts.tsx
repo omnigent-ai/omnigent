@@ -369,6 +369,11 @@ function useAgentTurnActive(): boolean {
  */
 export function workingIndicatorLabel(tick = 0, blockedOn: string | null = null): string {
   if (blockedOn) {
+    // A "dialog open" block lives only in the terminal tab, so point the user
+    // there to respond rather than leaving the session looking hung.
+    if (blockedOn === "dialog open") {
+      return "Waiting on a dialog in the terminal. Open the terminal tab to respond.";
+    }
     return `Blocked on: ${blockedOn}`;
   }
   return WORKING_MESSAGES[tick % WORKING_MESSAGES.length]!;

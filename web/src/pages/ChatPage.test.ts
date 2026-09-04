@@ -1028,7 +1028,15 @@ describe("workingIndicatorLabel — parked on a dialog", () => {
     // Being blocked on the user is the one state that needs an action, and the
     // dialog may exist only in the terminal tab — so it must not be buried
     // under a rotating "Cooking…".
-    expect(workingIndicatorLabel(2, "dialog open")).toBe("Blocked on: dialog open");
+    const label = workingIndicatorLabel(2, "dialog open");
+    expect(WORKING_MESSAGES).not.toContain(label);
+  });
+
+  it("points the user at the terminal for a dialog open", () => {
+    // "dialog open" means the agent is waiting on a dialog that lives only in
+    // the terminal tab. A bare "Blocked on: dialog open" leaves the user with
+    // no idea where to respond, so the label must guide them to the terminal.
+    expect(workingIndicatorLabel(2, "dialog open")).toMatch(/terminal/i);
   });
 
   it("falls back to the normal label when not parked", () => {
