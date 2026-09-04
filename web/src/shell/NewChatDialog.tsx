@@ -100,7 +100,12 @@ import {
   rankedSlashCommandNames,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
-import { setPendingInitialPrompt } from "@/store/chatStore";
+import {
+  beginLocalConversation,
+  hydrateLocalConversation,
+  removeLocalConversation,
+  setPendingInitialPrompt,
+} from "@/store/chatStore";
 import { markSessionCreated } from "@/store/interactionTelemetry";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
@@ -4253,6 +4258,7 @@ export function NewChatLandingScreen() {
     }
     setCreating(true);
     setCreateError(null);
+    let localConv: { tempConvId: string; pendingMsgTempId: string } | null = null;
     // The draft is spent from the moment it is submitted: it belongs to the
     // session now being created, so a detour back to this screen must not
     // hand it back pre-filled. Flipped here rather than on the response
@@ -4310,6 +4316,22 @@ export function NewChatLandingScreen() {
       const initialPrompt =
         buildMentionPreamble(mentionedItems, selectedAgent?.harness ?? null) +
         sanitizeInitialPrompt(message);
+      // Navigate-first: mint a client-only conversation, show the prompt, and
+      // jump into it now; the create runs below and hydrates the temp id to the
+      // real one (`hydrateLocalConversation`). Skipped for a pending custom
+      // agent — it has no agent id to POST with until its create binds one, so
+      // that path stays server-first.
+      if (effectiveAgentId !== null && effectiveAgentId !== PENDING_AGENT_ID) {
+        try {
+          const local = beginLocalConversation(initialPrompt, files);
+          if (local !== null) {
+            localConv = local;
+            navigate(`/c/${local.tempConvId}`);
+          }
+        } catch {
+          /* non-fatal: falls through to the server-first path below */
+        }
+      }
 
       // Native terminal agents open terminal-first: `omnigent.ui: terminal`
       // tells the UI to render the terminal wrapper, and `omnigent.wrapper`
@@ -4639,40 +4661,52 @@ export function NewChatLandingScreen() {
       // next time. Recorded only on a successful create, so a harness the user
       // merely browsed past never earns a primary slot.
       if (selectedNativeHarness !== null) addRecentHarness(selectedNativeHarness);
-      // Fire-and-forget: don't block navigation on the sidebar list refresh.
-      // The background refetch (or the WS session_added push) backfills the
-      // new session's row within ~1s of landing in the chat; the chat itself
-      // loads from the session id and never reads the sidebar cache.
-      void queryClient.refetchQueries({ queryKey: ["conversations"] });
-      void queryClient.invalidateQueries({ queryKey: ["directory-sessions"] });
-      // A first message matching one of the agent's bundled skills is
-      // handed off as a structured invocation so ChatPage auto-sends it
-      // as a `slash_command` event (server resolves the skill) instead
-      // of plain text the agent would see as a literal "/name". Native
-      // terminal agents keep plain text — their CLI owns slash commands.
-      setPendingInitialPrompt(data.id, {
-        text: initialPrompt,
-        skill: isNativeTerminalAgent
-          ? null
-          : matchSkillInvocation(initialPrompt, agent?.skills ?? []),
-        files,
-      });
-      // Label the new row with the prompt until the server's seed title lands.
-      recordOptimisticTitle(data.id, initialPrompt);
+      // A first message matching one of the agent's bundled skills is sent as a
+      // structured `slash_command` (server resolves the skill) rather than the
+      // literal "/name". Native terminal agents keep plain text — their CLI owns
+      // slash commands.
+      const skill = isNativeTerminalAgent
+        ? null
+        : matchSkillInvocation(initialPrompt, agent?.skills ?? []);
       // Scope the recall entry to the new session id so ArrowUp surfaces it in
-      // the freshly-opened chat (whose composer reads the same per-conversation
-      // key). Sanitized text so recall reproduces exactly what was sent.
+      // the freshly-opened chat. Sanitized text so recall reproduces what was sent.
       appendPromptHistoryEntry(initialPrompt, data.id);
       // The session was created — drop any draft a detour back to this
       // screen stashed, so the next visit starts clean.
       landingDraft = null;
-      // Only follow the create while the user is still on the landing
-      // screen. A create that outlived it means they moved on to another
-      // session; jumping them into this one now would hijack that. The
-      // session is created either way and its first message stays held
-      // for whenever they open it.
-      if (onScreenRef.current) navigate(`/c/${data.id}`);
+      void queryClient.invalidateQueries({ queryKey: ["directory-sessions"] });
+
+      // `localConv` is set only when a real agent id was resolved up front, so
+      // it's safe to POST the first message with it.
+      if (localConv !== null && effectiveAgentId !== null) {
+        // Hydrate the temp id onto the real id and POST the first message.
+        hydrateLocalConversation(
+          localConv.tempConvId,
+          data.id,
+          effectiveAgentId,
+          initialPrompt,
+          files,
+          localConv.pendingMsgTempId,
+          skill,
+          navigate,
+        );
+        void queryClient.refetchQueries({ queryKey: ["conversations"] });
+      } else {
+        // Server-first: a pending custom agent (or no client cache in tests).
+        // Label the row, stash the first message for ChatPage to send, navigate.
+        recordOptimisticTitle(data.id, initialPrompt);
+        void queryClient.refetchQueries({ queryKey: ["conversations"] });
+        setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files });
+        if (onScreenRef.current) navigate(`/c/${data.id}`);
+      }
     } catch {
+      // Tear down the client-only conversation; if the user is still on it, send
+      // them back to landing so the restored draft has somewhere to go. Gated on
+      // `wasViewing` (not `onScreenRef` — the landing already unmounted).
+      if (localConv !== null) {
+        const wasViewing = removeLocalConversation(localConv.tempConvId);
+        if (wasViewing) navigate("/");
+      }
       returnDraftToUser();
       setCreateError("Couldn't reach the server. Check your connection and try again.");
     } finally {
