@@ -3641,7 +3641,9 @@ def _host_daemon_alive() -> bool:
 _LOCAL_SERVER_DISCOVER_TIMEOUT_S = 120.0
 
 
-def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False) -> None:
+def _ensure_databricks_server_auth(
+    server: str, *, non_interactive: bool = False, profile: str | None = None
+) -> None:
     """Sign in (or fail with the login hint) for Databricks-fronted servers.
 
     Probes ``/v1/me`` with whatever credentials the auth chain can mint
@@ -3664,6 +3666,11 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
         emit the same fail-loud hint a headless invocation gets, even on a
         TTY. Lets callers (e.g. ``omnigent host --non-interactive``) keep
         their scripted, no-prompt behavior.
+    :param profile: An explicit ``~/.databrickscfg`` profile to
+        authenticate as (from ``omnigent host --profile``). Resolves and
+        persists that identity instead of the host-keyed browser flow, so
+        a machine holding several profiles for the workspace registers as
+        the one the user named.
     :raises click.ClickException: When the server is Databricks-fronted,
         no credentials resolve, and the login flow is suppressed (stdin is
         not a TTY or ``non_interactive`` is set) — or the login flow itself
@@ -3674,6 +3681,7 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     from omnigent.chat import _remote_headers
     from omnigent.cli_auth import (
         load_databricks_org_id,
+        load_databricks_profile,
         load_databricks_workspace_host,
         store_databricks_auth,
     )
@@ -3685,9 +3693,18 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
         # Unreachable / transient: let the connect path raise its own,
         # already-actionable error rather than failing the pre-flight.
         return
-    if probe.status_code == 200:
+    # An explicit --profile is an instruction to register as that identity.
+    # A co-resident service principal's token can answer 200 here — precisely
+    # the "already stuck as the SP" state — so bailing on 200 would silently
+    # drop the user's choice. Only skip when no profile was named.
+    if probe.status_code == 200 and profile is None:
         return
     workspace_host = _databricks_workspace_login_target(server, probe)
+    # On a 200 there is no redirect target to parse the workspace from; the
+    # workspace the app fronts is in the stored pointer record from a prior
+    # login. Needed so an explicit --profile can re-resolve and persist here.
+    if workspace_host is None and probe.status_code == 200 and profile is not None:
+        workspace_host = load_databricks_workspace_host(server)
     credential_rejected = False
     if workspace_host is None and probe.status_code in (401, 403):
         # A rejected bearer can hide the edge signature. Prefer the saved
@@ -3703,7 +3720,12 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     if workspace_host is None:
         return
     org_id = load_databricks_org_id(server)
-    auth_info = _databricks_workspace_auth_info(workspace_host)
+    resolve_profile = profile or load_databricks_profile(server)
+    auth_info = (
+        _databricks_profile_auth_info(resolve_profile)
+        if resolve_profile is not None
+        else _databricks_workspace_auth_info(workspace_host)
+    )
     if auth_info is not None:
         if org_id is None:
             org_id = _workspace_hosted_profile_org_id(
@@ -3711,13 +3733,14 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
             )
         refreshed_probe = _verify_databricks_server_token(server, auth_info.token, org_id)
         if refreshed_probe.status_code == 200:
-            store_databricks_auth(server, workspace_host, org_id=org_id)
+            store_databricks_auth(server, workspace_host, org_id=org_id, profile=resolve_profile)
             return
     # User-facing: show the display form (the workspace /omnigent URL, with
     # ?o= when known), not the internal API mount; it round-trips through
     # `omnigent login` back to the same API base.
     display = ServerUrl(api_base=server, org_id=org_id).display
-    login_cmd = f"omnigent login {display}"
+    profile_flag = f" --profile {profile}" if profile else ""
+    login_cmd = f"omnigent login {display}{profile_flag}"
     state = (
         f"Your Databricks credential for {display} has expired or was revoked"
         if credential_rejected
@@ -3732,7 +3755,7 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     # Login selector comes from the URL, not the stored org_id used above: on a
     # single-tenant host a replayed ?o= makes `databricks auth login --host` skip
     # workspace_id resolution, so the grant isn't workspace-bound (matches `login`).
-    _databricks_login(server, workspace_host, org_id=_org_id_from_url(server))
+    _databricks_login(server, workspace_host, org_id=_org_id_from_url(server), profile=profile)
 
 
 def _ensure_backend(server: str | None) -> str:
@@ -8796,6 +8819,7 @@ def _run_background_host(
     *,
     stop_command: str,
     non_interactive: bool,
+    profile: str | None = None,
 ) -> None:
     """Spawn (or reuse) the detached host daemon and report it.
 
@@ -8817,12 +8841,14 @@ def _run_background_host(
         matches how it was invoked.
     :param non_interactive: When ``True``, never launch the browser login —
         fail with the ``omnigent login`` hint instead.
+    :param profile: For a Databricks-fronted server, an explicit
+        ``~/.databrickscfg`` profile to register as (persisted).
     :raises click.ClickException: If the daemon cannot be spawned, exits
         immediately, fails to register, or (local mode) never serves its local
         Omnigent server.
     """
     if server:
-        _ensure_databricks_server_auth(server, non_interactive=non_interactive)
+        _ensure_databricks_server_auth(server, non_interactive=non_interactive, profile=profile)
     target = _normalize_daemon_target(server)
     previous = _find_daemon_record(target)
     _ensure_host_daemon(server or None)
@@ -8932,12 +8958,26 @@ def _host_stop_command(explicit_server: str | None) -> str:
         "launching the browser login flow. Use this in scripts and CI."
     ),
 )
+@click.option(
+    "--profile",
+    "profile",
+    default=None,
+    metavar="NAME",
+    help=(
+        "For a Databricks-fronted server: register this machine as the "
+        "identity of this `~/.databrickscfg` profile instead of the browser "
+        "login, and persist it. Use when the machine holds several profiles "
+        "for the workspace (e.g. your user login alongside a service "
+        "principal) to pin which identity the host registers as."
+    ),
+)
 @click.pass_context
 def host(
     ctx: click.Context,
     server: str | None,
     background: bool,
     non_interactive: bool,
+    profile: str | None,
 ) -> None:
     """
     Register this machine as a host with a server.
@@ -8973,6 +9013,9 @@ def host(
     :param non_interactive: When ``True``, never launch the browser login
         for an un-authed remote server — fail with the ``omnigent login``
         hint instead.
+    :param profile: For a Databricks-fronted server, an explicit
+        ``~/.databrickscfg`` profile to register as (persisted). ``None``
+        uses the browser login / any previously stored profile.
     """
     ctx.ensure_object(dict)
     ctx.obj["server"] = server
@@ -8997,6 +9040,7 @@ def host(
             server,
             stop_command=_host_stop_command(explicit_server),
             non_interactive=non_interactive,
+            profile=profile,
         )
         return
 
@@ -9034,7 +9078,9 @@ def host(
         # this runs the browser login and continues; ``--non-interactive``
         # (or a headless invocation) fails loud with the command to run.
         if remote_mode:
-            _ensure_databricks_server_auth(server, non_interactive=non_interactive)
+            _ensure_databricks_server_auth(
+                server, non_interactive=non_interactive, profile=profile
+            )
         _maybe_open_host_web_ui(server, non_interactive=non_interactive, cfg=cfg)
         run_host_process(server_url=server, daemon_target=target)
         stopped_cleanly = True
@@ -12062,7 +12108,12 @@ def _databricks_host_needs_org_selector(workspace_host: str) -> bool:
     return not meta.workspace_id and bool(meta.account_id)
 
 
-def _databricks_login(server: str, workspace_host: str, org_id: str | None = None) -> None:
+def _databricks_login(
+    server: str,
+    workspace_host: str,
+    org_id: str | None = None,
+    profile: str | None = None,
+) -> None:
     """Log in to a Databricks-fronted Omnigent server.
 
     Covers both Databricks Apps deployments and workspace-hosted
@@ -12074,8 +12125,13 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
     verification (e.g. a stale token-cache entry minted for a
     different workspace) triggers one fresh browser login and a
     re-verify before failing loud. On success, a pointer record is
-    stored in ``~/.omnigent/auth_tokens.json`` — no profile name is
-    created or consulted anywhere.
+    stored in ``~/.omnigent/auth_tokens.json``.
+
+    When *profile* is given, credentials resolve from that
+    ``~/.databrickscfg`` profile (an explicit identity — e.g. the
+    user's login rather than a co-resident service principal), the
+    browser flow is skipped, and the profile is persisted in the
+    pointer record so later commands replay the same identity.
 
     :param server: The server URL, e.g.
         ``"https://myapp-123.aws.databricksapps.com"``.
@@ -12085,9 +12141,12 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
         (see :func:`_org_id_from_url`). When set, the login binds the
         grant to this workspace and the verify request routes to it —
         needed where the bare host is the account, not a workspace.
+    :param profile: An explicit ``~/.databrickscfg`` profile to
+        authenticate as, e.g. ``"my-user"``. ``None`` resolves via the
+        host-keyed OAuth cache (the browser flow).
     :raises click.ClickException: When the ``databricks`` extra or CLI
-        binary is missing, the workspace login fails, or the server
-        rejects the workspace token.
+        binary is missing, the workspace login fails, the named profile
+        does not resolve, or the server rejects the workspace token.
     """
     from omnigent.onboarding.databricks_config import (
         DATABRICKS_EXTRA_INSTALL_HINT,
@@ -12104,7 +12163,17 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
 
     from omnigent.cli_auth import is_workspace_hosted_url
 
-    auth_info = _databricks_workspace_auth_info(workspace_host)
+    if profile is not None:
+        auth_info = _databricks_profile_auth_info(profile)
+        if auth_info is None:
+            raise click.ClickException(
+                f"Databricks profile {profile!r} did not resolve to a usable "
+                f"credential for {workspace_host}. Check `~/.databrickscfg` "
+                f"(run `databricks auth login -p {profile}` if it is a user "
+                "profile), or omit --profile to use the browser login."
+            )
+    else:
+        auth_info = _databricks_workspace_auth_info(workspace_host)
     if org_id is None and auth_info is not None:
         org_id = _workspace_hosted_profile_org_id(server, workspace_host, auth_info.profile_name)
 
@@ -12149,6 +12218,14 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
     # server (the user may lack access to it), and learn our identity
     # for the success message.
     verify = _verify_databricks_server_token(server, token, org_id)
+    if verify.status_code != 200 and profile is not None:
+        # An explicit --profile names one identity; there is no browser
+        # fallback to try. Fail loud with the rejected profile.
+        raise click.ClickException(
+            f"{workspace_host} accepted profile {profile!r}, but {display} "
+            f"rejected its token (HTTP {verify.status_code}). Check that this "
+            "profile's identity has access to the app, or omit --profile."
+        )
     if verify.status_code != 200 and not fresh_login_done:
         # A cached grant can be stale or minted for a different
         # workspace (the CLI token cache is host-keyed but not
@@ -12187,6 +12264,9 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
         # and browser links append it. The login URL's selector wins; fall
         # back to the org id the workspace stamps on responses.
         org_id=org_id or verify.headers.get("x-databricks-org-id"),
+        # Persist the chosen identity so later commands resolve by profile
+        # rather than guessing among host-matching profiles.
+        profile=profile,
     )
     who = f" as {user_id}" if user_id else ""
     click.echo(
@@ -12324,6 +12404,33 @@ def _databricks_workspace_auth_info(workspace_host: str) -> _DatabricksWorkspace
     return _DatabricksWorkspaceAuthInfo(token=token, profile_name=auth.profile_name)
 
 
+def _databricks_profile_auth_info(profile: str) -> _DatabricksWorkspaceAuthInfo | None:
+    """Mint a bearer from an explicit ``~/.databrickscfg`` profile.
+
+    The ``--profile`` counterpart to :func:`_databricks_workspace_auth_info`:
+    the user named the exact identity, so credentials resolve by profile
+    rather than by matching the workspace host (which cannot disambiguate a
+    user profile from a service principal for the same workspace).
+
+    :param profile: The ``~/.databrickscfg`` profile name, e.g. ``"my-user"``.
+    :returns: The minted token and the profile name, or ``None`` when the
+        profile does not resolve to a usable credential.
+    """
+    from omnigent.inner.databricks_executor import (
+        DatabricksAuthError,
+        _resolve_databricks_auth,
+    )
+
+    try:
+        auth, _host = _resolve_databricks_auth(profile=profile)
+        token = auth.current_token()
+    except (DatabricksAuthError, ImportError, ValueError):
+        return None
+    if not token:
+        return None
+    return _DatabricksWorkspaceAuthInfo(token=token, profile_name=auth.profile_name)
+
+
 def _databricks_workspace_token(workspace_host: str) -> str | None:
     """Mint a bearer for a workspace from the host-keyed OAuth cache.
 
@@ -12364,7 +12471,21 @@ def _remember_default_server(server: str) -> None:
 
 @cli.command("login")
 @click.argument("server_url")
-def login(server_url: str) -> None:
+@click.option(
+    "--profile",
+    "profile",
+    default=None,
+    metavar="NAME",
+    help=(
+        "For a Databricks-fronted server: authenticate as this "
+        "`~/.databrickscfg` profile instead of the browser login, and "
+        "persist it so later commands resolve the same identity. Use when "
+        "one machine holds several profiles for the workspace (e.g. your "
+        "user login alongside a service principal) and you want to pin "
+        "which one this server uses."
+    ),
+)
+def login(server_url: str, profile: str | None) -> None:
     """Authenticate with a remote Omnigent server.
 
     Probes the server's auth mode and runs the matching flow:
@@ -12427,9 +12548,15 @@ def login(server_url: str) -> None:
 
     databricks_workspace = _databricks_workspace_login_target(server, probe)
     if databricks_workspace is not None:
-        _databricks_login(server, databricks_workspace, org_id=org_id)
+        _databricks_login(server, databricks_workspace, org_id=org_id, profile=profile)
         _remember_default_server(server)
         return
+
+    if profile is not None:
+        raise click.ClickException(
+            f"--profile is only supported for Databricks-fronted servers; "
+            f"{server} is not one. Omit --profile."
+        )
 
     detected_login_url: str | None = None
     if probe.status_code == 401:

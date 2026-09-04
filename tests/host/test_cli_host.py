@@ -1238,7 +1238,9 @@ def test_host_background_signs_in_before_spawning(
     spawned_args, _ = _patch_background_host_spawn(monkeypatch, tmp_path)
     auth_calls: list[tuple[str, bool]] = []
 
-    def _fake_auth(server: str, *, non_interactive: bool = False) -> None:
+    def _fake_auth(
+        server: str, *, non_interactive: bool = False, profile: str | None = None
+    ) -> None:
         """Record the sign-in pre-flight.
 
         :param server: Server URL being authenticated.
@@ -1308,7 +1310,9 @@ def test_start_hosts_on_explicit_server(
     spawned_args, _ = _patch_background_host_spawn(monkeypatch, tmp_path)
     auth_calls: list[tuple[str, bool]] = []
 
-    def _fake_auth(server: str, *, non_interactive: bool = False) -> None:
+    def _fake_auth(
+        server: str, *, non_interactive: bool = False, profile: str | None = None
+    ) -> None:
         """Record the sign-in pre-flight.
 
         :param server: Server URL being authenticated.
