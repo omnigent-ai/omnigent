@@ -194,6 +194,8 @@ function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask>
     lastRunStatus: null,
     lastRunConversationId: null,
     nextRunAt: null,
+    activeRangeStart: null,
+    activeRangeEnd: null,
     ...overrides,
   } satisfies ScheduledTasksApiModule.ScheduledTask;
 }
@@ -732,6 +734,105 @@ describe("CreateScheduledTaskDialog submit", () => {
     renderDialog();
     expect(screen.queryByTestId("schedule-preview")).toBeNull();
     expect(screen.queryByText(/Reads as:/i)).toBeNull();
+  });
+});
+
+describe("CreateScheduledTaskDialog active range", () => {
+  it("shows the active-range control for Hourly and hides it for the Daily default", () => {
+    renderDialog();
+    // Default preset is Daily — the control is hourly-only.
+    expect(screen.queryByTestId("schedule-active-range-field")).toBeNull();
+
+    fireEvent.keyDown(screen.getByTestId("schedule-preset-trigger"), { key: "Enter" });
+    fireEvent.click(screen.getByRole("option", { name: "Hourly" }));
+    expect(screen.getByTestId("schedule-active-range-field")).toBeInTheDocument();
+    // Off by default — no time inputs until the toggle is switched on.
+    expect(screen.queryByTestId("schedule-active-range-times")).toBeNull();
+  });
+
+  it("clears the range when switching away from Hourly", () => {
+    renderDialog();
+    fireEvent.keyDown(screen.getByTestId("schedule-preset-trigger"), { key: "Enter" });
+    fireEvent.click(screen.getByRole("option", { name: "Hourly" }));
+    fireEvent.click(screen.getByTestId("schedule-active-range-toggle"));
+    expect(screen.getByTestId("schedule-active-range-times")).toBeInTheDocument();
+
+    fireEvent.keyDown(screen.getByTestId("schedule-preset-trigger"), { key: "Enter" });
+    fireEvent.click(screen.getByRole("option", { name: "Daily" }));
+    expect(screen.queryByTestId("schedule-active-range-field")).toBeNull();
+
+    // Switching back to Hourly starts from the cleared (off) state, not the
+    // range that was set before the detour through Daily.
+    fireEvent.keyDown(screen.getByTestId("schedule-preset-trigger"), { key: "Enter" });
+    fireEvent.click(screen.getByRole("option", { name: "Hourly" }));
+    expect(screen.queryByTestId("schedule-active-range-times")).toBeNull();
+  });
+
+  it("submits the range bounds on create when the toggle is switched on", async () => {
+    renderDialog();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Business hours" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Check queue" } });
+    fireEvent.keyDown(screen.getByTestId("schedule-preset-trigger"), { key: "Enter" });
+    fireEvent.click(screen.getByRole("option", { name: "Hourly" }));
+    fireEvent.click(screen.getByTestId("schedule-active-range-toggle"));
+
+    // Defaults to 9:00 AM–5:00 PM.
+    expect(screen.getByTestId("schedule-active-range-start-input")).toHaveValue("09:00 AM");
+    expect(screen.getByTestId("schedule-active-range-end-input")).toHaveValue("05:00 PM");
+
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    const arg = mutateAsync.mock.calls[0][0];
+    expect(arg.activeRangeStart).toBe("09:00");
+    expect(arg.activeRangeEnd).toBe("17:00");
+  });
+
+  it("prefills both inputs when editing a task with a range", () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          rrule: "FREQ=HOURLY;BYMINUTE=0",
+          activeRangeStart: "09:00",
+          activeRangeEnd: "17:00",
+        })}
+      />,
+    );
+    expect(screen.getByTestId("schedule-active-range-toggle")).toBeChecked();
+    expect(screen.getByTestId("schedule-active-range-start-input")).toHaveValue("09:00 AM");
+    expect(screen.getByTestId("schedule-active-range-end-input")).toHaveValue("05:00 PM");
+  });
+
+  it("sends explicit nulls when the range is turned off on an edit", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          rrule: "FREQ=HOURLY;BYMINUTE=0",
+          activeRangeStart: "09:00",
+          activeRangeEnd: "17:00",
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("schedule-active-range-toggle"));
+    expect(screen.queryByTestId("schedule-active-range-times")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    expect(input.activeRangeStart).toBeNull();
+    expect(input.activeRangeEnd).toBeNull();
+  });
+
+  it("a task with no range submits an edit with no active-range keys", async () => {
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={scheduledTask()} />);
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    expect(input).not.toHaveProperty("activeRangeStart");
+    expect(input).not.toHaveProperty("activeRangeEnd");
   });
 });
 

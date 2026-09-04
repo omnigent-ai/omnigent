@@ -68,6 +68,8 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
     lastRunStatus: null,
     lastRunConversationId: null,
     nextRunAt: null,
+    activeRangeStart: null,
+    activeRangeEnd: null,
     ...overrides,
   };
 }

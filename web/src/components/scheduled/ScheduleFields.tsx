@@ -24,10 +24,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import {
   DEFAULT_SCHEDULE_MODEL,
   WEEKDAY_CODES,
+  formatTimeOfDay24,
   parseMinuteOfHourInput,
   parseTimeOfDayInput,
   validateSchedule,
@@ -75,6 +77,11 @@ export function ScheduleFields({
   // shows a minute-only input instead.
   const isHourly = model.preset === "hourly";
   const showWeekdays = model.preset === "weekly";
+  // The active-range control only makes sense for an hourly cadence. Custom is
+  // unreachable from this form's dropdown today (see file header), but the
+  // check stays here for parity with buildRRule/validateSchedule, which also
+  // keep the Custom paths alive.
+  const showActiveRange = isHourly || (model.preset === "custom" && model.customFreq === "hourly");
 
   const error = validateSchedule(model);
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -185,6 +192,28 @@ export function ScheduleFields({
     onChange({ ...model, hour, minute });
   }
 
+  function handlePresetChange(preset: SchedulePreset) {
+    const staysHourly = preset === "hourly" || (preset === "custom" && model.customFreq === "hourly");
+    onChange({ ...model, preset, activeRange: staysHourly ? model.activeRange : null });
+  }
+
+  function handleActiveRangeToggle(enabled: boolean) {
+    onChange({
+      ...model,
+      activeRange: enabled ? { start: formatTimeOfDay24(9, 0), end: formatTimeOfDay24(17, 0) } : null,
+    });
+  }
+
+  function handleActiveRangeStartChange(hhmm: string) {
+    if (!model.activeRange) return;
+    onChange({ ...model, activeRange: { ...model.activeRange, start: hhmm } });
+  }
+
+  function handleActiveRangeEndChange(hhmm: string) {
+    if (!model.activeRange) return;
+    onChange({ ...model, activeRange: { ...model.activeRange, end: hhmm } });
+  }
+
   return (
     <div className="flex flex-col gap-3">
       <div className="grid gap-3 sm:grid-cols-2 sm:gap-6" data-testid="schedule-frequency-time-row">
@@ -197,7 +226,7 @@ export function ScheduleFields({
             value={model.preset}
             componentId="tasks.scheduled.schedule_frequency"
             valueHasNoPii
-            onValueChange={(value) => onChange({ ...model, preset: value as SchedulePreset })}
+            onValueChange={(value) => handlePresetChange(value as SchedulePreset)}
             onOpenChange={onSelectOpenChange}
           >
             <SelectTrigger
@@ -352,6 +381,47 @@ export function ScheduleFields({
         </div>
       )}
 
+      {showActiveRange && (
+        <div className="flex flex-col gap-1.5" data-testid="schedule-active-range-field">
+          <div className="flex items-center gap-2">
+            <Switch
+              checked={model.activeRange !== null}
+              onCheckedChange={handleActiveRangeToggle}
+              aria-label="Only run between"
+              data-testid="schedule-active-range-toggle"
+              componentId="tasks.scheduled.active_range_toggle"
+            />
+            <Label>Only run between</Label>
+          </div>
+          {model.activeRange && (
+            <div className="grid grid-cols-2 gap-3" data-testid="schedule-active-range-times">
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="schedule-active-range-start-input">Start</Label>
+                <TimeOfDayPicker
+                  id="schedule-active-range-start-input"
+                  value={model.activeRange.start}
+                  onChange={handleActiveRangeStartChange}
+                  placeholder="9:00 AM"
+                  testIdPrefix="schedule-active-range-start"
+                  onSelectOpenChange={onSelectOpenChange}
+                />
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="schedule-active-range-end-input">End</Label>
+                <TimeOfDayPicker
+                  id="schedule-active-range-end-input"
+                  value={model.activeRange.end}
+                  onChange={handleActiveRangeEndChange}
+                  placeholder="5:00 PM"
+                  testIdPrefix="schedule-active-range-end"
+                  onSelectOpenChange={onSelectOpenChange}
+                />
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* describeSchedule/buildRRule stay in the lib for list rows and possible
           future previews; only the inline validation error renders here now. */}
       {error && (
@@ -433,4 +503,166 @@ function PickerCell({
       {children}
     </button>
   );
+}
+
+/**
+ * A single time-of-day input + Popover picker, mirroring the `schedule-time`
+ * control above (hour/minute/period columns via `PickerCell`) but driven by a
+ * standalone strict 24-hour `"HH:MM"` string rather than the RRULE's
+ * hour/minute fields — used for the active-range start/end bounds, which are
+ * a sibling of the rule, not part of it.
+ */
+function TimeOfDayPicker({
+  id,
+  value,
+  onChange,
+  placeholder,
+  testIdPrefix,
+  onSelectOpenChange,
+}: {
+  id?: string;
+  /** Strict 24-hour `"HH:MM"`, e.g. `"09:00"`. */
+  value: string;
+  onChange: (hhmm: string) => void;
+  placeholder: string;
+  testIdPrefix: string;
+  onSelectOpenChange?: (open: boolean) => void;
+}) {
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const hourColumnRef = useRef<HTMLDivElement | null>(null);
+  const minuteColumnRef = useRef<HTMLDivElement | null>(null);
+  const periodColumnRef = useRef<HTMLDivElement | null>(null);
+  const [text, setText] = useState(() => formatValueForDisplay(value));
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    if (document.activeElement === inputRef.current) return;
+    setText(formatValueForDisplay(value));
+  }, [value]);
+
+  const parsedText = parseTimeOfDayInput(text);
+  const parsedValue = parseTimeOfDayInput(value);
+  const pickerTime = parsedText ?? parsedValue ?? { hour: 9, minute: 0 };
+  const pickerParts = toPickerParts(pickerTime);
+
+  useEffect(() => {
+    if (!open) return;
+    scrollSelectedIntoView(hourColumnRef.current);
+    scrollSelectedIntoView(minuteColumnRef.current);
+  }, [open, pickerParts.hour12, pickerParts.minute]);
+
+  function handleOpenChange(next: boolean) {
+    setOpen(next);
+    onSelectOpenChange?.(next);
+  }
+
+  function handleTextChange(next: string) {
+    setText(next);
+    const parsed = parseTimeOfDayInput(next);
+    if (parsed !== null) onChange(formatTimeOfDay24(parsed.hour, parsed.minute));
+  }
+
+  function canonicalize() {
+    const parsed = parseTimeOfDayInput(text);
+    if (parsed !== null) setText(formatTimeInput(parsed.hour, parsed.minute));
+  }
+
+  function applyPickerTime(next: Partial<{ hour12: number; minute: number; period: Period }>) {
+    const hour12 = next.hour12 ?? pickerParts.hour12;
+    const minute = next.minute ?? pickerParts.minute;
+    const period = next.period ?? pickerParts.period;
+    const hour = to24Hour(hour12, period);
+    setText(formatTimeInput(hour, minute));
+    onChange(formatTimeOfDay24(hour, minute));
+  }
+
+  return (
+    <Popover open={open} onOpenChange={handleOpenChange}>
+      <PopoverAnchor asChild>
+        <div className="relative">
+          <Input
+            ref={inputRef}
+            id={id}
+            value={text}
+            data-testid={`${testIdPrefix}-input`}
+            placeholder={placeholder}
+            className="pr-8 text-ui"
+            onFocus={() => handleOpenChange(true)}
+            onChange={(e) => handleTextChange(e.target.value)}
+            onBlur={canonicalize}
+          />
+          <button
+            type="button"
+            aria-label="Open time picker"
+            data-testid={`${testIdPrefix}-picker-trigger`}
+            className="absolute top-1/2 right-2 flex size-4 -translate-y-1/2 items-center justify-center rounded-sm text-muted-foreground hover:text-foreground"
+            onClick={() => handleOpenChange(!open)}
+          >
+            <ClockIcon className="size-3.5" />
+          </button>
+        </div>
+      </PopoverAnchor>
+      <PopoverContent
+        align="start"
+        className="w-64 rounded-sm p-1.5"
+        onOpenAutoFocus={(event) => event.preventDefault()}
+      >
+        <div className="grid grid-cols-3 gap-1" data-testid={`${testIdPrefix}-picker`}>
+          <div
+            ref={hourColumnRef}
+            className="max-h-40 overflow-y-auto overscroll-contain pr-0.5"
+            data-testid={`${testIdPrefix}-hour-column`}
+          >
+            {HOURS_12.map((hour) => (
+              <PickerCell
+                key={hour}
+                testId={`${testIdPrefix}-hour-${pad(hour)}`}
+                selected={pickerParts.hour12 === hour}
+                onClick={() => applyPickerTime({ hour12: hour })}
+              >
+                {pad(hour)}
+              </PickerCell>
+            ))}
+          </div>
+          <div
+            ref={minuteColumnRef}
+            className="max-h-40 overflow-y-auto overscroll-contain pr-0.5"
+            data-testid={`${testIdPrefix}-minute-column`}
+          >
+            {MINUTES.map((minute) => (
+              <PickerCell
+                key={minute}
+                testId={`${testIdPrefix}-minute-${pad(minute)}`}
+                selected={pickerParts.minute === minute}
+                onClick={() => applyPickerTime({ minute })}
+              >
+                {pad(minute)}
+              </PickerCell>
+            ))}
+          </div>
+          <div
+            ref={periodColumnRef}
+            className="max-h-40 overflow-y-auto overscroll-contain pr-0.5"
+            data-testid={`${testIdPrefix}-period-column`}
+          >
+            {PERIODS.map((period) => (
+              <PickerCell
+                key={period}
+                testId={`${testIdPrefix}-period-${period}`}
+                selected={pickerParts.period === period}
+                onClick={() => applyPickerTime({ period })}
+              >
+                {period}
+              </PickerCell>
+            ))}
+          </div>
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+function formatValueForDisplay(value: string): string {
+  const parsed = parseTimeOfDayInput(value);
+  return parsed ? formatTimeInput(parsed.hour, parsed.minute) : "";
 }

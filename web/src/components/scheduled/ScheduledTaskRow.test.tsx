@@ -31,6 +31,8 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
     lastRunStatus: null,
     lastRunConversationId: null,
     nextRunAt: null,
+    activeRangeStart: null,
+    activeRangeEnd: null,
     ...overrides,
   };
 }
@@ -74,6 +76,27 @@ describe("next-run text (server-sourced, relative delta)", () => {
   it("renders NO next-run text when nextRunAt is null (paused / unarmed)", () => {
     renderRow(task({ nextRunAt: null }));
     expect(screen.queryByTestId("task-next-run")).toBeNull();
+  });
+});
+
+describe("active-range subtitle", () => {
+  it("appends the range to the schedule summary when both bounds are set", () => {
+    renderRow(
+      task({
+        rrule: "FREQ=HOURLY;BYMINUTE=0",
+        activeRangeStart: "09:00",
+        activeRangeEnd: "17:00",
+      }),
+    );
+    expect(screen.getByTestId("task-schedule-line").textContent).toContain(
+      "Hourly, 9:00 AM–5:00 PM",
+    );
+  });
+
+  it("omits the range suffix when the task is unrestricted", () => {
+    renderRow(task({ rrule: "FREQ=HOURLY;BYMINUTE=0" }));
+    expect(screen.getByTestId("task-schedule-line").textContent).toContain("Hourly");
+    expect(screen.getByTestId("task-schedule-line").textContent).not.toContain("–");
   });
 });
 

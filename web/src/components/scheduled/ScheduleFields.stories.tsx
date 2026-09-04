@@ -43,3 +43,16 @@ export const WeeklyTimePickerOpen: Story = {
     await userEvent.click(within(canvasElement).getByTestId("schedule-time-picker-trigger"));
   },
 };
+
+export const HourlyWithActiveRange: Story = {
+  render: () => (
+    <ScheduleExample
+      initialModel={{
+        ...DEFAULT_SCHEDULE_MODEL,
+        preset: "hourly",
+        minute: 0,
+        activeRange: { start: "09:00", end: "17:00" },
+      }}
+    />
+  ),
+};

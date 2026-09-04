@@ -158,8 +158,34 @@ const MONTH_NAMES = [
  * Falls back to the library's `.toText()` (then the raw rule) for anything this
  * formatter doesn't special-case, so a valid-but-unusual rule still renders
  * something readable rather than blank.
+ *
+ * When `activeRange` is set (both bounds present, `"HH:MM"` 24-hour strings),
+ * appends `", 9:00 AM–5:00 PM"` so a range-restricted automation reads e.g.
+ * "Hourly, 9:00 AM–5:00 PM".
  */
-export function describeSchedule(rrule: string): string {
+export function describeSchedule(
+  rrule: string,
+  activeRange?: { start: string; end: string } | null,
+): string {
+  const base = describeScheduleRule(rrule);
+  const suffix = activeRange ? formatActiveRangeSuffix(activeRange) : "";
+  return `${base}${suffix}`;
+}
+
+function formatActiveRangeSuffix(activeRange: { start: string; end: string }): string {
+  const start = parseTimeOfDay24(activeRange.start);
+  const end = parseTimeOfDay24(activeRange.end);
+  if (!start || !end) return "";
+  return `, ${formatClockTime(start.hour, start.minute)}–${formatClockTime(end.hour, end.minute)}`;
+}
+
+function parseTimeOfDay24(value: string): { hour: number; minute: number } | null {
+  const match = /^([0-9]{2}):([0-9]{2})$/.exec(value);
+  if (!match) return null;
+  return { hour: Number(match[1]), minute: Number(match[2]) };
+}
+
+function describeScheduleRule(rrule: string): string {
   const rule = tryParse(rrule);
   if (!rule) return rrule;
   const o = rule.origOptions;

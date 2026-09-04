@@ -9,7 +9,9 @@ import { describe, expect, it } from "vitest";
 import {
   buildRRule,
   DEFAULT_SCHEDULE_MODEL,
+  formatTimeOfDay24,
   parseRRuleToScheduleModel,
+  validateSchedule,
   type ScheduleModel,
 } from "./scheduleBuilder";
 
@@ -113,5 +115,47 @@ describe("parseMinuteOfHourInput", () => {
     const { parseMinuteOfHourInput } = await import("./scheduleBuilder");
     expect(parseMinuteOfHourInput(":60")).toBeNull();
     expect(parseMinuteOfHourInput("abc")).toBeNull();
+  });
+});
+
+describe("formatTimeOfDay24", () => {
+  it("formats a strict zero-padded 24-hour HH:MM", () => {
+    expect(formatTimeOfDay24(9, 0)).toBe("09:00");
+    expect(formatTimeOfDay24(0, 0)).toBe("00:00");
+    expect(formatTimeOfDay24(17, 5)).toBe("17:05");
+    expect(formatTimeOfDay24(23, 59)).toBe("23:59");
+  });
+});
+
+describe("validateSchedule — active range", () => {
+  it("accepts a null active range (unrestricted)", () => {
+    expect(validateSchedule(model({ preset: "hourly", activeRange: null }))).toBeNull();
+  });
+
+  it("accepts a valid range, including an overnight one", () => {
+    expect(
+      validateSchedule(model({ preset: "hourly", activeRange: { start: "09:00", end: "17:00" } })),
+    ).toBeNull();
+    expect(
+      validateSchedule(model({ preset: "hourly", activeRange: { start: "22:00", end: "06:00" } })),
+    ).toBeNull();
+  });
+
+  it("rejects an unparseable start or end", () => {
+    expect(
+      validateSchedule(model({ preset: "hourly", activeRange: { start: "9:00", end: "17:00" } })),
+    ).toMatch(/valid start and end/i);
+    expect(
+      validateSchedule(model({ preset: "hourly", activeRange: { start: "09:00", end: "not-a-time" } })),
+    ).toMatch(/valid start and end/i);
+    expect(
+      validateSchedule(model({ preset: "hourly", activeRange: { start: "24:00", end: "17:00" } })),
+    ).toMatch(/valid start and end/i);
+  });
+
+  it("rejects a range whose start equals its end", () => {
+    expect(
+      validateSchedule(model({ preset: "hourly", activeRange: { start: "09:00", end: "09:00" } })),
+    ).toMatch(/must differ/i);
   });
 });

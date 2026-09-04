@@ -26,6 +26,8 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
     lastRunStatus: null,
     lastRunConversationId: null,
     nextRunAt: "2026-03-10T14:01:00Z",
+    activeRangeStart: null,
+    activeRangeEnd: null,
     ...overrides,
   };
 }

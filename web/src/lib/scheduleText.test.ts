@@ -264,6 +264,29 @@ describe("describeSchedule", () => {
     expect(describeSchedule("not a rule")).toBe("not a rule");
   });
 
+  it("appends the active range when both bounds are set", () => {
+    expect(describeSchedule("FREQ=HOURLY;BYMINUTE=0", { start: "09:00", end: "17:00" })).toBe(
+      "Hourly, 9:00 AM–5:00 PM",
+    );
+  });
+
+  it("renders an overnight range that wraps past midnight", () => {
+    expect(describeSchedule("FREQ=HOURLY;BYMINUTE=0", { start: "22:00", end: "06:00" })).toBe(
+      "Hourly, 10:00 PM–6:00 AM",
+    );
+  });
+
+  it("omits the suffix when activeRange is null or omitted", () => {
+    expect(describeSchedule("FREQ=HOURLY;BYMINUTE=0", null)).toBe("Hourly");
+    expect(describeSchedule("FREQ=HOURLY;BYMINUTE=0")).toBe("Hourly");
+  });
+
+  it("appends the range suffix to a non-hourly rule too", () => {
+    expect(
+      describeSchedule("FREQ=DAILY;BYHOUR=9;BYMINUTE=0", { start: "09:00", end: "17:00" }),
+    ).toBe("Every day at 9:00 AM, 9:00 AM–5:00 PM");
+  });
+
   it("round-trips every builder output to non-empty readable text", () => {
     const cases: ScheduleModel[] = [
       model({ preset: "hourly" }),

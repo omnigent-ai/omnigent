@@ -66,6 +66,13 @@ export interface ScheduledTask {
    * next-run can't match the server anchor for INTERVAL>1 rules.
    */
   nextRunAt: string | null;
+  /**
+   * Time-of-day window (inclusive, `"HH:MM"`) an occurrence must land in to
+   * actually fire, or `null` when the task is unrestricted. Both set or both
+   * `null` — never just one. An overnight range like `22:00`-`06:00` is valid.
+   */
+  activeRangeStart: string | null;
+  activeRangeEnd: string | null;
 }
 
 /** One run of a scheduled task, camelCased from `_run_to_response`. */
@@ -96,6 +103,9 @@ export interface CreateScheduledTaskInput {
   workspace?: string | null;
   /** Optional pinned host. */
   hostId?: string | null;
+  /** Active-range bounds (`"HH:MM"`); set together, or omit both. */
+  activeRangeStart?: string | null;
+  activeRangeEnd?: string | null;
 }
 
 /**
@@ -121,6 +131,13 @@ export interface UpdateScheduledTaskInput {
   workspace?: string;
   hostId?: string;
   state?: ScheduledTaskState;
+  /**
+   * Active-range bounds (`"HH:MM"`). Send both as strings to set a window, or
+   * both as explicit `null` to clear a previously-set one — omitting the keys
+   * leaves the existing range untouched.
+   */
+  activeRangeStart?: string | null;
+  activeRangeEnd?: string | null;
 }
 
 /** Wire shape of a task row (snake_case), matching `_to_response`. */
@@ -144,6 +161,8 @@ interface ScheduledTaskWire {
   last_run_status: ScheduledTaskRunStatus | null;
   last_run_conversation_id: string | null;
   next_run_at: string | null;
+  active_range_start: string | null;
+  active_range_end: string | null;
 }
 
 /** Wire shape of a run row (snake_case), matching `_run_to_response`. */
@@ -219,6 +238,8 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     lastRunStatus: wire.last_run_status,
     lastRunConversationId: wire.last_run_conversation_id,
     nextRunAt: wire.next_run_at,
+    activeRangeStart: wire.active_range_start,
+    activeRangeEnd: wire.active_range_end,
   };
 }
 
@@ -274,6 +295,8 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.permissionMode != null) body.permission_mode = input.permissionMode;
   if (input.workspace != null) body.workspace = input.workspace;
   if (input.hostId != null) body.host_id = input.hostId;
+  if (input.activeRangeStart != null) body.active_range_start = input.activeRangeStart;
+  if (input.activeRangeEnd != null) body.active_range_end = input.activeRangeEnd;
   const res = await authenticatedFetch("/v1/scheduled-tasks", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -303,6 +326,8 @@ export async function updateScheduledTask(
   if (input.workspace !== undefined) body.workspace = input.workspace;
   if (input.hostId !== undefined) body.host_id = input.hostId;
   if (input.state !== undefined) body.state = input.state;
+  if (input.activeRangeStart !== undefined) body.active_range_start = input.activeRangeStart;
+  if (input.activeRangeEnd !== undefined) body.active_range_end = input.activeRangeEnd;
   const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
