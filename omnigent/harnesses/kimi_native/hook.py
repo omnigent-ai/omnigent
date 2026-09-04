@@ -252,9 +252,6 @@ def _main_permission_request(argv: list[str]) -> int:
         "message": f"Kimi wants to call **{tool_name}**",
         "operation_type": tool_name,
     }
-    tool_input = payload.get("tool_input")
-    if isinstance(tool_input, dict):
-        body["tool_input"] = tool_input
 
     url = (
         f"{ap_server_url.rstrip('/')}/v1/sessions/"
