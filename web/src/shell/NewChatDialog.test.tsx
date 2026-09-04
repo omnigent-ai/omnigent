@@ -115,13 +115,18 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: vi.fn(),
 }));
 // The composer's project chip lists projects via useProjects; stub it to an
-// empty list so it doesn't fire its own authenticatedFetch (which would skew
-// the create-POST call-count / call-order assertions below).
+// empty list by default so it doesn't fire its own authenticatedFetch (which
+// would skew the create-POST call-count / call-order assertions below).
+// Wrapped in a mock function (rather than a bare arrow) so the `?host=` +
+// `?project=` precedence tests can override it per-test to exercise project
+// name→id resolution (real useProjectConfig then reads the id's stored config
+// through authenticatedFetch, which is already globally stubbed).
+const { useProjectsMock } = vi.hoisted(() => ({
+  useProjectsMock: vi.fn(() => ({ data: [] as { id: string; name: string }[] })),
+}));
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
-  // Empty projects list → no ?project= name resolves to an id, so the project
-  // prefill stays inert and the generic host/workspace defaults under test apply.
-  useProjects: () => ({ data: [] }),
+  useProjects: () => useProjectsMock(),
   // The landing reads useConversations for hasNoSessions; stub it so it doesn't
   // fire an authenticatedFetch that skews create-POST call assertions.
   useConversations: () => ({ data: undefined }),
@@ -712,6 +717,10 @@ function setupLandingMocks() {
   useHostWorktreesMock.mockReset();
   useDirectorySessionsMock.mockReset();
   useRunnerHealthMock.mockReset();
+  // Back to the empty-list default; per-test overrides (the `?host=` +
+  // `?project=` precedence tests) must not leak into the next test.
+  useProjectsMock.mockReset();
+  useProjectsMock.mockReturnValue({ data: [] });
   // Reset the install hooks to their inert defaults: per-test overrides
   // (a pending install set, a callback-firing mutate) must not leak into the
   // next test — a stale pending set would disable the Install button and make
@@ -2786,6 +2795,79 @@ describe("NewChatLandingScreen", () => {
     expect(heading.className).toContain("min-w-0");
     expect(heading.className).toContain("line-clamp-2");
     expect(heading.className).toContain("break-words");
+  });
+
+  it("selects the host named by a ?host= deep link, over the first-online default", async () => {
+    // Two online hosts: without ?host=, the auto-select effect would default to
+    // the first one (host_1 / "machine-1"). ?host=host_2 must win instead.
+    mockHosts([host("online", 1), host("online", 2)]);
+    renderLanding({}, "/?host=host_2");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("machine-2"),
+    );
+  });
+
+  it("falls back to the default host pick when ?host= names an unknown host id", async () => {
+    // Unrecognized id → same fallback as a plain `/` visit: the sole online
+    // host (host_1), which the "this machine" heuristic labels distinctly
+    // since it's the only online host on a local single-host server.
+    mockHosts([host("online", 1)]);
+    renderLanding({}, "/?host=does-not-exist");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
+        "This machine",
+      ),
+    );
+  });
+
+  it("falls back to the default host pick when ?host= names a currently-offline host", async () => {
+    // host_2 exists but is offline — the deep link must not select it; the
+    // online host_1 wins via the existing default logic instead (labeled "This
+    // machine" — the sole *online* host on a local single-host server).
+    mockHosts([host("online", 1), host("offline", 2)]);
+    renderLanding({}, "/?host=host_2");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
+        "This machine",
+      ),
+    );
+    expect(screen.getByTestId("new-chat-landing-host-chip").textContent).not.toContain("machine-2");
+  });
+
+  it("overrides a ?project='s stored host default", async () => {
+    // `?host=` must win over a project's stored host default. The auto-select
+    // effect checks hostParam before `prefillSettled`, so the deep link is
+    // honored even while the project-prefill machine is still resolving.
+    mockHosts([host("online", 1), host("online", 2)]);
+    useProjectsMock.mockReturnValue({ data: [{ id: "p_alpha", name: "alpha" }] });
+    authenticatedFetchMock.mockImplementation(async (url) => {
+      if (url === "/v1/projects/p_alpha") {
+        return {
+          ok: true,
+          json: async () => ({ id: "p_alpha", name: "alpha", config: { host_id: "host_1" } }),
+        } as Response;
+      }
+      return { ok: true, json: async () => ({}) } as Response;
+    });
+    renderLanding({}, "/?host=host_2&project=alpha");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("machine-2"),
+    );
+  });
+
+  it("keeps the default host pick unchanged with no ?host= param (regression guard)", async () => {
+    mockHosts([host("online", 1)]);
+    renderLanding({}, "/");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
+        "This machine",
+      ),
+    );
   });
 
   it.each([
