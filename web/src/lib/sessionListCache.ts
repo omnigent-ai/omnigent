@@ -59,6 +59,12 @@ export interface ConversationListFilters {
    * "all projects".
    */
   project?: string;
+  /**
+   * Ownership/archive scope for the sidebar tabs. ``"mine"`` holds only owned
+   * sessions; ``"shared"`` holds accessible-but-not-owned; ``"archived"`` holds
+   * only archived sessions. ``undefined`` is the default all-sessions list.
+   */
+  visibility?: "mine" | "shared" | "archived";
 }
 
 /**
@@ -151,11 +157,21 @@ export function filtersFromConversationQueryKey(key: readonly unknown[]): Conver
   if (project !== undefined && project !== null && typeof project !== "string") {
     throw new Error("Invalid conversations query key");
   }
+  const visibility = key[4];
+  if (
+    visibility !== undefined &&
+    visibility !== "mine" &&
+    visibility !== "shared" &&
+    visibility !== "archived"
+  ) {
+    throw new Error("Invalid conversations query key");
+  }
   return {
     searchQuery,
     includeArchived,
     // Treat null (visibility-scoped key) the same as undefined (no project filter).
     project: project ?? undefined,
+    visibility: visibility as ConversationListFilters["visibility"],
   };
 }
 
@@ -176,6 +192,17 @@ export function filtersFromConversationQueryKey(key: readonly unknown[]): Conver
  * @returns `true` when the row should be removed immediately.
  */
 function violatesKnownMembership(conv: Conversation, filters: ConversationListFilters): boolean {
+  // Visibility-scoped caches have strict membership rules beyond archive/project:
+  if (filters.visibility === "archived") {
+    // The archived cache holds only archived rows. A non-archived row (or one
+    // that just got un-archived) does not belong; evict it so the overlay paths
+    // don't leave stale active sessions in this cache.
+    return conv.archived !== true;
+  }
+  if (filters.visibility === "mine" || filters.visibility === "shared") {
+    // Mine/shared caches hold only active (non-archived) sessions. Evict if archived.
+    if (conv.archived === true) return true;
+  }
   if (!filters.includeArchived && conv.archived === true) return true;
   if (filters.project && conv.labels?.[PROJECT_LABEL_KEY] !== filters.project) return true;
   return false;
@@ -300,7 +327,12 @@ export function insertNewRowsIntoPages(
   filters: ConversationListFilters,
   skip?: (id: string) => boolean,
 ): { data: ConversationsInfiniteData | undefined; inserted: Conversation[] } {
+  // New sessions are always owned (active, not archived), so inserting them into
+  // "shared" (accessible-but-not-owned) or "archived" caches would mis-place
+  // them. Skip insertion and let the debounced refetch reconcile instead.
   if (!data || candidates.size === 0 || filters.searchQuery) return { data, inserted: [] };
+  if (filters.visibility === "shared" || filters.visibility === "archived")
+    return { data, inserted: [] };
   const present = new Set<string>();
   for (const page of data.pages) for (const c of page.data) present.add(c.id);
   const rows: Conversation[] = [];

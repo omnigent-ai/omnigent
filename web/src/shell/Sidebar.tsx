@@ -616,13 +616,18 @@ export function Sidebar({
   // infinite scroll (auto-loading the next page as the sentinel nears view).
   const scrollContainerRef = useRef<HTMLElement>(null);
 
-  // Inbox badge — total approval prompts across loaded rows. Same
-  // `pending_elicitations_count` the per-row "awaiting" hand badge
-  // reads (live via WS /v1/sessions/updates), just summed.
-  const loadedRows = useMemo(
-    () => (conversationsQuery.data?.pages ?? []).flatMap((page) => page.data),
-    [conversationsQuery.data],
-  );
+  // Inbox badge — total approval prompts across loaded rows. We read from both
+  // conversationsQuery (all-sessions, page 1 coverage) AND filteredConversationsQuery
+  // (tab-scoped, grows as the user scrolls) so that scrolling any filtered tab
+  // extends badge coverage — the two caches overlap and dedup handles it.
+  const loadedRows = useMemo(() => {
+    const rows = [
+      ...(conversationsQuery.data?.pages ?? []).flatMap((p) => p.data),
+      ...(filteredConversationsQuery.data?.pages ?? []).flatMap((p) => p.data),
+    ];
+    const seen = new Set<string>();
+    return rows.filter((c) => !seen.has(c.id) && (seen.add(c.id) as true));
+  }, [conversationsQuery.data, filteredConversationsQuery.data]);
   const pendingApprovals = useMemo(() => sumPendingApprovals(loadedRows), [loadedRows]);
   // Plus unseen file comments — the badge counts everything the Inbox
   // page lists. Comment queries are shared with the page/FileViewer

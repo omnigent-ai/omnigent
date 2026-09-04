@@ -1036,19 +1036,23 @@ def register_core_routes(
         # "all": all accessible sessions (legacy default). A project folder
         #   additionally gates on owned_by so a shared session with a
         #   like-named project stays out of the viewer's own folder.
-        if visibility == "mine":
+        # In no-auth mode user_id is None — ownership/share concepts are
+        # meaningless without an identity anchor, and passing None into the
+        # store's shared_only path raises ValueError. Fall back to "all".
+        effective_visibility = visibility if user_id is not None else "all"
+        if effective_visibility == "mine":
             accessible_by_param: str | None = None
             owned_by_param: str | None = user_id
             shared_only_param = False
             include_archived_param = False
             archived_only_param = False
-        elif visibility == "shared":
+        elif effective_visibility == "shared":
             accessible_by_param = user_id
             owned_by_param = None
             shared_only_param = True
             include_archived_param = False
             archived_only_param = False
-        elif visibility == "archived":
+        elif effective_visibility == "archived":
             accessible_by_param = user_id
             owned_by_param = None
             shared_only_param = False
