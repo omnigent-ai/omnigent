@@ -1265,6 +1265,75 @@ describe("Composer model/effort label", () => {
     // The real effort still renders — only the leaked model was suppressed.
     expect(label()).toHaveTextContent("High");
   });
+
+  it("opens the config modal when the label half of the pill is clicked", async () => {
+    // The pill-wide hover highlight advertises one clickable control, so the
+    // label half must perform the same action as the gear beside it.
+    useChatStore.setState({ llmModel: "opus", selectedEffort: "high" });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+
+    fireEvent.click(label());
+
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+  });
+
+  it("keeps the label click inert when the session is read-only", () => {
+    // Mirrors the gear's soft-disable: a read-only viewer gets no config modal
+    // from either pill half, and aria-disabled drops the pill's hover
+    // highlight so no dead affordance is advertised.
+    useChatStore.setState({ llmModel: "opus", selectedEffort: "high" });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+          readOnlyReason: "Mirrored transcript",
+        })}
+      />,
+    );
+
+    expect(label()).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(label());
+    expect(screen.queryByTestId("composer-config-modal")).toBeNull();
+  });
+
+  it("stays a non-interactive read-out when no gear renders beside it", () => {
+    // SDK/bundle identity fallback with no config surface: there's no modal
+    // to open, no button in the pill, and thus no hover highlight to honor.
+    useChatStore.setState({
+      selectedModel: null,
+      selectedEffort: null,
+      llmModel: null,
+      sessionHarness: "pi",
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "polly" }],
+          selectedAgentId: "a1",
+          modelPickerKind: null,
+          showModels: false,
+          showEffort: false,
+        })}
+      />,
+    );
+
+    expect(screen.queryByTestId("composer-config-gear")).toBeNull();
+    expect(label().tagName).toBe("SPAN");
+  });
 });
 
 describe("Composer effort slash-command visibility", () => {
